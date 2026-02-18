@@ -1,0 +1,11 @@
+[package]
+name = "heartbit-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heartbit = { path = "../heartbit" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
