@@ -13,4 +13,5 @@ pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StopReason, TokenUsage,
     ToolCall, ToolDefinition, ToolResult,
 };
+pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput};

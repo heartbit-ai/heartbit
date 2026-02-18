@@ -25,6 +25,9 @@ pub enum Error {
 
     #[error("Response truncated (max_tokens reached)")]
     Truncated,
+
+    #[error("MCP error: {0}")]
+    Mcp(String),
 }
 
 #[cfg(test)]
@@ -47,5 +50,11 @@ mod tests {
 
         let err = Error::Truncated;
         assert_eq!(err.to_string(), "Response truncated (max_tokens reached)");
+    }
+
+    #[test]
+    fn error_mcp_display_message() {
+        let err = Error::Mcp("connection refused".into());
+        assert_eq!(err.to_string(), "MCP error: connection refused");
     }
 }

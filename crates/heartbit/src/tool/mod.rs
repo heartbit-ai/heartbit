@@ -1,3 +1,5 @@
+pub mod mcp;
+
 use std::future::Future;
 use std::pin::Pin;
 
