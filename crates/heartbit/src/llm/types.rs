@@ -74,12 +74,12 @@ pub struct ToolDefinition {
 }
 
 /// A request to the LLM.
-#[derive(Debug, Clone, Serialize)]
+///
+/// The model is not part of the request — it's a property of the provider.
+#[derive(Debug, Clone)]
 pub struct CompletionRequest {
-    pub model: String,
     pub system: String,
     pub messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
 }

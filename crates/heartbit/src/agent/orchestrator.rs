@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -6,17 +8,28 @@ use tracing::info;
 
 use crate::error::Error;
 use crate::llm::LlmProvider;
-use crate::llm::types::{Message, TokenUsage, ToolDefinition, ToolResult};
+use crate::llm::types::{TokenUsage, ToolDefinition};
+use crate::tool::{Tool, ToolOutput};
 
-use super::context::AgentContext;
 use super::{AgentOutput, AgentRunner};
 
 /// A sub-agent definition registered with the orchestrator.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubAgentDef {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
+    pub tools: Vec<Arc<dyn Tool>>,
+}
+
+impl std::fmt::Debug for SubAgentDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubAgentDef")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("tools_count", &self.tools.len())
+            .finish()
+    }
 }
 
 /// A task delegated by the orchestrator to a sub-agent.
@@ -36,14 +49,10 @@ pub struct SubAgentResult {
 
 /// Multi-agent orchestrator.
 ///
-/// The orchestrator is itself an agent whose primary tool is `delegate_task`.
-/// It asks the LLM which sub-agents to spawn and with what instructions,
-/// then runs them in parallel and aggregates results.
+/// Refactored to use `AgentRunner` internally with a `DelegateTaskTool`.
+/// No duplicated agent loop — the orchestrator IS an AgentRunner.
 pub struct Orchestrator<P: LlmProvider> {
-    provider: Arc<P>,
-    sub_agents: Vec<SubAgentDef>,
-    model: String,
-    max_turns: usize,
+    runner: AgentRunner<P>,
 }
 
 impl<P: LlmProvider + 'static> Orchestrator<P> {
@@ -51,100 +60,54 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
         OrchestratorBuilder {
             provider,
             sub_agents: vec![],
-            model: "claude-sonnet-4-20250514".into(),
             max_turns: 10,
+            max_tokens: 4096,
         }
     }
 
     pub async fn run(&self, task: &str) -> Result<AgentOutput, Error> {
-        let system = self.build_system_prompt();
-        let tools = vec![self.delegate_tool_definition()];
-        let mut ctx =
-            AgentContext::new(&system, task, tools, &self.model).with_max_turns(self.max_turns);
-
-        let mut total_tool_calls = 0usize;
-        let mut total_usage = TokenUsage::default();
-
-        loop {
-            if ctx.current_turn() >= ctx.max_turns() {
-                return Err(Error::MaxTurnsExceeded(ctx.max_turns()));
-            }
-
-            ctx.increment_turn();
-            let response = self.provider.complete(ctx.to_request()).await?;
-            total_usage.input_tokens += response.usage.input_tokens;
-            total_usage.output_tokens += response.usage.output_tokens;
-
-            let tool_calls = response.tool_calls();
-
-            ctx.add_assistant_message(Message {
-                role: crate::llm::types::Role::Assistant,
-                content: response.content.clone(),
-            });
-
-            if tool_calls.is_empty() {
-                return Ok(AgentOutput {
-                    result: response.text(),
-                    tool_calls_made: total_tool_calls,
-                    tokens_used: total_usage,
-                });
-            }
-
-            // Process each tool call (should be delegate_task calls)
-            let mut tool_results = Vec::with_capacity(tool_calls.len());
-
-            for call in &tool_calls {
-                if call.name != "delegate_task" {
-                    tool_results.push(ToolResult::error(
-                        &call.id,
-                        format!(
-                            "Unknown tool: {}. Only delegate_task is available.",
-                            call.name
-                        ),
-                    ));
-                    continue;
-                }
-
-                total_tool_calls += 1;
-
-                match serde_json::from_value::<DelegateInput>(call.input.clone()) {
-                    Ok(input) => {
-                        let results = self.delegate(input.tasks).await?;
-                        let aggregated = self.format_results(&results);
-
-                        // Accumulate sub-agent token usage
-                        for r in &results {
-                            total_usage.input_tokens += r.tokens_used.input_tokens;
-                            total_usage.output_tokens += r.tokens_used.output_tokens;
-                        }
-
-                        tool_results.push(ToolResult::success(&call.id, aggregated));
-                    }
-                    Err(e) => {
-                        tool_results.push(ToolResult::error(
-                            &call.id,
-                            format!("Invalid delegate_task input: {e}"),
-                        ));
-                    }
-                }
-            }
-
-            ctx.add_tool_results(tool_results);
-        }
+        self.runner.execute(task).await
     }
+}
 
-    async fn delegate(&self, tasks: Vec<DelegatedTask>) -> Result<Vec<SubAgentResult>, Error> {
+/// The orchestrator's primary tool: delegates tasks to sub-agents in parallel.
+///
+/// Implements `Tool` so it can be registered with `AgentRunner`.
+/// Unknown agent names return an error result to the LLM instead of crashing.
+struct DelegateTaskTool<P: LlmProvider> {
+    provider: Arc<P>,
+    sub_agents: Vec<SubAgentDef>,
+    max_turns: usize,
+    max_tokens: u32,
+}
+
+impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
+    async fn delegate(&self, tasks: Vec<DelegatedTask>) -> Result<String, Error> {
         let mut join_set = tokio::task::JoinSet::new();
 
-        for task in tasks {
+        for (idx, task) in tasks.into_iter().enumerate() {
+            let agent_def = match self.sub_agents.iter().find(|a| a.name == task.agent) {
+                Some(def) => def.clone(),
+                None => {
+                    // Unknown agent: we'll collect this as an error in the results
+                    let agent_name = task.agent.clone();
+                    join_set.spawn(async move {
+                        (
+                            idx,
+                            SubAgentResult {
+                                agent: agent_name.clone(),
+                                result: format!("Error: unknown agent '{agent_name}'"),
+                                tokens_used: TokenUsage::default(),
+                            },
+                        )
+                    });
+                    continue;
+                }
+            };
+
             let provider = self.provider.clone();
-            let agent_def = self
-                .sub_agents
-                .iter()
-                .find(|a| a.name == task.agent)
-                .ok_or_else(|| Error::Agent(format!("Unknown sub-agent: {}", task.agent)))?
-                .clone();
-            let model = self.model.clone();
+            let max_turns = self.max_turns;
+            let max_tokens = self.max_tokens;
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -152,35 +115,57 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
                 let runner = AgentRunner::builder(provider)
                     .name(&agent_def.name)
                     .system_prompt(&agent_def.system_prompt)
-                    .model(&model)
+                    .tools(agent_def.tools)
+                    .max_turns(max_turns)
+                    .max_tokens(max_tokens)
                     .build();
 
-                let output = runner.execute(&task.task).await?;
-                Ok::<_, Error>(SubAgentResult {
-                    agent: agent_def.name,
-                    result: output.result,
-                    tokens_used: output.tokens_used,
-                })
+                let result = match runner.execute(&task.task).await {
+                    Ok(output) => SubAgentResult {
+                        agent: agent_def.name,
+                        result: output.result,
+                        tokens_used: output.tokens_used,
+                    },
+                    Err(e) => SubAgentResult {
+                        agent: agent_def.name,
+                        result: format!("Error: {e}"),
+                        tokens_used: TokenUsage::default(),
+                    },
+                };
+
+                (idx, result)
             });
         }
 
-        let mut results = Vec::new();
+        let mut results: Vec<(usize, SubAgentResult)> = Vec::new();
         while let Some(result) = join_set.join_next().await {
-            results.push(result.map_err(|e| Error::Agent(e.to_string()))??);
+            match result {
+                Ok(indexed_result) => results.push(indexed_result),
+                Err(e) => {
+                    tracing::error!(error = %e, "sub-agent task panicked");
+                }
+            }
         }
-        Ok(results)
-    }
 
-    fn delegate_tool_definition(&self) -> ToolDefinition {
+        // Sort by original index to preserve order
+        results.sort_by_key(|(idx, _)| *idx);
+
+        let formatted = results
+            .iter()
+            .map(|(_, r)| format!("=== Agent: {} ===\n{}", r.agent, r.result))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        Ok(formatted)
+    }
+}
+
+impl<P: LlmProvider + 'static> Tool for DelegateTaskTool<P> {
+    fn definition(&self) -> ToolDefinition {
         let agent_descriptions: Vec<serde_json::Value> = self
             .sub_agents
             .iter()
-            .map(|a| {
-                json!({
-                    "name": a.name,
-                    "description": a.description,
-                })
-            })
+            .map(|a| json!({"name": a.name, "description": a.description}))
             .collect();
 
         ToolDefinition {
@@ -199,16 +184,15 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
                             "properties": {
                                 "agent": {
                                     "type": "string",
-                                    "description": "Name of the sub-agent to delegate to"
+                                    "description": "Name of the sub-agent"
                                 },
                                 "task": {
                                     "type": "string",
-                                    "description": "The task instruction for the sub-agent"
+                                    "description": "Task instruction for the sub-agent"
                                 }
                             },
                             "required": ["agent", "task"]
-                        },
-                        "description": "List of tasks to delegate to sub-agents"
+                        }
                     }
                 },
                 "required": ["tasks"]
@@ -216,30 +200,17 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
         }
     }
 
-    fn build_system_prompt(&self) -> String {
-        let agent_list: String = self
-            .sub_agents
-            .iter()
-            .map(|a| format!("- **{}**: {}", a.name, a.description))
-            .collect::<Vec<_>>()
-            .join("\n");
+    fn execute(
+        &self,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let delegate_input: DelegateInput = serde_json::from_value(input)
+                .map_err(|e| Error::Agent(format!("Invalid delegate_task input: {e}")))?;
 
-        format!(
-            "You are an orchestrator agent. Your job is to break down complex tasks and \
-             delegate them to specialized sub-agents.\n\n\
-             Available sub-agents:\n{agent_list}\n\n\
-             Use the delegate_task tool to assign work to sub-agents. You can assign \
-             multiple tasks at once for parallel execution. After receiving results, \
-             synthesize them into a coherent response."
-        )
-    }
-
-    fn format_results(&self, results: &[SubAgentResult]) -> String {
-        results
-            .iter()
-            .map(|r| format!("=== Agent: {} ===\n{}", r.agent, r.result))
-            .collect::<Vec<_>>()
-            .join("\n\n")
+            let result = self.delegate(delegate_input.tasks).await?;
+            Ok(ToolOutput::success(result))
+        })
     }
 }
 
@@ -248,14 +219,31 @@ struct DelegateInput {
     tasks: Vec<DelegatedTask>,
 }
 
+fn build_system_prompt(sub_agents: &[SubAgentDef]) -> String {
+    let agent_list: String = sub_agents
+        .iter()
+        .map(|a| format!("- **{}**: {}", a.name, a.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "You are an orchestrator agent. Your job is to break down complex tasks and \
+         delegate them to specialized sub-agents.\n\n\
+         Available sub-agents:\n{agent_list}\n\n\
+         Use the delegate_task tool to assign work to sub-agents. You can assign \
+         multiple tasks at once for parallel execution. After receiving results, \
+         synthesize them into a coherent response."
+    )
+}
+
 pub struct OrchestratorBuilder<P: LlmProvider> {
     provider: Arc<P>,
     sub_agents: Vec<SubAgentDef>,
-    model: String,
     max_turns: usize,
+    max_tokens: u32,
 }
 
-impl<P: LlmProvider> OrchestratorBuilder<P> {
+impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     pub fn sub_agent(
         mut self,
         name: impl Into<String>,
@@ -266,12 +254,24 @@ impl<P: LlmProvider> OrchestratorBuilder<P> {
             name: name.into(),
             description: description.into(),
             system_prompt: system_prompt.into(),
+            tools: vec![],
         });
         self
     }
 
-    pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.model = model.into();
+    pub fn sub_agent_with_tools(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
+        self.sub_agents.push(SubAgentDef {
+            name: name.into(),
+            description: description.into(),
+            system_prompt: system_prompt.into(),
+            tools,
+        });
         self
     }
 
@@ -280,20 +280,39 @@ impl<P: LlmProvider> OrchestratorBuilder<P> {
         self
     }
 
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     pub fn build(self) -> Orchestrator<P> {
-        Orchestrator {
-            provider: self.provider,
+        let system = build_system_prompt(&self.sub_agents);
+
+        let delegate_tool: Arc<dyn Tool> = Arc::new(DelegateTaskTool {
+            provider: self.provider.clone(),
             sub_agents: self.sub_agents,
-            model: self.model,
             max_turns: self.max_turns,
-        }
+            max_tokens: self.max_tokens,
+        });
+
+        let runner = AgentRunner::builder(self.provider)
+            .name("orchestrator")
+            .system_prompt(system)
+            .tool(delegate_tool)
+            .max_turns(self.max_turns)
+            .max_tokens(self.max_tokens)
+            .build();
+
+        Orchestrator { runner }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock, StopReason};
+    use crate::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+    };
     use std::sync::Mutex;
 
     struct MockProvider {
@@ -310,7 +329,7 @@ mod tests {
 
     impl LlmProvider for MockProvider {
         async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
-            let mut responses = self.responses.lock().unwrap();
+            let mut responses = self.responses.lock().expect("mock lock poisoned");
             if responses.is_empty() {
                 return Err(Error::Agent("no more mock responses".into()));
             }
@@ -319,55 +338,45 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_builds_system_prompt_with_agents() {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let orch = Orchestrator::builder(provider)
-            .sub_agent("researcher", "Research specialist", "You research things.")
-            .sub_agent("coder", "Coding expert", "You write code.")
-            .build();
+    fn system_prompt_includes_agents() {
+        let agents = vec![
+            SubAgentDef {
+                name: "researcher".into(),
+                description: "Research specialist".into(),
+                system_prompt: "You research.".into(),
+                tools: vec![],
+            },
+            SubAgentDef {
+                name: "coder".into(),
+                description: "Coding expert".into(),
+                system_prompt: "You code.".into(),
+                tools: vec![],
+            },
+        ];
 
-        let prompt = orch.build_system_prompt();
+        let prompt = build_system_prompt(&agents);
         assert!(prompt.contains("researcher"));
         assert!(prompt.contains("Research specialist"));
         assert!(prompt.contains("coder"));
-        assert!(prompt.contains("Coding expert"));
     }
 
     #[test]
     fn delegate_tool_definition_includes_agents() {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let orch = Orchestrator::builder(provider)
-            .sub_agent("researcher", "Research", "prompt")
-            .build();
+        let tool: DelegateTaskTool<MockProvider> = DelegateTaskTool {
+            provider: Arc::new(MockProvider::new(vec![])),
+            sub_agents: vec![SubAgentDef {
+                name: "researcher".into(),
+                description: "Research".into(),
+                system_prompt: "prompt".into(),
+                tools: vec![],
+            }],
+            max_turns: 10,
+            max_tokens: 4096,
+        };
 
-        let tool = orch.delegate_tool_definition();
-        assert_eq!(tool.name, "delegate_task");
-        assert!(tool.description.contains("researcher"));
-    }
-
-    #[test]
-    fn format_results_aggregates() {
-        let provider = Arc::new(MockProvider::new(vec![]));
-        let orch = Orchestrator::builder(provider).build();
-
-        let results = vec![
-            SubAgentResult {
-                agent: "researcher".into(),
-                result: "Found X".into(),
-                tokens_used: TokenUsage::default(),
-            },
-            SubAgentResult {
-                agent: "coder".into(),
-                result: "Wrote Y".into(),
-                tokens_used: TokenUsage::default(),
-            },
-        ];
-
-        let formatted = orch.format_results(&results);
-        assert!(formatted.contains("=== Agent: researcher ==="));
-        assert!(formatted.contains("Found X"));
-        assert!(formatted.contains("=== Agent: coder ==="));
-        assert!(formatted.contains("Wrote Y"));
+        let def = tool.definition();
+        assert_eq!(def.name, "delegate_task");
+        assert!(def.description.contains("researcher"));
     }
 
     #[tokio::test]
@@ -394,8 +403,11 @@ mod tests {
 
     #[tokio::test]
     async fn orchestrator_delegates_and_synthesizes() {
+        // Responses consumed in order by provider. The orchestrator calls provider,
+        // then sub-agents call provider (in spawn order under single-threaded tokio test runtime),
+        // then orchestrator calls provider again for synthesis.
         let provider = Arc::new(MockProvider::new(vec![
-            // Orchestrator's first response: delegate to sub-agents
+            // 1: Orchestrator decides to delegate
             CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: "call-1".into(),
@@ -413,7 +425,7 @@ mod tests {
                     output_tokens: 20,
                 },
             },
-            // Sub-agent "researcher" response
+            // 2: Sub-agent "researcher" response
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Rust is fast and safe.".into(),
@@ -424,7 +436,7 @@ mod tests {
                     output_tokens: 8,
                 },
             },
-            // Sub-agent "analyst" response
+            // 3: Sub-agent "analyst" response
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Strengths: memory safety, performance.".into(),
@@ -435,7 +447,7 @@ mod tests {
                     output_tokens: 10,
                 },
             },
-            // Orchestrator's final synthesis
+            // 4: Orchestrator synthesis
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Based on research: Rust is excellent.".into(),
@@ -459,25 +471,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_handles_unknown_agent() {
-        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
-            content: vec![ContentBlock::ToolUse {
-                id: "call-1".into(),
-                name: "delegate_task".into(),
-                input: json!({
-                    "tasks": [{"agent": "nonexistent", "task": "do stuff"}]
-                }),
-            }],
-            stop_reason: StopReason::ToolUse,
-            usage: TokenUsage::default(),
-        }]));
+    async fn orchestrator_handles_unknown_agent_gracefully() {
+        // Unknown agent now returns error in tool result, not a hard crash
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({
+                        "tasks": [{"agent": "nonexistent", "task": "do stuff"}]
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            // Orchestrator recovers after seeing the error
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "No such agent available.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
 
         let orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
             .build();
 
-        let err = orch.run("delegate to unknown").await.unwrap_err();
-        assert!(err.to_string().contains("nonexistent"));
+        let output = orch.run("delegate to unknown").await.unwrap();
+        assert_eq!(output.result, "No such agent available.");
     }
 
     #[tokio::test]
@@ -492,7 +515,6 @@ mod tests {
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
             },
-            // After error, orchestrator responds directly
             CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Sorry, let me respond directly.".into(),

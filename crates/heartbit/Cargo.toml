@@ -9,11 +9,9 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

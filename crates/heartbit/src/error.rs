@@ -22,6 +22,9 @@ pub enum Error {
 
     #[error("Max turns ({0}) exceeded")]
     MaxTurnsExceeded(usize),
+
+    #[error("Response truncated (max_tokens reached)")]
+    Truncated,
 }
 
 #[cfg(test)]
@@ -41,5 +44,8 @@ mod tests {
 
         let err = Error::MaxTurnsExceeded(10);
         assert_eq!(err.to_string(), "Max turns (10) exceeded");
+
+        let err = Error::Truncated;
+        assert_eq!(err.to_string(), "Response truncated (max_tokens reached)");
     }
 }
