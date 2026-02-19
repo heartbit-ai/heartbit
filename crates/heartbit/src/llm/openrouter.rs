@@ -344,9 +344,15 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
         }
     }
 
+    let has_tool_calls = content
+        .iter()
+        .any(|c| matches!(c, ContentBlock::ToolUse { .. }));
+
+    // Normalize: some providers send "stop" even when tool calls are present.
     let stop_reason = match choice.finish_reason.as_deref() {
-        Some("stop") => StopReason::EndTurn,
         Some("tool_calls") => StopReason::ToolUse,
+        Some("stop") if has_tool_calls => StopReason::ToolUse,
+        Some("stop") => StopReason::EndTurn,
         Some("length") => StopReason::MaxTokens,
         Some(other) => {
             warn!(
@@ -516,9 +522,17 @@ where
         });
     }
 
+    let has_tool_calls = content
+        .iter()
+        .any(|c| matches!(c, ContentBlock::ToolUse { .. }));
+
+    // Normalize: some providers send "stop" even when tool calls are present.
+    // The agent loop checks content (not stop_reason) for tool detection, but
+    // we normalize here so the CompletionResponse is semantically correct.
     let stop_reason = match finish_reason.as_deref() {
-        Some("stop") => StopReason::EndTurn,
         Some("tool_calls") => StopReason::ToolUse,
+        Some("stop") if has_tool_calls => StopReason::ToolUse,
+        Some("stop") => StopReason::EndTurn,
         Some("length") => StopReason::MaxTokens,
         Some(other) => {
             warn!(
@@ -845,6 +859,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_stop_with_tool_calls_normalizes_to_tool_use() {
+        // Some providers send finish_reason "stop" even with tool_calls present.
+        // We normalize to ToolUse for semantic correctness.
+        let api = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    content: None,
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_1".into(),
+                        function: OpenAiFunction {
+                            name: "search".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("stop".into()), // wrong but real
+            }],
+            usage: None,
+        };
+
+        let response = into_completion_response(api).unwrap();
+        assert_eq!(response.stop_reason, StopReason::ToolUse); // normalized
+        assert_eq!(response.tool_calls().len(), 1);
+    }
+
+    #[test]
     fn build_request_multi_text_blocks_concatenated() {
         // Multiple text blocks in a user message should be concatenated into
         // a single message to avoid consecutive user messages (OpenAI constraint).
@@ -1157,6 +1197,22 @@ mod tests {
 
         let response = parse_openai_stream(stream, on_text).await.unwrap();
         assert_eq!(response.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[tokio::test]
+    async fn stream_stop_with_tool_calls_normalizes() {
+        // Provider sends "stop" with tool calls — should normalize to ToolUse
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.stop_reason, StopReason::ToolUse); // normalized
+        assert_eq!(response.tool_calls().len(), 1);
     }
 
     #[tokio::test]

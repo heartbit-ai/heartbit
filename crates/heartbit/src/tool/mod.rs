@@ -32,7 +32,14 @@ impl ToolOutput {
     ///
     /// When truncated, appends a `[truncated: N bytes omitted]` suffix so the
     /// LLM knows data was cut. Content within the limit is returned unchanged.
+    /// A `max_bytes` of 0 is treated as no-op (returns content unchanged).
+    ///
+    /// Note: the suffix itself is not counted toward `max_bytes`, so the
+    /// result may slightly exceed the limit.
     pub fn truncated(mut self, max_bytes: usize) -> Self {
+        if max_bytes == 0 {
+            return self;
+        }
         if self.content.len() > max_bytes {
             let mut cut = max_bytes;
             while cut > 0 && !self.content.is_char_boundary(cut) {
@@ -143,6 +150,13 @@ mod tests {
         let output = ToolOutput::success("hello"); // 5 bytes
         let truncated = output.truncated(5);
         assert_eq!(truncated.content, "hello");
+    }
+
+    #[test]
+    fn tool_output_truncated_zero_is_noop() {
+        let output = ToolOutput::success("some content");
+        let truncated = output.truncated(0);
+        assert_eq!(truncated.content, "some content"); // unchanged
     }
 
     #[test]
