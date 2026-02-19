@@ -48,6 +48,11 @@ impl TokenBudgetObject for TokenBudgetObjectImpl {
         let new_out = current_out.saturating_add(usage.output_tokens);
         let new_total = new_in.saturating_add(new_out);
 
+        // Always persist the updated totals so get_usage() reports
+        // accurate numbers even when the budget is exceeded.
+        ctx.set("input_tokens", new_in);
+        ctx.set("output_tokens", new_out);
+
         if new_total > limit {
             return Err(TerminalError::new(format!(
                 "Token budget exceeded: {new_total} > {limit} for {}",
@@ -55,9 +60,6 @@ impl TokenBudgetObject for TokenBudgetObjectImpl {
             ))
             .into());
         }
-
-        ctx.set("input_tokens", new_in);
-        ctx.set("output_tokens", new_out);
         Ok(())
     }
 

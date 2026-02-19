@@ -149,12 +149,26 @@ impl AgentWorkflow for AgentWorkflowImpl {
                 ctx.set("approval_turn", turn as u64);
                 let Json(decision) = ctx.promise::<Json<HumanDecision>>(&promise_key).await?;
                 if !decision.approved {
-                    ctx.set("state", "rejected".to_string());
-                    return Err(TerminalError::new(format!(
-                        "Rejected by human: {}",
-                        decision.reason.unwrap_or_default()
-                    ))
-                    .into());
+                    // Send error tool results back to the LLM (matching standalone behavior)
+                    // instead of permanently aborting the workflow. This gives the LLM a
+                    // chance to adjust its approach.
+                    let reason = decision
+                        .reason
+                        .unwrap_or_else(|| "Denied by human reviewer".into());
+                    let denial_blocks: Vec<ContentBlock> = tool_calls
+                        .iter()
+                        .map(|(id, _name, _input)| ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: format!("Tool execution denied: {reason}"),
+                            is_error: true,
+                        })
+                        .collect();
+                    messages.push(Message {
+                        role: Role::User,
+                        content: denial_blocks,
+                    });
+                    ctx.set("state", "running".to_string());
+                    continue;
                 }
                 ctx.set("state", "running".to_string());
             }

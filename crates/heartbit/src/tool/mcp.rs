@@ -90,15 +90,16 @@ fn extract_sse_events(body: &str) -> Result<Vec<String>, Error> {
     let mut current_lines: Vec<&str> = Vec::new();
 
     for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if line.trim().is_empty() {
             // Blank line = end of event
             if !current_lines.is_empty() {
                 events.push(current_lines.join("\n"));
                 current_lines.clear();
             }
-        } else if let Some(data) = trimmed.strip_prefix("data:") {
-            current_lines.push(data.trim());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            // SSE spec: strip exactly one leading space after the colon
+            let data = rest.strip_prefix(' ').unwrap_or(rest);
+            current_lines.push(data);
         }
     }
 

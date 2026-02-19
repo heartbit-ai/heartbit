@@ -148,13 +148,13 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
                     for tool in client.into_tools() {
                         let def = tool.definition();
                         if tools.contains_key(&def.name) {
-                            bail!(
-                                "duplicate MCP tool name '{}' from agent '{}' server '{}' — \
-                                 rename or remove the conflicting tool",
-                                def.name,
-                                agent.name,
-                                server_url
+                            tracing::warn!(
+                                tool = %def.name,
+                                agent = %agent.name,
+                                url = %server_url,
+                                "duplicate MCP tool name, keeping first registration"
                             );
+                            continue;
                         }
                         tracing::info!(tool = %def.name, "registered MCP tool");
                         tools.insert(def.name.clone(), tool);

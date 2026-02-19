@@ -156,6 +156,16 @@ impl HeartbitConfig {
                 "orchestrator.max_tokens must be at least 1".into(),
             ));
         }
+        // Ensure agent names are unique
+        let mut seen = std::collections::HashSet::new();
+        for agent in &self.agents {
+            if !seen.insert(&agent.name) {
+                return Err(Error::Config(format!(
+                    "duplicate agent name: '{}'",
+                    agent.name
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -448,6 +458,28 @@ max_tokens = 0
             msg.contains("max_tokens must be at least 1"),
             "error: {msg}"
         );
+    }
+
+    #[test]
+    fn duplicate_agent_names_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "researcher"
+description = "First"
+system_prompt = "First."
+
+[[agents]]
+name = "researcher"
+description = "Second"
+system_prompt = "Second."
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate agent name"), "error: {msg}");
     }
 
     #[test]
