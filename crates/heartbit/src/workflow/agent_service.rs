@@ -109,7 +109,30 @@ impl AgentService for AgentServiceImpl {
             }
         };
 
-        match tool.execute(request.input).await {
+        let result = match request.timeout_seconds {
+            Some(secs) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(secs),
+                    tool.execute(request.input),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Ok(Json(ToolCallResponse {
+                            content: format!(
+                                "Tool '{}' execution timed out after {secs}s",
+                                request.tool_name
+                            ),
+                            is_error: true,
+                        }));
+                    }
+                }
+            }
+            None => tool.execute(request.input).await,
+        };
+
+        match result {
             Ok(output) => Ok(Json(ToolCallResponse {
                 content: output.content,
                 is_error: output.is_error,

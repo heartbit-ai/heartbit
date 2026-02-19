@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,6 +26,7 @@ pub(crate) struct SubAgentDef {
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     pub(crate) context_strategy: Option<ContextStrategy>,
     pub(crate) summarize_threshold: Option<u32>,
+    pub(crate) tool_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -160,6 +162,9 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                 }
                 if let Some(threshold) = agent_def.summarize_threshold {
                     builder = builder.summarize_threshold(threshold);
+                }
+                if let Some(timeout) = agent_def.tool_timeout {
+                    builder = builder.tool_timeout(timeout);
                 }
 
                 // Add memory tools if shared memory is configured
@@ -348,6 +353,19 @@ pub(crate) fn build_delegate_tool_schema(agents: &[(&str, &str)]) -> ToolDefinit
     }
 }
 
+/// Configuration for adding a sub-agent to the orchestrator.
+///
+/// Used by `OrchestratorBuilder::sub_agent_full` to avoid a long parameter list.
+pub struct SubAgentConfig {
+    pub name: String,
+    pub description: String,
+    pub system_prompt: String,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub context_strategy: Option<ContextStrategy>,
+    pub summarize_threshold: Option<u32>,
+    pub tool_timeout: Option<Duration>,
+}
+
 pub struct OrchestratorBuilder<P: LlmProvider> {
     provider: Arc<P>,
     sub_agents: Vec<SubAgentDef>,
@@ -372,6 +390,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             tools: vec![],
             context_strategy: None,
             summarize_threshold: None,
+            tool_timeout: None,
         });
         self
     }
@@ -390,26 +409,20 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             tools,
             context_strategy: None,
             summarize_threshold: None,
+            tool_timeout: None,
         });
         self
     }
 
-    pub fn sub_agent_full(
-        mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        system_prompt: impl Into<String>,
-        tools: Vec<Arc<dyn Tool>>,
-        context_strategy: Option<ContextStrategy>,
-        summarize_threshold: Option<u32>,
-    ) -> Self {
+    pub fn sub_agent_full(mut self, def: SubAgentConfig) -> Self {
         self.sub_agents.push(SubAgentDef {
-            name: name.into(),
-            description: description.into(),
-            system_prompt: system_prompt.into(),
-            tools,
-            context_strategy,
-            summarize_threshold,
+            name: def.name,
+            description: def.description,
+            system_prompt: def.system_prompt,
+            tools: def.tools,
+            context_strategy: def.context_strategy,
+            summarize_threshold: def.summarize_threshold,
+            tool_timeout: def.tool_timeout,
         });
         self
     }
@@ -558,6 +571,7 @@ mod tests {
                 tools: vec![],
                 context_strategy: None,
                 summarize_threshold: None,
+                tool_timeout: None,
             }],
             shared_memory: None,
             max_turns: 10,

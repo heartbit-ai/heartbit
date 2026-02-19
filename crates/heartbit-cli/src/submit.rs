@@ -268,5 +268,6 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         tool_defs,
         context_window_tokens,
         summarize_threshold,
+        tool_timeout_seconds: config.tool_timeout_seconds,
     }
 }

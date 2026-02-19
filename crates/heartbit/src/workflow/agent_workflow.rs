@@ -196,6 +196,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     .tool_call(Json(ToolCallRequest {
                         tool_name: name.clone(),
                         input: input.clone(),
+                        timeout_seconds: task.tool_timeout_seconds,
                     }))
                     .call()
                     .await?

@@ -8,7 +8,7 @@ pub mod tool;
 pub mod workflow;
 
 pub use agent::context::ContextStrategy;
-pub use agent::orchestrator::Orchestrator;
+pub use agent::orchestrator::{Orchestrator, SubAgentConfig};
 pub use agent::{AgentOutput, AgentRunner};
 pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig, RetryProviderConfig};
 pub use error::Error;

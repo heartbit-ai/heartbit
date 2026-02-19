@@ -98,6 +98,8 @@ pub struct AgentConfig {
     pub mcp_servers: Vec<String>,
     /// Context window management strategy for this agent.
     pub context_strategy: Option<ContextStrategyConfig>,
+    /// Timeout in seconds for individual tool executions.
+    pub tool_timeout_seconds: Option<u64>,
 }
 
 /// Memory configuration for the orchestrator.
@@ -458,6 +460,39 @@ max_tokens = 0
             msg.contains("max_tokens must be at least 1"),
             "error: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_tool_timeout_seconds() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+tool_timeout_seconds = 60
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(config.agents[0].tool_timeout_seconds, Some(60));
+    }
+
+    #[test]
+    fn tool_timeout_defaults_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.agents[0].tool_timeout_seconds.is_none());
     }
 
     #[test]

@@ -12,7 +12,8 @@ use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
     InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OnApproval, OnText,
-    OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider, ToolCall,
+    OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider,
+    SubAgentConfig, ToolCall,
 };
 
 #[derive(Parser)]
@@ -307,14 +308,17 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
             Some(ContextStrategyConfig::Unlimited) | None => (None, None),
         };
 
-        builder = builder.sub_agent_full(
-            &agent.name,
-            &agent.description,
-            &agent.system_prompt,
+        builder = builder.sub_agent_full(SubAgentConfig {
+            name: agent.name.clone(),
+            description: agent.description.clone(),
+            system_prompt: agent.system_prompt.clone(),
             tools,
-            ctx_strategy,
+            context_strategy: ctx_strategy,
             summarize_threshold,
-        );
+            tool_timeout: agent
+                .tool_timeout_seconds
+                .map(std::time::Duration::from_secs),
+        });
     }
 
     // Wire shared memory if configured

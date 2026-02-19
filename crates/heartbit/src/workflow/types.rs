@@ -106,6 +106,9 @@ impl LlmCallRequest {
 pub struct ToolCallRequest {
     pub tool_name: String,
     pub input: serde_json::Value,
+    /// Optional timeout in seconds for the tool execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Response from a tool call activity.
@@ -134,6 +137,9 @@ pub struct AgentTask {
     /// compress old messages via LLM summarization when context exceeds this limit.
     #[serde(default)]
     pub summarize_threshold: Option<u32>,
+    /// Timeout in seconds for individual tool executions.
+    #[serde(default)]
+    pub tool_timeout_seconds: Option<u64>,
 }
 
 /// Result from an agent workflow.
@@ -180,6 +186,9 @@ pub struct AgentDef {
     /// Token threshold for automatic summarization.
     #[serde(default)]
     pub summarize_threshold: Option<u32>,
+    /// Timeout in seconds for individual tool executions.
+    #[serde(default)]
+    pub tool_timeout_seconds: Option<u64>,
 }
 
 /// Result from the orchestrator workflow.
@@ -286,6 +295,7 @@ mod tests {
         let req = ToolCallRequest {
             tool_name: "search".into(),
             input: serde_json::json!({"query": "rust"}),
+            timeout_seconds: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
@@ -315,6 +325,7 @@ mod tests {
             approval_required: false,
             context_window_tokens: None,
             summarize_threshold: None,
+            tool_timeout_seconds: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -359,6 +370,7 @@ mod tests {
                 tool_defs: vec![],
                 context_window_tokens: None,
                 summarize_threshold: None,
+                tool_timeout_seconds: None,
             }],
             max_turns: 10,
             max_tokens: 8192,

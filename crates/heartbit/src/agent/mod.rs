@@ -4,6 +4,7 @@ pub(crate) mod token_estimator;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::debug;
 
@@ -42,6 +43,8 @@ pub struct AgentRunner<P: LlmProvider> {
     on_text: Option<Arc<crate::llm::OnText>>,
     /// Optional callback for human-in-the-loop approval before tool execution.
     on_approval: Option<Arc<crate::llm::OnApproval>>,
+    /// Optional timeout for individual tool executions.
+    tool_timeout: Option<Duration>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -58,6 +61,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             memory: None,
             on_text: None,
             on_approval: None,
+            tool_timeout: None,
         }
     }
 
@@ -171,10 +175,20 @@ impl<P: LlmProvider> AgentRunner<P> {
             let tool = self.tools.get(&call.name).cloned();
             let input = call.input.clone();
             let call_name = call.name.clone();
+            let timeout = self.tool_timeout;
 
             join_set.spawn(async move {
                 let output = match tool {
-                    Some(t) => t.execute(input).await,
+                    Some(t) => match timeout {
+                        Some(dur) => match tokio::time::timeout(dur, t.execute(input)).await {
+                            Ok(result) => result,
+                            Err(_) => Ok(ToolOutput::error(format!(
+                                "Tool execution timed out after {}s",
+                                dur.as_secs_f64()
+                            ))),
+                        },
+                        None => t.execute(input).await,
+                    },
                     None => Ok(ToolOutput::error(format!("Tool not found: {call_name}"))),
                 };
                 (idx, output)
@@ -230,6 +244,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     memory: Option<Arc<dyn Memory>>,
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
+    tool_timeout: Option<Duration>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -304,6 +319,16 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a timeout for individual tool executions. If a tool does not
+    /// complete within this duration, the execution is cancelled and an
+    /// error result is returned to the LLM.
+    ///
+    /// Default: `None` (no timeout).
+    pub fn tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = Some(timeout);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
@@ -343,6 +368,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             summarize_threshold: self.summarize_threshold,
             on_text: self.on_text,
             on_approval: self.on_approval,
+            tool_timeout: self.tool_timeout,
         })
     }
 }
@@ -963,6 +989,132 @@ mod tests {
 
         let calls = received_calls.lock().expect("lock");
         assert_eq!(*calls, vec!["search", "read"]);
+    }
+
+    #[tokio::test]
+    async fn tool_timeout_returns_error_to_llm() {
+        // A slow tool should time out and return an error result to the LLM
+        struct SlowTool;
+        impl Tool for SlowTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "slow_tool".into(),
+                    description: "Takes forever".into(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+            fn execute(
+                &self,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(ToolOutput::success("should never reach here"))
+                })
+            }
+        }
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "slow_tool".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Tool timed out, moving on.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(SlowTool))
+            .tool_timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("run slow tool").await.unwrap();
+        assert_eq!(output.result, "Tool timed out, moving on.");
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_timeout_does_not_affect_fast_tools() {
+        // A fast tool should complete normally even with a timeout set
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Got results!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "search results")))
+            .tool_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("search").await.unwrap();
+        assert_eq!(output.result, "Got results!");
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn no_tool_timeout_allows_unlimited_execution() {
+        // Without tool_timeout, tools run without a timeout (backward compatible)
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "result")))
+            .build()
+            .unwrap();
+
+        // No tool_timeout set — should work as before
+        let output = runner.execute("test").await.unwrap();
+        assert_eq!(output.result, "Done!");
     }
 
     #[tokio::test]

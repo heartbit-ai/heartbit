@@ -238,6 +238,7 @@ async fn execute_delegation(
                 approval_required,
                 context_window_tokens: agent_def.context_window_tokens,
                 summarize_threshold: agent_def.summarize_threshold,
+                tool_timeout_seconds: agent_def.tool_timeout_seconds,
             }))
             .call()
             .await;
