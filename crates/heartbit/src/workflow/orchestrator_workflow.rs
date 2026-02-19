@@ -6,6 +6,7 @@ use crate::llm::types::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use super::agent_service::AgentServiceClient;
 use super::agent_workflow::AgentWorkflowClient;
 use super::blackboard::{BlackboardEntry, BlackboardObjectClient};
+use super::budget::TokenBudgetObjectClient;
 use super::types::{
     AgentDef, AgentStatus, AgentTask, LlmCallRequest, LlmCallResponse, OrchestratorResult,
     OrchestratorTask,
@@ -67,6 +68,20 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
 
             total_usage.input_tokens += llm_response.usage.input_tokens;
             total_usage.output_tokens += llm_response.usage.output_tokens;
+
+            // Report orchestrator LLM token usage to budget tracker
+            if let Err(e) = ctx
+                .object_client::<TokenBudgetObjectClient>(ctx.key())
+                .record_usage(Json(super::budget::TokenUsageRecord {
+                    input_tokens: llm_response.usage.input_tokens as u64,
+                    output_tokens: llm_response.usage.output_tokens as u64,
+                }))
+                .call()
+                .await
+            {
+                ctx.set("state", "error".to_string());
+                return Err(e.into());
+            }
 
             messages.push(Message {
                 role: Role::Assistant,

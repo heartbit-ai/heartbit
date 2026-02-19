@@ -61,87 +61,78 @@ impl Memory for InMemoryStore {
         Box::pin(async move {
             let has_text_query = query.text.is_some();
 
-            // Phase 1: Read lock — filter, clone, sort (read-only)
-            let mut results = {
-                let entries = self
-                    .entries
-                    .read()
-                    .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            // Single write lock for the entire operation. Recall updates
+            // access_count as a side effect, so we need write access anyway.
+            // Using one lock avoids a TOCTOU window where concurrent forget()
+            // or store() could interleave between filter and access-count update.
+            let mut entries = self
+                .entries
+                .write()
+                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
 
-                let mut results: Vec<MemoryEntry> = entries
-                    .values()
-                    .filter(|e| {
-                        if let Some(ref text) = query.text {
-                            let lower = text.to_lowercase();
-                            if !e.content.to_lowercase().contains(&lower) {
-                                return false;
-                            }
-                        }
-                        if let Some(ref cat) = query.category
-                            && e.category != *cat
-                        {
+            let mut results: Vec<MemoryEntry> = entries
+                .values()
+                .filter(|e| {
+                    if let Some(ref text) = query.text {
+                        let lower = text.to_lowercase();
+                        if !e.content.to_lowercase().contains(&lower) {
                             return false;
                         }
-                        if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t))
-                        {
-                            return false;
-                        }
-                        if let Some(ref agent) = query.agent
-                            && e.agent != *agent
-                        {
-                            return false;
-                        }
-                        true
-                    })
-                    .cloned()
-                    .collect();
-
-                // Sort by composite score descending (recency + importance + relevance)
-                let now = Utc::now();
-                results.sort_by(|a, b| {
-                    let relevance_a = if has_text_query { 1.0 } else { 0.0 };
-                    let relevance_b = if has_text_query { 1.0 } else { 0.0 };
-                    let score_a = composite_score(
-                        &self.scoring_weights,
-                        a.created_at,
-                        now,
-                        a.importance,
-                        relevance_a,
-                    );
-                    let score_b = composite_score(
-                        &self.scoring_weights,
-                        b.created_at,
-                        now,
-                        b.importance,
-                        relevance_b,
-                    );
-                    score_b
-                        .partial_cmp(&score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                if query.limit > 0 {
-                    results.truncate(query.limit);
-                }
-
-                results
-            }; // Read lock dropped here
-
-            // Phase 2: Write lock — update access counts only
-            if !results.is_empty() {
-                let mut entries = self
-                    .entries
-                    .write()
-                    .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
-                let now = Utc::now();
-                for r in &mut results {
-                    if let Some(e) = entries.get_mut(&r.id) {
-                        e.access_count += 1;
-                        e.last_accessed = now;
-                        // Update the returned copy too
-                        r.access_count = e.access_count;
-                        r.last_accessed = now;
                     }
+                    if let Some(ref cat) = query.category
+                        && e.category != *cat
+                    {
+                        return false;
+                    }
+                    if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
+                        return false;
+                    }
+                    if let Some(ref agent) = query.agent
+                        && e.agent != *agent
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+
+            // Sort by composite score descending (recency + importance + relevance)
+            let now = Utc::now();
+            results.sort_by(|a, b| {
+                let relevance_a = if has_text_query { 1.0 } else { 0.0 };
+                let relevance_b = if has_text_query { 1.0 } else { 0.0 };
+                let score_a = composite_score(
+                    &self.scoring_weights,
+                    a.created_at,
+                    now,
+                    a.importance,
+                    relevance_a,
+                );
+                let score_b = composite_score(
+                    &self.scoring_weights,
+                    b.created_at,
+                    now,
+                    b.importance,
+                    relevance_b,
+                );
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if query.limit > 0 {
+                results.truncate(query.limit);
+            }
+
+            // Update access counts atomically (still under the same lock)
+            let now = Utc::now();
+            for r in &mut results {
+                if let Some(e) = entries.get_mut(&r.id) {
+                    e.access_count += 1;
+                    e.last_accessed = now;
+                    r.access_count = e.access_count;
+                    r.last_accessed = now;
                 }
             }
 
