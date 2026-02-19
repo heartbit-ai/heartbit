@@ -1,9 +1,12 @@
+use bytes::Bytes;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::warn;
 
 use crate::error::Error;
 use crate::llm::LlmProvider;
+use crate::llm::anthropic::SseParser;
 use crate::llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason, TokenUsage, ToolChoice,
     ToolDefinition,
@@ -13,10 +16,8 @@ const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// OpenRouter LLM provider (OpenAI-compatible API).
 ///
-/// `stream_complete` is not overridden — it falls back to `complete()`.
-/// OpenRouter's streaming format (OpenAI SSE) differs from Anthropic's
-/// and requires a separate implementation. The `on_text` callback is
-/// not invoked; output is returned as a single response.
+/// Supports both non-streaming (`complete`) and streaming (`stream_complete`)
+/// modes. Streaming uses OpenAI's SSE format with `choices[].delta` chunks.
 pub struct OpenRouterProvider {
     client: Client,
     api_key: String,
@@ -65,6 +66,43 @@ impl LlmProvider for OpenRouterProvider {
 
         let api_response: OpenAiResponse = response.json().await?;
         into_completion_response(api_response)
+    }
+
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+    ) -> Result<CompletionResponse, Error> {
+        let mut body = build_openai_request(&self.model, &request)?;
+        body["stream"] = serde_json::json!(true);
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+
+        let response = self
+            .client
+            .post(API_URL)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!("authentication failed (HTTP {})", status.as_u16())
+            } else {
+                response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
+            };
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+
+        parse_openai_stream(response.bytes_stream(), on_text).await
     }
 }
 
@@ -330,6 +368,232 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
         stop_reason,
         usage,
     })
+}
+
+// --- Streaming: OpenAI SSE delta format ---
+
+#[derive(Deserialize, Default)]
+struct StreamingChunk {
+    #[serde(default)]
+    choices: Vec<StreamingChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Deserialize)]
+struct StreamingChoice {
+    #[serde(default)]
+    delta: StreamingDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamingDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamingToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct StreamingToolCallDelta {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamingFunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct StreamingFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Default)]
+struct AccumulatedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Parse an OpenAI-format SSE stream, emitting text deltas via `on_text`.
+///
+/// Reuses the `SseParser` from the Anthropic module for SSE framing.
+/// The JSON payload format differs: OpenAI uses `choices[].delta` with
+/// incremental content and tool call fragments.
+pub(crate) async fn parse_openai_stream<S>(
+    stream: S,
+    on_text: &super::OnText,
+) -> Result<CompletionResponse, Error>
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let mut parser = SseParser::new();
+    let mut utf8_buf: Vec<u8> = Vec::new();
+    let mut text = String::new();
+    let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage = TokenUsage::default();
+
+    tokio::pin!(stream);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(Error::Http)?;
+        utf8_buf.extend_from_slice(&chunk);
+
+        let valid_len = match std::str::from_utf8(&utf8_buf) {
+            Ok(_) => utf8_buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+
+        if valid_len > 0 {
+            let s = std::str::from_utf8(&utf8_buf[..valid_len])
+                .expect("valid_up_to guarantees valid UTF-8");
+            for event in parser.feed(s) {
+                process_openai_event(
+                    &event.data,
+                    on_text,
+                    &mut text,
+                    &mut tool_calls,
+                    &mut finish_reason,
+                    &mut usage,
+                );
+            }
+        }
+        utf8_buf.drain(..valid_len);
+    }
+
+    // Remaining buffer
+    if !utf8_buf.is_empty()
+        && let Ok(s) = std::str::from_utf8(&utf8_buf)
+    {
+        for event in parser.feed(s) {
+            process_openai_event(
+                &event.data,
+                on_text,
+                &mut text,
+                &mut tool_calls,
+                &mut finish_reason,
+                &mut usage,
+            );
+        }
+    }
+
+    for event in parser.flush() {
+        process_openai_event(
+            &event.data,
+            on_text,
+            &mut text,
+            &mut tool_calls,
+            &mut finish_reason,
+            &mut usage,
+        );
+    }
+
+    // Build content blocks
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    for tc in tool_calls {
+        let input = if tc.arguments.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                warn!(tool = %tc.name, error = %e, "malformed streaming tool arguments");
+                serde_json::json!({})
+            })
+        };
+        content.push(ContentBlock::ToolUse {
+            id: tc.id,
+            name: tc.name,
+            input,
+        });
+    }
+
+    let stop_reason = match finish_reason.as_deref() {
+        Some("stop") => StopReason::EndTurn,
+        Some("tool_calls") => StopReason::ToolUse,
+        Some("length") => StopReason::MaxTokens,
+        Some(other) => {
+            warn!(
+                finish_reason = other,
+                "unknown finish_reason in stream, treating as EndTurn"
+            );
+            StopReason::EndTurn
+        }
+        None => StopReason::EndTurn,
+    };
+
+    Ok(CompletionResponse {
+        content,
+        stop_reason,
+        usage,
+    })
+}
+
+fn process_openai_event(
+    data: &str,
+    on_text: &super::OnText,
+    text: &mut String,
+    tool_calls: &mut Vec<AccumulatedToolCall>,
+    finish_reason: &mut Option<String>,
+    usage: &mut TokenUsage,
+) {
+    if data == "[DONE]" {
+        return;
+    }
+
+    let chunk: StreamingChunk = match serde_json::from_str(data) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to parse streaming chunk, skipping");
+            return;
+        }
+    };
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(ref content) = choice.delta.content {
+            text.push_str(content);
+            on_text(content);
+        }
+
+        if let Some(ref tcs) = choice.delta.tool_calls {
+            for tc_delta in tcs {
+                while tool_calls.len() <= tc_delta.index {
+                    tool_calls.push(AccumulatedToolCall::default());
+                }
+                let tc = &mut tool_calls[tc_delta.index];
+                if let Some(ref id) = tc_delta.id {
+                    tc.id.clone_from(id);
+                }
+                if let Some(ref func) = tc_delta.function {
+                    if let Some(ref name) = func.name {
+                        tc.name.clone_from(name);
+                    }
+                    if let Some(ref args) = func.arguments {
+                        tc.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+
+        if choice.finish_reason.is_some() {
+            *finish_reason = choice.finish_reason.clone();
+        }
+    }
+
+    if let Some(ref u) = chunk.usage {
+        *usage = TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -787,5 +1051,130 @@ mod tests {
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[3]["role"], "tool");
+    }
+
+    // --- Streaming tests ---
+
+    fn make_sse_data(chunks: &[&str]) -> String {
+        chunks
+            .iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect::<Vec<_>>()
+            .join("")
+            + "data: [DONE]\n\n"
+    }
+
+    #[tokio::test]
+    async fn stream_text_response() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let r = received.clone();
+        let on_text: &crate::llm::OnText = &move |t: &str| {
+            r.lock().expect("lock").push(t.to_string());
+        };
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.text(), "Hello world");
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 5);
+
+        let texts = received.lock().expect("lock");
+        assert_eq!(*texts, vec!["Hello", " world"]);
+    }
+
+    #[tokio::test]
+    async fn stream_tool_call_response() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rust\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":10}}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+
+        let calls = response.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].input["q"], "rust");
+    }
+
+    #[tokio::test]
+    async fn stream_parallel_tool_calls() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":""}},{"index":1,"id":"c2","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}},{"index":1,"function":{"arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        let calls = response.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[1].name, "read");
+    }
+
+    #[tokio::test]
+    async fn stream_text_with_tool_calls() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"content":"Let me search."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"search","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.text(), "Let me search.");
+        assert_eq!(response.tool_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_max_tokens() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"content":"trunc"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[tokio::test]
+    async fn stream_chunked_delivery() {
+        // SSE data split across multiple byte chunks
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"content":"he"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"llo"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mid = sse.len() / 2;
+        let chunk1 = Bytes::from(sse[..mid].to_string());
+        let chunk2 = Bytes::from(sse[mid..].to_string());
+
+        let stream = futures::stream::iter(vec![Ok(chunk1), Ok(chunk2)]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.text(), "hello");
     }
 }
