@@ -17,6 +17,7 @@ pub struct AnthropicProvider {
     client: Client,
     api_key: String,
     model: String,
+    prompt_caching: bool,
 }
 
 impl AnthropicProvider {
@@ -25,13 +26,28 @@ impl AnthropicProvider {
             client: Client::new(),
             api_key: api_key.into(),
             model: model.into(),
+            prompt_caching: false,
+        }
+    }
+
+    /// Create an `AnthropicProvider` with prompt caching enabled.
+    ///
+    /// When enabled, the system prompt and tool definitions are annotated with
+    /// `cache_control` breakpoints so that Anthropic caches the prefix
+    /// server-side, reducing input tokens on subsequent turns.
+    pub fn with_prompt_caching(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            api_key: api_key.into(),
+            model: model.into(),
+            prompt_caching: true,
         }
     }
 }
 
 impl LlmProvider for AnthropicProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
-        let body = build_request_body(&self.model, &request)?;
+        let body = build_request_body(&self.model, &request, self.prompt_caching)?;
 
         let response = self
             .client
@@ -69,7 +85,7 @@ impl LlmProvider for AnthropicProvider {
         request: CompletionRequest,
         on_text: &super::OnText,
     ) -> Result<CompletionResponse, Error> {
-        let mut body = build_request_body(&self.model, &request)?;
+        let mut body = build_request_body(&self.model, &request, self.prompt_caching)?;
         body["stream"] = serde_json::Value::Bool(true);
 
         let response = self
@@ -105,6 +121,7 @@ impl LlmProvider for AnthropicProvider {
 fn build_request_body(
     model: &str,
     request: &CompletionRequest,
+    prompt_caching: bool,
 ) -> Result<serde_json::Value, Error> {
     let mut body = serde_json::json!({
         "model": model,
@@ -113,11 +130,29 @@ fn build_request_body(
     });
 
     if !request.system.is_empty() {
-        body["system"] = serde_json::Value::String(request.system.clone());
+        if prompt_caching {
+            // Array format with cache_control on the system block
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": request.system,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        } else {
+            body["system"] = serde_json::Value::String(request.system.clone());
+        }
     }
 
     if !request.tools.is_empty() {
-        body["tools"] = serde_json::to_value(&request.tools)?;
+        let mut tools = serde_json::to_value(&request.tools)?;
+        if prompt_caching {
+            // Add cache_control to the last tool definition
+            if let Some(arr) = tools.as_array_mut()
+                && let Some(last) = arr.last_mut()
+            {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+        }
+        body["tools"] = tools;
     }
 
     if let Some(ref tc) = request.tool_choice {
@@ -355,6 +390,9 @@ fn process_sse_event(
         "message_start" => {
             if let Ok(parsed) = serde_json::from_str::<MessageStartEvent>(&event.data) {
                 state.usage.input_tokens = parsed.message.usage.input_tokens;
+                state.usage.cache_creation_input_tokens =
+                    parsed.message.usage.cache_creation_input_tokens;
+                state.usage.cache_read_input_tokens = parsed.message.usage.cache_read_input_tokens;
             }
         }
         "content_block_start" => {
@@ -457,6 +495,10 @@ enum ApiContentBlock {
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 fn into_completion_response(api: ApiResponse) -> CompletionResponse {
@@ -477,6 +519,8 @@ fn into_completion_response(api: ApiResponse) -> CompletionResponse {
         usage: TokenUsage {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,
+            cache_creation_input_tokens: api.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: api.usage.cache_read_input_tokens,
         },
     }
 }
@@ -681,7 +725,7 @@ mod tests {
             tool_choice: None,
         };
 
-        let body = build_request_body("claude-sonnet-4-20250514", &request).unwrap();
+        let body = build_request_body("claude-sonnet-4-20250514", &request, false).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
         assert_eq!(body["max_tokens"], 1024);
         assert!(body.get("system").is_none());
@@ -705,7 +749,7 @@ mod tests {
             tool_choice: None,
         };
 
-        let body = build_request_body("claude-sonnet-4-20250514", &request).unwrap();
+        let body = build_request_body("claude-sonnet-4-20250514", &request, false).unwrap();
         assert_eq!(body["system"], "You are helpful.");
         assert_eq!(body["tools"][0]["name"], "search");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
@@ -720,7 +764,7 @@ mod tests {
             max_tokens: 1024,
             tool_choice: None,
         };
-        let body = build_request_body("model", &request).unwrap();
+        let body = build_request_body("model", &request, false).unwrap();
         assert!(body.get("tool_choice").is_none());
     }
 
@@ -734,7 +778,7 @@ mod tests {
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Auto),
         };
-        let body = build_request_body("model", &request).unwrap();
+        let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "auto");
     }
 
@@ -748,7 +792,7 @@ mod tests {
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Any),
         };
-        let body = build_request_body("model", &request).unwrap();
+        let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "any");
     }
 
@@ -764,7 +808,7 @@ mod tests {
                 name: "search".into(),
             }),
         };
-        let body = build_request_body("model", &request).unwrap();
+        let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "search");
     }
@@ -1059,6 +1103,8 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         };
 
@@ -1067,5 +1113,196 @@ mod tests {
         assert_eq!(response.stop_reason, StopReason::ToolUse);
         assert_eq!(response.usage.input_tokens, 100);
         assert_eq!(response.usage.output_tokens, 50);
+    }
+
+    // --- Prompt caching tests ---
+
+    #[test]
+    fn caching_disabled_system_is_string() {
+        let request = CompletionRequest {
+            system: "You are helpful.".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert!(body["system"].is_string());
+        assert_eq!(body["system"], "You are helpful.");
+    }
+
+    #[test]
+    fn caching_enabled_system_is_array_with_cache_control() {
+        let request = CompletionRequest {
+            system: "You are helpful.".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        assert!(body["system"].is_array());
+        let arr = body["system"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "You are helpful.");
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn caching_enabled_last_tool_gets_cache_control() {
+        use crate::llm::types::ToolDefinition;
+        use serde_json::json;
+
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![
+                ToolDefinition {
+                    name: "search".into(),
+                    description: "Search".into(),
+                    input_schema: json!({"type": "object"}),
+                },
+                ToolDefinition {
+                    name: "read".into(),
+                    description: "Read".into(),
+                    input_schema: json!({"type": "object"}),
+                },
+            ],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        // Only the LAST tool should have cache_control
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn caching_enabled_single_tool_gets_cache_control() {
+        use crate::llm::types::ToolDefinition;
+        use serde_json::json;
+
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![ToolDefinition {
+                name: "search".into(),
+                description: "Search".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn caching_enabled_no_tools_no_crash() {
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn caching_disabled_tools_have_no_cache_control() {
+        use crate::llm::types::ToolDefinition;
+        use serde_json::json;
+
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![ToolDefinition {
+                name: "search".into(),
+                description: "Search".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn api_usage_cache_fields_deserialize() {
+        let json = r#"{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":300}"#;
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 300);
+    }
+
+    #[test]
+    fn api_usage_cache_fields_default_when_missing() {
+        let json = r#"{"input_tokens":100,"output_tokens":50}"#;
+        let usage: ApiUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn response_maps_cache_tokens() {
+        let api = ApiResponse {
+            content: vec![ApiContentBlock::Text { text: "hi".into() }],
+            stop_reason: "end_turn".into(),
+            usage: ApiUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: 200,
+                cache_read_input_tokens: 300,
+            },
+        };
+        let response = into_completion_response(api);
+        assert_eq!(response.usage.cache_creation_input_tokens, 200);
+        assert_eq!(response.usage.cache_read_input_tokens, 300);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_cache_tokens_from_message_start() {
+        let sse_data = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":100}}}\n\n\
+            event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+            event: message_stop\n\
+            data: {\"type\":\"message_stop\"}\n\n";
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(response.usage.cache_creation_input_tokens, 50);
+        assert_eq!(response.usage.cache_read_input_tokens, 100);
+    }
+
+    #[test]
+    fn constructor_sets_prompt_caching_false() {
+        let provider = AnthropicProvider::new("key", "model");
+        assert!(!provider.prompt_caching);
+    }
+
+    #[test]
+    fn with_prompt_caching_sets_flag() {
+        let provider = AnthropicProvider::with_prompt_caching("key", "model");
+        assert!(provider.prompt_caching);
     }
 }

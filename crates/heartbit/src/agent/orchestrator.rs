@@ -14,6 +14,8 @@ use crate::tool::{Tool, ToolOutput};
 
 use crate::memory::Memory;
 
+use crate::knowledge::KnowledgeBase;
+
 use super::blackboard::Blackboard;
 use super::blackboard_tools::blackboard_tools;
 use super::context::ContextStrategy;
@@ -87,6 +89,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             max_tokens: 4096,
             shared_memory: None,
             blackboard: None,
+            knowledge_base: None,
             on_text: None,
             on_approval: None,
         }
@@ -113,6 +116,8 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
         let sub_tokens = self.sub_agent_tokens.lock().expect("token lock poisoned");
         output.tokens_used.input_tokens += sub_tokens.input_tokens;
         output.tokens_used.output_tokens += sub_tokens.output_tokens;
+        output.tokens_used.cache_creation_input_tokens += sub_tokens.cache_creation_input_tokens;
+        output.tokens_used.cache_read_input_tokens += sub_tokens.cache_read_input_tokens;
         Ok(output)
     }
 }
@@ -132,6 +137,8 @@ struct DelegateTaskTool<P: LlmProvider> {
     shared_memory: Option<Arc<dyn Memory>>,
     /// Shared blackboard for cross-agent coordination (None if not configured).
     blackboard: Option<Arc<dyn Blackboard>>,
+    /// Shared knowledge base for document retrieval (None if not configured).
+    knowledge_base: Option<Arc<dyn KnowledgeBase>>,
 }
 
 impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
@@ -165,6 +172,7 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             let max_tokens = agent_def.max_tokens.unwrap_or(self.max_tokens);
             let shared_memory = self.shared_memory.clone();
             let blackboard = self.blackboard.clone();
+            let knowledge_base = self.knowledge_base.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -208,6 +216,11 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                 // Add blackboard tools if blackboard is configured
                 if let Some(ref bb) = blackboard {
                     builder = builder.tools(blackboard_tools(bb.clone()));
+                }
+
+                // Add knowledge tools if knowledge base is configured
+                if let Some(ref kb) = knowledge_base {
+                    builder = builder.knowledge(kb.clone());
                 }
 
                 let runner = match builder.build() {
@@ -293,6 +306,8 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             for (_, r) in &results {
                 acc.input_tokens += r.tokens_used.input_tokens;
                 acc.output_tokens += r.tokens_used.output_tokens;
+                acc.cache_creation_input_tokens += r.tokens_used.cache_creation_input_tokens;
+                acc.cache_read_input_tokens += r.tokens_used.cache_read_input_tokens;
             }
         }
 
@@ -426,6 +441,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     max_tokens: u32,
     shared_memory: Option<Arc<dyn Memory>>,
     blackboard: Option<Arc<dyn Blackboard>>,
+    knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
@@ -521,6 +537,15 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Attach a shared knowledge base for document retrieval.
+    ///
+    /// Each sub-agent receives a `knowledge_search` tool to query the knowledge
+    /// base at runtime.
+    pub fn knowledge(mut self, kb: Arc<dyn KnowledgeBase>) -> Self {
+        self.knowledge_base = Some(kb);
+        self
+    }
+
     /// Set a callback for streaming text output on the orchestrator's LLM calls.
     /// Sub-agents do not stream — only the orchestrator's own reasoning and
     /// final synthesis are emitted incrementally.
@@ -561,6 +586,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             accumulated_tokens: sub_agent_tokens.clone(),
             shared_memory: self.shared_memory,
             blackboard: self.blackboard,
+            knowledge_base: self.knowledge_base,
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -656,6 +682,7 @@ mod tests {
             }],
             shared_memory: None,
             blackboard: None,
+            knowledge_base: None,
             max_turns: 10,
             max_tokens: 4096,
             accumulated_tokens: Arc::new(Mutex::new(TokenUsage::default())),
@@ -676,6 +703,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }]));
 
@@ -711,6 +739,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
             // 2: Sub-agent "researcher" response
@@ -722,6 +751,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
+                    ..Default::default()
                 },
             },
             // 3: Sub-agent "analyst" response
@@ -733,6 +763,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             // 4: Orchestrator synthesis
@@ -744,6 +775,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
+                    ..Default::default()
                 },
             },
         ]));
@@ -987,5 +1019,165 @@ mod tests {
             .build();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn knowledge_builder_method_works() {
+        use crate::knowledge::in_memory::InMemoryKnowledgeBase;
+
+        let kb: Arc<dyn KnowledgeBase> = Arc::new(InMemoryKnowledgeBase::new());
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        let result = Orchestrator::builder(provider)
+            .sub_agent("agent1", "Agent one", "You are agent 1.")
+            .knowledge(kb)
+            .build();
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sub_agents_receive_knowledge_tools() {
+        use crate::knowledge::in_memory::InMemoryKnowledgeBase;
+        use crate::llm::types::CompletionRequest;
+
+        struct ToolTrackingProvider {
+            responses: Mutex<Vec<CompletionResponse>>,
+            tool_names_seen: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl LlmProvider for ToolTrackingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                let names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+                self.tool_names_seen.lock().expect("lock").push(names);
+
+                let mut responses = self.responses.lock().expect("lock");
+                if responses.is_empty() {
+                    return Err(Error::Agent("no more mock responses".into()));
+                }
+                Ok(responses.remove(0))
+            }
+        }
+
+        let kb: Arc<dyn KnowledgeBase> = Arc::new(InMemoryKnowledgeBase::new());
+
+        let provider = Arc::new(ToolTrackingProvider {
+            responses: Mutex::new(vec![
+                // 1: Orchestrator delegates
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({
+                            "tasks": [{"agent": "worker", "task": "do work"}]
+                        }),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                },
+                // 2: Sub-agent responds
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Work done.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+                // 3: Orchestrator synthesis
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "All done.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+            ]),
+            tool_names_seen: Mutex::new(vec![]),
+        });
+
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent("worker", "Worker agent", "You work.")
+            .knowledge(kb)
+            .build()
+            .unwrap();
+
+        orch.run("do work").await.unwrap();
+
+        let all_tool_names = provider.tool_names_seen.lock().expect("lock");
+        assert!(
+            all_tool_names.len() >= 2,
+            "expected at least 2 LLM calls, got {}",
+            all_tool_names.len()
+        );
+        let sub_agent_tools = &all_tool_names[1];
+        assert!(
+            sub_agent_tools.contains(&"knowledge_search".to_string()),
+            "sub-agent should have knowledge_search tool, got: {sub_agent_tools:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_accumulates_cache_tokens_through_delegation() {
+        let provider = Arc::new(MockProvider::new(vec![
+            // 1: Orchestrator decides to delegate
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({
+                        "tasks": [{"agent": "researcher", "task": "Research Rust"}]
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 100,
+                    cache_read_input_tokens: 0,
+                },
+            },
+            // 2: Sub-agent "researcher" response (cache hit on second call)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Rust is fast.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 30,
+                },
+            },
+            // 3: Orchestrator synthesis (cache hit)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Rust is excellent.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 80,
+                    output_tokens: 30,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 90,
+                },
+            },
+        ]));
+
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("researcher", "Research specialist", "You research.")
+            .build()
+            .unwrap();
+
+        let output = orch.run("Analyze Rust").await.unwrap();
+        // Orchestrator: 50+80=130 in, 20+30=50 out, 100+0 cache_create, 0+90 cache_read
+        // Sub-agent: 10 in, 8 out, 0 cache_create, 30 cache_read
+        assert_eq!(output.tokens_used.input_tokens, 50 + 80 + 10);
+        assert_eq!(output.tokens_used.output_tokens, 20 + 30 + 8);
+        assert_eq!(output.tokens_used.cache_creation_input_tokens, 100);
+        assert_eq!(output.tokens_used.cache_read_input_tokens, 90 + 30);
     }
 }

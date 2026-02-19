@@ -245,6 +245,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -333,6 +334,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         };
         let resp: LlmCallResponse = cr.into();
@@ -425,6 +427,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             tool_calls_made: 3,
             structured: None,
@@ -577,6 +580,7 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 100,
+                ..Default::default()
             },
             tool_calls_made: 3,
         };

@@ -435,8 +435,10 @@ impl Tool for MemoryConsolidateTool {
             }
 
             if deleted == 0 {
-                // Clean up the orphaned consolidated entry
-                let _ = self.memory.forget(&new_id).await;
+                // Clean up the orphaned consolidated entry (best-effort)
+                if let Err(e) = self.memory.forget(&new_id).await {
+                    tracing::warn!(id = %new_id, error = %e, "failed to clean up orphaned consolidation entry");
+                }
                 return Ok(ToolOutput::error(
                     "None of the source memories were found. No consolidation performed.",
                 ));

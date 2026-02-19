@@ -18,6 +18,7 @@ use crate::llm::types::{
 };
 use crate::tool::{Tool, ToolOutput, validate_tool_input};
 
+use crate::knowledge::KnowledgeBase;
 use crate::memory::Memory;
 
 use self::context::{AgentContext, ContextStrategy};
@@ -71,6 +72,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             context_strategy: None,
             summarize_threshold: None,
             memory: None,
+            knowledge_base: None,
             on_text: None,
             on_approval: None,
             tool_timeout: None,
@@ -107,6 +109,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             };
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
+            total_usage.cache_creation_input_tokens += response.usage.cache_creation_input_tokens;
+            total_usage.cache_read_input_tokens += response.usage.cache_read_input_tokens;
 
             let tool_calls = response.tool_calls();
 
@@ -193,7 +197,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                 && ctx.needs_compaction(threshold)
             {
                 debug!(agent = %self.name, "context exceeds threshold, summarizing");
-                if let Some(summary) = self.generate_summary(&ctx).await? {
+                let (summary, summary_usage) = self.generate_summary(&ctx).await?;
+                total_usage.input_tokens += summary_usage.input_tokens;
+                total_usage.output_tokens += summary_usage.output_tokens;
+                total_usage.cache_creation_input_tokens +=
+                    summary_usage.cache_creation_input_tokens;
+                total_usage.cache_read_input_tokens += summary_usage.cache_read_input_tokens;
+                if let Some(summary) = summary {
                     ctx.inject_summary(summary, 4);
                 }
             }
@@ -202,9 +212,13 @@ impl<P: LlmProvider> AgentRunner<P> {
 
     /// Generate a summary of the conversation so far using the LLM.
     ///
-    /// Returns `None` if the summary was truncated (MaxTokens), in which case
-    /// the caller should skip compaction to avoid injecting a partial summary.
-    async fn generate_summary(&self, ctx: &AgentContext) -> Result<Option<String>, Error> {
+    /// Returns `(Option<summary_text>, token_usage)`. The summary is `None` if
+    /// truncated (MaxTokens), in which case the caller should skip compaction.
+    /// Token usage is always returned so the caller can accumulate it.
+    async fn generate_summary(
+        &self,
+        ctx: &AgentContext,
+    ) -> Result<(Option<String>, TokenUsage), Error> {
         let summary_request = CompletionRequest {
             system: "You are a summarization assistant. Summarize the following conversation \
                      concisely, preserving key facts, decisions, and tool results. \
@@ -217,14 +231,15 @@ impl<P: LlmProvider> AgentRunner<P> {
         };
 
         let response = self.provider.complete(summary_request).await?;
+        let usage = response.usage.clone();
         if response.stop_reason == StopReason::MaxTokens {
             tracing::warn!(
                 agent = %self.name,
                 "summarization truncated (max_tokens reached), skipping compaction"
             );
-            return Ok(None);
+            return Ok((None, usage));
         }
-        Ok(Some(response.text()))
+        Ok((Some(response.text()), usage))
     }
 
     /// Execute tools in parallel via JoinSet, returning results in original call order.
@@ -320,6 +335,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     context_strategy: Option<ContextStrategy>,
     summarize_threshold: Option<u32>,
     memory: Option<Arc<dyn Memory>>,
+    knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     tool_timeout: Option<Duration>,
@@ -375,6 +391,13 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// Call `.name()` before or after `.memory()` — the agent name is resolved at build.
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a knowledge base to the agent. The `knowledge_search` tool is
+    /// added at `build()` time.
+    pub fn knowledge(mut self, kb: Arc<dyn KnowledgeBase>) -> Self {
+        self.knowledge_base = Some(kb);
         self
     }
 
@@ -442,10 +465,13 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             return Err(Error::Config("max_tokens must be at least 1".into()));
         }
 
-        // Collect all tools, including memory tools created from builder's name
+        // Collect all tools, including memory and knowledge tools
         let mut all_tools = self.tools;
         if let Some(memory) = self.memory {
             all_tools.extend(crate::memory::tools::memory_tools(memory, &self.name));
+        }
+        if let Some(kb) = self.knowledge_base {
+            all_tools.extend(crate::knowledge::tools::knowledge_tools(kb));
         }
 
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::with_capacity(all_tools.len());
@@ -591,6 +617,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }]));
 
@@ -619,6 +646,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -629,6 +657,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ]));
@@ -1418,6 +1447,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 15,
+                ..Default::default()
             },
         }]));
 
@@ -1666,6 +1696,7 @@ mod tests {
             tokens_used: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             structured: Some(json!({"answer": "42"})),
         };
@@ -1776,6 +1807,137 @@ mod tests {
         assert!(
             seen.load(Ordering::SeqCst),
             "tool_choice should have been set to Any"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarization_tokens_accumulated_in_total_usage() {
+        // Verify that when summarization triggers, the summary LLM call's tokens
+        // are included in the final AgentOutput.tokens_used.
+        //
+        // Setup: summarize_threshold=1 forces summarization after every tool round.
+        // We need: turn 1 (tool call) → summarization → turn 2 (text response).
+        // The mock provides 3 responses: tool call, summary, final text.
+        //
+        // However, the summarization guard requires ctx.message_count() > 5 and
+        // ctx.needs_compaction(threshold). With threshold=1, needs_compaction
+        // will be true as soon as any tokens accumulate. But message_count() > 5
+        // requires at least 6 messages: initial user + (assistant + tool_results) * N.
+        // After turn 1: user + assistant + tool_results = 3 messages. Not enough.
+        // After turn 2: 3 + assistant + tool_results = 5 messages. Not enough (need >5).
+        // After turn 3: 5 + assistant + tool_results = 7 messages. This triggers it!
+        //
+        // So we need: 3 tool rounds + 1 summary + 1 final text = 5 mock responses.
+        let provider = Arc::new(MockProvider::new(vec![
+            // Turn 1: tool call
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            },
+            // Turn 2: tool call
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            },
+            // Turn 3: tool call (after this, message_count > 5, triggers summarization)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c3".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            },
+            // Summary LLM call (triggered by summarize_threshold)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Summary of conversation so far.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_creation_input_tokens: 25,
+                    cache_read_input_tokens: 10,
+                },
+            },
+            // Turn 4: final text response
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Final answer.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "result")))
+            .summarize_threshold(1) // trigger summarization at minimal threshold
+            .max_turns(10)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test task").await.unwrap();
+        assert_eq!(output.result, "Final answer.");
+        // Total: 4 agent turns (10 each) + 1 summary call (100)
+        assert_eq!(output.tokens_used.input_tokens, 10 + 10 + 10 + 100 + 10);
+        // Total: 4 agent turns (5 each) + 1 summary call (50)
+        assert_eq!(output.tokens_used.output_tokens, 5 + 5 + 5 + 50 + 5);
+        // Cache tokens come only from the summary call
+        assert_eq!(output.tokens_used.cache_creation_input_tokens, 25);
+        assert_eq!(output.tokens_used.cache_read_input_tokens, 10);
+    }
+
+    #[test]
+    fn knowledge_base_adds_search_tool() {
+        use crate::knowledge::in_memory::InMemoryKnowledgeBase;
+
+        let kb: Arc<dyn crate::knowledge::KnowledgeBase> = Arc::new(InMemoryKnowledgeBase::new());
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .knowledge(kb)
+            .build()
+            .unwrap();
+
+        assert!(
+            runner
+                .tool_defs
+                .iter()
+                .any(|d| d.name == "knowledge_search"),
+            "agent should have knowledge_search tool"
         );
     }
 }

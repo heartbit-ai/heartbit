@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod error;
+pub mod knowledge;
 pub mod llm;
 pub mod memory;
 pub mod store;
@@ -11,8 +12,13 @@ pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::context::ContextStrategy;
 pub use agent::orchestrator::{Orchestrator, SubAgentConfig};
 pub use agent::{AgentOutput, AgentRunner};
-pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig, RetryProviderConfig};
+pub use config::{
+    ContextStrategyConfig, HeartbitConfig, KnowledgeConfig, KnowledgeSourceConfig, MemoryConfig,
+    RetryProviderConfig,
+};
 pub use error::Error;
+pub use knowledge::in_memory::InMemoryKnowledgeBase;
+pub use knowledge::{Chunk, DocumentSource, KnowledgeBase, KnowledgeQuery, SearchResult};
 pub use llm::LlmProvider;
 pub use llm::OnApproval;
 pub use llm::OnText;

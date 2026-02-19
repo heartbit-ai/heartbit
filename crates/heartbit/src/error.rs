@@ -31,6 +31,9 @@ pub enum Error {
 
     #[error("Memory error: {0}")]
     Memory(String),
+
+    #[error("Knowledge error: {0}")]
+    Knowledge(String),
 }
 
 #[cfg(test)]
@@ -68,5 +71,11 @@ mod tests {
     fn error_memory_display_message() {
         let err = Error::Memory("not found".into());
         assert_eq!(err.to_string(), "Memory error: not found");
+    }
+
+    #[test]
+    fn error_knowledge_display_message() {
+        let err = Error::Knowledge("file not found".into());
+        assert_eq!(err.to_string(), "Knowledge error: file not found");
     }
 }

@@ -124,6 +124,12 @@ pub enum StopReason {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens used to create a new cache entry (Anthropic prompt caching).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// Tokens read from an existing cache entry (Anthropic prompt caching).
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 /// A response from the LLM.
@@ -412,5 +418,36 @@ mod tests {
         let json_str = serde_json::to_string(&tc).unwrap();
         let parsed: ToolCall = serde_json::from_str(&json_str).unwrap();
         assert_eq!(tc, parsed);
+    }
+
+    #[test]
+    fn token_usage_cache_fields_default_to_zero() {
+        let usage = TokenUsage::default();
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn token_usage_cache_fields_roundtrip() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 300,
+        };
+        let json_str = serde_json::to_string(&usage).unwrap();
+        let parsed: TokenUsage = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(usage, parsed);
+    }
+
+    #[test]
+    fn token_usage_backward_compat_deserialization() {
+        // Old format without cache fields should still deserialize
+        let json_str = r#"{"input_tokens":100,"output_tokens":50}"#;
+        let parsed: TokenUsage = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed.input_tokens, 100);
+        assert_eq!(parsed.output_tokens, 50);
+        assert_eq!(parsed.cache_creation_input_tokens, 0);
+        assert_eq!(parsed.cache_read_input_tokens, 0);
     }
 }

@@ -13,6 +13,7 @@ pub struct HeartbitConfig {
     pub restate: Option<RestateConfig>,
     pub telemetry: Option<TelemetryConfig>,
     pub memory: Option<MemoryConfig>,
+    pub knowledge: Option<KnowledgeConfig>,
 }
 
 /// LLM provider configuration.
@@ -22,6 +23,10 @@ pub struct ProviderConfig {
     pub model: String,
     /// Retry configuration for transient LLM API failures.
     pub retry: Option<RetryProviderConfig>,
+    /// Enable Anthropic prompt caching (system prompt + tool definitions).
+    /// Only effective for the `anthropic` provider. Defaults to `false`.
+    #[serde(default)]
+    pub prompt_caching: bool,
 }
 
 /// Retry configuration for transient LLM API failures (429, 500, 502, 503, 529).
@@ -121,6 +126,40 @@ pub enum MemoryConfig {
     InMemory,
     /// PostgreSQL-backed store.
     Postgres { database_url: String },
+}
+
+/// Knowledge base configuration for document retrieval.
+#[derive(Debug, Deserialize)]
+pub struct KnowledgeConfig {
+    /// Maximum byte length per chunk.
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
+    /// Number of overlapping bytes between consecutive chunks.
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
+    /// Document sources to index.
+    #[serde(default)]
+    pub sources: Vec<KnowledgeSourceConfig>,
+}
+
+fn default_chunk_size() -> usize {
+    1000
+}
+
+fn default_chunk_overlap() -> usize {
+    200
+}
+
+/// A single knowledge source to index.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KnowledgeSourceConfig {
+    /// A single file path.
+    File { path: String },
+    /// A glob pattern matching multiple files.
+    Glob { pattern: String },
+    /// A URL to fetch and index.
+    Url { url: String },
 }
 
 /// Restate server connection settings.
@@ -232,6 +271,22 @@ impl HeartbitConfig {
                 )));
             }
         }
+
+        // Validate knowledge config
+        if let Some(ref knowledge) = self.knowledge {
+            if knowledge.chunk_size == 0 {
+                return Err(Error::Config(
+                    "knowledge.chunk_size must be at least 1".into(),
+                ));
+            }
+            if knowledge.chunk_overlap >= knowledge.chunk_size {
+                return Err(Error::Config(format!(
+                    "knowledge.chunk_overlap ({}) must be less than chunk_size ({})",
+                    knowledge.chunk_overlap, knowledge.chunk_size
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -929,5 +984,167 @@ system_prompt = "You test."
         let err = HeartbitConfig::from_toml(toml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("agent name must not be empty"), "error: {msg}");
+    }
+
+    #[test]
+    fn parse_knowledge_config_with_all_source_types() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[knowledge]
+chunk_size = 2000
+chunk_overlap = 400
+
+[[knowledge.sources]]
+type = "file"
+path = "README.md"
+
+[[knowledge.sources]]
+type = "glob"
+pattern = "docs/**/*.md"
+
+[[knowledge.sources]]
+type = "url"
+url = "https://docs.example.com/api"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let knowledge = config.knowledge.unwrap();
+        assert_eq!(knowledge.chunk_size, 2000);
+        assert_eq!(knowledge.chunk_overlap, 400);
+        assert_eq!(knowledge.sources.len(), 3);
+        assert!(matches!(
+            knowledge.sources[0],
+            KnowledgeSourceConfig::File { .. }
+        ));
+        assert!(matches!(
+            knowledge.sources[1],
+            KnowledgeSourceConfig::Glob { .. }
+        ));
+        assert!(matches!(
+            knowledge.sources[2],
+            KnowledgeSourceConfig::Url { .. }
+        ));
+    }
+
+    #[test]
+    fn knowledge_config_defaults() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[knowledge]
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let knowledge = config.knowledge.unwrap();
+        assert_eq!(knowledge.chunk_size, 1000);
+        assert_eq!(knowledge.chunk_overlap, 200);
+        assert!(knowledge.sources.is_empty());
+    }
+
+    #[test]
+    fn knowledge_config_defaults_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.knowledge.is_none());
+    }
+
+    #[test]
+    fn knowledge_zero_chunk_size_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[knowledge]
+chunk_size = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk_size must be at least 1"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn knowledge_overlap_exceeds_chunk_size_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[knowledge]
+chunk_size = 100
+chunk_overlap = 100
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk_overlap") && msg.contains("less than chunk_size"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn prompt_caching_defaults_false() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(!config.provider.prompt_caching);
+    }
+
+    #[test]
+    fn prompt_caching_parses_true() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+prompt_caching = true
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.provider.prompt_caching);
+    }
+
+    #[test]
+    fn prompt_caching_backward_compat() {
+        // Old config without prompt_caching should parse fine
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.retry]
+max_retries = 3
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(!config.provider.prompt_caching);
+        assert!(config.provider.retry.is_some());
+    }
+
+    #[test]
+    fn knowledge_overlap_less_than_chunk_size_accepted() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[knowledge]
+chunk_size = 100
+chunk_overlap = 50
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let knowledge = config.knowledge.unwrap();
+        assert_eq!(knowledge.chunk_size, 100);
+        assert_eq!(knowledge.chunk_overlap, 50);
     }
 }

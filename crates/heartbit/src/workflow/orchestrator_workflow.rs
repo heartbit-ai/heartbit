@@ -70,6 +70,9 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
 
             total_usage.input_tokens += llm_response.usage.input_tokens;
             total_usage.output_tokens += llm_response.usage.output_tokens;
+            total_usage.cache_creation_input_tokens +=
+                llm_response.usage.cache_creation_input_tokens;
+            total_usage.cache_read_input_tokens += llm_response.usage.cache_read_input_tokens;
 
             // Report orchestrator LLM token usage to budget tracker
             if let Err(e) = ctx
@@ -77,6 +80,9 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                 .record_usage(Json(super::budget::TokenUsageRecord {
                     input_tokens: llm_response.usage.input_tokens as u64,
                     output_tokens: llm_response.usage.output_tokens as u64,
+                    cache_creation_input_tokens: llm_response.usage.cache_creation_input_tokens
+                        as u64,
+                    cache_read_input_tokens: llm_response.usage.cache_read_input_tokens as u64,
                 }))
                 .call()
                 .await
@@ -130,6 +136,9 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                         .await;
                         total_usage.input_tokens += sub_tokens.input_tokens;
                         total_usage.output_tokens += sub_tokens.output_tokens;
+                        total_usage.cache_creation_input_tokens +=
+                            sub_tokens.cache_creation_input_tokens;
+                        total_usage.cache_read_input_tokens += sub_tokens.cache_read_input_tokens;
                         tool_result_blocks.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: result,
@@ -275,6 +284,8 @@ async fn execute_delegation(
             Ok(Json(result)) => {
                 sub_tokens.input_tokens += result.tokens.input_tokens;
                 sub_tokens.output_tokens += result.tokens.output_tokens;
+                sub_tokens.cache_creation_input_tokens += result.tokens.cache_creation_input_tokens;
+                sub_tokens.cache_read_input_tokens += result.tokens.cache_read_input_tokens;
 
                 // Store result on the shared blackboard for cross-agent visibility
                 if let Err(e) = ctx
@@ -286,6 +297,8 @@ async fn execute_delegation(
                             "tokens": {
                                 "input": result.tokens.input_tokens,
                                 "output": result.tokens.output_tokens,
+                                "cache_creation_input": result.tokens.cache_creation_input_tokens,
+                                "cache_read_input": result.tokens.cache_read_input_tokens,
                             },
                             "tool_calls": result.tool_calls_made,
                         }),

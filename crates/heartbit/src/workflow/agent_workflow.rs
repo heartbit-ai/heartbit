@@ -115,6 +115,9 @@ impl AgentWorkflow for AgentWorkflowImpl {
             let llm_response = llm_response.into_inner();
             total_usage.input_tokens += llm_response.usage.input_tokens;
             total_usage.output_tokens += llm_response.usage.output_tokens;
+            total_usage.cache_creation_input_tokens +=
+                llm_response.usage.cache_creation_input_tokens;
+            total_usage.cache_read_input_tokens += llm_response.usage.cache_read_input_tokens;
 
             // Record token usage with budget tracker (TerminalError if exceeded).
             // Set error state before propagating so status() reports correctly.
@@ -123,6 +126,9 @@ impl AgentWorkflow for AgentWorkflowImpl {
                 .record_usage(Json(super::budget::TokenUsageRecord {
                     input_tokens: llm_response.usage.input_tokens as u64,
                     output_tokens: llm_response.usage.output_tokens as u64,
+                    cache_creation_input_tokens: llm_response.usage.cache_creation_input_tokens
+                        as u64,
+                    cache_read_input_tokens: llm_response.usage.cache_read_input_tokens as u64,
                 }))
                 .call()
                 .await
@@ -289,6 +295,10 @@ impl AgentWorkflow for AgentWorkflowImpl {
 
                     total_usage.input_tokens += summary_resp.usage.input_tokens;
                     total_usage.output_tokens += summary_resp.usage.output_tokens;
+                    total_usage.cache_creation_input_tokens +=
+                        summary_resp.usage.cache_creation_input_tokens;
+                    total_usage.cache_read_input_tokens +=
+                        summary_resp.usage.cache_read_input_tokens;
 
                     // Report summarization tokens to budget tracker
                     if let Err(e) = ctx
@@ -296,6 +306,12 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         .record_usage(Json(super::budget::TokenUsageRecord {
                             input_tokens: summary_resp.usage.input_tokens as u64,
                             output_tokens: summary_resp.usage.output_tokens as u64,
+                            cache_creation_input_tokens: summary_resp
+                                .usage
+                                .cache_creation_input_tokens
+                                as u64,
+                            cache_read_input_tokens: summary_resp.usage.cache_read_input_tokens
+                                as u64,
                         }))
                         .call()
                         .await

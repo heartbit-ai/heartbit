@@ -117,13 +117,23 @@ fn build_provider(config: &HeartbitConfig) -> Result<Arc<dyn DynLlmProvider>> {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = AnthropicProvider::new(api_key, &config.provider.model);
+            let base = if config.provider.prompt_caching {
+                AnthropicProvider::with_prompt_caching(api_key, &config.provider.model)
+            } else {
+                AnthropicProvider::new(api_key, &config.provider.model)
+            };
             match retry {
                 Some(rc) => Ok(Arc::new(RetryingProvider::new(base, rc))),
                 None => Ok(Arc::new(base)),
             }
         }
         "openrouter" => {
+            if config.provider.prompt_caching {
+                tracing::warn!(
+                    "prompt_caching is only effective with the 'anthropic' provider; \
+                     ignored for 'openrouter'"
+                );
+            }
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let base = OpenRouterProvider::new(api_key, &config.provider.model);

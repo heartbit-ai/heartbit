@@ -93,6 +93,22 @@ system_prompt = "You are a writing specialist."
 [memory]
 type = "in_memory"                    # or: type = "postgres", database_url = "..."
 
+[knowledge]
+chunk_size = 1000                     # max bytes per chunk (default: 1000)
+chunk_overlap = 200                   # overlap bytes between chunks (default: 200)
+
+[[knowledge.sources]]
+type = "file"
+path = "README.md"
+
+[[knowledge.sources]]
+type = "glob"
+pattern = "docs/**/*.md"
+
+[[knowledge.sources]]
+type = "url"
+url = "https://docs.example.com/api"
+
 [restate]
 endpoint = "http://localhost:9070"
 
@@ -141,6 +157,8 @@ service_name = "heartbit"
 **Blackboard** — shared `Key -> Value` store. Sub-agents get `blackboard_read`, `blackboard_write`, `blackboard_list` tools. After each sub-agent completes, its result is written to `"agent:{name}"`.
 
 **Memory** — `Memory` trait with `store`, `recall`, `update`, `forget`. Implementations: `InMemoryStore`, `PostgresMemoryStore`. Agents get 5 memory tools including `memory_consolidate` (MemGPT pattern). Recall scoring uses Park et al. composite: `recency + importance + relevance`.
+
+**Knowledge** — `KnowledgeBase` trait for document retrieval. `InMemoryKnowledgeBase` provides keyword search over indexed chunks. Loaders: file, glob, URL (with HTML stripping). Paragraph-aware chunking with configurable size and overlap. Agents get a `knowledge_search` tool. Standalone path only.
 
 ### Context management
 
@@ -259,7 +277,7 @@ npx -y supergateway \
 # Server at http://localhost:8000/mcp
 ```
 
-375 tests. TDD mandatory — red/green/refactor for every feature.
+433 tests. TDD mandatory — red/green/refactor for every feature.
 
 ## Project structure
 
@@ -268,6 +286,7 @@ crates/
   heartbit/           # Library crate
     src/
       agent/          # AgentRunner, Orchestrator, context management, blackboard
+      knowledge/      # KnowledgeBase trait, InMemoryKnowledgeBase, chunker, loaders
       llm/            # LlmProvider trait, Anthropic, OpenRouter, retry, SSE parser
       memory/         # Memory trait, InMemoryStore, PostgresMemoryStore, scoring
       tool/           # Tool trait, MCP client, validation

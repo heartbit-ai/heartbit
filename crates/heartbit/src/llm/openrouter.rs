@@ -300,10 +300,14 @@ struct OpenAiFunction {
     arguments: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
@@ -367,6 +371,8 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
     let usage = api.usage.map_or(TokenUsage::default(), |u| TokenUsage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
     });
 
     Ok(CompletionResponse {
@@ -606,6 +612,8 @@ fn process_openai_event(
         *usage = TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
         };
     }
 }
@@ -752,6 +760,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                ..Default::default()
             }),
         };
 
@@ -781,6 +790,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 20,
                 completion_tokens: 10,
+                ..Default::default()
             }),
         };
 
@@ -1213,6 +1223,69 @@ mod tests {
         let response = parse_openai_stream(stream, on_text).await.unwrap();
         assert_eq!(response.stop_reason, StopReason::ToolUse); // normalized
         assert_eq!(response.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn parse_response_with_cache_tokens() {
+        let api = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cache_creation_input_tokens: 80,
+                cache_read_input_tokens: 60,
+            }),
+        };
+
+        let response = into_completion_response(api).unwrap();
+        assert_eq!(response.usage.input_tokens, 100);
+        assert_eq!(response.usage.output_tokens, 20);
+        assert_eq!(response.usage.cache_creation_input_tokens, 80);
+        assert_eq!(response.usage.cache_read_input_tokens, 60);
+    }
+
+    #[test]
+    fn parse_response_cache_tokens_default_when_missing() {
+        let api = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 50,
+                completion_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+        };
+
+        let response = into_completion_response(api).unwrap();
+        assert_eq!(response.usage.cache_creation_input_tokens, 0);
+        assert_eq!(response.usage.cache_read_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_cache_tokens_passthrough() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10,"cache_creation_input_tokens":80,"cache_read_input_tokens":60}}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.usage.cache_creation_input_tokens, 80);
+        assert_eq!(response.usage.cache_read_input_tokens, 60);
     }
 
     #[tokio::test]

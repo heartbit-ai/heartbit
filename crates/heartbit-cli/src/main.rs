@@ -11,9 +11,10 @@ use tracing_subscriber::EnvFilter;
 use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, Blackboard, BoxedProvider, ContextStrategy,
-    ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard, InMemoryStore, McpClient, Memory,
-    MemoryConfig, OnApproval, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore,
-    RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
+    ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard, InMemoryKnowledgeBase,
+    InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient, Memory, MemoryConfig,
+    OnApproval, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig,
+    RetryingProvider, SubAgentConfig, ToolCall,
 };
 
 #[derive(Parser)]
@@ -216,7 +217,11 @@ fn build_provider_from_config(config: &HeartbitConfig) -> Result<Arc<BoxedProvid
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = AnthropicProvider::new(api_key, &config.provider.model);
+            let base = if config.provider.prompt_caching {
+                AnthropicProvider::with_prompt_caching(api_key, &config.provider.model)
+            } else {
+                AnthropicProvider::new(api_key, &config.provider.model)
+            };
             match retry {
                 Some(rc) => Ok(Arc::new(BoxedProvider::new(RetryingProvider::new(
                     base, rc,
@@ -225,6 +230,12 @@ fn build_provider_from_config(config: &HeartbitConfig) -> Result<Arc<BoxedProvid
             }
         }
         "openrouter" => {
+            if config.provider.prompt_caching {
+                tracing::warn!(
+                    "prompt_caching is only effective with the 'anthropic' provider; \
+                     ignored for 'openrouter'"
+                );
+            }
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let base = OpenRouterProvider::new(api_key, &config.provider.model);
@@ -255,6 +266,59 @@ async fn run_from_config(path: &std::path::Path, task: &str, approve: bool) -> R
         build_orchestrator_from_config(provider, &config, task, on_text, on_approval).await?;
     print_streaming_stats(&output);
     Ok(())
+}
+
+/// Load and index knowledge sources from config into an in-memory knowledge base.
+async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<dyn KnowledgeBase>> {
+    use heartbit::knowledge::chunker::ChunkConfig;
+    use heartbit::knowledge::loader;
+
+    let kb = Arc::new(InMemoryKnowledgeBase::new());
+    let chunk_config = ChunkConfig {
+        chunk_size: config.chunk_size,
+        chunk_overlap: config.chunk_overlap,
+    };
+
+    for source in &config.sources {
+        match source {
+            KnowledgeSourceConfig::File { path } => {
+                let path = std::path::Path::new(path);
+                match loader::load_file(&*kb, path, &chunk_config).await {
+                    Ok(count) => {
+                        tracing::info!(path = %path.display(), chunks = count, "indexed knowledge file");
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "failed to load knowledge file, skipping");
+                    }
+                }
+            }
+            KnowledgeSourceConfig::Glob { pattern } => {
+                match loader::load_glob(&*kb, pattern, &chunk_config).await {
+                    Ok(count) => {
+                        tracing::info!(pattern = %pattern, chunks = count, "indexed knowledge glob");
+                    }
+                    Err(e) => {
+                        tracing::warn!(pattern = %pattern, error = %e, "failed to load knowledge glob, skipping");
+                    }
+                }
+            }
+            KnowledgeSourceConfig::Url { url } => {
+                match loader::load_url(&*kb, url, &chunk_config).await {
+                    Ok(count) => {
+                        tracing::info!(url = %url, chunks = count, "indexed knowledge URL");
+                    }
+                    Err(e) => {
+                        tracing::warn!(url = %url, error = %e, "failed to load knowledge URL, skipping");
+                    }
+                }
+            }
+        }
+    }
+
+    let total = kb.chunk_count().await.unwrap_or(0);
+    tracing::info!(total_chunks = total, "knowledge base loaded");
+
+    Ok(kb)
 }
 
 async fn build_orchestrator_from_config(
@@ -325,6 +389,12 @@ async fn build_orchestrator_from_config(
     let blackboard: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
     builder = builder.blackboard(blackboard);
 
+    // Wire knowledge base if configured
+    if let Some(ref knowledge_config) = config.knowledge {
+        let kb = load_knowledge_base(knowledge_config).await?;
+        builder = builder.knowledge(kb);
+    }
+
     let mut orchestrator = builder.build()?;
     let output = orchestrator.run(task).await?;
     Ok(output)
@@ -371,11 +441,23 @@ async fn run_from_env(task: &str, approve: bool) -> Result<()> {
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
             let model = std::env::var("HEARTBIT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
-            Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
-                AnthropicProvider::new(api_key, model),
-            )))
+            let prompt_caching = std::env::var("HEARTBIT_PROMPT_CACHING")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let base = if prompt_caching {
+                AnthropicProvider::with_prompt_caching(api_key, model)
+            } else {
+                AnthropicProvider::new(api_key, model)
+            };
+            Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(base)))
         }
         "openrouter" => {
+            if std::env::var("HEARTBIT_PROMPT_CACHING").is_ok() {
+                tracing::warn!(
+                    "HEARTBIT_PROMPT_CACHING is only effective with the 'anthropic' provider; \
+                     ignored for 'openrouter'"
+                );
+            }
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let model = std::env::var("HEARTBIT_MODEL")
@@ -485,8 +567,20 @@ fn approval_callback() -> Arc<OnApproval> {
 /// Print stats after a streaming run (text already printed via callback).
 fn print_streaming_stats(output: &AgentOutput) {
     // Ensure stats start on a new line after streamed text
-    eprintln!(
-        "\n---\nTokens used: {} in / {} out | Tool calls: {}",
-        output.tokens_used.input_tokens, output.tokens_used.output_tokens, output.tool_calls_made,
-    );
+    let u = &output.tokens_used;
+    if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
+        eprintln!(
+            "\n---\nTokens used: {} in / {} out (cache: {} created, {} read) | Tool calls: {}",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_creation_input_tokens,
+            u.cache_read_input_tokens,
+            output.tool_calls_made,
+        );
+    } else {
+        eprintln!(
+            "\n---\nTokens used: {} in / {} out | Tool calls: {}",
+            u.input_tokens, u.output_tokens, output.tool_calls_made,
+        );
+    }
 }
