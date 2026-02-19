@@ -198,6 +198,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         tool_name: name.clone(),
                         input: input.clone(),
                         timeout_seconds: task.tool_timeout_seconds,
+                        max_output_bytes: task.max_tool_output_bytes,
                     }))
                     .call()
                     .await?

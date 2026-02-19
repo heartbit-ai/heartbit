@@ -84,6 +84,9 @@ pub struct ToolCallRequest {
     /// Optional timeout in seconds for the tool execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Maximum byte size for tool output. Oversized results are truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<usize>,
 }
 
 /// Response from a tool call activity.
@@ -322,10 +325,33 @@ mod tests {
             tool_name: "search".into(),
             input: serde_json::json!({"query": "rust"}),
             timeout_seconds: None,
+            max_output_bytes: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "search");
+    }
+
+    #[test]
+    fn tool_call_request_max_output_bytes_roundtrips() {
+        let req = ToolCallRequest {
+            tool_name: "search".into(),
+            input: serde_json::json!({}),
+            timeout_seconds: Some(30),
+            max_output_bytes: Some(4096),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_output_bytes, Some(4096));
+    }
+
+    #[test]
+    fn tool_call_request_max_output_bytes_defaults_to_none() {
+        // Backward compatibility: old JSON without max_output_bytes still parses
+        let json = r#"{"tool_name":"search","input":{}}"#;
+        let parsed: ToolCallRequest = serde_json::from_str(json).unwrap();
+        assert!(parsed.max_output_bytes.is_none());
+        assert!(parsed.timeout_seconds.is_none());
     }
 
     #[test]

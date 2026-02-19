@@ -147,10 +147,16 @@ impl AgentService for AgentServiceImpl {
         };
 
         match result {
-            Ok(output) => Ok(Json(ToolCallResponse {
-                content: output.content,
-                is_error: output.is_error,
-            })),
+            Ok(output) => {
+                let output = match request.max_output_bytes {
+                    Some(max) => output.truncated(max),
+                    None => output,
+                };
+                Ok(Json(ToolCallResponse {
+                    content: output.content,
+                    is_error: output.is_error,
+                }))
+            }
             Err(e) => Ok(Json(ToolCallResponse {
                 content: format!("Tool '{}' error: {e}", request.tool_name),
                 is_error: true,
