@@ -12,7 +12,7 @@ use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
     InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OpenRouterProvider, Orchestrator,
-    RetryConfig, RetryingProvider,
+    PostgresMemoryStore, RetryConfig, RetryingProvider,
 };
 
 #[derive(Parser)]
@@ -262,10 +262,15 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
     if let Some(ref memory_config) = config.memory {
         let memory: Arc<dyn Memory> = match memory_config {
             MemoryConfig::InMemory => Arc::new(InMemoryStore::new()),
-            MemoryConfig::Postgres { .. } => {
-                anyhow::bail!(
-                    "Postgres memory store is not yet implemented. Use type = \"in_memory\" instead."
-                );
+            MemoryConfig::Postgres { database_url } => {
+                let store = PostgresMemoryStore::connect(database_url)
+                    .await
+                    .context("failed to connect to PostgreSQL for memory store")?;
+                store
+                    .run_migration()
+                    .await
+                    .context("failed to run memory store migration")?;
+                Arc::new(store)
             }
         };
         builder = builder.shared_memory(memory);

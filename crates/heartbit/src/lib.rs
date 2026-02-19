@@ -21,6 +21,7 @@ pub use llm::types::{
     ToolCall, ToolDefinition, ToolResult,
 };
 pub use memory::in_memory::InMemoryStore;
+pub use memory::postgres::PostgresMemoryStore;
 pub use memory::{Memory, MemoryEntry, MemoryQuery};
 pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput};

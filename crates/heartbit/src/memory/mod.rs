@@ -1,5 +1,6 @@
 pub mod in_memory;
 pub mod namespaced;
+pub mod postgres;
 pub mod scoring;
 pub mod shared_tools;
 pub mod tools;
