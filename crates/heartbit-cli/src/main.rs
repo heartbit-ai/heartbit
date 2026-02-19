@@ -172,11 +172,7 @@ async fn run_standalone(config_path: Option<&std::path::Path>, task: &str) -> Re
 
 /// Build a `RetryConfig` from the provider config, if retry is configured.
 fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
-    config.provider.retry.as_ref().map(|r| RetryConfig {
-        max_retries: r.max_retries,
-        base_delay: std::time::Duration::from_millis(r.base_delay_ms),
-        max_delay: std::time::Duration::from_millis(r.max_delay_ms),
-    })
+    config.provider.retry.as_ref().map(RetryConfig::from)
 }
 
 async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {

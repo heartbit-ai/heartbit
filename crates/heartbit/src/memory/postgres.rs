@@ -174,7 +174,12 @@ impl Memory for PostgresMemoryStore {
             if let Some(ref agent) = query.agent {
                 sql.push_str(&format!(" AND agent = ${param_idx}"));
                 agent_filter = Some(agent.clone());
+                param_idx += 1;
             }
+
+            // param_idx is intentionally incremented after each filter to keep
+            // placeholders consistent if filters are reordered or new ones added.
+            let _ = param_idx;
 
             sql.push_str(" ORDER BY created_at DESC");
 

@@ -111,11 +111,7 @@ fn setup_telemetry(otlp_endpoint: &str, service_name: &str) -> Result<()> {
 }
 
 fn build_provider(config: &HeartbitConfig) -> Result<Arc<dyn DynLlmProvider>> {
-    let retry = config.provider.retry.as_ref().map(|r| RetryConfig {
-        max_retries: r.max_retries,
-        base_delay: std::time::Duration::from_millis(r.base_delay_ms),
-        max_delay: std::time::Duration::from_millis(r.max_delay_ms),
-    });
+    let retry = config.provider.retry.as_ref().map(RetryConfig::from);
 
     match config.provider.name.as_str() {
         "anthropic" => {

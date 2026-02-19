@@ -275,6 +275,9 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
         }
+        if self.max_tokens == 0 {
+            return Err(Error::Config("max_tokens must be at least 1".into()));
+        }
 
         // Collect all tools, including memory tools created from builder's name
         let mut all_tools = self.tools;
@@ -660,6 +663,22 @@ mod tests {
         let err = result.err().unwrap();
         assert!(
             err.to_string().contains("max_turns must be at least 1"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_errors_on_zero_max_tokens() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .max_tokens(0)
+            .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("max_tokens must be at least 1"),
             "error: {err}"
         );
     }

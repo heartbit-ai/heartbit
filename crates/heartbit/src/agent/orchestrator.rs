@@ -115,6 +115,8 @@ struct DelegateTaskTool<P: LlmProvider> {
 
 impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
     async fn delegate(&self, tasks: Vec<DelegatedTask>) -> Result<String, Error> {
+        let task_count = tasks.len();
+        let agent_names: Vec<String> = tasks.iter().map(|t| t.agent.clone()).collect();
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, task) in tasks.into_iter().enumerate() {
@@ -203,17 +205,35 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             });
         }
 
-        let mut results: Vec<(usize, SubAgentResult)> = Vec::new();
+        let mut results: Vec<Option<(usize, SubAgentResult)>> = vec![None; task_count];
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(indexed_result) => results.push(indexed_result),
+                Ok((idx, sub_result)) => {
+                    results[idx] = Some((idx, sub_result));
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "sub-agent task panicked");
                 }
             }
         }
 
-        // Sort by original index to preserve order
+        // Fill gaps (panicked tasks) with error results, then sort by index
+        let mut results: Vec<(usize, SubAgentResult)> = results
+            .into_iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                r.unwrap_or_else(|| {
+                    (
+                        idx,
+                        SubAgentResult {
+                            agent: agent_names[idx].clone(),
+                            result: "Error: sub-agent task panicked".into(),
+                            tokens_used: TokenUsage::default(),
+                        },
+                    )
+                })
+            })
+            .collect();
         results.sort_by_key(|(idx, _)| *idx);
 
         // Accumulate sub-agent tokens
