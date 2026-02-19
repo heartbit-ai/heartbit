@@ -2,6 +2,12 @@
 name = "openrouter"
 model = "anthropic/claude-sonnet-4"
 
+# Retry transient API failures (429, 500, 502, 503, 529)
+[provider.retry]
+max_retries = 3
+base_delay_ms = 500
+max_delay_ms = 30000
+
 [orchestrator]
 max_turns = 15
 max_tokens = 8192

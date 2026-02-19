@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use restate_sdk::prelude::*;
 
-use heartbit::HeartbitConfig;
 use heartbit::llm::anthropic::AnthropicProvider;
 use heartbit::llm::openrouter::OpenRouterProvider;
 use heartbit::tool::Tool;
@@ -17,6 +16,7 @@ use heartbit::workflow::circuit_breaker::{CircuitBreakerObject, CircuitBreakerOb
 use heartbit::workflow::orchestrator_workflow::{OrchestratorWorkflow, OrchestratorWorkflowImpl};
 use heartbit::workflow::scheduler::{SchedulerObject, SchedulerObjectImpl};
 use heartbit::workflow::types::DynLlmProvider;
+use heartbit::{HeartbitConfig, RetryConfig, RetryingProvider};
 
 /// Start the Restate-compatible HTTP worker.
 ///
@@ -111,22 +111,30 @@ fn setup_telemetry(otlp_endpoint: &str, service_name: &str) -> Result<()> {
 }
 
 fn build_provider(config: &HeartbitConfig) -> Result<Arc<dyn DynLlmProvider>> {
+    let retry = config.provider.retry.as_ref().map(|r| RetryConfig {
+        max_retries: r.max_retries,
+        base_delay: std::time::Duration::from_millis(r.base_delay_ms),
+        max_delay: std::time::Duration::from_millis(r.max_delay_ms),
+    });
+
     match config.provider.name.as_str() {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            Ok(Arc::new(AnthropicProvider::new(
-                api_key,
-                &config.provider.model,
-            )))
+            let base = AnthropicProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => Ok(Arc::new(RetryingProvider::new(base, rc))),
+                None => Ok(Arc::new(base)),
+            }
         }
         "openrouter" => {
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            Ok(Arc::new(OpenRouterProvider::new(
-                api_key,
-                &config.provider.model,
-            )))
+            let base = OpenRouterProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => Ok(Arc::new(RetryingProvider::new(base, rc))),
+                None => Ok(Arc::new(base)),
+            }
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
     }

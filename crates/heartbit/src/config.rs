@@ -20,6 +20,34 @@ pub struct HeartbitConfig {
 pub struct ProviderConfig {
     pub name: String,
     pub model: String,
+    /// Retry configuration for transient LLM API failures.
+    pub retry: Option<RetryProviderConfig>,
+}
+
+/// Retry configuration for transient LLM API failures (429, 500, 502, 503, 529).
+#[derive(Debug, Deserialize)]
+pub struct RetryProviderConfig {
+    /// Maximum retry attempts (default: 3).
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Base delay in milliseconds for exponential backoff (default: 500).
+    #[serde(default = "default_base_delay_ms")]
+    pub base_delay_ms: u64,
+    /// Maximum delay cap in milliseconds (default: 30000).
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+
+fn default_base_delay_ms() -> u64 {
+    500
+}
+
+fn default_max_delay_ms() -> u64 {
+    30_000
 }
 
 /// Orchestrator-level settings with sensible defaults.
@@ -420,5 +448,51 @@ max_tokens = 0
             msg.contains("max_tokens must be at least 1"),
             "error: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_retry_config() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.retry]
+max_retries = 5
+base_delay_ms = 1000
+max_delay_ms = 60000
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let retry = config.provider.retry.unwrap();
+        assert_eq!(retry.max_retries, 5);
+        assert_eq!(retry.base_delay_ms, 1000);
+        assert_eq!(retry.max_delay_ms, 60000);
+    }
+
+    #[test]
+    fn retry_config_defaults_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.provider.retry.is_none());
+    }
+
+    #[test]
+    fn retry_config_uses_defaults_for_missing_fields() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.retry]
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let retry = config.provider.retry.unwrap();
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.base_delay_ms, 500);
+        assert_eq!(retry.max_delay_ms, 30000);
     }
 }

@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openrouter;
+pub mod retry;
 pub mod types;
 
 use crate::llm::types::{CompletionRequest, CompletionResponse};

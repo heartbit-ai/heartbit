@@ -10,11 +10,12 @@ pub mod workflow;
 pub use agent::context::ContextStrategy;
 pub use agent::orchestrator::Orchestrator;
 pub use agent::{AgentOutput, AgentRunner};
-pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig};
+pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig, RetryProviderConfig};
 pub use error::Error;
 pub use llm::LlmProvider;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::openrouter::OpenRouterProvider;
+pub use llm::retry::{RetryConfig, RetryingProvider};
 pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StopReason, TokenUsage,
     ToolCall, ToolDefinition, ToolResult,

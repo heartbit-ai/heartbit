@@ -12,6 +12,7 @@ use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
     InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OpenRouterProvider, Orchestrator,
+    RetryConfig, RetryingProvider,
 };
 
 #[derive(Parser)]
@@ -169,24 +170,55 @@ async fn run_standalone(config_path: Option<&std::path::Path>, task: &str) -> Re
     }
 }
 
+/// Build a `RetryConfig` from the provider config, if retry is configured.
+fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
+    config.provider.retry.as_ref().map(|r| RetryConfig {
+        max_retries: r.max_retries,
+        base_delay: std::time::Duration::from_millis(r.base_delay_ms),
+        max_delay: std::time::Duration::from_millis(r.max_delay_ms),
+    })
+}
+
 async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
     let config = HeartbitConfig::from_file(path)
         .with_context(|| format!("failed to load config from {}", path.display()))?;
+
+    let retry = retry_config_from(&config);
 
     match config.provider.name.as_str() {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let provider = Arc::new(AnthropicProvider::new(api_key, &config.provider.model));
-            let output = build_orchestrator_from_config(provider, &config, task).await?;
-            print_output(&output);
+            let base = AnthropicProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => {
+                    let provider = Arc::new(RetryingProvider::new(base, rc));
+                    let output = build_orchestrator_from_config(provider, &config, task).await?;
+                    print_output(&output);
+                }
+                None => {
+                    let provider = Arc::new(base);
+                    let output = build_orchestrator_from_config(provider, &config, task).await?;
+                    print_output(&output);
+                }
+            }
         }
         "openrouter" => {
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let provider = Arc::new(OpenRouterProvider::new(api_key, &config.provider.model));
-            let output = build_orchestrator_from_config(provider, &config, task).await?;
-            print_output(&output);
+            let base = OpenRouterProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => {
+                    let provider = Arc::new(RetryingProvider::new(base, rc));
+                    let output = build_orchestrator_from_config(provider, &config, task).await?;
+                    print_output(&output);
+                }
+                None => {
+                    let provider = Arc::new(base);
+                    let output = build_orchestrator_from_config(provider, &config, task).await?;
+                    print_output(&output);
+                }
+            }
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
     }
