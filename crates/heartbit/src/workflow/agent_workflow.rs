@@ -240,6 +240,20 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     total_usage.input_tokens += summary_resp.usage.input_tokens;
                     total_usage.output_tokens += summary_resp.usage.output_tokens;
 
+                    // Report summarization tokens to budget tracker
+                    if let Err(e) = ctx
+                        .object_client::<TokenBudgetObjectClient>(ctx.key())
+                        .record_usage(Json(super::budget::TokenUsageRecord {
+                            input_tokens: summary_resp.usage.input_tokens as u64,
+                            output_tokens: summary_resp.usage.output_tokens as u64,
+                        }))
+                        .call()
+                        .await
+                    {
+                        ctx.set("state", "error".to_string());
+                        return Err(e.into());
+                    }
+
                     // Merge summary into first message, keep last 4
                     inject_summary_into_messages(&mut messages, &task.input, &summary, 4);
                 }

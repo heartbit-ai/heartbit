@@ -95,7 +95,9 @@ impl CircuitBreakerObject for CircuitBreakerObjectImpl {
             }
             CircuitState::HalfOpen => {
                 // Any failure in half-open goes back to open
+                let threshold = ctx.get::<u32>("failure_threshold").await?.unwrap_or(5);
                 ctx.set("state", "open".to_string());
+                ctx.set("failures", threshold);
                 ctx.set("successes", 0u32);
             }
             CircuitState::Open => {

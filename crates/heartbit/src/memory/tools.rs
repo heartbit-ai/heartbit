@@ -205,14 +205,18 @@ impl Tool for MemoryRecallTool {
                     let relevance = if has_text_query { 1.0 } else { 0.0 };
                     let score =
                         composite_score(&weights, e.created_at, now, e.importance, relevance);
+                    let display_content = if e.content.len() > 200 {
+                        format!("{}...", &e.content[..200])
+                    } else {
+                        e.content.clone()
+                    };
                     format!(
-                        "- [{}] ({}, importance:{}) score:{:.2} {}{}\n  Tags: {:?} | Accessed: {} times",
+                        "- [{}] ({}, importance:{}) score:{:.2} {}\n  Tags: {:?} | Accessed: {} times",
                         e.id,
                         e.category,
                         e.importance,
                         score,
-                        e.content,
-                        if e.content.len() > 200 { "..." } else { "" },
+                        display_content,
                         e.tags,
                         e.access_count,
                     )

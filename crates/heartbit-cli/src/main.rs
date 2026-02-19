@@ -71,9 +71,10 @@ enum Commands {
         #[arg(long)]
         restate_url: Option<String>,
     },
-    /// Send human approval signal to a workflow
+    /// Send human approval signal to a child agent workflow.
+    /// Use 'heartbit status <orchestrator-id>' to find child workflow IDs.
     Approve {
-        /// Workflow ID to approve
+        /// Child agent workflow ID to approve (from 'status' output)
         workflow_id: String,
 
         /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
