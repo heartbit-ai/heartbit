@@ -40,6 +40,8 @@ pub struct AgentRunner<P: LlmProvider> {
     summarize_threshold: Option<u32>,
     /// Optional callback for streaming text output.
     on_text: Option<Arc<crate::llm::OnText>>,
+    /// Optional callback for human-in-the-loop approval before tool execution.
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -55,6 +57,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             summarize_threshold: None,
             memory: None,
             on_text: None,
+            on_approval: None,
         }
     }
 
@@ -104,6 +107,25 @@ impl<P: LlmProvider> AgentRunner<P> {
                     tool_calls_made: total_tool_calls,
                     tokens_used: total_usage,
                 });
+            }
+
+            // Human-in-the-loop: if approval callback is set, ask before executing
+            if let Some(ref cb) = self.on_approval
+                && !cb(&tool_calls)
+            {
+                debug!(agent = %self.name, "tool execution denied by approval callback");
+                let results: Vec<ToolResult> = tool_calls
+                    .iter()
+                    .map(|tc| {
+                        ToolResult::error(
+                            tc.id.clone(),
+                            "Tool execution denied by human reviewer".to_string(),
+                        )
+                    })
+                    .collect();
+                total_tool_calls += tool_calls.len();
+                ctx.add_tool_results(results);
+                continue;
             }
 
             total_tool_calls += tool_calls.len();
@@ -207,6 +229,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     summarize_threshold: Option<u32>,
     memory: Option<Arc<dyn Memory>>,
     on_text: Option<Arc<crate::llm::OnText>>,
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -271,6 +294,16 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a callback for human-in-the-loop approval before tool execution.
+    ///
+    /// When set, the callback is invoked with the list of tool calls before
+    /// each execution round. If it returns `false`, tool execution is denied
+    /// and the agent receives error results, allowing the LLM to adjust.
+    pub fn on_approval(mut self, callback: Arc<crate::llm::OnApproval>) -> Self {
+        self.on_approval = Some(callback);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
@@ -309,6 +342,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
             on_text: self.on_text,
+            on_approval: self.on_approval,
         })
     }
 }
@@ -791,5 +825,177 @@ mod tests {
             runner.context_strategy,
             ContextStrategy::Unlimited
         ));
+    }
+
+    #[tokio::test]
+    async fn approval_callback_approves_tool_execution() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let approved = Arc::new(AtomicBool::new(false));
+        let approved_clone = approved.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({"q": "rust"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Found it!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let callback: Arc<crate::llm::OnApproval> = Arc::new(move |_calls| {
+            approved_clone.store(true, Ordering::SeqCst);
+            true
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "results")))
+            .on_approval(callback)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert!(
+            approved.load(Ordering::SeqCst),
+            "approval callback was called"
+        );
+        assert_eq!(output.result, "Found it!");
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn approval_callback_denies_tool_execution() {
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({"q": "rust"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            // After denial, LLM responds with text instead
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I understand, I won't execute that.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let callback: Arc<crate::llm::OnApproval> = Arc::new(|_calls| false);
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "results")))
+            .on_approval(callback)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert_eq!(output.result, "I understand, I won't execute that.");
+        // Tool call is counted even though denied (the LLM made the call)
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn approval_callback_receives_correct_tool_calls() {
+        let received_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received_calls.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "search".into(),
+                        input: json!({"q": "rust"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c2".into(),
+                        name: "read".into(),
+                        input: json!({"path": "/tmp"}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let callback: Arc<crate::llm::OnApproval> = Arc::new(move |calls| {
+            let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+            received_clone.lock().expect("lock").extend(names);
+            true
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "found")))
+            .tool(Arc::new(MockTool::new("read", "content")))
+            .on_approval(callback)
+            .build()
+            .unwrap();
+
+        runner.execute("test").await.unwrap();
+
+        let calls = received_calls.lock().expect("lock");
+        assert_eq!(*calls, vec!["search", "read"]);
+    }
+
+    #[tokio::test]
+    async fn no_approval_callback_executes_tools_directly() {
+        // Without on_approval, tools execute without any gate
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "result")))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert_eq!(output.result, "Done!");
+        assert_eq!(output.tool_calls_made, 1);
     }
 }

@@ -123,6 +123,11 @@ pub async fn query_status(workflow_id: &str, restate_url: &str) -> Result<()> {
 }
 
 /// Send human approval signal to a workflow.
+///
+/// Queries the current turn from the workflow status first, then sends
+/// approval targeting that specific turn. This avoids the TOCTOU race
+/// where `turn: None` could approve the wrong turn if state changes
+/// between the status query and the approval signal.
 pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
     let url = format!(
         "{}/AgentWorkflow/{}/approve",
@@ -130,13 +135,29 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
         workflow_id
     );
 
+    // Query current turn to target the approval precisely
+    let status_url = format!(
+        "{}/AgentWorkflow/{}/status",
+        restate_url.trim_end_matches('/'),
+        workflow_id
+    );
+    let client = reqwest::Client::new();
+    let turn = match client.get(&status_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            serde_json::from_str::<heartbit::workflow::types::AgentStatus>(&body)
+                .ok()
+                .map(|s| s.current_turn as u64)
+        }
+        _ => None,
+    };
+
     let decision = HumanDecision {
         approved: true,
         reason: Some("Approved via CLI".into()),
-        turn: None, // fall back to reading current turn from workflow state
+        turn,
     };
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -146,7 +167,11 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
         .context("failed to send approval")?;
 
     if resp.status().is_success() {
-        println!("Approval sent to workflow {workflow_id}");
+        if let Some(t) = turn {
+            println!("Approval sent to workflow {workflow_id} (turn {t})");
+        } else {
+            println!("Approval sent to workflow {workflow_id}");
+        }
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

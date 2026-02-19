@@ -71,6 +71,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             max_tokens: 4096,
             shared_memory: None,
             on_text: None,
+            on_approval: None,
         }
     }
 
@@ -354,6 +355,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     max_tokens: u32,
     shared_memory: Option<Arc<dyn Memory>>,
     on_text: Option<Arc<crate::llm::OnText>>,
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -438,6 +440,14 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Set a callback for human-in-the-loop approval on the orchestrator's
+    /// tool calls (i.e., delegate_task calls). Sub-agents do not use this
+    /// callback — only the orchestrator's decisions are gated.
+    pub fn on_approval(mut self, callback: Arc<crate::llm::OnApproval>) -> Self {
+        self.on_approval = Some(callback);
+        self
+    }
+
     pub fn build(self) -> Result<Orchestrator<P>, Error> {
         if self.sub_agents.is_empty() {
             tracing::warn!(
@@ -472,6 +482,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
 
         if let Some(on_text) = self.on_text {
             runner_builder = runner_builder.on_text(on_text);
+        }
+        if let Some(on_approval) = self.on_approval {
+            runner_builder = runner_builder.on_approval(on_approval);
         }
 
         let runner = runner_builder.build()?;

@@ -11,8 +11,8 @@ use tracing_subscriber::EnvFilter;
 use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
-    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OnText, OpenRouterProvider,
-    Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider,
+    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OnApproval, OnText,
+    OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider, ToolCall,
 };
 
 #[derive(Parser)]
@@ -37,6 +37,9 @@ enum Commands {
         /// The task to execute
         #[arg(trailing_var_arg = true)]
         task: Vec<String>,
+        /// Require human approval before each tool execution round
+        #[arg(long)]
+        approve: bool,
     },
     /// Start the Restate-compatible HTTP worker
     Serve {
@@ -104,13 +107,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Run { task }) => {
+        Some(Commands::Run { task, approve }) => {
             init_tracing();
             let task_str = task.join(" ");
             if task_str.is_empty() {
                 bail!("Usage: heartbit run <task>");
             }
-            run_standalone(cli.config.as_deref(), &task_str).await
+            run_standalone(cli.config.as_deref(), &task_str, approve).await
         }
         Some(Commands::Serve { bind }) => {
             // serve::run_worker handles its own tracing init (with optional OTel)
@@ -158,15 +161,19 @@ async fn main() -> Result<()> {
                     "Usage: heartbit [run|serve|submit|status|approve] <args>\n       heartbit <task>  (shorthand for 'run')"
                 );
             }
-            run_standalone(cli.config.as_deref(), &task_str).await
+            run_standalone(cli.config.as_deref(), &task_str, false).await
         }
     }
 }
 
-async fn run_standalone(config_path: Option<&std::path::Path>, task: &str) -> Result<()> {
+async fn run_standalone(
+    config_path: Option<&std::path::Path>,
+    task: &str,
+    approve: bool,
+) -> Result<()> {
     match config_path {
-        Some(path) => run_from_config(path, task).await,
-        None => run_from_env(task).await,
+        Some(path) => run_from_config(path, task, approve).await,
+        None => run_from_env(task, approve).await,
     }
 }
 
@@ -175,12 +182,17 @@ fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
     config.provider.retry.as_ref().map(RetryConfig::from)
 }
 
-async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
+async fn run_from_config(path: &std::path::Path, task: &str, approve: bool) -> Result<()> {
     let config = HeartbitConfig::from_file(path)
         .with_context(|| format!("failed to load config from {}", path.display()))?;
 
     let retry = retry_config_from(&config);
     let on_text = streaming_callback();
+    let on_approval = if approve {
+        Some(approval_callback())
+    } else {
+        None
+    };
 
     match config.provider.name.as_str() {
         "anthropic" => {
@@ -190,11 +202,25 @@ async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
             let output = match retry {
                 Some(rc) => {
                     let provider = Arc::new(RetryingProvider::new(base, rc));
-                    build_orchestrator_from_config(provider, &config, task, on_text).await?
+                    build_orchestrator_from_config(
+                        provider,
+                        &config,
+                        task,
+                        on_text,
+                        on_approval.clone(),
+                    )
+                    .await?
                 }
                 None => {
                     let provider = Arc::new(base);
-                    build_orchestrator_from_config(provider, &config, task, on_text).await?
+                    build_orchestrator_from_config(
+                        provider,
+                        &config,
+                        task,
+                        on_text,
+                        on_approval.clone(),
+                    )
+                    .await?
                 }
             };
             print_streaming_stats(&output);
@@ -206,11 +232,25 @@ async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
             let output = match retry {
                 Some(rc) => {
                     let provider = Arc::new(RetryingProvider::new(base, rc));
-                    build_orchestrator_from_config(provider, &config, task, on_text).await?
+                    build_orchestrator_from_config(
+                        provider,
+                        &config,
+                        task,
+                        on_text,
+                        on_approval.clone(),
+                    )
+                    .await?
                 }
                 None => {
                     let provider = Arc::new(base);
-                    build_orchestrator_from_config(provider, &config, task, on_text).await?
+                    build_orchestrator_from_config(
+                        provider,
+                        &config,
+                        task,
+                        on_text,
+                        on_approval.clone(),
+                    )
+                    .await?
                 }
             };
             print_streaming_stats(&output);
@@ -226,11 +266,16 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
     config: &HeartbitConfig,
     task: &str,
     on_text: Arc<OnText>,
+    on_approval: Option<Arc<OnApproval>>,
 ) -> Result<AgentOutput> {
     let mut builder = Orchestrator::builder(provider)
         .max_turns(config.orchestrator.max_turns)
         .max_tokens(config.orchestrator.max_tokens)
         .on_text(on_text);
+
+    if let Some(cb) = on_approval {
+        builder = builder.on_approval(cb);
+    }
 
     for agent in &config.agents {
         let tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
@@ -304,7 +349,7 @@ async fn load_mcp_tools(agent_name: &str, mcp_servers: &[String]) -> Vec<Arc<dyn
     tools
 }
 
-async fn run_from_env(task: &str) -> Result<()> {
+async fn run_from_env(task: &str, approve: bool) -> Result<()> {
     let provider_name = std::env::var("HEARTBIT_PROVIDER").unwrap_or_else(|_| {
         if std::env::var("OPENROUTER_API_KEY").is_ok() {
             "openrouter".into()
@@ -314,6 +359,11 @@ async fn run_from_env(task: &str) -> Result<()> {
     });
 
     let on_text = streaming_callback();
+    let on_approval = if approve {
+        Some(approval_callback())
+    } else {
+        None
+    };
 
     match provider_name.as_str() {
         "anthropic" => {
@@ -324,7 +374,8 @@ async fn run_from_env(task: &str) -> Result<()> {
             let provider = Arc::new(RetryingProvider::with_defaults(AnthropicProvider::new(
                 api_key, model,
             )));
-            let output = run_default_orchestrator(provider, task, on_text).await?;
+            let output =
+                run_default_orchestrator(provider, task, on_text, on_approval.clone()).await?;
             print_streaming_stats(&output);
         }
         "openrouter" => {
@@ -335,7 +386,8 @@ async fn run_from_env(task: &str) -> Result<()> {
             let provider = Arc::new(RetryingProvider::with_defaults(OpenRouterProvider::new(
                 api_key, model,
             )));
-            let output = run_default_orchestrator(provider, task, on_text).await?;
+            let output =
+                run_default_orchestrator(provider, task, on_text, on_approval.clone()).await?;
             print_streaming_stats(&output);
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
@@ -348,9 +400,15 @@ async fn run_default_orchestrator<P: LlmProvider + 'static>(
     provider: Arc<P>,
     task: &str,
     on_text: Arc<OnText>,
+    on_approval: Option<Arc<OnApproval>>,
 ) -> Result<AgentOutput> {
-    let orchestrator = Orchestrator::builder(provider)
-        .on_text(on_text)
+    let mut builder = Orchestrator::builder(provider).on_text(on_text);
+
+    if let Some(cb) = on_approval {
+        builder = builder.on_approval(cb);
+    }
+
+    let orchestrator = builder
         .sub_agent(
             "researcher",
             "Research specialist who gathers information and facts",
@@ -384,6 +442,31 @@ fn streaming_callback() -> Arc<OnText> {
         use std::io::Write;
         print!("{text}");
         std::io::stdout().flush().ok();
+    })
+}
+
+/// Create an interactive approval callback that prompts on stderr.
+fn approval_callback() -> Arc<OnApproval> {
+    Arc::new(|tool_calls: &[ToolCall]| {
+        use std::io::Write;
+        eprintln!("\n--- Approval Required ---");
+        for tc in tool_calls {
+            eprintln!("  Tool: {}", tc.name);
+            if let Ok(pretty) = serde_json::to_string_pretty(&tc.input) {
+                for line in pretty.lines() {
+                    eprintln!("    {line}");
+                }
+            }
+        }
+        eprint!("Approve? [Y/n] ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return false;
+        }
+        let trimmed = input.trim().to_lowercase();
+        trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
     })
 }
 

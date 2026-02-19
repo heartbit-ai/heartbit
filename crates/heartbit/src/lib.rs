@@ -13,6 +13,7 @@ pub use agent::{AgentOutput, AgentRunner};
 pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig, RetryProviderConfig};
 pub use error::Error;
 pub use llm::LlmProvider;
+pub use llm::OnApproval;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::openrouter::OpenRouterProvider;
