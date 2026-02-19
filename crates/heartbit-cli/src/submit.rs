@@ -277,5 +277,6 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         max_tool_output_bytes: config.max_tool_output_bytes,
         max_turns: config.max_turns,
         max_tokens: config.max_tokens,
+        response_schema: None,
     }
 }

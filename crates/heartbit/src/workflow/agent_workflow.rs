@@ -8,6 +8,8 @@ use crate::llm::types::{ContentBlock, Message, Role, StopReason, TokenUsage};
 
 use super::agent_service::AgentServiceClient;
 use super::budget::TokenBudgetObjectClient;
+use crate::llm::types::ToolDefinition;
+
 use super::types::{
     AgentResult, AgentStatus, AgentTask, HumanDecision, LlmCallRequest, ToolCallRequest,
     ToolCallResponse,
@@ -42,7 +44,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
     ) -> Result<Json<AgentResult>, HandlerError> {
         // Auto-discover tools from AgentService if none were provided.
         // The list_tools() call is journaled by Restate, so replay is deterministic.
-        let tool_defs = if task.tool_defs.is_empty() {
+        let mut tool_defs = if task.tool_defs.is_empty() {
             match ctx
                 .service_client::<AgentServiceClient>()
                 .list_tools()
@@ -58,6 +60,18 @@ impl AgentWorkflow for AgentWorkflowImpl {
         } else {
             task.tool_defs.clone()
         };
+
+        // Inject __respond__ tool for structured output if response_schema is set.
+        if let Some(ref schema) = task.response_schema {
+            tool_defs.push(ToolDefinition {
+                name: "__respond__".into(),
+                description: "Produce your final structured response. Call this tool when you \
+                              have gathered all necessary information and are ready to return \
+                              your answer in the required format."
+                    .into(),
+                input_schema: schema.clone(),
+            });
+        }
 
         // Build allowed-tool set for per-agent scoping. Prevents an agent
         // from executing tools assigned to other agents even if the LLM
@@ -140,6 +154,21 @@ impl AgentWorkflow for AgentWorkflowImpl {
             // Execute tool calls — each is a durable activity
             let tool_calls = extract_tool_calls(&llm_response.content);
             total_tool_calls += tool_calls.len();
+
+            // Intercept __respond__ for structured output (before dispatching to AgentService).
+            if task.response_schema.is_some()
+                && let Some((_id, _name, input)) =
+                    tool_calls.iter().find(|(_, name, _)| name == "__respond__")
+            {
+                let text =
+                    serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+                ctx.set("state", "completed".to_string());
+                return Ok(Json(AgentResult {
+                    text,
+                    tokens: total_usage,
+                    tool_calls_made: total_tool_calls,
+                }));
+            }
 
             // Human-in-the-loop gate: await approval before executing tools.
             // Each turn gets a unique promise key so that approvals are

@@ -122,6 +122,10 @@ pub struct AgentTask {
     /// truncated with a `[truncated]` suffix.
     #[serde(default)]
     pub max_tool_output_bytes: Option<usize>,
+    /// Optional JSON Schema for structured output. When set, a synthetic
+    /// `__respond__` tool is injected and the agent returns structured JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// Result from an agent workflow.
@@ -180,6 +184,10 @@ pub struct AgentDef {
     /// Per-agent token limit. Overrides orchestrator default when set.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Optional JSON Schema for structured output. When set, the agent
+    /// returns structured JSON conforming to the schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// Result from the orchestrator workflow.
@@ -385,6 +393,7 @@ mod tests {
             summarize_threshold: None,
             tool_timeout_seconds: None,
             max_tool_output_bytes: None,
+            response_schema: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -433,6 +442,7 @@ mod tests {
                 max_tool_output_bytes: None,
                 max_turns: None,
                 max_tokens: None,
+                response_schema: None,
             }],
             max_turns: 10,
             max_tokens: 8192,
@@ -472,6 +482,60 @@ mod tests {
         let parsed: HumanDecision = serde_json::from_str(json).unwrap();
         assert!(parsed.approved);
         assert!(parsed.turn.is_none());
+    }
+
+    #[test]
+    fn agent_task_response_schema_roundtrips() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+        let task = AgentTask {
+            input: "test".into(),
+            system_prompt: "sys".into(),
+            tool_defs: vec![],
+            max_turns: 5,
+            max_tokens: 1024,
+            approval_required: false,
+            context_window_tokens: None,
+            summarize_threshold: None,
+            tool_timeout_seconds: None,
+            max_tool_output_bytes: None,
+            response_schema: Some(schema.clone()),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let parsed: AgentTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.response_schema, Some(schema));
+    }
+
+    #[test]
+    fn agent_task_response_schema_defaults_to_none() {
+        let json =
+            r#"{"input":"x","system_prompt":"y","tool_defs":[],"max_turns":5,"max_tokens":1024}"#;
+        let parsed: AgentTask = serde_json::from_str(json).unwrap();
+        assert!(parsed.response_schema.is_none());
+    }
+
+    #[test]
+    fn agent_def_response_schema_roundtrips() {
+        let schema = serde_json::json!({"type": "object"});
+        let def = AgentDef {
+            name: "test".into(),
+            description: "Test".into(),
+            system_prompt: "sys".into(),
+            tool_defs: vec![],
+            context_window_tokens: None,
+            summarize_threshold: None,
+            tool_timeout_seconds: None,
+            max_tool_output_bytes: None,
+            max_turns: None,
+            max_tokens: None,
+            response_schema: Some(schema.clone()),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let parsed: AgentDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.response_schema, Some(schema));
     }
 
     // DynLlmProvider tests are in llm/mod.rs (canonical location)

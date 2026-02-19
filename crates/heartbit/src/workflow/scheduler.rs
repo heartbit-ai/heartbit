@@ -115,6 +115,7 @@ mod tests {
                 max_tool_output_bytes: None,
                 max_turns: None,
                 max_tokens: None,
+                response_schema: None,
             }],
             max_turns: 10,
             max_tokens: 4096,

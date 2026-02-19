@@ -256,6 +256,7 @@ async fn execute_delegation(
                 summarize_threshold: agent_def.summarize_threshold,
                 tool_timeout_seconds: agent_def.tool_timeout_seconds,
                 max_tool_output_bytes: agent_def.max_tool_output_bytes,
+                response_schema: agent_def.response_schema.clone(),
             }))
             .call()
             .await;

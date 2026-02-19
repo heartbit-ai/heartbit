@@ -25,6 +25,9 @@ pub struct AgentOutput {
     pub result: String,
     pub tool_calls_made: usize,
     pub tokens_used: TokenUsage,
+    /// Structured output when the agent was configured with a response schema.
+    /// Contains the validated JSON conforming to the schema.
+    pub structured: Option<serde_json::Value>,
 }
 
 /// Runs an agent loop: LLM call → tool execution → repeat until done.
@@ -48,6 +51,9 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Optional maximum byte size for tool output content. Oversized results
     /// are truncated with a `[truncated: N bytes omitted]` suffix.
     max_tool_output_bytes: Option<usize>,
+    /// When set, a synthetic `respond` tool is injected with this JSON Schema.
+    /// The agent calls `respond` to produce structured output conforming to the schema.
+    structured_schema: Option<serde_json::Value>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -66,6 +72,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             on_approval: None,
             tool_timeout: None,
             max_tool_output_bytes: None,
+            structured_schema: None,
         }
     }
 
@@ -104,6 +111,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 content: response.content,
             });
 
+            // Check for structured output: if the LLM called the synthetic `__respond__` tool,
+            // extract its input as the structured result and return immediately.
+            if self.structured_schema.is_some()
+                && let Some(respond_call) = tool_calls.iter().find(|tc| tc.name == "__respond__")
+            {
+                let structured = respond_call.input.clone();
+                let text = serde_json::to_string_pretty(&structured)
+                    .unwrap_or_else(|_| structured.to_string());
+                total_tool_calls += 1;
+                return Ok(AgentOutput {
+                    result: text,
+                    tool_calls_made: total_tool_calls,
+                    tokens_used: total_usage,
+                    structured: Some(structured),
+                });
+            }
+
             if tool_calls.is_empty() {
                 // Check for truncation
                 if response.stop_reason == StopReason::MaxTokens {
@@ -114,6 +138,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     result: ctx.last_assistant_text().unwrap_or_default().to_string(),
                     tool_calls_made: total_tool_calls,
                     tokens_used: total_usage,
+                    structured: None,
                 });
             }
 
@@ -268,6 +293,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     tool_timeout: Option<Duration>,
     max_tool_output_bytes: Option<usize>,
+    structured_schema: Option<serde_json::Value>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -364,6 +390,16 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a JSON Schema for structured output. The agent will receive a
+    /// synthetic `__respond__` tool with this schema. When the LLM calls
+    /// `__respond__`, its input is extracted as `AgentOutput::structured`.
+    ///
+    /// The agent can still use regular tools before producing output.
+    pub fn structured_schema(mut self, schema: serde_json::Value) -> Self {
+        self.structured_schema = Some(schema);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
@@ -391,6 +427,20 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tools.insert(def.name, t);
         }
 
+        // Inject the synthetic __respond__ tool for structured output.
+        // Only the ToolDefinition is added — there's no Tool impl because
+        // the execute loop intercepts __respond__ calls before tool dispatch.
+        if let Some(ref schema) = self.structured_schema {
+            tool_defs.push(ToolDefinition {
+                name: "__respond__".into(),
+                description: "Produce your final structured response. Call this tool when you \
+                              have gathered all necessary information and are ready to return \
+                              your answer in the required format."
+                    .into(),
+                input_schema: schema.clone(),
+            });
+        }
+
         Ok(AgentRunner {
             provider: self.provider,
             name: self.name,
@@ -405,6 +455,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             on_approval: self.on_approval,
             tool_timeout: self.tool_timeout,
             max_tool_output_bytes: self.max_tool_output_bytes,
+            structured_schema: self.structured_schema,
         })
     }
 }
@@ -1303,6 +1354,152 @@ mod tests {
         let output = runner.execute("get big data").await.unwrap();
         assert_eq!(output.result, "Got truncated result.");
         assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn structured_output_extracts_respond_tool() {
+        // When structured_schema is set, __respond__ tool call returns structured output
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "confidence": {"type": "number"}
+            },
+            "required": ["answer", "confidence"]
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "__respond__".into(),
+                input: json!({"answer": "42", "confidence": 0.95}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens: 20,
+                output_tokens: 15,
+            },
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("You are helpful.")
+            .structured_schema(schema)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("what is the answer?").await.unwrap();
+        assert!(output.structured.is_some());
+        let structured = output.structured.unwrap();
+        assert_eq!(structured["answer"], "42");
+        assert_eq!(structured["confidence"], 0.95);
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn structured_output_none_without_schema() {
+        // Without structured_schema, output.structured is always None
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Hello!".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert!(output.structured.is_none());
+    }
+
+    #[tokio::test]
+    async fn structured_output_allows_real_tools_first() {
+        // Agent uses a regular tool, then calls __respond__ on the next turn
+        let schema = json!({
+            "type": "object",
+            "properties": { "result": {"type": "string"} },
+            "required": ["result"]
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // Turn 1: Use a real tool
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({"q": "data"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            // Turn 2: Call __respond__ with structured output
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "__respond__".into(),
+                    input: json!({"result": "found it"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "search results")))
+            .structured_schema(schema)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("find data").await.unwrap();
+        assert!(output.structured.is_some());
+        assert_eq!(output.structured.unwrap()["result"], "found it");
+        // 1 real tool call + 1 __respond__ call
+        assert_eq!(output.tool_calls_made, 2);
+    }
+
+    #[test]
+    fn structured_schema_injects_respond_tool_definition() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "answer": {"type": "string"} }
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .structured_schema(schema.clone())
+            .build()
+            .unwrap();
+
+        // __respond__ should be in tool_defs but NOT in the tools HashMap
+        assert!(runner.tool_defs.iter().any(|d| d.name == "__respond__"));
+        assert!(!runner.tools.contains_key("__respond__"));
+        let respond_def = runner
+            .tool_defs
+            .iter()
+            .find(|d| d.name == "__respond__")
+            .unwrap();
+        assert_eq!(respond_def.input_schema, schema);
+    }
+
+    #[test]
+    fn no_respond_tool_without_schema() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .build()
+            .unwrap();
+
+        assert!(!runner.tool_defs.iter().any(|d| d.name == "__respond__"));
     }
 
     #[tokio::test]
