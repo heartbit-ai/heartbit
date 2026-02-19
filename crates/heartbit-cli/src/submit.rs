@@ -260,9 +260,7 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         Some(heartbit::ContextStrategyConfig::SlidingWindow { max_tokens }) => {
             (Some(*max_tokens), None)
         }
-        Some(heartbit::ContextStrategyConfig::Summarize { max_tokens }) => {
-            (None, Some(*max_tokens))
-        }
+        Some(heartbit::ContextStrategyConfig::Summarize { threshold }) => (None, Some(*threshold)),
         _ => (None, None),
     };
 

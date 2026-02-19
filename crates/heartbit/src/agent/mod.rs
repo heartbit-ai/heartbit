@@ -93,13 +93,15 @@ impl<P: LlmProvider> AgentRunner<P> {
 
             ctx.increment_turn();
             debug!(agent = %self.name, turn = ctx.current_turn(), "executing turn");
+            let mut request = ctx.to_request();
+            // Force tool use when structured output is configured so the LLM
+            // cannot bypass __respond__ by returning plain text.
+            if self.structured_schema.is_some() {
+                request.tool_choice = Some(crate::llm::types::ToolChoice::Any);
+            }
             let response = match &self.on_text {
-                Some(cb) => {
-                    self.provider
-                        .stream_complete(ctx.to_request(), &**cb)
-                        .await?
-                }
-                None => self.provider.complete(ctx.to_request()).await?,
+                Some(cb) => self.provider.stream_complete(request, &**cb).await?,
+                None => self.provider.complete(request).await?,
             };
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
@@ -135,6 +137,17 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // Check for truncation
                 if response.stop_reason == StopReason::MaxTokens {
                     return Err(Error::Truncated);
+                }
+
+                // Structured output was requested but LLM returned text without
+                // calling __respond__. This is a contract violation — the caller
+                // expects structured output but would get None silently.
+                if self.structured_schema.is_some() {
+                    return Err(Error::Agent(
+                        "LLM returned text without calling __respond__; \
+                         structured output was not produced"
+                            .into(),
+                    ));
                 }
 
                 return Ok(AgentOutput {
@@ -176,14 +189,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                 && ctx.needs_compaction(threshold)
             {
                 debug!(agent = %self.name, "context exceeds threshold, summarizing");
-                let summary = self.generate_summary(&ctx).await?;
-                ctx.inject_summary(summary, 4);
+                if let Some(summary) = self.generate_summary(&ctx).await? {
+                    ctx.inject_summary(summary, 4);
+                }
             }
         }
     }
 
     /// Generate a summary of the conversation so far using the LLM.
-    async fn generate_summary(&self, ctx: &AgentContext) -> Result<String, Error> {
+    ///
+    /// Returns `None` if the summary was truncated (MaxTokens), in which case
+    /// the caller should skip compaction to avoid injecting a partial summary.
+    async fn generate_summary(&self, ctx: &AgentContext) -> Result<Option<String>, Error> {
         let summary_request = CompletionRequest {
             system: "You are a summarization assistant. Summarize the following conversation \
                      concisely, preserving key facts, decisions, and tool results. \
@@ -196,7 +213,14 @@ impl<P: LlmProvider> AgentRunner<P> {
         };
 
         let response = self.provider.complete(summary_request).await?;
-        Ok(response.text())
+        if response.stop_reason == StopReason::MaxTokens {
+            tracing::warn!(
+                agent = %self.name,
+                "summarization truncated (max_tokens reached), skipping compaction"
+            );
+            return Ok(None);
+        }
+        Ok(Some(response.text()))
     }
 
     /// Execute tools in parallel via JoinSet, returning results in original call order.
@@ -1651,5 +1675,94 @@ mod tests {
         let json_str = serde_json::to_string(&output).unwrap();
         let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
         assert!(parsed.structured.is_none());
+    }
+
+    #[tokio::test]
+    async fn structured_output_errors_when_llm_ignores_respond() {
+        // When structured_schema is set but LLM returns text without calling
+        // __respond__, the agent should return an error (not silently succeed
+        // with structured: None).
+        let schema = json!({
+            "type": "object",
+            "properties": { "answer": {"type": "string"} },
+            "required": ["answer"]
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // LLM ignores __respond__ and returns plain text
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Here is the answer.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .structured_schema(schema)
+            .build()
+            .unwrap();
+
+        let err = runner.execute("test").await.unwrap_err();
+        assert!(
+            err.to_string().contains("__respond__"),
+            "error should mention __respond__: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_output_forces_tool_choice_any() {
+        // Verify that structured_schema causes tool_choice to be set
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ToolChoiceTracker {
+            tool_choice_any_seen: Arc<AtomicBool>,
+        }
+
+        impl LlmProvider for ToolChoiceTracker {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                if request.tool_choice == Some(crate::llm::types::ToolChoice::Any) {
+                    self.tool_choice_any_seen.store(true, Ordering::SeqCst);
+                }
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "__respond__".into(),
+                        input: json!({"answer": "42"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(ToolChoiceTracker {
+            tool_choice_any_seen: seen.clone(),
+        });
+
+        let schema = json!({
+            "type": "object",
+            "properties": { "answer": {"type": "string"} }
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .structured_schema(schema)
+            .build()
+            .unwrap();
+
+        runner.execute("test").await.unwrap();
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "tool_choice should have been set to Any"
+        );
     }
 }

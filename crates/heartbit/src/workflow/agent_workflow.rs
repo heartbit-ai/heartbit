@@ -104,7 +104,13 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     messages: request_messages,
                     tools: tool_defs.clone(),
                     max_tokens: task.max_tokens,
-                    tool_choice: None,
+                    // Force tool use when structured output is configured so the
+                    // LLM cannot bypass __respond__ by returning plain text.
+                    tool_choice: if task.response_schema.is_some() {
+                        Some(crate::llm::types::ToolChoice::Any)
+                    } else {
+                        None
+                    },
                 }))
                 .call()
                 .await?;
@@ -141,6 +147,17 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     return Err(
                         TerminalError::new("Response truncated (max_tokens reached)").into(),
                     );
+                }
+
+                // Structured output was requested but LLM returned text without
+                // calling __respond__. This is a contract violation.
+                if task.response_schema.is_some() {
+                    ctx.set("state", "error".to_string());
+                    return Err(TerminalError::new(
+                        "LLM returned text without calling __respond__; \
+                         structured output was not produced",
+                    )
+                    .into());
                 }
 
                 ctx.set("state", "completed".to_string());
@@ -272,7 +289,6 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         .await?
                         .into_inner();
 
-                    let summary = summary_resp.text();
                     total_usage.input_tokens += summary_resp.usage.input_tokens;
                     total_usage.output_tokens += summary_resp.usage.output_tokens;
 
@@ -290,8 +306,17 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         return Err(e.into());
                     }
 
-                    // Merge summary into first message, keep last 4
-                    inject_summary_into_messages(&mut messages, &task.input, &summary, 4);
+                    // Skip compaction if summary was truncated (MaxTokens) to
+                    // avoid injecting a partial summary that corrupts context.
+                    if summary_resp.stop_reason == StopReason::MaxTokens {
+                        tracing::warn!(
+                            "summarization truncated (max_tokens reached), skipping compaction"
+                        );
+                    } else {
+                        let summary = summary_resp.text();
+                        // Merge summary into first message, keep last 4
+                        inject_summary_into_messages(&mut messages, &task.input, &summary, 4);
+                    }
                 }
             }
         }

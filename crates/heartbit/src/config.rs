@@ -84,8 +84,8 @@ pub enum ContextStrategyConfig {
     Unlimited,
     /// Sliding window: trim old messages to stay within `max_tokens`.
     SlidingWindow { max_tokens: u32 },
-    /// Summarize: compress old messages when exceeding `max_tokens`.
-    Summarize { max_tokens: u32 },
+    /// Summarize: compress old messages when context exceeds `threshold` tokens.
+    Summarize { threshold: u32 },
 }
 
 /// A sub-agent defined in the configuration file.
@@ -180,12 +180,15 @@ impl HeartbitConfig {
             }
             // Validate context strategy max_tokens > 0
             match &agent.context_strategy {
-                Some(ContextStrategyConfig::SlidingWindow { max_tokens })
-                | Some(ContextStrategyConfig::Summarize { max_tokens })
-                    if *max_tokens == 0 =>
-                {
+                Some(ContextStrategyConfig::SlidingWindow { max_tokens }) if *max_tokens == 0 => {
                     return Err(Error::Config(format!(
                         "agent '{}': context_strategy.max_tokens must be at least 1",
+                        agent.name
+                    )));
+                }
+                Some(ContextStrategyConfig::Summarize { threshold }) if *threshold == 0 => {
+                    return Err(Error::Config(format!(
+                        "agent '{}': context_strategy.threshold must be at least 1",
                         agent.name
                     )));
                 }
@@ -400,12 +403,12 @@ model = "claude-sonnet-4-20250514"
 name = "test"
 description = "Test"
 system_prompt = "You test."
-context_strategy = { type = "summarize", max_tokens = 80000 }
+context_strategy = { type = "summarize", threshold = 80000 }
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert_eq!(
             config.agents[0].context_strategy,
-            Some(ContextStrategyConfig::Summarize { max_tokens: 80000 })
+            Some(ContextStrategyConfig::Summarize { threshold: 80000 })
         );
     }
 
@@ -788,7 +791,7 @@ context_strategy = { type = "sliding_window", max_tokens = 0 }
     }
 
     #[test]
-    fn zero_summarize_max_tokens_rejected() {
+    fn zero_summarize_threshold_rejected() {
         let toml = r#"
 [provider]
 name = "anthropic"
@@ -798,12 +801,12 @@ model = "claude-sonnet-4-20250514"
 name = "test"
 description = "Test"
 system_prompt = "You test."
-context_strategy = { type = "summarize", max_tokens = 0 }
+context_strategy = { type = "summarize", threshold = 0 }
 "#;
         let err = HeartbitConfig::from_toml(toml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("context_strategy.max_tokens must be at least 1"),
+            msg.contains("context_strategy.threshold must be at least 1"),
             "error: {msg}"
         );
     }

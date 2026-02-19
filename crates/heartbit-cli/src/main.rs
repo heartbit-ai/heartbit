@@ -282,7 +282,7 @@ async fn build_orchestrator_from_config(
                 }),
                 None,
             ),
-            Some(ContextStrategyConfig::Summarize { max_tokens }) => (None, Some(*max_tokens)),
+            Some(ContextStrategyConfig::Summarize { threshold }) => (None, Some(*threshold)),
             Some(ContextStrategyConfig::Unlimited) | None => (None, None),
         };
 
