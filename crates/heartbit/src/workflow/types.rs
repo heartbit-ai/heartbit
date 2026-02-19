@@ -174,6 +174,12 @@ pub struct AgentDef {
     /// Maximum byte size for individual tool output.
     #[serde(default)]
     pub max_tool_output_bytes: Option<usize>,
+    /// Per-agent turn limit. Overrides orchestrator default when set.
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+    /// Per-agent token limit. Overrides orchestrator default when set.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 /// Result from the orchestrator workflow.
@@ -425,6 +431,8 @@ mod tests {
                 summarize_threshold: None,
                 tool_timeout_seconds: None,
                 max_tool_output_bytes: None,
+                max_turns: None,
+                max_tokens: None,
             }],
             max_turns: 10,
             max_tokens: 8192,

@@ -103,6 +103,10 @@ pub struct AgentConfig {
     /// Maximum byte size for individual tool output. Results exceeding this
     /// limit are truncated with a `[truncated]` suffix.
     pub max_tool_output_bytes: Option<usize>,
+    /// Per-agent turn limit. Overrides the orchestrator default when set.
+    pub max_turns: Option<usize>,
+    /// Per-agent token limit. Overrides the orchestrator default when set.
+    pub max_tokens: Option<u32>,
 }
 
 /// Memory configuration for the orchestrator.
@@ -182,6 +186,18 @@ impl HeartbitConfig {
                     )));
                 }
                 _ => {}
+            }
+            if agent.max_turns == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': max_turns must be at least 1",
+                    agent.name
+                )));
+            }
+            if agent.max_tokens == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': max_tokens must be at least 1",
+                    agent.name
+                )));
             }
         }
         Ok(())
@@ -542,6 +558,96 @@ system_prompt = "You test."
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert!(config.agents[0].max_tool_output_bytes.is_none());
+    }
+
+    #[test]
+    fn parse_per_agent_max_turns() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "browser"
+description = "Browser"
+system_prompt = "Browse."
+max_turns = 20
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(config.agents[0].max_turns, Some(20));
+    }
+
+    #[test]
+    fn parse_per_agent_max_tokens() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "writer"
+description = "Writer"
+system_prompt = "Write."
+max_tokens = 16384
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(config.agents[0].max_tokens, Some(16384));
+    }
+
+    #[test]
+    fn per_agent_limits_default_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.agents[0].max_turns.is_none());
+        assert!(config.agents[0].max_tokens.is_none());
+    }
+
+    #[test]
+    fn per_agent_zero_max_turns_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+max_turns = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_turns must be at least 1"), "error: {msg}");
+    }
+
+    #[test]
+    fn per_agent_zero_max_tokens_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+max_tokens = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokens must be at least 1"),
+            "error: {msg}"
+        );
     }
 
     #[test]

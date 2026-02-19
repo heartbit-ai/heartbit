@@ -22,6 +22,8 @@ When given a URL, navigate to it first, then gather the requested information. \
 Be thorough — take both a snapshot (for text content) and a screenshot (for visual layout). \
 Report what you find clearly and factually."""
 mcp_servers = ["http://localhost:8001/mcp"]
+max_turns = 20        # browser needs more turns than default
+max_tokens = 16384    # larger context for page content
 
 [[agents]]
 name = "analyst"
@@ -38,6 +40,7 @@ Your job is to take information and analysis and write well-structured reports, 
 Use the write_file tool to save reports to the workspace. Use markdown format for reports. \
 Always confirm what file you wrote and its path."""
 mcp_servers = ["http://localhost:8000/mcp"]
+max_turns = 3         # writing is quick
 
 # Uncomment when Restate is set up
 # [restate]

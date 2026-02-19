@@ -275,5 +275,7 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         summarize_threshold,
         tool_timeout_seconds: config.tool_timeout_seconds,
         max_tool_output_bytes: config.max_tool_output_bytes,
+        max_turns: config.max_turns,
+        max_tokens: config.max_tokens,
     }
 }

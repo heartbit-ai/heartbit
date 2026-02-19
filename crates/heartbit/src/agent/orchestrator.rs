@@ -28,6 +28,10 @@ pub(crate) struct SubAgentDef {
     pub(crate) summarize_threshold: Option<u32>,
     pub(crate) tool_timeout: Option<Duration>,
     pub(crate) max_tool_output_bytes: Option<usize>,
+    /// Per-agent turn limit. When `None`, uses orchestrator default.
+    pub(crate) max_turns: Option<usize>,
+    /// Per-agent token limit. When `None`, uses orchestrator default.
+    pub(crate) max_tokens: Option<u32>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -150,8 +154,8 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             };
 
             let provider = self.provider.clone();
-            let max_turns = self.max_turns;
-            let max_tokens = self.max_tokens;
+            let max_turns = agent_def.max_turns.unwrap_or(self.max_turns);
+            let max_tokens = agent_def.max_tokens.unwrap_or(self.max_tokens);
             let shared_memory = self.shared_memory.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
@@ -375,6 +379,10 @@ pub struct SubAgentConfig {
     pub summarize_threshold: Option<u32>,
     pub tool_timeout: Option<Duration>,
     pub max_tool_output_bytes: Option<usize>,
+    /// Per-agent turn limit. When `None`, uses orchestrator default.
+    pub max_turns: Option<usize>,
+    /// Per-agent token limit. When `None`, uses orchestrator default.
+    pub max_tokens: Option<u32>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -403,6 +411,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             summarize_threshold: None,
             tool_timeout: None,
             max_tool_output_bytes: None,
+            max_turns: None,
+            max_tokens: None,
         });
         self
     }
@@ -423,6 +433,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             summarize_threshold: None,
             tool_timeout: None,
             max_tool_output_bytes: None,
+            max_turns: None,
+            max_tokens: None,
         });
         self
     }
@@ -437,6 +449,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             summarize_threshold: def.summarize_threshold,
             tool_timeout: def.tool_timeout,
             max_tool_output_bytes: def.max_tool_output_bytes,
+            max_turns: def.max_turns,
+            max_tokens: def.max_tokens,
         });
         self
     }
@@ -587,6 +601,8 @@ mod tests {
                 summarize_threshold: None,
                 tool_timeout: None,
                 max_tool_output_bytes: None,
+                max_turns: None,
+                max_tokens: None,
             }],
             shared_memory: None,
             max_turns: 10,
