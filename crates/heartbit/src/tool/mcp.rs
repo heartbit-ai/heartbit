@@ -297,6 +297,9 @@ impl McpSession {
             )));
         }
 
+        // Consume the response body to allow HTTP connection reuse
+        let _ = response.bytes().await;
+
         Ok(())
     }
 

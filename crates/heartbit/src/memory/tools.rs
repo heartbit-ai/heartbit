@@ -435,10 +435,11 @@ impl Tool for MemoryConsolidateTool {
             }
 
             if deleted == 0 {
-                return Ok(ToolOutput::error(format!(
-                    "None of the source memories were found. \
-                     Consolidated entry {new_id} was created but no sources were removed."
-                )));
+                // Clean up the orphaned consolidated entry
+                let _ = self.memory.forget(&new_id).await;
+                return Ok(ToolOutput::error(
+                    "None of the source memories were found. No consolidation performed.",
+                ));
             }
 
             let mut msg = format!("Consolidated {deleted} memories into new memory: {new_id}");
@@ -868,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn consolidate_tool_all_not_found() {
-        let (_store, tools) = setup();
+        let (store, tools) = setup();
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         let result = consolidate_tool
@@ -884,6 +885,16 @@ mod tests {
                 .content
                 .contains("None of the source memories were found")
         );
+
+        // Verify the orphaned consolidated entry was cleaned up
+        let all = store
+            .recall(MemoryQuery {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(all.is_empty(), "orphaned entry should have been cleaned up");
     }
 
     #[tokio::test]
