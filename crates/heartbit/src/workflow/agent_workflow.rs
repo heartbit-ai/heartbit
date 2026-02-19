@@ -225,8 +225,12 @@ impl AgentWorkflow for AgentWorkflowImpl {
         ctx: SharedWorkflowContext<'_>,
         Json(decision): Json<HumanDecision>,
     ) -> Result<(), HandlerError> {
-        // Resolve the promise for the turn currently awaiting approval.
-        let turn = ctx.get::<u64>("approval_turn").await?.unwrap_or(0);
+        // Use the explicit turn from the decision if provided (avoids TOCTOU race),
+        // otherwise fall back to reading the current approval_turn from state.
+        let turn = match decision.turn {
+            Some(t) => t,
+            None => ctx.get::<u64>("approval_turn").await?.unwrap_or(0),
+        };
         let promise_key = format!("approval-turn-{turn}");
         ctx.resolve_promise::<Json<HumanDecision>>(&promise_key, Json(decision));
         Ok(())

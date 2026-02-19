@@ -74,6 +74,11 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
     }
 
     pub async fn run(&self, task: &str) -> Result<AgentOutput, Error> {
+        // Reset sub-agent token accumulator so repeated calls don't inflate counts
+        {
+            let mut acc = self.sub_agent_tokens.lock().expect("token lock poisoned");
+            *acc = TokenUsage::default();
+        }
         let mut output = self.runner.execute(task).await?;
         // Add sub-agent tokens that were accumulated during delegation
         let sub_tokens = self.sub_agent_tokens.lock().expect("token lock poisoned");
@@ -157,7 +162,19 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                     ));
                 }
 
-                let runner = builder.build();
+                let runner = match builder.build() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return (
+                            idx,
+                            SubAgentResult {
+                                agent: agent_def.name,
+                                result: format!("Error building agent: {e}"),
+                                tokens_used: TokenUsage::default(),
+                            },
+                        );
+                    }
+                };
 
                 let result = match runner.execute(&task.task).await {
                     Ok(output) => SubAgentResult {
@@ -381,7 +398,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
-    pub fn build(self) -> Orchestrator<P> {
+    pub fn build(self) -> Result<Orchestrator<P>, Error> {
+        if self.sub_agents.is_empty() {
+            tracing::warn!(
+                "orchestrator built with no sub-agents — delegate_task tool will list no agents"
+            );
+        }
+
         let pairs: Vec<(&str, &str)> = self
             .sub_agents
             .iter()
@@ -406,12 +429,12 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .tool(delegate_tool)
             .max_turns(self.max_turns)
             .max_tokens(self.max_tokens)
-            .build();
+            .build()?;
 
-        Orchestrator {
+        Ok(Orchestrator {
             runner,
             sub_agent_tokens,
-        }
+        })
     }
 }
 
@@ -504,7 +527,8 @@ mod tests {
 
         let orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
-            .build();
+            .build()
+            .unwrap();
 
         let output = orch.run("simple question").await.unwrap();
         assert_eq!(output.result, "Simple answer.");
@@ -573,7 +597,8 @@ mod tests {
         let orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research specialist", "You research.")
             .sub_agent("analyst", "Analysis expert", "You analyze.")
-            .build();
+            .build()
+            .unwrap();
 
         let output = orch.run("Analyze Rust").await.unwrap();
         assert_eq!(output.result, "Based on research: Rust is excellent.");
@@ -610,7 +635,8 @@ mod tests {
 
         let orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
-            .build();
+            .build()
+            .unwrap();
 
         let output = orch.run("delegate to unknown").await.unwrap();
         assert_eq!(output.result, "No such agent available.");
@@ -639,7 +665,8 @@ mod tests {
 
         let orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
-            .build();
+            .build()
+            .unwrap();
 
         let output = orch.run("do something").await.unwrap();
         assert_eq!(output.result, "Sorry, let me respond directly.");

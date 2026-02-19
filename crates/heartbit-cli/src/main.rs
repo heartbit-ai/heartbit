@@ -239,7 +239,7 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
         builder = builder.shared_memory(memory);
     }
 
-    let orchestrator = builder.build();
+    let orchestrator = builder.build()?;
     let output = orchestrator.run(task).await?;
     Ok(output)
 }
@@ -330,7 +330,7 @@ async fn run_default_orchestrator<P: LlmProvider + 'static>(
              and produce clear, well-structured, and engaging output. Focus on clarity, \
              organization, and readability.",
         )
-        .build();
+        .build()?;
 
     let output = orchestrator.run(task).await?;
     Ok(output)

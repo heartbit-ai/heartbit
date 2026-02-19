@@ -59,10 +59,13 @@ impl Memory for InMemoryStore {
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
         Box::pin(async move {
-            let entries = self
+            // Use write lock throughout to atomically filter, sort, and update access counts.
+            let mut entries = self
                 .entries
-                .read()
+                .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+
+            let has_text_query = query.text.is_some();
 
             let mut results: Vec<MemoryEntry> = entries
                 .values()
@@ -93,7 +96,6 @@ impl Memory for InMemoryStore {
 
             // Sort by composite score descending (recency + importance + relevance)
             let now = Utc::now();
-            let has_text_query = query.text.is_some();
             results.sort_by(|a, b| {
                 let relevance_a = if has_text_query { 1.0 } else { 0.0 };
                 let relevance_b = if has_text_query { 1.0 } else { 0.0 };
@@ -120,14 +122,11 @@ impl Memory for InMemoryStore {
                 results.truncate(query.limit);
             }
 
-            // Update access counts for returned entries
-            drop(entries);
-            if let Ok(mut write_entries) = self.entries.write() {
-                for r in &results {
-                    if let Some(e) = write_entries.get_mut(&r.id) {
-                        e.access_count += 1;
-                        e.last_accessed = Utc::now();
-                    }
+            // Update access counts for returned entries (atomic — same lock)
+            for r in &results {
+                if let Some(e) = entries.get_mut(&r.id) {
+                    e.access_count += 1;
+                    e.last_accessed = Utc::now();
                 }
             }
 

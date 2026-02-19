@@ -95,6 +95,7 @@ mod tests {
                 system_prompt: "Generate reports.".into(),
                 tool_defs: vec![],
                 context_window_tokens: None,
+                summarize_threshold: None,
             }],
             max_turns: 10,
             max_tokens: 4096,

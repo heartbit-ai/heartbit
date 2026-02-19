@@ -140,8 +140,15 @@ impl AgentContext {
         let combined = Message::user(format!(
             "{original_task}\n\n[Previous conversation summary]\n{summary}"
         ));
-        let last_messages: Vec<Message> =
-            self.messages[total.saturating_sub(keep_last_n)..].to_vec();
+
+        // Determine tail start, then adjust to maintain alternating User/Assistant roles.
+        // After the combined User message, the tail must start with an Assistant message.
+        let mut tail_start = total.saturating_sub(keep_last_n);
+        if tail_start < total && self.messages[tail_start].role == Role::User && tail_start > 1 {
+            // Include the preceding Assistant message to maintain alternation
+            tail_start -= 1;
+        }
+        let last_messages: Vec<Message> = self.messages[tail_start..].to_vec();
 
         self.messages.clear();
         self.messages.push(combined);
@@ -514,6 +521,33 @@ mod tests {
         assert_eq!(ctx.messages[0].role, Role::User);
         // The remaining messages should start with assistant
         assert_eq!(ctx.messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn inject_summary_adjusts_tail_when_starting_with_user() {
+        // Regression: if keep_last_n tail starts with a User message (tool_result),
+        // the combined User + User sequence violates the alternating-role invariant.
+        // inject_summary must include the preceding Assistant to maintain alternation.
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_assistant_message(Message::assistant("a1"));
+        ctx.add_tool_results(vec![ToolResult::success("c1", "result1")]);
+        ctx.add_assistant_message(Message::assistant("a2"));
+        ctx.add_tool_results(vec![ToolResult::success("c2", "result2")]);
+        ctx.add_assistant_message(Message::assistant("a3"));
+        // Messages: User, A, U(tool), A, U(tool), A
+        // Total = 6, keep_last_n = 2 → tail_start = 4 → messages[4] = U(tool)
+        // Without fix: combined(U) + U(tool) + A → role violation
+        // With fix: combined(U) + A + U(tool) + A → correct alternation
+
+        ctx.inject_summary("summary".into(), 2);
+
+        // First must be User, second must be Assistant
+        assert_eq!(ctx.messages[0].role, Role::User);
+        assert_eq!(ctx.messages[1].role, Role::Assistant);
+        // Verify alternation throughout
+        for w in ctx.messages.windows(2) {
+            assert_ne!(w[0].role, w[1].role, "adjacent messages have same role");
+        }
     }
 
     #[test]

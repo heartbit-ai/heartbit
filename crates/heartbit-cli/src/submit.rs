@@ -125,6 +125,7 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
     let decision = HumanDecision {
         approved: true,
         reason: Some("Approved via CLI".into()),
+        turn: None, // fall back to reading current turn from workflow state
     };
 
     let client = reqwest::Client::new();
@@ -148,9 +149,14 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
 }
 
 fn agent_config_to_def(config: &AgentConfig) -> AgentDef {
-    let context_window_tokens = match &config.context_strategy {
-        Some(heartbit::ContextStrategyConfig::SlidingWindow { max_tokens }) => Some(*max_tokens),
-        _ => None,
+    let (context_window_tokens, summarize_threshold) = match &config.context_strategy {
+        Some(heartbit::ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+            (Some(*max_tokens), None)
+        }
+        Some(heartbit::ContextStrategyConfig::Summarize { max_tokens }) => {
+            (None, Some(*max_tokens))
+        }
+        _ => (None, None),
     };
 
     AgentDef {
@@ -159,5 +165,6 @@ fn agent_config_to_def(config: &AgentConfig) -> AgentDef {
         system_prompt: config.system_prompt.clone(),
         tool_defs: vec![],
         context_window_tokens,
+        summarize_threshold,
     }
 }

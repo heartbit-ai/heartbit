@@ -249,8 +249,10 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
-    pub fn build(self) -> AgentRunner<P> {
-        assert!(self.max_turns > 0, "max_turns must be at least 1");
+    pub fn build(self) -> Result<AgentRunner<P>, Error> {
+        if self.max_turns == 0 {
+            return Err(Error::Config("max_turns must be at least 1".into()));
+        }
 
         // Collect all tools, including memory tools created from builder's name
         let mut all_tools = self.tools;
@@ -271,7 +273,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tools.insert(def.name, t);
         }
 
-        AgentRunner {
+        Ok(AgentRunner {
             provider: self.provider,
             name: self.name,
             system_prompt: self.system_prompt,
@@ -281,7 +283,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_tokens: self.max_tokens,
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
-        }
+        })
     }
 }
 
@@ -391,7 +393,8 @@ mod tests {
         let runner = AgentRunner::builder(provider)
             .name("test")
             .system_prompt("You are helpful.")
-            .build();
+            .build()
+            .unwrap();
 
         let output = runner.execute("say hello").await.unwrap();
         assert_eq!(output.result, "Hello!");
@@ -430,7 +433,8 @@ mod tests {
             .name("test")
             .system_prompt("You are helpful.")
             .tool(Arc::new(MockTool::new("search", "search results here")))
-            .build();
+            .build()
+            .unwrap();
 
         let output = runner.execute("find rust info").await.unwrap();
         assert_eq!(output.result, "Found it!");
@@ -467,7 +471,8 @@ mod tests {
             .system_prompt("sys")
             .tool(Arc::new(MockTool::new("search", "result")))
             .max_turns(2)
-            .build();
+            .build()
+            .unwrap();
 
         let err = runner.execute("loop forever").await.unwrap_err();
         assert!(matches!(err, Error::MaxTurnsExceeded(2)));
@@ -498,7 +503,8 @@ mod tests {
         let runner = AgentRunner::builder(provider)
             .name("test")
             .system_prompt("sys")
-            .build();
+            .build()
+            .unwrap();
 
         // No longer errors — sends error back to LLM, which recovers
         let output = runner.execute("use unknown tool").await.unwrap();
@@ -539,7 +545,8 @@ mod tests {
             .system_prompt("sys")
             .tool(Arc::new(MockTool::new("search", "found")))
             .tool(Arc::new(MockTool::new("read", "file content")))
-            .build();
+            .build()
+            .unwrap();
 
         let output = runner.execute("do both").await.unwrap();
         assert_eq!(output.result, "Done!");
@@ -559,7 +566,8 @@ mod tests {
         let runner = AgentRunner::builder(provider)
             .name("test")
             .system_prompt("sys")
-            .build();
+            .build()
+            .unwrap();
 
         let err = runner.execute("write a long essay").await.unwrap_err();
         assert!(matches!(err, Error::Truncated));
@@ -590,7 +598,8 @@ mod tests {
             .name("test")
             .system_prompt("sys")
             .tool(Arc::new(MockTool::failing("failing", "something broke")))
-            .build();
+            .build()
+            .unwrap();
 
         let output = runner.execute("try the tool").await.unwrap();
         assert_eq!(output.result, "Tool failed, but I recovered.");
@@ -608,7 +617,8 @@ mod tests {
             .name("test")
             .system_prompt("sys")
             .max_tokens(8192)
-            .build();
+            .build()
+            .unwrap();
 
         // Just verify it builds and runs without error
         let output = runner.execute("test").await.unwrap();
@@ -616,14 +626,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "max_turns must be at least 1")]
-    fn build_panics_on_zero_max_turns() {
+    fn build_errors_on_zero_max_turns() {
         let provider = Arc::new(MockProvider::new(vec![]));
-        AgentRunner::builder(provider)
+        let result = AgentRunner::builder(provider)
             .name("test")
             .system_prompt("sys")
             .max_turns(0)
             .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("max_turns must be at least 1"),
+            "error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -638,7 +653,8 @@ mod tests {
             .name("test")
             .system_prompt("sys")
             .context_strategy(ContextStrategy::SlidingWindow { max_tokens: 50000 })
-            .build();
+            .build()
+            .unwrap();
 
         assert!(matches!(
             runner.context_strategy,
@@ -657,7 +673,8 @@ mod tests {
         let runner = AgentRunner::builder(provider)
             .name("test")
             .system_prompt("sys")
-            .build();
+            .build()
+            .unwrap();
 
         assert!(matches!(
             runner.context_strategy,

@@ -120,7 +120,7 @@ impl PostgresStore {
         error: Option<&str>,
         token_usage: Option<serde_json::Value>,
     ) -> Result<(), Error> {
-        sqlx::query(
+        let result_row = sqlx::query(
             r#"
             UPDATE tasks
             SET status = $2, result = $3, error = $4, token_usage = $5,
@@ -136,6 +136,10 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::Store(format!("failed to update task: {e}")))?;
+
+        if result_row.rows_affected() == 0 {
+            return Err(Error::Store(format!("task not found: {id}")));
+        }
 
         Ok(())
     }

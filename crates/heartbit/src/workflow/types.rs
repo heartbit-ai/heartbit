@@ -173,6 +173,9 @@ pub struct AgentDef {
     /// Optional context window token limit for sliding window trimming.
     #[serde(default)]
     pub context_window_tokens: Option<u32>,
+    /// Token threshold for automatic summarization.
+    #[serde(default)]
+    pub summarize_threshold: Option<u32>,
 }
 
 /// Result from the orchestrator workflow.
@@ -187,6 +190,11 @@ pub struct OrchestratorResult {
 pub struct HumanDecision {
     pub approved: bool,
     pub reason: Option<String>,
+    /// Explicit turn number to approve. When provided, the approval targets
+    /// this specific turn's promise, avoiding a TOCTOU race from reading
+    /// shared state. When `None`, falls back to reading `approval_turn` state.
+    #[serde(default)]
+    pub turn: Option<u64>,
 }
 
 #[cfg(test)]
@@ -346,6 +354,7 @@ mod tests {
                 system_prompt: "You research.".into(),
                 tool_defs: vec![],
                 context_window_tokens: None,
+                summarize_threshold: None,
             }],
             max_turns: 10,
             max_tokens: 8192,
@@ -370,11 +379,21 @@ mod tests {
         let decision = HumanDecision {
             approved: true,
             reason: Some("looks good".into()),
+            turn: Some(3),
         };
         let json = serde_json::to_string(&decision).unwrap();
         let parsed: HumanDecision = serde_json::from_str(&json).unwrap();
         assert!(parsed.approved);
         assert_eq!(parsed.reason.unwrap(), "looks good");
+        assert_eq!(parsed.turn, Some(3));
+    }
+
+    #[test]
+    fn human_decision_turn_defaults_to_none() {
+        let json = r#"{"approved":true,"reason":null}"#;
+        let parsed: HumanDecision = serde_json::from_str(json).unwrap();
+        assert!(parsed.approved);
+        assert!(parsed.turn.is_none());
     }
 
     #[test]

@@ -236,7 +236,7 @@ async fn execute_delegation(
                 max_tokens,
                 approval_required,
                 context_window_tokens: agent_def.context_window_tokens,
-                summarize_threshold: None,
+                summarize_threshold: agent_def.summarize_threshold,
             }))
             .call()
             .await;
