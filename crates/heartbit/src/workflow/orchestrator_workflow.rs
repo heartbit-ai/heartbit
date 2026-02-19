@@ -34,6 +34,7 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
         Json(task): Json<OrchestratorTask>,
     ) -> Result<Json<OrchestratorResult>, HandlerError> {
         let mut total_usage = TokenUsage::default();
+        let mut total_tool_calls: usize = 0;
 
         // Store initial status
         ctx.set("state", "running".to_string());
@@ -101,8 +102,17 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                 return Ok(Json(OrchestratorResult {
                     text: llm_response.text(),
                     tokens: total_usage,
+                    tool_calls_made: total_tool_calls,
                 }));
             }
+
+            // Count tool calls in this turn
+            let turn_tool_calls = llm_response
+                .content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                .count();
+            total_tool_calls += turn_tool_calls;
 
             // Step 2: Execute delegated tasks via child agent workflows
             let mut tool_result_blocks = Vec::new();

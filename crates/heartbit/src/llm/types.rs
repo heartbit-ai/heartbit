@@ -156,7 +156,7 @@ impl CompletionResponse {
 }
 
 /// A tool call extracted from a response.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -392,5 +392,17 @@ mod tests {
         let err = ToolResult::error("id", "failed");
         assert!(err.is_error);
         assert_eq!(err.content, "failed");
+    }
+
+    #[test]
+    fn tool_call_roundtrips() {
+        let tc = ToolCall {
+            id: "call-1".into(),
+            name: "search".into(),
+            input: json!({"query": "rust"}),
+        };
+        let json_str = serde_json::to_string(&tc).unwrap();
+        let parsed: ToolCall = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(tc, parsed);
     }
 }

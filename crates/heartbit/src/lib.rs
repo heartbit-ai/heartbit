@@ -24,6 +24,7 @@ pub use llm::types::{
 };
 pub use llm::{BoxedProvider, DynLlmProvider};
 pub use memory::in_memory::InMemoryStore;
+pub use memory::namespaced::NamespacedMemory;
 pub use memory::postgres::PostgresMemoryStore;
 pub use memory::scoring::ScoringWeights;
 pub use memory::{Memory, MemoryEntry, MemoryQuery};

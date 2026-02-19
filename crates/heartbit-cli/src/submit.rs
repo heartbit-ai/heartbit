@@ -211,8 +211,8 @@ pub async fn get_result(workflow_id: &str, restate_url: &str) -> Result<()> {
         {
             println!("{}", result.text);
             eprintln!(
-                "---\nTokens: {} in / {} out",
-                result.tokens.input_tokens, result.tokens.output_tokens
+                "---\nTokens: {} in / {} out | Tool calls: {}",
+                result.tokens.input_tokens, result.tokens.output_tokens, result.tool_calls_made,
             );
         } else {
             println!("{body}");

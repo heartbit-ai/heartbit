@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::Error;
@@ -20,7 +21,7 @@ use crate::memory::Memory;
 use self::context::{AgentContext, ContextStrategy};
 
 /// Output of an agent run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutput {
     pub result: String,
     pub tool_calls_made: usize,
@@ -1618,5 +1619,37 @@ mod tests {
 
         let output = runner.execute("search").await.unwrap();
         assert_eq!(output.result, "Done!");
+    }
+
+    #[test]
+    fn agent_output_roundtrips() {
+        let output = AgentOutput {
+            result: "Hello!".into(),
+            tool_calls_made: 3,
+            tokens_used: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            structured: Some(json!({"answer": "42"})),
+        };
+        let json_str = serde_json::to_string(&output).unwrap();
+        let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.result, "Hello!");
+        assert_eq!(parsed.tool_calls_made, 3);
+        assert_eq!(parsed.tokens_used.input_tokens, 100);
+        assert_eq!(parsed.structured, Some(json!({"answer": "42"})));
+    }
+
+    #[test]
+    fn agent_output_structured_none_serializes() {
+        let output = AgentOutput {
+            result: "ok".into(),
+            tool_calls_made: 0,
+            tokens_used: TokenUsage::default(),
+            structured: None,
+        };
+        let json_str = serde_json::to_string(&output).unwrap();
+        let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed.structured.is_none());
     }
 }

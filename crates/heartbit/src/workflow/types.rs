@@ -199,6 +199,9 @@ pub struct AgentDef {
 pub struct OrchestratorResult {
     pub text: String,
     pub tokens: TokenUsage,
+    /// Total tool calls made by the orchestrator (delegate_task invocations).
+    #[serde(default)]
+    pub tool_calls_made: usize,
 }
 
 /// Human decision for approval gates.
@@ -565,6 +568,30 @@ mod tests {
         let json = serde_json::to_string(&def).unwrap();
         let parsed: AgentDef = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.response_schema, Some(schema));
+    }
+
+    #[test]
+    fn orchestrator_result_roundtrips() {
+        let result = OrchestratorResult {
+            text: "Synthesized answer".into(),
+            tokens: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+            },
+            tool_calls_made: 3,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.text, "Synthesized answer");
+        assert_eq!(parsed.tool_calls_made, 3);
+    }
+
+    #[test]
+    fn orchestrator_result_tool_calls_defaults_to_zero() {
+        // Backward compatibility: old JSON without tool_calls_made still parses
+        let json = r#"{"text":"ok","tokens":{"input_tokens":0,"output_tokens":0}}"#;
+        let parsed: OrchestratorResult = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tool_calls_made, 0);
     }
 
     // DynLlmProvider tests are in llm/mod.rs (canonical location)
