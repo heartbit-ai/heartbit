@@ -25,6 +25,7 @@ pub use llm::types::{
 pub use llm::{BoxedProvider, DynLlmProvider};
 pub use memory::in_memory::InMemoryStore;
 pub use memory::postgres::PostgresMemoryStore;
+pub use memory::scoring::ScoringWeights;
 pub use memory::{Memory, MemoryEntry, MemoryQuery};
 pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput, validate_tool_input};

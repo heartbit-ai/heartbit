@@ -107,6 +107,10 @@ pub struct AgentConfig {
     pub max_turns: Option<usize>,
     /// Per-agent token limit. Overrides the orchestrator default when set.
     pub max_tokens: Option<u32>,
+    /// Optional JSON Schema for structured output. Expressed as an inline
+    /// TOML table that maps to the JSON Schema object. When set, the agent
+    /// receives a synthetic `__respond__` tool and returns structured JSON.
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// Memory configuration for the orchestrator.
@@ -648,6 +652,50 @@ max_tokens = 0
             msg.contains("max_tokens must be at least 1"),
             "error: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_response_schema() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "analyst"
+description = "Analyst"
+system_prompt = "Analyze."
+
+[agents.response_schema]
+type = "object"
+
+[agents.response_schema.properties.score]
+type = "number"
+
+[agents.response_schema.properties.summary]
+type = "string"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let schema = config.agents[0].response_schema.as_ref().unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["score"]["type"], "number");
+        assert_eq!(schema["properties"]["summary"]["type"], "string");
+    }
+
+    #[test]
+    fn response_schema_defaults_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "Test."
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.agents[0].response_schema.is_none());
     }
 
     #[test]
