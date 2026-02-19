@@ -1,0 +1,15 @@
+[Unit]
+Description=Heartbit Agent Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/heartbit serve --config /etc/heartbit/heartbit.toml
+Restart=on-failure
+RestartSec=5s
+MemoryMax=2G
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+services:
+  restate:
+    image: docker.restate.dev/restatedev/restate:latest
+    ports:
+      - "8080:8080"   # ingress
+      - "9070:9070"   # admin API
+    volumes:
+      - restate-data:/target/restate-data
+
+  heartbit:
+    build: .
+    command: heartbit serve --config /app/heartbit.toml --bind 0.0.0.0:9080
+    ports:
+      - "9080:9080"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./heartbit.toml:/app/heartbit.toml:ro
+    depends_on:
+      - restate
+
+volumes:
+  restate-data:

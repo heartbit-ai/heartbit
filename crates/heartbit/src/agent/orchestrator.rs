@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,15 +11,20 @@ use crate::llm::LlmProvider;
 use crate::llm::types::{TokenUsage, ToolDefinition};
 use crate::tool::{Tool, ToolOutput};
 
+use crate::memory::Memory;
+
+use super::context::ContextStrategy;
 use super::{AgentOutput, AgentRunner};
 
 /// A sub-agent definition registered with the orchestrator.
 #[derive(Clone)]
-pub struct SubAgentDef {
-    pub name: String,
-    pub description: String,
-    pub system_prompt: String,
-    pub tools: Vec<Arc<dyn Tool>>,
+pub(crate) struct SubAgentDef {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) system_prompt: String,
+    pub(crate) tools: Vec<Arc<dyn Tool>>,
+    pub(crate) context_strategy: Option<ContextStrategy>,
+    pub(crate) summarize_threshold: Option<u32>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -34,17 +39,17 @@ impl std::fmt::Debug for SubAgentDef {
 
 /// A task delegated by the orchestrator to a sub-agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DelegatedTask {
-    pub agent: String,
-    pub task: String,
+pub(crate) struct DelegatedTask {
+    pub(crate) agent: String,
+    pub(crate) task: String,
 }
 
 /// Result from a sub-agent execution.
 #[derive(Debug, Clone)]
-pub struct SubAgentResult {
-    pub agent: String,
-    pub result: String,
-    pub tokens_used: TokenUsage,
+pub(crate) struct SubAgentResult {
+    pub(crate) agent: String,
+    pub(crate) result: String,
+    pub(crate) tokens_used: TokenUsage,
 }
 
 /// Multi-agent orchestrator.
@@ -53,6 +58,8 @@ pub struct SubAgentResult {
 /// No duplicated agent loop — the orchestrator IS an AgentRunner.
 pub struct Orchestrator<P: LlmProvider> {
     runner: AgentRunner<P>,
+    /// Shared accumulator for sub-agent token usage (populated by DelegateTaskTool).
+    sub_agent_tokens: Arc<Mutex<TokenUsage>>,
 }
 
 impl<P: LlmProvider + 'static> Orchestrator<P> {
@@ -62,11 +69,17 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             sub_agents: vec![],
             max_turns: 10,
             max_tokens: 4096,
+            shared_memory: None,
         }
     }
 
     pub async fn run(&self, task: &str) -> Result<AgentOutput, Error> {
-        self.runner.execute(task).await
+        let mut output = self.runner.execute(task).await?;
+        // Add sub-agent tokens that were accumulated during delegation
+        let sub_tokens = self.sub_agent_tokens.lock().expect("token lock poisoned");
+        output.tokens_used.input_tokens += sub_tokens.input_tokens;
+        output.tokens_used.output_tokens += sub_tokens.output_tokens;
+        Ok(output)
     }
 }
 
@@ -79,6 +92,10 @@ struct DelegateTaskTool<P: LlmProvider> {
     sub_agents: Vec<SubAgentDef>,
     max_turns: usize,
     max_tokens: u32,
+    /// Shared accumulator for sub-agent token usage, read by Orchestrator::run.
+    accumulated_tokens: Arc<Mutex<TokenUsage>>,
+    /// Shared memory store for cross-agent memory (None if not configured).
+    shared_memory: Option<Arc<dyn Memory>>,
 }
 
 impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
@@ -108,17 +125,39 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             let provider = self.provider.clone();
             let max_turns = self.max_turns;
             let max_tokens = self.max_tokens;
+            let shared_memory = self.shared_memory.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
             join_set.spawn(async move {
-                let runner = AgentRunner::builder(provider)
+                let mut builder = AgentRunner::builder(provider)
                     .name(&agent_def.name)
                     .system_prompt(&agent_def.system_prompt)
                     .tools(agent_def.tools)
                     .max_turns(max_turns)
-                    .max_tokens(max_tokens)
-                    .build();
+                    .max_tokens(max_tokens);
+
+                if let Some(strategy) = agent_def.context_strategy {
+                    builder = builder.context_strategy(strategy);
+                }
+                if let Some(threshold) = agent_def.summarize_threshold {
+                    builder = builder.summarize_threshold(threshold);
+                }
+
+                // Add memory tools if shared memory is configured
+                if let Some(ref memory) = shared_memory {
+                    let ns = Arc::new(crate::memory::namespaced::NamespacedMemory::new(
+                        memory.clone(),
+                        &agent_def.name,
+                    ));
+                    builder = builder.memory(ns);
+                    builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
+                        memory.clone(),
+                        &agent_def.name,
+                    ));
+                }
+
+                let runner = builder.build();
 
                 let result = match runner.execute(&task.task).await {
                     Ok(output) => SubAgentResult {
@@ -150,6 +189,15 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
         // Sort by original index to preserve order
         results.sort_by_key(|(idx, _)| *idx);
 
+        // Accumulate sub-agent tokens
+        {
+            let mut acc = self.accumulated_tokens.lock().expect("token lock poisoned");
+            for (_, r) in &results {
+                acc.input_tokens += r.tokens_used.input_tokens;
+                acc.output_tokens += r.tokens_used.output_tokens;
+            }
+        }
+
         let formatted = results
             .iter()
             .map(|(_, r)| format!("=== Agent: {} ===\n{}", r.agent, r.result))
@@ -162,42 +210,12 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
 
 impl<P: LlmProvider + 'static> Tool for DelegateTaskTool<P> {
     fn definition(&self) -> ToolDefinition {
-        let agent_descriptions: Vec<serde_json::Value> = self
+        let pairs: Vec<(&str, &str)> = self
             .sub_agents
             .iter()
-            .map(|a| json!({"name": a.name, "description": a.description}))
+            .map(|a| (a.name.as_str(), a.description.as_str()))
             .collect();
-
-        ToolDefinition {
-            name: "delegate_task".into(),
-            description: format!(
-                "Delegate tasks to sub-agents for parallel execution. Available agents: {}",
-                serde_json::to_string(&agent_descriptions).unwrap_or_default()
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "agent": {
-                                    "type": "string",
-                                    "description": "Name of the sub-agent"
-                                },
-                                "task": {
-                                    "type": "string",
-                                    "description": "Task instruction for the sub-agent"
-                                }
-                            },
-                            "required": ["agent", "task"]
-                        }
-                    }
-                },
-                "required": ["tasks"]
-            }),
-        }
+        build_delegate_tool_schema(&pairs)
     }
 
     fn execute(
@@ -219,10 +237,13 @@ struct DelegateInput {
     tasks: Vec<DelegatedTask>,
 }
 
-fn build_system_prompt(sub_agents: &[SubAgentDef]) -> String {
-    let agent_list: String = sub_agents
+/// Build the orchestrator system prompt listing available agents.
+///
+/// Shared between standalone and Restate paths. Takes `(name, description)` pairs.
+pub(crate) fn build_system_prompt(agents: &[(&str, &str)]) -> String {
+    let agent_list: String = agents
         .iter()
-        .map(|a| format!("- **{}**: {}", a.name, a.description))
+        .map(|(name, desc)| format!("- **{name}**: {desc}"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -236,11 +257,54 @@ fn build_system_prompt(sub_agents: &[SubAgentDef]) -> String {
     )
 }
 
+/// Build the delegate_task tool definition.
+///
+/// Shared between standalone and Restate paths. Takes `(name, description)` pairs.
+pub(crate) fn build_delegate_tool_schema(agents: &[(&str, &str)]) -> ToolDefinition {
+    let agent_descriptions: Vec<serde_json::Value> = agents
+        .iter()
+        .map(|(name, desc)| json!({"name": name, "description": desc}))
+        .collect();
+
+    ToolDefinition {
+        name: "delegate_task".into(),
+        description: format!(
+            "Delegate tasks to sub-agents for parallel execution. Available agents: {}",
+            serde_json::to_string(&agent_descriptions)
+                .expect("agent list serialization is infallible")
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {
+                                "type": "string",
+                                "description": "Name of the sub-agent"
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "Task instruction for the sub-agent"
+                            }
+                        },
+                        "required": ["agent", "task"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        }),
+    }
+}
+
 pub struct OrchestratorBuilder<P: LlmProvider> {
     provider: Arc<P>,
     sub_agents: Vec<SubAgentDef>,
     max_turns: usize,
     max_tokens: u32,
+    shared_memory: Option<Arc<dyn Memory>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -255,6 +319,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             description: description.into(),
             system_prompt: system_prompt.into(),
             tools: vec![],
+            context_strategy: None,
+            summarize_threshold: None,
         });
         self
     }
@@ -271,6 +337,28 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             description: description.into(),
             system_prompt: system_prompt.into(),
             tools,
+            context_strategy: None,
+            summarize_threshold: None,
+        });
+        self
+    }
+
+    pub fn sub_agent_full(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tools: Vec<Arc<dyn Tool>>,
+        context_strategy: Option<ContextStrategy>,
+        summarize_threshold: Option<u32>,
+    ) -> Self {
+        self.sub_agents.push(SubAgentDef {
+            name: name.into(),
+            description: description.into(),
+            system_prompt: system_prompt.into(),
+            tools,
+            context_strategy,
+            summarize_threshold,
         });
         self
     }
@@ -285,14 +373,31 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Attach a shared memory store. Each sub-agent gets:
+    /// - Private memory tools (namespaced to the agent)
+    /// - Shared memory tools (cross-agent read/write)
+    pub fn shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.shared_memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> Orchestrator<P> {
-        let system = build_system_prompt(&self.sub_agents);
+        let pairs: Vec<(&str, &str)> = self
+            .sub_agents
+            .iter()
+            .map(|a| (a.name.as_str(), a.description.as_str()))
+            .collect();
+        let system = build_system_prompt(&pairs);
+
+        let sub_agent_tokens = Arc::new(Mutex::new(TokenUsage::default()));
 
         let delegate_tool: Arc<dyn Tool> = Arc::new(DelegateTaskTool {
             provider: self.provider.clone(),
             sub_agents: self.sub_agents,
             max_turns: self.max_turns,
             max_tokens: self.max_tokens,
+            accumulated_tokens: sub_agent_tokens.clone(),
+            shared_memory: self.shared_memory,
         });
 
         let runner = AgentRunner::builder(self.provider)
@@ -303,7 +408,10 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .max_tokens(self.max_tokens)
             .build();
 
-        Orchestrator { runner }
+        Orchestrator {
+            runner,
+            sub_agent_tokens,
+        }
     }
 }
 
@@ -340,24 +448,22 @@ mod tests {
     #[test]
     fn system_prompt_includes_agents() {
         let agents = vec![
-            SubAgentDef {
-                name: "researcher".into(),
-                description: "Research specialist".into(),
-                system_prompt: "You research.".into(),
-                tools: vec![],
-            },
-            SubAgentDef {
-                name: "coder".into(),
-                description: "Coding expert".into(),
-                system_prompt: "You code.".into(),
-                tools: vec![],
-            },
+            ("researcher", "Research specialist"),
+            ("coder", "Coding expert"),
         ];
 
         let prompt = build_system_prompt(&agents);
         assert!(prompt.contains("researcher"));
         assert!(prompt.contains("Research specialist"));
         assert!(prompt.contains("coder"));
+    }
+
+    #[test]
+    fn delegate_tool_schema_includes_agents() {
+        let agents = vec![("researcher", "Research")];
+        let def = build_delegate_tool_schema(&agents);
+        assert_eq!(def.name, "delegate_task");
+        assert!(def.description.contains("researcher"));
     }
 
     #[test]
@@ -369,9 +475,13 @@ mod tests {
                 description: "Research".into(),
                 system_prompt: "prompt".into(),
                 tools: vec![],
+                context_strategy: None,
+                summarize_threshold: None,
             }],
+            shared_memory: None,
             max_turns: 10,
             max_tokens: 4096,
+            accumulated_tokens: Arc::new(Mutex::new(TokenUsage::default())),
         };
 
         let def = tool.definition();
@@ -468,6 +578,9 @@ mod tests {
         let output = orch.run("Analyze Rust").await.unwrap();
         assert_eq!(output.result, "Based on research: Rust is excellent.");
         assert_eq!(output.tool_calls_made, 1); // one delegate_task call
+        // Orchestrator tokens (50+80 in, 20+30 out) + sub-agent tokens (10+12 in, 8+10 out)
+        assert_eq!(output.tokens_used.input_tokens, 50 + 80 + 10 + 12);
+        assert_eq!(output.tokens_used.output_tokens, 20 + 30 + 8 + 10);
     }
 
     #[tokio::test]

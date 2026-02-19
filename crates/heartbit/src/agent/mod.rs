@@ -1,5 +1,6 @@
 pub mod context;
 pub mod orchestrator;
+pub(crate) mod token_estimator;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,10 +9,14 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::llm::LlmProvider;
-use crate::llm::types::{Message, StopReason, TokenUsage, ToolCall, ToolDefinition, ToolResult};
+use crate::llm::types::{
+    CompletionRequest, Message, StopReason, TokenUsage, ToolCall, ToolDefinition, ToolResult,
+};
 use crate::tool::{Tool, ToolOutput};
 
-use self::context::AgentContext;
+use crate::memory::Memory;
+
+use self::context::{AgentContext, ContextStrategy};
 
 /// Output of an agent run.
 #[derive(Debug, Clone)]
@@ -30,6 +35,9 @@ pub struct AgentRunner<P: LlmProvider> {
     tool_defs: Vec<ToolDefinition>,
     max_turns: usize,
     max_tokens: u32,
+    context_strategy: ContextStrategy,
+    /// Token threshold at which to trigger summarization. `None` = no summarization.
+    summarize_threshold: Option<u32>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -41,17 +49,17 @@ impl<P: LlmProvider> AgentRunner<P> {
             tools: Vec::new(),
             max_turns: 10,
             max_tokens: 4096,
+            context_strategy: None,
+            summarize_threshold: None,
+            memory: None,
         }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     pub async fn execute(&self, task: &str) -> Result<AgentOutput, Error> {
         let mut ctx = AgentContext::new(&self.system_prompt, task, self.tool_defs.clone())
             .with_max_turns(self.max_turns)
-            .with_max_tokens(self.max_tokens);
+            .with_max_tokens(self.max_tokens)
+            .with_context_strategy(self.context_strategy.clone());
 
         let mut total_tool_calls = 0usize;
         let mut total_usage = TokenUsage::default();
@@ -91,17 +99,45 @@ impl<P: LlmProvider> AgentRunner<P> {
             total_tool_calls += tool_calls.len();
             let results = self.execute_tools_parallel(&tool_calls).await;
             ctx.add_tool_results(results);
+
+            // Summarization: if threshold is set and context exceeds it, compress
+            if let Some(threshold) = self.summarize_threshold
+                && ctx.needs_compaction(threshold)
+            {
+                debug!(agent = %self.name, "context exceeds threshold, summarizing");
+                let summary = self.generate_summary(&ctx).await?;
+                ctx.inject_summary(summary, 4);
+            }
         }
     }
 
+    /// Generate a summary of the conversation so far using the LLM.
+    async fn generate_summary(&self, ctx: &AgentContext) -> Result<String, Error> {
+        let summary_request = CompletionRequest {
+            system: "You are a summarization assistant. Summarize the following conversation \
+                     concisely, preserving key facts, decisions, and tool results. \
+                     Focus on information that would be needed to continue the conversation."
+                .into(),
+            messages: vec![Message::user(ctx.conversation_text())],
+            tools: vec![],
+            max_tokens: 1024,
+        };
+
+        let response = self.provider.complete(summary_request).await?;
+        Ok(response.text())
+    }
+
     /// Execute tools in parallel via JoinSet, returning results in original call order.
+    ///
+    /// Panicked tasks produce an error `ToolResult` so the LLM always gets a
+    /// result for every `tool_use_id` it sent.
     async fn execute_tools_parallel(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+        let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, call) in calls.iter().enumerate() {
             let tool = self.tools.get(&call.name).cloned();
             let input = call.input.clone();
-            let call_id = call.id.clone();
             let call_name = call.name.clone();
 
             join_set.spawn(async move {
@@ -109,18 +145,19 @@ impl<P: LlmProvider> AgentRunner<P> {
                     Some(t) => t.execute(input).await,
                     None => Ok(ToolOutput::error(format!("Tool not found: {call_name}"))),
                 };
-                (idx, call_id, output)
+                (idx, output)
             });
         }
 
-        let mut results: Vec<(usize, ToolResult)> = Vec::with_capacity(calls.len());
+        let mut results_vec: Vec<Option<ToolResult>> = vec![None; calls.len()];
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok((idx, call_id, Ok(output))) => {
-                    results.push((idx, tool_output_to_result(call_id, output)));
+                Ok((idx, Ok(output))) => {
+                    results_vec[idx] = Some(tool_output_to_result(call_ids[idx].clone(), output));
                 }
-                Ok((idx, call_id, Err(e))) => {
-                    results.push((idx, ToolResult::error(call_id, e.to_string())));
+                Ok((idx, Err(e))) => {
+                    results_vec[idx] =
+                        Some(ToolResult::error(call_ids[idx].clone(), e.to_string()));
                 }
                 Err(join_err) => {
                     tracing::error!(error = %join_err, "tool task panicked");
@@ -128,9 +165,16 @@ impl<P: LlmProvider> AgentRunner<P> {
             }
         }
 
-        // Sort by original index to preserve call order
-        results.sort_by_key(|(idx, _)| *idx);
-        results.into_iter().map(|(_, r)| r).collect()
+        // Fill gaps (panicked tasks) with error results
+        results_vec
+            .into_iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                r.unwrap_or_else(|| {
+                    ToolResult::error(call_ids[idx].clone(), "Tool execution panicked".to_string())
+                })
+            })
+            .collect()
     }
 }
 
@@ -149,6 +193,9 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     tools: Vec<Arc<dyn Tool>>,
     max_turns: usize,
     max_tokens: u32,
+    context_strategy: Option<ContextStrategy>,
+    summarize_threshold: Option<u32>,
+    memory: Option<Arc<dyn Memory>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -182,13 +229,47 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    pub fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
+        self.context_strategy = Some(strategy);
+        self
+    }
+
+    /// Set the token threshold at which to trigger automatic summarization.
+    pub fn summarize_threshold(mut self, threshold: u32) -> Self {
+        self.summarize_threshold = Some(threshold);
+        self
+    }
+
+    /// Attach a memory store to the agent. Memory tools (store, recall, update,
+    /// forget, consolidate) are created at `build()` time using the builder's `name`.
+    ///
+    /// Call `.name()` before or after `.memory()` — the agent name is resolved at build.
+    pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> AgentRunner<P> {
-        let tool_defs: Vec<ToolDefinition> = self.tools.iter().map(|t| t.definition()).collect();
-        let tools: HashMap<String, Arc<dyn Tool>> = self
-            .tools
-            .into_iter()
-            .map(|t| (t.definition().name, t))
-            .collect();
+        assert!(self.max_turns > 0, "max_turns must be at least 1");
+
+        // Collect all tools, including memory tools created from builder's name
+        let mut all_tools = self.tools;
+        if let Some(memory) = self.memory {
+            all_tools.extend(crate::memory::tools::memory_tools(memory, &self.name));
+        }
+
+        let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::with_capacity(all_tools.len());
+        let mut tool_defs: Vec<ToolDefinition> = Vec::with_capacity(all_tools.len());
+
+        for t in all_tools {
+            let def = t.definition();
+            if tools.contains_key(&def.name) {
+                tracing::warn!(tool = %def.name, "duplicate tool name, keeping first registration");
+                continue;
+            }
+            tool_defs.push(def.clone());
+            tools.insert(def.name, t);
+        }
 
         AgentRunner {
             provider: self.provider,
@@ -198,6 +279,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tool_defs,
             max_turns: self.max_turns,
             max_tokens: self.max_tokens,
+            context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
+            summarize_threshold: self.summarize_threshold,
         }
     }
 }
@@ -530,5 +613,55 @@ mod tests {
         // Just verify it builds and runs without error
         let output = runner.execute("test").await.unwrap();
         assert_eq!(output.result, "ok");
+    }
+
+    #[test]
+    #[should_panic(expected = "max_turns must be at least 1")]
+    fn build_panics_on_zero_max_turns() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .max_turns(0)
+            .build();
+    }
+
+    #[tokio::test]
+    async fn context_strategy_builder_sets_sliding_window() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .context_strategy(ContextStrategy::SlidingWindow { max_tokens: 50000 })
+            .build();
+
+        assert!(matches!(
+            runner.context_strategy,
+            ContextStrategy::SlidingWindow { max_tokens: 50000 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn context_strategy_defaults_to_unlimited() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .build();
+
+        assert!(matches!(
+            runner.context_strategy,
+            ContextStrategy::Unlimited
+        ));
     }
 }

@@ -1,0 +1,6 @@
+[Unit]
+Description=Heartbit daily report task
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/heartbit submit --config /etc/heartbit/heartbit.toml Generate daily status report

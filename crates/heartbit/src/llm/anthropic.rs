@@ -268,7 +268,14 @@ impl SseResponseState {
             self.content.push(ContentBlock::Text { text });
         }
         if let Some(tool) = self.current_tool_use.take() {
-            let input = serde_json::from_str(&tool.input_json).unwrap_or_default();
+            let input = serde_json::from_str(&tool.input_json).unwrap_or_else(|e| {
+                tracing::warn!(
+                    tool = %tool.name,
+                    error = %e,
+                    "malformed tool input JSON from SSE stream, defaulting to null"
+                );
+                serde_json::Value::Null
+            });
             self.content.push(ContentBlock::ToolUse {
                 id: tool.id,
                 name: tool.name,

@@ -133,7 +133,8 @@ fn build_openai_request(
                             "type": "function",
                             "function": {
                                 "name": name,
-                                "arguments": serde_json::to_string(input).unwrap_or_default(),
+                                "arguments": serde_json::to_string(input)
+                                    .expect("serde_json::Value serialization is infallible"),
                             }
                         })),
                         _ => None,
@@ -244,8 +245,18 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
     // Tool calls
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
-            let input: serde_json::Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let input: serde_json::Value = if tc.function.arguments.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        tool = %tc.function.name,
+                        error = %e,
+                        "malformed tool arguments JSON, defaulting to empty object"
+                    );
+                    serde_json::json!({})
+                })
+            };
             content.push(ContentBlock::ToolUse {
                 id: tc.id,
                 name: tc.function.name,

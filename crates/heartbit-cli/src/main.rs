@@ -1,26 +1,276 @@
+mod serve;
+mod submit;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use heartbit::llm::anthropic::AnthropicProvider;
-use heartbit::llm::openrouter::OpenRouterProvider;
-use heartbit::{AgentOutput, LlmProvider, Orchestrator};
+use heartbit::tool::Tool;
+use heartbit::{
+    AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
+    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OpenRouterProvider, Orchestrator,
+};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Parser)]
+#[command(name = "heartbit", about = "Multi-agent enterprise runtime")]
+struct Cli {
+    /// Path to heartbit.toml config file
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Task to execute (when no subcommand is given)
+    #[arg(trailing_var_arg = true)]
+    task: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Execute a task directly (standalone mode, no Restate)
+    Run {
+        /// The task to execute
+        #[arg(trailing_var_arg = true)]
+        task: Vec<String>,
+    },
+    /// Start the Restate-compatible HTTP worker
+    Serve {
+        /// Address to bind the worker
+        #[arg(long, default_value = "0.0.0.0:9080")]
+        bind: String,
+    },
+    /// Submit a task to Restate for durable execution
+    Submit {
+        /// The task to execute
+        #[arg(trailing_var_arg = true)]
+        task: Vec<String>,
+
+        /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
+        #[arg(long)]
+        restate_url: Option<String>,
+    },
+    /// Query workflow status
+    Status {
+        /// Workflow ID to check
+        workflow_id: String,
+
+        /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
+        #[arg(long)]
+        restate_url: Option<String>,
+    },
+    /// Send human approval signal to a workflow
+    Approve {
+        /// Workflow ID to approve
+        workflow_id: String,
+
+        /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
+        #[arg(long)]
+        restate_url: Option<String>,
+    },
+}
+
+const DEFAULT_RESTATE_URL: &str = "http://localhost:8080";
+
+/// Resolve restate URL: CLI flag → config file → default.
+fn resolve_restate_url(cli_url: Option<String>, config_path: Option<&std::path::Path>) -> String {
+    if let Some(url) = cli_url {
+        return url;
+    }
+    if let Some(path) = config_path
+        && let Ok(config) = HeartbitConfig::from_file(path)
+        && let Some(restate) = config.restate
+    {
+        return restate.endpoint;
+    }
+    DEFAULT_RESTATE_URL.into()
+}
+
+/// Initialize the simple fmt tracing subscriber (for non-serve commands).
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+}
 
-    let task: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    if task.is_empty() {
-        bail!("Usage: heartbit <task>");
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Run { task }) => {
+            init_tracing();
+            let task_str = task.join(" ");
+            if task_str.is_empty() {
+                bail!("Usage: heartbit run <task>");
+            }
+            run_standalone(cli.config.as_deref(), &task_str).await
+        }
+        Some(Commands::Serve { bind }) => {
+            // serve::run_worker handles its own tracing init (with optional OTel)
+            let config_path = cli
+                .config
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
+            serve::run_worker(config_path, &bind).await
+        }
+        Some(Commands::Submit { task, restate_url }) => {
+            init_tracing();
+            let task_str = task.join(" ");
+            if task_str.is_empty() {
+                bail!("Usage: heartbit submit <task>");
+            }
+            let config_path = cli
+                .config
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
+            let url = resolve_restate_url(restate_url, Some(config_path));
+            submit::submit_task(config_path, &task_str, &url).await
+        }
+        Some(Commands::Status {
+            workflow_id,
+            restate_url,
+        }) => {
+            init_tracing();
+            let url = resolve_restate_url(restate_url, cli.config.as_deref());
+            submit::query_status(&workflow_id, &url).await
+        }
+        Some(Commands::Approve {
+            workflow_id,
+            restate_url,
+        }) => {
+            init_tracing();
+            let url = resolve_restate_url(restate_url, cli.config.as_deref());
+            submit::send_approval(&workflow_id, &url).await
+        }
+        None => {
+            init_tracing();
+            // Backward-compatible: bare task args without subcommand
+            let task_str = cli.task.join(" ");
+            if task_str.is_empty() {
+                bail!(
+                    "Usage: heartbit [run|serve|submit|status|approve] <args>\n       heartbit <task>  (shorthand for 'run')"
+                );
+            }
+            run_standalone(cli.config.as_deref(), &task_str).await
+        }
+    }
+}
+
+async fn run_standalone(config_path: Option<&std::path::Path>, task: &str) -> Result<()> {
+    match config_path {
+        Some(path) => run_from_config(path, task).await,
+        None => run_from_env(task).await,
+    }
+}
+
+async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
+    let config = HeartbitConfig::from_file(path)
+        .with_context(|| format!("failed to load config from {}", path.display()))?;
+
+    match config.provider.name.as_str() {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
+            let provider = Arc::new(AnthropicProvider::new(api_key, &config.provider.model));
+            let output = build_orchestrator_from_config(provider, &config, task).await?;
+            print_output(&output);
+        }
+        "openrouter" => {
+            let api_key = std::env::var("OPENROUTER_API_KEY")
+                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
+            let provider = Arc::new(OpenRouterProvider::new(api_key, &config.provider.model));
+            let output = build_orchestrator_from_config(provider, &config, task).await?;
+            print_output(&output);
+        }
+        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
     }
 
-    // Provider selection: check env vars
+    Ok(())
+}
+
+async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
+    provider: Arc<P>,
+    config: &HeartbitConfig,
+    task: &str,
+) -> Result<AgentOutput> {
+    let mut builder = Orchestrator::builder(provider)
+        .max_turns(config.orchestrator.max_turns)
+        .max_tokens(config.orchestrator.max_tokens);
+
+    for agent in &config.agents {
+        let tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
+        let (ctx_strategy, summarize_threshold) = match &agent.context_strategy {
+            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => (
+                Some(ContextStrategy::SlidingWindow {
+                    max_tokens: *max_tokens,
+                }),
+                None,
+            ),
+            Some(ContextStrategyConfig::Summarize { max_tokens }) => (None, Some(*max_tokens)),
+            Some(ContextStrategyConfig::Unlimited) | None => (None, None),
+        };
+
+        builder = builder.sub_agent_full(
+            &agent.name,
+            &agent.description,
+            &agent.system_prompt,
+            tools,
+            ctx_strategy,
+            summarize_threshold,
+        );
+    }
+
+    // Wire shared memory if configured
+    if let Some(ref memory_config) = config.memory {
+        let memory: Arc<dyn Memory> = match memory_config {
+            MemoryConfig::InMemory => Arc::new(InMemoryStore::new()),
+            MemoryConfig::Postgres { .. } => {
+                anyhow::bail!(
+                    "Postgres memory store is not yet implemented. Use type = \"in_memory\" instead."
+                );
+            }
+        };
+        builder = builder.shared_memory(memory);
+    }
+
+    let orchestrator = builder.build();
+    let output = orchestrator.run(task).await?;
+    Ok(output)
+}
+
+/// Connect to MCP servers and collect tools. Failures are logged and skipped.
+async fn load_mcp_tools(agent_name: &str, mcp_servers: &[String]) -> Vec<Arc<dyn Tool>> {
+    let mut tools = Vec::new();
+    for server_url in mcp_servers {
+        tracing::info!(agent = %agent_name, url = %server_url, "connecting to MCP server");
+        match McpClient::connect(server_url).await {
+            Ok(client) => {
+                for tool in client.into_tools() {
+                    let def = tool.definition();
+                    tracing::info!(tool = %def.name, "registered MCP tool");
+                    tools.push(tool);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_name,
+                    url = %server_url,
+                    error = %e,
+                    "failed to connect to MCP server, skipping"
+                );
+            }
+        }
+    }
+    tools
+}
+
+async fn run_from_env(task: &str) -> Result<()> {
     let provider_name = std::env::var("HEARTBIT_PROVIDER").unwrap_or_else(|_| {
         if std::env::var("OPENROUTER_API_KEY").is_ok() {
             "openrouter".into()
@@ -36,7 +286,7 @@ async fn main() -> Result<()> {
             let model = std::env::var("HEARTBIT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
             let provider = Arc::new(AnthropicProvider::new(api_key, model));
-            let output = run_orchestrator(provider, &task).await?;
+            let output = run_default_orchestrator(provider, task).await?;
             print_output(&output);
         }
         "openrouter" => {
@@ -45,7 +295,7 @@ async fn main() -> Result<()> {
             let model = std::env::var("HEARTBIT_MODEL")
                 .unwrap_or_else(|_| "anthropic/claude-sonnet-4".into());
             let provider = Arc::new(OpenRouterProvider::new(api_key, model));
-            let output = run_orchestrator(provider, &task).await?;
+            let output = run_default_orchestrator(provider, task).await?;
             print_output(&output);
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
@@ -54,7 +304,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_orchestrator<P: LlmProvider + 'static>(
+async fn run_default_orchestrator<P: LlmProvider + 'static>(
     provider: Arc<P>,
     task: &str,
 ) -> Result<AgentOutput> {

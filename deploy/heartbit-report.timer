@@ -1,0 +1,9 @@
+[Unit]
+Description=Heartbit daily report timer
+
+[Timer]
+OnCalendar=Mon..Fri 09:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -171,6 +171,7 @@ struct McpSession {
     endpoint: String,
     session_id: RwLock<Option<String>>,
     next_id: AtomicU64,
+    auth_header: Option<String>,
 }
 
 impl McpSession {
@@ -220,6 +221,9 @@ impl McpSession {
 
         if let Some(sid) = self.read_session_id()? {
             builder = builder.header("Mcp-Session-Id", sid);
+        }
+        if let Some(auth) = &self.auth_header {
+            builder = builder.header("Authorization", auth);
         }
 
         let response = builder.send().await?;
@@ -275,6 +279,9 @@ impl McpSession {
         if let Some(sid) = self.read_session_id()? {
             builder = builder.header("Mcp-Session-Id", sid);
         }
+        if let Some(auth) = &self.auth_header {
+            builder = builder.header("Authorization", auth);
+        }
 
         let response = builder.send().await?;
         self.update_session_id(&response)?;
@@ -293,6 +300,13 @@ impl McpSession {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput, Error> {
+        // MCP servers expect arguments to be an object, never null.
+        // LLMs sometimes send null/empty for tools with no required params.
+        let arguments = if arguments.is_null() {
+            serde_json::json!({})
+        } else {
+            arguments
+        };
         let params = serde_json::json!({
             "name": name,
             "arguments": arguments,
@@ -323,7 +337,14 @@ impl Tool for McpTool {
         Box::pin(async move {
             match self.session.call_tool(&self.def.name, input).await {
                 Ok(output) => Ok(output),
-                Err(e) => Ok(ToolOutput::error(e.to_string())),
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %self.def.name,
+                        error = %e,
+                        "MCP tool call failed"
+                    );
+                    Ok(ToolOutput::error(e.to_string()))
+                }
             }
         })
     }
@@ -345,6 +366,22 @@ impl McpClient {
     ///
     /// Performs the full handshake: initialize → notifications/initialized → tools/list.
     pub async fn connect(endpoint: &str) -> Result<Self, Error> {
+        Self::connect_internal(endpoint, None).await
+    }
+
+    /// Connect to an MCP server with an authorization header.
+    ///
+    /// Use this for agentgateway or other authenticated MCP proxies.
+    /// The `auth_header` is sent as the `Authorization` header value
+    /// (e.g., `"Bearer <token>"`).
+    pub async fn connect_with_auth(
+        endpoint: &str,
+        auth_header: impl Into<String>,
+    ) -> Result<Self, Error> {
+        Self::connect_internal(endpoint, Some(auth_header.into())).await
+    }
+
+    async fn connect_internal(endpoint: &str, auth_header: Option<String>) -> Result<Self, Error> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()?;
@@ -354,6 +391,7 @@ impl McpClient {
             endpoint: endpoint.to_string(),
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
+            auth_header,
         });
 
         // Initialize — rpc() captures Mcp-Session-Id from the response automatically
@@ -716,6 +754,7 @@ mod tests {
             endpoint: "http://unused".to_string(),
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
+            auth_header: None,
         };
 
         assert_eq!(session.next_id(), 0);
@@ -732,6 +771,7 @@ mod tests {
             endpoint: "http://unused".to_string(),
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
+            auth_header: None,
         });
 
         let expected_def = ToolDefinition {
@@ -759,6 +799,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_string(), // nothing listening
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
+            auth_header: None,
         });
 
         let tool = McpTool {

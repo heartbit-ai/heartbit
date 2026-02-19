@@ -1,10 +1,16 @@
 pub mod agent;
+pub mod config;
 pub mod error;
 pub mod llm;
+pub mod memory;
+pub mod store;
 pub mod tool;
+pub mod workflow;
 
+pub use agent::context::ContextStrategy;
 pub use agent::orchestrator::Orchestrator;
 pub use agent::{AgentOutput, AgentRunner};
+pub use config::{ContextStrategyConfig, HeartbitConfig, MemoryConfig};
 pub use error::Error;
 pub use llm::LlmProvider;
 pub use llm::anthropic::AnthropicProvider;
@@ -13,5 +19,7 @@ pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StopReason, TokenUsage,
     ToolCall, ToolDefinition, ToolResult,
 };
+pub use memory::in_memory::InMemoryStore;
+pub use memory::{Memory, MemoryEntry, MemoryQuery};
 pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput};

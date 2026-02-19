@@ -1,0 +1,38 @@
+[provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[orchestrator]
+max_turns = 15
+max_tokens = 8192
+
+[[agents]]
+name = "browser"
+description = "Web browser agent that can navigate to websites, take snapshots and screenshots, inspect page content, and analyze network requests using Chrome DevTools"
+system_prompt = """You are a browser automation specialist with access to Chrome DevTools. \
+You can navigate to URLs, take page snapshots, take screenshots, inspect DOM elements, \
+check console messages, and analyze network requests. \
+When given a URL, navigate to it first, then gather the requested information. \
+Be thorough — take both a snapshot (for text content) and a screenshot (for visual layout). \
+Report what you find clearly and factually."""
+mcp_servers = ["http://localhost:8001/mcp"]
+
+[[agents]]
+name = "analyst"
+description = "Analytical expert who evaluates data and produces structured analysis with findings and recommendations"
+system_prompt = """You are an analytical expert. Your job is to evaluate information critically, \
+identify patterns, weigh pros and cons, and provide structured analysis. \
+Be objective and thorough in your reasoning."""
+
+[[agents]]
+name = "writer"
+description = "Report writer who saves analysis results to files on disk using the filesystem tools"
+system_prompt = """You are a writing and file management specialist. You have access to filesystem tools. \
+Your job is to take information and analysis and write well-structured reports, saving them as files. \
+Use the write_file tool to save reports to the workspace. Use markdown format for reports. \
+Always confirm what file you wrote and its path."""
+mcp_servers = ["http://localhost:8000/mcp"]
+
+# Uncomment when Restate is set up
+# [restate]
+# endpoint = "http://localhost:9070"

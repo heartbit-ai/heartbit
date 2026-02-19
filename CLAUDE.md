@@ -28,10 +28,15 @@ All three must pass. No warnings allowed.
 ### Architecture
 - 2 crates: `heartbit` (lib) and `heartbit-cli` (bin). Split when a module gets too big.
 - Flat agent hierarchy: orchestrator spawns sub-agents, sub-agents do NOT spawn.
-- `tokio::JoinSet` for parallel tool execution and sub-agent dispatch.
+- Two execution paths: standalone (`AgentRunner` + `tokio::JoinSet`) and durable (`Restate SDK 0.8`).
+- `tokio::JoinSet` for parallel tool execution and sub-agent dispatch (standalone path).
+- Restate workflows/services/objects for durable execution with replay (Restate path).
+- MCP Streamable HTTP client for tool server connectivity.
 - SSE parser maison for Anthropic streaming (no third-party SSE crate).
+- Optional PostgreSQL store for task tracking and audit logging.
+- Optional OpenTelemetry tracing via OTLP exporter.
 - Workspace dependencies in root Cargo.toml.
 
 ### What We Don't Build (Yet)
-No NATS, event sourcing, DAG scheduler, durable execution, gRPC, Redis, Prometheus, OpenTelemetry.
+No NATS, event sourcing, DAG scheduler, gRPC, Redis, Prometheus.
 Add when the need arrives, not before.
