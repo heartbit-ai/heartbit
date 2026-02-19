@@ -1,6 +1,6 @@
 use restate_sdk::prelude::*;
 
-use crate::agent::context::{apply_sliding_window, messages_to_text};
+use crate::agent::context::{apply_sliding_window, inject_summary_into_messages, messages_to_text};
 use crate::agent::token_estimator::estimate_message_tokens;
 use crate::llm::types::{ContentBlock, Message, Role, StopReason, TokenUsage};
 
@@ -200,18 +200,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     total_usage.output_tokens += summary_resp.usage.output_tokens;
 
                     // Merge summary into first message, keep last 4
-                    let keep_last = 4;
-                    if messages.len() > 1 + keep_last {
-                        let original_task = &task.input;
-                        let combined = Message::user(format!(
-                            "{original_task}\n\n[Previous conversation summary]\n{summary}"
-                        ));
-                        let tail: Vec<Message> =
-                            messages[messages.len().saturating_sub(keep_last)..].to_vec();
-                        messages.clear();
-                        messages.push(combined);
-                        messages.extend(tail);
-                    }
+                    inject_summary_into_messages(&mut messages, &task.input, &summary, 4);
                 }
             }
         }

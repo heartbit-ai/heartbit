@@ -45,7 +45,10 @@ impl LlmProvider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<body read error: {e}>"));
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -78,7 +81,10 @@ impl AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<body read error: {e}>"));
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,

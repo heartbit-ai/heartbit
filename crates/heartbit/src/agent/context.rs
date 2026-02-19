@@ -119,12 +119,6 @@ impl AgentContext {
     /// If there aren't enough messages to compact (first + keep_last_n >= total),
     /// this is a no-op.
     pub(crate) fn inject_summary(&mut self, summary: String, keep_last_n: usize) {
-        let total = self.messages.len();
-        // Need at least: first(1) + something_to_summarize(1) + keep_last_n
-        if total <= 1 + keep_last_n {
-            return;
-        }
-
         // Extract the original task text from the first message
         let original_task: String = self.messages[0]
             .content
@@ -136,23 +130,7 @@ impl AgentContext {
             .collect::<Vec<_>>()
             .join("");
 
-        // Merge task + summary into a single user message to preserve alternating roles
-        let combined = Message::user(format!(
-            "{original_task}\n\n[Previous conversation summary]\n{summary}"
-        ));
-
-        // Determine tail start, then adjust to maintain alternating User/Assistant roles.
-        // After the combined User message, the tail must start with an Assistant message.
-        let mut tail_start = total.saturating_sub(keep_last_n);
-        if tail_start < total && self.messages[tail_start].role == Role::User && tail_start > 1 {
-            // Include the preceding Assistant message to maintain alternation
-            tail_start -= 1;
-        }
-        let last_messages: Vec<Message> = self.messages[tail_start..].to_vec();
-
-        self.messages.clear();
-        self.messages.push(combined);
-        self.messages.extend(last_messages);
+        inject_summary_into_messages(&mut self.messages, &original_task, &summary, keep_last_n);
     }
 
     /// Render all messages as a plain text transcript for summarization.
@@ -175,6 +153,42 @@ impl AgentContext {
             max_tokens: self.max_tokens,
         }
     }
+}
+
+/// Inject a summary into a message list, replacing middle messages.
+///
+/// Keeps the original task from `messages[0]` and merges it with the summary
+/// into a single User message. Then appends the last `keep_last_n` messages.
+/// Adjusts the tail start to ensure User/Assistant alternation is preserved.
+///
+/// Shared between standalone (`AgentContext`) and durable (`AgentWorkflow`) paths.
+pub(crate) fn inject_summary_into_messages(
+    messages: &mut Vec<Message>,
+    original_task: &str,
+    summary: &str,
+    keep_last_n: usize,
+) {
+    let total = messages.len();
+    // Need at least: first(1) + something_to_summarize(1) + keep_last_n
+    if total <= 1 + keep_last_n {
+        return;
+    }
+
+    let combined = Message::user(format!(
+        "{original_task}\n\n[Previous conversation summary]\n{summary}"
+    ));
+
+    // Determine tail start, then adjust to maintain alternating User/Assistant roles.
+    // After the combined User message, the tail must start with an Assistant message.
+    let mut tail_start = total.saturating_sub(keep_last_n);
+    if tail_start < total && messages[tail_start].role == Role::User && tail_start > 1 {
+        tail_start -= 1;
+    }
+    let last_messages: Vec<Message> = messages[tail_start..].to_vec();
+
+    messages.clear();
+    messages.push(combined);
+    messages.extend(last_messages);
 }
 
 /// Render a message list as a plain text transcript for summarization.
@@ -557,5 +571,39 @@ mod tests {
 
         ctx.add_assistant_message(Message::assistant("a".repeat(100)));
         assert!(ctx.total_tokens() > initial);
+    }
+
+    #[test]
+    fn shared_inject_summary_preserves_alternation() {
+        // Test the shared function directly (used by both standalone and Restate paths)
+        let mut messages = vec![
+            Message::user("original task"),
+            Message::assistant("a1"),
+            Message::tool_results(vec![ToolResult::success("c1", "result1")]),
+            Message::assistant("a2"),
+            Message::tool_results(vec![ToolResult::success("c2", "result2")]),
+            Message::assistant("a3"),
+        ];
+
+        inject_summary_into_messages(&mut messages, "original task", "summary of conversation", 2);
+
+        // First must be User (combined), then alternating
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        for w in messages.windows(2) {
+            assert_ne!(w[0].role, w[1].role, "adjacent messages have same role");
+        }
+        // Combined message contains both task and summary
+        let first_text: String = messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(first_text.contains("original task"));
+        assert!(first_text.contains("summary of conversation"));
     }
 }

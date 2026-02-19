@@ -42,7 +42,10 @@ impl LlmProvider for OpenRouterProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<body read error: {e}>"));
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -88,8 +91,15 @@ fn build_openai_request(
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
-                            ..
+                            is_error,
                         } => {
+                            // OpenAI format has no is_error field; prefix content
+                            // so the LLM sees the error context.
+                            let content = if *is_error {
+                                format!("[ERROR] {content}")
+                            } else {
+                                content.clone()
+                            };
                             messages.push(serde_json::json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -409,6 +419,8 @@ mod tests {
         assert_eq!(messages[0]["content"], "found it");
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call-2");
+        // Error tool results get [ERROR] prefix since OpenAI format has no is_error field
+        assert_eq!(messages[1]["content"], "[ERROR] not found");
     }
 
     // --- Response parsing tests ---

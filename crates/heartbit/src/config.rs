@@ -123,6 +123,11 @@ impl HeartbitConfig {
                 "orchestrator.max_turns must be at least 1".into(),
             ));
         }
+        if self.orchestrator.max_tokens == 0 {
+            return Err(Error::Config(
+                "orchestrator.max_tokens must be at least 1".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -397,5 +402,23 @@ max_turns = 0
         let err = HeartbitConfig::from_toml(toml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("max_turns must be at least 1"), "error: {msg}");
+    }
+
+    #[test]
+    fn zero_max_tokens_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_tokens = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokens must be at least 1"),
+            "error: {msg}"
+        );
     }
 }
