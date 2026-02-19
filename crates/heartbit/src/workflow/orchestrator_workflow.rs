@@ -50,7 +50,7 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
         let mut messages = vec![Message::user(&task.input)];
 
         for turn in 0..task.max_turns {
-            ctx.set("current_turn", turn as u64);
+            ctx.set("current_turn", (turn + 1) as u64);
 
             // Step 1: Ask the orchestrator LLM what to do (durable activity)
             let llm_response: LlmCallResponse = ctx

@@ -73,7 +73,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
         ctx.set("max_turns", task.max_turns as u64);
 
         for turn in 0..task.max_turns {
-            ctx.set("current_turn", turn as u64);
+            ctx.set("current_turn", (turn + 1) as u64);
 
             // Apply sliding window if configured
             let request_messages = if let Some(window_tokens) = task.context_window_tokens {
@@ -144,9 +144,10 @@ impl AgentWorkflow for AgentWorkflowImpl {
             // Each turn gets a unique promise key so that approvals are
             // consumed once and subsequent turns block on fresh promises.
             if task.approval_required && !tool_calls.is_empty() {
-                let promise_key = format!("approval-turn-{turn}");
+                let display_turn = turn + 1;
+                let promise_key = format!("approval-turn-{display_turn}");
                 ctx.set("state", "awaiting_approval".to_string());
-                ctx.set("approval_turn", turn as u64);
+                ctx.set("approval_turn", display_turn as u64);
                 let Json(decision) = ctx.promise::<Json<HumanDecision>>(&promise_key).await?;
                 if !decision.approved {
                     // Send error tool results back to the LLM (matching standalone behavior)
