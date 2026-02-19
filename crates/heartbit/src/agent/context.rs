@@ -120,7 +120,10 @@ impl AgentContext {
     /// this is a no-op.
     pub(crate) fn inject_summary(&mut self, summary: String, keep_last_n: usize) {
         // Extract the original task text from the first message
-        let original_task: String = self.messages[0]
+        let Some(first) = self.messages.first() else {
+            return;
+        };
+        let original_task: String = first
             .content
             .iter()
             .filter_map(|b| match b {
