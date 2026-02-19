@@ -14,6 +14,8 @@ use crate::tool::{Tool, ToolOutput};
 
 use crate::memory::Memory;
 
+use super::blackboard::Blackboard;
+use super::blackboard_tools::blackboard_tools;
 use super::context::ContextStrategy;
 use super::{AgentOutput, AgentRunner};
 
@@ -84,6 +86,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             max_turns: 10,
             max_tokens: 4096,
             shared_memory: None,
+            blackboard: None,
             on_text: None,
             on_approval: None,
         }
@@ -127,6 +130,8 @@ struct DelegateTaskTool<P: LlmProvider> {
     accumulated_tokens: Arc<Mutex<TokenUsage>>,
     /// Shared memory store for cross-agent memory (None if not configured).
     shared_memory: Option<Arc<dyn Memory>>,
+    /// Shared blackboard for cross-agent coordination (None if not configured).
+    blackboard: Option<Arc<dyn Blackboard>>,
 }
 
 impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
@@ -159,6 +164,7 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
             let max_turns = agent_def.max_turns.unwrap_or(self.max_turns);
             let max_tokens = agent_def.max_tokens.unwrap_or(self.max_tokens);
             let shared_memory = self.shared_memory.clone();
+            let blackboard = self.blackboard.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -199,6 +205,11 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                     ));
                 }
 
+                // Add blackboard tools if blackboard is configured
+                if let Some(ref bb) = blackboard {
+                    builder = builder.tools(blackboard_tools(bb.clone()));
+                }
+
                 let runner = match builder.build() {
                     Ok(r) => r,
                     Err(e) => {
@@ -225,6 +236,21 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                         tokens_used: TokenUsage::default(),
                     },
                 };
+
+                // Write agent result to blackboard (matching Restate path's "agent:{name}" key)
+                if let Some(ref bb) = blackboard {
+                    let key = format!("agent:{}", result.agent);
+                    if let Err(e) = bb
+                        .write(&key, serde_json::Value::String(result.result.clone()))
+                        .await
+                    {
+                        tracing::warn!(
+                            agent = %result.agent,
+                            error = %e,
+                            "failed to write result to blackboard"
+                        );
+                    }
+                }
 
                 (idx, result)
             });
@@ -399,6 +425,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     max_turns: usize,
     max_tokens: u32,
     shared_memory: Option<Arc<dyn Memory>>,
+    blackboard: Option<Arc<dyn Blackboard>>,
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
@@ -484,6 +511,16 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Attach a shared blackboard for cross-agent coordination.
+    ///
+    /// Each sub-agent receives `blackboard_read`, `blackboard_write`, and
+    /// `blackboard_list` tools. After each sub-agent completes, its result
+    /// is automatically written to the blackboard under the `"agent:{name}"` key.
+    pub fn blackboard(mut self, blackboard: Arc<dyn Blackboard>) -> Self {
+        self.blackboard = Some(blackboard);
+        self
+    }
+
     /// Set a callback for streaming text output on the orchestrator's LLM calls.
     /// Sub-agents do not stream — only the orchestrator's own reasoning and
     /// final synthesis are emitted incrementally.
@@ -523,6 +560,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tokens: self.max_tokens,
             accumulated_tokens: sub_agent_tokens.clone(),
             shared_memory: self.shared_memory,
+            blackboard: self.blackboard,
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -617,6 +655,7 @@ mod tests {
                 response_schema: None,
             }],
             shared_memory: None,
+            blackboard: None,
             max_turns: 10,
             max_tokens: 4096,
             accumulated_tokens: Arc::new(Mutex::new(TokenUsage::default())),
@@ -785,5 +824,168 @@ mod tests {
 
         let output = orch.run("do something").await.unwrap();
         assert_eq!(output.result, "Sorry, let me respond directly.");
+    }
+
+    #[tokio::test]
+    async fn blackboard_populated_after_delegation() {
+        use crate::agent::blackboard::InMemoryBlackboard;
+
+        let bb = Arc::new(InMemoryBlackboard::new());
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // 1: Orchestrator delegates to researcher
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({
+                        "tasks": [{"agent": "researcher", "task": "Find info"}]
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            // 2: Sub-agent responds
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Research result here.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+            // 3: Orchestrator synthesis
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("researcher", "Research specialist", "You research.")
+            .blackboard(bb.clone())
+            .build()
+            .unwrap();
+
+        orch.run("research something").await.unwrap();
+
+        // Verify the blackboard has the agent result
+        let val: Option<serde_json::Value> = bb.read("agent:researcher").await.unwrap();
+        assert!(val.is_some(), "blackboard should have agent:researcher key");
+        assert_eq!(
+            val.unwrap(),
+            serde_json::Value::String("Research result here.".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agents_receive_blackboard_tools() {
+        use crate::agent::blackboard::InMemoryBlackboard;
+        use crate::llm::types::CompletionRequest;
+
+        // Track tool definitions seen by the sub-agent
+        struct ToolTrackingProvider {
+            responses: Mutex<Vec<CompletionResponse>>,
+            tool_names_seen: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl LlmProvider for ToolTrackingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                let names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+                self.tool_names_seen.lock().expect("lock").push(names);
+
+                let mut responses = self.responses.lock().expect("lock");
+                if responses.is_empty() {
+                    return Err(Error::Agent("no more mock responses".into()));
+                }
+                Ok(responses.remove(0))
+            }
+        }
+
+        let bb = Arc::new(InMemoryBlackboard::new());
+
+        let provider = Arc::new(ToolTrackingProvider {
+            responses: Mutex::new(vec![
+                // 1: Orchestrator delegates
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({
+                            "tasks": [{"agent": "worker", "task": "do work"}]
+                        }),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                },
+                // 2: Sub-agent responds
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Work done.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+                // 3: Orchestrator synthesis
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "All done.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                },
+            ]),
+            tool_names_seen: Mutex::new(vec![]),
+        });
+
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent("worker", "Worker agent", "You work.")
+            .blackboard(bb)
+            .build()
+            .unwrap();
+
+        orch.run("do work").await.unwrap();
+
+        // The second LLM call is from the sub-agent — check its tools
+        let all_tool_names = provider.tool_names_seen.lock().expect("lock");
+        assert!(
+            all_tool_names.len() >= 2,
+            "expected at least 2 LLM calls, got {}",
+            all_tool_names.len()
+        );
+        let sub_agent_tools = &all_tool_names[1];
+        assert!(
+            sub_agent_tools.contains(&"blackboard_read".to_string()),
+            "sub-agent should have blackboard_read tool, got: {sub_agent_tools:?}"
+        );
+        assert!(
+            sub_agent_tools.contains(&"blackboard_write".to_string()),
+            "sub-agent should have blackboard_write tool, got: {sub_agent_tools:?}"
+        );
+        assert!(
+            sub_agent_tools.contains(&"blackboard_list".to_string()),
+            "sub-agent should have blackboard_list tool, got: {sub_agent_tools:?}"
+        );
+    }
+
+    #[test]
+    fn blackboard_builder_method_works() {
+        use crate::agent::blackboard::InMemoryBlackboard;
+
+        let bb = Arc::new(InMemoryBlackboard::new());
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        // Should build successfully with blackboard
+        let result = Orchestrator::builder(provider)
+            .sub_agent("agent1", "Agent one", "You are agent 1.")
+            .blackboard(bb)
+            .build();
+
+        assert!(result.is_ok());
     }
 }

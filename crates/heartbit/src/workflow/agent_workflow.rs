@@ -64,11 +64,8 @@ impl AgentWorkflow for AgentWorkflowImpl {
         // Inject __respond__ tool for structured output if response_schema is set.
         if let Some(ref schema) = task.response_schema {
             tool_defs.push(ToolDefinition {
-                name: "__respond__".into(),
-                description: "Produce your final structured response. Call this tool when you \
-                              have gathered all necessary information and are ready to return \
-                              your answer in the required format."
-                    .into(),
+                name: crate::llm::types::RESPOND_TOOL_NAME.into(),
+                description: crate::llm::types::RESPOND_TOOL_DESCRIPTION.into(),
                 input_schema: schema.clone(),
             });
         }
@@ -175,8 +172,9 @@ impl AgentWorkflow for AgentWorkflowImpl {
 
             // Intercept __respond__ for structured output (before dispatching to AgentService).
             if task.response_schema.is_some()
-                && let Some((_id, _name, input)) =
-                    tool_calls.iter().find(|(_, name, _)| name == "__respond__")
+                && let Some((_id, _name, input)) = tool_calls
+                    .iter()
+                    .find(|(_, name, _)| name == crate::llm::types::RESPOND_TOOL_NAME)
             {
                 let structured = input.clone();
                 let text =

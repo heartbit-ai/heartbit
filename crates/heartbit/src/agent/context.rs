@@ -5,7 +5,7 @@ use crate::llm::types::{
 use super::token_estimator::{estimate_message_tokens, estimate_tokens};
 
 /// Strategy for managing the context window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContextStrategy {
     /// No trimming — all messages are sent (current default behavior).
     Unlimited,

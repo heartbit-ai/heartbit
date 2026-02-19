@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Name of the synthetic tool used for structured output.
+pub(crate) const RESPOND_TOOL_NAME: &str = "__respond__";
+
+/// Description for the synthetic `__respond__` tool.
+pub(crate) const RESPOND_TOOL_DESCRIPTION: &str = "Produce your final structured response. Call this tool when you \
+     have gathered all necessary information and are ready to return \
+     your answer in the required format.";
+
 /// Role in a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

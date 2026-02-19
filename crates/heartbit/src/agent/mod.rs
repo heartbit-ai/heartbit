@@ -1,3 +1,5 @@
+pub mod blackboard;
+pub(crate) mod blackboard_tools;
 pub mod context;
 pub mod orchestrator;
 pub(crate) mod token_estimator;
@@ -119,7 +121,9 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Count ALL tool calls in this turn (including co-submitted ones) for parity
             // with the Restate path, even though non-__respond__ calls are not executed.
             if self.structured_schema.is_some()
-                && let Some(respond_call) = tool_calls.iter().find(|tc| tc.name == "__respond__")
+                && let Some(respond_call) = tool_calls
+                    .iter()
+                    .find(|tc| tc.name == crate::llm::types::RESPOND_TOOL_NAME)
             {
                 let structured = respond_call.input.clone();
                 let text = serde_json::to_string_pretty(&structured)
@@ -428,6 +432,9 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     }
 
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
+        if self.name.is_empty() {
+            return Err(Error::Config("agent name must not be empty".into()));
+        }
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
         }
@@ -459,11 +466,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         // the execute loop intercepts __respond__ calls before tool dispatch.
         if let Some(ref schema) = self.structured_schema {
             tool_defs.push(ToolDefinition {
-                name: "__respond__".into(),
-                description: "Produce your final structured response. Call this tool when you \
-                              have gathered all necessary information and are ready to return \
-                              your answer in the required format."
-                    .into(),
+                name: crate::llm::types::RESPOND_TOOL_NAME.into(),
+                description: crate::llm::types::RESPOND_TOOL_DESCRIPTION.into(),
                 input_schema: schema.clone(),
             });
         }
@@ -826,6 +830,18 @@ mod tests {
     }
 
     #[test]
+    fn build_errors_on_empty_name() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider).system_prompt("sys").build();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("agent name must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
     fn build_errors_on_zero_max_turns() {
         let provider = Arc::new(MockProvider::new(vec![]));
         let result = AgentRunner::builder(provider)
@@ -872,10 +888,10 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             runner.context_strategy,
             ContextStrategy::SlidingWindow { max_tokens: 50000 }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -961,10 +977,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(matches!(
-            runner.context_strategy,
-            ContextStrategy::Unlimited
-        ));
+        assert_eq!(runner.context_strategy, ContextStrategy::Unlimited);
     }
 
     #[tokio::test]

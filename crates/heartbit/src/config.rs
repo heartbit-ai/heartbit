@@ -169,9 +169,22 @@ impl HeartbitConfig {
                 "orchestrator.max_tokens must be at least 1".into(),
             ));
         }
+        // Validate retry config: base_delay_ms <= max_delay_ms
+        if let Some(ref retry) = self.provider.retry
+            && retry.base_delay_ms > retry.max_delay_ms
+        {
+            return Err(Error::Config(format!(
+                "provider.retry.base_delay_ms ({}) must not exceed max_delay_ms ({})",
+                retry.base_delay_ms, retry.max_delay_ms
+            )));
+        }
+
         // Ensure agent names are unique
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
+            if agent.name.is_empty() {
+                return Err(Error::Config("agent name must not be empty".into()));
+            }
             if !seen.insert(&agent.name) {
                 return Err(Error::Config(format!(
                     "duplicate agent name: '{}'",
@@ -203,6 +216,18 @@ impl HeartbitConfig {
             if agent.max_tokens == Some(0) {
                 return Err(Error::Config(format!(
                     "agent '{}': max_tokens must be at least 1",
+                    agent.name
+                )));
+            }
+            if agent.tool_timeout_seconds == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': tool_timeout_seconds must be at least 1",
+                    agent.name
+                )));
+            }
+            if agent.max_tool_output_bytes == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': max_tool_output_bytes must be at least 1",
                     agent.name
                 )));
             }
@@ -809,5 +834,100 @@ context_strategy = { type = "summarize", threshold = 0 }
             msg.contains("context_strategy.threshold must be at least 1"),
             "error: {msg}"
         );
+    }
+
+    #[test]
+    fn retry_base_delay_exceeds_max_delay_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.retry]
+base_delay_ms = 60000
+max_delay_ms = 1000
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("base_delay_ms") && msg.contains("max_delay_ms"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn retry_base_delay_equals_max_delay_accepted() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.retry]
+base_delay_ms = 5000
+max_delay_ms = 5000
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let retry = config.provider.retry.unwrap();
+        assert_eq!(retry.base_delay_ms, 5000);
+        assert_eq!(retry.max_delay_ms, 5000);
+    }
+
+    #[test]
+    fn zero_tool_timeout_seconds_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+tool_timeout_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_timeout_seconds must be at least 1"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn zero_max_tool_output_bytes_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+max_tool_output_bytes = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tool_output_bytes must be at least 1"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_agent_name_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = ""
+description = "Test"
+system_prompt = "You test."
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agent name must not be empty"), "error: {msg}");
     }
 }

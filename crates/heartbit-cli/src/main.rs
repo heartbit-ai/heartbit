@@ -10,10 +10,10 @@ use tracing_subscriber::EnvFilter;
 
 use heartbit::tool::Tool;
 use heartbit::{
-    AgentOutput, AnthropicProvider, BoxedProvider, ContextStrategy, ContextStrategyConfig,
-    HeartbitConfig, InMemoryStore, McpClient, Memory, MemoryConfig, OnApproval, OnText,
-    OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider,
-    SubAgentConfig, ToolCall,
+    AgentOutput, AnthropicProvider, Blackboard, BoxedProvider, ContextStrategy,
+    ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard, InMemoryStore, McpClient, Memory,
+    MemoryConfig, OnApproval, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore,
+    RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
 };
 
 #[derive(Parser)]
@@ -321,6 +321,10 @@ async fn build_orchestrator_from_config(
         builder = builder.shared_memory(memory);
     }
 
+    // Always attach an in-memory blackboard for cross-agent coordination
+    let blackboard: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
+    builder = builder.blackboard(blackboard);
+
     let mut orchestrator = builder.build()?;
     let output = orchestrator.run(task).await?;
     Ok(output)
@@ -407,6 +411,8 @@ async fn run_default_orchestrator(
         builder = builder.on_approval(cb);
     }
 
+    let blackboard: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
+
     let mut orchestrator = builder
         .sub_agent(
             "researcher",
@@ -429,6 +435,7 @@ async fn run_default_orchestrator(
              and produce clear, well-structured, and engaging output. Focus on clarity, \
              organization, and readability.",
         )
+        .blackboard(blackboard)
         .build()?;
 
     let output = orchestrator.run(task).await?;
@@ -445,6 +452,12 @@ fn streaming_callback() -> Arc<OnText> {
 }
 
 /// Create an interactive approval callback that prompts on stderr.
+///
+/// The `OnApproval` callback is sync by design (`dyn Fn(&[ToolCall]) -> bool`).
+/// The blocking stdin read runs on one tokio worker thread, but this is
+/// intentional: the orchestrator is waiting for the human decision anyway,
+/// and the multi-threaded runtime (`#[tokio::main]`) allows other tasks to
+/// progress on remaining worker threads.
 fn approval_callback() -> Arc<OnApproval> {
     Arc::new(|tool_calls: &[ToolCall]| {
         use std::io::Write;

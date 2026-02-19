@@ -7,6 +7,7 @@ pub mod store;
 pub mod tool;
 pub mod workflow;
 
+pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::context::ContextStrategy;
 pub use agent::orchestrator::{Orchestrator, SubAgentConfig};
 pub use agent::{AgentOutput, AgentRunner};
