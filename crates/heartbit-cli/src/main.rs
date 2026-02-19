@@ -317,7 +317,9 @@ async fn run_from_env(task: &str) -> Result<()> {
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
             let model = std::env::var("HEARTBIT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
-            let provider = Arc::new(AnthropicProvider::new(api_key, model));
+            let provider = Arc::new(RetryingProvider::with_defaults(AnthropicProvider::new(
+                api_key, model,
+            )));
             let output = run_default_orchestrator(provider, task).await?;
             print_output(&output);
         }
@@ -326,7 +328,9 @@ async fn run_from_env(task: &str) -> Result<()> {
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let model = std::env::var("HEARTBIT_MODEL")
                 .unwrap_or_else(|_| "anthropic/claude-sonnet-4".into());
-            let provider = Arc::new(OpenRouterProvider::new(api_key, model));
+            let provider = Arc::new(RetryingProvider::with_defaults(OpenRouterProvider::new(
+                api_key, model,
+            )));
             let output = run_default_orchestrator(provider, task).await?;
             print_output(&output);
         }
