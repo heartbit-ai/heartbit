@@ -27,6 +27,7 @@ pub(crate) struct SubAgentDef {
     pub(crate) context_strategy: Option<ContextStrategy>,
     pub(crate) summarize_threshold: Option<u32>,
     pub(crate) tool_timeout: Option<Duration>,
+    pub(crate) max_tool_output_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -171,6 +172,9 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                 }
                 if let Some(timeout) = agent_def.tool_timeout {
                     builder = builder.tool_timeout(timeout);
+                }
+                if let Some(max) = agent_def.max_tool_output_bytes {
+                    builder = builder.max_tool_output_bytes(max);
                 }
 
                 // Add memory tools if shared memory is configured
@@ -370,6 +374,7 @@ pub struct SubAgentConfig {
     pub context_strategy: Option<ContextStrategy>,
     pub summarize_threshold: Option<u32>,
     pub tool_timeout: Option<Duration>,
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -397,6 +402,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             context_strategy: None,
             summarize_threshold: None,
             tool_timeout: None,
+            max_tool_output_bytes: None,
         });
         self
     }
@@ -416,6 +422,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             context_strategy: None,
             summarize_threshold: None,
             tool_timeout: None,
+            max_tool_output_bytes: None,
         });
         self
     }
@@ -429,6 +436,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             context_strategy: def.context_strategy,
             summarize_threshold: def.summarize_threshold,
             tool_timeout: def.tool_timeout,
+            max_tool_output_bytes: def.max_tool_output_bytes,
         });
         self
     }
@@ -578,6 +586,7 @@ mod tests {
                 context_strategy: None,
                 summarize_threshold: None,
                 tool_timeout: None,
+                max_tool_output_bytes: None,
             }],
             shared_memory: None,
             max_turns: 10,

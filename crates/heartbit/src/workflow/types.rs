@@ -115,6 +115,10 @@ pub struct AgentTask {
     /// Timeout in seconds for individual tool executions.
     #[serde(default)]
     pub tool_timeout_seconds: Option<u64>,
+    /// Maximum byte size for individual tool output. Oversized results are
+    /// truncated with a `[truncated]` suffix.
+    #[serde(default)]
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 /// Result from an agent workflow.
@@ -164,6 +168,9 @@ pub struct AgentDef {
     /// Timeout in seconds for individual tool executions.
     #[serde(default)]
     pub tool_timeout_seconds: Option<u64>,
+    /// Maximum byte size for individual tool output.
+    #[serde(default)]
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 /// Result from the orchestrator workflow.
@@ -345,6 +352,7 @@ mod tests {
             context_window_tokens: None,
             summarize_threshold: None,
             tool_timeout_seconds: None,
+            max_tool_output_bytes: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -390,6 +398,7 @@ mod tests {
                 context_window_tokens: None,
                 summarize_threshold: None,
                 tool_timeout_seconds: None,
+                max_tool_output_bytes: None,
             }],
             max_turns: 10,
             max_tokens: 8192,

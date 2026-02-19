@@ -100,6 +100,9 @@ pub struct AgentConfig {
     pub context_strategy: Option<ContextStrategyConfig>,
     /// Timeout in seconds for individual tool executions.
     pub tool_timeout_seconds: Option<u64>,
+    /// Maximum byte size for individual tool output. Results exceeding this
+    /// limit are truncated with a `[truncated]` suffix.
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 /// Memory configuration for the orchestrator.
@@ -506,6 +509,39 @@ system_prompt = "You test."
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert!(config.agents[0].tool_timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn parse_max_tool_output_bytes() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+max_tool_output_bytes = 16384
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(config.agents[0].max_tool_output_bytes, Some(16384));
+    }
+
+    #[test]
+    fn max_tool_output_bytes_defaults_to_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.agents[0].max_tool_output_bytes.is_none());
     }
 
     #[test]

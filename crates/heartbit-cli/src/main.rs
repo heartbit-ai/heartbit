@@ -296,6 +296,7 @@ async fn build_orchestrator_from_config(
             tool_timeout: agent
                 .tool_timeout_seconds
                 .map(std::time::Duration::from_secs),
+            max_tool_output_bytes: agent.max_tool_output_bytes,
         });
     }
 

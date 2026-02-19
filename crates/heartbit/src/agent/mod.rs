@@ -45,6 +45,9 @@ pub struct AgentRunner<P: LlmProvider> {
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     /// Optional timeout for individual tool executions.
     tool_timeout: Option<Duration>,
+    /// Optional maximum byte size for tool output content. Oversized results
+    /// are truncated with a `[truncated: N bytes omitted]` suffix.
+    max_tool_output_bytes: Option<usize>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -62,6 +65,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             on_text: None,
             on_approval: None,
             tool_timeout: None,
+            max_tool_output_bytes: None,
         }
     }
 
@@ -210,6 +214,10 @@ impl<P: LlmProvider> AgentRunner<P> {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok((idx, Ok(output))) => {
+                    let output = match self.max_tool_output_bytes {
+                        Some(max) => output.truncated(max),
+                        None => output,
+                    };
                     results_vec[idx] = Some(tool_output_to_result(call_ids[idx].clone(), output));
                 }
                 Ok((idx, Err(e))) => {
@@ -256,6 +264,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     tool_timeout: Option<Duration>,
+    max_tool_output_bytes: Option<usize>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -340,6 +349,18 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a maximum byte size for individual tool output content.
+    ///
+    /// Tool results exceeding this limit are truncated with a
+    /// `[truncated: N bytes omitted]` suffix, preventing oversized results
+    /// from blowing out the context window.
+    ///
+    /// Default: `None` (no truncation).
+    pub fn max_tool_output_bytes(mut self, max: usize) -> Self {
+        self.max_tool_output_bytes = Some(max);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
@@ -380,6 +401,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             on_text: self.on_text,
             on_approval: self.on_approval,
             tool_timeout: self.tool_timeout,
+            max_tool_output_bytes: self.max_tool_output_bytes,
         })
     }
 }
@@ -1223,5 +1245,94 @@ mod tests {
         // Agent gets error from validation, then LLM responds
         assert_eq!(output.result, "I see the validation error.");
         assert_eq!(output.tool_calls_made, 1); // The call was counted
+    }
+
+    #[tokio::test]
+    async fn large_tool_output_is_truncated() {
+        // Tool that returns a very large result
+        struct BigTool;
+        impl Tool for BigTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "big".into(),
+                    description: "Returns big output".into(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+            fn execute(
+                &self,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(ToolOutput::success("x".repeat(10_000))) })
+            }
+        }
+
+        // Capture what the LLM receives by checking the second response
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "big".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Got truncated result.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool))
+            .max_tool_output_bytes(500)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("get big data").await.unwrap();
+        assert_eq!(output.result, "Got truncated result.");
+        assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn small_tool_output_not_truncated_with_limit() {
+        // When max_tool_output_bytes is set but output is small, no truncation
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done!".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "small result")))
+            .max_tool_output_bytes(1000)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("search").await.unwrap();
+        assert_eq!(output.result, "Done!");
     }
 }

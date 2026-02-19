@@ -255,6 +255,7 @@ async fn execute_delegation(
                 context_window_tokens: agent_def.context_window_tokens,
                 summarize_threshold: agent_def.summarize_threshold,
                 tool_timeout_seconds: agent_def.tool_timeout_seconds,
+                max_tool_output_bytes: agent_def.max_tool_output_bytes,
             }))
             .call()
             .await;

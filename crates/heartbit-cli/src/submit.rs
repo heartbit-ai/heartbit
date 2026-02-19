@@ -274,5 +274,6 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         context_window_tokens,
         summarize_threshold,
         tool_timeout_seconds: config.tool_timeout_seconds,
+        max_tool_output_bytes: config.max_tool_output_bytes,
     }
 }

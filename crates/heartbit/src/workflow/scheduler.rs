@@ -112,6 +112,7 @@ mod tests {
                 context_window_tokens: None,
                 summarize_threshold: None,
                 tool_timeout_seconds: None,
+                max_tool_output_bytes: None,
             }],
             max_turns: 10,
             max_tokens: 4096,

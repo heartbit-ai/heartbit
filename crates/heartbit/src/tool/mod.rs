@@ -27,6 +27,24 @@ impl ToolOutput {
             is_error: true,
         }
     }
+
+    /// Truncate content if it exceeds `max_bytes`, preserving UTF-8 validity.
+    ///
+    /// When truncated, appends a `[truncated: N bytes omitted]` suffix so the
+    /// LLM knows data was cut. Content within the limit is returned unchanged.
+    pub fn truncated(mut self, max_bytes: usize) -> Self {
+        if self.content.len() > max_bytes {
+            let mut cut = max_bytes;
+            while cut > 0 && !self.content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let omitted = self.content.len() - cut;
+            self.content.truncate(cut);
+            self.content
+                .push_str(&format!("\n\n[truncated: {omitted} bytes omitted]"));
+        }
+        self
+    }
 }
 
 /// Trait for tools that agents can invoke.
@@ -89,6 +107,50 @@ mod tests {
         let output = ToolOutput::error("something failed");
         assert_eq!(output.content, "something failed");
         assert!(output.is_error);
+    }
+
+    #[test]
+    fn tool_output_truncated_noop_when_within_limit() {
+        let output = ToolOutput::success("short text");
+        let truncated = output.truncated(100);
+        assert_eq!(truncated.content, "short text");
+        assert!(!truncated.is_error);
+    }
+
+    #[test]
+    fn tool_output_truncated_cuts_long_content() {
+        let output = ToolOutput::success("a".repeat(1000));
+        let truncated = output.truncated(100);
+        assert!(truncated.content.len() < 1000);
+        assert!(truncated.content.starts_with("aaaa"));
+        assert!(truncated.content.contains("[truncated:"));
+        assert!(truncated.content.contains("bytes omitted]"));
+        assert!(!truncated.is_error); // preserves is_error flag
+    }
+
+    #[test]
+    fn tool_output_truncated_preserves_utf8() {
+        // "é" is 2 bytes in UTF-8. A cut at byte 5 would split a char boundary.
+        let output = ToolOutput::success("ééééé"); // 10 bytes
+        let truncated = output.truncated(5);
+        // Should cut at char boundary (4 bytes = 2 chars), not mid-char
+        assert!(truncated.content.starts_with("éé"));
+        assert!(truncated.content.contains("[truncated:"));
+    }
+
+    #[test]
+    fn tool_output_truncated_exact_boundary_noop() {
+        let output = ToolOutput::success("hello"); // 5 bytes
+        let truncated = output.truncated(5);
+        assert_eq!(truncated.content, "hello");
+    }
+
+    #[test]
+    fn tool_output_truncated_error_also_truncates() {
+        let output = ToolOutput::error("e".repeat(200));
+        let truncated = output.truncated(50);
+        assert!(truncated.content.contains("[truncated:"));
+        assert!(truncated.is_error); // preserves error flag
     }
 
     #[test]
