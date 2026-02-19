@@ -45,10 +45,15 @@ impl LlmProvider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<body read error: {e}>"));
+            // Sanitize body for auth failures to avoid leaking API key fragments in logs
+            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!("authentication failed (HTTP {})", status.as_u16())
+            } else {
+                response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
+            };
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -81,10 +86,15 @@ impl AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<body read error: {e}>"));
+            // Sanitize body for auth failures to avoid leaking API key fragments in logs
+            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!("authentication failed (HTTP {})", status.as_u16())
+            } else {
+                response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
+            };
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,

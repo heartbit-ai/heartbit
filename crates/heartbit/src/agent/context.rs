@@ -168,6 +168,9 @@ pub(crate) fn inject_summary_into_messages(
     summary: &str,
     keep_last_n: usize,
 ) {
+    if messages.is_empty() {
+        return;
+    }
     let total = messages.len();
     // Need at least: first(1) + something_to_summarize(1) + keep_last_n
     if total <= 1 + keep_last_n {
@@ -605,5 +608,12 @@ mod tests {
             .join("");
         assert!(first_text.contains("original task"));
         assert!(first_text.contains("summary of conversation"));
+    }
+
+    #[test]
+    fn inject_summary_empty_messages_is_noop() {
+        let mut messages = vec![];
+        inject_summary_into_messages(&mut messages, "task", "summary", 2);
+        assert!(messages.is_empty());
     }
 }

@@ -151,9 +151,7 @@ impl Tool for SharedMemoryWriteTool {
         ToolDefinition {
             name: "shared_memory_write".into(),
             description: "Write a memory to the shared namespace, visible to all agents. \
-                          Use this to share important findings with other agents. \
-                          Note: shared memories are write-once and cannot be updated or \
-                          deleted through private memory tools."
+                          Use this to share important findings with other agents."
                 .into(),
             input_schema: json!({
                 "type": "object",

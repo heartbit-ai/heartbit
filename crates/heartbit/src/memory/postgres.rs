@@ -6,6 +6,7 @@ use sqlx::{FromRow, PgPool, Row};
 
 use crate::error::Error;
 
+use super::scoring::{ScoringWeights, composite_score};
 use super::{Memory, MemoryEntry, MemoryQuery};
 
 /// Row type for reading memories from PostgreSQL.
@@ -42,8 +43,9 @@ impl From<MemoryRow> for MemoryEntry {
 ///
 /// Uses `sqlx::query_as()` (runtime queries, no compile-time macros).
 /// Recall filtering uses SQL WHERE clauses with `ILIKE` for text search.
-/// Results are ordered by `created_at DESC` (scoring is applied in-memory
-/// for consistency with `InMemoryStore`'s composite scoring).
+/// Results are fetched ordered by `created_at DESC` from the database, then
+/// re-sorted in-memory using composite scoring (recency + importance + relevance)
+/// for consistency with `InMemoryStore`.
 pub struct PostgresMemoryStore {
     pool: PgPool,
 }
@@ -164,6 +166,8 @@ impl Memory for PostgresMemoryStore {
 
             sql.push_str(" ORDER BY created_at DESC");
 
+            // IMPORTANT: LIMIT must remain the last clause. The param_idx counter
+            // and binding order below assume LIMIT is the final bound parameter.
             if query.limit > 0 {
                 sql.push_str(&format!(" LIMIT ${param_idx}"));
             }
@@ -192,6 +196,7 @@ impl Memory for PostgresMemoryStore {
                 .await
                 .map_err(|e| Error::Memory(format!("failed to recall memories: {e}")))?;
 
+            let has_text_query = query.text.is_some();
             let mut entries: Vec<MemoryEntry> = rows
                 .into_iter()
                 .map(|row| {
@@ -209,6 +214,21 @@ impl Memory for PostgresMemoryStore {
                     MemoryEntry::from(r)
                 })
                 .collect();
+
+            // Apply composite scoring for consistency with InMemoryStore
+            let now = Utc::now();
+            let weights = ScoringWeights::default();
+            entries.sort_by(|a, b| {
+                let relevance_a = if has_text_query { 1.0 } else { 0.0 };
+                let relevance_b = if has_text_query { 1.0 } else { 0.0 };
+                let score_a =
+                    composite_score(&weights, a.created_at, now, a.importance, relevance_a);
+                let score_b =
+                    composite_score(&weights, b.created_at, now, b.importance, relevance_b);
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             // Update access counts for returned entries
             if !entries.is_empty() {

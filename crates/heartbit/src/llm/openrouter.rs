@@ -42,10 +42,15 @@ impl LlmProvider for OpenRouterProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<body read error: {e}>"));
+            // Sanitize body for auth failures to avoid leaking API key fragments in logs
+            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!("authentication failed (HTTP {})", status.as_u16())
+            } else {
+                response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
+            };
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -77,16 +82,12 @@ fn build_openai_request(
     for msg in &request.messages {
         match msg.role {
             Role::User => {
-                // User messages: text blocks become content, tool_result blocks become tool messages
-                let mut has_text = false;
+                // Collect text blocks into a single message to avoid consecutive user messages
+                let mut text_parts = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            has_text = true;
-                            messages.push(serde_json::json!({
-                                "role": "user",
-                                "content": text,
-                            }));
+                            text_parts.push(text.as_str());
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,
@@ -109,14 +110,17 @@ fn build_openai_request(
                         _ => {}
                     }
                 }
-                // If no text blocks, and the message only has tool results, we're done
-                // But if somehow we have a user message with no content, add empty
-                if !has_text
-                    && !msg
-                        .content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                if !text_parts.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": text_parts.join("\n\n"),
+                    }));
+                } else if !msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
                 {
+                    // No text blocks and no tool results — add empty user message
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": "",
@@ -542,6 +546,38 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "search");
         assert_eq!(calls[1].name, "read");
+    }
+
+    #[test]
+    fn build_request_multi_text_blocks_concatenated() {
+        // Multiple text blocks in a user message should be concatenated into
+        // a single message to avoid consecutive user messages (OpenAI constraint).
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "First paragraph.".into(),
+                    },
+                    ContentBlock::Text {
+                        text: "Second paragraph.".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // Should produce a single user message, not two
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(
+            messages[0]["content"],
+            "First paragraph.\n\nSecond paragraph."
+        );
     }
 
     // --- Roundtrip test: request → response → request ---

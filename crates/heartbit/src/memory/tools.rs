@@ -400,24 +400,8 @@ impl Tool for MemoryConsolidateTool {
                 ));
             }
 
-            // Delete source memories, track which were found
-            let total = input.source_ids.len();
-            let mut deleted = 0;
-            let mut not_found = Vec::new();
-            for id in &input.source_ids {
-                match self.memory.forget(id).await? {
-                    true => deleted += 1,
-                    false => not_found.push(id.clone()),
-                }
-            }
-
-            if deleted == 0 {
-                return Ok(ToolOutput::error(
-                    "None of the source memories were found. Consolidation aborted.",
-                ));
-            }
-
-            // Create consolidated entry
+            // Create consolidated entry FIRST to prevent data loss.
+            // If store fails, no sources are deleted.
             let new_id = Uuid::new_v4().to_string();
             let now = Utc::now();
             let entry = MemoryEntry {
@@ -433,6 +417,24 @@ impl Tool for MemoryConsolidateTool {
             };
 
             self.memory.store(entry).await?;
+
+            // Delete source memories, track which were found
+            let total = input.source_ids.len();
+            let mut deleted = 0;
+            let mut not_found = Vec::new();
+            for id in &input.source_ids {
+                match self.memory.forget(id).await? {
+                    true => deleted += 1,
+                    false => not_found.push(id.clone()),
+                }
+            }
+
+            if deleted == 0 {
+                return Ok(ToolOutput::error(format!(
+                    "None of the source memories were found. \
+                     Consolidated entry {new_id} was created but no sources were removed."
+                )));
+            }
 
             let mut msg = format!("Consolidated {deleted} memories into new memory: {new_id}");
             if !not_found.is_empty() {
@@ -833,7 +835,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("None of the source memories"));
+        assert!(
+            result
+                .content
+                .contains("None of the source memories were found")
+        );
     }
 
     #[tokio::test]

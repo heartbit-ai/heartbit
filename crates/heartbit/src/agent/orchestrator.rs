@@ -73,6 +73,15 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
         }
     }
 
+    /// Run the orchestrator with a task. Returns the combined output from
+    /// the orchestrator and all sub-agents.
+    ///
+    /// # Concurrent use
+    ///
+    /// This method is NOT safe for concurrent calls on the same instance.
+    /// The shared sub-agent token accumulator is reset at the start of each call,
+    /// so concurrent runs would produce incorrect token counts. Create separate
+    /// `Orchestrator` instances for concurrent use.
     pub async fn run(&self, task: &str) -> Result<AgentOutput, Error> {
         // Reset sub-agent token accumulator so repeated calls don't inflate counts
         {
