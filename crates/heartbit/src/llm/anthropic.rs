@@ -120,6 +120,10 @@ fn build_request_body(
         body["tools"] = serde_json::to_value(&request.tools)?;
     }
 
+    if let Some(ref tc) = request.tool_choice {
+        body["tool_choice"] = serde_json::to_value(tc)?;
+    }
+
     Ok(body)
 }
 
@@ -658,6 +662,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_request_body("claude-sonnet-4-20250514", &request).unwrap();
@@ -681,12 +686,71 @@ mod tests {
                 input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
             }],
             max_tokens: 2048,
+            tool_choice: None,
         };
 
         let body = build_request_body("claude-sonnet-4-20250514", &request).unwrap();
         assert_eq!(body["system"], "You are helpful.");
         assert_eq!(body["tools"][0]["name"], "search");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_request_body_no_tool_choice_omits_field() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_request_body("model", &request).unwrap();
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_request_body_tool_choice_auto() {
+        use crate::llm::types::ToolChoice;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Auto),
+        };
+        let body = build_request_body("model", &request).unwrap();
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn build_request_body_tool_choice_any() {
+        use crate::llm::types::ToolChoice;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Any),
+        };
+        let body = build_request_body("model", &request).unwrap();
+        assert_eq!(body["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn build_request_body_tool_choice_specific_tool() {
+        use crate::llm::types::ToolChoice;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Tool {
+                name: "search".into(),
+            }),
+        };
+        let body = build_request_body("model", &request).unwrap();
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "search");
     }
 
     // --- SSE stream integration tests ---

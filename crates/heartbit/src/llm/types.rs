@@ -73,6 +73,22 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// Controls which tools the LLM is allowed or forced to call.
+///
+/// Maps to Anthropic's `tool_choice` parameter and OpenAI's equivalent.
+/// When `None` is used in `CompletionRequest`, the provider's default behavior
+/// applies (equivalent to `Auto`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Let the LLM decide whether to call tools. This is the default.
+    Auto,
+    /// Force the LLM to call at least one tool (any tool).
+    Any,
+    /// Force the LLM to call a specific tool by name.
+    Tool { name: String },
+}
+
 /// A request to the LLM.
 ///
 /// The model is not part of the request — it's a property of the provider.
@@ -82,6 +98,8 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
+    /// Optional tool choice constraint. `None` = provider default (auto).
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// Why the LLM stopped generating.
@@ -323,6 +341,46 @@ mod tests {
             serde_json::to_string(&StopReason::MaxTokens).unwrap(),
             "\"max_tokens\""
         );
+    }
+
+    #[test]
+    fn tool_choice_auto_serializes() {
+        let tc = ToolChoice::Auto;
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["type"], "auto");
+    }
+
+    #[test]
+    fn tool_choice_any_serializes() {
+        let tc = ToolChoice::Any;
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["type"], "any");
+    }
+
+    #[test]
+    fn tool_choice_tool_serializes() {
+        let tc = ToolChoice::Tool {
+            name: "search".into(),
+        };
+        let json = serde_json::to_value(&tc).unwrap();
+        assert_eq!(json["type"], "tool");
+        assert_eq!(json["name"], "search");
+    }
+
+    #[test]
+    fn tool_choice_roundtrips() {
+        let choices = vec![
+            ToolChoice::Auto,
+            ToolChoice::Any,
+            ToolChoice::Tool {
+                name: "search".into(),
+            },
+        ];
+        for tc in choices {
+            let json = serde_json::to_string(&tc).unwrap();
+            let parsed: ToolChoice = serde_json::from_str(&json).unwrap();
+            assert_eq!(tc, parsed);
+        }
     }
 
     #[test]

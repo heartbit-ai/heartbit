@@ -154,6 +154,7 @@ impl AgentContext {
             messages,
             tools: self.tools.clone(),
             max_tokens: self.max_tokens,
+            tool_choice: None,
         }
     }
 }

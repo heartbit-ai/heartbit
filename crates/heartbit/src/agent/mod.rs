@@ -157,6 +157,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             messages: vec![Message::user(ctx.conversation_text())],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let response = self.provider.complete(summary_request).await?;

@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::error::Error;
 use crate::llm::LlmProvider;
 use crate::llm::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason, TokenUsage,
+    CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason, TokenUsage, ToolChoice,
     ToolDefinition,
 };
 
@@ -192,7 +192,28 @@ fn build_openai_request(
         body["tools"] = serde_json::Value::Array(tools);
     }
 
+    // Convert tool_choice to OpenAI format
+    if let Some(ref tc) = request.tool_choice {
+        body["tool_choice"] = tool_choice_to_openai(tc);
+    }
+
     Ok(body)
+}
+
+/// Convert our `ToolChoice` to OpenAI's format.
+///
+/// - `Auto` → `"auto"` (string)
+/// - `Any` → `"required"` (OpenAI's equivalent of "must call a tool")
+/// - `Tool { name }` → `{"type": "function", "function": {"name": "..."}}`
+fn tool_choice_to_openai(tc: &ToolChoice) -> serde_json::Value {
+    match tc {
+        ToolChoice::Auto => serde_json::json!("auto"),
+        ToolChoice::Any => serde_json::json!("required"),
+        ToolChoice::Tool { name } => serde_json::json!({
+            "type": "function",
+            "function": {"name": name}
+        }),
+    }
 }
 
 fn tool_to_openai(tool: &ToolDefinition) -> serde_json::Value {
@@ -326,6 +347,7 @@ mod tests {
             messages: vec![Message::user("hello")],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("anthropic/claude-sonnet-4", &request).unwrap();
@@ -345,6 +367,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -365,6 +388,7 @@ mod tests {
                 input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
             }],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -396,6 +420,7 @@ mod tests {
             ],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -419,6 +444,7 @@ mod tests {
             ])],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -573,6 +599,7 @@ mod tests {
             }],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -621,6 +648,7 @@ mod tests {
             ],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -634,6 +662,64 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call-1");
         assert_eq!(messages[3]["role"], "user");
         assert_eq!(messages[3]["content"], "Here are the results:");
+    }
+
+    // --- tool_choice tests ---
+
+    #[test]
+    fn build_request_no_tool_choice_omits_field() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_request_tool_choice_auto() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Auto),
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn build_request_tool_choice_any() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Any),
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        // OpenAI uses "required" for "must call a tool"
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn build_request_tool_choice_specific_tool() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: Some(ToolChoice::Tool {
+                name: "search".into(),
+            }),
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "search");
     }
 
     // --- Roundtrip test: request → response → request ---
@@ -652,6 +738,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body1 = build_openai_request("model", &request1).unwrap();
@@ -689,6 +776,7 @@ mod tests {
             ],
             tools: vec![],
             max_tokens: 1024,
+            tool_choice: None,
         };
 
         let body2 = build_openai_request("model", &request2).unwrap();

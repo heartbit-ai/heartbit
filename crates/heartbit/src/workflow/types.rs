@@ -68,6 +68,7 @@ impl LlmCallRequest {
             messages: self.messages.clone(),
             tools: self.tools.clone(),
             max_tokens: self.max_tokens,
+            tool_choice: None,
         }
     }
 }

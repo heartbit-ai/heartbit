@@ -213,6 +213,7 @@ mod tests {
             messages: vec![Message::user("test")],
             tools: vec![],
             max_tokens: 100,
+            tool_choice: None,
         }
     }
 

@@ -20,7 +20,7 @@ pub use llm::openrouter::OpenRouterProvider;
 pub use llm::retry::{RetryConfig, RetryingProvider};
 pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StopReason, TokenUsage,
-    ToolCall, ToolDefinition, ToolResult,
+    ToolCall, ToolChoice, ToolDefinition, ToolResult,
 };
 pub use llm::{BoxedProvider, DynLlmProvider};
 pub use memory::in_memory::InMemoryStore;
