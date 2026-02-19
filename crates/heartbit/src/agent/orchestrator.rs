@@ -58,6 +58,11 @@ pub(crate) struct SubAgentResult {
 ///
 /// Refactored to use `AgentRunner` internally with a `DelegateTaskTool`.
 /// No duplicated agent loop — the orchestrator IS an AgentRunner.
+///
+/// The `DelegateTaskTool` accumulates sub-agent token usage in a shared
+/// `Arc<Mutex<TokenUsage>>`. Each `run()` call resets the accumulator
+/// before starting, so sequential calls are safe. For concurrent use,
+/// create separate `Orchestrator` instances.
 pub struct Orchestrator<P: LlmProvider> {
     runner: AgentRunner<P>,
     /// Shared accumulator for sub-agent token usage (populated by DelegateTaskTool).
@@ -82,11 +87,12 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
     ///
     /// # Concurrent use
     ///
-    /// This method is NOT safe for concurrent calls on the same instance.
-    /// The shared sub-agent token accumulator is reset at the start of each call,
-    /// so concurrent runs would produce incorrect token counts. Create separate
-    /// `Orchestrator` instances for concurrent use.
-    pub async fn run(&self, task: &str) -> Result<AgentOutput, Error> {
+    /// This method takes `&mut self` to prevent concurrent calls on the same
+    /// instance at compile time. The sub-agent token accumulator is reset at
+    /// the start of each call, so concurrent runs would produce incorrect
+    /// token counts. For concurrent use, create separate `Orchestrator`
+    /// instances.
+    pub async fn run(&mut self, task: &str) -> Result<AgentOutput, Error> {
         // Reset sub-agent token accumulator so repeated calls don't inflate counts
         {
             let mut acc = self.sub_agent_tokens.lock().expect("token lock poisoned");
@@ -597,7 +603,7 @@ mod tests {
             },
         }]));
 
-        let orch = Orchestrator::builder(provider)
+        let mut orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
             .build()
             .unwrap();
@@ -666,7 +672,7 @@ mod tests {
             },
         ]));
 
-        let orch = Orchestrator::builder(provider)
+        let mut orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research specialist", "You research.")
             .sub_agent("analyst", "Analysis expert", "You analyze.")
             .build()
@@ -705,7 +711,7 @@ mod tests {
             },
         ]));
 
-        let orch = Orchestrator::builder(provider)
+        let mut orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
             .build()
             .unwrap();
@@ -735,7 +741,7 @@ mod tests {
             },
         ]));
 
-        let orch = Orchestrator::builder(provider)
+        let mut orch = Orchestrator::builder(provider)
             .sub_agent("researcher", "Research", "prompt")
             .build()
             .unwrap();

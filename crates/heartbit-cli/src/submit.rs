@@ -9,7 +9,12 @@ use heartbit::store::PostgresStore;
 use heartbit::workflow::types::{AgentDef, HumanDecision, OrchestratorTask};
 
 /// Submit a task to Restate for durable execution.
-pub async fn submit_task(config_path: &Path, task: &str, restate_url: &str) -> Result<()> {
+pub async fn submit_task(
+    config_path: &Path,
+    task: &str,
+    restate_url: &str,
+    approve: bool,
+) -> Result<()> {
     let config = HeartbitConfig::from_file(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
@@ -53,7 +58,7 @@ pub async fn submit_task(config_path: &Path, task: &str, restate_url: &str) -> R
         agents,
         max_turns: config.orchestrator.max_turns,
         max_tokens: config.orchestrator.max_tokens,
-        approval_required: false,
+        approval_required: approve,
     };
 
     let url = format!(

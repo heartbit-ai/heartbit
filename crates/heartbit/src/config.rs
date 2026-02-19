@@ -167,6 +167,19 @@ impl HeartbitConfig {
                     agent.name
                 )));
             }
+            // Validate context strategy max_tokens > 0
+            match &agent.context_strategy {
+                Some(ContextStrategyConfig::SlidingWindow { max_tokens })
+                | Some(ContextStrategyConfig::Summarize { max_tokens })
+                    if *max_tokens == 0 =>
+                {
+                    return Err(Error::Config(format!(
+                        "agent '{}': context_strategy.max_tokens must be at least 1",
+                        agent.name
+                    )));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -561,5 +574,47 @@ model = "claude-sonnet-4-20250514"
         assert_eq!(retry.max_retries, 3);
         assert_eq!(retry.base_delay_ms, 500);
         assert_eq!(retry.max_delay_ms, 30000);
+    }
+
+    #[test]
+    fn zero_context_strategy_max_tokens_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+context_strategy = { type = "sliding_window", max_tokens = 0 }
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context_strategy.max_tokens must be at least 1"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn zero_summarize_max_tokens_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "test"
+description = "Test"
+system_prompt = "You test."
+context_strategy = { type = "summarize", max_tokens = 0 }
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context_strategy.max_tokens must be at least 1"),
+            "error: {msg}"
+        );
     }
 }

@@ -36,43 +36,57 @@ pub trait SchedulerObject {
 pub struct SchedulerObjectImpl;
 
 impl SchedulerObject for SchedulerObjectImpl {
+    /// Start a recurring schedule. Each invocation submits one task, then
+    /// schedules the next iteration via a delayed self-send. This releases
+    /// the Restate exclusive lock between iterations, allowing `stop()` to
+    /// interleave and set the running flag to false.
     async fn start(
         &self,
         mut ctx: ObjectContext<'_>,
         Json(config): Json<ScheduleConfig>,
     ) -> Result<(), HandlerError> {
+        // Check if stopped between iterations
+        let running = ctx.get::<bool>("running").await?.unwrap_or(false);
+        if !running {
+            // First call: mark as running. Subsequent calls: already running.
+            // If stop() was called between iterations, running is false and we exit.
+            let is_first = ctx.get::<bool>("initialized").await?.unwrap_or(false);
+            if is_first {
+                // stop() was called — don't restart
+                return Ok(());
+            }
+        }
         ctx.set("running", true);
-        let interval = Duration::from_secs(config.interval_secs);
+        ctx.set("initialized", true);
+
         let key = ctx.key().to_string();
 
-        loop {
-            // Check if we should stop
-            let running = ctx.get::<bool>("running").await?.unwrap_or(false);
-            if !running {
-                break;
-            }
+        // Submit the task as a new orchestrator workflow
+        let workflow_id = format!("{}-{}", key, ctx.rand_uuid());
+        ctx.workflow_client::<OrchestratorWorkflowClient>(&workflow_id)
+            .run(Json(OrchestratorTask {
+                input: config.task.clone(),
+                agents: config.agents.clone(),
+                max_turns: config.max_turns,
+                max_tokens: config.max_tokens,
+                approval_required: false,
+            }))
+            .send();
 
-            // Submit the task as a new orchestrator workflow
-            let workflow_id = format!("{}-{}", key, ctx.rand_uuid());
-            ctx.workflow_client::<OrchestratorWorkflowClient>(&workflow_id)
-                .run(Json(OrchestratorTask {
-                    input: config.task.clone(),
-                    agents: config.agents.clone(),
-                    max_turns: config.max_turns,
-                    max_tokens: config.max_tokens,
-                    approval_required: false,
-                }))
-                .send();
-
-            // Durable sleep — survives crashes
-            ctx.sleep(interval).await?;
-        }
+        // Schedule next iteration after the interval. This releases the
+        // exclusive lock, allowing stop() to run before the next iteration.
+        let interval = Duration::from_secs(config.interval_secs);
+        ctx.object_client::<SchedulerObjectClient>(&key)
+            .start(Json(config))
+            .send_after(interval);
 
         Ok(())
     }
 
     async fn stop(&self, ctx: ObjectContext<'_>) -> Result<(), HandlerError> {
         ctx.set("running", false);
+        // Clear initialized so a future start() can begin fresh
+        ctx.set("initialized", false);
         Ok(())
     }
 

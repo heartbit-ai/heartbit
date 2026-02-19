@@ -172,5 +172,46 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
         }
     }
 
+    // Register memory tools if memory is configured (matching standalone behavior)
+    if let Some(ref memory_config) = config.memory {
+        let memory: Arc<dyn heartbit::Memory> = match memory_config {
+            heartbit::MemoryConfig::InMemory => Arc::new(heartbit::InMemoryStore::new()),
+            heartbit::MemoryConfig::Postgres { database_url } => {
+                let store = heartbit::PostgresMemoryStore::connect(database_url)
+                    .await
+                    .context("failed to connect to PostgreSQL for memory store")?;
+                store
+                    .run_migration()
+                    .await
+                    .context("failed to run memory store migration")?;
+                Arc::new(store)
+            }
+        };
+
+        // Register per-agent memory tools (namespaced private + shared)
+        for agent in &config.agents {
+            let ns = Arc::new(heartbit::memory::namespaced::NamespacedMemory::new(
+                memory.clone(),
+                &agent.name,
+            ));
+            for tool in heartbit::memory::tools::memory_tools(ns, &agent.name) {
+                let def = tool.definition();
+                if !tools.contains_key(&def.name) {
+                    tracing::info!(tool = %def.name, agent = %agent.name, "registered memory tool");
+                    tools.insert(def.name.clone(), tool);
+                }
+            }
+            for tool in
+                heartbit::memory::shared_tools::shared_memory_tools(memory.clone(), &agent.name)
+            {
+                let def = tool.definition();
+                if !tools.contains_key(&def.name) {
+                    tracing::info!(tool = %def.name, agent = %agent.name, "registered shared memory tool");
+                    tools.insert(def.name.clone(), tool);
+                }
+            }
+        }
+    }
+
     Ok(tools)
 }

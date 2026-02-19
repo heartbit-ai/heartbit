@@ -148,7 +148,8 @@ impl AgentService for AgentServiceImpl {
         &self,
         _ctx: Context<'_>,
     ) -> Result<Json<Vec<ToolDefinition>>, HandlerError> {
-        let defs = self.tools.values().map(|t| t.definition()).collect();
+        let mut defs: Vec<ToolDefinition> = self.tools.values().map(|t| t.definition()).collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Json(defs))
     }
 }

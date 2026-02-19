@@ -54,6 +54,10 @@ enum Commands {
         #[arg(trailing_var_arg = true)]
         task: Vec<String>,
 
+        /// Require human approval before each tool execution round
+        #[arg(long)]
+        approve: bool,
+
         /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
         #[arg(long)]
         restate_url: Option<String>,
@@ -133,7 +137,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
             serve::run_worker(config_path, &bind).await
         }
-        Some(Commands::Submit { task, restate_url }) => {
+        Some(Commands::Submit {
+            task,
+            approve,
+            restate_url,
+        }) => {
             init_tracing();
             let task_str = task.join(" ");
             if task_str.is_empty() {
@@ -144,7 +152,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
             let url = resolve_restate_url(restate_url, Some(config_path));
-            submit::submit_task(config_path, &task_str, &url).await
+            submit::submit_task(config_path, &task_str, &url, approve).await
         }
         Some(Commands::Status {
             workflow_id,
@@ -339,7 +347,7 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
         builder = builder.shared_memory(memory);
     }
 
-    let orchestrator = builder.build()?;
+    let mut orchestrator = builder.build()?;
     let output = orchestrator.run(task).await?;
     Ok(output)
 }
@@ -429,7 +437,7 @@ async fn run_default_orchestrator<P: LlmProvider + 'static>(
         builder = builder.on_approval(cb);
     }
 
-    let orchestrator = builder
+    let mut orchestrator = builder
         .sub_agent(
             "researcher",
             "Research specialist who gathers information and facts",
