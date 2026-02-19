@@ -13,7 +13,7 @@ use crate::llm::LlmProvider;
 use crate::llm::types::{
     CompletionRequest, Message, StopReason, TokenUsage, ToolCall, ToolDefinition, ToolResult,
 };
-use crate::tool::{Tool, ToolOutput};
+use crate::tool::{Tool, ToolOutput, validate_tool_input};
 
 use crate::memory::Memory;
 
@@ -176,6 +176,16 @@ impl<P: LlmProvider> AgentRunner<P> {
             let input = call.input.clone();
             let call_name = call.name.clone();
             let timeout = self.tool_timeout;
+
+            // Validate input against the tool's declared schema before dispatching.
+            // On failure, produce an error result without executing the tool.
+            if let Some(ref t) = tool {
+                let schema = &t.definition().input_schema;
+                if let Err(msg) = validate_tool_input(schema, &input) {
+                    join_set.spawn(async move { (idx, Ok(ToolOutput::error(msg))) });
+                    continue;
+                }
+            }
 
             join_set.spawn(async move {
                 let output = match tool {
@@ -1149,5 +1159,68 @@ mod tests {
         let output = runner.execute("test").await.unwrap();
         assert_eq!(output.result, "Done!");
         assert_eq!(output.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_validation_rejects_bad_input() {
+        // Tool with a strict schema requiring a "query" string
+        struct StrictTool;
+        impl Tool for StrictTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "search".into(),
+                    description: "Search".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    }),
+                }
+            }
+            fn execute(
+                &self,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(ToolOutput::success("should not be called")) })
+            }
+        }
+
+        // LLM sends invalid input (missing required "query"), then corrects
+        let provider = Arc::new(MockProvider::new(vec![
+            // Turn 1: LLM tries to call search with bad input
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({"wrong_field": 42}), // Missing "query"
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            // Turn 2: LLM sees validation error, responds with text
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I see the validation error.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(StrictTool))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("search for something").await.unwrap();
+        // Agent gets error from validation, then LLM responds
+        assert_eq!(output.result, "I see the validation error.");
+        assert_eq!(output.tool_calls_made, 1); // The call was counted
     }
 }

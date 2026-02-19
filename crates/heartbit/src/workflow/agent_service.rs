@@ -109,6 +109,15 @@ impl AgentService for AgentServiceImpl {
             }
         };
 
+        // Validate input against the tool's declared schema before executing.
+        let schema = &tool.definition().input_schema;
+        if let Err(msg) = crate::tool::validate_tool_input(schema, &request.input) {
+            return Ok(Json(ToolCallResponse {
+                content: msg,
+                is_error: true,
+            }));
+        }
+
         let result = match request.timeout_seconds {
             Some(secs) => {
                 match tokio::time::timeout(
