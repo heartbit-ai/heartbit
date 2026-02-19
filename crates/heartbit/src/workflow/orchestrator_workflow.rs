@@ -76,6 +76,7 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
             // If no tool calls, return the direct response
             if !llm_response.has_tool_calls() {
                 if llm_response.stop_reason == StopReason::MaxTokens {
+                    ctx.set("state", "error".to_string());
                     return Err(
                         TerminalError::new("Response truncated (max_tokens reached)").into(),
                     );
