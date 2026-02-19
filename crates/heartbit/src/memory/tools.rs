@@ -206,7 +206,8 @@ impl Tool for MemoryRecallTool {
                     let score =
                         composite_score(&weights, e.created_at, now, e.importance, relevance);
                     let display_content = if e.content.len() > 200 {
-                        format!("{}...", &e.content[..200])
+                        let truncated: String = e.content.chars().take(200).collect();
+                        format!("{truncated}...")
                     } else {
                         e.content.clone()
                     };
@@ -724,6 +725,45 @@ mod tests {
 
         let result = recall_tool.execute(json!({})).await.unwrap();
         assert!(result.content.contains("importance:8"));
+    }
+
+    #[tokio::test]
+    async fn recall_tool_truncates_long_content_safely() {
+        let (_store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let recall_tool = find_tool(&tools, "memory_recall");
+
+        // Content with multi-byte UTF-8 characters (each emoji is 4 bytes)
+        let content = "🦀".repeat(100); // 400 bytes, 100 chars
+        store_tool
+            .execute(json!({"content": content}))
+            .await
+            .unwrap();
+
+        // Should not panic on non-ASCII content
+        let result = recall_tool.execute(json!({})).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Found 1 memory"));
+    }
+
+    #[tokio::test]
+    async fn recall_tool_truncates_very_long_content() {
+        let (_store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let recall_tool = find_tool(&tools, "memory_recall");
+
+        // 500 ASCII chars — should be truncated to 200 + "..."
+        let content = "a".repeat(500);
+        store_tool
+            .execute(json!({"content": content}))
+            .await
+            .unwrap();
+
+        let result = recall_tool.execute(json!({})).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("..."));
+        // Should NOT contain all 500 'a's
+        assert!(!result.content.contains(&"a".repeat(500)));
     }
 
     // --- consolidation tests ---

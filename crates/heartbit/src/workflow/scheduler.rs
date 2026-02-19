@@ -45,17 +45,18 @@ impl SchedulerObject for SchedulerObjectImpl {
         mut ctx: ObjectContext<'_>,
         Json(config): Json<ScheduleConfig>,
     ) -> Result<(), HandlerError> {
-        // Check if stopped between iterations
+        // Guard: distinguish "first ever call" from "scheduled self-send after stop()".
+        // Both have running=false, but initialized differentiates them.
         let running = ctx.get::<bool>("running").await?.unwrap_or(false);
-        if !running {
-            // First call: mark as running. Subsequent calls: already running.
-            // If stop() was called between iterations, running is false and we exit.
-            let is_first = ctx.get::<bool>("initialized").await?.unwrap_or(false);
-            if is_first {
-                // stop() was called — don't restart
-                return Ok(());
-            }
+        let initialized = ctx.get::<bool>("initialized").await?.unwrap_or(false);
+
+        if !running && initialized {
+            // stop() was called — this is a scheduled self-send that should not restart.
+            // Clear initialized so a future explicit start() call can begin fresh.
+            ctx.clear("initialized");
+            return Ok(());
         }
+
         ctx.set("running", true);
         ctx.set("initialized", true);
 
@@ -85,8 +86,8 @@ impl SchedulerObject for SchedulerObjectImpl {
 
     async fn stop(&self, ctx: ObjectContext<'_>) -> Result<(), HandlerError> {
         ctx.set("running", false);
-        // Clear initialized so a future start() can begin fresh
-        ctx.set("initialized", false);
+        // Keep initialized=true so the next scheduled start() detects the stop
+        // and exits. That start() clears initialized, enabling future restarts.
         Ok(())
     }
 
