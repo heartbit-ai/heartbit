@@ -75,6 +75,15 @@ enum Commands {
         #[arg(long)]
         restate_url: Option<String>,
     },
+    /// Get the result of a completed workflow
+    Result {
+        /// Workflow ID to get results from
+        workflow_id: String,
+
+        /// Restate ingress URL (overrides config; defaults to http://localhost:8080)
+        #[arg(long)]
+        restate_url: Option<String>,
+    },
 }
 
 const DEFAULT_RESTATE_URL: &str = "http://localhost:8080";
@@ -152,13 +161,21 @@ async fn main() -> Result<()> {
             let url = resolve_restate_url(restate_url, cli.config.as_deref());
             submit::send_approval(&workflow_id, &url).await
         }
+        Some(Commands::Result {
+            workflow_id,
+            restate_url,
+        }) => {
+            init_tracing();
+            let url = resolve_restate_url(restate_url, cli.config.as_deref());
+            submit::get_result(&workflow_id, &url).await
+        }
         None => {
             init_tracing();
             // Backward-compatible: bare task args without subcommand
             let task_str = cli.task.join(" ");
             if task_str.is_empty() {
                 bail!(
-                    "Usage: heartbit [run|serve|submit|status|approve] <args>\n       heartbit <task>  (shorthand for 'run')"
+                    "Usage: heartbit [run|serve|submit|status|approve|result] <args>\n       heartbit <task>  (shorthand for 'run')"
                 );
             }
             run_standalone(cli.config.as_deref(), &task_str, false).await

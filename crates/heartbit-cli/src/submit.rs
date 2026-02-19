@@ -181,6 +181,50 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get the result of a completed workflow.
+///
+/// Calls the Restate workflow's `output` endpoint which returns the final
+/// result once the workflow has completed.
+pub async fn get_result(workflow_id: &str, restate_url: &str) -> Result<()> {
+    let url = format!(
+        "{}/restate/workflow/OrchestratorWorkflow/{}/output",
+        restate_url.trim_end_matches('/'),
+        workflow_id
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("failed to get workflow result")?;
+
+    if resp.status().is_success() {
+        let body = resp.text().await?;
+        if let Ok(result) =
+            serde_json::from_str::<heartbit::workflow::types::OrchestratorResult>(&body)
+        {
+            println!("{}", result.text);
+            eprintln!(
+                "---\nTokens: {} in / {} out",
+                result.tokens.input_tokens, result.tokens.output_tokens
+            );
+        } else {
+            println!("{body}");
+        }
+    } else if resp.status() == reqwest::StatusCode::ACCEPTED {
+        println!(
+            "Workflow {workflow_id} is still running. Check status with: heartbit status {workflow_id}"
+        );
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Restate returned {status}: {body}");
+    }
+
+    Ok(())
+}
+
 /// Connect to MCP servers and collect tool definitions. Failures are logged and skipped.
 async fn load_mcp_tool_defs(agent_name: &str, mcp_servers: &[String]) -> Vec<ToolDefinition> {
     let mut defs = Vec::new();
