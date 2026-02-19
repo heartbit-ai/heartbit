@@ -11,8 +11,8 @@ use tracing_subscriber::EnvFilter;
 use heartbit::tool::Tool;
 use heartbit::{
     AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
-    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OpenRouterProvider, Orchestrator,
-    PostgresMemoryStore, RetryConfig, RetryingProvider,
+    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OnText, OpenRouterProvider,
+    Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider,
 };
 
 #[derive(Parser)]
@@ -184,41 +184,40 @@ async fn run_from_config(path: &std::path::Path, task: &str) -> Result<()> {
         .with_context(|| format!("failed to load config from {}", path.display()))?;
 
     let retry = retry_config_from(&config);
+    let on_text = streaming_callback();
 
     match config.provider.name.as_str() {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
             let base = AnthropicProvider::new(api_key, &config.provider.model);
-            match retry {
+            let output = match retry {
                 Some(rc) => {
                     let provider = Arc::new(RetryingProvider::new(base, rc));
-                    let output = build_orchestrator_from_config(provider, &config, task).await?;
-                    print_output(&output);
+                    build_orchestrator_from_config(provider, &config, task, on_text).await?
                 }
                 None => {
                     let provider = Arc::new(base);
-                    let output = build_orchestrator_from_config(provider, &config, task).await?;
-                    print_output(&output);
+                    build_orchestrator_from_config(provider, &config, task, on_text).await?
                 }
-            }
+            };
+            print_streaming_stats(&output);
         }
         "openrouter" => {
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let base = OpenRouterProvider::new(api_key, &config.provider.model);
-            match retry {
+            let output = match retry {
                 Some(rc) => {
                     let provider = Arc::new(RetryingProvider::new(base, rc));
-                    let output = build_orchestrator_from_config(provider, &config, task).await?;
-                    print_output(&output);
+                    build_orchestrator_from_config(provider, &config, task, on_text).await?
                 }
                 None => {
                     let provider = Arc::new(base);
-                    let output = build_orchestrator_from_config(provider, &config, task).await?;
-                    print_output(&output);
+                    build_orchestrator_from_config(provider, &config, task, on_text).await?
                 }
-            }
+            };
+            print_streaming_stats(&output);
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
     }
@@ -230,10 +229,12 @@ async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
     provider: Arc<P>,
     config: &HeartbitConfig,
     task: &str,
+    on_text: Arc<OnText>,
 ) -> Result<AgentOutput> {
     let mut builder = Orchestrator::builder(provider)
         .max_turns(config.orchestrator.max_turns)
-        .max_tokens(config.orchestrator.max_tokens);
+        .max_tokens(config.orchestrator.max_tokens)
+        .on_text(on_text);
 
     for agent in &config.agents {
         let tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
@@ -316,6 +317,8 @@ async fn run_from_env(task: &str) -> Result<()> {
         }
     });
 
+    let on_text = streaming_callback();
+
     match provider_name.as_str() {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -325,8 +328,8 @@ async fn run_from_env(task: &str) -> Result<()> {
             let provider = Arc::new(RetryingProvider::with_defaults(AnthropicProvider::new(
                 api_key, model,
             )));
-            let output = run_default_orchestrator(provider, task).await?;
-            print_output(&output);
+            let output = run_default_orchestrator(provider, task, on_text).await?;
+            print_streaming_stats(&output);
         }
         "openrouter" => {
             let api_key = std::env::var("OPENROUTER_API_KEY")
@@ -336,8 +339,8 @@ async fn run_from_env(task: &str) -> Result<()> {
             let provider = Arc::new(RetryingProvider::with_defaults(OpenRouterProvider::new(
                 api_key, model,
             )));
-            let output = run_default_orchestrator(provider, task).await?;
-            print_output(&output);
+            let output = run_default_orchestrator(provider, task, on_text).await?;
+            print_streaming_stats(&output);
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
     }
@@ -348,8 +351,10 @@ async fn run_from_env(task: &str) -> Result<()> {
 async fn run_default_orchestrator<P: LlmProvider + 'static>(
     provider: Arc<P>,
     task: &str,
+    on_text: Arc<OnText>,
 ) -> Result<AgentOutput> {
     let orchestrator = Orchestrator::builder(provider)
+        .on_text(on_text)
         .sub_agent(
             "researcher",
             "Research specialist who gathers information and facts",
@@ -377,8 +382,18 @@ async fn run_default_orchestrator<P: LlmProvider + 'static>(
     Ok(output)
 }
 
-fn print_output(output: &AgentOutput) {
-    println!("{}", output.result);
+/// Create a streaming text callback that writes deltas to stdout immediately.
+fn streaming_callback() -> Arc<OnText> {
+    Arc::new(|text: &str| {
+        use std::io::Write;
+        print!("{text}");
+        std::io::stdout().flush().ok();
+    })
+}
+
+/// Print stats after a streaming run (text already printed via callback).
+fn print_streaming_stats(output: &AgentOutput) {
+    // Ensure stats start on a new line after streamed text
     eprintln!(
         "\n---\nTokens used: {} in / {} out | Tool calls: {}",
         output.tokens_used.input_tokens, output.tokens_used.output_tokens, output.tool_calls_made,

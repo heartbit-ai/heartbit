@@ -100,6 +100,38 @@ impl<P: LlmProvider> LlmProvider for RetryingProvider<P> {
         // All retries exhausted — return the last error
         Err(last_err.expect("at least one attempt must have been made"))
     }
+
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_text: &super::OnText,
+    ) -> Result<CompletionResponse, Error> {
+        let mut last_err: Option<Error> = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let delay = compute_delay(&self.config, attempt - 1);
+                tracing::warn!(
+                    attempt = attempt,
+                    max_retries = self.config.max_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %last_err.as_ref().expect("last_err set before retry"),
+                    "retrying streaming LLM call after transient failure"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.inner.stream_complete(request.clone(), on_text).await {
+                Ok(response) => return Ok(response),
+                Err(e) if is_retryable(&e) => {
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.expect("at least one attempt must have been made"))
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +347,37 @@ mod tests {
         let result = provider.complete(test_request()).await;
         assert!(result.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_complete_retries_on_transient_failure() {
+        // FailNTimes only implements complete; the default stream_complete
+        // delegates to complete. RetryingProvider::stream_complete retries
+        // through that chain.
+        let (mock, count) = FailNTimes::new(2, || Error::Api {
+            status: 429,
+            message: "rate limited".into(),
+        });
+        let provider = RetryingProvider::new(mock, fast_config(3));
+
+        let on_text: &crate::llm::OnText = &|_| {};
+        let result = provider.stream_complete(test_request(), on_text).await;
+        assert!(result.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 3); // 2 failures + 1 success
+    }
+
+    #[tokio::test]
+    async fn stream_complete_does_not_retry_non_retryable() {
+        let (mock, count) = FailNTimes::new(5, || Error::Api {
+            status: 400,
+            message: "bad request".into(),
+        });
+        let provider = RetryingProvider::new(mock, fast_config(3));
+
+        let on_text: &crate::llm::OnText = &|_| {};
+        let result = provider.stream_complete(test_request(), on_text).await;
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1); // No retries
     }
 
     #[test]

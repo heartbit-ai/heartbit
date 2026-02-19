@@ -38,6 +38,8 @@ pub struct AgentRunner<P: LlmProvider> {
     context_strategy: ContextStrategy,
     /// Token threshold at which to trigger summarization. `None` = no summarization.
     summarize_threshold: Option<u32>,
+    /// Optional callback for streaming text output.
+    on_text: Option<Arc<crate::llm::OnText>>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -52,6 +54,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             context_strategy: None,
             summarize_threshold: None,
             memory: None,
+            on_text: None,
         }
     }
 
@@ -71,7 +74,14 @@ impl<P: LlmProvider> AgentRunner<P> {
 
             ctx.increment_turn();
             debug!(agent = %self.name, turn = ctx.current_turn(), "executing turn");
-            let response = self.provider.complete(ctx.to_request()).await?;
+            let response = match &self.on_text {
+                Some(cb) => {
+                    self.provider
+                        .stream_complete(ctx.to_request(), &**cb)
+                        .await?
+                }
+                None => self.provider.complete(ctx.to_request()).await?,
+            };
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
 
@@ -196,6 +206,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     context_strategy: Option<ContextStrategy>,
     summarize_threshold: Option<u32>,
     memory: Option<Arc<dyn Memory>>,
+    on_text: Option<Arc<crate::llm::OnText>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -249,6 +260,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a callback for streaming text output. When set, the agent uses
+    /// `stream_complete` instead of `complete`, calling the callback for each
+    /// text delta as it arrives from the LLM.
+    pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
+        self.on_text = Some(callback);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.max_turns == 0 {
             return Err(Error::Config("max_turns must be at least 1".into()));
@@ -283,6 +302,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_tokens: self.max_tokens,
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
+            on_text: self.on_text,
         })
     }
 }
@@ -660,6 +680,75 @@ mod tests {
             runner.context_strategy,
             ContextStrategy::SlidingWindow { max_tokens: 50000 }
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_uses_stream_complete_when_on_text_set() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StreamTrackingProvider {
+            stream_called: Arc<AtomicBool>,
+        }
+
+        impl LlmProvider for StreamTrackingProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "non-stream".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
+            }
+
+            async fn stream_complete(
+                &self,
+                _request: CompletionRequest,
+                on_text: &crate::llm::OnText,
+            ) -> Result<CompletionResponse, Error> {
+                self.stream_called.store(true, Ordering::SeqCst);
+                on_text("streamed ");
+                on_text("text");
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "streamed text".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let stream_called = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(StreamTrackingProvider {
+            stream_called: stream_called.clone(),
+        });
+
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+        let callback: Arc<crate::llm::OnText> = Arc::new(move |text: &str| {
+            received_clone.lock().expect("lock").push(text.to_string());
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .on_text(callback)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert!(
+            stream_called.load(Ordering::SeqCst),
+            "stream_complete should have been called"
+        );
+        assert_eq!(output.result, "streamed text");
+
+        let texts = received.lock().expect("lock");
+        assert_eq!(*texts, vec!["streamed ", "text"]);
     }
 
     #[tokio::test]

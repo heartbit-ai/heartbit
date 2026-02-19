@@ -70,6 +70,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             max_turns: 10,
             max_tokens: 4096,
             shared_memory: None,
+            on_text: None,
         }
     }
 
@@ -332,6 +333,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     max_turns: usize,
     max_tokens: u32,
     shared_memory: Option<Arc<dyn Memory>>,
+    on_text: Option<Arc<crate::llm::OnText>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -408,6 +410,14 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Set a callback for streaming text output on the orchestrator's LLM calls.
+    /// Sub-agents do not stream — only the orchestrator's own reasoning and
+    /// final synthesis are emitted incrementally.
+    pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
+        self.on_text = Some(callback);
+        self
+    }
+
     pub fn build(self) -> Result<Orchestrator<P>, Error> {
         if self.sub_agents.is_empty() {
             tracing::warn!(
@@ -433,13 +443,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             shared_memory: self.shared_memory,
         });
 
-        let runner = AgentRunner::builder(self.provider)
+        let mut runner_builder = AgentRunner::builder(self.provider)
             .name("orchestrator")
             .system_prompt(system)
             .tool(delegate_tool)
             .max_turns(self.max_turns)
-            .max_tokens(self.max_tokens)
-            .build()?;
+            .max_tokens(self.max_tokens);
+
+        if let Some(on_text) = self.on_text {
+            runner_builder = runner_builder.on_text(on_text);
+        }
+
+        let runner = runner_builder.build()?;
 
         Ok(Orchestrator {
             runner,

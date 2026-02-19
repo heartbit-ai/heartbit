@@ -63,14 +63,12 @@ impl LlmProvider for AnthropicProvider {
         let api_response: ApiResponse = response.json().await?;
         Ok(into_completion_response(api_response))
     }
-}
 
-/// Streaming completion using SSE.
-///
-/// Currently not wired into the agent loop (which uses `complete()`).
-/// Available for future streaming output support.
-impl AnthropicProvider {
-    pub async fn stream(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_text: &super::OnText,
+    ) -> Result<CompletionResponse, Error> {
         let mut body = build_request_body(&self.model, &request)?;
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -86,7 +84,6 @@ impl AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            // Sanitize body for auth failures to avoid leaking API key fragments in logs
             let message = if status.as_u16() == 401 || status.as_u16() == 403 {
                 format!("authentication failed (HTTP {})", status.as_u16())
             } else {
@@ -101,7 +98,7 @@ impl AnthropicProvider {
             });
         }
 
-        parse_sse_stream(response.bytes_stream()).await
+        parse_sse_stream_with_callback(response.bytes_stream(), on_text).await
     }
 }
 
@@ -235,8 +232,11 @@ pub(crate) struct SseEvent {
     pub(crate) data: String,
 }
 
-/// Parse an SSE byte stream into a CompletionResponse.
-pub(crate) async fn parse_sse_stream<S>(stream: S) -> Result<CompletionResponse, Error>
+/// Parse an SSE byte stream into a CompletionResponse, calling `on_text` for each text delta.
+async fn parse_sse_stream_with_callback<S>(
+    stream: S,
+    on_text: &super::OnText,
+) -> Result<CompletionResponse, Error>
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
@@ -249,13 +249,12 @@ where
         let chunk = chunk.map_err(Error::Http)?;
         let events = parser.feed(&String::from_utf8_lossy(&chunk));
         for event in events {
-            process_sse_event(&mut state, &event)?;
+            process_sse_event(&mut state, &event, Some(on_text))?;
         }
     }
 
-    // Flush remaining data
     for event in parser.flush() {
-        process_sse_event(&mut state, &event)?;
+        process_sse_event(&mut state, &event, Some(on_text))?;
     }
 
     Ok(state.into_response())
@@ -310,7 +309,11 @@ impl SseResponseState {
     }
 }
 
-fn process_sse_event(state: &mut SseResponseState, event: &SseEvent) -> Result<(), Error> {
+fn process_sse_event(
+    state: &mut SseResponseState,
+    event: &SseEvent,
+    on_text: Option<&super::OnText>,
+) -> Result<(), Error> {
     match event.event_type.as_str() {
         "message_start" => {
             if let Ok(parsed) = serde_json::from_str::<MessageStartEvent>(&event.data) {
@@ -339,8 +342,13 @@ fn process_sse_event(state: &mut SseResponseState, event: &SseEvent) -> Result<(
             if let Ok(parsed) = serde_json::from_str::<ContentBlockDeltaEvent>(&event.data) {
                 match parsed.delta.r#type.as_str() {
                     "text_delta" => {
-                        if let Some(ref mut text) = state.current_text {
-                            text.push_str(&parsed.delta.text.unwrap_or_default());
+                        if let Some(ref delta) = parsed.delta.text {
+                            if let Some(cb) = on_text {
+                                cb(delta);
+                            }
+                            if let Some(ref mut text) = state.current_text {
+                                text.push_str(delta);
+                            }
                         }
                     }
                     "input_json_delta" => {
@@ -494,6 +502,7 @@ struct MessageDeltaUsage {
 mod tests {
     use super::*;
     use crate::llm::types::Message;
+    use std::sync::Arc;
 
     // --- SseParser unit tests ---
 
@@ -672,7 +681,9 @@ mod tests {
             data: {\"type\":\"message_stop\"}\n\n";
 
         let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
-        let response = parse_sse_stream(stream).await.unwrap();
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
 
         assert_eq!(response.text(), "Hello world!");
         assert_eq!(response.stop_reason, StopReason::EndTurn);
@@ -699,7 +710,9 @@ mod tests {
         ];
 
         let stream = futures::stream::iter(chunks);
-        let response = parse_sse_stream(stream).await.unwrap();
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
 
         assert_eq!(response.text(), "Hi");
         assert_eq!(response.stop_reason, StopReason::EndTurn);
@@ -730,7 +743,9 @@ mod tests {
             data: {\"type\":\"message_stop\"}\n\n";
 
         let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
-        let response = parse_sse_stream(stream).await.unwrap();
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
 
         assert_eq!(response.stop_reason, StopReason::ToolUse);
         let calls = response.tool_calls();
@@ -763,7 +778,9 @@ mod tests {
             data: {\"type\":\"message_stop\"}\n\n";
 
         let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
-        let response = parse_sse_stream(stream).await.unwrap();
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
 
         let calls = response.tool_calls();
         assert_eq!(calls.len(), 2);
@@ -787,9 +804,88 @@ mod tests {
             data: {\"type\":\"message_stop\"}\r\n\r\n";
 
         let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
-        let response = parse_sse_stream(stream).await.unwrap();
+        let response = parse_sse_stream_with_callback(stream, &|_| {})
+            .await
+            .unwrap();
 
         assert_eq!(response.text(), "OK");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_with_callback_invokes_on_text() {
+        use std::sync::Mutex;
+
+        let sse_data = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n\
+            event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world!\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+            event: message_stop\n\
+            data: {\"type\":\"message_stop\"}\n\n";
+
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let collected_clone = collected.clone();
+        let on_text: &crate::llm::OnText = &move |text: &str| {
+            collected_clone.lock().expect("lock").push(text.to_string());
+        };
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
+        let response = parse_sse_stream_with_callback(stream, on_text)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text(), "Hello world!");
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 5);
+
+        let deltas = collected.lock().expect("lock");
+        assert_eq!(*deltas, vec!["Hello ", "world!"]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_with_callback_tool_use_does_not_invoke_on_text() {
+        use std::sync::Mutex;
+
+        // Tool use blocks should NOT trigger the on_text callback
+        let sse_data = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+            event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"search\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\": \\\"test\\\"}\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n\
+            event: message_stop\n\
+            data: {\"type\":\"message_stop\"}\n\n";
+
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let collected_clone = collected.clone();
+        let on_text: &crate::llm::OnText = &move |text: &str| {
+            collected_clone.lock().expect("lock").push(text.to_string());
+        };
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse_data))]);
+        let response = parse_sse_stream_with_callback(stream, on_text)
+            .await
+            .unwrap();
+
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        assert_eq!(response.tool_calls().len(), 1);
+
+        let deltas = collected.lock().expect("lock");
+        assert!(
+            deltas.is_empty(),
+            "on_text should not be called for tool_use blocks"
+        );
     }
 
     #[test]
