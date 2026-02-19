@@ -193,8 +193,14 @@ mod tests {
     impl LlmProvider for FailNTimes {
         async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            if self.remaining_failures.load(Ordering::SeqCst) > 0 {
-                self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
+            // Atomic decrement: avoids TOCTOU between load and sub.
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    if v > 0 { Some(v - 1) } else { None }
+                })
+                .is_ok()
+            {
                 return Err((self.error_factory)());
             }
             Ok(success_response())

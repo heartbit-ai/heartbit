@@ -187,6 +187,10 @@ pub(crate) fn inject_summary_into_messages(
     // Determine tail start, then adjust to maintain alternating User/Assistant roles.
     // After the combined User message, the tail must start with an Assistant message.
     let mut tail_start = total.saturating_sub(keep_last_n);
+    // Guard: `tail_start > 1` because index 0 is the original first message being
+    // replaced — including it in the tail would duplicate content. In valid conversations,
+    // messages[1] is always Assistant (first LLM response after the user task), so
+    // `tail_start == 1 && User` cannot occur with well-formed input.
     if tail_start < total && messages[tail_start].role == Role::User && tail_start > 1 {
         tail_start -= 1;
     }
@@ -611,6 +615,38 @@ mod tests {
             .join("");
         assert!(first_text.contains("original task"));
         assert!(first_text.contains("summary of conversation"));
+    }
+
+    #[test]
+    fn inject_summary_tail_start_near_beginning() {
+        // With total = 4 and keep_last_n = 2, tail_start = 2.
+        // messages[2] is Assistant (valid), so no role adjustment needed.
+        // This tests the boundary near the start of the conversation.
+        let mut messages = vec![
+            Message::user("original task"),
+            Message::assistant("first response"),
+            Message::assistant("second response"),
+            Message::assistant("third response"),
+        ];
+
+        inject_summary_into_messages(&mut messages, "original task", "summary", 2);
+
+        // combined(User) + last 2 = 3 messages
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        // Combined message has task + summary
+        let first_text: String = messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(first_text.contains("original task"));
+        assert!(first_text.contains("summary"));
     }
 
     #[test]

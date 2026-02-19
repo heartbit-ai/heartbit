@@ -586,6 +586,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_request_mixed_user_message_tool_results_before_text() {
+        // When a User message has both Text and ToolResult blocks, OpenAI format
+        // requires tool messages immediately after the assistant's tool_calls.
+        // The current implementation correctly emits tool messages first, then
+        // the user text message, regardless of block order in the source message.
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![
+                Message::user("search for rust"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "search".into(),
+                        input: json!({"q": "rust"}),
+                    }],
+                },
+                // Mixed message: text + tool result
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "Here are the results:".into(),
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-1".into(),
+                            content: "found it".into(),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 1024,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // user + assistant + tool + user(text)
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        // Tool result comes before user text (correct for OpenAI format)
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-1");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "Here are the results:");
+    }
+
     // --- Roundtrip test: request → response → request ---
 
     #[test]
