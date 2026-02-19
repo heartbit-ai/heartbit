@@ -148,6 +148,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     text: llm_response.text(),
                     tokens: total_usage,
                     tool_calls_made: total_tool_calls,
+                    structured: None,
                 }));
             }
 
@@ -160,6 +161,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                 && let Some((_id, _name, input)) =
                     tool_calls.iter().find(|(_, name, _)| name == "__respond__")
             {
+                let structured = input.clone();
                 let text =
                     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
                 ctx.set("state", "completed".to_string());
@@ -167,6 +169,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     text,
                     tokens: total_usage,
                     tool_calls_made: total_tool_calls,
+                    structured: Some(structured),
                 }));
             }
 

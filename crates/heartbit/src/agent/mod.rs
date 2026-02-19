@@ -113,13 +113,15 @@ impl<P: LlmProvider> AgentRunner<P> {
 
             // Check for structured output: if the LLM called the synthetic `__respond__` tool,
             // extract its input as the structured result and return immediately.
+            // Count ALL tool calls in this turn (including co-submitted ones) for parity
+            // with the Restate path, even though non-__respond__ calls are not executed.
             if self.structured_schema.is_some()
                 && let Some(respond_call) = tool_calls.iter().find(|tc| tc.name == "__respond__")
             {
                 let structured = respond_call.input.clone();
                 let text = serde_json::to_string_pretty(&structured)
                     .unwrap_or_else(|_| structured.to_string());
-                total_tool_calls += 1;
+                total_tool_calls += tool_calls.len();
                 return Ok(AgentOutput {
                     result: text,
                     tool_calls_made: total_tool_calls,
@@ -1488,6 +1490,88 @@ mod tests {
             .find(|d| d.name == "__respond__")
             .unwrap();
         assert_eq!(respond_def.input_schema, schema);
+    }
+
+    #[tokio::test]
+    async fn structured_output_counts_all_tool_calls_in_respond_turn() {
+        // When __respond__ appears alongside other tool calls, ALL are counted
+        let schema = json!({
+            "type": "object",
+            "properties": { "result": {"type": "string"} }
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({"q": "data"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "__respond__".into(),
+                    input: json!({"result": "done"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "results")))
+            .structured_schema(schema)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test").await.unwrap();
+        assert!(output.structured.is_some());
+        // Both tool calls in the turn are counted (search + __respond__)
+        assert_eq!(output.tool_calls_made, 2);
+    }
+
+    #[tokio::test]
+    async fn structured_output_max_turns_when_respond_never_called() {
+        // When structured_schema is set but LLM never calls __respond__,
+        // the agent exhausts turns and returns MaxTurnsExceeded
+        let schema = json!({
+            "type": "object",
+            "properties": { "result": {"type": "string"} }
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "results")))
+            .structured_schema(schema)
+            .max_turns(2)
+            .build()
+            .unwrap();
+
+        let err = runner.execute("test").await.unwrap_err();
+        assert!(matches!(err, Error::MaxTurnsExceeded(2)));
     }
 
     #[test]

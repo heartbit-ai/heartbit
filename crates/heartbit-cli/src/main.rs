@@ -299,6 +299,7 @@ async fn build_orchestrator_from_config(
             max_tool_output_bytes: agent.max_tool_output_bytes,
             max_turns: agent.max_turns,
             max_tokens: agent.max_tokens,
+            response_schema: None,
         });
     }
 

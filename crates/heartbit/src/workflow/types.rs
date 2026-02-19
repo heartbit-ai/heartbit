@@ -134,6 +134,10 @@ pub struct AgentResult {
     pub text: String,
     pub tokens: TokenUsage,
     pub tool_calls_made: usize,
+    /// Structured output when the agent was configured with a `response_schema`.
+    /// Contains the validated JSON conforming to the schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
 }
 
 /// Current status of an agent workflow (queryable via shared handler).
@@ -420,11 +424,13 @@ mod tests {
                 output_tokens: 50,
             },
             tool_calls_made: 3,
+            structured: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: AgentResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.text, "Rust is great");
         assert_eq!(parsed.tool_calls_made, 3);
+        assert!(parsed.structured.is_none());
     }
 
     #[test]
@@ -482,6 +488,29 @@ mod tests {
         let parsed: HumanDecision = serde_json::from_str(json).unwrap();
         assert!(parsed.approved);
         assert!(parsed.turn.is_none());
+    }
+
+    #[test]
+    fn agent_result_structured_roundtrips() {
+        let structured = serde_json::json!({"answer": "42"});
+        let result = AgentResult {
+            text: "{\"answer\": \"42\"}".into(),
+            tokens: TokenUsage::default(),
+            tool_calls_made: 1,
+            structured: Some(structured.clone()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: AgentResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.structured, Some(structured));
+    }
+
+    #[test]
+    fn agent_result_structured_defaults_to_none() {
+        // Backward compatibility: old JSON without structured field still parses
+        let json =
+            r#"{"text":"ok","tokens":{"input_tokens":0,"output_tokens":0},"tool_calls_made":0}"#;
+        let parsed: AgentResult = serde_json::from_str(json).unwrap();
+        assert!(parsed.structured.is_none());
     }
 
     #[test]

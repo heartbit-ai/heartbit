@@ -32,6 +32,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) max_turns: Option<usize>,
     /// Per-agent token limit. When `None`, uses orchestrator default.
     pub(crate) max_tokens: Option<u32>,
+    /// Optional JSON Schema for structured output.
+    pub(crate) response_schema: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -179,6 +181,9 @@ impl<P: LlmProvider + 'static> DelegateTaskTool<P> {
                 }
                 if let Some(max) = agent_def.max_tool_output_bytes {
                     builder = builder.max_tool_output_bytes(max);
+                }
+                if let Some(schema) = agent_def.response_schema {
+                    builder = builder.structured_schema(schema);
                 }
 
                 // Add memory tools if shared memory is configured
@@ -383,6 +388,9 @@ pub struct SubAgentConfig {
     pub max_turns: Option<usize>,
     /// Per-agent token limit. When `None`, uses orchestrator default.
     pub max_tokens: Option<u32>,
+    /// Optional JSON Schema for structured output. When set, the sub-agent
+    /// receives a synthetic `__respond__` tool and returns structured JSON.
+    pub response_schema: Option<serde_json::Value>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -413,6 +421,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tool_output_bytes: None,
             max_turns: None,
             max_tokens: None,
+            response_schema: None,
         });
         self
     }
@@ -435,6 +444,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tool_output_bytes: None,
             max_turns: None,
             max_tokens: None,
+            response_schema: None,
         });
         self
     }
@@ -451,6 +461,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tool_output_bytes: def.max_tool_output_bytes,
             max_turns: def.max_turns,
             max_tokens: def.max_tokens,
+            response_schema: def.response_schema,
         });
         self
     }
@@ -603,6 +614,7 @@ mod tests {
                 max_tool_output_bytes: None,
                 max_turns: None,
                 max_tokens: None,
+                response_schema: None,
             }],
             shared_memory: None,
             max_turns: 10,
