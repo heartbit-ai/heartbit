@@ -90,6 +90,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     messages: request_messages,
                     tools: tool_defs.clone(),
                     max_tokens: task.max_tokens,
+                    tool_choice: None,
                 }))
                 .call()
                 .await?;
@@ -231,6 +232,7 @@ impl AgentWorkflow for AgentWorkflowImpl {
                             messages: vec![Message::user(messages_to_text(&messages))],
                             tools: vec![],
                             max_tokens: 1024,
+                            tool_choice: None,
                         }))
                         .call()
                         .await?

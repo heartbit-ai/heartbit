@@ -167,10 +167,13 @@ impl SseParser {
     pub(crate) fn flush(mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // Process remaining buffer as a final line
+        // Process remaining buffer as a final line.
+        // Strip trailing \r since next_line() defers lone \r at buffer end
+        // (waiting for a possible \n in the next chunk that never arrives).
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.process_line(&line, &mut events);
+            let line = line.trim_end_matches('\r');
+            self.process_line(line, &mut events);
         }
 
         // Emit any pending event
@@ -651,6 +654,19 @@ mod tests {
         let events = parser.feed("event: test\ndata: \n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "");
+    }
+
+    #[test]
+    fn parser_flush_strips_trailing_cr() {
+        let mut parser = SseParser::new();
+
+        // Buffer ends with \r (next_line defers it, waiting for possible \n)
+        let events = parser.feed("event: test\ndata: hello\r");
+        assert!(events.is_empty());
+
+        let flushed = parser.flush();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].data, "hello"); // no trailing \r
     }
 
     // --- build_request_body tests ---

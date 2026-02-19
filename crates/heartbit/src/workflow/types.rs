@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason, TokenUsage,
-    ToolDefinition,
+    ToolChoice, ToolDefinition,
 };
 
 // Re-export DynLlmProvider from its canonical location in `llm` module.
@@ -19,6 +19,9 @@ pub struct LlmCallRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: u32,
+    /// Optional tool choice constraint for structured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// Response from an LLM call activity.
@@ -68,7 +71,7 @@ impl LlmCallRequest {
             messages: self.messages.clone(),
             tools: self.tools.clone(),
             max_tokens: self.max_tokens,
-            tool_choice: None,
+            tool_choice: self.tool_choice.clone(),
         }
     }
 }
@@ -193,6 +196,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             max_tokens: 4096,
+            tool_choice: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: LlmCallRequest = serde_json::from_str(&json).unwrap();
@@ -239,10 +243,53 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 2048,
+            tool_choice: None,
         };
         let cr = req.to_completion_request();
         assert_eq!(cr.system, "sys");
         assert_eq!(cr.max_tokens, 2048);
+    }
+
+    #[test]
+    fn llm_call_request_tool_choice_roundtrips() {
+        let req = LlmCallRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 2048,
+            tool_choice: Some(ToolChoice::Tool {
+                name: "search".into(),
+            }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: LlmCallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.tool_choice,
+            Some(ToolChoice::Tool {
+                name: "search".into()
+            })
+        );
+    }
+
+    #[test]
+    fn llm_call_request_tool_choice_defaults_to_none() {
+        // Backward compatibility: old JSON without tool_choice still parses
+        let json = r#"{"system":"sys","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[],"max_tokens":2048}"#;
+        let parsed: LlmCallRequest = serde_json::from_str(json).unwrap();
+        assert!(parsed.tool_choice.is_none());
+    }
+
+    #[test]
+    fn llm_call_request_forwards_tool_choice_to_completion_request() {
+        let req = LlmCallRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 2048,
+            tool_choice: Some(ToolChoice::Any),
+        };
+        let cr = req.to_completion_request();
+        assert_eq!(cr.tool_choice, Some(ToolChoice::Any));
     }
 
     #[test]

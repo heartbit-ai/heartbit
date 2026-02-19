@@ -61,6 +61,7 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                     messages: messages.clone(),
                     tools: vec![delegate_tool_def.clone()],
                     max_tokens: task.max_tokens,
+                    tool_choice: None,
                 }))
                 .call()
                 .await?
