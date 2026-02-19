@@ -50,6 +50,11 @@ impl AgentServiceImpl {
 }
 
 impl AgentService for AgentServiceImpl {
+    /// Execute an LLM completion as a Restate activity.
+    ///
+    /// Uses `DynLlmProvider::complete` (not `stream_complete`) because Restate
+    /// activities return serialized responses — there is no streaming channel
+    /// back to the caller. Streaming is only used in the standalone CLI path.
     async fn llm_call(
         &self,
         ctx: Context<'_>,

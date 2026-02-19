@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use restate_sdk::prelude::*;
 
+use heartbit::DynLlmProvider;
 use heartbit::llm::anthropic::AnthropicProvider;
 use heartbit::llm::openrouter::OpenRouterProvider;
 use heartbit::tool::Tool;
@@ -15,7 +16,6 @@ use heartbit::workflow::budget::{TokenBudgetObject, TokenBudgetObjectImpl};
 use heartbit::workflow::circuit_breaker::{CircuitBreakerObject, CircuitBreakerObjectImpl};
 use heartbit::workflow::orchestrator_workflow::{OrchestratorWorkflow, OrchestratorWorkflowImpl};
 use heartbit::workflow::scheduler::{SchedulerObject, SchedulerObjectImpl};
-use heartbit::workflow::types::DynLlmProvider;
 use heartbit::{HeartbitConfig, RetryConfig, RetryingProvider};
 
 /// Start the Restate-compatible HTTP worker.

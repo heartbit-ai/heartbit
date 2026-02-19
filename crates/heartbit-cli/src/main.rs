@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 
 use heartbit::tool::Tool;
 use heartbit::{
-    AgentOutput, AnthropicProvider, ContextStrategy, ContextStrategyConfig, HeartbitConfig,
-    InMemoryStore, LlmProvider, McpClient, Memory, MemoryConfig, OnApproval, OnText,
+    AgentOutput, AnthropicProvider, BoxedProvider, ContextStrategy, ContextStrategyConfig,
+    HeartbitConfig, InMemoryStore, McpClient, Memory, MemoryConfig, OnApproval, OnText,
     OpenRouterProvider, Orchestrator, PostgresMemoryStore, RetryConfig, RetryingProvider,
     SubAgentConfig, ToolCall,
 };
@@ -209,11 +209,41 @@ fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
     config.provider.retry.as_ref().map(RetryConfig::from)
 }
 
+/// Construct a type-erased LLM provider from config.
+fn build_provider_from_config(config: &HeartbitConfig) -> Result<Arc<BoxedProvider>> {
+    let retry = retry_config_from(config);
+    match config.provider.name.as_str() {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
+            let base = AnthropicProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => Ok(Arc::new(BoxedProvider::new(RetryingProvider::new(
+                    base, rc,
+                )))),
+                None => Ok(Arc::new(BoxedProvider::new(base))),
+            }
+        }
+        "openrouter" => {
+            let api_key = std::env::var("OPENROUTER_API_KEY")
+                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
+            let base = OpenRouterProvider::new(api_key, &config.provider.model);
+            match retry {
+                Some(rc) => Ok(Arc::new(BoxedProvider::new(RetryingProvider::new(
+                    base, rc,
+                )))),
+                None => Ok(Arc::new(BoxedProvider::new(base))),
+            }
+        }
+        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    }
+}
+
 async fn run_from_config(path: &std::path::Path, task: &str, approve: bool) -> Result<()> {
     let config = HeartbitConfig::from_file(path)
         .with_context(|| format!("failed to load config from {}", path.display()))?;
 
-    let retry = retry_config_from(&config);
+    let provider = build_provider_from_config(&config)?;
     let on_text = streaming_callback();
     let on_approval = if approve {
         Some(approval_callback())
@@ -221,75 +251,14 @@ async fn run_from_config(path: &std::path::Path, task: &str, approve: bool) -> R
         None
     };
 
-    match config.provider.name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = AnthropicProvider::new(api_key, &config.provider.model);
-            let output = match retry {
-                Some(rc) => {
-                    let provider = Arc::new(RetryingProvider::new(base, rc));
-                    build_orchestrator_from_config(
-                        provider,
-                        &config,
-                        task,
-                        on_text,
-                        on_approval.clone(),
-                    )
-                    .await?
-                }
-                None => {
-                    let provider = Arc::new(base);
-                    build_orchestrator_from_config(
-                        provider,
-                        &config,
-                        task,
-                        on_text,
-                        on_approval.clone(),
-                    )
-                    .await?
-                }
-            };
-            print_streaming_stats(&output);
-        }
-        "openrouter" => {
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let base = OpenRouterProvider::new(api_key, &config.provider.model);
-            let output = match retry {
-                Some(rc) => {
-                    let provider = Arc::new(RetryingProvider::new(base, rc));
-                    build_orchestrator_from_config(
-                        provider,
-                        &config,
-                        task,
-                        on_text,
-                        on_approval.clone(),
-                    )
-                    .await?
-                }
-                None => {
-                    let provider = Arc::new(base);
-                    build_orchestrator_from_config(
-                        provider,
-                        &config,
-                        task,
-                        on_text,
-                        on_approval.clone(),
-                    )
-                    .await?
-                }
-            };
-            print_streaming_stats(&output);
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
-    }
-
+    let output =
+        build_orchestrator_from_config(provider, &config, task, on_text, on_approval).await?;
+    print_streaming_stats(&output);
     Ok(())
 }
 
-async fn build_orchestrator_from_config<P: LlmProvider + 'static>(
-    provider: Arc<P>,
+async fn build_orchestrator_from_config(
+    provider: Arc<BoxedProvider>,
     config: &HeartbitConfig,
     task: &str,
     on_text: Arc<OnText>,
@@ -388,6 +357,28 @@ async fn run_from_env(task: &str, approve: bool) -> Result<()> {
         }
     });
 
+    let provider: Arc<BoxedProvider> = match provider_name.as_str() {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
+            let model = std::env::var("HEARTBIT_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+            Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+                AnthropicProvider::new(api_key, model),
+            )))
+        }
+        "openrouter" => {
+            let api_key = std::env::var("OPENROUTER_API_KEY")
+                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
+            let model = std::env::var("HEARTBIT_MODEL")
+                .unwrap_or_else(|_| "anthropic/claude-sonnet-4".into());
+            Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+                OpenRouterProvider::new(api_key, model),
+            )))
+        }
+        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    };
+
     let on_text = streaming_callback();
     let on_approval = if approve {
         Some(approval_callback())
@@ -395,39 +386,13 @@ async fn run_from_env(task: &str, approve: bool) -> Result<()> {
         None
     };
 
-    match provider_name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let model = std::env::var("HEARTBIT_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
-            let provider = Arc::new(RetryingProvider::with_defaults(AnthropicProvider::new(
-                api_key, model,
-            )));
-            let output =
-                run_default_orchestrator(provider, task, on_text, on_approval.clone()).await?;
-            print_streaming_stats(&output);
-        }
-        "openrouter" => {
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let model = std::env::var("HEARTBIT_MODEL")
-                .unwrap_or_else(|_| "anthropic/claude-sonnet-4".into());
-            let provider = Arc::new(RetryingProvider::with_defaults(OpenRouterProvider::new(
-                api_key, model,
-            )));
-            let output =
-                run_default_orchestrator(provider, task, on_text, on_approval.clone()).await?;
-            print_streaming_stats(&output);
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
-    }
-
+    let output = run_default_orchestrator(provider, task, on_text, on_approval).await?;
+    print_streaming_stats(&output);
     Ok(())
 }
 
-async fn run_default_orchestrator<P: LlmProvider + 'static>(
-    provider: Arc<P>,
+async fn run_default_orchestrator(
+    provider: Arc<BoxedProvider>,
     task: &str,
     on_text: Arc<OnText>,
     on_approval: Option<Arc<OnApproval>>,

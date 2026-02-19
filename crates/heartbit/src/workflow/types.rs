@@ -1,41 +1,12 @@
-use std::future::Future;
-use std::pin::Pin;
-
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
 use crate::llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason, TokenUsage,
     ToolDefinition,
 };
 
-// ---------------------------------------------------------------------------
-// DynLlmProvider — object-safe adapter for LlmProvider (RPITIT → dyn)
-// ---------------------------------------------------------------------------
-
-/// Object-safe version of `LlmProvider` for use in Restate service impls.
-///
-/// `LlmProvider` uses RPITIT (not dyn-compatible). This trait wraps it via
-/// `Pin<Box<dyn Future>>` so we can store providers as `Arc<dyn DynLlmProvider>`.
-///
-/// NOTE: Only `complete` is exposed — `stream_complete` is not supported on
-/// the Restate path. Restate handlers are request/response (not streamed),
-/// so incremental text output is not applicable here.
-pub trait DynLlmProvider: Send + Sync {
-    fn complete<'a>(
-        &'a self,
-        request: CompletionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
-}
-
-impl<P: crate::LlmProvider> DynLlmProvider for P {
-    fn complete<'a>(
-        &'a self,
-        request: CompletionRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
-        Box::pin(crate::LlmProvider::complete(self, request))
-    }
-}
+// Re-export DynLlmProvider from its canonical location in `llm` module.
+pub use crate::llm::DynLlmProvider;
 
 // ---------------------------------------------------------------------------
 // Serializable request/response types for Restate services
@@ -412,30 +383,5 @@ mod tests {
         assert!(parsed.turn.is_none());
     }
 
-    #[test]
-    fn dyn_llm_provider_wraps_provider() {
-        // Verify the DynLlmProvider blanket impl compiles with a concrete provider
-        use crate::llm::types::CompletionRequest;
-
-        struct FakeProvider;
-        impl crate::LlmProvider for FakeProvider {
-            async fn complete(
-                &self,
-                _request: CompletionRequest,
-            ) -> Result<CompletionResponse, Error> {
-                Ok(CompletionResponse {
-                    content: vec![ContentBlock::Text {
-                        text: "fake".into(),
-                    }],
-                    stop_reason: StopReason::EndTurn,
-                    usage: TokenUsage::default(),
-                })
-            }
-        }
-
-        let provider = FakeProvider;
-        let dyn_provider: &dyn DynLlmProvider = &provider;
-        // Verify it's object-safe by creating a reference
-        let _ = dyn_provider;
-    }
+    // DynLlmProvider tests are in llm/mod.rs (canonical location)
 }

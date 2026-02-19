@@ -22,6 +22,7 @@ pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StopReason, TokenUsage,
     ToolCall, ToolDefinition, ToolResult,
 };
+pub use llm::{BoxedProvider, DynLlmProvider};
 pub use memory::in_memory::InMemoryStore;
 pub use memory::postgres::PostgresMemoryStore;
 pub use memory::{Memory, MemoryEntry, MemoryQuery};
