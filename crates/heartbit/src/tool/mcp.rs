@@ -420,6 +420,14 @@ impl McpClient {
         })
     }
 
+    /// Get tool definitions without consuming the client.
+    ///
+    /// Useful when you only need the schemas (e.g., for Restate task payloads)
+    /// and don't need the executable tool instances.
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.iter().map(mcp_tool_to_definition).collect()
+    }
+
     /// Convert discovered MCP tools into `Arc<dyn Tool>` instances.
     pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         let session = self.session;

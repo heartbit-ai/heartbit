@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use heartbit::HeartbitConfig;
 use heartbit::config::AgentConfig;
+use heartbit::llm::types::ToolDefinition;
 use heartbit::store::PostgresStore;
 use heartbit::workflow::types::{AgentDef, HumanDecision, OrchestratorTask};
 
@@ -40,9 +41,16 @@ pub async fn submit_task(config_path: &Path, task: &str, restate_url: &str) -> R
         tracing::warn!(error = %e, "failed to record task in database, continuing");
     }
 
+    // Resolve per-agent tool definitions from MCP servers
+    let mut agents = Vec::with_capacity(config.agents.len());
+    for agent_config in &config.agents {
+        let tool_defs = load_mcp_tool_defs(&agent_config.name, &agent_config.mcp_servers).await;
+        agents.push(agent_config_to_def(agent_config, tool_defs));
+    }
+
     let orchestrator_task = OrchestratorTask {
         input: task.into(),
-        agents: config.agents.iter().map(agent_config_to_def).collect(),
+        agents,
         max_turns: config.orchestrator.max_turns,
         max_tokens: config.orchestrator.max_tokens,
         approval_required: false,
@@ -148,7 +156,32 @@ pub async fn send_approval(workflow_id: &str, restate_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn agent_config_to_def(config: &AgentConfig) -> AgentDef {
+/// Connect to MCP servers and collect tool definitions. Failures are logged and skipped.
+async fn load_mcp_tool_defs(agent_name: &str, mcp_servers: &[String]) -> Vec<ToolDefinition> {
+    let mut defs = Vec::new();
+    for server_url in mcp_servers {
+        tracing::info!(agent = %agent_name, url = %server_url, "resolving MCP tool definitions");
+        match heartbit::McpClient::connect(server_url).await {
+            Ok(client) => {
+                for def in client.tool_definitions() {
+                    tracing::info!(agent = %agent_name, tool = %def.name, "resolved tool definition");
+                    defs.push(def);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_name,
+                    url = %server_url,
+                    error = %e,
+                    "failed to connect to MCP server, agent will run without these tools"
+                );
+            }
+        }
+    }
+    defs
+}
+
+fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> AgentDef {
     let (context_window_tokens, summarize_threshold) = match &config.context_strategy {
         Some(heartbit::ContextStrategyConfig::SlidingWindow { max_tokens }) => {
             (Some(*max_tokens), None)
@@ -163,7 +196,7 @@ fn agent_config_to_def(config: &AgentConfig) -> AgentDef {
         name: config.name.clone(),
         description: config.description.clone(),
         system_prompt: config.system_prompt.clone(),
-        tool_defs: vec![],
+        tool_defs,
         context_window_tokens,
         summarize_threshold,
     }
