@@ -140,8 +140,11 @@ impl<P: LlmProvider> AgentRunner<P> {
             let results = self.execute_tools_parallel(&tool_calls).await;
             ctx.add_tool_results(results);
 
-            // Summarization: if threshold is set and context exceeds it, compress
+            // Summarization: if threshold is set and context exceeds it, compress.
+            // Guard on message count: inject_summary(keep_last_n=4) is a no-op
+            // when total messages <= 5 (1 first + 4 kept), so skip the LLM call.
             if let Some(threshold) = self.summarize_threshold
+                && ctx.message_count() > 5
                 && ctx.needs_compaction(threshold)
             {
                 debug!(agent = %self.name, "context exceeds threshold, summarizing");

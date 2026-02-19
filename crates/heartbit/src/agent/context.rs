@@ -56,6 +56,10 @@ impl AgentContext {
         self
     }
 
+    pub(crate) fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
     pub(crate) fn current_turn(&self) -> usize {
         self.current_turn
     }

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use restate_sdk::prelude::*;
 
 use crate::agent::context::{apply_sliding_window, inject_summary_into_messages, messages_to_text};
-use crate::agent::token_estimator::estimate_message_tokens;
+use crate::agent::token_estimator::{estimate_message_tokens, estimate_tokens};
 use crate::llm::types::{ContentBlock, Message, Role, StopReason, TokenUsage};
 
 use super::agent_service::AgentServiceClient;
@@ -220,7 +220,8 @@ impl AgentWorkflow for AgentWorkflowImpl {
             // Summarization: compress context if it exceeds the threshold.
             // Uses an LLM call through AgentService for durability.
             if let Some(threshold) = task.summarize_threshold {
-                let total_tokens: u32 = messages.iter().map(estimate_message_tokens).sum();
+                let total_tokens: u32 = messages.iter().map(estimate_message_tokens).sum::<u32>()
+                    + estimate_tokens(&task.system_prompt);
                 if total_tokens > threshold && messages.len() > 5 {
                     let summary_resp = ctx
                         .service_client::<AgentServiceClient>()
