@@ -260,6 +260,7 @@ impl<P: LlmProvider + 'static> Tool for DelegateTaskTool<P> {
 
 #[derive(Deserialize)]
 struct DelegateInput {
+    #[serde(default)]
     tasks: Vec<DelegatedTask>,
 }
 

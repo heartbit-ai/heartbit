@@ -43,17 +43,21 @@ impl From<MemoryRow> for MemoryEntry {
 ///
 /// Uses `sqlx::query_as()` (runtime queries, no compile-time macros).
 /// Recall filtering uses SQL WHERE clauses with `ILIKE` for text search.
-/// Results are fetched ordered by `created_at DESC` from the database, then
-/// re-sorted in-memory using composite scoring (recency + importance + relevance)
-/// for consistency with `InMemoryStore`.
+/// All matching rows are fetched, then scored and truncated in-memory using
+/// composite scoring (recency + importance + relevance) for consistency
+/// with `InMemoryStore`.
 pub struct PostgresMemoryStore {
     pool: PgPool,
+    scoring_weights: ScoringWeights,
 }
 
 impl PostgresMemoryStore {
     /// Create from an existing connection pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scoring_weights: ScoringWeights::default(),
+        }
     }
 
     /// Connect to PostgreSQL using the given URL.
@@ -61,7 +65,16 @@ impl PostgresMemoryStore {
         let pool = PgPool::connect(database_url)
             .await
             .map_err(|e| Error::Memory(format!("database connection failed: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            scoring_weights: ScoringWeights::default(),
+        })
+    }
+
+    /// Set custom scoring weights for recall ordering.
+    pub fn with_scoring_weights(mut self, weights: ScoringWeights) -> Self {
+        self.scoring_weights = weights;
+        self
     }
 
     /// Run the memory table migration. Safe to call multiple times.
@@ -161,16 +174,9 @@ impl Memory for PostgresMemoryStore {
             if let Some(ref agent) = query.agent {
                 sql.push_str(&format!(" AND agent = ${param_idx}"));
                 agent_filter = Some(agent.clone());
-                param_idx += 1;
             }
 
             sql.push_str(" ORDER BY created_at DESC");
-
-            // IMPORTANT: LIMIT must remain the last clause. The param_idx counter
-            // and binding order below assume LIMIT is the final bound parameter.
-            if query.limit > 0 {
-                sql.push_str(&format!(" LIMIT ${param_idx}"));
-            }
 
             // Build and bind
             let mut q = sqlx::query(&sql);
@@ -186,9 +192,6 @@ impl Memory for PostgresMemoryStore {
             }
             if let Some(ref agent) = agent_filter {
                 q = q.bind(agent);
-            }
-            if query.limit > 0 {
-                q = q.bind(query.limit as i64);
             }
 
             let rows = q
@@ -217,18 +220,24 @@ impl Memory for PostgresMemoryStore {
 
             // Apply composite scoring for consistency with InMemoryStore
             let now = Utc::now();
-            let weights = ScoringWeights::default();
+            let weights = &self.scoring_weights;
             entries.sort_by(|a, b| {
                 let relevance_a = if has_text_query { 1.0 } else { 0.0 };
                 let relevance_b = if has_text_query { 1.0 } else { 0.0 };
                 let score_a =
-                    composite_score(&weights, a.created_at, now, a.importance, relevance_a);
+                    composite_score(weights, a.created_at, now, a.importance, relevance_a);
                 let score_b =
-                    composite_score(&weights, b.created_at, now, b.importance, relevance_b);
+                    composite_score(weights, b.created_at, now, b.importance, relevance_b);
                 score_b
                     .partial_cmp(&score_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+
+            // Apply limit after scoring (not in SQL) so high-importance
+            // old entries aren't excluded before scoring.
+            if query.limit > 0 {
+                entries.truncate(query.limit);
+            }
 
             // Update access counts for returned entries
             if !entries.is_empty() {
@@ -259,12 +268,14 @@ impl Memory for PostgresMemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
-            let result = sqlx::query("UPDATE memories SET content = $2 WHERE id = $1")
-                .bind(&id)
-                .bind(&content)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Error::Memory(format!("failed to update memory: {e}")))?;
+            let result = sqlx::query(
+                "UPDATE memories SET content = $2, last_accessed = now() WHERE id = $1",
+            )
+            .bind(&id)
+            .bind(&content)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Memory(format!("failed to update memory: {e}")))?;
 
             if result.rows_affected() == 0 {
                 return Err(Error::Memory(format!("memory not found: {id}")));

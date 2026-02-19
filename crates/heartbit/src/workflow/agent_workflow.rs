@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use restate_sdk::prelude::*;
 
 use crate::agent::context::{apply_sliding_window, inject_summary_into_messages, messages_to_text};
@@ -57,6 +59,11 @@ impl AgentWorkflow for AgentWorkflowImpl {
             task.tool_defs.clone()
         };
 
+        // Build allowed-tool set for per-agent scoping. Prevents an agent
+        // from executing tools assigned to other agents even if the LLM
+        // hallucinates tool names that exist in the shared AgentService.
+        let allowed_tools: HashSet<String> = tool_defs.iter().map(|d| d.name.clone()).collect();
+
         let mut messages = vec![Message::user(&task.input)];
         let mut total_usage = TokenUsage::default();
         let mut total_tool_calls: usize = 0;
@@ -91,14 +98,20 @@ impl AgentWorkflow for AgentWorkflowImpl {
             total_usage.input_tokens += llm_response.usage.input_tokens;
             total_usage.output_tokens += llm_response.usage.output_tokens;
 
-            // Record token usage with budget tracker (TerminalError if exceeded)
-            ctx.object_client::<TokenBudgetObjectClient>(ctx.key())
+            // Record token usage with budget tracker (TerminalError if exceeded).
+            // Set error state before propagating so status() reports correctly.
+            if let Err(e) = ctx
+                .object_client::<TokenBudgetObjectClient>(ctx.key())
                 .record_usage(Json(super::budget::TokenUsageRecord {
                     input_tokens: llm_response.usage.input_tokens as u64,
                     output_tokens: llm_response.usage.output_tokens as u64,
                 }))
                 .call()
-                .await?;
+                .await
+            {
+                ctx.set("state", "error".to_string());
+                return Err(e.into());
+            }
 
             // Add assistant message to conversation
             messages.push(Message {
@@ -151,6 +164,18 @@ impl AgentWorkflow for AgentWorkflowImpl {
             // replay. Parallelism happens at the Restate server level instead.
             let mut tool_result_blocks = Vec::with_capacity(tool_calls.len());
             for (id, name, input) in &tool_calls {
+                // Enforce per-agent tool scoping: reject tools not in this agent's
+                // allowed set. Only checked when tool_defs is non-empty (if empty,
+                // the agent has access to all tools in the shared AgentService).
+                if !allowed_tools.is_empty() && !allowed_tools.contains(name.as_str()) {
+                    tool_result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("Tool not available: {name}"),
+                        is_error: true,
+                    });
+                    continue;
+                }
+
                 let result: ToolCallResponse = ctx
                     .service_client::<AgentServiceClient>()
                     .tool_call(Json(ToolCallRequest {
