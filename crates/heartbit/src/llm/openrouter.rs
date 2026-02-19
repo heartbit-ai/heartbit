@@ -11,6 +11,12 @@ use crate::llm::types::{
 
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// OpenRouter LLM provider (OpenAI-compatible API).
+///
+/// `stream_complete` is not overridden — it falls back to `complete()`.
+/// OpenRouter's streaming format (OpenAI SSE) differs from Anthropic's
+/// and requires a separate implementation. The `on_text` callback is
+/// not invoked; output is returned as a single response.
 pub struct OpenRouterProvider {
     client: Client,
     api_key: String,

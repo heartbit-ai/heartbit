@@ -11,9 +11,6 @@ pub enum Error {
     #[error("API error ({status}): {message}")]
     Api { status: u16, message: String },
 
-    #[error("SSE parse error: {0}")]
-    SseParse(String),
-
     #[error("Agent error: {0}")]
     Agent(String),
 

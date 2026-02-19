@@ -233,6 +233,10 @@ pub(crate) struct SseEvent {
 }
 
 /// Parse an SSE byte stream into a CompletionResponse, calling `on_text` for each text delta.
+///
+/// Uses a byte buffer to handle multi-byte UTF-8 sequences split across HTTP chunks.
+/// Only complete UTF-8 sequences are decoded; incomplete trailing bytes are held
+/// in the buffer until the next chunk arrives.
 async fn parse_sse_stream_with_callback<S>(
     stream: S,
     on_text: &super::OnText,
@@ -242,19 +246,45 @@ where
 {
     let mut state = SseResponseState::default();
     let mut parser = SseParser::new();
+    let mut utf8_buf: Vec<u8> = Vec::new();
 
     tokio::pin!(stream);
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(Error::Http)?;
-        let events = parser.feed(&String::from_utf8_lossy(&chunk));
+        utf8_buf.extend_from_slice(&chunk);
+
+        // Decode the longest valid UTF-8 prefix, keeping incomplete trailing bytes
+        let valid_len = match std::str::from_utf8(&utf8_buf) {
+            Ok(_) => utf8_buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+
+        if valid_len > 0 {
+            // Safety: valid_len is guaranteed to be a valid UTF-8 boundary
+            let text = std::str::from_utf8(&utf8_buf[..valid_len])
+                .expect("valid_up_to guarantees valid UTF-8");
+            let events = parser.feed(text);
+            for event in events {
+                process_sse_event(&mut state, &event, on_text)?;
+            }
+        }
+
+        utf8_buf.drain(..valid_len);
+    }
+
+    // Process any remaining complete bytes (incomplete UTF-8 at end of stream is dropped)
+    if !utf8_buf.is_empty()
+        && let Ok(text) = std::str::from_utf8(&utf8_buf)
+    {
+        let events = parser.feed(text);
         for event in events {
-            process_sse_event(&mut state, &event, Some(on_text))?;
+            process_sse_event(&mut state, &event, on_text)?;
         }
     }
 
     for event in parser.flush() {
-        process_sse_event(&mut state, &event, Some(on_text))?;
+        process_sse_event(&mut state, &event, on_text)?;
     }
 
     Ok(state.into_response())
@@ -312,7 +342,7 @@ impl SseResponseState {
 fn process_sse_event(
     state: &mut SseResponseState,
     event: &SseEvent,
-    on_text: Option<&super::OnText>,
+    on_text: &super::OnText,
 ) -> Result<(), Error> {
     match event.event_type.as_str() {
         "message_start" => {
@@ -343,9 +373,7 @@ fn process_sse_event(
                 match parsed.delta.r#type.as_str() {
                     "text_delta" => {
                         if let Some(ref delta) = parsed.delta.text {
-                            if let Some(cb) = on_text {
-                                cb(delta);
-                            }
+                            on_text(delta);
                             if let Some(ref mut text) = state.current_text {
                                 text.push_str(delta);
                             }
@@ -886,6 +914,52 @@ mod tests {
             deltas.is_empty(),
             "on_text should not be called for tool_use blocks"
         );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_handles_utf8_split_across_chunks() {
+        use std::sync::Mutex;
+
+        // "Hello 🌍!" — the globe emoji is 4 bytes: F0 9F 8C 8D
+        // We split the SSE data mid-emoji across two HTTP chunks.
+        let full_sse = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n\
+            event: content_block_start\n\
+            data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+            event: content_block_delta\n\
+            data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello 🌍!\"}}\n\n\
+            event: content_block_stop\n\
+            data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+            event: message_stop\n\
+            data: {\"type\":\"message_stop\"}\n\n";
+
+        let bytes = full_sse.as_bytes();
+        // Find the emoji position and split mid-emoji (after first 2 of 4 emoji bytes)
+        let emoji_pos = bytes.windows(4).position(|w| w == "🌍".as_bytes()).unwrap();
+        let split_point = emoji_pos + 2; // split in middle of 4-byte emoji
+
+        let chunk1 = Bytes::copy_from_slice(&bytes[..split_point]);
+        let chunk2 = Bytes::copy_from_slice(&bytes[split_point..]);
+
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let collected_clone = collected.clone();
+        let on_text: &crate::llm::OnText = &move |text: &str| {
+            collected_clone.lock().expect("lock").push(text.to_string());
+        };
+
+        let stream = futures::stream::iter(vec![Ok(chunk1), Ok(chunk2)]);
+        let response = parse_sse_stream_with_callback(stream, on_text)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text(), "Hello 🌍!");
+
+        let deltas = collected.lock().expect("lock");
+        // The emoji should appear intact in the collected deltas
+        let joined: String = deltas.iter().cloned().collect();
+        assert_eq!(joined, "Hello 🌍!");
     }
 
     #[test]

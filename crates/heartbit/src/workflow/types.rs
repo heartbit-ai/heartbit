@@ -17,6 +17,10 @@ use crate::llm::types::{
 ///
 /// `LlmProvider` uses RPITIT (not dyn-compatible). This trait wraps it via
 /// `Pin<Box<dyn Future>>` so we can store providers as `Arc<dyn DynLlmProvider>`.
+///
+/// NOTE: Only `complete` is exposed — `stream_complete` is not supported on
+/// the Restate path. Restate handlers are request/response (not streamed),
+/// so incremental text output is not applicable here.
 pub trait DynLlmProvider: Send + Sync {
     fn complete<'a>(
         &'a self,

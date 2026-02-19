@@ -263,6 +263,9 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// Set a callback for streaming text output. When set, the agent uses
     /// `stream_complete` instead of `complete`, calling the callback for each
     /// text delta as it arrives from the LLM.
+    ///
+    /// The callback must not panic. A panic inside the callback will propagate
+    /// through the agent loop and abort the run.
     pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
         self.on_text = Some(callback);
         self

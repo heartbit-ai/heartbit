@@ -101,6 +101,9 @@ impl<P: LlmProvider> LlmProvider for RetryingProvider<P> {
         Err(last_err.expect("at least one attempt must have been made"))
     }
 
+    // NOTE: On retry, `on_text` is called again from the start of the new
+    // response. The final `CompletionResponse` is correct, but the callback
+    // may receive duplicate text deltas if a previous attempt partially streamed.
     async fn stream_complete(
         &self,
         request: CompletionRequest,
