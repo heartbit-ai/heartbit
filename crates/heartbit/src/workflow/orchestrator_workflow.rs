@@ -1,6 +1,7 @@
 use restate_sdk::prelude::*;
 
 use crate::agent::orchestrator::{build_delegate_tool_schema, build_system_prompt};
+use crate::config::DispatchMode;
 use crate::llm::types::{ContentBlock, Message, Role, StopReason, TokenUsage};
 
 use super::agent_service::AgentServiceClient;
@@ -41,13 +42,19 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
         ctx.set("max_turns", task.max_turns as u64);
 
         // Build orchestrator system prompt and delegate tool def using shared functions
-        let pairs: Vec<(&str, &str)> = task
+        let tool_names: Vec<Vec<String>> = task
             .agents
             .iter()
-            .map(|a| (a.name.as_str(), a.description.as_str()))
+            .map(|a| a.tool_defs.iter().map(|t| t.name.clone()).collect())
             .collect();
-        let system = build_system_prompt(&pairs);
-        let delegate_tool_def = build_delegate_tool_schema(&pairs);
+        let triples: Vec<(&str, &str, &[String])> = task
+            .agents
+            .iter()
+            .zip(tool_names.iter())
+            .map(|(a, names)| (a.name.as_str(), a.description.as_str(), names.as_slice()))
+            .collect();
+        let system = build_system_prompt(&triples, false, DispatchMode::Parallel);
+        let delegate_tool_def = build_delegate_tool_schema(&triples, DispatchMode::Parallel);
 
         let mut messages = vec![Message::user(&task.input)];
 
@@ -63,16 +70,13 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                     tools: vec![delegate_tool_def.clone()],
                     max_tokens: task.max_tokens,
                     tool_choice: None,
+                    reasoning_effort: task.reasoning_effort,
                 }))
                 .call()
                 .await?
                 .into_inner();
 
-            total_usage.input_tokens += llm_response.usage.input_tokens;
-            total_usage.output_tokens += llm_response.usage.output_tokens;
-            total_usage.cache_creation_input_tokens +=
-                llm_response.usage.cache_creation_input_tokens;
-            total_usage.cache_read_input_tokens += llm_response.usage.cache_read_input_tokens;
+            total_usage += llm_response.usage;
 
             // Report orchestrator LLM token usage to budget tracker
             if let Err(e) = ctx
@@ -134,11 +138,28 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
                             task.approval_required,
                         )
                         .await;
-                        total_usage.input_tokens += sub_tokens.input_tokens;
-                        total_usage.output_tokens += sub_tokens.output_tokens;
-                        total_usage.cache_creation_input_tokens +=
-                            sub_tokens.cache_creation_input_tokens;
-                        total_usage.cache_read_input_tokens += sub_tokens.cache_read_input_tokens;
+                        // Report sub-agent token costs to the orchestrator's budget tracker
+                        if (sub_tokens.input_tokens > 0 || sub_tokens.output_tokens > 0)
+                            && let Err(e) = ctx
+                                .object_client::<TokenBudgetObjectClient>(ctx.key())
+                                .record_usage(Json(super::budget::TokenUsageRecord {
+                                    input_tokens: sub_tokens.input_tokens as u64,
+                                    output_tokens: sub_tokens.output_tokens as u64,
+                                    cache_creation_input_tokens: sub_tokens
+                                        .cache_creation_input_tokens
+                                        as u64,
+                                    cache_read_input_tokens: sub_tokens.cache_read_input_tokens
+                                        as u64,
+                                }))
+                                .call()
+                                .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to report sub-agent tokens to budget tracker"
+                            );
+                        }
+                        total_usage += sub_tokens;
                         tool_result_blocks.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: result,
@@ -177,7 +198,12 @@ impl OrchestratorWorkflow for OrchestratorWorkflowImpl {
         let child_workflows = ctx
             .get::<String>("child_workflows")
             .await?
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .map(|s| {
+                serde_json::from_str(&s).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "corrupt child_workflows state in status query");
+                    vec![]
+                })
+            })
             .unwrap_or_default();
 
         Ok(Json(AgentStatus {
@@ -203,7 +229,6 @@ async fn execute_delegation(
 ) -> (String, bool, TokenUsage) {
     #[derive(serde::Deserialize)]
     struct DelegateInput {
-        #[serde(default)]
         tasks: Vec<DelegateTask>,
     }
 
@@ -223,6 +248,14 @@ async fn execute_delegation(
             );
         }
     };
+
+    if delegate_input.tasks.is_empty() {
+        return (
+            "Error: delegate_task requires at least one task".into(),
+            true,
+            TokenUsage::default(),
+        );
+    }
 
     let mut results = Vec::new();
     let mut any_error = false;
@@ -276,16 +309,14 @@ async fn execute_delegation(
                 tool_timeout_seconds: agent_def.tool_timeout_seconds,
                 max_tool_output_bytes: agent_def.max_tool_output_bytes,
                 response_schema: agent_def.response_schema.clone(),
+                reasoning_effort: agent_def.reasoning_effort,
             }))
             .call()
             .await;
 
         match agent_result {
             Ok(Json(result)) => {
-                sub_tokens.input_tokens += result.tokens.input_tokens;
-                sub_tokens.output_tokens += result.tokens.output_tokens;
-                sub_tokens.cache_creation_input_tokens += result.tokens.cache_creation_input_tokens;
-                sub_tokens.cache_read_input_tokens += result.tokens.cache_read_input_tokens;
+                sub_tokens += result.tokens;
 
                 // Store result on the shared blackboard for cross-agent visibility
                 if let Err(e) = ctx
@@ -331,24 +362,31 @@ mod tests {
 
     #[test]
     fn orchestrator_prompt_includes_agents() {
-        let agents = vec![
-            ("researcher", "Research specialist"),
-            ("coder", "Coding expert"),
+        let tools_a = vec!["web_search".to_string()];
+        let tools_b: Vec<String> = vec![];
+        let agents: Vec<(&str, &str, &[String])> = vec![
+            ("researcher", "Research specialist", tools_a.as_slice()),
+            ("coder", "Coding expert", tools_b.as_slice()),
         ];
 
-        let prompt = build_system_prompt(&agents);
+        let prompt = build_system_prompt(&agents, false, DispatchMode::Parallel);
         assert!(prompt.contains("researcher"));
         assert!(prompt.contains("Research specialist"));
         assert!(prompt.contains("coder"));
+        assert!(prompt.contains("Tools: web_search"));
+        assert!(prompt.contains("Tools: (none)"));
     }
 
     #[test]
     fn delegate_tool_def_has_correct_schema() {
-        let agents = vec![("researcher", "Research")];
+        let tools = vec!["web_search".to_string()];
+        let agents: Vec<(&str, &str, &[String])> =
+            vec![("researcher", "Research", tools.as_slice())];
 
-        let def = build_delegate_tool_schema(&agents);
+        let def = build_delegate_tool_schema(&agents, DispatchMode::Parallel);
         assert_eq!(def.name, "delegate_task");
         assert!(def.description.contains("researcher"));
+        assert!(def.description.contains("web_search"));
         assert!(
             def.input_schema["properties"]["tasks"].is_array()
                 || def.input_schema["properties"]["tasks"]["type"] == "array"
