@@ -760,7 +760,9 @@ pub async fn run_daemon(
             let user_ns = input.user_namespace;
             let m = tg_metrics.clone();
             Box::pin(async move {
-                let on_text = bridge.make_on_text();
+                // No streaming preview for Telegram — only send the final
+                // HTML-formatted result to avoid a raw-markdown flash.
+                let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
                 let on_event = bridge.make_on_event();
                 let on_question = bridge.make_on_question();
 

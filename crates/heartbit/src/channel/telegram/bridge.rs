@@ -296,6 +296,23 @@ impl TelegramBridge {
         true
     }
 
+    /// Get the current stream message ID (if streaming has started).
+    pub async fn stream_message_id(&self) -> Option<i32> {
+        let buf = self.stream_buffer.lock().await;
+        buf.message_id()
+    }
+
+    /// Delete the streamed message. Used before sending formatted chunks.
+    pub async fn delete_stream_message(&self) {
+        let buf = self.stream_buffer.lock().await;
+        if let Some(msg_id) = buf.message_id() {
+            let _ = self
+                .bot
+                .delete_message(self.chat_id, MessageId(msg_id))
+                .await;
+        }
+    }
+
     /// Reset the stream buffer for a new message cycle.
     pub async fn reset_stream(&self) {
         let mut buf = self.stream_buffer.lock().await;

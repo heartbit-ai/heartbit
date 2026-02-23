@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use teloxide::prelude::*;
-use teloxide::types::ChatId;
+use teloxide::types::{ChatId, ParseMode};
 
 use crate::channel::session::{SessionMessage, SessionRole, SessionStore, format_session_context};
 use crate::error::Error;
@@ -14,7 +14,7 @@ use crate::memory::{Memory, MemoryQuery};
 use super::access::AccessControl;
 use super::bridge::TelegramBridge;
 use super::config::TelegramConfig;
-use super::delivery::{RateLimiter, chunk_message};
+use super::delivery::{RateLimiter, chunk_message, markdown_to_telegram_html};
 use super::keyboard::{CallbackAction, parse_callback_data};
 use super::router::{ChatSessionMap, IdleSession};
 
@@ -236,22 +236,14 @@ impl TelegramAdapter {
             bridges.remove(&chat_id);
         }
 
-        // Flush remaining streamed text. Returns true if streaming was active
-        // (content already visible to user via edit_message_text).
-        let streamed = bridge.flush_stream().await;
+        // Delete the streaming preview message (plain-text, potentially truncated)
+        // and send the final output as formatted HTML.
+        bridge.delete_stream_message().await;
 
-        // Send final result only when needed:
-        // - Not streamed → always send (no streaming output was shown)
-        // - Streamed but output > 4096 bytes → send full chunked version
-        //   because stream buffer truncates to 4096 (Telegram limit per message)
-        // - Streamed and output <= 4096 → skip (already visible via edit)
         match result {
             Ok(output) => {
                 if !output.is_empty() {
-                    if !streamed || output.len() > 4096 {
-                        self.send_chunked(chat_id, &output).await;
-                    }
-                    // Always store in session history regardless of delivery method
+                    self.send_html(chat_id, &output).await;
                     let _ = self.session_store.add_message(
                         session_id,
                         SessionMessage {
@@ -318,8 +310,36 @@ impl TelegramAdapter {
         }
     }
 
-    /// Send a message chunked for Telegram's 4096-char limit.
-    async fn send_chunked(&self, chat_id: i64, text: &str) {
+    /// Send output as HTML-formatted Telegram messages.
+    ///
+    /// Converts markdown to Telegram HTML, chunks for the 4096-char limit,
+    /// and falls back to plain text if Telegram rejects the HTML.
+    async fn send_html(&self, chat_id: i64, text: &str) {
+        let html = markdown_to_telegram_html(text);
+        let chunks = chunk_message(&html);
+        let mut limiter = RateLimiter::new(1000);
+
+        for chunk in &chunks {
+            let delay = limiter.check();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let result = self
+                .bot
+                .send_message(ChatId(chat_id), *chunk)
+                .parse_mode(ParseMode::Html)
+                .await;
+            if result.is_err() {
+                // HTML rejected — fall back to plain text for remaining chunks
+                self.send_plain(chat_id, text).await;
+                return;
+            }
+            limiter.record_send();
+        }
+    }
+
+    /// Fallback: send as plain text chunks (no formatting).
+    async fn send_plain(&self, chat_id: i64, text: &str) {
         let chunks = chunk_message(text);
         let mut limiter = RateLimiter::new(1000);
         for chunk in chunks {
@@ -526,10 +546,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_chunked_handles_short_message() {
+    async fn send_html_handles_short_message() {
         let adapter = make_adapter(None);
         // This will fail to actually send (no real bot), but shouldn't panic
-        adapter.send_chunked(12345, "Hello").await;
+        adapter.send_html(12345, "Hello **world**").await;
     }
 
     #[test]

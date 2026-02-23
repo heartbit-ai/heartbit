@@ -146,6 +146,145 @@ impl StreamBuffer {
     }
 }
 
+/// Convert markdown text to Telegram-compatible HTML.
+///
+/// Handles: code blocks, inline code, bold, italic, headers, and list items.
+/// Other markdown is left as-is with HTML entities escaped.
+pub fn markdown_to_telegram_html(input: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_buf = String::new();
+
+    for line in input.split('\n') {
+        if line.trim_start().starts_with("```") {
+            if in_code_block {
+                if code_buf.ends_with('\n') {
+                    code_buf.pop();
+                }
+                segments.push(format!("<pre>{}</pre>", escape_html(&code_buf)));
+                code_buf.clear();
+            }
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if in_code_block {
+            code_buf.push_str(line);
+            code_buf.push('\n');
+            continue;
+        }
+
+        segments.push(convert_markdown_line(line));
+    }
+
+    if in_code_block {
+        if code_buf.ends_with('\n') {
+            code_buf.pop();
+        }
+        segments.push(format!("<pre>{}</pre>", escape_html(&code_buf)));
+    }
+
+    segments.join("\n")
+}
+
+fn convert_markdown_line(line: &str) -> String {
+    for prefix in ["#### ", "### ", "## ", "# "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return format!("<b>{}</b>", convert_inline(&escape_html(rest)));
+        }
+    }
+    if let Some(rest) = line.strip_prefix("- ") {
+        return format!("• {}", convert_inline(&escape_html(rest)));
+    }
+    if let Some(rest) = line.strip_prefix("* ") {
+        return format!("• {}", convert_inline(&escape_html(rest)));
+    }
+    convert_inline(&escape_html(line))
+}
+
+fn convert_inline(text: &str) -> String {
+    // Phase 1: Extract inline code spans into placeholders (protects content)
+    let (text, code_spans) = extract_code_spans(text);
+    // Phase 2: Bold (**) before italic (*) to avoid ambiguity
+    let text = replace_paired(&text, "**", "**", "<b>", "</b>");
+    let text = replace_paired(&text, "*", "*", "<i>", "</i>");
+    // Phase 3: Restore code spans
+    restore_code_spans(&text, &code_spans)
+}
+
+/// Extract inline code spans and replace with null-byte placeholders.
+fn extract_code_spans(text: &str) -> (String, Vec<String>) {
+    let mut result = String::with_capacity(text.len());
+    let mut spans = Vec::new();
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find('`') {
+        result.push_str(&remaining[..start]);
+        let after = &remaining[start + 1..];
+        match after.find('`') {
+            Some(end) if end > 0 => {
+                let code_content = &after[..end];
+                let placeholder = format!("\x00C{}\x00", spans.len());
+                spans.push(format!("<code>{code_content}</code>"));
+                result.push_str(&placeholder);
+                remaining = &after[end + 1..];
+            }
+            _ => {
+                result.push('`');
+                remaining = after;
+            }
+        }
+    }
+    result.push_str(remaining);
+    (result, spans)
+}
+
+fn restore_code_spans(text: &str, spans: &[String]) -> String {
+    let mut result = text.to_string();
+    for (i, span) in spans.iter().enumerate() {
+        let placeholder = format!("\x00C{i}\x00");
+        result = result.replace(&placeholder, span);
+    }
+    result
+}
+
+/// Replace paired markdown delimiters with HTML tags.
+fn replace_paired(
+    text: &str,
+    open: &str,
+    close: &str,
+    html_open: &str,
+    html_close: &str,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(open) {
+        result.push_str(&remaining[..start]);
+        let after_open = &remaining[start + open.len()..];
+        match after_open.find(close) {
+            Some(end) if end > 0 => {
+                result.push_str(html_open);
+                result.push_str(&after_open[..end]);
+                result.push_str(html_close);
+                remaining = &after_open[end + close.len()..];
+            }
+            _ => {
+                result.push_str(open);
+                remaining = after_open;
+            }
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Simple token-bucket rate limiter (1 message per second per chat).
 pub struct RateLimiter {
     last_send: Instant,
@@ -382,5 +521,113 @@ mod tests {
     #[test]
     fn floor_char_boundary_beyond_len() {
         assert_eq!(floor_char_boundary("abc", 10), 3);
+    }
+
+    // --- markdown_to_telegram_html tests ---
+
+    #[test]
+    fn md_plain_text_escapes_html() {
+        assert_eq!(
+            markdown_to_telegram_html("a < b & c > d"),
+            "a &lt; b &amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn md_bold() {
+        assert_eq!(
+            markdown_to_telegram_html("hello **world**"),
+            "hello <b>world</b>"
+        );
+    }
+
+    #[test]
+    fn md_italic() {
+        assert_eq!(
+            markdown_to_telegram_html("hello *world*"),
+            "hello <i>world</i>"
+        );
+    }
+
+    #[test]
+    fn md_inline_code() {
+        assert_eq!(
+            markdown_to_telegram_html("use `println!`"),
+            "use <code>println!</code>"
+        );
+    }
+
+    #[test]
+    fn md_code_block() {
+        let input = "before\n```rust\nfn main() {}\n```\nafter";
+        let html = markdown_to_telegram_html(input);
+        assert!(html.contains("<pre>fn main() {}</pre>"));
+        assert!(html.contains("before"));
+        assert!(html.contains("after"));
+    }
+
+    #[test]
+    fn md_code_block_escapes_html() {
+        let input = "```\nif a < b && c > d\n```";
+        let html = markdown_to_telegram_html(input);
+        assert!(html.contains("a &lt; b &amp;&amp; c &gt; d"));
+    }
+
+    #[test]
+    fn md_headers() {
+        assert_eq!(markdown_to_telegram_html("# Title"), "<b>Title</b>");
+        assert_eq!(markdown_to_telegram_html("## Sub"), "<b>Sub</b>");
+        assert_eq!(markdown_to_telegram_html("### Deep"), "<b>Deep</b>");
+    }
+
+    #[test]
+    fn md_list_items() {
+        assert_eq!(markdown_to_telegram_html("- item one"), "• item one");
+        assert_eq!(markdown_to_telegram_html("* item two"), "• item two");
+    }
+
+    #[test]
+    fn md_bold_inside_header() {
+        assert_eq!(
+            markdown_to_telegram_html("## **Important**"),
+            "<b><b>Important</b></b>"
+        );
+    }
+
+    #[test]
+    fn md_code_span_protects_stars() {
+        assert_eq!(
+            markdown_to_telegram_html("`a*b` and *italic*"),
+            "<code>a*b</code> and <i>italic</i>"
+        );
+    }
+
+    #[test]
+    fn md_unclosed_code_block() {
+        let input = "text\n```\ncode here";
+        let html = markdown_to_telegram_html(input);
+        assert!(html.contains("<pre>code here</pre>"));
+    }
+
+    #[test]
+    fn md_mixed_formatting() {
+        let input = "# Hello\n\nThis is **bold** and *italic*.\n\n- item `code`\n\n```\nblock\n```";
+        let html = markdown_to_telegram_html(input);
+        assert!(html.contains("<b>Hello</b>"));
+        assert!(html.contains("<b>bold</b>"));
+        assert!(html.contains("<i>italic</i>"));
+        assert!(html.contains("• item <code>code</code>"));
+        assert!(html.contains("<pre>block</pre>"));
+    }
+
+    #[test]
+    fn md_empty_delimiters_left_alone() {
+        // **** (empty bold) should not produce <b></b>
+        assert_eq!(markdown_to_telegram_html("****"), "****");
+    }
+
+    #[test]
+    fn md_lone_star_left_alone() {
+        assert_eq!(markdown_to_telegram_html("3 * 4"), "3 * 4");
     }
 }

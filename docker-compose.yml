@@ -21,6 +21,23 @@ services:
     depends_on:
       - restate
 
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: heartbit-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: heartbit
+      POSTGRES_PASSWORD: heartbit
+      POSTGRES_DB: heartbit
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U heartbit"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   kafka:
     image: apache/kafka:4.0.0
     hostname: kafka
@@ -55,4 +72,5 @@ services:
 
 volumes:
   restate-data:
+  postgres-data:
   kafka-data:

@@ -140,10 +140,12 @@ impl PostgresMemoryStore {
     }
 
     /// Run the memory table migration. Safe to call multiple times.
+    ///
+    /// Each statement runs separately because `sqlx` prepared statements
+    /// do not support multi-command batches.
     pub async fn run_migration(&self) -> Result<(), Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS memories (
+        let statements = [
+            r#"CREATE TABLE IF NOT EXISTS memories (
                 id              TEXT PRIMARY KEY,
                 agent           TEXT NOT NULL,
                 content         TEXT NOT NULL,
@@ -159,29 +161,30 @@ impl PostgresMemoryStore {
                 strength        DOUBLE PRECISION NOT NULL DEFAULT 1.0,
                 related_ids     TEXT[] NOT NULL DEFAULT '{}',
                 source_ids      TEXT[] NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent);
-            CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
-            CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type);
-            CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength);
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_strength ON memories(strength)",
+            // Add new columns to existing tables
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type TEXT NOT NULL DEFAULT 'episodic'",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS keywords TEXT[] NOT NULL DEFAULT '{}'",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS summary TEXT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength DOUBLE PRECISION NOT NULL DEFAULT 1.0",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS related_ids TEXT[] NOT NULL DEFAULT '{}'",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ids TEXT[] NOT NULL DEFAULT '{}'",
+            // pgvector extension and embedding column for hybrid retrieval
+            "CREATE EXTENSION IF NOT EXISTS vector",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1536)",
+            "CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops)",
+        ];
 
-            -- Add new columns to existing tables (safe to run multiple times)
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type TEXT NOT NULL DEFAULT 'episodic';
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS keywords TEXT[] NOT NULL DEFAULT '{}';
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS summary TEXT;
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength DOUBLE PRECISION NOT NULL DEFAULT 1.0;
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS related_ids TEXT[] NOT NULL DEFAULT '{}';
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ids TEXT[] NOT NULL DEFAULT '{}';
-
-            -- pgvector extension and embedding column for hybrid retrieval
-            CREATE EXTENSION IF NOT EXISTS vector;
-            ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1536);
-            CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops);
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::Memory(format!("memory migration failed: {e}")))?;
+        for stmt in statements {
+            sqlx::query(stmt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Memory(format!("migration failed on: {stmt}: {e}")))?;
+        }
         Ok(())
     }
 }
