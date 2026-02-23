@@ -1,3 +1,4 @@
+mod daemon;
 mod serve;
 mod submit;
 
@@ -13,9 +14,10 @@ use heartbit::{
     A2aClient, AgentEvent, AgentOutput, AgentRunner, AnthropicProvider, Blackboard, BoxedProvider,
     BuiltinToolsConfig, ContextStrategy, ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard,
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
-    McpServerEntry, Memory, MemoryConfig, ObservabilityMode, OnApproval, OnEvent, OnQuestion,
-    OnRetry, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore, QuestionRequest,
-    QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, ToolCall, builtin_tools,
+    McpServerEntry, Memory, MemoryConfig, MemoryQuery, ObservabilityMode, OnApproval, OnEvent,
+    OnQuestion, OnRetry, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore,
+    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
+    builtin_tools,
 };
 
 #[derive(Parser)]
@@ -108,6 +110,15 @@ enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Run the daemon: long-running Kafka-backed task execution with HTTP API
+    Daemon {
+        /// Address to bind the HTTP API (overrides config)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Print structured agent events to stderr as one-line JSON
+        #[arg(long, short)]
+        verbose: bool,
+    },
 }
 
 const DEFAULT_RESTATE_URL: &str = "http://localhost:8080";
@@ -130,7 +141,7 @@ fn resolve_restate_url(cli_url: Option<String>, config_path: Option<&std::path::
 ///
 /// Priority: CLI `--observability` → config `[telemetry].observability_mode` →
 /// `HEARTBIT_OBSERVABILITY` env var → `--verbose` implies Analysis → Production.
-fn resolve_observability(
+pub(crate) fn resolve_observability(
     cli_flag: Option<&str>,
     config_str: Option<&str>,
     verbose: bool,
@@ -185,7 +196,7 @@ pub(crate) fn init_tracing_from_config(config: &HeartbitConfig) -> Result<()> {
 ///
 /// Walks up the directory tree to the git root, then checks the global config
 /// directory. Returns the combined instruction text, or `None` if no files found.
-fn load_instruction_text() -> Option<String> {
+pub(crate) fn load_instruction_text() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     let paths = heartbit::discover_instruction_files(&cwd);
     if paths.is_empty() {
@@ -208,7 +219,8 @@ fn load_instruction_text() -> Option<String> {
 ///
 /// Returns `None` if the default path cannot be determined. Logs a warning
 /// and returns `None` if the file exists but fails to parse.
-fn load_learned_permissions() -> Option<Arc<std::sync::Mutex<heartbit::LearnedPermissions>>> {
+pub(crate) fn load_learned_permissions()
+-> Option<Arc<std::sync::Mutex<heartbit::LearnedPermissions>>> {
     let path = heartbit::LearnedPermissions::default_path()?;
     match heartbit::LearnedPermissions::load(&path) {
         Ok(learned) => {
@@ -230,6 +242,9 @@ fn load_learned_permissions() -> Option<Arc<std::sync::Mutex<heartbit::LearnedPe
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file if present (silently ignore if missing)
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -309,6 +324,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Daemon { bind, verbose }) => {
+            let config_path = cli
+                .config
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
+            daemon::run_daemon(
+                config_path,
+                bind.as_deref(),
+                verbose,
+                cli.observability.as_deref(),
+            )
+            .await
+        }
         None => {
             // Backward-compatible: bare task args without subcommand
             let task_str = cli.task.join(" ");
@@ -343,12 +371,12 @@ async fn run_standalone(
 }
 
 /// Build a `RetryConfig` from the provider config, if retry is configured.
-fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
+pub(crate) fn retry_config_from(config: &HeartbitConfig) -> Option<RetryConfig> {
     config.provider.retry.as_ref().map(RetryConfig::from)
 }
 
 /// Build an on_retry callback that emits `AgentEvent::RetryAttempt` via the event callback.
-fn build_on_retry(on_event: &Arc<OnEvent>) -> Arc<OnRetry> {
+pub(crate) fn build_on_retry(on_event: &Arc<OnEvent>) -> Arc<OnRetry> {
     let cb = on_event.clone();
     Arc::new(
         move |attempt: u32, max_retries: u32, delay_ms: u64, error_class: &str| {
@@ -511,6 +539,9 @@ async fn run_from_config(
         on_approval,
         on_event,
         mode,
+        None, // no story_id in CLI run mode
+        None, // CLI uses stdin-based question callback via create_builtin_tools()
+        None, // no external memory in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -578,7 +609,8 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
     Ok(kb)
 }
 
-async fn build_orchestrator_from_config(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_orchestrator_from_config(
     provider: Arc<BoxedProvider>,
     config: &HeartbitConfig,
     task: &str,
@@ -586,6 +618,9 @@ async fn build_orchestrator_from_config(
     on_approval: Option<Arc<OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
     observability_mode: ObservabilityMode,
+    story_id: Option<&str>,
+    on_question: Option<Arc<OnQuestion>>,
+    external_memory: Option<Arc<dyn Memory>>,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
     let mut builder = Orchestrator::builder(provider)
@@ -676,8 +711,18 @@ async fn build_orchestrator_from_config(
         builder = builder.on_event(cb);
     }
 
-    // Create shared built-in tools (FileTracker, TodoStore shared across all agents)
-    let builtins = create_builtin_tools();
+    // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
+    // When an on_question callback is provided (e.g., from WS bridge), the question
+    // tool uses it instead of the default CLI stdin callback.
+    let builtins = if let Some(ref oq) = on_question {
+        let config = BuiltinToolsConfig {
+            on_question: Some(oq.clone()),
+            ..Default::default()
+        };
+        builtin_tools(config)
+    } else {
+        create_builtin_tools()
+    };
 
     for agent in &config.agents {
         let mcp_tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
@@ -748,22 +793,48 @@ async fn build_orchestrator_from_config(
         });
     }
 
-    // Wire shared memory if configured
-    if let Some(ref memory_config) = config.memory {
-        let memory: Arc<dyn Memory> = match memory_config {
-            MemoryConfig::InMemory => Arc::new(InMemoryStore::new()),
-            MemoryConfig::Postgres { database_url } => {
-                let store = PostgresMemoryStore::connect(database_url)
-                    .await
-                    .context("failed to connect to PostgreSQL for memory store")?;
-                store
-                    .run_migration()
-                    .await
-                    .context("failed to run memory store migration")?;
-                Arc::new(store)
+    // Wire shared memory: use external_memory if provided, else create from config.
+    // When a story_id is present, use memory_namespace_prefix so all agents read/write
+    // within the story's namespace, and pre-load prior story context into the task text.
+    let mut task_text = task.to_string();
+    let base_memory = if let Some(ext) = external_memory {
+        Some(ext)
+    } else if let Some(ref memory_config) = config.memory {
+        Some(create_memory_store(memory_config).await?)
+    } else {
+        None
+    };
+    if let Some(base_memory) = base_memory {
+        // Pre-load story context when a story/user namespace is present.
+        // Uses agent_prefix to match all sub-agent namespaces under this story
+        // (e.g. "tg:123" matches "tg:123:assistant", "tg:123:researcher").
+        if let Some(sid) = story_id {
+            let prior = base_memory
+                .recall(MemoryQuery {
+                    limit: 10,
+                    agent_prefix: Some(sid.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_default();
+
+            if !prior.is_empty() {
+                let ctx: String = prior
+                    .iter()
+                    .map(|e| format!("- [{}] {}", e.category, e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                task_text =
+                    format!("## Prior story context\n{ctx}\n\n## Current task\n{task_text}");
+                tracing::info!(
+                    story_id = sid,
+                    prior_memories = prior.len(),
+                    "loaded story context into task"
+                );
             }
-        };
-        builder = builder.shared_memory(memory);
+            builder = builder.memory_namespace_prefix(sid);
+        }
+        builder = builder.shared_memory(base_memory);
     }
 
     // Always attach an in-memory blackboard for cross-agent coordination
@@ -785,12 +856,15 @@ async fn build_orchestrator_from_config(
     }
 
     let mut orchestrator = builder.build()?;
-    let output = orchestrator.run(task).await?;
+    let output = orchestrator.run(&task_text).await?;
     Ok(output)
 }
 
 /// Connect to MCP servers and collect tools. Failures are logged and skipped.
-async fn load_mcp_tools(agent_name: &str, mcp_servers: &[McpServerEntry]) -> Vec<Arc<dyn Tool>> {
+pub(crate) async fn load_mcp_tools(
+    agent_name: &str,
+    mcp_servers: &[McpServerEntry],
+) -> Vec<Arc<dyn Tool>> {
     let mut tools = Vec::new();
     for entry in mcp_servers {
         let url = entry.url();
@@ -821,7 +895,10 @@ async fn load_mcp_tools(agent_name: &str, mcp_servers: &[McpServerEntry]) -> Vec
 }
 
 /// Discover A2A agents and collect tools. Failures are logged and skipped.
-async fn load_a2a_tools(agent_name: &str, a2a_agents: &[McpServerEntry]) -> Vec<Arc<dyn Tool>> {
+pub(crate) async fn load_a2a_tools(
+    agent_name: &str,
+    a2a_agents: &[McpServerEntry],
+) -> Vec<Arc<dyn Tool>> {
     let mut tools = Vec::new();
     for entry in a2a_agents {
         let url = entry.url();
@@ -903,6 +980,47 @@ fn build_provider_from_env(on_retry: Option<Arc<OnRetry>>) -> Result<Arc<BoxedPr
             Ok(Arc::new(BoxedProvider::new(retrying)))
         }
         other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    }
+}
+
+/// Create a memory store from config.
+pub(crate) async fn create_memory_store(config: &MemoryConfig) -> Result<Arc<dyn Memory>> {
+    match config {
+        MemoryConfig::InMemory => Ok(Arc::new(InMemoryStore::new())),
+        MemoryConfig::Postgres {
+            database_url,
+            embedding,
+        } => {
+            let store = PostgresMemoryStore::connect(database_url)
+                .await
+                .context("failed to connect to PostgreSQL for memory store")?;
+            store
+                .run_migration()
+                .await
+                .context("failed to run memory store migration")?;
+            let memory: Arc<dyn Memory> = Arc::new(store);
+
+            // Wrap with EmbeddingMemory if embedding provider is configured
+            if let Some(emb_config) = embedding
+                && emb_config.provider != "none"
+            {
+                let api_key = std::env::var(&emb_config.api_key_env).unwrap_or_default();
+                if !api_key.is_empty() {
+                    let mut provider = heartbit::OpenAiEmbedding::new(&api_key, &emb_config.model);
+                    if let Some(ref base_url) = emb_config.base_url {
+                        provider = provider.with_base_url(base_url);
+                    }
+                    if let Some(dim) = emb_config.dimension {
+                        provider = provider.with_dimension(dim);
+                    }
+                    return Ok(Arc::new(heartbit::EmbeddingMemory::new(
+                        memory,
+                        Arc::new(provider),
+                    )));
+                }
+            }
+            Ok(memory)
+        }
     }
 }
 
@@ -1078,6 +1196,21 @@ async fn run_default_agent(
     // Wire hierarchical instruction files (HEARTBIT.md)
     if let Some(text) = load_instruction_text() {
         builder = builder.instruction_text(text);
+    }
+    // Wire memory from env: HEARTBIT_MEMORY=in_memory or postgres://...
+    if let Ok(value) = std::env::var("HEARTBIT_MEMORY") {
+        let config = if value == "in_memory" {
+            MemoryConfig::InMemory
+        } else if value.starts_with("postgres://") || value.starts_with("postgresql://") {
+            MemoryConfig::Postgres {
+                database_url: value,
+                embedding: None,
+            }
+        } else {
+            bail!("HEARTBIT_MEMORY must be 'in_memory' or a PostgreSQL URL, got: {value}");
+        };
+        let memory = create_memory_store(&config).await?;
+        builder = builder.memory(memory);
     }
     // Wire LSP integration if enabled via env
     if std::env::var("HEARTBIT_LSP_ENABLED")
@@ -1259,6 +1392,11 @@ async fn run_chat_from_config(
             builder = builder.consolidate_on_exit(true);
         }
     }
+    // Wire memory if configured
+    if let Some(ref memory_config) = config.memory {
+        let memory = create_memory_store(memory_config).await?;
+        builder = builder.memory(memory);
+    }
     // Wire LSP integration if configured
     if let Some(ref lsp_config) = config.lsp
         && lsp_config.enabled
@@ -1415,6 +1553,21 @@ async fn run_chat_from_env(
     // Wire hierarchical instruction files (HEARTBIT.md)
     if let Some(text) = load_instruction_text() {
         builder = builder.instruction_text(text);
+    }
+    // Wire memory from env: HEARTBIT_MEMORY=in_memory or postgres://...
+    if let Ok(value) = std::env::var("HEARTBIT_MEMORY") {
+        let config = if value == "in_memory" {
+            MemoryConfig::InMemory
+        } else if value.starts_with("postgres://") || value.starts_with("postgresql://") {
+            MemoryConfig::Postgres {
+                database_url: value,
+                embedding: None,
+            }
+        } else {
+            bail!("HEARTBIT_MEMORY must be 'in_memory' or a PostgreSQL URL, got: {value}");
+        };
+        let memory = create_memory_store(&config).await?;
+        builder = builder.memory(memory);
     }
     // Wire LSP integration if enabled via env
     if std::env::var("HEARTBIT_LSP_ENABLED")
@@ -1642,7 +1795,7 @@ fn question_callback() -> Arc<OnQuestion> {
 ///
 /// Returns tools ready to pass to sub-agents. The `FileTracker` and `TodoStore`
 /// are shared across all agents that receive these tools.
-fn create_builtin_tools() -> Vec<Arc<dyn Tool>> {
+pub(crate) fn create_builtin_tools() -> Vec<Arc<dyn Tool>> {
     let config = BuiltinToolsConfig {
         on_question: Some(question_callback()),
         ..Default::default()
@@ -1651,7 +1804,7 @@ fn create_builtin_tools() -> Vec<Arc<dyn Tool>> {
 }
 
 /// Create an event callback that writes each event as one-line JSON to stderr.
-fn event_callback() -> Arc<OnEvent> {
+pub(crate) fn event_callback() -> Arc<OnEvent> {
     Arc::new(|event: AgentEvent| {
         let json = serde_json::to_string(&event).expect("AgentEvent serialization is infallible");
         eprintln!("[event] {json}");

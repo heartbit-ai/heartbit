@@ -46,12 +46,23 @@ pub async fn submit_task(
         tracing::warn!(error = %e, "failed to record task in database, continuing");
     }
 
-    // Resolve per-agent tool definitions from MCP servers
+    // Resolve per-agent tool definitions from MCP servers and A2A agents
     let mut agents = Vec::with_capacity(config.agents.len());
     for agent_config in &config.agents {
-        let tool_defs = load_mcp_tool_defs(&agent_config.name, &agent_config.mcp_servers).await;
+        let mut tool_defs = load_mcp_tool_defs(&agent_config.name, &agent_config.mcp_servers).await;
+        let a2a_defs = load_a2a_tool_defs(&agent_config.name, &agent_config.a2a_agents).await;
+        tool_defs.extend(a2a_defs);
         agents.push(agent_config_to_def(agent_config, tool_defs));
     }
+
+    let reasoning_effort = config
+        .orchestrator
+        .reasoning_effort
+        .as_deref()
+        .map(heartbit::config::parse_reasoning_effort)
+        .transpose()
+        .ok()
+        .flatten();
 
     let orchestrator_task = OrchestratorTask {
         input: task.into(),
@@ -59,6 +70,7 @@ pub async fn submit_task(
         max_turns: config.orchestrator.max_turns,
         max_tokens: config.orchestrator.max_tokens,
         approval_required: approve,
+        reasoning_effort,
     };
 
     let url = format!(
@@ -231,11 +243,19 @@ pub async fn get_result(workflow_id: &str, restate_url: &str) -> Result<()> {
 }
 
 /// Connect to MCP servers and collect tool definitions. Failures are logged and skipped.
-async fn load_mcp_tool_defs(agent_name: &str, mcp_servers: &[String]) -> Vec<ToolDefinition> {
+async fn load_mcp_tool_defs(
+    agent_name: &str,
+    mcp_servers: &[heartbit::McpServerEntry],
+) -> Vec<ToolDefinition> {
     let mut defs = Vec::new();
-    for server_url in mcp_servers {
-        tracing::info!(agent = %agent_name, url = %server_url, "resolving MCP tool definitions");
-        match heartbit::McpClient::connect(server_url).await {
+    for entry in mcp_servers {
+        let url = entry.url();
+        tracing::info!(agent = %agent_name, url = %url, "resolving MCP tool definitions");
+        let result = match entry.auth_header() {
+            Some(auth) => heartbit::McpClient::connect_with_auth(url, auth).await,
+            None => heartbit::McpClient::connect(url).await,
+        };
+        match result {
             Ok(client) => {
                 for def in client.tool_definitions() {
                     tracing::info!(agent = %agent_name, tool = %def.name, "resolved tool definition");
@@ -245,9 +265,42 @@ async fn load_mcp_tool_defs(agent_name: &str, mcp_servers: &[String]) -> Vec<Too
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_name,
-                    url = %server_url,
+                    url = %url,
                     error = %e,
                     "failed to connect to MCP server, agent will run without these tools"
+                );
+            }
+        }
+    }
+    defs
+}
+
+/// Discover A2A agents and collect tool definitions. Failures are logged and skipped.
+async fn load_a2a_tool_defs(
+    agent_name: &str,
+    a2a_agents: &[heartbit::McpServerEntry],
+) -> Vec<ToolDefinition> {
+    let mut defs = Vec::new();
+    for entry in a2a_agents {
+        let url = entry.url();
+        tracing::info!(agent = %agent_name, url = %url, "resolving A2A tool definitions");
+        let result = match entry.auth_header() {
+            Some(auth) => heartbit::A2aClient::connect_with_auth(url, auth).await,
+            None => heartbit::A2aClient::connect(url).await,
+        };
+        match result {
+            Ok(client) => {
+                for def in client.tool_definitions() {
+                    tracing::info!(agent = %agent_name, tool = %def.name, "resolved A2A tool definition");
+                    defs.push(def);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_name,
+                    url = %url,
+                    error = %e,
+                    "failed to discover A2A agent, agent will run without these tools"
                 );
             }
         }
@@ -261,8 +314,16 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
             (Some(*max_tokens), None)
         }
         Some(heartbit::ContextStrategyConfig::Summarize { threshold }) => (None, Some(*threshold)),
-        _ => (None, None),
+        _ => (None, config.summarize_threshold),
     };
+
+    let reasoning_effort = config
+        .reasoning_effort
+        .as_deref()
+        .map(heartbit::config::parse_reasoning_effort)
+        .transpose()
+        .ok()
+        .flatten();
 
     AgentDef {
         name: config.name.clone(),
@@ -276,5 +337,6 @@ fn agent_config_to_def(config: &AgentConfig, tool_defs: Vec<ToolDefinition>) -> 
         max_turns: config.max_turns,
         max_tokens: config.max_tokens,
         response_schema: config.response_schema.clone(),
+        reasoning_effort,
     }
 }

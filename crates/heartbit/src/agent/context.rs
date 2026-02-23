@@ -1,5 +1,5 @@
 use crate::llm::types::{
-    CompletionRequest, ContentBlock, Message, Role, ToolDefinition, ToolResult,
+    CompletionRequest, ContentBlock, Message, ReasoningEffort, Role, ToolDefinition, ToolResult,
 };
 
 use super::token_estimator::{estimate_message_tokens, estimate_tokens};
@@ -22,6 +22,7 @@ pub(crate) struct AgentContext {
     max_tokens: u32,
     current_turn: usize,
     context_strategy: ContextStrategy,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AgentContext {
@@ -38,6 +39,7 @@ impl AgentContext {
             max_tokens: 4096,
             current_turn: 0,
             context_strategy: ContextStrategy::Unlimited,
+            reasoning_effort: None,
         }
     }
 
@@ -53,6 +55,11 @@ impl AgentContext {
 
     pub(crate) fn with_context_strategy(mut self, strategy: ContextStrategy) -> Self {
         self.context_strategy = strategy;
+        self
+    }
+
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -76,6 +83,10 @@ impl AgentContext {
         self.messages.push(message);
     }
 
+    pub(crate) fn add_user_message(&mut self, text: impl Into<String>) {
+        self.messages.push(Message::user(text));
+    }
+
     pub(crate) fn add_tool_results(&mut self, results: Vec<ToolResult>) {
         self.messages.push(Message::tool_results(results));
     }
@@ -91,8 +102,7 @@ impl AgentContext {
                         ContentBlock::Text { text } => Some(text.as_str()),
                         _ => None,
                     })
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .collect();
                 Some(text)
             } else {
                 None
@@ -134,8 +144,7 @@ impl AgentContext {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("");
+            .collect();
 
         inject_summary_into_messages(&mut self.messages, &original_task, &summary, keep_last_n);
     }
@@ -143,6 +152,21 @@ impl AgentContext {
     /// Render all messages as a plain text transcript for summarization.
     pub(crate) fn conversation_text(&self) -> String {
         messages_to_text(&self.messages)
+    }
+
+    /// Return the messages that would be discarded by `inject_summary(keep_last_n)`.
+    ///
+    /// This is the "middle" of the message list (excluding first and last N messages).
+    pub(crate) fn messages_to_be_compacted(&self, keep_last_n: usize) -> &[Message] {
+        if self.messages.len() <= 1 + keep_last_n {
+            return &[];
+        }
+        let tail_start = self.messages.len().saturating_sub(keep_last_n);
+        // Middle = messages[1..tail_start]
+        if tail_start <= 1 {
+            return &[];
+        }
+        &self.messages[1..tail_start]
     }
 
     pub(crate) fn to_request(&self) -> CompletionRequest {
@@ -159,6 +183,7 @@ impl AgentContext {
             tools: self.tools.clone(),
             max_tokens: self.max_tokens,
             tool_choice: None,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -196,7 +221,7 @@ pub(crate) fn inject_summary_into_messages(
     // replaced — including it in the tail would duplicate content. In valid conversations,
     // messages[1] is always Assistant (first LLM response after the user task), so
     // `tail_start == 1 && User` cannot occur with well-formed input.
-    if tail_start < total && messages[tail_start].role == Role::User && tail_start > 1 {
+    while tail_start < total && messages[tail_start].role == Role::User && tail_start > 1 {
         tail_start -= 1;
     }
     let last_messages: Vec<Message> = messages[tail_start..].to_vec();
@@ -338,6 +363,16 @@ mod tests {
         assert_eq!(ctx.current_turn(), 0);
         ctx.increment_turn();
         assert_eq!(ctx.current_turn(), 1);
+    }
+
+    #[test]
+    fn add_user_message_creates_user_message() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_user_message("follow up question");
+
+        let req = ctx.to_request();
+        assert_eq!(req.messages.len(), 2); // initial + added
+        assert_eq!(req.messages[1].role, Role::User);
     }
 
     #[test]
@@ -659,5 +694,79 @@ mod tests {
         let mut messages = vec![];
         inject_summary_into_messages(&mut messages, "task", "summary", 2);
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn inject_summary_while_loop_steps_back_to_assistant() {
+        // The `while` loop (vs single `if`) ensures the tail always starts with
+        // an Assistant message even when keep_last_n produces a tail starting with User.
+        let mut messages = vec![
+            Message::user("original task"),
+            Message::assistant("a1"),
+            Message::tool_results(vec![ToolResult::success("c1", "r1")]),
+            Message::assistant("a2"),
+            Message::tool_results(vec![ToolResult::success("c2", "r2")]),
+            Message::assistant("a3"),
+            Message::tool_results(vec![ToolResult::success("c3", "r3")]),
+            Message::assistant("a4"),
+        ];
+        // total=8, keep_last_n=2 → tail_start=6 → messages[6]=U(tool) → step back
+        // messages[5]=A → stop. Correct.
+        inject_summary_into_messages(&mut messages, "original task", "summary", 2);
+
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+        for w in messages.windows(2) {
+            assert_ne!(w[0].role, w[1].role, "adjacent messages have same role");
+        }
+    }
+
+    #[test]
+    fn messages_to_be_compacted_returns_middle() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_assistant_message(Message::assistant("a1"));
+        ctx.add_assistant_message(Message::assistant("a2"));
+        ctx.add_assistant_message(Message::assistant("a3"));
+        ctx.add_assistant_message(Message::assistant("a4"));
+
+        // total=5, keep_last_n=2 → tail_start=3 → middle=[1..3]
+        let compacted = ctx.messages_to_be_compacted(2);
+        assert_eq!(compacted.len(), 2);
+    }
+
+    #[test]
+    fn messages_to_be_compacted_empty_when_few_messages() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_assistant_message(Message::assistant("a1"));
+
+        // total=2, 1 + keep_last_n=2 = 3 > 2 → empty
+        let compacted = ctx.messages_to_be_compacted(2);
+        assert!(compacted.is_empty());
+    }
+
+    #[test]
+    fn messages_to_be_compacted_excludes_first_and_last() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_assistant_message(Message::assistant("old1"));
+        ctx.add_assistant_message(Message::assistant("old2"));
+        ctx.add_assistant_message(Message::assistant("recent1"));
+        ctx.add_assistant_message(Message::assistant("recent2"));
+
+        let compacted = ctx.messages_to_be_compacted(2);
+        // Should contain old1 and old2 (indices 1,2), not task (0) or recent (3,4)
+        for msg in compacted {
+            let text: String = msg
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                text.starts_with("old"),
+                "compacted messages should be old ones, got: {text}"
+            );
+        }
     }
 }

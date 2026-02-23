@@ -70,6 +70,7 @@ with_retry() {
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         if [ "$attempt" -gt 0 ]; then
             yellow "  retry $attempt/$MAX_RETRIES..."
+            kill_webapp_port
         fi
         rm -f "$WORKDIR/_stdout" "$WORKDIR/_stderr" "$WORKDIR/_events.jsonl"
         local result=0
@@ -143,8 +144,9 @@ start_cdp_mcp() {
     bold "  Starting Chrome DevTools MCP via supergateway..."
 
     npx -y supergateway \
-        --stdio "npx -y chrome-devtools-mcp@latest" \
+        --stdio "npx -y chrome-devtools-mcp@latest --browserUrl http://localhost:$CHROME_DEBUG_PORT" \
         --outputTransport streamableHttp \
+        --stateful \
         --port "$CDP_MCP_PORT" \
         --healthEndpoint /healthz \
         > "$WORKDIR/_mcp_stdout" 2> "$WORKDIR/_mcp_stderr" &
@@ -177,6 +179,8 @@ kill_webapp_port() {
         sleep 1
         kill -9 "$pid" 2>/dev/null || true
     fi
+    # Kill any webapp binary from the workdir (catches wrong-port zombies)
+    pkill -f "$WORKDIR/webapp/target" 2>/dev/null || true
 }
 
 cleanup() {
@@ -218,13 +222,12 @@ dispatch_mode = "sequential"
 [[agents]]
 name = "builder"
 description = "Rust web developer who creates Axum web applications using bash and file tools"
-system_prompt = """You are a Rust web developer. Create a minimal Axum web app.
+system_prompt = """You are a Rust developer. Build a minimal Axum web app. Use ABSOLUTE paths. Project: $WORKDIR/webapp
 
-IMPORTANT: All file paths must be ABSOLUTE. The project directory is: $WORKDIR/webapp
-
-Steps:
+Steps (follow EXACTLY, do not add extra steps):
 1. Run: cargo init $WORKDIR/webapp
-2. Write $WORKDIR/webapp/Cargo.toml with EXACTLY this content:
+2. Read $WORKDIR/webapp/Cargo.toml
+3. Write $WORKDIR/webapp/Cargo.toml with this content:
    [package]
    name = "webapp"
    version = "0.1.0"
@@ -233,7 +236,8 @@ Steps:
    axum = "0.8"
    tokio = { version = "1", features = ["full"] }
    serde = { version = "1", features = ["derive"] }
-3. Write $WORKDIR/webapp/src/main.rs using this EXACT axum 0.8 pattern:
+4. Read $WORKDIR/webapp/src/main.rs
+5. Write $WORKDIR/webapp/src/main.rs with this EXACT content:
 
 use axum::{routing::{get, post}, Router, Form, response::Html};
 use serde::Deserialize;
@@ -258,47 +262,56 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-4. Run: cargo build --manifest-path $WORKDIR/webapp/Cargo.toml
+6. Run: cargo build --manifest-path $WORKDIR/webapp/Cargo.toml
 
-If cargo build fails, fix errors and retry. Do NOT start the server. Stop after a successful build."""
-max_turns = 15
+If build fails, fix and retry. Your task is COMPLETE once cargo build succeeds. Do nothing else after that."""
+max_turns = 10
 
 [agents.provider]
 name = "openrouter"
 model = "$HEARTBIT_BUILDER_MODEL"
 
+[agents.session_prune]
+keep_recent_n = 2
+pruned_tool_result_max_bytes = 200
+preserve_task = true
+
 [[agents]]
 name = "tester"
 description = "QA engineer who tests web applications using Chrome DevTools browser automation via MCP tools"
-system_prompt = """You are a QA engineer. Test the web app at $WORKDIR/webapp using Chrome DevTools MCP tools.
+system_prompt = """You are a QA tester. Test the web app using Chrome DevTools MCP tools.
 
-IMPORTANT: Use ABSOLUTE paths everywhere. The binary is at: $WORKDIR/webapp/target/debug/webapp
+IMPORTANT: Use ABSOLUTE paths. Binary: $WORKDIR/webapp/target/debug/webapp
 
-Step 1 — Start the server (CRITICAL: use EXACTLY this multi-line bash command):
+Step 1 — Start server (use this EXACT bash command, all lines together):
   $WORKDIR/webapp/target/debug/webapp > $WORKDIR/server.log 2>&1 &
   sleep 3
   echo "server started on port $WEBAPP_PORT"
 
-The above MUST be sent as a SINGLE multi-line bash command (all three lines together). Do NOT use a single-line command ending in &.
+Step 2 — Test with Chrome DevTools MCP tools ONLY (not curl, not bash for HTTP):
+  a) navigate_page to http://localhost:$WEBAPP_PORT/
+  b) take_snapshot — verify "Hello from Heartbit" is present
+  c) fill the input field with "test message"
+  d) click the submit button
+  e) take_snapshot — verify response page
 
-Step 2 — Test with Chrome DevTools MCP tools:
-  CRITICAL: You MUST use Chrome DevTools MCP tools (navigate_page, take_snapshot, fill, click).
-  Do NOT use curl or bash for HTTP requests. The MCP tools are your ONLY way to interact with the browser.
-  a) Use navigate_page to go to http://localhost:$WEBAPP_PORT/
-  b) Use take_snapshot to verify the page loaded and "Hello from Heartbit" is present
-  c) Use fill to type "test message" into the input field
-  d) Use click to press the submit button
-  e) Use take_snapshot to verify the response page
+If a tool returns "No snapshot found", take_snapshot again then retry. Never kill Chrome or browser processes.
 
-Step 3 — Write results to $WORKDIR/test_results.txt with PASS/FAIL for each check.
+Step 3 — Write PASS/FAIL results to $WORKDIR/test_results.txt
+Step 4 — Kill server: pkill -f "$WORKDIR/webapp/target/debug/webapp" || true
 
-Step 4 — Kill the server: pkill -f "$WORKDIR/webapp/target/debug/webapp" || true"""
+RULES: Never read source code. Never run cargo build. Never use curl. Only use MCP tools for browser interaction."""
 mcp_servers = ["http://localhost:$CDP_MCP_PORT/mcp"]
-max_turns = 20
+max_turns = 25
 
 [agents.provider]
 name = "openrouter"
 model = "$HEARTBIT_TESTER_MODEL"
+
+[agents.session_prune]
+keep_recent_n = 2
+pruned_tool_result_max_bytes = 200
+preserve_task = true
 
 [[agents]]
 name = "fixer"
@@ -319,6 +332,11 @@ max_turns = 15
 [agents.provider]
 name = "openrouter"
 model = "$HEARTBIT_FIXER_MODEL"
+
+[agents.session_prune]
+keep_recent_n = 2
+pruned_tool_result_max_bytes = 200
+preserve_task = true
 TOMLEOF
 }
 
@@ -481,7 +499,25 @@ else:
             echo "    WARNING: No non-builtin tool calls from tester (CDP tools not invoked)"
         fi
 
-        # 8. Final cargo build passes
+        # 8. Fixer agent ran
+        if ! grep -q '"agent":"fixer"' "$WORKDIR/_events.jsonl" && \
+           ! grep -q '"agent": "fixer"' "$WORKDIR/_events.jsonl"; then
+            LAST_FAIL_REASON="fixer agent never ran"
+            return 1
+        fi
+        echo "    Fixer agent events present"
+
+        # 9. test_results.txt created by tester (warning only)
+        if [ ! -f "$WORKDIR/test_results.txt" ]; then
+            echo "    WARNING: test_results.txt not created by tester"
+        fi
+
+        # 10. fix_report.txt created by fixer (warning only)
+        if [ ! -f "$WORKDIR/fix_report.txt" ]; then
+            echo "    WARNING: fix_report.txt not created by fixer"
+        fi
+
+        # 11. Final cargo build passes
         if cargo build --manifest-path "$WORKDIR/webapp/Cargo.toml" 2>/dev/null; then
             echo "    Final cargo build: OK"
         else

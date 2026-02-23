@@ -101,6 +101,7 @@ impl Tool for SharedMemoryReadTool {
                     tags: input.tags,
                     agent: input.agent, // None = all agents
                     limit: input.limit,
+                    ..Default::default()
                 })
                 .await?;
 
@@ -111,9 +112,14 @@ impl Tool for SharedMemoryReadTool {
             let formatted: Vec<String> = results
                 .iter()
                 .map(|e| {
+                    let mt = match e.memory_type {
+                        crate::memory::MemoryType::Episodic => "episodic",
+                        crate::memory::MemoryType::Semantic => "semantic",
+                        crate::memory::MemoryType::Reflection => "reflection",
+                    };
                     format!(
-                        "- [{}] @{} ({}, importance:{}) {}",
-                        e.id, e.agent, e.category, e.importance, e.content,
+                        "- [{}] @{} ({}, {}, importance:{}, strength:{:.2}) {}",
+                        e.id, e.agent, e.category, mt, e.importance, e.strength, e.content,
                     )
                 })
                 .collect();
@@ -144,6 +150,10 @@ struct SharedWriteInput {
     tags: Vec<String>,
     #[serde(default = "super::default_importance")]
     importance: u8,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 impl Tool for SharedMemoryWriteTool {
@@ -175,6 +185,15 @@ impl Tool for SharedMemoryWriteTool {
                         "minimum": 1,
                         "maximum": 10,
                         "description": "Importance score 1-10 (default: 5)"
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keywords for improved retrieval (BM25 boost)"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-sentence summary for context"
                     }
                 },
                 "required": ["content"]
@@ -202,6 +221,13 @@ impl Tool for SharedMemoryWriteTool {
                 last_accessed: now,
                 access_count: 0,
                 importance: input.importance.clamp(1, 10),
+                memory_type: super::MemoryType::default(),
+                keywords: input.keywords,
+                summary: input.summary,
+                strength: 1.0,
+                related_ids: vec![],
+                source_ids: vec![],
+                embedding: None,
             };
 
             self.memory.store(entry).await?;
@@ -312,5 +338,39 @@ mod tests {
         let result = read_a.execute(json!({"agent": "agent_a"})).await.unwrap();
         assert!(result.content.contains("data from A"));
         assert!(!result.content.contains("data from B"));
+    }
+
+    #[tokio::test]
+    async fn write_with_keywords_and_summary() {
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let tools = shared_memory_tools(store.clone(), "agent_a");
+        let write_tool = find_tool(&tools, "shared_memory_write");
+
+        write_tool
+            .execute(json!({
+                "content": "Rust has zero-cost abstractions",
+                "keywords": ["rust", "performance", "abstractions"],
+                "summary": "Key Rust language feature"
+            }))
+            .await
+            .unwrap();
+
+        // Verify keywords and summary were stored
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].keywords,
+            vec!["rust", "performance", "abstractions"]
+        );
+        assert_eq!(
+            entries[0].summary.as_deref(),
+            Some("Key Rust language feature")
+        );
     }
 }

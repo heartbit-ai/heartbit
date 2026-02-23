@@ -123,6 +123,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             tool_timeout: None,
             max_tool_output_bytes: None,
             shared_memory: None,
+            memory_namespace_prefix: None,
             blackboard: None,
             knowledge_base: None,
             on_text: None,
@@ -199,6 +200,9 @@ struct DelegateTaskTool {
     accumulated_tokens: Arc<Mutex<TokenUsage>>,
     /// Shared memory store for cross-agent memory (None if not configured).
     shared_memory: Option<Arc<dyn Memory>>,
+    /// Optional prefix prepended to agent names when namespacing memory
+    /// (e.g. `"tg:123"` → namespace becomes `"tg:123:assistant"` instead of `"assistant"`).
+    memory_namespace_prefix: Option<String>,
     /// Shared blackboard for cross-agent coordination (None if not configured).
     blackboard: Option<Arc<dyn Blackboard>>,
     /// Shared knowledge base for document retrieval (None if not configured).
@@ -268,6 +272,7 @@ impl DelegateTaskTool {
             let max_turns = agent_def.max_turns.unwrap_or(self.max_turns);
             let max_tokens = agent_def.max_tokens.unwrap_or(self.max_tokens);
             let shared_memory = self.shared_memory.clone();
+            let ns_prefix = self.memory_namespace_prefix.clone();
             let blackboard = self.blackboard.clone();
             let knowledge_base = self.knowledge_base.clone();
             let on_event = self.on_event.clone();
@@ -359,14 +364,18 @@ impl DelegateTaskTool {
 
                 // Add memory tools if shared memory is configured
                 if let Some(ref memory) = shared_memory {
+                    let agent_ns = match &ns_prefix {
+                        Some(prefix) => format!("{prefix}:{}", agent_def.name),
+                        None => agent_def.name.clone(),
+                    };
                     let ns = Arc::new(crate::memory::namespaced::NamespacedMemory::new(
                         memory.clone(),
-                        &agent_def.name,
+                        &agent_ns,
                     ));
                     builder = builder.memory(ns);
                     builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                         memory.clone(),
-                        &agent_def.name,
+                        &agent_ns,
                     ));
                 }
 
@@ -533,6 +542,7 @@ struct FormSquadTool {
     permission_rules: super::permission::PermissionRuleset,
     accumulated_tokens: Arc<Mutex<TokenUsage>>,
     shared_memory: Option<Arc<dyn Memory>>,
+    memory_namespace_prefix: Option<String>,
     /// Outer blackboard for writing squad results. Squad members use a private one.
     blackboard: Option<Arc<dyn Blackboard>>,
     knowledge_base: Option<Arc<dyn KnowledgeBase>>,
@@ -638,6 +648,7 @@ impl Tool for FormSquadTool {
                 let max_turns = agent_def.max_turns.unwrap_or(self.default_max_turns);
                 let max_tokens = agent_def.max_tokens.unwrap_or(self.default_max_tokens);
                 let shared_memory = self.shared_memory.clone();
+                let ns_prefix = self.memory_namespace_prefix.clone();
                 let bb = private_bb.clone();
                 let knowledge_base = self.knowledge_base.clone();
                 let on_event = self.on_event.clone();
@@ -729,14 +740,18 @@ impl Tool for FormSquadTool {
 
                     // Add memory tools if shared memory is configured
                     if let Some(ref memory) = shared_memory {
+                        let agent_ns = match &ns_prefix {
+                            Some(prefix) => format!("{prefix}:{}", agent_def.name),
+                            None => agent_def.name.clone(),
+                        };
                         let ns = Arc::new(crate::memory::namespaced::NamespacedMemory::new(
                             memory.clone(),
-                            &agent_def.name,
+                            &agent_ns,
                         ));
                         builder = builder.memory(ns);
                         builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                             memory.clone(),
-                            &agent_def.name,
+                            &agent_ns,
                         ));
                     }
 
@@ -960,6 +975,10 @@ pub(crate) fn build_system_prompt(
          1. DECOMPOSE: Break the task into distinct subtasks. Identify which require different expertise.\n\
          2. MATCH: For each subtask, pick the best-fit agent based on their description and tools.\n\
          {choose_tool_step}\n\n\
+         ## Important\n\
+         - ALWAYS delegate to a sub-agent using your delegation tools. You do NOT have any \
+           direct capabilities — sub-agents have the tools. Never respond to the user directly \
+           without delegating first.\n\n\
          ## Effort Scaling\n\
          - If only ONE agent is relevant, delegate a single task. Do NOT force-split across agents.\n\
          - If the task is simple enough for one agent, use one agent.\n\
@@ -1175,6 +1194,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     tool_timeout: Option<Duration>,
     max_tool_output_bytes: Option<usize>,
     shared_memory: Option<Arc<dyn Memory>>,
+    memory_namespace_prefix: Option<String>,
     blackboard: Option<Arc<dyn Blackboard>>,
     knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_text: Option<Arc<crate::llm::OnText>>,
@@ -1335,6 +1355,14 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// - Shared memory tools (cross-agent read/write)
     pub fn shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.shared_memory = Some(memory);
+        self
+    }
+
+    /// Set a prefix for memory namespacing. When set, sub-agent memory
+    /// namespaces become `"{prefix}:{agent_name}"` instead of just `"{agent_name}"`.
+    /// This enables per-user or per-story isolation without nesting `NamespacedMemory`.
+    pub fn memory_namespace_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.memory_namespace_prefix = Some(prefix.into());
         self
     }
 
@@ -1585,6 +1613,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             permission_rules: self.permission_rules.clone(),
             accumulated_tokens: sub_agent_tokens.clone(),
             shared_memory: self.shared_memory.clone(),
+            memory_namespace_prefix: self.memory_namespace_prefix.clone(),
             blackboard: self.blackboard.clone(),
             knowledge_base: self.knowledge_base.clone(),
             cached_definition,
@@ -1613,6 +1642,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 permission_rules: self.permission_rules.clone(),
                 accumulated_tokens: sub_agent_tokens.clone(),
                 shared_memory: self.shared_memory,
+                memory_namespace_prefix: self.memory_namespace_prefix,
                 blackboard: self.blackboard,
                 knowledge_base: self.knowledge_base,
                 on_event: self.on_event.clone(),
@@ -1978,6 +2008,7 @@ mod tests {
                 consolidate_on_exit: None,
             }],
             shared_memory: None,
+            memory_namespace_prefix: None,
             blackboard: None,
             knowledge_base: None,
             max_turns: 10,
@@ -4095,7 +4126,10 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
-                | AgentEvent::AutoCompactionTriggered { agent, .. } => agent,
+                | AgentEvent::AutoCompactionTriggered { agent, .. }
+                | AgentEvent::SessionPruned { agent, .. } => agent,
+                AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
+                AgentEvent::StoryUpdated { story_id, .. } => story_id,
             }
         }
 
@@ -4742,7 +4776,10 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
-                | AgentEvent::AutoCompactionTriggered { agent, .. } => agent,
+                | AgentEvent::AutoCompactionTriggered { agent, .. }
+                | AgentEvent::SessionPruned { agent, .. } => agent,
+                AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
+                AgentEvent::StoryUpdated { story_id, .. } => story_id,
             }
         }
 
@@ -4764,6 +4801,9 @@ mod tests {
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",
                 AgentEvent::AutoCompactionTriggered { .. } => "AutoCompactionTriggered",
+                AgentEvent::SessionPruned { .. } => "SessionPruned",
+                AgentEvent::SensorEventProcessed { .. } => "SensorEventProcessed",
+                AgentEvent::StoryUpdated { .. } => "StoryUpdated",
             }
         }
 

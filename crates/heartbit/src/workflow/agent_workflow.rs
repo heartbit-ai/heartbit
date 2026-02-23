@@ -101,23 +101,14 @@ impl AgentWorkflow for AgentWorkflowImpl {
                     messages: request_messages,
                     tools: tool_defs.clone(),
                     max_tokens: task.max_tokens,
-                    // Force tool use when structured output is configured so the
-                    // LLM cannot bypass __respond__ by returning plain text.
-                    tool_choice: if task.response_schema.is_some() {
-                        Some(crate::llm::types::ToolChoice::Any)
-                    } else {
-                        None
-                    },
+                    tool_choice: None,
+                    reasoning_effort: task.reasoning_effort,
                 }))
                 .call()
                 .await?;
 
             let llm_response = llm_response.into_inner();
-            total_usage.input_tokens += llm_response.usage.input_tokens;
-            total_usage.output_tokens += llm_response.usage.output_tokens;
-            total_usage.cache_creation_input_tokens +=
-                llm_response.usage.cache_creation_input_tokens;
-            total_usage.cache_read_input_tokens += llm_response.usage.cache_read_input_tokens;
+            total_usage += llm_response.usage;
 
             // Record token usage with budget tracker (TerminalError if exceeded).
             // Set error state before propagating so status() reports correctly.
@@ -177,11 +168,31 @@ impl AgentWorkflow for AgentWorkflowImpl {
             total_tool_calls += tool_calls.len();
 
             // Intercept __respond__ for structured output (before dispatching to AgentService).
-            if task.response_schema.is_some()
-                && let Some((_id, _name, input)) = tool_calls
+            if let Some(ref schema) = task.response_schema
+                && let Some((respond_id, _name, input)) = tool_calls
                     .iter()
                     .find(|(_, name, _)| name == crate::llm::types::RESPOND_TOOL_NAME)
             {
+                // Validate against the caller's schema before accepting.
+                if let Err(validation_error) = crate::tool::validate_tool_input(schema, input) {
+                    tracing::warn!(
+                        error = %validation_error,
+                        "structured output failed schema validation in Restate path, retrying"
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: respond_id.clone(),
+                            content: format!(
+                                "Structured output validation failed: {validation_error}. \
+                                 Please fix the output to match the schema and call __respond__ again."
+                            ),
+                            is_error: true,
+                        }],
+                    });
+                    continue;
+                }
+
                 let structured = input.clone();
                 let text =
                     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
@@ -272,7 +283,10 @@ impl AgentWorkflow for AgentWorkflowImpl {
 
             // Summarization: compress context if it exceeds the threshold.
             // Uses an LLM call through AgentService for durability.
-            if let Some(threshold) = task.summarize_threshold {
+            // Skip when sliding window is active — it already handles context compression.
+            if task.context_window_tokens.is_none()
+                && let Some(threshold) = task.summarize_threshold
+            {
                 let total_tokens: u32 = messages.iter().map(estimate_message_tokens).sum::<u32>()
                     + estimate_tokens(&task.system_prompt);
                 if total_tokens > threshold && messages.len() > 5 {
@@ -288,17 +302,13 @@ impl AgentWorkflow for AgentWorkflowImpl {
                             tools: vec![],
                             max_tokens: 1024,
                             tool_choice: None,
+                            reasoning_effort: None,
                         }))
                         .call()
                         .await?
                         .into_inner();
 
-                    total_usage.input_tokens += summary_resp.usage.input_tokens;
-                    total_usage.output_tokens += summary_resp.usage.output_tokens;
-                    total_usage.cache_creation_input_tokens +=
-                        summary_resp.usage.cache_creation_input_tokens;
-                    total_usage.cache_read_input_tokens +=
-                        summary_resp.usage.cache_read_input_tokens;
+                    total_usage += summary_resp.usage;
 
                     // Report summarization tokens to budget tracker
                     if let Err(e) = ctx
@@ -348,7 +358,12 @@ impl AgentWorkflow for AgentWorkflowImpl {
         // otherwise fall back to reading the current approval_turn from state.
         let turn = match decision.turn {
             Some(t) => t,
-            None => ctx.get::<u64>("approval_turn").await?.unwrap_or(0),
+            None => ctx.get::<u64>("approval_turn").await?.ok_or_else(|| {
+                TerminalError::new(
+                    "approval received but no approval_turn state set; \
+                         provide explicit turn in HumanDecision",
+                )
+            })?,
         };
         let promise_key = format!("approval-turn-{turn}");
         ctx.resolve_promise::<Json<HumanDecision>>(&promise_key, Json(decision));

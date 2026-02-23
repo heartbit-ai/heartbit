@@ -19,6 +19,23 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 glob = { workspace = true }
 jsonschema = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+a2a-sdk = { workspace = true }
+rdkafka = { workspace = true }
+cron = { workspace = true }
+tokio-util = { workspace = true }
+prometheus = { workspace = true }
+quick-xml = { workspace = true }
+pgvector = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+teloxide = { workspace = true, optional = true }
+
+[features]
+telegram = ["teloxide"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

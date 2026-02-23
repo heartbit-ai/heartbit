@@ -1,10 +1,13 @@
 pub mod anthropic;
+pub mod error_class;
 pub mod openrouter;
+pub mod pricing;
 pub mod retry;
 pub mod types;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, CompletionResponse};
@@ -12,12 +15,48 @@ use crate::llm::types::{CompletionRequest, CompletionResponse};
 /// Callback invoked with each text delta during streaming.
 pub type OnText = dyn Fn(&str) + Send + Sync;
 
+/// Decision returned by the `OnApproval` callback.
+///
+/// `Allow` and `Deny` behave like the previous `true`/`false` return.
+/// `AlwaysAllow` and `AlwaysDeny` additionally persist the decision as a
+/// learned permission rule so it survives across sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Allow this time.
+    Allow,
+    /// Deny this time.
+    Deny,
+    /// Allow and persist as a permission rule.
+    AlwaysAllow,
+    /// Deny and persist as a permission rule.
+    AlwaysDeny,
+}
+
+impl ApprovalDecision {
+    /// Returns `true` when the decision allows execution.
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Self::Allow | Self::AlwaysAllow)
+    }
+
+    /// Returns `true` when the decision should be persisted.
+    pub fn is_persistent(self) -> bool {
+        matches!(self, Self::AlwaysAllow | Self::AlwaysDeny)
+    }
+}
+
+impl From<bool> for ApprovalDecision {
+    fn from(allowed: bool) -> Self {
+        if allowed { Self::Allow } else { Self::Deny }
+    }
+}
+
 /// Callback invoked before tool execution for human-in-the-loop approval.
 ///
 /// Receives the list of tool calls the LLM wants to execute.
-/// Returns `true` to proceed with execution, `false` to deny.
-/// When denied, the agent sends an error result back to the LLM.
-pub type OnApproval = dyn Fn(&[crate::llm::types::ToolCall]) -> bool + Send + Sync;
+/// Returns an [`ApprovalDecision`] indicating whether to proceed.
+/// `AlwaysAllow`/`AlwaysDeny` additionally persist the decision as a
+/// learned permission rule.
+pub type OnApproval = dyn Fn(&[crate::llm::types::ToolCall]) -> ApprovalDecision + Send + Sync;
 
 /// Trait for LLM providers.
 ///
@@ -47,6 +86,13 @@ pub trait LlmProvider: Send + Sync {
         let _ = on_text;
         self.complete(request)
     }
+
+    /// Return the model identifier, if known.
+    ///
+    /// Used for audit trail events. Default returns `None`.
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +119,8 @@ pub trait DynLlmProvider: Send + Sync {
         request: CompletionRequest,
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
+
+    fn model_name(&self) -> Option<&str>;
 }
 
 impl<P: LlmProvider> DynLlmProvider for P {
@@ -89,6 +137,10 @@ impl<P: LlmProvider> DynLlmProvider for P {
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
         Box::pin(LlmProvider::stream_complete(self, request, on_text))
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        LlmProvider::model_name(self)
     }
 }
 
@@ -118,6 +170,39 @@ impl BoxedProvider {
     pub fn new<P: LlmProvider + 'static>(provider: P) -> Self {
         Self(Box::new(provider))
     }
+
+    /// Create a type-erased provider from an `Arc<P>`.
+    ///
+    /// Useful when the provider is already behind an `Arc` (e.g., shared between
+    /// the orchestrator and sub-agents) and needs to be converted to `BoxedProvider`
+    /// for type erasure without consuming the original.
+    pub fn from_arc<P: LlmProvider + 'static>(provider: Arc<P>) -> Self {
+        /// Internal adapter: delegates to the `Arc<P>` inner provider.
+        struct ArcAdapter<P>(Arc<P>);
+
+        impl<P: LlmProvider> LlmProvider for ArcAdapter<P> {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                self.0.complete(request).await
+            }
+
+            async fn stream_complete(
+                &self,
+                request: CompletionRequest,
+                on_text: &OnText,
+            ) -> Result<CompletionResponse, Error> {
+                self.0.stream_complete(request, on_text).await
+            }
+
+            fn model_name(&self) -> Option<&str> {
+                self.0.model_name()
+            }
+        }
+
+        Self(Box::new(ArcAdapter(provider)))
+    }
 }
 
 impl LlmProvider for BoxedProvider {
@@ -131,6 +216,10 @@ impl LlmProvider for BoxedProvider {
         on_text: &OnText,
     ) -> Result<CompletionResponse, Error> {
         self.0.stream_complete(request, on_text).await
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        self.0.model_name()
     }
 }
 
@@ -185,6 +274,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             tool_choice: None,
+            reasoning_effort: None,
         }
     }
 
@@ -241,5 +331,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.text(), "fake");
+    }
+
+    #[tokio::test]
+    async fn boxed_provider_from_arc_delegates_complete() {
+        let provider = Arc::new(FakeProvider);
+        let boxed = BoxedProvider::from_arc(provider);
+        let response = LlmProvider::complete(&boxed, test_request()).await.unwrap();
+        assert_eq!(response.text(), "fake");
+    }
+
+    #[tokio::test]
+    async fn boxed_provider_from_arc_delegates_stream_complete() {
+        let provider = Arc::new(StreamingFakeProvider);
+        let boxed = BoxedProvider::from_arc(provider);
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+        let on_text: &OnText = &move |text: &str| {
+            received_clone
+                .lock()
+                .expect("test lock")
+                .push(text.to_string());
+        };
+        let response = LlmProvider::stream_complete(&boxed, test_request(), on_text)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "hello world");
+        let texts = received.lock().expect("test lock");
+        assert_eq!(*texts, vec!["hello", " world"]);
+    }
+
+    #[test]
+    fn model_name_default_is_none() {
+        let provider = FakeProvider;
+        assert!(LlmProvider::model_name(&provider).is_none());
+    }
+
+    #[test]
+    fn boxed_provider_preserves_model_name() {
+        struct NamedProvider;
+        impl LlmProvider for NamedProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                unimplemented!()
+            }
+            fn model_name(&self) -> Option<&str> {
+                Some("test-model")
+            }
+        }
+        let boxed = BoxedProvider::new(NamedProvider);
+        assert_eq!(LlmProvider::model_name(&boxed), Some("test-model"));
+    }
+
+    #[test]
+    fn boxed_provider_from_arc_preserves_model_name() {
+        struct NamedProvider;
+        impl LlmProvider for NamedProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                unimplemented!()
+            }
+            fn model_name(&self) -> Option<&str> {
+                Some("arc-model")
+            }
+        }
+        let boxed = BoxedProvider::from_arc(Arc::new(NamedProvider));
+        assert_eq!(LlmProvider::model_name(&boxed), Some("arc-model"));
+    }
+
+    #[tokio::test]
+    async fn boxed_provider_from_arc_shares_underlying_provider() {
+        // Verify from_arc shares the underlying provider via Arc (not a copy)
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingProvider(Arc<std::sync::atomic::AtomicUsize>);
+        impl LlmProvider for CountingProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "counted".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let inner = Arc::new(CountingProvider(call_count.clone()));
+        let boxed1 = BoxedProvider::from_arc(inner.clone());
+        let boxed2 = BoxedProvider::from_arc(inner);
+
+        LlmProvider::complete(&boxed1, test_request())
+            .await
+            .unwrap();
+        LlmProvider::complete(&boxed2, test_request())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "both boxed providers should share the same underlying provider"
+        );
+    }
+
+    // --- ApprovalDecision ---
+
+    #[test]
+    fn approval_decision_from_true() {
+        let decision = ApprovalDecision::from(true);
+        assert_eq!(decision, ApprovalDecision::Allow);
+        assert!(decision.is_allowed());
+        assert!(!decision.is_persistent());
+    }
+
+    #[test]
+    fn approval_decision_from_false() {
+        let decision = ApprovalDecision::from(false);
+        assert_eq!(decision, ApprovalDecision::Deny);
+        assert!(!decision.is_allowed());
+        assert!(!decision.is_persistent());
+    }
+
+    #[test]
+    fn approval_decision_always_allow() {
+        let decision = ApprovalDecision::AlwaysAllow;
+        assert!(decision.is_allowed());
+        assert!(decision.is_persistent());
+    }
+
+    #[test]
+    fn approval_decision_always_deny() {
+        let decision = ApprovalDecision::AlwaysDeny;
+        assert!(!decision.is_allowed());
+        assert!(decision.is_persistent());
     }
 }

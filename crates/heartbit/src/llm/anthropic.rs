@@ -46,6 +46,10 @@ impl AnthropicProvider {
 }
 
 impl LlmProvider for AnthropicProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
         let body = build_request_body(&self.model, &request, self.prompt_caching)?;
 
@@ -155,8 +159,56 @@ fn build_request_body(
         body["tools"] = tools;
     }
 
+    if prompt_caching {
+        // Add cache_control to the last content block of the second-to-last
+        // user message. This creates a cache breakpoint so the conversation
+        // prefix up to that point is cached across turns.
+        if let Some(messages) = body["messages"].as_array_mut() {
+            let user_indices: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m["role"] == "user")
+                .map(|(i, _)| i)
+                .collect();
+            // Place breakpoint on the second-to-last user message
+            if user_indices.len() >= 2 {
+                let idx = user_indices[user_indices.len() - 2];
+                if let Some(content) = messages[idx]["content"].as_array_mut()
+                    && let Some(last_block) = content.last_mut()
+                {
+                    last_block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+            }
+        }
+    }
+
     if let Some(ref tc) = request.tool_choice {
         body["tool_choice"] = serde_json::to_value(tc)?;
+    }
+
+    // Add extended thinking for Anthropic models that support it.
+    // Maps ReasoningEffort to budget_tokens (fraction of max_tokens).
+    // Anthropic requires: budget_tokens >= 1024 and budget_tokens < max_tokens.
+    if let Some(effort) = request.reasoning_effort {
+        use crate::llm::types::ReasoningEffort;
+        const MIN_THINKING_BUDGET: u32 = 1024;
+        let raw_budget = match effort {
+            ReasoningEffort::High => request.max_tokens.saturating_mul(4),
+            ReasoningEffort::Medium => request.max_tokens.saturating_mul(2),
+            ReasoningEffort::Low => request.max_tokens,
+            ReasoningEffort::None => 0,
+        };
+        // Clamp: at least 1024 (Anthropic minimum), at most max_tokens - 1
+        // (budget_tokens must be strictly less than max_tokens).
+        if raw_budget > 0 && request.max_tokens > MIN_THINKING_BUDGET {
+            let budget = raw_budget
+                .max(MIN_THINKING_BUDGET)
+                .min(request.max_tokens.saturating_sub(1));
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget
+            });
+        }
     }
 
     Ok(body)
@@ -418,7 +470,9 @@ fn process_sse_event(
                 match parsed.delta.r#type.as_str() {
                     "text_delta" => {
                         if let Some(ref delta) = parsed.delta.text {
-                            on_text(delta);
+                            if !delta.is_empty() {
+                                on_text(delta);
+                            }
                             if let Some(ref mut text) = state.current_text {
                                 text.push_str(delta);
                             }
@@ -521,6 +575,7 @@ fn into_completion_response(api: ApiResponse) -> CompletionResponse {
             output_tokens: api.usage.output_tokens,
             cache_creation_input_tokens: api.usage.cache_creation_input_tokens,
             cache_read_input_tokens: api.usage.cache_read_input_tokens,
+            reasoning_tokens: 0,
         },
     }
 }
@@ -580,7 +635,7 @@ struct MessageDeltaUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::Message;
+    use crate::llm::types::{ContentBlock, Message, Role};
     use std::sync::Arc;
 
     // --- SseParser unit tests ---
@@ -723,6 +778,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_request_body("claude-sonnet-4-20250514", &request, false).unwrap();
@@ -747,6 +803,7 @@ mod tests {
             }],
             max_tokens: 2048,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_request_body("claude-sonnet-4-20250514", &request, false).unwrap();
@@ -763,6 +820,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         assert!(body.get("tool_choice").is_none());
@@ -777,6 +835,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Auto),
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "auto");
@@ -791,6 +850,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Any),
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -807,10 +867,90 @@ mod tests {
             tool_choice: Some(ToolChoice::Tool {
                 name: "search".into(),
             }),
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "search");
+    }
+
+    #[test]
+    fn build_request_body_reasoning_effort_medium() {
+        use crate::llm::types::ReasoningEffort;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 4096,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // 4096 * 2 = 8192, clamped to max_tokens - 1 = 4095
+        assert_eq!(body["thinking"]["budget_tokens"], 4095);
+    }
+
+    #[test]
+    fn build_request_body_reasoning_effort_high() {
+        use crate::llm::types::ReasoningEffort;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 4096,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // 4096 * 4 = 16384, clamped to max_tokens - 1 = 4095
+        assert_eq!(body["thinking"]["budget_tokens"], 4095);
+    }
+
+    #[test]
+    fn build_request_body_reasoning_effort_none_omits_thinking() {
+        use crate::llm::types::ReasoningEffort;
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::None),
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_body_reasoning_effort_skipped_when_max_tokens_too_small() {
+        use crate::llm::types::ReasoningEffort;
+        // max_tokens <= MIN_THINKING_BUDGET (1024) → thinking skipped
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn build_request_body_no_reasoning_omits_thinking() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        assert!(body.get("thinking").is_none());
     }
 
     // --- SSE stream integration tests ---
@@ -1125,6 +1265,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         assert!(body["system"].is_string());
@@ -1139,6 +1280,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, true).unwrap();
         assert!(body["system"].is_array());
@@ -1171,6 +1313,7 @@ mod tests {
             ],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, true).unwrap();
         let tools = body["tools"].as_array().unwrap();
@@ -1195,6 +1338,7 @@ mod tests {
             }],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, true).unwrap();
         let tools = body["tools"].as_array().unwrap();
@@ -1209,6 +1353,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, true).unwrap();
         assert!(body.get("tools").is_none());
@@ -1229,6 +1374,7 @@ mod tests {
             }],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_request_body("model", &request, false).unwrap();
         let tools = body["tools"].as_array().unwrap();
@@ -1304,5 +1450,125 @@ mod tests {
     fn with_prompt_caching_sets_flag() {
         let provider = AnthropicProvider::with_prompt_caching("key", "model");
         assert!(provider.prompt_caching);
+    }
+
+    #[test]
+    fn model_name_returns_configured_model() {
+        let provider = AnthropicProvider::new("key", "claude-3-5-sonnet-20241022");
+        assert_eq!(provider.model_name(), Some("claude-3-5-sonnet-20241022"));
+    }
+
+    #[test]
+    fn caching_marks_second_to_last_user_message() {
+        use serde_json::json;
+
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![
+                Message::user("first question"),
+                Message::assistant("first answer"),
+                Message::user("second question"),
+                Message::assistant("second answer"),
+                Message::user("third question"),
+            ],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // Second-to-last user message is index 2 ("second question")
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // First user message should NOT have cache_control
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        // Last user message should NOT have cache_control
+        assert!(messages[4]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn caching_no_message_breakpoint_with_single_user_message() {
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("only question")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // Only 1 user message — no breakpoint placed
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn caching_disabled_no_message_breakpoints() {
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+            ],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("model", &request, false).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // No cache_control on any message when caching is disabled
+        for msg in messages {
+            if let Some(content) = msg["content"].as_array() {
+                for block in content {
+                    assert!(block.get("cache_control").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caching_message_breakpoint_with_tool_results() {
+        use serde_json::json;
+
+        // Simulate a realistic agent conversation with tool calls
+        let request = CompletionRequest {
+            system: "sys".into(),
+            messages: vec![
+                Message::user("read file.txt"),
+                Message::assistant("I'll read that file."),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "file contents here".into(),
+                        is_error: false,
+                    }],
+                },
+                Message::assistant("The file contains..."),
+                Message::user("now edit it"),
+            ],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("model", &request, true).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+
+        // Second-to-last user message is index 2 (the tool result)
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // Last user message should NOT have cache_control
+        assert!(messages[4]["content"][0].get("cache_control").is_none());
     }
 }

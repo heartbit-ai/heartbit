@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-heartbit = { path = "../heartbit" }
+heartbit = { path = "../heartbit", features = ["telegram"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -18,3 +18,13 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+prometheus = { workspace = true }
+rdkafka = { workspace = true }
+teloxide = { workspace = true }
+dotenvy = { workspace = true }

@@ -97,6 +97,21 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
+/// Controls reasoning/thinking effort for models that support it.
+/// Maps to OpenRouter's `reasoning` parameter and Anthropic's extended thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Maximum reasoning depth.
+    High,
+    /// Default reasoning depth.
+    Medium,
+    /// Minimal reasoning.
+    Low,
+    /// Disable reasoning entirely (fastest, cheapest).
+    None,
+}
+
 /// A request to the LLM.
 ///
 /// The model is not part of the request — it's a property of the provider.
@@ -108,10 +123,12 @@ pub struct CompletionRequest {
     pub max_tokens: u32,
     /// Optional tool choice constraint. `None` = provider default (auto).
     pub tool_choice: Option<ToolChoice>,
+    /// Optional reasoning/thinking effort level. `None` = no reasoning.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Why the LLM stopped generating.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -120,7 +137,7 @@ pub enum StopReason {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -130,6 +147,19 @@ pub struct TokenUsage {
     /// Tokens read from an existing cache entry (Anthropic prompt caching).
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// Tokens consumed by the model's internal reasoning/thinking.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input_tokens += rhs.input_tokens;
+        self.output_tokens += rhs.output_tokens;
+        self.cache_creation_input_tokens += rhs.cache_creation_input_tokens;
+        self.cache_read_input_tokens += rhs.cache_read_input_tokens;
+        self.reasoning_tokens += rhs.reasoning_tokens;
+    }
 }
 
 /// A response from the LLM.
@@ -164,8 +194,7 @@ impl CompletionResponse {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .collect()
     }
 }
 
@@ -425,6 +454,7 @@ mod tests {
         let usage = TokenUsage::default();
         assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
     }
 
     #[test]
@@ -434,6 +464,7 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: 200,
             cache_read_input_tokens: 300,
+            reasoning_tokens: 400,
         };
         let json_str = serde_json::to_string(&usage).unwrap();
         let parsed: TokenUsage = serde_json::from_str(&json_str).unwrap();
@@ -441,13 +472,73 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_add_assign() {
+        let mut a = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 20,
+            reasoning_tokens: 30,
+        };
+        let b = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 30,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 15,
+            reasoning_tokens: 25,
+        };
+        a += b;
+        assert_eq!(a.input_tokens, 300);
+        assert_eq!(a.output_tokens, 80);
+        assert_eq!(a.cache_creation_input_tokens, 15);
+        assert_eq!(a.cache_read_input_tokens, 35);
+        assert_eq!(a.reasoning_tokens, 55);
+    }
+
+    #[test]
     fn token_usage_backward_compat_deserialization() {
-        // Old format without cache fields should still deserialize
+        // Old format without cache/reasoning fields should still deserialize
         let json_str = r#"{"input_tokens":100,"output_tokens":50}"#;
         let parsed: TokenUsage = serde_json::from_str(json_str).unwrap();
         assert_eq!(parsed.input_tokens, 100);
         assert_eq!(parsed.output_tokens, 50);
         assert_eq!(parsed.cache_creation_input_tokens, 0);
         assert_eq!(parsed.cache_read_input_tokens, 0);
+        assert_eq!(parsed.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn reasoning_effort_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::High).unwrap(),
+            "\"high\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Low).unwrap(),
+            "\"low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::None).unwrap(),
+            "\"none\""
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_roundtrips() {
+        let efforts = vec![
+            ReasoningEffort::High,
+            ReasoningEffort::Medium,
+            ReasoningEffort::Low,
+            ReasoningEffort::None,
+        ];
+        for effort in efforts {
+            let json = serde_json::to_string(&effort).unwrap();
+            let parsed: ReasoningEffort = serde_json::from_str(&json).unwrap();
+            assert_eq!(effort, parsed);
+        }
     }
 }

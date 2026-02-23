@@ -11,19 +11,27 @@ use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
-use super::scoring::{ScoringWeights, composite_score};
+use super::reflection::ReflectionTracker;
 use super::{Memory, MemoryEntry, MemoryQuery};
 
 /// Create the 5 memory tools bound to a specific memory store and agent name.
-pub fn memory_tools(memory: Arc<dyn Memory>, agent_name: &str) -> Vec<Arc<dyn Tool>> {
+///
+/// If `reflection_threshold` is set, the store tool will include a reflection
+/// hint when cumulative importance exceeds the threshold.
+pub fn memory_tools_with_reflection(
+    memory: Arc<dyn Memory>,
+    agent_name: &str,
+    reflection_threshold: Option<u32>,
+) -> Vec<Arc<dyn Tool>> {
+    let tracker = reflection_threshold.map(|t| Arc::new(ReflectionTracker::new(t)));
     vec![
         Arc::new(MemoryStoreTool {
             memory: memory.clone(),
             agent_name: agent_name.into(),
+            reflection_tracker: tracker,
         }),
         Arc::new(MemoryRecallTool {
             memory: memory.clone(),
-            agent_name: agent_name.into(),
         }),
         Arc::new(MemoryUpdateTool {
             memory: memory.clone(),
@@ -43,6 +51,7 @@ pub fn memory_tools(memory: Arc<dyn Memory>, agent_name: &str) -> Vec<Arc<dyn To
 struct MemoryStoreTool {
     memory: Arc<dyn Memory>,
     agent_name: String,
+    reflection_tracker: Option<Arc<ReflectionTracker>>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +63,10 @@ struct StoreInput {
     tags: Vec<String>,
     #[serde(default = "super::default_importance")]
     importance: u8,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 impl Tool for MemoryStoreTool {
@@ -85,6 +98,15 @@ impl Tool for MemoryStoreTool {
                         "minimum": 1,
                         "maximum": 10,
                         "description": "Importance score 1-10 (default: 5). Higher = more likely to surface in recall."
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keywords for improved retrieval (BM25 scoring). Provide 3-5 key terms."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-sentence summary providing context for this memory."
                     }
                 },
                 "required": ["content"]
@@ -112,10 +134,47 @@ impl Tool for MemoryStoreTool {
                 last_accessed: now,
                 access_count: 0,
                 importance: input.importance.clamp(1, 10),
+                memory_type: super::MemoryType::default(),
+                keywords: input.keywords,
+                summary: input.summary,
+                strength: 1.0,
+                related_ids: vec![],
+                source_ids: vec![],
+                embedding: None,
             };
 
+            let importance = entry.importance;
+            let keywords = entry.keywords.clone();
             self.memory.store(entry).await?;
-            Ok(ToolOutput::success(format!("Stored memory with id: {id}")))
+
+            // Link evolution: find related entries by keyword overlap
+            if !keywords.is_empty()
+                && let Ok(existing) = self
+                    .memory
+                    .recall(MemoryQuery {
+                        limit: 20,
+                        ..Default::default()
+                    })
+                    .await
+            {
+                for e in &existing {
+                    if e.id == id || e.keywords.is_empty() {
+                        continue;
+                    }
+                    let jaccard = super::consolidation::jaccard_similarity(&keywords, &e.keywords);
+                    if jaccard >= 0.2 {
+                        let _ = self.memory.add_link(&id, &e.id).await;
+                    }
+                }
+            }
+
+            let mut msg = format!("Stored memory with id: {id}");
+            if let Some(ref tracker) = self.reflection_tracker
+                && tracker.record(importance)
+            {
+                msg.push_str(super::reflection::REFLECTION_HINT);
+            }
+            Ok(ToolOutput::success(msg))
         })
     }
 }
@@ -124,7 +183,6 @@ impl Tool for MemoryStoreTool {
 
 struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
-    agent_name: String,
 }
 
 #[derive(Deserialize)]
@@ -180,15 +238,18 @@ impl Tool for MemoryRecallTool {
             let input: RecallInput =
                 serde_json::from_value(input).map_err(|e| Error::Memory(e.to_string()))?;
 
-            let has_text_query = input.query.is_some();
             let results = self
                 .memory
                 .recall(MemoryQuery {
                     text: input.query,
                     category: input.category,
                     tags: input.tags,
-                    agent: Some(self.agent_name.clone()),
+                    // agent: None lets NamespacedMemory default to the correct
+                    // compound namespace (e.g. "tg:123:assistant"). Passing the
+                    // plain agent_name would bypass NamespacedMemory's scoping.
+                    agent: None,
                     limit: input.limit,
+                    ..Default::default()
                 })
                 .await?;
 
@@ -196,31 +257,40 @@ impl Tool for MemoryRecallTool {
                 return Ok(ToolOutput::success("No memories found."));
             }
 
-            let now = Utc::now();
-            let weights = ScoringWeights::default();
-
+            // Results are pre-sorted by the store using its configured scoring
+            // weights. We display rank order rather than recomputing scores
+            // (which may use different weights than the store).
             let formatted: Vec<String> = results
                 .iter()
-                .map(|e| {
-                    let relevance = if has_text_query { 1.0 } else { 0.0 };
-                    let score =
-                        composite_score(&weights, e.created_at, now, e.importance, relevance);
+                .enumerate()
+                .map(|(rank, e)| {
                     let display_content = if e.content.len() > 200 {
                         let truncated: String = e.content.chars().take(200).collect();
                         format!("{truncated}...")
                     } else {
                         e.content.clone()
                     };
-                    format!(
-                        "- [{}] ({}, importance:{}) score:{:.2} {}\n  Tags: {:?} | Accessed: {} times",
+                    let mt = match e.memory_type {
+                        crate::memory::MemoryType::Episodic => "episodic",
+                        crate::memory::MemoryType::Semantic => "semantic",
+                        crate::memory::MemoryType::Reflection => "reflection",
+                    };
+                    let mut line = format!(
+                        "- #{} [{}] ({}, {}, importance:{}, strength:{:.2}) {}\n  Tags: {:?} | Accessed: {} times",
+                        rank + 1,
                         e.id,
                         e.category,
+                        mt,
                         e.importance,
-                        score,
+                        e.strength,
                         display_content,
                         e.tags,
                         e.access_count,
-                    )
+                    );
+                    if !e.keywords.is_empty() {
+                        line.push_str(&format!(" | Keywords: {:?}", e.keywords));
+                    }
+                    line
                 })
                 .collect();
 
@@ -405,6 +475,35 @@ impl Tool for MemoryConsolidateTool {
                 ));
             }
 
+            // Fetch source memories to merge their keywords and tags.
+            // Use a generous limit — consolidation is not a hot path.
+            let sources = self
+                .memory
+                .recall(MemoryQuery {
+                    limit: 1000,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_default();
+
+            let source_set: std::collections::HashSet<&str> =
+                input.source_ids.iter().map(|s| s.as_str()).collect();
+
+            let mut merged_keywords: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut merged_tags: std::collections::HashSet<String> =
+                input.tags.iter().cloned().collect();
+
+            for entry in &sources {
+                if source_set.contains(entry.id.as_str()) {
+                    merged_keywords.extend(entry.keywords.iter().cloned());
+                    merged_tags.extend(entry.tags.iter().cloned());
+                }
+            }
+
+            let keywords: Vec<String> = merged_keywords.into_iter().collect();
+            let tags: Vec<String> = merged_tags.into_iter().collect();
+
             // Create consolidated entry FIRST to prevent data loss.
             // If store fails, no sources are deleted.
             let new_id = Uuid::new_v4().to_string();
@@ -414,11 +513,18 @@ impl Tool for MemoryConsolidateTool {
                 agent: self.agent_name.clone(),
                 content: input.content,
                 category: input.category,
-                tags: input.tags,
+                tags,
                 created_at: now,
                 last_accessed: now,
                 access_count: 0,
                 importance: input.importance.clamp(1, 10),
+                memory_type: super::MemoryType::Semantic,
+                keywords,
+                summary: None,
+                strength: 1.0,
+                related_ids: vec![],
+                source_ids: input.source_ids.clone(),
+                embedding: None,
             };
 
             self.memory.store(entry).await?;
@@ -465,7 +571,7 @@ mod tests {
 
     fn setup() -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = memory_tools(store.clone(), "test-agent");
+        let tools = memory_tools_with_reflection(store.clone(), "test-agent", None);
         (store, tools)
     }
 
@@ -701,18 +807,23 @@ mod tests {
     // --- recall output format tests ---
 
     #[tokio::test]
-    async fn recall_tool_shows_score() {
+    async fn recall_tool_shows_rank() {
         let (_store, tools) = setup();
         let store_tool = find_tool(&tools, "memory_store");
         let recall_tool = find_tool(&tools, "memory_recall");
 
         store_tool
-            .execute(json!({"content": "scored memory"}))
+            .execute(json!({"content": "first memory"}))
+            .await
+            .unwrap();
+        store_tool
+            .execute(json!({"content": "second memory"}))
             .await
             .unwrap();
 
         let result = recall_tool.execute(json!({})).await.unwrap();
-        assert!(result.content.contains("score:"));
+        assert!(result.content.contains("#1"), "should show rank #1");
+        assert!(result.content.contains("#2"), "should show rank #2");
     }
 
     #[tokio::test]
@@ -978,5 +1089,296 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 5); // default
+    }
+
+    #[tokio::test]
+    async fn consolidate_tool_merges_source_keywords_and_tags() {
+        let (store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let consolidate_tool = find_tool(&tools, "memory_consolidate");
+
+        store_tool
+            .execute(json!({
+                "content": "first fact",
+                "keywords": ["rust", "performance"],
+                "tags": ["lang"]
+            }))
+            .await
+            .unwrap();
+        store_tool
+            .execute(json!({
+                "content": "second fact",
+                "keywords": ["safety", "rust"],
+                "tags": ["design"]
+            }))
+            .await
+            .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+
+        consolidate_tool
+            .execute(json!({
+                "source_ids": ids,
+                "content": "merged fact",
+                "tags": ["summary"]
+            }))
+            .await
+            .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Keywords merged from both sources (deduplicated)
+        let kw = &entries[0].keywords;
+        assert!(kw.contains(&"rust".to_string()));
+        assert!(kw.contains(&"performance".to_string()));
+        assert!(kw.contains(&"safety".to_string()));
+
+        // Tags merged from sources + explicit input
+        let tags = &entries[0].tags;
+        assert!(tags.contains(&"summary".to_string()));
+        assert!(tags.contains(&"lang".to_string()));
+        assert!(tags.contains(&"design".to_string()));
+    }
+
+    // --- keywords and summary tests ---
+
+    #[tokio::test]
+    async fn store_tool_accepts_keywords() {
+        let (store, tools) = setup();
+        let tool = find_tool(&tools, "memory_store");
+
+        tool.execute(json!({
+            "content": "Rust has zero-cost abstractions",
+            "keywords": ["rust", "zero-cost", "abstractions"]
+        }))
+        .await
+        .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].keywords,
+            vec!["rust", "zero-cost", "abstractions"]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_tool_accepts_summary() {
+        let (store, tools) = setup();
+        let tool = find_tool(&tools, "memory_store");
+
+        tool.execute(json!({
+            "content": "Detailed technical analysis of Rust ownership model",
+            "summary": "Rust ownership analysis"
+        }))
+        .await
+        .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].summary.as_deref(),
+            Some("Rust ownership analysis")
+        );
+    }
+
+    #[tokio::test]
+    async fn store_tool_keywords_improve_recall() {
+        let (_store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let recall_tool = find_tool(&tools, "memory_recall");
+
+        // Store with keyword "performance" not in content
+        store_tool
+            .execute(json!({
+                "content": "Rust is great for systems programming",
+                "keywords": ["performance", "speed", "systems"]
+            }))
+            .await
+            .unwrap();
+
+        // Search for "performance" — should find via keyword match
+        let result = recall_tool
+            .execute(json!({"query": "performance"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Rust is great"),
+            "keywords should enable finding the memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_tool_shows_keywords_in_output() {
+        let (_store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let recall_tool = find_tool(&tools, "memory_recall");
+
+        store_tool
+            .execute(json!({
+                "content": "test content",
+                "keywords": ["test-keyword"]
+            }))
+            .await
+            .unwrap();
+
+        let result = recall_tool.execute(json!({})).await.unwrap();
+        assert!(
+            result.content.contains("test-keyword"),
+            "recall output should show keywords"
+        );
+    }
+
+    // --- reflection tests ---
+
+    fn setup_with_reflection(threshold: u32) -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let tools = memory_tools_with_reflection(store.clone(), "test-agent", Some(threshold));
+        (store, tools)
+    }
+
+    #[tokio::test]
+    async fn store_includes_reflection_hint_when_triggered() {
+        let (_store, tools) = setup_with_reflection(10);
+        let store_tool = find_tool(&tools, "memory_store");
+
+        // Store with importance 10 — should trigger immediately
+        let result = store_tool
+            .execute(json!({"content": "very important", "importance": 10}))
+            .await
+            .unwrap();
+        assert!(
+            result.content.contains("Reflection suggested"),
+            "should include reflection hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_no_reflection_below_threshold() {
+        let (_store, tools) = setup_with_reflection(20);
+        let store_tool = find_tool(&tools, "memory_store");
+
+        let result = store_tool
+            .execute(json!({"content": "minor fact", "importance": 3}))
+            .await
+            .unwrap();
+        assert!(
+            !result.content.contains("Reflection suggested"),
+            "should not trigger reflection below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_reflection_accumulates() {
+        let (_store, tools) = setup_with_reflection(10);
+        let store_tool = find_tool(&tools, "memory_store");
+
+        // importance 5 + 5 = 10, second should trigger
+        let r1 = store_tool
+            .execute(json!({"content": "fact A", "importance": 5}))
+            .await
+            .unwrap();
+        assert!(!r1.content.contains("Reflection suggested"));
+
+        let r2 = store_tool
+            .execute(json!({"content": "fact B", "importance": 5}))
+            .await
+            .unwrap();
+        assert!(
+            r2.content.contains("Reflection suggested"),
+            "should trigger after accumulation"
+        );
+    }
+
+    // --- linking tests ---
+
+    #[tokio::test]
+    async fn store_creates_links_for_keyword_overlap() {
+        let (store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+
+        // Store first entry with keywords
+        store_tool
+            .execute(json!({
+                "content": "Rust is fast",
+                "keywords": ["rust", "performance", "speed"]
+            }))
+            .await
+            .unwrap();
+
+        // Store second entry with overlapping keywords
+        store_tool
+            .execute(json!({
+                "content": "Rust has great perf",
+                "keywords": ["rust", "performance"]
+            }))
+            .await
+            .unwrap();
+
+        // Check that entries are linked
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let has_links = entries.iter().any(|e| !e.related_ids.is_empty());
+        assert!(
+            has_links,
+            "entries with overlapping keywords should be linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_no_links_without_keywords() {
+        let (store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+
+        store_tool
+            .execute(json!({"content": "no keywords A"}))
+            .await
+            .unwrap();
+        store_tool
+            .execute(json!({"content": "no keywords B"}))
+            .await
+            .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let has_links = entries.iter().any(|e| !e.related_ids.is_empty());
+        assert!(!has_links, "entries without keywords should not be linked");
     }
 }

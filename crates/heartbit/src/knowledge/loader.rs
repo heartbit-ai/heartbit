@@ -11,7 +11,8 @@ pub async fn load_file(
     path: &Path,
     config: &ChunkConfig,
 ) -> Result<usize, Error> {
-    let content = std::fs::read_to_string(path)
+    let content = tokio::fs::read_to_string(path)
+        .await
         .map_err(|e| Error::Knowledge(format!("failed to read {}: {e}", path.display())))?;
 
     let title = path
@@ -95,23 +96,42 @@ pub async fn load_url(
 
 /// Strip HTML tags from text, replacing them with spaces.
 ///
-/// This is a simple regex-free parser. For full HTML→markdown conversion
-/// a dedicated crate would be appropriate, but for V1 tag stripping suffices.
+/// Skips content inside `<script>` and `<style>` tags. For full
+/// HTML→markdown conversion a dedicated crate would be appropriate,
+/// but for V1 tag stripping suffices.
 pub fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
+    let mut tag_name = String::new();
+    let mut collecting_tag = false;
     let mut last_was_space = false;
+    let mut skip_content = false; // true inside <script> or <style>
 
     for ch in html.chars() {
         if ch == '<' {
             in_tag = true;
-            if !last_was_space && !result.is_empty() {
+            tag_name.clear();
+            collecting_tag = true;
+            if !skip_content && !last_was_space && !result.is_empty() {
                 result.push(' ');
                 last_was_space = true;
             }
-        } else if ch == '>' {
+        } else if ch == '>' && in_tag {
             in_tag = false;
-        } else if !in_tag {
+            collecting_tag = false;
+            let tag_lower = tag_name.to_lowercase();
+            match tag_lower.as_str() {
+                "script" | "style" => skip_content = true,
+                "/script" | "/style" => skip_content = false,
+                _ => {}
+            }
+        } else if in_tag && collecting_tag {
+            if ch.is_whitespace() {
+                collecting_tag = false;
+            } else {
+                tag_name.push(ch);
+            }
+        } else if !in_tag && !skip_content {
             if ch.is_whitespace() {
                 if !last_was_space {
                     result.push(' ');
@@ -220,6 +240,26 @@ mod tests {
         let html = "<p>  lots   of    spaces  </p>";
         let text = strip_html_tags(html);
         assert_eq!(text, "lots of spaces");
+    }
+
+    #[test]
+    fn strip_html_skips_script_content() {
+        let html = "<p>Hello</p><script>var x = 1; alert('xss');</script><p>World</p>";
+        let text = strip_html_tags(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(!text.contains("alert"));
+        assert!(!text.contains("var x"));
+    }
+
+    #[test]
+    fn strip_html_skips_style_content() {
+        let html = "<p>Hello</p><style>body { color: red; }</style><p>World</p>";
+        let text = strip_html_tags(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(!text.contains("color"));
+        assert!(!text.contains("body"));
     }
 
     #[test]

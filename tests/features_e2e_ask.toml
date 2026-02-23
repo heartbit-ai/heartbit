@@ -1,0 +1,24 @@
+# Config for permission tests that force all tools to ask.
+# Used by features_e2e.sh tests 1 & 2.
+
+[provider]
+name = "openrouter"
+model = "qwen/qwen3-30b-a3b"
+
+[provider.retry]
+max_retries = 2
+base_delay_ms = 500
+max_delay_ms = 10000
+
+[orchestrator]
+max_turns = 10
+max_tokens = 4096
+
+[[agents]]
+name = "worker"
+description = "General-purpose agent that uses bash and file tools"
+system_prompt = "You are a helpful assistant. Use the available tools to accomplish the task."
+
+[[permissions]]
+tool = "*"
+action = "ask"

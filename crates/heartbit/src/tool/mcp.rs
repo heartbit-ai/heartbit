@@ -60,6 +60,8 @@ struct McpToolDef {
 #[derive(Debug, Deserialize)]
 struct McpToolsListResult {
     tools: Vec<McpToolDef>,
+    #[serde(default, rename = "nextCursor")]
+    next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +136,11 @@ fn find_rpc_response(events: &[String], expected_id: u64) -> Result<String, Erro
 }
 
 fn mcp_result_to_tool_output(result: McpCallToolResult) -> ToolOutput {
+    let non_text_count = result
+        .content
+        .iter()
+        .filter(|c| c.content_type != "text")
+        .count();
     let text: String = result
         .content
         .iter()
@@ -147,10 +154,18 @@ fn mcp_result_to_tool_output(result: McpCallToolResult) -> ToolOutput {
         .collect::<Vec<_>>()
         .join("\n");
 
-    if result.is_error {
-        ToolOutput::error(text)
+    let output = if text.is_empty() && non_text_count > 0 {
+        format!(
+            "[MCP server returned {non_text_count} non-text content block(s) that cannot be displayed]"
+        )
     } else {
-        ToolOutput::success(text)
+        text
+    };
+
+    if result.is_error {
+        ToolOutput::error(output)
+    } else {
+        ToolOutput::success(output)
     }
 }
 
@@ -415,12 +430,23 @@ impl McpClient {
 
         session.notify("notifications/initialized", None).await?;
 
-        let tools_result = session.rpc("tools/list", None).await?;
-        let tools_list: McpToolsListResult = serde_json::from_value(tools_result)?;
+        // Paginate tools/list — collect all pages via nextCursor
+        let mut all_tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = cursor.as_ref().map(|c| serde_json::json!({"cursor": c}));
+            let tools_result = session.rpc("tools/list", params).await?;
+            let page: McpToolsListResult = serde_json::from_value(tools_result)?;
+            all_tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
 
         Ok(Self {
             session,
-            tools: tools_list.tools,
+            tools: all_tools,
         })
     }
 
@@ -755,6 +781,48 @@ mod tests {
 
         let result: McpCallToolResult = serde_json::from_value(json).unwrap();
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn tool_result_non_text_only_shows_placeholder() {
+        let result = McpCallToolResult {
+            content: vec![
+                McpContent {
+                    content_type: "image".into(),
+                    text: None,
+                },
+                McpContent {
+                    content_type: "resource".into(),
+                    text: None,
+                },
+            ],
+            is_error: false,
+        };
+
+        let output = mcp_result_to_tool_output(result);
+        assert!(output.content.contains("2 non-text content block(s)"));
+        assert!(!output.is_error);
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_non_text_returns_text() {
+        // When there's both text and non-text, only text is returned (no placeholder)
+        let result = McpCallToolResult {
+            content: vec![
+                McpContent {
+                    content_type: "text".into(),
+                    text: Some("real text".into()),
+                },
+                McpContent {
+                    content_type: "image".into(),
+                    text: None,
+                },
+            ],
+            is_error: false,
+        };
+
+        let output = mcp_result_to_tool_output(result);
+        assert_eq!(output.content, "real text");
     }
 
     // --- McpSession tests ---

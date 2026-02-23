@@ -71,6 +71,7 @@ impl SchedulerObject for SchedulerObjectImpl {
                 max_turns: config.max_turns,
                 max_tokens: config.max_tokens,
                 approval_required: false,
+                reasoning_effort: None,
             }))
             .send();
 
@@ -116,6 +117,7 @@ mod tests {
                 max_turns: None,
                 max_tokens: None,
                 response_schema: None,
+                reasoning_effort: None,
             }],
             max_turns: 10,
             max_tokens: 4096,

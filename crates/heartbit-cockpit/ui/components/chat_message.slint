@@ -1,0 +1,180 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct ChatMsg {
+    id: int,
+    agent: string,
+    // "user", "assistant", "tool", "system"
+    role: string,
+    content: string,
+    is-tool-call: bool,
+    tool-name: string,
+    tool-input: string,
+    tool-output: string,
+    tool-is-error: bool,
+    tool-duration: string,
+    is-expanded: bool,
+}
+
+export component ChatMessage inherits Rectangle {
+    in property <ChatMsg> msg;
+    callback toggle-expand();
+    callback copy-text(string);
+
+    background: msg.role == "user" ? #1e3a5f :
+                msg.role == "system" ? #1e1b4b :
+                msg.is-tool-call ? #1e293b :
+                #1a2332;
+    border-radius: 8px;
+    // Size to content, not stretch
+    vertical-stretch: 0;
+
+    HorizontalLayout {
+        spacing: 0px;
+        padding: 0px;
+        // Colored left accent for tool calls (red for errors)
+        if msg.is-tool-call : Rectangle {
+            width: 3px;
+            background: msg.tool-is-error ? #ef4444 : #f59e0b;
+            border-radius: 2px;
+        }
+
+        VerticalLayout {
+            padding: msg.role == "system" ? 6px : 10px;
+            spacing: 4px;
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: msg.role == "user" ? "You" :
+                          msg.role == "system" ? "System" :
+                          msg.agent;
+                    color: msg.role == "user" ? #60a5fa :
+                           msg.role == "system" ? #a78bfa :
+                           #34d399;
+                    font-size: msg.role == "system" ? 11px : 12px;
+                    font-weight: 600;
+                }
+                if msg.is-tool-call : Text {
+                    text: "⚙ " + msg.tool-name;
+                    color: #f59e0b;
+                    font-size: 12px;
+                }
+                if msg.is-tool-call && msg.tool-is-error : Text {
+                    text: "✗ error";
+                    color: #ef4444;
+                    font-size: 11px;
+                }
+                if msg.is-tool-call && msg.tool-duration != "" : Text {
+                    text: msg.tool-duration;
+                    color: #64748b;
+                    font-size: 11px;
+                }
+            }
+
+            // Content text — skip for tool calls (redundant with header showing tool-name)
+            if !msg.is-tool-call : Rectangle {
+                max-height: 400px;
+                vertical-stretch: 0;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 0px;
+                        Text {
+                            text: msg.content;
+                            color: #e2e8f0;
+                            font-size: msg.role == "system" ? 12px : 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // Tool input: clipped preview (collapsed) or full scrollable (expanded)
+            if msg.is-tool-call && msg.tool-input != "" && !msg.is-expanded : Rectangle {
+                max-height: 48px;
+                clip: true;
+                vertical-stretch: 0;
+                Text {
+                    text: msg.tool-input;
+                    color: #64748b;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+            if msg.is-tool-call && msg.tool-input != "" && msg.is-expanded : Rectangle {
+                background: #0f172a;
+                border-radius: 4px;
+                max-height: 200px;
+                vertical-stretch: 0;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 8px;
+                        Text {
+                            text: msg.tool-input;
+                            color: #94a3b8;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // Action row: expand toggle + copy button
+            HorizontalLayout {
+                spacing: 8px;
+                height: 18px;
+                vertical-stretch: 0;
+
+                if msg.is-tool-call && (msg.tool-output != "" || msg.tool-input != "") : TouchArea {
+                    horizontal-stretch: 0;
+                    clicked => { toggle-expand(); }
+                    Text {
+                        text: msg.is-expanded ? "▼ Hide details" : "▶ Show details";
+                        color: #60a5fa;
+                        font-size: 11px;
+                    }
+                }
+
+                // Spacer
+                Rectangle { horizontal-stretch: 1; }
+
+                // Copy button — copies message content or tool output
+                if msg.content != "" || msg.tool-output != "" : TouchArea {
+                    horizontal-stretch: 0;
+                    width: 36px;
+                    clicked => {
+                        if msg.is-tool-call && msg.tool-output != "" {
+                            copy-text(msg.tool-output);
+                        } else {
+                            copy-text(msg.content);
+                        }
+                    }
+                    copy-ta := Text {
+                        text: "Copy";
+                        color: parent.has-hover ? #60a5fa : #475569;
+                        font-size: 11px;
+                        horizontal-alignment: right;
+                    }
+                }
+            }
+
+            // Expanded tool output (scrollable, max 300px tall)
+            if msg.is-tool-call && msg.is-expanded && msg.tool-output != "" : Rectangle {
+                background: #0f172a;
+                border-radius: 4px;
+                max-height: 300px;
+                vertical-stretch: 0;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 8px;
+                        Text {
+                            text: msg.tool-output;
+                            color: msg.tool-is-error ? #fca5a5 : #cbd5e1;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

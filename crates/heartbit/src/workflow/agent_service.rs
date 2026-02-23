@@ -79,19 +79,27 @@ impl AgentService for AgentServiceImpl {
 
         match result {
             Ok(response) => {
-                // Record success with circuit breaker
-                ctx.object_client::<CircuitBreakerObjectClient>(&self.provider_name)
+                // Record success with circuit breaker (best-effort — don't mask LLM result)
+                if let Err(e) = ctx
+                    .object_client::<CircuitBreakerObjectClient>(&self.provider_name)
                     .record_success()
                     .call()
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to record success with circuit breaker");
+                }
                 Ok(Json(LlmCallResponse::from(response)))
             }
             Err(e) => {
-                // Record failure with circuit breaker
-                ctx.object_client::<CircuitBreakerObjectClient>(&self.provider_name)
+                // Record failure with circuit breaker (best-effort — don't mask LLM error)
+                if let Err(cb_err) = ctx
+                    .object_client::<CircuitBreakerObjectClient>(&self.provider_name)
                     .record_failure()
                     .call()
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(error = %cb_err, "failed to record failure with circuit breaker");
+                }
                 Err(TerminalError::new(format!("LLM call failed: {e}")).into())
             }
         }

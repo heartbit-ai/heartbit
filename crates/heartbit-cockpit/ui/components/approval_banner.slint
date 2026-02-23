@@ -1,0 +1,51 @@
+import { HorizontalBox, Button } from "std-widgets.slint";
+
+export component ApprovalBanner inherits Rectangle {
+    in property <string> tool-names;
+    in property <bool> visible-approval;
+    in property <string> agent-name;
+    // 0=Allow, 1=Deny, 2=AlwaysAllow, 3=AlwaysDeny
+    callback respond(int);
+
+    visible: visible-approval;
+    background: #78350f;
+    border-radius: 8px;
+    vertical-stretch: 0;
+
+    HorizontalBox {
+        padding: 10px;
+        spacing: 8px;
+        alignment: center;
+
+        Text {
+            text: agent-name != "" ?
+                "Agent '" + agent-name + "' requests: " + tool-names :
+                "Approve tools: " + tool-names + "?";
+            color: #fbbf24;
+            font-size: 13px;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+
+        Button {
+            text: "Allow";
+            clicked => { respond(0); }
+        }
+
+        Button {
+            text: "Deny";
+            clicked => { respond(1); }
+        }
+
+        Button {
+            text: "Always Allow";
+            clicked => { respond(2); }
+        }
+
+        Button {
+            text: "Always Deny";
+            clicked => { respond(3); }
+        }
+    }
+}

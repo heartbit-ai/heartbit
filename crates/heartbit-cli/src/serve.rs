@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use restate_sdk::prelude::*;
 
 use heartbit::DynLlmProvider;
-use heartbit::llm::anthropic::AnthropicProvider;
-use heartbit::llm::openrouter::OpenRouterProvider;
+use heartbit::HeartbitConfig;
 use heartbit::tool::Tool;
 use heartbit::workflow::agent_service::{AgentService, AgentServiceImpl};
 use heartbit::workflow::agent_workflow::{AgentWorkflow, AgentWorkflowImpl};
@@ -16,7 +15,6 @@ use heartbit::workflow::budget::{TokenBudgetObject, TokenBudgetObjectImpl};
 use heartbit::workflow::circuit_breaker::{CircuitBreakerObject, CircuitBreakerObjectImpl};
 use heartbit::workflow::orchestrator_workflow::{OrchestratorWorkflow, OrchestratorWorkflowImpl};
 use heartbit::workflow::scheduler::{SchedulerObject, SchedulerObjectImpl};
-use heartbit::{HeartbitConfig, RetryConfig, RetryingProvider};
 
 /// Start the Restate-compatible HTTP worker.
 ///
@@ -26,21 +24,7 @@ pub async fn run_worker(config_path: &Path, bind: &str) -> Result<()> {
     let config = HeartbitConfig::from_file(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
-    // Set up tracing: OTel-aware if configured, simple fmt otherwise
-    if let Some(telemetry) = &config.telemetry {
-        setup_telemetry(&telemetry.otlp_endpoint, &telemetry.service_name)?;
-        tracing::info!(
-            "OpenTelemetry configured, exporting to {}",
-            telemetry.otlp_endpoint
-        );
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-    }
+    crate::init_tracing_from_config(&config)?;
 
     let provider = build_provider(&config)?;
     let tools = build_tools(&config).await?;
@@ -74,7 +58,7 @@ pub async fn run_worker(config_path: &Path, bind: &str) -> Result<()> {
     Ok(())
 }
 
-fn setup_telemetry(otlp_endpoint: &str, service_name: &str) -> Result<()> {
+pub(crate) fn setup_telemetry(otlp_endpoint: &str, service_name: &str) -> Result<()> {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::WithExportConfig;
     use tracing_subscriber::layer::SubscriberExt;
@@ -111,39 +95,9 @@ fn setup_telemetry(otlp_endpoint: &str, service_name: &str) -> Result<()> {
 }
 
 fn build_provider(config: &HeartbitConfig) -> Result<Arc<dyn DynLlmProvider>> {
-    let retry = config.provider.retry.as_ref().map(RetryConfig::from);
-
-    match config.provider.name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = if config.provider.prompt_caching {
-                AnthropicProvider::with_prompt_caching(api_key, &config.provider.model)
-            } else {
-                AnthropicProvider::new(api_key, &config.provider.model)
-            };
-            match retry {
-                Some(rc) => Ok(Arc::new(RetryingProvider::new(base, rc))),
-                None => Ok(Arc::new(base)),
-            }
-        }
-        "openrouter" => {
-            if config.provider.prompt_caching {
-                tracing::warn!(
-                    "prompt_caching is only effective with the 'anthropic' provider; \
-                     ignored for 'openrouter'"
-                );
-            }
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let base = OpenRouterProvider::new(api_key, &config.provider.model);
-            match retry {
-                Some(rc) => Ok(Arc::new(RetryingProvider::new(base, rc))),
-                None => Ok(Arc::new(base)),
-            }
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
-    }
+    // Reuse the shared provider construction from main.rs.
+    // BoxedProvider implements DynLlmProvider, so the Arc coercion is safe.
+    Ok(crate::build_provider_from_config(config, None)?)
 }
 
 async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn Tool>>> {
@@ -151,9 +105,14 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
 
     // Connect to MCP servers declared in agent configs
     for agent in &config.agents {
-        for server_url in &agent.mcp_servers {
-            tracing::info!(agent = %agent.name, url = %server_url, "connecting to MCP server");
-            match heartbit::McpClient::connect(server_url).await {
+        for entry in &agent.mcp_servers {
+            let url = entry.url();
+            tracing::info!(agent = %agent.name, url = %url, "connecting to MCP server");
+            let result = match entry.auth_header() {
+                Some(auth) => heartbit::McpClient::connect_with_auth(url, auth).await,
+                None => heartbit::McpClient::connect(url).await,
+            };
+            match result {
                 Ok(client) => {
                     for tool in client.into_tools() {
                         let def = tool.definition();
@@ -161,7 +120,7 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
                             tracing::warn!(
                                 tool = %def.name,
                                 agent = %agent.name,
-                                url = %server_url,
+                                url = %url,
                                 "duplicate MCP tool name, keeping first registration"
                             );
                             continue;
@@ -173,9 +132,47 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
                 Err(e) => {
                     tracing::warn!(
                         agent = %agent.name,
-                        url = %server_url,
+                        url = %url,
                         error = %e,
                         "failed to connect to MCP server, skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    // Connect to A2A agents declared in agent configs
+    for agent in &config.agents {
+        for entry in &agent.a2a_agents {
+            let url = entry.url();
+            tracing::info!(agent = %agent.name, url = %url, "discovering A2A agent");
+            let result = match entry.auth_header() {
+                Some(auth) => heartbit::A2aClient::connect_with_auth(url, auth).await,
+                None => heartbit::A2aClient::connect(url).await,
+            };
+            match result {
+                Ok(client) => {
+                    for tool in client.into_tools() {
+                        let def = tool.definition();
+                        if tools.contains_key(&def.name) {
+                            tracing::warn!(
+                                tool = %def.name,
+                                agent = %agent.name,
+                                url = %url,
+                                "duplicate A2A tool name, keeping first registration"
+                            );
+                            continue;
+                        }
+                        tracing::info!(tool = %def.name, "registered A2A agent tool");
+                        tools.insert(def.name.clone(), tool);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent.name,
+                        url = %url,
+                        error = %e,
+                        "failed to discover A2A agent, skipping"
                     );
                 }
             }
@@ -193,6 +190,14 @@ async fn build_tools(config: &HeartbitConfig) -> Result<HashMap<String, Arc<dyn 
             "memory configuration detected but memory tools are not yet supported \
              in the Restate worker path; use standalone mode ('heartbit run') for \
              memory-enabled agents"
+        );
+    }
+
+    if config.knowledge.is_some() {
+        tracing::warn!(
+            "knowledge configuration detected but knowledge tools are not yet supported \
+             in the Restate worker path; use standalone mode ('heartbit run') for \
+             knowledge-enabled agents"
         );
     }
 

@@ -2,3 +2,5 @@
 *.swp
 *.swo
 .env
+gateway/.ag_*.log
+docker-compose.override.yml

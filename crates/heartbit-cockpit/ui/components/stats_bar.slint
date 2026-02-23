@@ -1,0 +1,65 @@
+import { VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export struct TokenStats {
+    total-input: string,
+    total-output: string,
+    reasoning: string,
+    cache-created: string,
+    cache-read: string,
+    total-cost: string,
+    tool-calls: string,
+    last-latency: string,
+    model: string,
+    elapsed: string,
+}
+
+component StatRow inherits HorizontalBox {
+    in property <string> label;
+    in property <string> value;
+    spacing: 4px;
+
+    Text {
+        text: label;
+        color: #94a3b8;
+        font-size: 11px;
+        horizontal-alignment: left;
+        horizontal-stretch: 1;
+    }
+    Text {
+        text: value;
+        color: #e2e8f0;
+        font-size: 11px;
+        horizontal-alignment: right;
+    }
+}
+
+export component StatsBar inherits Rectangle {
+    in property <TokenStats> stats;
+
+    background: #1e293b;
+    border-radius: 8px;
+    vertical-stretch: 0;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 6px;
+
+        Text {
+            text: "Statistics";
+            color: #e2e8f0;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        if stats.elapsed != "" : StatRow { label: "Elapsed"; value: stats.elapsed; }
+        if stats.model != "" : StatRow { label: "Model"; value: stats.model; }
+        StatRow { label: "Input tokens"; value: stats.total-input; }
+        StatRow { label: "Output tokens"; value: stats.total-output; }
+        if stats.reasoning != "0" : StatRow { label: "Reasoning"; value: stats.reasoning; }
+        if stats.cache-created != "0" : StatRow { label: "Cache created"; value: stats.cache-created; }
+        if stats.cache-read != "0" : StatRow { label: "Cache read"; value: stats.cache-read; }
+        if stats.tool-calls != "0" : StatRow { label: "Tool calls"; value: stats.tool-calls; }
+        if stats.last-latency != "" : StatRow { label: "Last latency"; value: stats.last-latency; }
+        StatRow { label: "Est. cost"; value: stats.total-cost; }
+    }
+}

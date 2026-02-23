@@ -1,3 +1,5 @@
+pub mod a2a;
+pub mod builtins;
 pub mod mcp;
 
 use std::future::Future;

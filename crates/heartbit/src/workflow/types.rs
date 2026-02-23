@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::llm::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason, TokenUsage,
-    ToolChoice, ToolDefinition,
+    CompletionRequest, CompletionResponse, ContentBlock, Message, ReasoningEffort, StopReason,
+    TokenUsage, ToolChoice, ToolDefinition,
 };
 
 // Re-export DynLlmProvider from its canonical location in `llm` module.
@@ -22,6 +22,9 @@ pub struct LlmCallRequest {
     /// Optional tool choice constraint for structured output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Optional reasoning/thinking effort level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Response from an LLM call activity.
@@ -72,6 +75,7 @@ impl LlmCallRequest {
             tools: self.tools.clone(),
             max_tokens: self.max_tokens,
             tool_choice: self.tool_choice.clone(),
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -126,6 +130,9 @@ pub struct AgentTask {
     /// `__respond__` tool is injected and the agent returns structured JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<serde_json::Value>,
+    /// Optional reasoning/thinking effort level for LLM calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Result from an agent workflow.
@@ -161,6 +168,9 @@ pub struct OrchestratorTask {
     /// When true, child agent workflows require human approval before tool execution.
     #[serde(default)]
     pub approval_required: bool,
+    /// Optional reasoning/thinking effort level for the orchestrator LLM calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Agent definition within an orchestrator task.
@@ -192,6 +202,9 @@ pub struct AgentDef {
     /// returns structured JSON conforming to the schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<serde_json::Value>,
+    /// Optional reasoning/thinking effort level for LLM calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Result from the orchestrator workflow.
@@ -228,6 +241,7 @@ mod tests {
             tools: vec![],
             max_tokens: 4096,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: LlmCallRequest = serde_json::from_str(&json).unwrap();
@@ -276,6 +290,7 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let cr = req.to_completion_request();
         assert_eq!(cr.system, "sys");
@@ -292,6 +307,7 @@ mod tests {
             tool_choice: Some(ToolChoice::Tool {
                 name: "search".into(),
             }),
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: LlmCallRequest = serde_json::from_str(&json).unwrap();
@@ -319,9 +335,55 @@ mod tests {
             tools: vec![],
             max_tokens: 2048,
             tool_choice: Some(ToolChoice::Any),
+            reasoning_effort: None,
         };
         let cr = req.to_completion_request();
         assert_eq!(cr.tool_choice, Some(ToolChoice::Any));
+    }
+
+    #[test]
+    fn llm_call_request_reasoning_effort_roundtrips() {
+        let req = LlmCallRequest {
+            system: "sys".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 4096,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: LlmCallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reasoning_effort, Some(ReasoningEffort::High));
+        let cr = parsed.to_completion_request();
+        assert_eq!(cr.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn llm_call_request_reasoning_effort_defaults_to_none() {
+        let json = r#"{"system":"sys","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[],"max_tokens":2048}"#;
+        let parsed: LlmCallRequest = serde_json::from_str(json).unwrap();
+        assert!(parsed.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn agent_task_reasoning_effort_roundtrips() {
+        let task = AgentTask {
+            input: "test".into(),
+            system_prompt: "sys".into(),
+            tool_defs: vec![],
+            max_turns: 5,
+            max_tokens: 4096,
+            approval_required: false,
+            context_window_tokens: None,
+            summarize_threshold: None,
+            tool_timeout_seconds: None,
+            max_tool_output_bytes: None,
+            response_schema: None,
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let parsed: AgentTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reasoning_effort, Some(ReasoningEffort::Medium));
     }
 
     #[test]
@@ -403,6 +465,7 @@ mod tests {
             tool_timeout_seconds: None,
             max_tool_output_bytes: None,
             response_schema: None,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -455,10 +518,12 @@ mod tests {
                 max_turns: None,
                 max_tokens: None,
                 response_schema: None,
+                reasoning_effort: None,
             }],
             max_turns: 10,
             max_tokens: 8192,
             approval_required: true,
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: OrchestratorTask = serde_json::from_str(&json).unwrap();
@@ -538,6 +603,7 @@ mod tests {
             tool_timeout_seconds: None,
             max_tool_output_bytes: None,
             response_schema: Some(schema.clone()),
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: AgentTask = serde_json::from_str(&json).unwrap();
@@ -567,6 +633,7 @@ mod tests {
             max_turns: None,
             max_tokens: None,
             response_schema: Some(schema.clone()),
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&def).unwrap();
         let parsed: AgentDef = serde_json::from_str(&json).unwrap();

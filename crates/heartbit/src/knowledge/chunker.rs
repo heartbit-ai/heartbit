@@ -1,6 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use super::{Chunk, DocumentSource};
 
 /// Configuration for text chunking.
@@ -22,11 +19,24 @@ impl Default for ChunkConfig {
 }
 
 /// Generate a deterministic chunk ID from source URI and chunk index.
+///
+/// Uses a simple FNV-1a hash for stability across process restarts and
+/// Rust versions (unlike `DefaultHasher` which uses randomized SipHash).
 fn chunk_id(uri: &str, index: usize) -> String {
-    let mut hasher = DefaultHasher::new();
-    uri.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = fnv1a_hash(uri.as_bytes());
     format!("{hash:016x}-{index}")
+}
+
+/// FNV-1a 64-bit hash — deterministic across all platforms and runs.
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Split text into overlapping chunks, respecting paragraph boundaries.

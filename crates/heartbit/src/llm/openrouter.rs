@@ -8,8 +8,8 @@ use crate::error::Error;
 use crate::llm::LlmProvider;
 use crate::llm::anthropic::SseParser;
 use crate::llm::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason, TokenUsage, ToolChoice,
-    ToolDefinition,
+    CompletionRequest, CompletionResponse, ContentBlock, ReasoningEffort, Role, StopReason,
+    TokenUsage, ToolChoice, ToolDefinition,
 };
 
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -35,6 +35,10 @@ impl OpenRouterProvider {
 }
 
 impl LlmProvider for OpenRouterProvider {
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
         let body = build_openai_request(&self.model, &request)?;
 
@@ -235,6 +239,17 @@ fn build_openai_request(
         body["tool_choice"] = tool_choice_to_openai(tc);
     }
 
+    // Add reasoning/thinking parameter for models that support it (e.g., Qwen3)
+    if let Some(effort) = request.reasoning_effort {
+        let effort_str = match effort {
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::None => "none",
+        };
+        body["reasoning"] = serde_json::json!({"effort": effort_str});
+    }
+
     Ok(body)
 }
 
@@ -308,11 +323,13 @@ struct OpenAiUsage {
     cache_creation_input_tokens: u32,
     #[serde(default)]
     cache_read_input_tokens: u32,
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
     let choice = api.choices.into_iter().next().ok_or_else(|| Error::Api {
-        status: 0,
+        status: 502,
         message: "empty choices array in response".into(),
     })?;
 
@@ -373,6 +390,7 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
         output_tokens: u.completion_tokens,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
         cache_read_input_tokens: u.cache_read_input_tokens,
+        reasoning_tokens: u.reasoning_tokens,
     });
 
     Ok(CompletionResponse {
@@ -528,6 +546,16 @@ where
         });
     }
 
+    // Guard: if the stream completed without any content and no finish_reason
+    // was ever received, the upstream likely returned empty choices in all chunks.
+    // Return a retryable error (matching the non-streaming path).
+    if content.is_empty() && finish_reason.is_none() {
+        return Err(Error::Api {
+            status: 502,
+            message: "empty choices in all streaming chunks".into(),
+        });
+    }
+
     let has_tool_calls = content
         .iter()
         .any(|c| matches!(c, ContentBlock::ToolUse { .. }));
@@ -614,6 +642,7 @@ fn process_openai_event(
             output_tokens: u.completion_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
+            reasoning_tokens: u.reasoning_tokens,
         };
     }
 }
@@ -634,6 +663,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("anthropic/claude-sonnet-4", &request).unwrap();
@@ -654,6 +684,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -675,6 +706,7 @@ mod tests {
             }],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -707,6 +739,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -731,6 +764,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -831,6 +865,11 @@ mod tests {
 
         let err = into_completion_response(api).unwrap_err();
         assert!(err.to_string().contains("empty choices"));
+        // Must be retryable (status 502 = bad gateway from upstream model)
+        match &err {
+            Error::Api { status, .. } => assert_eq!(*status, 502),
+            other => panic!("expected Error::Api, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -914,6 +953,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -963,6 +1003,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body = build_openai_request("model", &request).unwrap();
@@ -988,6 +1029,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
         let body = build_openai_request("model", &request).unwrap();
         assert!(body.get("tool_choice").is_none());
@@ -1001,6 +1043,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Auto),
+            reasoning_effort: None,
         };
         let body = build_openai_request("model", &request).unwrap();
         assert_eq!(body["tool_choice"], "auto");
@@ -1014,6 +1057,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: Some(ToolChoice::Any),
+            reasoning_effort: None,
         };
         let body = build_openai_request("model", &request).unwrap();
         // OpenAI uses "required" for "must call a tool"
@@ -1030,10 +1074,75 @@ mod tests {
             tool_choice: Some(ToolChoice::Tool {
                 name: "search".into(),
             }),
+            reasoning_effort: None,
         };
         let body = build_openai_request("model", &request).unwrap();
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["function"]["name"], "search");
+    }
+
+    #[test]
+    fn build_request_reasoning_effort_included() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::Medium),
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn build_request_reasoning_effort_high() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn build_request_no_reasoning_effort_omits_field() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_openai_request("model", &request).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn parse_response_reasoning_tokens() {
+        let api = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 50,
+                completion_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_tokens: 25,
+            }),
+        };
+        let response = into_completion_response(api).unwrap();
+        assert_eq!(response.usage.reasoning_tokens, 25);
     }
 
     // --- Roundtrip test: request → response → request ---
@@ -1053,6 +1162,7 @@ mod tests {
             }],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body1 = build_openai_request("model", &request1).unwrap();
@@ -1091,6 +1201,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            reasoning_effort: None,
         };
 
         let body2 = build_openai_request("model", &request2).unwrap();
@@ -1240,6 +1351,7 @@ mod tests {
                 completion_tokens: 20,
                 cache_creation_input_tokens: 80,
                 cache_read_input_tokens: 60,
+                reasoning_tokens: 0,
             }),
         };
 
@@ -1265,6 +1377,7 @@ mod tests {
                 completion_tokens: 10,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                reasoning_tokens: 0,
             }),
         };
 
@@ -1305,5 +1418,33 @@ mod tests {
 
         let response = parse_openai_stream(stream, on_text).await.unwrap();
         assert_eq!(response.text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn stream_empty_choices_returns_retryable_error() {
+        // All chunks have empty choices — should produce a 502 error, not a silent empty response
+        let sse = make_sse_data(&[
+            r#"{"choices":[]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let err = parse_openai_stream(stream, on_text).await.unwrap_err();
+        assert!(
+            err.to_string().contains("empty choices"),
+            "expected empty choices error, got: {err}"
+        );
+        match &err {
+            Error::Api { status, .. } => assert_eq!(*status, 502),
+            other => panic!("expected Error::Api, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_name_returns_configured_model() {
+        let provider = OpenRouterProvider::new("key", "anthropic/claude-3-opus");
+        assert_eq!(provider.model_name(), Some("anthropic/claude-3-opus"));
     }
 }

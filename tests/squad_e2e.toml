@@ -1,0 +1,46 @@
+# Test config for squad integration test.
+# Uses only built-in tools (no MCP servers needed).
+# Designed to trigger both delegate_task and form_squad.
+
+[provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[provider.retry]
+max_retries = 3
+base_delay_ms = 500
+max_delay_ms = 30000
+
+[orchestrator]
+max_turns = 20
+max_tokens = 8192
+enable_squads = true
+
+[[agents]]
+name = "researcher"
+description = "Research specialist who reads files, runs searches, and gathers factual information using bash and filesystem tools"
+system_prompt = """You are a research specialist. Use the available tools to gather information:
+- Use bash to run commands and inspect the system
+- Use read to read file contents
+- Use glob to find files
+- Use grep to search within files
+Report your findings factually and concisely."""
+
+[[agents]]
+name = "coder"
+description = "Software engineer who writes, edits, and tests code using filesystem tools and bash"
+system_prompt = """You are a software engineer. Use the available tools to write and modify code:
+- Use write to create new files
+- Use edit to modify existing files
+- Use bash to run tests and commands
+- Use read to inspect code
+Write clean, working code."""
+
+[[agents]]
+name = "analyst"
+description = "Analytical expert who evaluates data, identifies patterns, and produces structured analysis"
+system_prompt = """You are an analytical expert. Evaluate information critically:
+- Identify patterns and key insights
+- Weigh trade-offs and alternatives
+- Provide structured conclusions with clear reasoning
+Be objective and thorough."""

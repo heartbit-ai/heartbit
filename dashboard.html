@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Heartbit Daemon Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; padding: 16px; }
+  h1 { color: #58a6ff; font-size: 18px; margin-bottom: 12px; }
+  h2 { color: #8b949e; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; border-bottom: 1px solid #21262d; padding-bottom: 4px; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
+  .card.healthy { border-left: 3px solid #3fb950; }
+  .card.unhealthy { border-left: 3px solid #f85149; }
+  .card.pending { border-left: 3px solid #d29922; }
+
+  .stat { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .stat-label { color: #8b949e; font-size: 11px; }
+  .stat-value { color: #f0f6fc; font-size: 16px; font-weight: bold; }
+  .stat-value.green { color: #3fb950; }
+  .stat-value.red { color: #f85149; }
+  .stat-value.yellow { color: #d29922; }
+  .stat-value.blue { color: #58a6ff; }
+
+  .events-log { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; height: 360px; overflow-y: auto; padding: 8px; font-size: 11px; line-height: 1.6; }
+  .events-log .event { padding: 2px 0; border-bottom: 1px solid #21262d; }
+  .events-log .ts { color: #484f58; }
+  .events-log .type { font-weight: bold; }
+  .events-log .type.run_started { color: #58a6ff; }
+  .events-log .type.turn_started { color: #8b949e; }
+  .events-log .type.llm_response { color: #a371f7; }
+  .events-log .type.tool_call_started { color: #d29922; }
+  .events-log .type.tool_call_completed { color: #3fb950; }
+  .events-log .type.run_completed { color: #3fb950; }
+  .events-log .type.run_failed { color: #f85149; }
+  .events-log .type.sub_agents_dispatched { color: #79c0ff; }
+  .events-log .type.sub_agent_completed { color: #56d364; }
+  .events-log .detail { color: #8b949e; margin-left: 8px; }
+
+  .tasks-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .tasks-table th { color: #8b949e; text-align: left; padding: 4px 8px; border-bottom: 1px solid #30363d; font-weight: normal; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+  .tasks-table td { padding: 4px 8px; border-bottom: 1px solid #21262d; }
+  .tasks-table .state-running { color: #58a6ff; }
+  .tasks-table .state-completed { color: #3fb950; }
+  .tasks-table .state-failed { color: #f85149; }
+  .tasks-table .state-pending { color: #d29922; }
+
+  .metrics-raw { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; max-height: 200px; overflow-y: auto; padding: 8px; font-size: 10px; line-height: 1.5; color: #8b949e; white-space: pre; }
+
+  #connection-status { position: fixed; top: 8px; right: 16px; font-size: 11px; padding: 4px 8px; border-radius: 4px; }
+  #connection-status.connected { background: #0d1117; color: #3fb950; border: 1px solid #3fb950; }
+  #connection-status.disconnected { background: #0d1117; color: #f85149; border: 1px solid #f85149; }
+
+  .submit-bar { display: flex; gap: 8px; margin-bottom: 16px; }
+  .submit-bar input { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; color: #c9d1d9; font-family: inherit; font-size: 13px; }
+  .submit-bar input:focus { outline: none; border-color: #58a6ff; }
+  .submit-bar button { background: #238636; border: none; border-radius: 6px; color: white; padding: 8px 16px; cursor: pointer; font-family: inherit; font-size: 13px; }
+  .submit-bar button:hover { background: #2ea043; }
+</style>
+</head>
+<body>
+
+<h1>&#x2764; Heartbit Daemon Dashboard</h1>
+<div id="connection-status" class="disconnected">disconnected</div>
+
+<div class="submit-bar">
+  <input id="task-input" type="text" placeholder="Submit a task to the daemon..." />
+  <button onclick="submitTask()">Submit</button>
+</div>
+
+<div class="grid">
+  <div class="card" id="health-card">
+    <h2>Health</h2>
+    <div class="stat"><span class="stat-label">Status</span><span class="stat-value" id="health-status">--</span></div>
+    <div class="stat"><span class="stat-label">Uptime</span><span class="stat-value" id="health-uptime">--</span></div>
+    <div class="stat"><span class="stat-label">Kafka</span><span class="stat-value" id="health-kafka">--</span></div>
+  </div>
+  <div class="card">
+    <h2>Tasks</h2>
+    <div class="stat"><span class="stat-label">Submitted</span><span class="stat-value blue" id="m-submitted">0</span></div>
+    <div class="stat"><span class="stat-label">Active</span><span class="stat-value yellow" id="m-active">0</span></div>
+    <div class="stat"><span class="stat-label">Completed</span><span class="stat-value green" id="m-completed">0</span></div>
+    <div class="stat"><span class="stat-label">Failed</span><span class="stat-value red" id="m-failed">0</span></div>
+  </div>
+  <div class="card">
+    <h2>LLM</h2>
+    <div class="stat"><span class="stat-label">Calls</span><span class="stat-value" id="m-llm-calls">0</span></div>
+    <div class="stat"><span class="stat-label">Input tokens</span><span class="stat-value" id="m-llm-input">0</span></div>
+    <div class="stat"><span class="stat-label">Output tokens</span><span class="stat-value" id="m-llm-output">0</span></div>
+    <div class="stat"><span class="stat-label">Cost (USD)</span><span class="stat-value green" id="m-llm-cost">$0.00</span></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h2>Tools</h2>
+    <div id="tool-stats" style="font-size: 11px; color: #8b949e;">No tool calls yet</div>
+  </div>
+  <div class="card">
+    <h2>Reliability</h2>
+    <div class="stat"><span class="stat-label">Retries</span><span class="stat-value" id="m-retries">0</span></div>
+    <div class="stat"><span class="stat-label">Doom loops</span><span class="stat-value" id="m-doom">0</span></div>
+    <div class="stat"><span class="stat-label">Compactions</span><span class="stat-value" id="m-compactions">0</span></div>
+    <div class="stat"><span class="stat-label">Guardrail denials</span><span class="stat-value" id="m-guardrails">0</span></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div>
+    <h2>Live Events</h2>
+    <div class="events-log" id="events-log"></div>
+  </div>
+  <div>
+    <h2>Tasks</h2>
+    <div style="max-height: 360px; overflow-y: auto;">
+      <table class="tasks-table" id="tasks-table">
+        <thead><tr><th>ID</th><th>State</th><th>Task</th><th>Tokens</th><th>Cost</th></tr></thead>
+        <tbody id="tasks-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = 'http://127.0.0.1:7777';
+let sseConnections = {};
+
+function fmt(n) { return n >= 1000 ? (n/1000).toFixed(1) + 'k' : String(n); }
+function fmtTime(s) { return s >= 3600 ? (s/3600).toFixed(1) + 'h' : s >= 60 ? (s/60).toFixed(0) + 'm' : s.toFixed(0) + 's'; }
+
+// --- Health polling ---
+async function pollHealth() {
+  try {
+    const [hz, rz] = await Promise.all([
+      fetch(BASE + '/healthz').then(r => r.json()).catch(() => null),
+      fetch(BASE + '/readyz').then(r => r.json()).catch(() => null),
+    ]);
+    const card = document.getElementById('health-card');
+    const status = document.getElementById('health-status');
+    const uptime = document.getElementById('health-uptime');
+    const kafka = document.getElementById('health-kafka');
+    const conn = document.getElementById('connection-status');
+
+    if (hz) {
+      status.textContent = hz.status;
+      status.className = 'stat-value ' + (hz.status === 'ok' ? 'green' : 'red');
+      uptime.textContent = fmtTime(hz.uptime_seconds || 0);
+      card.className = 'card ' + (hz.status === 'ok' ? 'healthy' : 'unhealthy');
+      conn.textContent = 'connected';
+      conn.className = 'connected';
+    } else {
+      status.textContent = 'unreachable';
+      status.className = 'stat-value red';
+      card.className = 'card unhealthy';
+      conn.textContent = 'disconnected';
+      conn.className = 'disconnected';
+    }
+    if (rz && rz.checks) {
+      const kc = rz.checks.find(c => c.name === 'kafka');
+      kafka.textContent = kc && kc.ok ? 'connected' : 'down';
+      kafka.className = 'stat-value ' + (kc && kc.ok ? 'green' : 'red');
+    }
+  } catch(e) {
+    document.getElementById('connection-status').textContent = 'disconnected';
+    document.getElementById('connection-status').className = 'disconnected';
+  }
+}
+
+// --- Metrics polling ---
+function parsePrometheus(text) {
+  const m = {};
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#') || !line.trim()) continue;
+    const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*?)(\{[^}]*\})?\s+(.+)$/);
+    if (match) {
+      const [, name, labels, val] = match;
+      const key = name + (labels || '');
+      m[key] = parseFloat(val);
+    }
+  }
+  return m;
+}
+
+async function pollMetrics() {
+  try {
+    const text = await fetch(BASE + '/metrics').then(r => r.text());
+    const m = parsePrometheus(text);
+
+    document.getElementById('m-submitted').textContent = fmt(m['heartbit_daemon_tasks_submitted_total'] || 0);
+    document.getElementById('m-active').textContent = fmt(m['heartbit_daemon_tasks_active'] || 0);
+    document.getElementById('m-completed').textContent = fmt(m['heartbit_daemon_tasks_completed_total'] || 0);
+    document.getElementById('m-failed').textContent = fmt(m['heartbit_daemon_tasks_failed_total'] || 0);
+
+    document.getElementById('m-llm-calls').textContent = fmt(m['heartbit_llm_calls_total'] || 0);
+    document.getElementById('m-llm-input').textContent = fmt(m['heartbit_llm_tokens_input_total'] || 0);
+    document.getElementById('m-llm-output').textContent = fmt(m['heartbit_llm_tokens_output_total'] || 0);
+    const cost = m['heartbit_llm_cost_usd_total'] || 0;
+    document.getElementById('m-llm-cost').textContent = '$' + cost.toFixed(4);
+
+    document.getElementById('m-retries').textContent = m['heartbit_reliability_retry_attempts_total'] || 0;
+    document.getElementById('m-doom').textContent = m['heartbit_reliability_doom_loops_detected_total'] || 0;
+    document.getElementById('m-compactions').textContent = m['heartbit_reliability_context_compactions_total'] || 0;
+    document.getElementById('m-guardrails').textContent = m['heartbit_reliability_guardrail_denials_total'] || 0;
+
+    // Tool stats
+    const tools = {};
+    for (const [k, v] of Object.entries(m)) {
+      const tm = k.match(/heartbit_tool_calls_total\{tool_name="([^"]+)"\}/);
+      if (tm) tools[tm[1]] = (tools[tm[1]] || 0) + v;
+    }
+    const toolDiv = document.getElementById('tool-stats');
+    if (Object.keys(tools).length > 0) {
+      toolDiv.innerHTML = Object.entries(tools)
+        .sort((a,b) => b[1] - a[1])
+        .map(([name, count]) => `<div class="stat"><span class="stat-label">${name}</span><span class="stat-value">${count}</span></div>`)
+        .join('');
+    }
+  } catch(e) { /* daemon not reachable */ }
+}
+
+// --- Tasks polling ---
+async function pollTasks() {
+  try {
+    const data = await fetch(BASE + '/tasks?limit=20').then(r => r.json());
+    const tbody = document.getElementById('tasks-body');
+    tbody.innerHTML = '';
+    for (const t of (data.tasks || data || [])) {
+      const stateClass = 'state-' + (t.state || 'pending').toLowerCase();
+      const shortId = (t.id || '').substring(0, 8);
+      const shortTask = (t.task || '').substring(0, 60) + ((t.task||'').length > 60 ? '...' : '');
+      const tokens = (t.tokens_used?.input_tokens || 0) + (t.tokens_used?.output_tokens || 0);
+      const cost = t.estimated_cost_usd ? '$' + t.estimated_cost_usd.toFixed(4) : '-';
+      const row = document.createElement('tr');
+      row.innerHTML = `<td>${shortId}</td><td class="${stateClass}">${t.state}</td><td>${shortTask}</td><td>${fmt(tokens)}</td><td>${cost}</td>`;
+      row.style.cursor = 'pointer';
+      row.onclick = () => subscribeToTask(t.id);
+      tbody.appendChild(row);
+    }
+  } catch(e) {}
+}
+
+// --- SSE event subscription ---
+function subscribeToTask(taskId) {
+  if (sseConnections[taskId]) return; // already subscribed
+  const evSource = new EventSource(BASE + '/tasks/' + taskId + '/events');
+  sseConnections[taskId] = evSource;
+
+  evSource.onmessage = (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      addEvent(taskId, evt);
+    } catch(err) {
+      addEventRaw(taskId, e.data);
+    }
+  };
+  evSource.onerror = () => {
+    evSource.close();
+    delete sseConnections[taskId];
+  };
+  addEventRaw(taskId, `subscribed to task ${taskId.substring(0,8)}`);
+}
+
+function addEvent(taskId, evt) {
+  const log = document.getElementById('events-log');
+  const ts = new Date().toLocaleTimeString();
+  const shortId = taskId.substring(0, 8);
+  const type = evt.type || 'unknown';
+  const typeClass = type.toLowerCase().replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+
+  let detail = '';
+  if (type === 'LlmResponse' || type === 'llm_response') {
+    detail = `${evt.latency_ms||'?'}ms | model: ${evt.model||'?'}`;
+    if (evt.text) detail += ` | "${evt.text.substring(0,80)}..."`;
+  } else if (type === 'ToolCallStarted' || type === 'tool_call_started') {
+    detail = `${evt.tool_name||'?'}`;
+  } else if (type === 'ToolCallCompleted' || type === 'tool_call_completed') {
+    detail = `${evt.tool_name||'?'} ${evt.output ? '('+evt.output.substring(0,60)+'...)' : ''}`;
+  } else if (type === 'TurnStarted' || type === 'turn_started') {
+    detail = `turn ${evt.turn||'?'}/${evt.max_turns||'?'}`;
+  } else if (type === 'RunCompleted' || type === 'run_completed') {
+    detail = `tokens: ${evt.input_tokens||0}+${evt.output_tokens||0}`;
+  } else if (type === 'RunFailed' || type === 'run_failed') {
+    detail = evt.error || '';
+  }
+
+  const div = document.createElement('div');
+  div.className = 'event';
+  div.innerHTML = `<span class="ts">${ts}</span> <span class="type ${typeClass}">[${shortId}] ${type}</span><span class="detail">${detail}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function addEventRaw(taskId, text) {
+  const log = document.getElementById('events-log');
+  const ts = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.className = 'event';
+  div.innerHTML = `<span class="ts">${ts}</span> <span class="detail">${text}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// --- Submit task ---
+async function submitTask() {
+  const input = document.getElementById('task-input');
+  const task = input.value.trim();
+  if (!task) return;
+  input.value = '';
+
+  try {
+    const resp = await fetch(BASE + '/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task }),
+    });
+    const data = await resp.json();
+    if (data.id) {
+      addEventRaw('', `submitted task ${data.id.substring(0,8)}: "${task.substring(0,60)}"`);
+      subscribeToTask(data.id);
+    }
+  } catch(e) {
+    addEventRaw('', `submit failed: ${e.message}`);
+  }
+}
+
+document.getElementById('task-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitTask();
+});
+
+// --- Polling loops ---
+setInterval(pollHealth, 3000);
+setInterval(pollMetrics, 2000);
+setInterval(pollTasks, 3000);
+pollHealth();
+pollMetrics();
+pollTasks();
+</script>
+</body>
+</html>

@@ -78,6 +78,24 @@ impl Memory for NamespacedMemory {
         let prefixed = self.prefix_id(id);
         Box::pin(async move { self.inner.forget(&prefixed).await })
     }
+
+    fn add_link(
+        &self,
+        id: &str,
+        related_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        let prefixed_id = self.prefix_id(id);
+        let prefixed_related = self.prefix_id(related_id);
+        Box::pin(async move { self.inner.add_link(&prefixed_id, &prefixed_related).await })
+    }
+
+    fn prune(
+        &self,
+        min_strength: f64,
+        min_age: chrono::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+        Box::pin(async move { self.inner.prune(min_strength, min_age).await })
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +103,8 @@ mod tests {
     use super::*;
     use crate::memory::in_memory::InMemoryStore;
     use chrono::Utc;
+
+    use super::super::MemoryType;
 
     fn make_entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -97,6 +117,13 @@ mod tests {
             last_accessed: Utc::now(),
             access_count: 0,
             importance: 5,
+            memory_type: MemoryType::default(),
+            keywords: vec![],
+            summary: None,
+            strength: 1.0,
+            related_ids: vec![],
+            source_ids: vec![],
+            embedding: None,
         }
     }
 
@@ -257,6 +284,56 @@ mod tests {
         ns.store(make_entry("m1", "to delete")).await.unwrap();
         assert!(ns.forget("m1").await.unwrap());
 
+        let results = ns
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_link_delegates_with_prefix() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "agent_a");
+
+        ns.store(make_entry("m1", "first")).await.unwrap();
+        ns.store(make_entry("m2", "second")).await.unwrap();
+
+        // Link via namespaced (unprefixed IDs)
+        ns.add_link("m1", "m2").await.unwrap();
+
+        // Verify in raw store that prefixed IDs are linked
+        let all = inner
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let m1 = all.iter().find(|e| e.id == "agent_a:m1").unwrap();
+        let m2 = all.iter().find(|e| e.id == "agent_a:m2").unwrap();
+        assert!(m1.related_ids.contains(&"agent_a:m2".to_string()));
+        assert!(m2.related_ids.contains(&"agent_a:m1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn prune_delegates_to_inner() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "agent_a");
+
+        let mut entry = make_entry("m1", "weak memory");
+        entry.strength = 0.01;
+        entry.created_at = Utc::now() - chrono::Duration::hours(48);
+        entry.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        ns.store(entry).await.unwrap();
+
+        let pruned = ns.prune(0.1, chrono::Duration::hours(1)).await.unwrap();
+        assert_eq!(pruned, 1);
+
+        // Verify entry is gone
         let results = ns
             .recall(MemoryQuery {
                 limit: 10,

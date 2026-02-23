@@ -1,0 +1,174 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# Agentgateway config for heartbit — example template.
+#
+# 1. Copy this file:  cp config.example.yaml config.yaml
+# 2. Copy env file:   cp .env.example .env
+# 3. Fill in API keys in .env
+# 4. Start:           ./start.sh
+#
+# Heartbit connects to: http://localhost:3000/mcp
+# All tool names are auto-prefixed by target name (e.g., github_create_issue).
+#
+# Environment variables are expanded via shellexpand before YAML parsing,
+# so ${VAR} syntax works everywhere in this file.
+
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - policies:
+        cors:
+          allowOrigins: ["*"]
+          allowHeaders: [mcp-protocol-version, content-type, cache-control]
+          exposeHeaders: [Mcp-Session-Id]
+      backends:
+      - mcp:
+          targets:
+          # ── Tier 1: Local Stdio (no API keys needed) ─────────────────
+          #
+          # These run as child processes via npx. No configuration required.
+
+          - name: filesystem
+            # Secure file operations (read, write, list, search).
+            # Change /workspace to your project root.
+            stdio:
+              cmd: npx
+              args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+          - name: git
+            # Git repo operations (status, diff, log, commit, branch).
+            # Requires: uvx (pip install uv) — official Python MCP server.
+            stdio:
+              cmd: uvx
+              args: ["mcp-server-git", "--repository", "/workspace"]
+
+          - name: fetch
+            # Fetch URLs and convert HTML to markdown.
+            stdio:
+              cmd: npx
+              args: ["-y", "@modelcontextprotocol/server-fetch"]
+
+          - name: memory
+            # Persistent knowledge graph for cross-session memory.
+            stdio:
+              cmd: npx
+              args: ["-y", "@modelcontextprotocol/server-memory"]
+
+          - name: thinking
+            # Structured multi-step reasoning (sequential thinking).
+            stdio:
+              cmd: npx
+              args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+          - name: playwright
+            # Browser automation (navigate, click, screenshot, fill forms).
+            # Launches a local Chromium instance.
+            stdio:
+              cmd: npx
+              args: ["-y", "@playwright/mcp"]
+
+          - name: context7
+            # Up-to-date library documentation and code examples.
+            # resolve-library-id → query-docs workflow.
+            stdio:
+              cmd: npx
+              args: ["-y", "@upstash/context7-mcp"]
+
+          # ── Tier 2: Stdio with API Keys ──────────────────────────────
+          #
+          # These need API keys set in gateway/.env (see .env.example).
+
+          - name: github
+            # GitHub operations (issues, PRs, repos, code search).
+            # Requires: GITHUB_TOKEN in .env
+            stdio:
+              cmd: github-mcp-server
+              args: ["stdio"]
+              env:
+                GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN:-}"
+
+          - name: brave-search
+            # Web search via Brave Search API.
+            # Requires: BRAVE_API_KEY in .env
+            stdio:
+              cmd: npx
+              args: ["-y", "@brave/brave-search-mcp-server"]
+              env:
+                BRAVE_API_KEY: "${BRAVE_API_KEY:-}"
+
+          - name: terraform
+            # Terraform plan, apply, state operations.
+            # Optional: TF_TOKEN for Terraform Cloud.
+            stdio:
+              cmd: terraform-mcp-server
+              args: ["stdio"]
+
+          - name: notion
+            # Notion pages and databases.
+            # Requires: NOTION_TOKEN in .env
+            stdio:
+              cmd: npx
+              args: ["-y", "@notionhq/notion-mcp-server"]
+              env:
+                OPENAPI_MCP_HEADERS: '{"Authorization":"Bearer ${NOTION_TOKEN:-}"}'
+
+          # ── Tier 3: Remote HTTP (enterprise cloud services) ──────────
+          #
+          # These connect to hosted MCP endpoints. Auth is typically
+          # handled via OAuth or bearer tokens on the remote side.
+
+          - name: sentry
+            # Error tracking and performance monitoring.
+            # Auth: OAuth flow or SENTRY_AUTH_TOKEN header.
+            sse:
+              host: https://mcp.sentry.dev/sse
+
+          - name: atlassian
+            # Jira + Confluence operations.
+            # Auth: OAuth flow via Atlassian.
+            sse:
+              host: https://mcp.atlassian.com/v1/sse
+
+          # ── Optional: Uncomment and configure as needed ──────────────
+
+          # - name: kubernetes
+          #   # K8s cluster operations. Uses ~/.kube/config.
+          #   stdio:
+          #     cmd: kubernetes-mcp-server
+
+          # - name: slack
+          #   # Slack messaging. Requires OAuth setup.
+          #   sse:
+          #     host: https://your-slack-mcp-endpoint/sse
+
+          # - name: linear
+          #   # Linear issue tracking.
+          #   sse:
+          #     host: https://your-linear-mcp-endpoint/sse
+
+          # - name: datadog
+          #   # Datadog monitoring and APM.
+          #   sse:
+          #     host: https://your-datadog-mcp-endpoint/sse
+
+          # ── Cloud Infrastructure (uncomment per provider) ────────────
+
+          # - name: aws
+          #   # AWS Cloud Control API. Needs AWS credentials.
+          #   stdio:
+          #     cmd: aws-mcp-server
+
+          # - name: gcp
+          #   # Google Cloud. Needs gcloud auth.
+          #   stdio:
+          #     cmd: gcp-mcp-server
+
+          # - name: azure
+          #   # Azure. Needs Azure CLI auth.
+          #   stdio:
+          #     cmd: azure-mcp-server
+
+          # Tool name prefixing: "always" prepends target name to every
+          # tool (e.g., github_create_issue, playwright_navigate).
+          prefixMode: always
