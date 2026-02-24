@@ -870,6 +870,7 @@ pub async fn run_daemon(
                 workspace_dir,
                 todo_store, // persistent daemon todo store
                 Some(&tools),
+                None, // no multimodal content in Kafka consumer path
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1036,6 +1037,7 @@ pub async fn run_daemon(
             let bridge = input.bridge;
             let task_text = input.task_text;
             let user_ns = input.user_namespace;
+            let attachments = input.attachments;
             let m = tg_metrics.clone();
             let todo_store = tg_todo_store.clone();
             let workspace_dir = tg_workspace.clone();
@@ -1078,6 +1080,28 @@ pub async fn run_daemon(
                     t.started_at = Some(chrono::Utc::now());
                 });
 
+                // Convert media attachments to content blocks for multimodal support.
+                // Captions are already included in task_text via the adapter's text
+                // variable, so we don't duplicate them here.
+                let content_blocks = if attachments.is_empty() {
+                    None
+                } else {
+                    use base64::Engine;
+                    let mut blocks = Vec::new();
+                    if !task_text.is_empty() {
+                        blocks.push(heartbit::ContentBlock::Text {
+                            text: task_text.clone(),
+                        });
+                    }
+                    for att in &attachments {
+                        blocks.push(heartbit::ContentBlock::Image {
+                            media_type: att.media_type.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(&att.data),
+                        });
+                    }
+                    Some(blocks)
+                };
+
                 let start = Instant::now();
                 let result = crate::build_orchestrator_from_config(
                     provider,
@@ -1093,6 +1117,7 @@ pub async fn run_daemon(
                     workspace_dir,
                     todo_store,
                     Some(&tools),
+                    content_blocks,
                 )
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1809,6 +1834,7 @@ async fn run_interactive_task(
             workspace_dir,
             daemon_todo_store,
             pre_loaded_tools,
+            None, // no multimodal content in interactive sessions
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }

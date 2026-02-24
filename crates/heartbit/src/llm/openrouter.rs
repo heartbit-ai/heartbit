@@ -130,12 +130,25 @@ fn build_openai_request(
     for msg in &request.messages {
         match msg.role {
             Role::User => {
-                // Collect text blocks into a single message to avoid consecutive user messages
+                let has_images = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+
                 let mut text_parts = Vec::new();
+                let mut image_parts = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.as_str());
+                        }
+                        ContentBlock::Image { media_type, data } => {
+                            image_parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{media_type};base64,{data}")
+                                }
+                            }));
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,
@@ -158,7 +171,24 @@ fn build_openai_request(
                         _ => {}
                     }
                 }
-                if !text_parts.is_empty() {
+
+                if has_images {
+                    // Use array content format when images are present (OpenAI vision)
+                    let mut content_parts: Vec<serde_json::Value> = Vec::new();
+                    if !text_parts.is_empty() {
+                        content_parts.push(serde_json::json!({
+                            "type": "text",
+                            "text": text_parts.join("\n\n"),
+                        }));
+                    }
+                    content_parts.extend(image_parts);
+                    if !content_parts.is_empty() {
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": content_parts,
+                        }));
+                    }
+                } else if !text_parts.is_empty() {
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": text_parts.join("\n\n"),
@@ -1019,6 +1049,87 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call-1");
         assert_eq!(messages[3]["role"], "user");
         assert_eq!(messages[3]["content"], "Here are the results:");
+    }
+
+    #[test]
+    fn build_request_user_with_image_uses_array_content() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "What is this?".into(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/jpeg".into(),
+                        data: "base64data".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        // Content should be an array (not a string) when images are present
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,base64data"
+        );
+    }
+
+    #[test]
+    fn build_request_text_only_still_uses_string_content() {
+        // Text-only messages should still use string content (backward-compatible)
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // String content, not array
+        assert!(messages[0]["content"].is_string());
+        assert_eq!(messages[0]["content"], "hello");
+    }
+
+    #[test]
+    fn build_request_image_only_no_text() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "abc123".into(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        // Only image, no text part
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
     }
 
     // --- tool_choice tests ---

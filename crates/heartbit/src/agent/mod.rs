@@ -327,13 +327,49 @@ impl<P: LlmProvider> AgentRunner<P> {
     }
 
     pub async fn execute(&self, task: &str) -> Result<AgentOutput, Error> {
+        let ctx = AgentContext::new(&self.system_prompt, task, self.tool_defs.clone())
+            .with_max_turns(self.max_turns)
+            .with_max_tokens(self.max_tokens)
+            .with_context_strategy(self.context_strategy.clone())
+            .with_reasoning_effort(self.reasoning_effort);
+        self.execute_with_context(ctx, task).await
+    }
+
+    /// Execute with pre-built multimodal content blocks (e.g., text + images).
+    pub async fn execute_with_content(
+        &self,
+        content: Vec<ContentBlock>,
+    ) -> Result<AgentOutput, Error> {
+        // Extract text for event/span descriptions
+        let task_summary: String = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let ctx = AgentContext::from_content(&self.system_prompt, content, self.tool_defs.clone())
+            .with_max_turns(self.max_turns)
+            .with_max_tokens(self.max_tokens)
+            .with_context_strategy(self.context_strategy.clone())
+            .with_reasoning_effort(self.reasoning_effort);
+        self.execute_with_context(ctx, &task_summary).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: AgentContext,
+        task_description: &str,
+    ) -> Result<AgentOutput, Error> {
         // Shared accumulator so we can retrieve partial usage even when the
         // future is dropped by tokio::time::timeout.
         let usage_acc = Arc::new(std::sync::Mutex::new(TokenUsage::default()));
         let fut = {
             let acc = usage_acc.clone();
             async move {
-                match self.execute_inner(task, acc).await {
+                match self.execute_inner(ctx, task_description, acc).await {
                     Ok(output) => Ok(output),
                     Err((e, usage)) => Err(e.with_partial_usage(usage)),
                 }
@@ -373,6 +409,7 @@ impl<P: LlmProvider> AgentRunner<P> {
 
     async fn execute_inner(
         &self,
+        initial_ctx: AgentContext,
         task: &str,
         usage_acc: Arc<std::sync::Mutex<TokenUsage>>,
     ) -> Result<AgentOutput, (Error, TokenUsage)> {
@@ -398,7 +435,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                 truncate_for_event(task, EVENT_MAX_PAYLOAD_BYTES).as_str(),
             );
         } else if mode.includes_metrics() {
-            run_span.record("task", &task[..task.len().min(256)]);
+            let cut = crate::tool::builtins::floor_char_boundary(task, 256);
+            run_span.record("task", &task[..cut]);
         }
 
         let result = async {
@@ -407,11 +445,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                 task: task.to_string(),
             });
 
-            let mut ctx = AgentContext::new(&self.system_prompt, task, self.tool_defs.clone())
-                .with_max_turns(self.max_turns)
-                .with_max_tokens(self.max_tokens)
-                .with_context_strategy(self.context_strategy.clone())
-                .with_reasoning_effort(self.reasoning_effort);
+            let mut ctx = initial_ctx;
 
             let mut total_tool_calls = 0usize;
             let mut total_usage = TokenUsage::default();
@@ -721,6 +755,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                     role: crate::llm::types::Role::Assistant,
                     content: response.content,
                 });
+
+                // Evict base64 images from older messages to prevent context bloat.
+                ctx.evict_images();
 
                 // Check for structured output: if the LLM called the synthetic `__respond__` tool,
                 // validate its input against the schema, then extract as structured result.

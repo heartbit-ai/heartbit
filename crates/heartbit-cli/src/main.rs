@@ -646,6 +646,7 @@ async fn run_from_config(
         workspace_dir,
         None, // no daemon todo store in CLI run mode
         None, // no pre-loaded tools in CLI run mode
+        None, // no multimodal content in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -728,6 +729,7 @@ pub(crate) async fn build_orchestrator_from_config(
     workspace_dir: Option<std::path::PathBuf>,
     daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
     pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn Tool>>>>,
+    content_blocks: Option<Vec<heartbit::ContentBlock>>,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
 
@@ -774,6 +776,31 @@ pub(crate) async fn build_orchestrator_from_config(
                 story_id = sid,
                 prior_memories = prior.len(),
                 "loaded story context into task"
+            );
+        }
+    }
+
+    // When story context was prepended and content_blocks exist, update the
+    // text block so the LLM sees the enriched context alongside images.
+    let mut content_blocks = content_blocks;
+    if task_text != task
+        && let Some(ref mut blocks) = content_blocks
+    {
+        // Replace the first Text block with enriched task_text, or prepend one
+        let updated = blocks.iter_mut().any(|b| {
+            if let heartbit::ContentBlock::Text { text } = b {
+                *text = task_text.clone();
+                true
+            } else {
+                false
+            }
+        });
+        if !updated {
+            blocks.insert(
+                0,
+                heartbit::ContentBlock::Text {
+                    text: task_text.clone(),
+                },
             );
         }
     }
@@ -845,6 +872,17 @@ pub(crate) async fn build_orchestrator_from_config(
                 (is_single, idx)
             }
         }
+    };
+
+    // Force single-agent routing when multimodal content is present.
+    // The orchestrator only supports text — images would be silently lost.
+    let (route_to_single, selected_agent_index) = if content_blocks.is_some() && !route_to_single {
+        tracing::info!(
+            "forcing single-agent routing: multimodal content not supported by orchestrator"
+        );
+        (true, Some(0))
+    } else {
+        (route_to_single, selected_agent_index)
     };
 
     if route_to_single {
@@ -1076,7 +1114,12 @@ pub(crate) async fn build_orchestrator_from_config(
         );
 
         let runner = rb.build()?;
-        match runner.execute(&task_text).await {
+        let run_result = if let Some(blocks) = content_blocks {
+            runner.execute_with_content(blocks).await
+        } else {
+            runner.execute(&task_text).await
+        };
+        match run_result {
             Ok(output) => return Ok(output),
             Err(err) => {
                 // Tier 3: escalation — if enabled and the failure warrants it,

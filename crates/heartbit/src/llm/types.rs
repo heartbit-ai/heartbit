@@ -34,6 +34,10 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    Image {
+        media_type: String,
+        data: String,
+    },
 }
 
 /// A message in a conversation.
@@ -55,6 +59,13 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    pub fn user_with_content(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
         }
     }
 
@@ -342,6 +353,43 @@ mod tests {
         };
 
         assert_eq!(response.text(), "Hello world");
+    }
+
+    #[test]
+    fn content_block_image_roundtrip() {
+        let block = ContentBlock::Image {
+            media_type: "image/jpeg".into(),
+            data: "base64data".into(),
+        };
+        let json_str = serde_json::to_string(&block).unwrap();
+        let roundtripped: ContentBlock = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(block, roundtripped);
+
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "image");
+        assert_eq!(json["media_type"], "image/jpeg");
+        assert_eq!(json["data"], "base64data");
+    }
+
+    #[test]
+    fn message_user_with_content_creates_mixed_blocks() {
+        let msg = Message::user_with_content(vec![
+            ContentBlock::Text {
+                text: "describe this image".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "base64data".into(),
+            },
+        ]);
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.content.len(), 2);
+        assert!(
+            matches!(&msg.content[0], ContentBlock::Text { text } if text == "describe this image")
+        );
+        assert!(
+            matches!(&msg.content[1], ContentBlock::Image { media_type, .. } if media_type == "image/png")
+        );
     }
 
     #[test]

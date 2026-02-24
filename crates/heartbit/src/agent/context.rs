@@ -43,6 +43,48 @@ impl AgentContext {
         }
     }
 
+    /// Create a context from pre-built content blocks (for multimodal messages).
+    pub(crate) fn from_content(
+        system: impl Into<String>,
+        content: Vec<ContentBlock>,
+        tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
+            system: system.into(),
+            messages: vec![Message {
+                role: Role::User,
+                content,
+            }],
+            tools,
+            max_turns: 10,
+            max_tokens: 4096,
+            current_turn: 0,
+            context_strategy: ContextStrategy::Unlimited,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Replace `ContentBlock::Image` blocks in all messages except the last user
+    /// message with a text placeholder. Prevents large base64 payloads from
+    /// accumulating in the conversation history.
+    pub(crate) fn evict_images(&mut self) {
+        // Find the index of the last user message
+        let last_user_idx = self.messages.iter().rposition(|m| m.role == Role::User);
+
+        for (i, msg) in self.messages.iter_mut().enumerate() {
+            if Some(i) == last_user_idx {
+                continue;
+            }
+            for block in &mut msg.content {
+                if matches!(block, ContentBlock::Image { .. }) {
+                    *block = ContentBlock::Text {
+                        text: "[image previously sent]".into(),
+                    };
+                }
+            }
+        }
+    }
+
     pub(crate) fn with_max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
@@ -251,6 +293,9 @@ pub(crate) fn messages_to_text(messages: &[Message]) -> String {
                 }
                 ContentBlock::ToolResult { content, .. } => {
                     format!("[Tool result: {content}]")
+                }
+                ContentBlock::Image { media_type, .. } => {
+                    format!("[Image: {media_type}]")
                 }
             })
             .collect::<Vec<String>>()
@@ -687,6 +732,78 @@ mod tests {
             .join("");
         assert!(first_text.contains("original task"));
         assert!(first_text.contains("summary"));
+    }
+
+    #[test]
+    fn from_content_creates_multimodal_message() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "describe this".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/jpeg".into(),
+                data: "base64data".into(),
+            },
+        ];
+        let ctx = AgentContext::from_content("system", content, vec![]);
+        let req = ctx.to_request();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].content.len(), 2);
+        assert!(matches!(
+            &req.messages[0].content[1],
+            ContentBlock::Image { .. }
+        ));
+    }
+
+    #[test]
+    fn evict_images_replaces_old_images_with_placeholder() {
+        let mut ctx = AgentContext::from_content(
+            "sys",
+            vec![
+                ContentBlock::Text {
+                    text: "describe this".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/jpeg".into(),
+                    data: "data1".into(),
+                },
+            ],
+            vec![],
+        );
+        ctx.add_assistant_message(Message::assistant("It shows a cat."));
+        // Add a second user message with another image (this is now the "last" user)
+        ctx.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "data2".into(),
+            }],
+        });
+
+        ctx.evict_images();
+
+        // First user message's image should be replaced
+        assert_eq!(
+            ctx.messages[0].content[1],
+            ContentBlock::Text {
+                text: "[image previously sent]".into()
+            }
+        );
+        // Last user message's image should be preserved
+        assert!(matches!(
+            &ctx.messages[2].content[0],
+            ContentBlock::Image { media_type, .. } if media_type == "image/png"
+        ));
+    }
+
+    #[test]
+    fn evict_images_noop_when_no_images() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_assistant_message(Message::assistant("reply"));
+        let msg_count = ctx.message_count();
+        ctx.evict_images();
+        assert_eq!(ctx.message_count(), msg_count);
     }
 
     #[test]

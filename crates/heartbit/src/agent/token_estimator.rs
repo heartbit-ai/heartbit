@@ -27,6 +27,12 @@ pub(crate) fn estimate_message_tokens(message: &Message) -> u32 {
                 content,
                 ..
             } => estimate_tokens(tool_use_id) + estimate_tokens(content),
+            ContentBlock::Image { data, .. } => {
+                // Base64 images are ~1.37x the raw size. Anthropic vision bills
+                // based on image dimensions, but for context window estimation
+                // we approximate: each 750 base64 chars ≈ 1 token.
+                (data.len() as u32) / 750 + 85 // 85 = overhead for the image block structure
+            }
         })
         .sum();
 

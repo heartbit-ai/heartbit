@@ -122,6 +122,56 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// Convert our internal `Message` list to Anthropic's wire format.
+///
+/// `ContentBlock::Image` maps to Anthropic's `source.type = "base64"` image block.
+/// Other blocks serialize naturally to the expected Anthropic JSON shape.
+fn messages_to_anthropic(messages: &[crate::llm::types::Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|msg| {
+            let content: Vec<serde_json::Value> = msg
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    }),
+                    ContentBlock::ToolUse { id, name, input } => serde_json::json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": input,
+                    }),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error,
+                    }),
+                    ContentBlock::Image { media_type, data } => serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        }
+                    }),
+                })
+                .collect();
+            serde_json::json!({
+                "role": msg.role,
+                "content": content,
+            })
+        })
+        .collect()
+}
+
 fn build_request_body(
     model: &str,
     request: &CompletionRequest,
@@ -130,7 +180,7 @@ fn build_request_body(
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": request.max_tokens,
-        "messages": request.messages,
+        "messages": messages_to_anthropic(&request.messages),
     });
 
     if !request.system.is_empty() {
@@ -1458,6 +1508,94 @@ mod tests {
     fn model_name_returns_configured_model() {
         let provider = AnthropicProvider::new("key", "claude-3-5-sonnet-20241022");
         assert_eq!(provider.model_name(), Some("claude-3-5-sonnet-20241022"));
+    }
+
+    #[test]
+    fn messages_to_anthropic_image_block() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "What is in this image?".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/jpeg".into(),
+                    data: "base64data".into(),
+                },
+            ],
+        }];
+        let result = messages_to_anthropic(&messages);
+        assert_eq!(result.len(), 1);
+        let content = result[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is in this image?");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], "base64data");
+    }
+
+    #[test]
+    fn messages_to_anthropic_tool_use_and_result() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({"q": "test"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "found it".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let result = messages_to_anthropic(&messages);
+        assert_eq!(result.len(), 2);
+        // Assistant tool_use
+        assert_eq!(result[0]["content"][0]["type"], "tool_use");
+        assert_eq!(result[0]["content"][0]["id"], "call-1");
+        assert_eq!(result[0]["content"][0]["name"], "search");
+        // User tool_result
+        assert_eq!(result[1]["content"][0]["type"], "tool_result");
+        assert_eq!(result[1]["content"][0]["tool_use_id"], "call-1");
+    }
+
+    #[test]
+    fn build_request_body_with_image_produces_correct_wire_format() {
+        let request = CompletionRequest {
+            system: "You describe images.".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "Describe this.".into(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: "iVBOR...".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let body = build_request_body("claude-sonnet-4-20250514", &request, false).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
     }
 
     #[test]

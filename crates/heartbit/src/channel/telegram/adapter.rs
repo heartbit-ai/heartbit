@@ -15,8 +15,17 @@ use super::access::AccessControl;
 use super::bridge::TelegramBridge;
 use super::config::TelegramConfig;
 use super::delivery::{RateLimiter, chunk_message, markdown_to_telegram_html};
+use super::extract;
 use super::keyboard::{CallbackAction, parse_callback_data};
 use super::router::{ChatSessionMap, IdleSession};
+use super::transcribe::transcribe_audio;
+
+/// A media attachment from Telegram (photo, voice, document).
+pub struct MediaAttachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+    pub caption: Option<String>,
+}
 
 /// Callback type for running an agent task with bridge callbacks.
 ///
@@ -36,6 +45,8 @@ pub struct RunTaskInput {
     /// User-specific namespace prefix (e.g. `"tg:12345"`). Passed as `story_id`
     /// to `build_orchestrator_from_config` for per-user memory isolation.
     pub user_namespace: Option<String>,
+    /// Media attachments (photos, documents). Empty for text-only messages.
+    pub attachments: Vec<MediaAttachment>,
 }
 
 /// Callback type for memory consolidation on idle sessions.
@@ -151,8 +162,14 @@ impl TelegramAdapter {
         }
     }
 
-    /// Handle an incoming text message from a Telegram DM.
-    async fn handle_dm(&self, chat_id: i64, user_id: i64, text: &str) -> Result<(), Error> {
+    /// Handle an incoming message from a Telegram DM (text, photos, documents).
+    async fn handle_dm(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        text: &str,
+        attachments: Vec<MediaAttachment>,
+    ) -> Result<(), Error> {
         // Access check
         if !self.access.check_dm(user_id) {
             tracing::debug!(user_id, "telegram DM denied by access policy");
@@ -230,6 +247,7 @@ impl TelegramAdapter {
             bridge: Arc::clone(&bridge),
             memory,
             user_namespace: Some(format!("tg:{user_id}")),
+            attachments,
         };
         let result = (self.run_task)(input).await;
 
@@ -399,6 +417,24 @@ impl TelegramAdapter {
     }
 }
 
+/// Download a file from Telegram by its file ID.
+async fn download_telegram_file(
+    bot: &Bot,
+    file_id: &teloxide::types::FileId,
+) -> Result<Vec<u8>, Error> {
+    use teloxide::net::Download;
+
+    let file = bot
+        .get_file(file_id.clone())
+        .await
+        .map_err(|e| Error::Telegram(format!("get_file failed: {e}")))?;
+    let mut buf = Vec::new();
+    bot.download_file(&file.path, &mut buf)
+        .await
+        .map_err(|e| Error::Telegram(format!("download failed: {e}")))?;
+    Ok(buf)
+}
+
 /// Teloxide handler for incoming messages.
 async fn handle_message(
     msg: Message,
@@ -409,14 +445,120 @@ async fn handle_message(
         return Ok(());
     }
 
-    let text = match msg.text() {
-        Some(t) if !t.is_empty() => t,
-        _ => return Ok(()),
-    };
+    let mut text = msg.text().or(msg.caption()).unwrap_or("").to_string();
+    let mut attachments = Vec::new();
+
+    // Photo handling: download the largest photo size
+    if let Some(photos) = msg.photo()
+        && let Some(largest) = photos.last()
+    {
+        match download_telegram_file(&adapter.bot, &largest.file.id).await {
+            Ok(data) => attachments.push(MediaAttachment {
+                media_type: "image/jpeg".into(),
+                data,
+                caption: msg.caption().map(String::from),
+            }),
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram photo"),
+        }
+    }
+
+    // Document handling
+    if let Some(doc) = msg.document() {
+        match download_telegram_file(&adapter.bot, &doc.file.id).await {
+            Ok(data) => {
+                let mime = doc
+                    .mime_type
+                    .as_ref()
+                    .map(|m| m.as_ref())
+                    .unwrap_or("application/octet-stream");
+
+                if mime.starts_with("image/") {
+                    // Treat image documents as image attachments (Phase 1 path)
+                    attachments.push(MediaAttachment {
+                        media_type: mime.into(),
+                        data,
+                        caption: msg.caption().map(String::from),
+                    });
+                } else if let Some(text_content) = extract::extract_text(&data, mime) {
+                    // Inject extracted text as context with filename
+                    let fname = doc.file_name.as_deref().unwrap_or("unnamed");
+                    let prefix = format!("[Document: {fname}]\n{text_content}");
+                    text = if text.is_empty() {
+                        prefix
+                    } else {
+                        format!("{text}\n\n{prefix}")
+                    };
+                } else {
+                    tracing::debug!(mime, "unsupported document type, skipping");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram document"),
+        }
+    }
+
+    // Voice message handling: transcribe via Whisper API
+    let transcription_key = adapter
+        .config
+        .transcription_api_key
+        .clone()
+        .or_else(|| std::env::var("HEARTBIT_TRANSCRIPTION_API_KEY").ok());
+    if let Some(voice) = msg.voice()
+        && let Some(ref api_key) = transcription_key
+    {
+        match download_telegram_file(&adapter.bot, &voice.file.id).await {
+            Ok(data) => {
+                let client = reqwest::Client::new();
+                match transcribe_audio(&client, &data, api_key).await {
+                    Ok(transcript) => {
+                        let prefix = format!("[Voice message] {transcript}");
+                        text = if text.is_empty() {
+                            prefix
+                        } else {
+                            format!("{text}\n\n{prefix}")
+                        };
+                    }
+                    Err(e) => tracing::warn!(error = %e, "voice transcription failed"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram voice"),
+        }
+    }
+
+    // Audio file handling: transcribe via Whisper API (same as voice)
+    if let Some(audio) = msg.audio()
+        && let Some(ref api_key) = transcription_key
+    {
+        match download_telegram_file(&adapter.bot, &audio.file.id).await {
+            Ok(data) => {
+                let client = reqwest::Client::new();
+                match transcribe_audio(&client, &data, api_key).await {
+                    Ok(transcript) => {
+                        let title = audio.title.as_deref().unwrap_or("audio");
+                        let prefix = format!("[Audio: {title}] {transcript}");
+                        text = if text.is_empty() {
+                            prefix
+                        } else {
+                            format!("{text}\n\n{prefix}")
+                        };
+                    }
+                    Err(e) => tracing::warn!(error = %e, "audio transcription failed"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram audio"),
+        }
+    }
+
+    // Skip if nothing to process
+    if text.is_empty() && attachments.is_empty() {
+        return Ok(());
+    }
 
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or_default();
 
-    if let Err(e) = adapter.handle_dm(msg.chat.id.0, user_id, text).await {
+    if let Err(e) = adapter
+        .handle_dm(msg.chat.id.0, user_id, &text, attachments)
+        .await
+    {
         tracing::error!(
             chat_id = msg.chat.id.0,
             error = %e,
