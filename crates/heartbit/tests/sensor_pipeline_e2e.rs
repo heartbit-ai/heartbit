@@ -286,6 +286,7 @@ impl heartbit::llm::DynLlmProvider for MockSlmProvider {
                 }],
                 stop_reason: heartbit::llm::types::StopReason::EndTurn,
                 usage: heartbit::llm::types::TokenUsage::default(),
+                model: None,
             })
         })
     }

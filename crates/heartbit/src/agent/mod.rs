@@ -10,6 +10,7 @@ pub mod permission;
 pub mod pruner;
 pub mod routing;
 pub(crate) mod token_estimator;
+pub mod tool_filter;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -168,6 +169,9 @@ pub struct AgentRunner<P: LlmProvider> {
     /// When set, limits the number of tool definitions sent per LLM turn.
     /// Tools are selected based on recent usage and keyword relevance.
     max_tools_per_turn: Option<usize>,
+    /// When set, pre-filters tool definitions based on query classification
+    /// before dynamic selection. Reduces token usage for simple queries.
+    tool_profile: Option<tool_filter::ToolProfile>,
     /// Maximum number of consecutive identical tool-call turns before the
     /// agent receives an error result instead of executing the tools. `None`
     /// disables doom loop detection.
@@ -225,6 +229,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             enable_reflection: false,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
+            tool_profile: None,
             max_identical_tool_calls: None,
             permission_rules: permission::PermissionRuleset::default(),
             instruction_text: None,
@@ -351,8 +356,12 @@ impl<P: LlmProvider> AgentRunner<P> {
             let consolidation_usage = self.consolidate_memory_on_exit().await;
             if consolidation_usage.input_tokens > 0 || consolidation_usage.output_tokens > 0 {
                 output.tokens_used += consolidation_usage;
-                // Recalculate cost estimate with consolidation tokens included.
-                output.estimated_cost_usd = self.estimate_cost(&output.tokens_used);
+                // Add consolidation cost increment (uses static model name — consolidation
+                // always runs through the same provider, not cascade tiers).
+                if let Some(consolidation_cost) = self.estimate_cost(&consolidation_usage) {
+                    output.estimated_cost_usd =
+                        Some(output.estimated_cost_usd.unwrap_or(0.0) + consolidation_cost);
+                }
             }
 
             // Prune weak/old memories.
@@ -406,6 +415,8 @@ impl<P: LlmProvider> AgentRunner<P> {
 
             let mut total_tool_calls = 0usize;
             let mut total_usage = TokenUsage::default();
+            // Accumulate cost per-turn for accurate cascade pricing.
+            let mut total_cost: f64 = 0.0;
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
@@ -460,6 +471,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                 } else {
                     ctx.to_request()
                 };
+
+                // Tool profile pre-filter: narrow tool set based on query classification
+                if let Some(profile) = self.tool_profile {
+                    request.tools = tool_filter::filter_tools(&request.tools, profile);
+                }
 
                 // Dynamic tool selection: filter tools when there are too many
                 if let Some(max_tools) = self.max_tools_per_turn {
@@ -527,7 +543,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                 if mode.includes_metrics() {
                     llm_span.record("latency_ms", llm_latency_ms);
                     llm_span.record("ttft_ms", time_to_first_token_ms);
-                    if let Some(model) = self.provider.model_name() {
+                    if let Ok(ref r) = llm_result {
+                        if let Some(ref model) = r.model {
+                            llm_span.record(observability::GEN_AI_REQUEST_MODEL, model.as_str());
+                        } else if let Some(model) = self.provider.model_name() {
+                            llm_span.record(observability::GEN_AI_REQUEST_MODEL, model);
+                        }
+                    } else if let Some(model) = self.provider.model_name() {
                         llm_span.record(observability::GEN_AI_REQUEST_MODEL, model);
                     }
                     if let Ok(ref r) = llm_result {
@@ -571,6 +593,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                             match self.generate_summary(&ctx).await {
                                 Ok((Some(summary), summary_usage)) => {
                                     total_usage += summary_usage;
+                                    if let Some(c) = self.estimate_cost(&summary_usage) {
+                                        total_cost += c;
+                                    }
                                     *usage_acc.lock().expect("usage lock poisoned") = total_usage;
                                     self.flush_to_memory_before_compaction(&ctx, 4).await;
                                     ctx.inject_summary(summary, 4);
@@ -626,6 +651,17 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 };
                 total_usage += response.usage;
+                // Per-turn cost: prefer response.model (cascade) over static model_name()
+                let turn_model = response
+                    .model
+                    .as_deref()
+                    .or_else(|| self.provider.model_name());
+                if let Some(model) = turn_model
+                    && let Some(cost) =
+                        crate::llm::pricing::estimate_cost(model, &response.usage)
+                {
+                    total_cost += cost;
+                }
                 // Update shared accumulator so RunTimeout can retrieve partial usage
                 *usage_acc.lock().expect("usage lock poisoned") = total_usage;
 
@@ -639,7 +675,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                     tool_call_count: tool_calls.len(),
                     text: truncate_for_event(&response.text(), EVENT_MAX_PAYLOAD_BYTES),
                     latency_ms: llm_latency_ms,
-                    model: self.provider.model_name().map(|s| s.to_string()),
+                    model: response
+                        .model
+                        .clone()
+                        .or_else(|| self.provider.model_name().map(|s| s.to_string())),
                     time_to_first_token_ms,
                 });
 
@@ -730,7 +769,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                         tool_calls_made: total_tool_calls,
                         tokens_used: total_usage,
                         structured: Some(structured),
-                        estimated_cost_usd: self.estimate_cost(&total_usage),
+                        estimated_cost_usd: if total_cost > 0.0 {
+                            Some(total_cost)
+                        } else {
+                            self.estimate_cost(&total_usage)
+                        },
                     });
                 }
 
@@ -784,7 +827,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                         tool_calls_made: total_tool_calls,
                         tokens_used: total_usage,
                         structured: None,
-                        estimated_cost_usd: self.estimate_cost(&total_usage),
+                        estimated_cost_usd: if total_cost > 0.0 {
+                            Some(total_cost)
+                        } else {
+                            self.estimate_cost(&total_usage)
+                        },
                     });
                 }
 
@@ -1344,12 +1391,15 @@ impl<P: LlmProvider> AgentRunner<P> {
             .filter(|w| w.len() > 2)
             .collect();
 
-        // Partition into recently-used (always included) and candidates
+        // Partition into pinned (always included) and candidates.
+        // Pinned: recently-used tools + __respond__ (structured output must never be dropped).
         let mut selected: Vec<ToolDefinition> = Vec::new();
         let mut candidates: Vec<(ToolDefinition, usize)> = Vec::new();
 
         for tool in all_tools {
-            if recently_used.contains(&tool.name) {
+            if recently_used.contains(&tool.name)
+                || tool.name == crate::llm::types::RESPOND_TOOL_NAME
+            {
                 selected.push(tool.clone());
             } else {
                 // Score by keyword overlap with tool name + description
@@ -1640,6 +1690,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     enable_reflection: bool,
     tool_output_compression_threshold: Option<usize>,
     max_tools_per_turn: Option<usize>,
+    tool_profile: Option<tool_filter::ToolProfile>,
     max_identical_tool_calls: Option<u32>,
     permission_rules: permission::PermissionRuleset,
     /// Instruction file contents to prepend to the system prompt.
@@ -1834,6 +1885,16 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
 
     pub fn max_tools_per_turn(mut self, max: usize) -> Self {
         self.max_tools_per_turn = Some(max);
+        self
+    }
+
+    /// Set a static tool profile to pre-filter tools before dynamic selection.
+    ///
+    /// When set, tool definitions are filtered to the profile's subset before
+    /// `max_tools_per_turn` scoring applies. Use `ToolProfile::Conversational`
+    /// for chat-only agents, `Standard` for code agents, `Full` for all tools.
+    pub fn tool_profile(mut self, profile: tool_filter::ToolProfile) -> Self {
+        self.tool_profile = Some(profile);
         self
     }
 
@@ -2046,9 +2107,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             ));
         }
 
-        // Append resourcefulness guidelines — ensures agents always verify
-        // capabilities and explore solutions before claiming they cannot.
-        system_prompt.push_str(RESOURCEFULNESS_GUIDELINES);
+        // Append resourcefulness guidelines only when the agent has power tools
+        // (bash, write, patch, edit) that make the guidance relevant. Saves ~180
+        // tokens for conversational-only agents.
+        let has_power_tools = tool_defs
+            .iter()
+            .any(|t| matches!(t.name.as_str(), "bash" | "write" | "patch" | "edit"));
+        if has_power_tools {
+            system_prompt.push_str(RESOURCEFULNESS_GUIDELINES);
+        }
 
         Ok(AgentRunner {
             provider: self.provider,
@@ -2073,6 +2140,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             enable_reflection: self.enable_reflection,
             tool_output_compression_threshold: self.tool_output_compression_threshold,
             max_tools_per_turn: self.max_tools_per_turn,
+            tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,
             permission_rules: std::sync::RwLock::new(self.permission_rules),
             learned_permissions: self.learned_permissions,
@@ -2195,6 +2263,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2228,6 +2297,7 @@ mod tests {
                         output_tokens: 500,
                         ..Default::default()
                     },
+                    model: None,
                 })
             }
             fn model_name(&self) -> Option<&str> {
@@ -2261,6 +2331,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2291,6 +2362,7 @@ mod tests {
                     output_tokens: 10,
                     ..Default::default()
                 },
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2302,6 +2374,7 @@ mod tests {
                     output_tokens: 15,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -2330,6 +2403,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
@@ -2339,6 +2413,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2382,6 +2457,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
             // Turn 2: another tool call → exceeds max_turns
             CompletionResponse {
@@ -2398,6 +2474,7 @@ mod tests {
                     cache_read_input_tokens: 25,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
         ]));
 
@@ -2429,6 +2506,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2436,6 +2514,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2469,6 +2548,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2476,6 +2556,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2500,6 +2581,7 @@ mod tests {
             }],
             stop_reason: StopReason::MaxTokens,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2532,6 +2614,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2539,6 +2622,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2559,6 +2643,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2673,6 +2758,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -2722,6 +2808,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
         // Empty instruction text should not modify the system prompt
         let builder = AgentRunner::builder(provider)
@@ -2742,6 +2829,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2776,6 +2864,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
 
@@ -2793,6 +2882,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -2832,6 +2922,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -2859,6 +2950,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2866,6 +2958,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2902,6 +2995,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // After denial, LLM responds with text instead
             CompletionResponse {
@@ -2910,6 +3004,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2951,6 +3046,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2958,6 +3054,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3016,6 +3113,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3023,6 +3121,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3051,6 +3150,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3058,6 +3158,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3086,6 +3187,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3093,6 +3195,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3120,6 +3223,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3127,6 +3231,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3181,6 +3286,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: LLM sees validation error, responds with text
             CompletionResponse {
@@ -3189,6 +3295,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3237,6 +3344,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3244,6 +3352,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3284,6 +3393,7 @@ mod tests {
                 output_tokens: 15,
                 ..Default::default()
             },
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -3310,6 +3420,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -3341,6 +3452,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: Call __respond__ with structured output
             CompletionResponse {
@@ -3351,6 +3463,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3418,6 +3531,7 @@ mod tests {
             ],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -3452,6 +3566,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
@@ -3461,6 +3576,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3510,6 +3626,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -3517,6 +3634,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3587,6 +3705,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3631,6 +3750,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -3711,6 +3831,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3765,6 +3886,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: LLM corrects itself with valid output
             CompletionResponse {
@@ -3775,6 +3897,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3813,6 +3936,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: Corrected
             CompletionResponse {
@@ -3823,6 +3947,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3856,6 +3981,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -3902,6 +4028,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // Turn 2: tool call
             CompletionResponse {
@@ -3916,6 +4043,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // Turn 3: tool call (after this, message_count > 5, triggers summarization)
             CompletionResponse {
@@ -3930,6 +4058,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // Summary LLM call (triggered by summarize_threshold)
             CompletionResponse {
@@ -3944,6 +4073,7 @@ mod tests {
                     cache_read_input_tokens: 10,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
             // Turn 4: final text response
             CompletionResponse {
@@ -3956,6 +4086,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -4018,6 +4149,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -4100,6 +4232,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4107,6 +4240,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4175,6 +4309,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -4216,6 +4351,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -4263,6 +4399,7 @@ mod tests {
                     content: vec![ContentBlock::Text { text: "ok".into() }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -4311,6 +4448,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -4387,6 +4525,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -4477,6 +4616,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4484,6 +4624,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4557,6 +4698,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 CompletionResponse {
                     content: vec![ContentBlock::Text {
@@ -4564,6 +4706,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             tool_results_seen: Mutex::new(vec![]),
@@ -4605,6 +4748,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4612,6 +4756,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4650,6 +4795,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -4685,6 +4831,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4692,6 +4839,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4727,6 +4875,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4734,6 +4883,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4760,6 +4910,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -4767,6 +4918,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4806,6 +4958,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let on_input: Arc<OnInput> = Arc::new(|| {
@@ -4849,11 +5002,13 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text { text: "OK.".into() }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4892,6 +5047,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
 
         let runner = AgentRunner::builder(provider)
@@ -4928,6 +5084,7 @@ mod tests {
                             output_tokens: 50,
                             ..Default::default()
                         },
+                        model: None,
                     });
                 }
                 // Second call: sleep forever (simulates slow LLM)
@@ -5014,6 +5171,7 @@ mod tests {
                             output_tokens: 80,
                             ..Default::default()
                         },
+                        model: None,
                     });
                 }
                 Err(Error::Api {
@@ -5092,6 +5250,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // Turn 2: final answer
                 CompletionResponse {
@@ -5100,6 +5259,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             user_messages: Mutex::new(vec![]),
@@ -5164,6 +5324,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 CompletionResponse {
                     content: vec![ContentBlock::Text {
@@ -5171,6 +5332,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             user_messages: Mutex::new(vec![]),
@@ -5230,6 +5392,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             }]),
             user_messages: Mutex::new(vec![]),
         });
@@ -5266,6 +5429,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: final answer
             CompletionResponse {
@@ -5274,6 +5438,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -5326,6 +5491,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // Compression call response
                 CompletionResponse {
@@ -5338,6 +5504,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    model: None,
                 },
                 // Turn 2: final answer
                 CompletionResponse {
@@ -5346,6 +5513,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             call_count: Mutex::new(0),
@@ -5384,6 +5552,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -5391,6 +5560,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -5566,6 +5736,46 @@ mod tests {
     }
 
     #[test]
+    fn select_tools_preserves_respond_tool() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .build()
+            .unwrap();
+
+        let tools: Vec<ToolDefinition> = vec![
+            ToolDefinition {
+                name: "bash".into(),
+                description: "Run commands".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "read".into(),
+                description: "Read files".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "write".into(),
+                description: "Write files".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: crate::llm::types::RESPOND_TOOL_NAME.into(),
+                description: "Structured output".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+
+        // max_tools=2, no recently_used — __respond__ must still be included
+        let selected = runner.select_tools_for_turn(&tools, &[], &[], 2);
+        assert!(
+            selected.iter().any(|t| t.name == "__respond__"),
+            "__respond__ must always survive select_tools_for_turn"
+        );
+    }
+
+    #[test]
     fn levenshtein_identical_strings() {
         assert_eq!(super::levenshtein("read_file", "read_file"), 0);
     }
@@ -5646,6 +5856,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -5657,6 +5868,7 @@ mod tests {
                     output_tokens: 3,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
         let runner = AgentRunner::builder(provider)
@@ -5685,6 +5897,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -5696,6 +5909,7 @@ mod tests {
                     output_tokens: 3,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
         let runner = AgentRunner::builder(provider)
@@ -5749,6 +5963,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            model: None,
         }
     }
 
@@ -5765,6 +5980,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            model: None,
         }
     }
 
@@ -5982,6 +6198,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         };
 
         let provider = Arc::new(MockProvider::new(vec![
@@ -5995,6 +6212,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6027,6 +6245,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
@@ -6036,6 +6255,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Different input resets tracker
             CompletionResponse {
@@ -6046,6 +6266,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::ToolUse {
@@ -6055,6 +6276,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6062,6 +6284,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6093,6 +6316,7 @@ mod tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         };
 
         let provider = Arc::new(MockProvider::new(vec![
@@ -6107,6 +6331,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6160,6 +6385,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6167,6 +6393,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6207,6 +6434,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6214,6 +6442,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6248,6 +6477,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6255,6 +6485,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6310,6 +6541,7 @@ mod tests {
                 ],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6317,6 +6549,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6359,6 +6592,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -6366,6 +6600,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6400,6 +6635,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: LLM calls bash again → learned rule matches → auto-allowed
             CompletionResponse {
@@ -6410,6 +6646,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 3: done
             CompletionResponse {
@@ -6418,6 +6655,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6457,6 +6695,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: LLM calls bash again → learned Deny rule matches → auto-denied
             CompletionResponse {
@@ -6467,6 +6706,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 3: done
             CompletionResponse {
@@ -6475,6 +6715,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6512,6 +6753,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 2: bash rm → config deny matches first (before learned allow)
             CompletionResponse {
@@ -6522,6 +6764,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Turn 3: done
             CompletionResponse {
@@ -6530,6 +6773,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -6564,6 +6808,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]);
         let runner = AgentRunner::builder(Arc::new(provider))
             .name("test")
@@ -6586,15 +6831,47 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]);
         let runner = AgentRunner::builder(Arc::new(provider))
             .name("test")
             .system_prompt("base prompt")
+            .tool(Arc::new(MockTool::new("bash", "ok")))
             .build()
             .unwrap();
 
         assert!(runner.system_prompt.starts_with("base prompt"));
         assert!(runner.system_prompt.contains("Resourcefulness"));
         assert!(!runner.system_prompt.contains("workspace"));
+    }
+
+    #[test]
+    fn resourcefulness_guidelines_included_with_power_tools() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("prompt")
+            .tool(Arc::new(MockTool::new("bash", "ok")))
+            .build()
+            .unwrap();
+        assert!(
+            runner.system_prompt.contains("Resourcefulness"),
+            "should include guidelines when bash tool is present"
+        );
+    }
+
+    #[test]
+    fn resourcefulness_guidelines_excluded_without_power_tools() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("prompt")
+            .tool(Arc::new(MockTool::new("memory_recall", "ok")))
+            .build()
+            .unwrap();
+        assert!(
+            !runner.system_prompt.contains("Resourcefulness"),
+            "should not include guidelines when only memory tools are present"
+        );
     }
 }

@@ -397,6 +397,7 @@ fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, E
         content,
         stop_reason,
         usage,
+        model: None,
     })
 }
 
@@ -582,6 +583,7 @@ where
         content,
         stop_reason,
         usage,
+        model: None,
     })
 }
 

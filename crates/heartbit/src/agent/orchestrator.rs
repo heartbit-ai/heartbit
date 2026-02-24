@@ -58,6 +58,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) tool_output_compression_threshold: Option<usize>,
     /// Maximum tools per turn for this sub-agent.
     pub(crate) max_tools_per_turn: Option<usize>,
+    /// Tool profile for pre-filtering tool definitions.
+    pub(crate) tool_profile: Option<super::tool_filter::ToolProfile>,
     /// Maximum consecutive identical tool-call turns for doom loop detection.
     pub(crate) max_identical_tool_calls: Option<u32>,
     /// Session pruning configuration.
@@ -326,6 +328,9 @@ impl DelegateTaskTool {
                 }
                 if let Some(max) = agent_def.max_tools_per_turn {
                     builder = builder.max_tools_per_turn(max);
+                }
+                if let Some(profile) = agent_def.tool_profile {
+                    builder = builder.tool_profile(profile);
                 }
                 if let Some(max) = agent_def.max_identical_tool_calls {
                     builder = builder.max_identical_tool_calls(max);
@@ -705,6 +710,9 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(max) = agent_def.max_tools_per_turn {
                         builder = builder.max_tools_per_turn(max);
+                    }
+                    if let Some(profile) = agent_def.tool_profile {
+                        builder = builder.tool_profile(profile);
                     }
                     if let Some(max) = agent_def.max_identical_tool_calls {
                         builder = builder.max_identical_tool_calls(max);
@@ -1182,6 +1190,8 @@ pub struct SubAgentConfig {
     pub tool_output_compression_threshold: Option<usize>,
     /// Maximum tools per turn for this sub-agent.
     pub max_tools_per_turn: Option<usize>,
+    /// Tool profile for pre-filtering tool definitions for this sub-agent.
+    pub tool_profile: Option<super::tool_filter::ToolProfile>,
     /// Maximum consecutive identical tool-call turns for doom loop detection.
     pub max_identical_tool_calls: Option<u32>,
     /// Session pruning configuration for this sub-agent.
@@ -1257,6 +1267,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_reflection: None,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
+            tool_profile: None,
             max_identical_tool_calls: None,
             session_prune_config: None,
             enable_recursive_summarization: None,
@@ -1293,6 +1304,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_reflection: None,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
+            tool_profile: None,
             max_identical_tool_calls: None,
             session_prune_config: None,
             enable_recursive_summarization: None,
@@ -1323,6 +1335,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_reflection: def.enable_reflection,
             tool_output_compression_threshold: def.tool_output_compression_threshold,
             max_tools_per_turn: def.max_tools_per_turn,
+            tool_profile: def.tool_profile,
             max_identical_tool_calls: def.max_identical_tool_calls,
             session_prune_config: def.session_prune_config,
             enable_recursive_summarization: def.enable_recursive_summarization,
@@ -1946,6 +1959,7 @@ mod tests {
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         }]));
         let mut orch = Orchestrator::builder(provider)
             .sub_agent("a", "Agent A", "prompt a")
@@ -2025,6 +2039,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -2085,6 +2100,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            model: None,
         }]));
 
         let mut orch = Orchestrator::builder(provider)
@@ -2121,6 +2137,7 @@ mod tests {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Sub-agent "researcher" response
             CompletionResponse {
@@ -2133,6 +2150,7 @@ mod tests {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Sub-agent "analyst" response
             CompletionResponse {
@@ -2145,6 +2163,7 @@ mod tests {
                     output_tokens: 10,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Orchestrator synthesis
             CompletionResponse {
@@ -2157,6 +2176,7 @@ mod tests {
                     output_tokens: 30,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -2188,6 +2208,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // Orchestrator recovers after seeing the error
             CompletionResponse {
@@ -2196,6 +2217,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2219,6 +2241,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -2226,6 +2249,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2250,6 +2274,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: LLM recovers after seeing the error
             CompletionResponse {
@@ -2258,6 +2283,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2282,6 +2308,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: LLM recovers after seeing the parse error
             CompletionResponse {
@@ -2290,6 +2317,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2320,6 +2348,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Sub-agent responds
             CompletionResponse {
@@ -2328,6 +2357,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: Orchestrator synthesis
             CompletionResponse {
@@ -2336,6 +2366,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2398,6 +2429,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 2: Sub-agent responds
                 CompletionResponse {
@@ -2406,6 +2438,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 3: Orchestrator synthesis
                 CompletionResponse {
@@ -2414,6 +2447,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             tool_names_seen: Mutex::new(vec![]),
@@ -2521,6 +2555,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 2: Sub-agent responds
                 CompletionResponse {
@@ -2529,6 +2564,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 3: Orchestrator synthesis
                 CompletionResponse {
@@ -2537,6 +2573,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             tool_names_seen: Mutex::new(vec![]),
@@ -2583,6 +2620,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
             // 2: Sub-agent "researcher" response (cache hit on second call)
             CompletionResponse {
@@ -2597,6 +2635,7 @@ mod tests {
                     cache_read_input_tokens: 30,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
             // 3: Orchestrator synthesis (cache hit)
             CompletionResponse {
@@ -2611,6 +2650,7 @@ mod tests {
                     cache_read_input_tokens: 90,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
         ]));
 
@@ -2649,6 +2689,7 @@ mod tests {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Sub-agent responds (tokens we must NOT lose)
             CompletionResponse {
@@ -2661,6 +2702,7 @@ mod tests {
                     output_tokens: 10,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Orchestrator tries to delegate again (turn 2 = max_turns exceeded)
             CompletionResponse {
@@ -2677,6 +2719,7 @@ mod tests {
                     output_tokens: 25,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Second sub-agent call
             CompletionResponse {
@@ -2689,6 +2732,7 @@ mod tests {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -2745,6 +2789,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Sub-agent responds
             CompletionResponse {
@@ -2757,6 +2802,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Orchestrator synthesizes
             CompletionResponse {
@@ -2765,6 +2811,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -2868,6 +2915,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 2: Sub-agent responds
                 CompletionResponse {
@@ -2876,6 +2924,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 3: Orchestrator synthesis
                 CompletionResponse {
@@ -2884,6 +2933,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
             systems_seen: Mutex::new(vec![]),
@@ -2909,6 +2959,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -2965,6 +3016,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -3006,6 +3058,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -3062,6 +3115,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
                 // 3: Orchestrator synthesis
                 CompletionResponse {
@@ -3070,6 +3124,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 },
             ]),
         });
@@ -3088,6 +3143,7 @@ mod tests {
                         output_tokens: 3,
                         ..Default::default()
                     },
+                    model: None,
                 },
             ]),
         }));
@@ -3112,6 +3168,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -3143,6 +3200,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Sub-agent responds (from shared provider)
             CompletionResponse {
@@ -3151,6 +3209,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: Orchestrator synthesis
             CompletionResponse {
@@ -3159,6 +3218,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3182,6 +3242,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -3274,6 +3335,7 @@ mod tests {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Squad member "researcher" responds
             CompletionResponse {
@@ -3286,6 +3348,7 @@ mod tests {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Squad member "analyst" responds
             CompletionResponse {
@@ -3298,6 +3361,7 @@ mod tests {
                     output_tokens: 10,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Outer orchestrator synthesizes
             CompletionResponse {
@@ -3310,6 +3374,7 @@ mod tests {
                     output_tokens: 25,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -3345,6 +3410,7 @@ mod tests {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Squad member agent_a responds
             CompletionResponse {
@@ -3357,6 +3423,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Squad member agent_b responds
             CompletionResponse {
@@ -3369,6 +3436,7 @@ mod tests {
                     output_tokens: 6,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Outer orchestrator synthesizes
             CompletionResponse {
@@ -3381,6 +3449,7 @@ mod tests {
                     output_tokens: 25,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -3423,6 +3492,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Orchestrator recovers
             CompletionResponse {
@@ -3431,6 +3501,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3460,6 +3531,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Orchestrator recovers
             CompletionResponse {
@@ -3468,6 +3540,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3498,6 +3571,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Orchestrator recovers
             CompletionResponse {
@@ -3506,6 +3580,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3540,6 +3615,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Squad member writer_a responds
             CompletionResponse {
@@ -3548,6 +3624,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: Squad member writer_b responds
             CompletionResponse {
@@ -3556,6 +3633,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 4: Outer orchestrator synthesizes
             CompletionResponse {
@@ -3564,6 +3642,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -3623,6 +3702,7 @@ mod tests {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Squad member agent_a responds (agent_b uses its own failing provider)
             CompletionResponse {
@@ -3635,6 +3715,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Outer orchestrator recovers from the squad error
             CompletionResponse {
@@ -3647,6 +3728,7 @@ mod tests {
                     output_tokens: 25,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -3671,6 +3753,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -3722,6 +3805,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             }]),
             tool_names_seen: Mutex::new(vec![]),
         });
@@ -3791,6 +3875,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             }]),
             tool_names_seen: Mutex::new(vec![]),
         });
@@ -3891,6 +3976,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Sub-agent "worker" response
             CompletionResponse {
@@ -3899,6 +3985,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: Orchestrator synthesis
             CompletionResponse {
@@ -3907,6 +3994,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -4014,6 +4102,7 @@ mod tests {
                     output_tokens: 40,
                     ..Default::default()
                 },
+                model: None,
             },
             // 2: Sub-agent "researcher" LLM response: calls web_search tool
             CompletionResponse {
@@ -4033,6 +4122,7 @@ mod tests {
                     output_tokens: 10,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Sub-agent "researcher" final response after tool result
             CompletionResponse {
@@ -4045,6 +4135,7 @@ mod tests {
                     output_tokens: 15,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Sub-agent "coder" LLM response: calls read_file tool
             CompletionResponse {
@@ -4064,6 +4155,7 @@ mod tests {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                model: None,
             },
             // 5: Sub-agent "coder" final response after tool result
             CompletionResponse {
@@ -4076,6 +4168,7 @@ mod tests {
                     output_tokens: 12,
                     ..Default::default()
                 },
+                model: None,
             },
             // 6: Orchestrator synthesis
             CompletionResponse {
@@ -4088,6 +4181,7 @@ mod tests {
                     output_tokens: 50,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -4158,7 +4252,8 @@ mod tests {
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
-                | AgentEvent::SessionPruned { agent, .. } => agent,
+                | AgentEvent::SessionPruned { agent, .. }
+                | AgentEvent::ModelEscalated { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -4485,6 +4580,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Sub-agent "slow-agent" — hangs forever (timeout will fire)
             // This response won't be consumed because the provider will run out
@@ -4524,6 +4620,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -4604,6 +4701,7 @@ mod tests {
                     cache_read_input_tokens: 3,
                     reasoning_tokens: 0,
                 },
+                model: None,
             },
             // 2: Squad member "planner" responds immediately (single turn)
             CompletionResponse {
@@ -4617,6 +4715,7 @@ mod tests {
                     reasoning_tokens: 8,
                     ..Default::default()
                 },
+                model: None,
             },
             // 3: Squad member "worker" calls the `compute` tool (turn 1)
             CompletionResponse {
@@ -4636,6 +4735,7 @@ mod tests {
                     output_tokens: 12,
                     ..Default::default()
                 },
+                model: None,
             },
             // 4: Squad member "worker" produces final text after tool result (turn 2)
             CompletionResponse {
@@ -4648,6 +4748,7 @@ mod tests {
                     output_tokens: 18,
                     ..Default::default()
                 },
+                model: None,
             },
             // 5: (reviewer uses failing_provider, not this queue)
             // 6: Orchestrator recovers — synthesizes from partial squad results
@@ -4661,6 +4762,7 @@ mod tests {
                     output_tokens: 60,
                     ..Default::default()
                 },
+                model: None,
             },
         ]));
 
@@ -4707,6 +4809,7 @@ mod tests {
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
+                tool_profile: None,
                 max_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
@@ -4811,7 +4914,8 @@ mod tests {
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
-                | AgentEvent::SessionPruned { agent, .. } => agent,
+                | AgentEvent::SessionPruned { agent, .. }
+                | AgentEvent::ModelEscalated { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -4840,6 +4944,7 @@ mod tests {
                 AgentEvent::SensorEventProcessed { .. } => "SensorEventProcessed",
                 AgentEvent::StoryUpdated { .. } => "StoryUpdated",
                 AgentEvent::TaskRouted { .. } => "TaskRouted",
+                AgentEvent::ModelEscalated { .. } => "ModelEscalated",
             }
         }
 
@@ -5139,6 +5244,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }
@@ -5184,6 +5290,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: Worker tries to call bash (will be denied by permission rules)
             CompletionResponse {
@@ -5194,6 +5301,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: Worker sees the denial and responds
             CompletionResponse {
@@ -5202,6 +5310,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 4: Orchestrator synthesis
             CompletionResponse {
@@ -5210,6 +5319,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 
@@ -5277,6 +5387,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 2: alpha tries bash (denied)
             CompletionResponse {
@@ -5287,6 +5398,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::ToolUse,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 3: alpha sees denial
             CompletionResponse {
@@ -5295,6 +5407,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 4: beta just responds (no bash)
             CompletionResponse {
@@ -5303,6 +5416,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
             // 5: Orchestrator synthesis
             CompletionResponse {
@@ -5311,6 +5425,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             },
         ]));
 

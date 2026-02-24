@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod cascade;
 pub mod error_class;
 pub mod openrouter;
 pub mod pricing;
@@ -239,6 +240,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             })
         }
     }
@@ -263,6 +265,7 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::default(),
+                model: None,
             })
         }
     }
@@ -420,6 +423,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             }
         }

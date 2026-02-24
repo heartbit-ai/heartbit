@@ -223,6 +223,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             })
         }

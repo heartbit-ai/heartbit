@@ -37,6 +37,10 @@ fn default_stream_debounce_ms() -> u64 {
     500
 }
 
+fn default_memory_recall_limit() -> usize {
+    5
+}
+
 /// Configuration for the Telegram bot channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramConfig {
@@ -82,6 +86,15 @@ pub struct TelegramConfig {
     /// PostgreSQL URL for session persistence. Falls back to `daemon.database_url`.
     #[serde(default)]
     pub database_url: Option<String>,
+
+    /// Maximum number of memory entries to recall per message. Defaults to 5.
+    #[serde(default = "default_memory_recall_limit")]
+    pub memory_recall_limit: usize,
+
+    /// When true, skip memory recall for very short trivial messages
+    /// (< 20 chars, no question mark). Saves tokens on greetings. Defaults to false.
+    #[serde(default)]
+    pub memory_skip_trivial: bool,
 }
 
 impl Default for TelegramConfig {
@@ -97,6 +110,8 @@ impl Default for TelegramConfig {
             max_concurrent: default_max_concurrent(),
             stream_debounce_ms: default_stream_debounce_ms(),
             database_url: None,
+            memory_recall_limit: default_memory_recall_limit(),
+            memory_skip_trivial: false,
         }
     }
 }
@@ -137,6 +152,8 @@ mod tests {
         assert_eq!(config.max_concurrent, 50);
         assert_eq!(config.stream_debounce_ms, 500);
         assert!(config.database_url.is_none());
+        assert_eq!(config.memory_recall_limit, 5);
+        assert!(!config.memory_skip_trivial);
     }
 
     #[test]
@@ -152,6 +169,8 @@ interaction_timeout_seconds = 60
 max_concurrent = 10
 stream_debounce_ms = 250
 database_url = "postgres://localhost/heartbit"
+memory_recall_limit = 3
+memory_skip_trivial = true
 "#;
         let config: TelegramConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
@@ -167,6 +186,8 @@ database_url = "postgres://localhost/heartbit"
             config.database_url.as_deref(),
             Some("postgres://localhost/heartbit")
         );
+        assert_eq!(config.memory_recall_limit, 3);
+        assert!(config.memory_skip_trivial);
     }
 
     #[test]

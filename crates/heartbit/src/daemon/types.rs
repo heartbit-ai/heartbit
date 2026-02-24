@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -53,6 +55,8 @@ pub struct DaemonTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
 }
 
 impl DaemonTask {
@@ -71,8 +75,24 @@ impl DaemonTask {
             tool_calls_made: 0,
             estimated_cost_usd: None,
             source: source.into(),
+            agent_name: None,
         }
     }
+}
+
+/// Aggregated statistics across all daemon tasks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskStats {
+    pub total_tasks: usize,
+    pub tasks_by_state: HashMap<String, usize>,
+    pub tasks_by_source: HashMap<String, usize>,
+    pub active_tasks: usize,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub total_estimated_cost_usd: f64,
 }
 
 #[cfg(test)]
@@ -225,6 +245,7 @@ mod tests {
         assert_eq!(task.tool_calls_made, 0);
         assert!(task.estimated_cost_usd.is_none());
         assert_eq!(task.source, "api");
+        assert!(task.agent_name.is_none());
     }
 
     #[test]
@@ -249,5 +270,76 @@ mod tests {
         assert!(!json.contains("result"));
         assert!(!json.contains("error"));
         assert!(!json.contains("estimated_cost_usd"));
+        assert!(!json.contains("agent_name"));
+    }
+
+    #[test]
+    fn agent_name_roundtrip_present() {
+        let id = Uuid::new_v4();
+        let mut task = DaemonTask::new(id, "analyze code", "api");
+        task.agent_name = Some("security-agent".into());
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("agent_name"));
+        assert!(json.contains("security-agent"));
+        let parsed: DaemonTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.agent_name.as_deref(), Some("security-agent"));
+    }
+
+    #[test]
+    fn agent_name_roundtrip_absent_backward_compat() {
+        // Old JSON without agent_name field should deserialize with None
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","task":"test","state":"pending","created_at":"2026-01-01T00:00:00Z","tokens_used":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0},"tool_calls_made":0,"source":"api"}"#;
+        let parsed: DaemonTask = serde_json::from_str(json).unwrap();
+        assert!(parsed.agent_name.is_none());
+        assert_eq!(parsed.task, "test");
+        assert_eq!(parsed.source, "api");
+    }
+
+    #[test]
+    fn task_stats_default_is_zero() {
+        let stats = TaskStats::default();
+        assert_eq!(stats.total_tasks, 0);
+        assert!(stats.tasks_by_state.is_empty());
+        assert!(stats.tasks_by_source.is_empty());
+        assert_eq!(stats.active_tasks, 0);
+        assert_eq!(stats.total_input_tokens, 0);
+        assert_eq!(stats.total_output_tokens, 0);
+        assert_eq!(stats.total_cache_read_tokens, 0);
+        assert_eq!(stats.total_cache_creation_tokens, 0);
+        assert_eq!(stats.total_estimated_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn task_stats_serde_roundtrip() {
+        let mut stats = TaskStats::default();
+        stats.total_tasks = 10;
+        stats.tasks_by_state.insert("running".into(), 3);
+        stats.tasks_by_source.insert("api".into(), 7);
+        stats.active_tasks = 3;
+        stats.total_input_tokens = 5000;
+        stats.total_output_tokens = 2000;
+        stats.total_estimated_cost_usd = 1.23;
+
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: TaskStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_tasks, 10);
+        assert_eq!(parsed.tasks_by_state.get("running"), Some(&3));
+        assert_eq!(parsed.tasks_by_source.get("api"), Some(&7));
+        assert_eq!(parsed.active_tasks, 3);
+        assert_eq!(parsed.total_input_tokens, 5000);
+        assert_eq!(parsed.total_output_tokens, 2000);
+        assert_eq!(parsed.total_estimated_cost_usd, 1.23);
+    }
+
+    #[test]
+    fn task_stats_deserialize_partial_json() {
+        // Older versions may not have all fields — #[serde(default)] ensures they default.
+        let json = r#"{"total_tasks": 5}"#;
+        let stats: TaskStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.total_tasks, 5);
+        assert_eq!(stats.active_tasks, 0);
+        assert!(stats.tasks_by_state.is_empty());
+        assert_eq!(stats.total_input_tokens, 0);
+        assert_eq!(stats.total_estimated_cost_usd, 0.0);
     }
 }

@@ -16,7 +16,7 @@ use crate::agent::events::AgentEvent;
 use crate::config::DaemonConfig;
 
 use super::store::TaskStore;
-use super::types::{DaemonCommand, DaemonTask, TaskState};
+use super::types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 
 /// Cloneable handle for producing commands and reading state.
 #[derive(Clone)]
@@ -82,6 +82,38 @@ impl DaemonHandle {
     pub fn subscribe_events(&self, id: uuid::Uuid) -> Option<broadcast::Receiver<AgentEvent>> {
         let channels = self.event_channels.read().ok()?;
         channels.get(&id).map(|tx| tx.subscribe())
+    }
+
+    /// Register a task directly in the store (for non-Kafka execution paths like Telegram/WS).
+    pub fn register_task(
+        &self,
+        id: uuid::Uuid,
+        task: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Result<(), Error> {
+        let daemon_task = DaemonTask::new(id, task, source);
+        self.store.insert(daemon_task)
+    }
+
+    /// Update a registered task's state (for non-Kafka execution paths).
+    pub fn update_task(&self, id: uuid::Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error> {
+        self.store.update(id, f)
+    }
+
+    /// List tasks with optional source/state filters.
+    pub fn list_tasks_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        source: Option<&str>,
+        state: Option<TaskState>,
+    ) -> Result<(Vec<DaemonTask>, usize), Error> {
+        self.store.list_filtered(limit, offset, source, state)
+    }
+
+    /// Aggregate stats across all tasks.
+    pub fn stats(&self) -> Result<TaskStats, Error> {
+        self.store.stats()
     }
 
     /// Produce a `CancelTask` command.
@@ -466,6 +498,124 @@ mod tests {
 
         let rx = handle.subscribe_events(id);
         assert!(rx.is_some());
+    }
+
+    #[test]
+    fn register_task_appears_in_store() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        handle
+            .register_task(id, "do something", "telegram")
+            .unwrap();
+
+        let task = handle.get_task(id).unwrap().unwrap();
+        assert_eq!(task.id, id);
+        assert_eq!(task.task, "do something");
+        assert_eq!(task.source, "telegram");
+        assert_eq!(task.state, TaskState::Pending);
+    }
+
+    #[test]
+    fn register_task_duplicate_rejected() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        handle.register_task(id, "first", "api").unwrap();
+        let err = handle.register_task(id, "second", "api").unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn update_task_modifies_state() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        handle.register_task(id, "test", "ws").unwrap();
+
+        handle
+            .update_task(id, &|t| {
+                t.state = TaskState::Running;
+                t.started_at = Some(chrono::Utc::now());
+            })
+            .unwrap();
+
+        let task = handle.get_task(id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.started_at.is_some());
+    }
+
+    #[test]
+    fn update_task_nonexistent_returns_error() {
+        let handle = test_handle();
+        let err = handle
+            .update_task(uuid::Uuid::new_v4(), &|_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn handle_list_tasks_filtered_by_source() {
+        let handle = test_handle();
+        for i in 0..3 {
+            let source = if i < 2 { "telegram" } else { "api" };
+            handle
+                .register_task(uuid::Uuid::new_v4(), format!("task {i}"), source)
+                .unwrap();
+        }
+
+        let (tasks, total) = handle
+            .list_tasks_filtered(10, 0, Some("telegram"), None)
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.source == "telegram"));
+    }
+
+    #[test]
+    fn handle_list_tasks_filtered_by_state() {
+        let handle = test_handle();
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        handle.register_task(id1, "a", "api").unwrap();
+        handle.register_task(id2, "b", "api").unwrap();
+        handle
+            .update_task(id1, &|t| t.state = TaskState::Running)
+            .unwrap();
+
+        let (tasks, total) = handle
+            .list_tasks_filtered(10, 0, None, Some(TaskState::Running))
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tasks[0].id, id1);
+    }
+
+    #[test]
+    fn handle_stats_aggregates() {
+        let handle = test_handle();
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let id3 = uuid::Uuid::new_v4();
+        handle.register_task(id1, "a", "api").unwrap();
+        handle.register_task(id2, "b", "telegram").unwrap();
+        handle.register_task(id3, "c", "api").unwrap();
+        handle
+            .update_task(id2, &|t| t.state = TaskState::Running)
+            .unwrap();
+        handle
+            .update_task(id3, &|t| {
+                t.state = TaskState::Completed;
+                t.tokens_used.input_tokens = 100;
+                t.estimated_cost_usd = Some(0.01);
+            })
+            .unwrap();
+
+        let stats = handle.stats().unwrap();
+        assert_eq!(stats.total_tasks, 3);
+        assert_eq!(stats.active_tasks, 1);
+        assert_eq!(stats.tasks_by_source.get("api"), Some(&2));
+        assert_eq!(stats.tasks_by_source.get("telegram"), Some(&1));
+        assert_eq!(stats.tasks_by_state.get("running"), Some(&1));
+        assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
+        assert_eq!(stats.total_input_tokens, 100);
+        assert!((stats.total_estimated_cost_usd - 0.01).abs() < 1e-9);
     }
 
     #[tokio::test]

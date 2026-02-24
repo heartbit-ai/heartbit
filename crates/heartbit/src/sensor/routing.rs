@@ -166,6 +166,7 @@ mod tests {
                     content: vec![ContentBlock::Text { text: "ok".into() }],
                     stop_reason: StopReason::EndTurn,
                     usage: TokenUsage::default(),
+                    model: None,
                 })
             })
         }

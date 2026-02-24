@@ -168,6 +168,9 @@ pub struct CompletionResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
     pub usage: TokenUsage,
+    /// Model that produced this response. Set by cascading/routing providers.
+    /// `None` when the model is known statically from the provider.
+    pub model: Option<String>,
 }
 
 impl CompletionResponse {
@@ -308,6 +311,7 @@ mod tests {
             ],
             stop_reason: StopReason::ToolUse,
             usage: TokenUsage::default(),
+            model: None,
         };
 
         let calls = response.tool_calls();
@@ -334,6 +338,7 @@ mod tests {
             ],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
+            model: None,
         };
 
         assert_eq!(response.text(), "Hello world");
@@ -540,5 +545,30 @@ mod tests {
             let parsed: ReasoningEffort = serde_json::from_str(&json).unwrap();
             assert_eq!(effort, parsed);
         }
+    }
+
+    #[test]
+    fn response_model_field_defaults_to_none() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        assert!(response.model.is_none());
+    }
+
+    #[test]
+    fn response_model_roundtrip_with_value() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            model: Some("anthropic/claude-3.5-haiku".into()),
+        };
+        assert_eq!(
+            response.model.as_deref(),
+            Some("anthropic/claude-3.5-haiku")
+        );
     }
 }

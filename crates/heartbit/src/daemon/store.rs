@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::types::{DaemonTask, TaskState};
+use super::types::{DaemonTask, TaskState, TaskStats};
 use crate::Error;
 use crate::llm::types::TokenUsage;
 
@@ -23,6 +23,63 @@ pub trait TaskStore: Send + Sync {
     /// to the task and may modify it in place. Returns an error if the task
     /// is not found.
     fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error>;
+
+    /// List tasks with optional source and state filters. Returns `(tasks, total_matching)`.
+    fn list_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        source: Option<&str>,
+        state: Option<TaskState>,
+    ) -> Result<(Vec<DaemonTask>, usize), Error> {
+        let (all_tasks, _) = self.list(usize::MAX, 0)?;
+        let filtered: Vec<DaemonTask> = all_tasks
+            .into_iter()
+            .filter(|t| source.is_none_or(|s| t.source == s))
+            .filter(|t| state.is_none_or(|s| t.state == s))
+            .collect();
+        let total = filtered.len();
+        let tasks = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((tasks, total))
+    }
+
+    /// Compute aggregate statistics across all tasks.
+    fn stats(&self) -> Result<TaskStats, Error> {
+        let (all_tasks, _) = self.list(usize::MAX, 0)?;
+        let mut stats = TaskStats {
+            total_tasks: all_tasks.len(),
+            ..Default::default()
+        };
+        for task in &all_tasks {
+            let state_key = match task.state {
+                TaskState::Pending => "pending",
+                TaskState::Running => "running",
+                TaskState::Completed => "completed",
+                TaskState::Failed => "failed",
+                TaskState::Cancelled => "cancelled",
+            };
+            *stats
+                .tasks_by_state
+                .entry(state_key.to_string())
+                .or_default() += 1;
+            *stats
+                .tasks_by_source
+                .entry(task.source.clone())
+                .or_default() += 1;
+            if task.state == TaskState::Running {
+                stats.active_tasks += 1;
+            }
+            stats.total_input_tokens += task.tokens_used.input_tokens as u64;
+            stats.total_output_tokens += task.tokens_used.output_tokens as u64;
+            stats.total_cache_read_tokens += task.tokens_used.cache_read_input_tokens as u64;
+            stats.total_cache_creation_tokens +=
+                task.tokens_used.cache_creation_input_tokens as u64;
+            if let Some(cost) = task.estimated_cost_usd {
+                stats.total_estimated_cost_usd += cost;
+            }
+        }
+        Ok(stats)
+    }
 }
 
 /// In-memory task store backed by `std::sync::RwLock`.
@@ -52,19 +109,20 @@ impl Default for InMemoryTaskStore {
 impl TaskStore for InMemoryTaskStore {
     fn insert(&self, task: DaemonTask) -> Result<(), Error> {
         let id = task.id;
+        // Acquire both locks before mutating to keep tasks and order consistent.
+        // Lock order: tasks → order (same as list/list_filtered to avoid deadlock).
         let mut tasks = self
             .tasks
+            .write()
+            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let mut order = self
+            .order
             .write()
             .map_err(|e| Error::Daemon(e.to_string()))?;
         if tasks.contains_key(&id) {
             return Err(Error::Daemon(format!("task {id} already exists")));
         }
         tasks.insert(id, task);
-        drop(tasks);
-        let mut order = self
-            .order
-            .write()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
         order.push(id);
         Ok(())
     }
@@ -108,6 +166,34 @@ impl TaskStore for InMemoryTaskStore {
         f(task);
         Ok(())
     }
+
+    fn list_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        source: Option<&str>,
+        state: Option<TaskState>,
+    ) -> Result<(Vec<DaemonTask>, usize), Error> {
+        let tasks = self
+            .tasks
+            .read()
+            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let order = self
+            .order
+            .read()
+            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let filtered: Vec<DaemonTask> = order
+            .iter()
+            .rev()
+            .filter_map(|id| tasks.get(id))
+            .filter(|t| source.is_none_or(|s| t.source == s))
+            .filter(|t| state.is_none_or(|s| t.state == s))
+            .cloned()
+            .collect();
+        let total = filtered.len();
+        let result = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((result, total))
+    }
 }
 
 // --- PostgreSQL task store ---
@@ -131,6 +217,7 @@ struct TaskRow {
     tool_calls_made: i32,
     estimated_cost_usd: Option<f64>,
     source: String,
+    agent_name: Option<String>,
 }
 
 fn task_state_to_str(state: TaskState) -> &'static str {
@@ -174,6 +261,7 @@ impl From<TaskRow> for DaemonTask {
             tool_calls_made: row.tool_calls_made as usize,
             estimated_cost_usd: row.estimated_cost_usd,
             source: row.source,
+            agent_name: row.agent_name,
         }
     }
 }
@@ -220,7 +308,8 @@ impl PostgresTaskStore {
                 reasoning_tokens            INTEGER NOT NULL DEFAULT 0,
                 tool_calls_made             INTEGER NOT NULL DEFAULT 0,
                 estimated_cost_usd          DOUBLE PRECISION,
-                source                      TEXT NOT NULL
+                source                      TEXT NOT NULL,
+                agent_name                  TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at
                 ON daemon_tasks(created_at);
@@ -231,6 +320,13 @@ impl PostgresTaskStore {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
+
+        // Add agent_name column if not already present (for existing tables).
+        sqlx::query("ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS agent_name TEXT")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Daemon(format!("agent_name migration failed: {e}")))?;
+
         Ok(())
     }
 }
@@ -245,8 +341,8 @@ impl TaskStore for PostgresTaskStore {
                         (id, task, state, created_at, started_at, completed_at, result, error,
                          input_tokens, output_tokens, cache_creation_input_tokens,
                          cache_read_input_tokens, reasoning_tokens, tool_calls_made,
-                         estimated_cost_usd, source)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
+                         estimated_cost_usd, source, agent_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
                 )
                 .bind(task.id)
                 .bind(&task.task)
@@ -264,6 +360,7 @@ impl TaskStore for PostgresTaskStore {
                 .bind(task.tool_calls_made as i32)
                 .bind(task.estimated_cost_usd)
                 .bind(&task.source)
+                .bind(&task.agent_name)
                 .execute(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
@@ -280,7 +377,7 @@ impl TaskStore for PostgresTaskStore {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source \
+                     estimated_cost_usd, source, agent_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -304,7 +401,7 @@ impl TaskStore for PostgresTaskStore {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source \
+                     estimated_cost_usd, source, agent_name \
                      FROM daemon_tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit as i64)
@@ -327,7 +424,7 @@ impl TaskStore for PostgresTaskStore {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source \
+                     estimated_cost_usd, source, agent_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -347,7 +444,7 @@ impl TaskStore for PostgresTaskStore {
                         result = $6, error = $7, input_tokens = $8, output_tokens = $9,
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
-                        estimated_cost_usd = $14, source = $15
+                        estimated_cost_usd = $14, source = $15, agent_name = $16
                     WHERE id = $1"#,
                 )
                 .bind(task.id)
@@ -365,10 +462,134 @@ impl TaskStore for PostgresTaskStore {
                 .bind(task.tool_calls_made as i32)
                 .bind(task.estimated_cost_usd)
                 .bind(&task.source)
+                .bind(&task.agent_name)
                 .execute(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to update task: {e}")))?;
                 Ok(())
+            })
+        })
+    }
+
+    fn list_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        source: Option<&str>,
+        state: Option<TaskState>,
+    ) -> Result<(Vec<DaemonTask>, usize), Error> {
+        let pool = self.pool.clone();
+        let source_owned = source.map(String::from);
+        let state_str = state.map(task_state_to_str);
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                // Build dynamic WHERE clause
+                let mut conditions = Vec::new();
+                let mut param_idx = 1;
+
+                if source_owned.is_some() {
+                    conditions.push(format!("source = ${param_idx}"));
+                    param_idx += 1;
+                }
+                if state_str.is_some() {
+                    conditions.push(format!("state = ${param_idx}"));
+                    param_idx += 1;
+                }
+
+                let where_clause = if conditions.is_empty() {
+                    String::new()
+                } else {
+                    format!("WHERE {}", conditions.join(" AND "))
+                };
+
+                // Count query
+                let count_sql = format!("SELECT COUNT(*) FROM daemon_tasks {where_clause}");
+                let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+                if let Some(ref s) = source_owned {
+                    count_query = count_query.bind(s);
+                }
+                if let Some(st) = state_str {
+                    count_query = count_query.bind(st);
+                }
+                let total: i64 = count_query
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to count filtered tasks: {e}")))?;
+
+                // Data query
+                let data_sql = format!(
+                    "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
+                     input_tokens, output_tokens, cache_creation_input_tokens, \
+                     cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
+                     estimated_cost_usd, source, agent_name \
+                     FROM daemon_tasks {where_clause} ORDER BY created_at DESC \
+                     LIMIT ${param_idx} OFFSET ${}",
+                    param_idx + 1
+                );
+                let mut data_query = sqlx::query_as::<_, TaskRow>(&data_sql);
+                if let Some(ref s) = source_owned {
+                    data_query = data_query.bind(s);
+                }
+                if let Some(st) = state_str {
+                    data_query = data_query.bind(st);
+                }
+                data_query = data_query.bind(limit as i64).bind(offset as i64);
+
+                let rows: Vec<TaskRow> = data_query
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to list filtered tasks: {e}")))?;
+                let tasks = rows.into_iter().map(DaemonTask::from).collect();
+                Ok((tasks, total as usize))
+            })
+        })
+    }
+
+    fn stats(&self) -> Result<TaskStats, Error> {
+        let pool = self.pool.clone();
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                // Single query with aggregation grouped by state and source
+                #[derive(sqlx::FromRow)]
+                struct StatsRow {
+                    state: String,
+                    source: String,
+                    cnt: i64,
+                    sum_input: i64,
+                    sum_output: i64,
+                    sum_cache_read: i64,
+                    sum_cache_creation: i64,
+                    sum_cost: f64,
+                }
+                let rows: Vec<StatsRow> = sqlx::query_as(
+                    "SELECT state, source, COUNT(*) AS cnt, \
+                     COALESCE(SUM(input_tokens), 0) AS sum_input, \
+                     COALESCE(SUM(output_tokens), 0) AS sum_output, \
+                     COALESCE(SUM(cache_read_input_tokens), 0) AS sum_cache_read, \
+                     COALESCE(SUM(cache_creation_input_tokens), 0) AS sum_cache_creation, \
+                     COALESCE(SUM(estimated_cost_usd), 0.0) AS sum_cost \
+                     FROM daemon_tasks GROUP BY state, source",
+                )
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
+
+                let mut stats = TaskStats::default();
+                for row in &rows {
+                    let count = row.cnt as usize;
+                    stats.total_tasks += count;
+                    *stats.tasks_by_state.entry(row.state.clone()).or_default() += count;
+                    *stats.tasks_by_source.entry(row.source.clone()).or_default() += count;
+                    if row.state == "running" {
+                        stats.active_tasks += count;
+                    }
+                    stats.total_input_tokens += row.sum_input as u64;
+                    stats.total_output_tokens += row.sum_output as u64;
+                    stats.total_cache_read_tokens += row.sum_cache_read as u64;
+                    stats.total_cache_creation_tokens += row.sum_cache_creation as u64;
+                    stats.total_estimated_cost_usd += row.sum_cost;
+                }
+                Ok(stats)
             })
         })
     }
@@ -583,6 +804,7 @@ mod tests {
             tool_calls_made: 0,
             estimated_cost_usd: None,
             source: "api".into(),
+            agent_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.id, id);
@@ -617,6 +839,7 @@ mod tests {
             tool_calls_made: 7,
             estimated_cost_usd: Some(0.042),
             source: "cron:daily".into(),
+            agent_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Completed);
@@ -651,6 +874,7 @@ mod tests {
             tool_calls_made: 1,
             estimated_cost_usd: Some(0.001),
             source: "sensor:email".into(),
+            agent_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Failed);
@@ -680,10 +904,250 @@ mod tests {
             tool_calls_made: 0,
             estimated_cost_usd: None,
             source: "api".into(),
+            agent_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.created_at, created);
         assert_eq!(task.started_at, Some(started));
         assert_eq!(task.completed_at, Some(completed));
+    }
+
+    #[test]
+    fn task_row_with_agent_name() {
+        let row = TaskRow {
+            id: Uuid::new_v4(),
+            task: "named task".into(),
+            state: "running".into(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            result: None,
+            error: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            reasoning_tokens: 0,
+            tool_calls_made: 0,
+            estimated_cost_usd: None,
+            source: "api".into(),
+            agent_name: Some("security-bot".into()),
+        };
+        let task = DaemonTask::from(row);
+        assert_eq!(task.agent_name.as_deref(), Some("security-bot"));
+    }
+
+    // --- list_filtered tests ---
+
+    #[test]
+    fn list_filtered_by_source() {
+        let store = InMemoryTaskStore::new();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t1", "api"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t2", "cron"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t3", "api"))
+            .unwrap();
+
+        let (tasks, total) = store.list_filtered(10, 0, Some("api"), None).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        for t in &tasks {
+            assert_eq!(t.source, "api");
+        }
+    }
+
+    #[test]
+    fn list_filtered_by_state() {
+        let store = InMemoryTaskStore::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        store.insert(DaemonTask::new(id1, "t1", "api")).unwrap();
+        store.insert(DaemonTask::new(id2, "t2", "api")).unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t3", "api"))
+            .unwrap();
+        store
+            .update(id1, &|t| t.state = TaskState::Running)
+            .unwrap();
+        store
+            .update(id2, &|t| t.state = TaskState::Running)
+            .unwrap();
+
+        let (tasks, total) = store
+            .list_filtered(10, 0, None, Some(TaskState::Running))
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        for t in &tasks {
+            assert_eq!(t.state, TaskState::Running);
+        }
+    }
+
+    #[test]
+    fn list_filtered_by_both() {
+        let store = InMemoryTaskStore::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        store.insert(DaemonTask::new(id1, "t1", "api")).unwrap();
+        store.insert(DaemonTask::new(id2, "t2", "cron")).unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t3", "api"))
+            .unwrap();
+        store
+            .update(id1, &|t| t.state = TaskState::Running)
+            .unwrap();
+        store
+            .update(id2, &|t| t.state = TaskState::Running)
+            .unwrap();
+
+        let (tasks, total) = store
+            .list_filtered(10, 0, Some("api"), Some(TaskState::Running))
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, id1);
+    }
+
+    #[test]
+    fn list_filtered_none_returns_all() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..4 {
+            store
+                .insert(DaemonTask::new(Uuid::new_v4(), format!("t{i}"), "api"))
+                .unwrap();
+        }
+
+        let (tasks, total) = store.list_filtered(10, 0, None, None).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(tasks.len(), 4);
+    }
+
+    #[test]
+    fn list_filtered_pagination() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..5 {
+            store
+                .insert(DaemonTask::new(Uuid::new_v4(), format!("t{i}"), "api"))
+                .unwrap();
+        }
+
+        let (tasks, total) = store.list_filtered(2, 1, Some("api"), None).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(tasks.len(), 2);
+    }
+
+    // --- stats tests ---
+
+    #[test]
+    fn stats_empty_store() {
+        let store = InMemoryTaskStore::new();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_tasks, 0);
+        assert!(stats.tasks_by_state.is_empty());
+        assert!(stats.tasks_by_source.is_empty());
+        assert_eq!(stats.active_tasks, 0);
+        assert_eq!(stats.total_input_tokens, 0);
+        assert_eq!(stats.total_output_tokens, 0);
+        assert_eq!(stats.total_cache_read_tokens, 0);
+        assert_eq!(stats.total_cache_creation_tokens, 0);
+        assert_eq!(stats.total_estimated_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn stats_aggregates_correctly() {
+        let store = InMemoryTaskStore::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        store.insert(DaemonTask::new(id1, "t1", "api")).unwrap();
+        store.insert(DaemonTask::new(id2, "t2", "cron")).unwrap();
+        store.insert(DaemonTask::new(id3, "t3", "api")).unwrap();
+
+        store
+            .update(id1, &|t| {
+                t.state = TaskState::Running;
+                t.tokens_used.input_tokens = 100;
+                t.tokens_used.output_tokens = 50;
+            })
+            .unwrap();
+        store
+            .update(id2, &|t| {
+                t.state = TaskState::Completed;
+                t.tokens_used.input_tokens = 200;
+                t.tokens_used.output_tokens = 80;
+                t.tokens_used.cache_read_input_tokens = 30;
+                t.tokens_used.cache_creation_input_tokens = 10;
+                t.estimated_cost_usd = Some(0.05);
+            })
+            .unwrap();
+        store
+            .update(id3, &|t| {
+                t.state = TaskState::Failed;
+                t.tokens_used.input_tokens = 50;
+                t.estimated_cost_usd = Some(0.01);
+            })
+            .unwrap();
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_tasks, 3);
+        assert_eq!(stats.tasks_by_state.get("running"), Some(&1));
+        assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
+        assert_eq!(stats.tasks_by_state.get("failed"), Some(&1));
+        assert_eq!(stats.active_tasks, 1); // only Running
+        assert_eq!(stats.total_input_tokens, 350);
+        assert_eq!(stats.total_output_tokens, 130);
+        assert_eq!(stats.total_cache_read_tokens, 30);
+        assert_eq!(stats.total_cache_creation_tokens, 10);
+        assert!((stats.total_estimated_cost_usd - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_by_source_breakdown() {
+        let store = InMemoryTaskStore::new();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t1", "api"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t2", "api"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t3", "cron"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "t4", "sensor:rss"))
+            .unwrap();
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.tasks_by_source.get("api"), Some(&2));
+        assert_eq!(stats.tasks_by_source.get("cron"), Some(&1));
+        assert_eq!(stats.tasks_by_source.get("sensor:rss"), Some(&1));
+    }
+
+    #[test]
+    fn stats_active_count() {
+        let store = InMemoryTaskStore::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        store.insert(DaemonTask::new(id1, "t1", "api")).unwrap();
+        store.insert(DaemonTask::new(id2, "t2", "api")).unwrap();
+        store.insert(DaemonTask::new(id3, "t3", "api")).unwrap();
+
+        store
+            .update(id1, &|t| t.state = TaskState::Running)
+            .unwrap();
+        store
+            .update(id2, &|t| t.state = TaskState::Running)
+            .unwrap();
+        // id3 stays Pending
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.active_tasks, 2);
+        assert_eq!(stats.tasks_by_state.get("running"), Some(&2));
+        assert_eq!(stats.tasks_by_state.get("pending"), Some(&1));
     }
 }

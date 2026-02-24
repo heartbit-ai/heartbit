@@ -57,6 +57,10 @@ pub struct ListQuery {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -144,8 +148,53 @@ async fn handle_list(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
-    match state.handle.list_tasks(query.limit, query.offset) {
+    let state_filter = query.state.as_deref().and_then(parse_task_state);
+    match state.handle.list_tasks_filtered(
+        query.limit,
+        query.offset,
+        query.source.as_deref(),
+        state_filter,
+    ) {
         Ok((tasks, total)) => Json(ListResponse { tasks, total }).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_task_state(s: &str) -> Option<heartbit::TaskState> {
+    match s {
+        "pending" => Some(heartbit::TaskState::Pending),
+        "running" => Some(heartbit::TaskState::Running),
+        "completed" => Some(heartbit::TaskState::Completed),
+        "failed" => Some(heartbit::TaskState::Failed),
+        "cancelled" => Some(heartbit::TaskState::Cancelled),
+        _ => None,
+    }
+}
+
+async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
+    match state.handle.stats() {
+        Ok(stats) => {
+            let uptime_seconds = state.start_time.elapsed().as_secs();
+            Json(serde_json::json!({
+                "total_tasks": stats.total_tasks,
+                "tasks_by_state": stats.tasks_by_state,
+                "tasks_by_source": stats.tasks_by_source,
+                "active_tasks": stats.active_tasks,
+                "total_tokens": {
+                    "input_tokens": stats.total_input_tokens,
+                    "output_tokens": stats.total_output_tokens,
+                    "cache_read_tokens": stats.total_cache_read_tokens,
+                    "cache_creation_tokens": stats.total_cache_creation_tokens,
+                },
+                "total_estimated_cost_usd": stats.total_estimated_cost_usd,
+                "uptime_seconds": uptime_seconds,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -928,13 +977,14 @@ pub async fn run_daemon(
         .route("/health", get(handle_healthz))
         .route("/metrics", get(handle_metrics));
 
-    // Protected routes — tasks, SSE, WS, todo
+    // Protected routes — tasks, SSE, WS, todo, stats
     let mut protected_routes = Router::new()
         .route("/tasks", post(handle_submit))
         .route("/tasks", get(handle_list))
         .route("/tasks/{id}", get(handle_get))
         .route("/tasks/{id}", delete(handle_cancel))
         .route("/tasks/{id}/events", get(handle_events))
+        .route("/stats", get(handle_stats))
         .route("/todo", get(handle_todo));
 
     if ws_enabled {
@@ -978,6 +1028,7 @@ pub async fn run_daemon(
         let tg_todo_store = app_state.todo_store.clone();
         let tg_workspace = app_state.workspace_dir.clone();
         let tg_tools = app_state.tool_cache.clone();
+        let tg_handle = app_state.handle.clone();
 
         // Build the RunTask closure that reuses build_orchestrator_from_config
         let run_task: Arc<heartbit::channel::telegram::RunTask> = Arc::new(move |input| {
@@ -989,7 +1040,14 @@ pub async fn run_daemon(
             let todo_store = tg_todo_store.clone();
             let workspace_dir = tg_workspace.clone();
             let tools = tg_tools.clone();
+            let handle = tg_handle.clone();
             Box::pin(async move {
+                // Register task in store for visibility via GET /tasks
+                let task_id = uuid::Uuid::new_v4();
+                if let Err(e) = handle.register_task(task_id, &task_text, "telegram") {
+                    tracing::warn!(error = %e, "failed to register telegram task in store");
+                }
+
                 // No streaming preview for Telegram — only send the final
                 // HTML-formatted result to avoid a raw-markdown flash.
                 let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
@@ -997,13 +1055,29 @@ pub async fn run_daemon(
                 let on_question = bridge.make_on_question();
 
                 let on_retry = build_on_retry(&on_event);
-                let provider = build_provider_from_config(&config, Some(on_retry))
-                    .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
+                let provider = match build_provider_from_config(&config, Some(on_retry)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let _ = handle.update_task(task_id, &|t| {
+                            t.state = heartbit::TaskState::Failed;
+                            t.completed_at = Some(chrono::Utc::now());
+                            t.error = Some(err_str.clone());
+                        });
+                        return Err(HeartbitError::Daemon(err_str));
+                    }
+                };
 
                 // Track active tasks (after provider creation to avoid gauge leak on error)
                 if let Some(ref m) = m {
                     m.tasks_active().inc();
                 }
+                // Transition to Running
+                let _ = handle.update_task(task_id, &|t| {
+                    t.state = heartbit::TaskState::Running;
+                    t.started_at = Some(chrono::Utc::now());
+                });
+
                 let start = Instant::now();
                 let result = crate::build_orchestrator_from_config(
                     provider,
@@ -1030,6 +1104,33 @@ pub async fn run_daemon(
                     match &result {
                         Ok(_) => m.record_task_completed(duration_secs),
                         Err(_) => m.record_task_failed(duration_secs),
+                    }
+                }
+
+                // Update store with completion state
+                let now = chrono::Utc::now();
+                match &result {
+                    Ok(output) => {
+                        let tokens = output.tokens_used;
+                        let cost = output.estimated_cost_usd;
+                        let tool_calls = output.tool_calls_made;
+                        let res = output.result.clone();
+                        let _ = handle.update_task(task_id, &|t| {
+                            t.state = heartbit::TaskState::Completed;
+                            t.completed_at = Some(now);
+                            t.result = Some(res.clone());
+                            t.tokens_used = tokens;
+                            t.tool_calls_made = tool_calls;
+                            t.estimated_cost_usd = cost;
+                        });
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let _ = handle.update_task(task_id, &|t| {
+                            t.state = heartbit::TaskState::Failed;
+                            t.completed_at = Some(now);
+                            t.error = Some(err_str.clone());
+                        });
                     }
                 }
 
@@ -1392,8 +1493,20 @@ async fn handle_ws_chat_send(
     let ws_workspace = state.workspace_dir.clone();
     let ws_todo = state.todo_store.clone();
     let ws_tools = state.tool_cache.clone();
+    let ws_handle = state.handle.clone();
+
+    // Register WS task in store for visibility via GET /tasks
+    if let Err(e) = ws_handle.register_task(task_id, &task_text, "ws") {
+        tracing::warn!(error = %e, "failed to register ws task in store");
+    }
 
     tokio::spawn(async move {
+        // Transition to Running
+        let _ = ws_handle.update_task(task_id, &|t| {
+            t.state = heartbit::TaskState::Running;
+            t.started_at = Some(chrono::Utc::now());
+        });
+
         let result = run_interactive_task(
             &config,
             &task_text,
@@ -1413,6 +1526,33 @@ async fn handle_ws_chat_send(
             "ws",
         )
         .await;
+
+        // Update store with completion state
+        let now = chrono::Utc::now();
+        match &result {
+            Ok(output) => {
+                let tokens = output.tokens_used;
+                let cost = output.estimated_cost_usd;
+                let tool_calls = output.tool_calls_made;
+                let res = output.result.clone();
+                let _ = ws_handle.update_task(task_id, &|t| {
+                    t.state = heartbit::TaskState::Completed;
+                    t.completed_at = Some(now);
+                    t.result = Some(res.clone());
+                    t.tokens_used = tokens;
+                    t.tool_calls_made = tool_calls;
+                    t.estimated_cost_usd = cost;
+                });
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let _ = ws_handle.update_task(task_id, &|t| {
+                    t.state = heartbit::TaskState::Failed;
+                    t.completed_at = Some(now);
+                    t.error = Some(err_str.clone());
+                });
+            }
+        }
 
         // Record result in session
         let (final_text, is_err) = match &result {

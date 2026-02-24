@@ -429,6 +429,7 @@ impl SseResponseState {
             content: self.content,
             stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
+            model: None,
         }
     }
 }
@@ -577,6 +578,7 @@ fn into_completion_response(api: ApiResponse) -> CompletionResponse {
             cache_read_input_tokens: api.usage.cache_read_input_tokens,
             reasoning_tokens: 0,
         },
+        model: None,
     }
 }
 

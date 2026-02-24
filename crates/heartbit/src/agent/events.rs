@@ -204,6 +204,15 @@ pub enum AgentEvent {
         priority: Option<String>,
     },
 
+    /// Model cascade escalated from a cheaper tier.
+    ModelEscalated {
+        agent: String,
+        from_tier: String,
+        to_tier: String,
+        /// "gate_rejected" or "tier_error"
+        reason: String,
+    },
+
     /// Task was routed to single-agent or orchestrator by the complexity analyzer.
     TaskRouted {
         /// "single_agent" or "orchestrate"
@@ -450,6 +459,12 @@ mod tests {
                 tool_results_pruned: 2,
                 bytes_saved: 1500,
                 tool_results_total: 4,
+            },
+            AgentEvent::ModelEscalated {
+                agent: "a".into(),
+                from_tier: "haiku".into(),
+                to_tier: "sonnet".into(),
+                reason: "gate_rejected".into(),
             },
             AgentEvent::TaskRouted {
                 decision: "single_agent".into(),
@@ -785,6 +800,33 @@ mod tests {
         match event {
             AgentEvent::ToolCallCompleted { output, .. } => assert_eq!(output, ""),
             other => panic!("expected ToolCallCompleted, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_escalated_roundtrip() {
+        let event = AgentEvent::ModelEscalated {
+            agent: "a".into(),
+            from_tier: "haiku".into(),
+            to_tier: "sonnet".into(),
+            reason: "gate_rejected".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"model_escalated""#));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::ModelEscalated {
+                agent,
+                from_tier,
+                to_tier,
+                reason,
+            } => {
+                assert_eq!(agent, "a");
+                assert_eq!(from_tier, "haiku");
+                assert_eq!(to_tier, "sonnet");
+                assert_eq!(reason, "gate_rejected");
+            }
+            other => panic!("expected ModelEscalated, got: {other:?}"),
         }
     }
 }

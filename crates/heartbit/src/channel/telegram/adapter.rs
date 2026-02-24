@@ -126,9 +126,14 @@ impl TelegramAdapter {
             None => return String::new(),
         };
 
+        // Skip memory recall for trivial messages (greetings, short acks)
+        if self.config.memory_skip_trivial && message.len() < 20 && !message.contains('?') {
+            return String::new();
+        }
+
         let query = MemoryQuery {
             text: Some(message.to_string()),
-            limit: 10,
+            limit: self.config.memory_recall_limit,
             agent_prefix: Some(format!("tg:{user_id}")),
             ..Default::default()
         };
@@ -452,12 +457,21 @@ mod tests {
     use crate::channel::session::InMemorySessionStore;
 
     fn make_adapter(memory: Option<Arc<dyn Memory>>) -> Arc<TelegramAdapter> {
+        make_adapter_with_config(
+            memory,
+            TelegramConfig {
+                dm_policy: super::super::config::DmPolicy::Open,
+                max_concurrent: 5,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn make_adapter_with_config(
+        memory: Option<Arc<dyn Memory>>,
+        config: TelegramConfig,
+    ) -> Arc<TelegramAdapter> {
         let bot = Bot::new("0:AAAA-test-token");
-        let config = TelegramConfig {
-            dm_policy: super::super::config::DmPolicy::Open,
-            max_concurrent: 5,
-            ..Default::default()
-        };
         let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
         let run_task: Arc<RunTask> =
             Arc::new(|input| Box::pin(async move { Ok(format!("Echo: {}", input.task_text)) }));
@@ -682,5 +696,106 @@ mod tests {
         let bridges = adapter.active_bridges.read().unwrap();
         assert!(bridges.contains_key(&chat_id));
         assert!(Arc::ptr_eq(bridges.get(&chat_id).unwrap(), &bridge2));
+    }
+
+    #[tokio::test]
+    async fn preload_memories_skips_trivial_when_enabled() {
+        use crate::memory::in_memory::InMemoryStore;
+        use crate::memory::namespaced::NamespacedMemory;
+        use crate::memory::{MemoryEntry, MemoryType};
+
+        let store = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:123:assistant");
+        let entry = MemoryEntry {
+            id: "test-1".into(),
+            agent: String::new(),
+            content: "User likes Rust".into(),
+            category: "general".into(),
+            tags: vec!["rust".into()],
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            access_count: 0,
+            importance: 5,
+            memory_type: MemoryType::Episodic,
+            keywords: vec!["rust".into()],
+            summary: None,
+            strength: 1.0,
+            related_ids: Vec::new(),
+            source_ids: Vec::new(),
+            embedding: None,
+        };
+        ns.store(entry).await.unwrap();
+
+        let config = TelegramConfig {
+            dm_policy: super::super::config::DmPolicy::Open,
+            max_concurrent: 5,
+            memory_skip_trivial: true,
+            ..Default::default()
+        };
+        let adapter = make_adapter_with_config(Some(store), config);
+
+        // Short trivial message (< 20 chars, no '?') → skipped
+        let ctx = adapter.preload_memories(123, "hello").await;
+        assert!(ctx.is_empty(), "trivial message should skip memory recall");
+
+        // Longer message with question mark → not skipped, recall runs
+        let ctx = adapter
+            .preload_memories(123, "can you tell me about Rust programming?")
+            .await;
+        assert!(
+            ctx.contains("Relevant context from memory"),
+            "non-trivial message should recall memories, got: {ctx:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_memories_respects_recall_limit() {
+        use crate::memory::in_memory::InMemoryStore;
+        use crate::memory::namespaced::NamespacedMemory;
+        use crate::memory::{MemoryEntry, MemoryType};
+
+        let store = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:42:assistant");
+
+        // Store 10 entries
+        for i in 0..10 {
+            let entry = MemoryEntry {
+                id: format!("mem-{i}"),
+                agent: String::new(),
+                content: format!("Memory entry number {i} about programming"),
+                category: "general".into(),
+                tags: vec!["programming".into()],
+                created_at: chrono::Utc::now(),
+                last_accessed: chrono::Utc::now(),
+                access_count: 0,
+                importance: 5,
+                memory_type: MemoryType::Episodic,
+                keywords: vec!["programming".into()],
+                summary: None,
+                strength: 1.0,
+                related_ids: Vec::new(),
+                source_ids: Vec::new(),
+                embedding: None,
+            };
+            ns.store(entry).await.unwrap();
+        }
+
+        // With limit=3, should return at most 3 entries
+        let config = TelegramConfig {
+            dm_policy: super::super::config::DmPolicy::Open,
+            max_concurrent: 5,
+            memory_recall_limit: 3,
+            ..Default::default()
+        };
+        let adapter = make_adapter_with_config(Some(store), config);
+
+        let ctx = adapter
+            .preload_memories(42, "tell me about programming")
+            .await;
+        let entry_count = ctx.matches("- Memory entry").count();
+        assert!(
+            entry_count <= 3,
+            "expected at most 3 entries but got {entry_count}"
+        );
     }
 }

@@ -52,6 +52,12 @@ fn model_pricing(model: &str) -> Option<(f64, f64)> {
         "anthropic/claude-3-haiku" | "anthropic/claude-3-haiku:beta" => Some((0.25, 1.25)),
         // Qwen models (OpenRouter)
         "qwen/qwen3.5-plus-02-15" => Some((0.40, 2.40)),
+        // DeepSeek models (OpenRouter)
+        "deepseek/deepseek-v3.2" => Some((0.26, 0.38)),
+        // Google Gemini models (OpenRouter)
+        "google/gemini-3-flash-preview" => Some((0.50, 3.00)),
+        // NVIDIA models (OpenRouter)
+        "nvidia/nemotron-3-nano-30b-a3b" => Some((0.05, 0.20)),
         _ => None,
     }
 }
@@ -281,5 +287,17 @@ mod tests {
 
         let or_beta = estimate_cost("anthropic/claude-3.5-sonnet:beta", &usage).unwrap();
         assert!((native - or_beta).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn deepseek_pricing() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let cost = estimate_cost("deepseek/deepseek-v3.2", &usage).unwrap();
+        // $0.26/M input + $0.38/M output = $0.64
+        assert!((cost - 0.64).abs() < 0.001, "cost: {cost}");
     }
 }

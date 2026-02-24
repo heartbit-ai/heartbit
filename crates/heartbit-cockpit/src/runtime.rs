@@ -360,6 +360,11 @@ async fn run_from_config(
             enable_reflection: agent.enable_reflection,
             tool_output_compression_threshold: agent.tool_output_compression_threshold,
             max_tools_per_turn: agent.max_tools_per_turn,
+            tool_profile: agent
+                .tool_profile
+                .as_deref()
+                .map(heartbit::parse_tool_profile)
+                .transpose()?,
             max_identical_tool_calls: agent.max_identical_tool_calls,
             session_prune_config: agent.session_prune.as_ref().map(|sp| {
                 heartbit::SessionPruneConfig {

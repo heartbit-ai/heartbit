@@ -46,19 +46,21 @@ pub use agent::routing::{
     AgentCapability, ComplexitySignals, RoutingDecision, RoutingMode, TaskComplexityAnalyzer,
     resolve_routing_mode, should_escalate,
 };
+pub use agent::tool_filter::ToolProfile;
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 pub use config::{
-    ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, ContextStrategyConfig,
-    DaemonConfig, DispatchMode, EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig,
-    KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpServerEntry, MemoryConfig, MetricsConfig,
+    ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, CascadeConfig,
+    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig, DispatchMode,
+    EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig, KnowledgeConfig,
+    KnowledgeSourceConfig, LspConfig, McpServerEntry, MemoryConfig, MetricsConfig,
     OrchestratorConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig,
     SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,
-    TokenBudgetConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort,
+    TokenBudgetConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
 };
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
-    PostgresTaskStore, TaskState, TaskStore, TodoEntry, TodoList, TodoManageTool,
+    PostgresTaskStore, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
 };
 pub use error::Error;
 pub use knowledge::in_memory::InMemoryKnowledgeBase;
@@ -68,6 +70,7 @@ pub use llm::LlmProvider;
 pub use llm::OnApproval;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
+pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
 pub use llm::error_class::{ErrorClass, classify as classify_error};
 pub use llm::openrouter::OpenRouterProvider;
 pub use llm::pricing::estimate_cost;

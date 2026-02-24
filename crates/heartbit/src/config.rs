@@ -3,7 +3,21 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::agent::permission::PermissionRule;
 use crate::agent::routing::RoutingMode;
+use crate::agent::tool_filter::ToolProfile;
 use crate::llm::types::ReasoningEffort;
+
+/// Parse a tool profile string into the enum.
+pub fn parse_tool_profile(s: &str) -> Result<ToolProfile, Error> {
+    match s.to_lowercase().as_str() {
+        "conversational" => Ok(ToolProfile::Conversational),
+        "standard" => Ok(ToolProfile::Standard),
+        "full" => Ok(ToolProfile::Full),
+        _ => Err(Error::Config(format!(
+            "invalid tool_profile '{}': must be conversational, standard, or full",
+            s
+        ))),
+    }
+}
 
 /// Parse a reasoning effort string into the enum.
 pub fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, Error> {
@@ -54,6 +68,66 @@ pub struct ProviderConfig {
     /// Only effective for the `anthropic` provider. Defaults to `false`.
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Model cascading configuration. When enabled, tries cheaper models first
+    /// and escalates to the main model only when the confidence gate rejects.
+    pub cascade: Option<CascadeConfig>,
+}
+
+/// Model cascading configuration for cost-efficient LLM selection.
+///
+/// When enabled, the provider tries cheaper model tiers first and only
+/// escalates to the main (most expensive) model when the confidence gate
+/// rejects the cheaper response or the tier errors.
+#[derive(Debug, Deserialize)]
+pub struct CascadeConfig {
+    /// Enable model cascading. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model tiers from cheapest to most expensive.
+    /// The main `[provider].model` is always the implicit final tier.
+    #[serde(default)]
+    pub tiers: Vec<CascadeTierConfig>,
+    /// Confidence gate configuration. Default: heuristic with sensible defaults.
+    #[serde(default)]
+    pub gate: CascadeGateConfig,
+}
+
+/// A single tier in the model cascade.
+#[derive(Debug, Deserialize)]
+pub struct CascadeTierConfig {
+    pub model: String,
+}
+
+/// Confidence gate configuration for model cascading.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CascadeGateConfig {
+    /// Heuristic gate: zero-cost checks on response length, refusal patterns, etc.
+    Heuristic {
+        /// Minimum output tokens for acceptance (default: 5).
+        #[serde(default = "default_min_output_tokens")]
+        min_output_tokens: u32,
+        /// Accept responses that include tool calls (default: true).
+        #[serde(default = "default_true")]
+        accept_tool_calls: bool,
+        /// Escalate on MaxTokens stop reason (default: true).
+        #[serde(default = "default_true")]
+        escalate_on_max_tokens: bool,
+    },
+}
+
+impl Default for CascadeGateConfig {
+    fn default() -> Self {
+        Self::Heuristic {
+            min_output_tokens: default_min_output_tokens(),
+            accept_tool_calls: true,
+            escalate_on_max_tokens: true,
+        }
+    }
+}
+
+fn default_min_output_tokens() -> u32 {
+    5
 }
 
 /// Retry configuration for transient LLM API failures (429, 500, 502, 503, 529).
@@ -126,6 +200,9 @@ pub struct OrchestratorConfig {
     /// Maximum number of tool definitions sent per LLM turn. When agents have
     /// many tools, filtering to the most relevant reduces context usage and cost.
     pub max_tools_per_turn: Option<usize>,
+    /// Tool profile for pre-filtering tool definitions. Valid values:
+    /// "conversational", "standard", "full". Defaults to no filtering.
+    pub tool_profile: Option<String>,
     /// Maximum consecutive identical tool-call turns before doom loop detection
     /// triggers. When reached, tool calls get error results instead of executing.
     pub max_identical_tool_calls: Option<u32>,
@@ -172,6 +249,7 @@ impl Default for OrchestratorConfig {
             enable_reflection: None,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
+            tool_profile: None,
             max_identical_tool_calls: None,
             dispatch_mode: None,
             routing: RoutingMode::default(),
@@ -237,6 +315,8 @@ pub struct AgentProviderConfig {
     /// Enable Anthropic prompt caching for this agent.
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Per-agent model cascading override.
+    pub cascade: Option<CascadeConfig>,
 }
 
 /// A sub-agent defined in the configuration file.
@@ -282,6 +362,10 @@ pub struct AgentConfig {
     pub tool_output_compression_threshold: Option<usize>,
     /// Maximum tools per turn for this agent. Overrides the orchestrator default.
     pub max_tools_per_turn: Option<usize>,
+    /// Tool profile for pre-filtering tool definitions. Valid values:
+    /// "conversational" (memory + question only), "standard" (builtins only),
+    /// "full" (all tools). When absent, no pre-filtering is applied.
+    pub tool_profile: Option<String>,
     /// Maximum consecutive identical tool-call turns before doom loop detection.
     /// Overrides the orchestrator default.
     pub max_identical_tool_calls: Option<u32>,
@@ -904,6 +988,13 @@ impl HeartbitConfig {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        // Validate top-level provider
+        if self.provider.name.is_empty() {
+            return Err(Error::Config("provider.name must not be empty".into()));
+        }
+        if self.provider.model.is_empty() {
+            return Err(Error::Config("provider.model must not be empty".into()));
+        }
         if self.orchestrator.max_turns == 0 {
             return Err(Error::Config(
                 "orchestrator.max_turns must be at least 1".into(),
@@ -973,10 +1064,35 @@ impl HeartbitConfig {
                 "orchestrator.max_tools_per_turn must be at least 1".into(),
             ));
         }
+        if let Some(ref profile) = self.orchestrator.tool_profile {
+            parse_tool_profile(profile)?;
+        }
         if self.orchestrator.max_identical_tool_calls == Some(0) {
             return Err(Error::Config(
                 "orchestrator.max_identical_tool_calls must be at least 1".into(),
             ));
+        }
+
+        // Validate cascade config: enabled requires at least one tier
+        if let Some(ref cascade) = self.provider.cascade
+            && cascade.enabled
+            && cascade.tiers.is_empty()
+        {
+            return Err(Error::Config(
+                "provider.cascade.enabled is true but no tiers are configured; \
+                 add at least one [[provider.cascade.tiers]] entry"
+                    .into(),
+            ));
+        }
+        // Validate cascade tier models are non-empty
+        if let Some(ref cascade) = self.provider.cascade {
+            for (i, tier) in cascade.tiers.iter().enumerate() {
+                if tier.model.is_empty() {
+                    return Err(Error::Config(format!(
+                        "provider.cascade.tiers[{i}].model must not be empty"
+                    )));
+                }
+            }
         }
 
         // Validate retry config: base_delay_ms <= max_delay_ms
@@ -1123,6 +1239,14 @@ impl HeartbitConfig {
                     "agent '{}': max_identical_tool_calls must be at least 1",
                     agent.name
                 )));
+            }
+            if let Some(ref profile) = agent.tool_profile {
+                parse_tool_profile(profile).map_err(|_| {
+                    Error::Config(format!(
+                        "agent '{}': invalid tool_profile '{}': must be conversational, standard, or full",
+                        agent.name, profile
+                    ))
+                })?;
             }
         }
 
@@ -4730,5 +4854,202 @@ brokers = "localhost:9092"
 "#;
         let config = HeartbitConfig::from_toml(toml_str).unwrap();
         assert!(config.daemon.unwrap().auth.is_none());
+    }
+
+    // --- Cascade config ---
+
+    #[test]
+    fn cascade_config_parses_full() {
+        let toml_str = r#"
+[provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[provider.cascade]
+enabled = true
+
+[[provider.cascade.tiers]]
+model = "anthropic/claude-3.5-haiku"
+
+[provider.cascade.gate]
+type = "heuristic"
+min_output_tokens = 10
+accept_tool_calls = false
+escalate_on_max_tokens = false
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let cascade = config.provider.cascade.unwrap();
+        assert!(cascade.enabled);
+        assert_eq!(cascade.tiers.len(), 1);
+        assert_eq!(cascade.tiers[0].model, "anthropic/claude-3.5-haiku");
+        match &cascade.gate {
+            CascadeGateConfig::Heuristic {
+                min_output_tokens,
+                accept_tool_calls,
+                escalate_on_max_tokens,
+            } => {
+                assert_eq!(*min_output_tokens, 10);
+                assert!(!accept_tool_calls);
+                assert!(!escalate_on_max_tokens);
+            }
+        }
+    }
+
+    #[test]
+    fn cascade_config_defaults_when_absent() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert!(config.provider.cascade.is_none());
+    }
+
+    #[test]
+    fn cascade_config_gate_defaults() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.cascade]
+enabled = true
+
+[[provider.cascade.tiers]]
+model = "claude-3.5-haiku"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let cascade = config.provider.cascade.unwrap();
+        match &cascade.gate {
+            CascadeGateConfig::Heuristic {
+                min_output_tokens,
+                accept_tool_calls,
+                escalate_on_max_tokens,
+            } => {
+                assert_eq!(*min_output_tokens, 5);
+                assert!(accept_tool_calls);
+                assert!(escalate_on_max_tokens);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_cascade_enabled_without_tiers() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.cascade]
+enabled = true
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("no tiers are configured"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn cascade_disabled_with_tiers_is_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.cascade]
+enabled = false
+
+[[provider.cascade.tiers]]
+model = "claude-3.5-haiku"
+"#;
+        // enabled=false means the tiers are ignored; should not error
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let cascade = config.provider.cascade.unwrap();
+        assert!(!cascade.enabled);
+    }
+
+    #[test]
+    fn agent_provider_cascade_config_parses() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "researcher"
+description = "Research agent"
+system_prompt = "You are a researcher."
+
+[agents.provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[agents.provider.cascade]
+enabled = true
+
+[[agents.provider.cascade.tiers]]
+model = "anthropic/claude-3.5-haiku"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let agent_cascade = config.agents[0]
+            .provider
+            .as_ref()
+            .unwrap()
+            .cascade
+            .as_ref()
+            .unwrap();
+        assert!(agent_cascade.enabled);
+        assert_eq!(agent_cascade.tiers.len(), 1);
+    }
+
+    #[test]
+    fn validate_rejects_empty_provider_name() {
+        let toml_str = r#"
+[provider]
+name = ""
+model = "claude-sonnet-4-20250514"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("provider.name must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_provider_model() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("provider.model must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_cascade_tier_model() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.cascade]
+enabled = true
+
+[[provider.cascade.tiers]]
+model = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.cascade.tiers[0].model must not be empty"),
+            "error: {err}"
+        );
     }
 }

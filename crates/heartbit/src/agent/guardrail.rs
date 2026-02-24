@@ -106,6 +106,7 @@ mod tests {
             content: vec![],
             stop_reason: crate::llm::types::StopReason::EndTurn,
             usage: crate::llm::types::TokenUsage::default(),
+            model: None,
         };
         let action = g.post_llm(&response).await.unwrap();
         assert!(matches!(action, GuardAction::Allow));

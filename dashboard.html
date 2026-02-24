@@ -50,6 +50,18 @@
 
   .metrics-raw { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; max-height: 200px; overflow-y: auto; padding: 8px; font-size: 10px; line-height: 1.5; color: #8b949e; white-space: pre; }
 
+  .source-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-right: 4px; }
+  .source-badge.api { background: #1f2937; color: #58a6ff; }
+  .source-badge.telegram { background: #1f2937; color: #a371f7; }
+  .source-badge.ws { background: #1f2937; color: #d29922; }
+  .source-badge.cron { background: #1f2937; color: #8b949e; }
+  .source-badge.sensor { background: #1f2937; color: #3fb950; }
+  .source-badge.heartbit { background: #1f2937; color: #f85149; }
+
+  .agent-pill { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; background: #1c2128; color: #79c0ff; margin: 1px 2px; }
+
+  .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+
   #connection-status { position: fixed; top: 8px; right: 16px; font-size: 11px; padding: 4px 8px; border-radius: 4px; }
   #connection-status.connected { background: #0d1117; color: #3fb950; border: 1px solid #3fb950; }
   #connection-status.disconnected { background: #0d1117; color: #f85149; border: 1px solid #f85149; }
@@ -71,7 +83,7 @@
   <button onclick="submitTask()">Submit</button>
 </div>
 
-<div class="grid">
+<div class="grid-4">
   <div class="card" id="health-card">
     <h2>Health</h2>
     <div class="stat"><span class="stat-label">Status</span><span class="stat-value" id="health-status">--</span></div>
@@ -80,7 +92,7 @@
   </div>
   <div class="card">
     <h2>Tasks</h2>
-    <div class="stat"><span class="stat-label">Submitted</span><span class="stat-value blue" id="m-submitted">0</span></div>
+    <div class="stat"><span class="stat-label">Total</span><span class="stat-value blue" id="m-total">0</span></div>
     <div class="stat"><span class="stat-label">Active</span><span class="stat-value yellow" id="m-active">0</span></div>
     <div class="stat"><span class="stat-label">Completed</span><span class="stat-value green" id="m-completed">0</span></div>
     <div class="stat"><span class="stat-label">Failed</span><span class="stat-value red" id="m-failed">0</span></div>
@@ -92,9 +104,17 @@
     <div class="stat"><span class="stat-label">Output tokens</span><span class="stat-value" id="m-llm-output">0</span></div>
     <div class="stat"><span class="stat-label">Cost (USD)</span><span class="stat-value green" id="m-llm-cost">$0.00</span></div>
   </div>
+  <div class="card">
+    <h2>Sources</h2>
+    <div id="source-breakdown" style="font-size: 11px; color: #8b949e;">No tasks yet</div>
+  </div>
 </div>
 
-<div class="grid-2">
+<div class="grid">
+  <div class="card">
+    <h2>Agents</h2>
+    <div id="agent-stats" style="font-size: 11px; color: #8b949e;">No agent runs yet</div>
+  </div>
   <div class="card">
     <h2>Tools</h2>
     <div id="tool-stats" style="font-size: 11px; color: #8b949e;">No tool calls yet</div>
@@ -105,6 +125,8 @@
     <div class="stat"><span class="stat-label">Doom loops</span><span class="stat-value" id="m-doom">0</span></div>
     <div class="stat"><span class="stat-label">Compactions</span><span class="stat-value" id="m-compactions">0</span></div>
     <div class="stat"><span class="stat-label">Guardrail denials</span><span class="stat-value" id="m-guardrails">0</span></div>
+    <div class="stat"><span class="stat-label">Session prunes</span><span class="stat-value" id="m-prunes">0</span></div>
+    <div class="stat"><span class="stat-label">Summarizations</span><span class="stat-value" id="m-summarizations">0</span></div>
   </div>
 </div>
 
@@ -117,7 +139,7 @@
     <h2>Tasks</h2>
     <div style="max-height: 360px; overflow-y: auto;">
       <table class="tasks-table" id="tasks-table">
-        <thead><tr><th>ID</th><th>State</th><th>Task</th><th>Tokens</th><th>Cost</th></tr></thead>
+        <thead><tr><th>ID</th><th>Source</th><th>State</th><th>Task</th><th>Tokens</th><th>Cost</th></tr></thead>
         <tbody id="tasks-body"></tbody>
       </table>
     </div>
@@ -184,31 +206,85 @@ function parsePrometheus(text) {
   return m;
 }
 
+// Sum all label variants for a metric name, e.g. heartbit_llm_calls_total{agent="x"} + {agent="y"}
+function sumMetric(m, prefix) {
+  let total = 0;
+  for (const [k, v] of Object.entries(m)) {
+    if (k === prefix || k.startsWith(prefix + '{')) total += v;
+  }
+  return total;
+}
+
+// Extract label values: extractLabel(m, 'heartbit_agent_runs_started_total', 'agent') → {analyst: 2, ...}
+function extractLabel(m, prefix, labelName) {
+  const result = {};
+  const re = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\{.*?${labelName}="([^"]+)".*\\}$`);
+  for (const [k, v] of Object.entries(m)) {
+    const match = k.match(re);
+    if (match) result[match[1]] = (result[match[1]] || 0) + v;
+  }
+  return result;
+}
+
+async function pollStats() {
+  try {
+    const stats = await fetch(BASE + '/stats').then(r => r.json());
+    document.getElementById('m-total').textContent = fmt(stats.total_tasks || 0);
+    document.getElementById('m-active').textContent = fmt(stats.active_tasks || 0);
+    document.getElementById('m-completed').textContent = fmt((stats.tasks_by_state || {}).completed || 0);
+    document.getElementById('m-failed').textContent = fmt((stats.tasks_by_state || {}).failed || 0);
+
+    // Source breakdown
+    const srcDiv = document.getElementById('source-breakdown');
+    const sources = stats.tasks_by_source || {};
+    if (Object.keys(sources).length > 0) {
+      srcDiv.innerHTML = Object.entries(sources)
+        .sort((a,b) => b[1] - a[1])
+        .map(([src, cnt]) => `<div class="stat"><span class="stat-label"><span class="source-badge ${src}">${src}</span></span><span class="stat-value">${cnt}</span></div>`)
+        .join('');
+    } else {
+      srcDiv.textContent = 'No tasks yet';
+    }
+  } catch(e) {}
+}
+
 async function pollMetrics() {
   try {
     const text = await fetch(BASE + '/metrics').then(r => r.text());
     const m = parsePrometheus(text);
 
-    document.getElementById('m-submitted').textContent = fmt(m['heartbit_daemon_tasks_submitted_total'] || 0);
-    document.getElementById('m-active').textContent = fmt(m['heartbit_daemon_tasks_active'] || 0);
-    document.getElementById('m-completed').textContent = fmt(m['heartbit_daemon_tasks_completed_total'] || 0);
-    document.getElementById('m-failed').textContent = fmt(m['heartbit_daemon_tasks_failed_total'] || 0);
-
-    document.getElementById('m-llm-calls').textContent = fmt(m['heartbit_llm_calls_total'] || 0);
-    document.getElementById('m-llm-input').textContent = fmt(m['heartbit_llm_tokens_input_total'] || 0);
-    document.getElementById('m-llm-output').textContent = fmt(m['heartbit_llm_tokens_output_total'] || 0);
-    const cost = m['heartbit_llm_cost_usd_total'] || 0;
+    // LLM stats (aggregated across agent labels)
+    document.getElementById('m-llm-calls').textContent = fmt(sumMetric(m, 'heartbit_llm_calls_total'));
+    document.getElementById('m-llm-input').textContent = fmt(sumMetric(m, 'heartbit_llm_tokens_input_total'));
+    document.getElementById('m-llm-output').textContent = fmt(sumMetric(m, 'heartbit_llm_tokens_output_total'));
+    const cost = sumMetric(m, 'heartbit_llm_cost_usd_total');
     document.getElementById('m-llm-cost').textContent = '$' + cost.toFixed(4);
 
+    // Reliability
     document.getElementById('m-retries').textContent = m['heartbit_reliability_retry_attempts_total'] || 0;
     document.getElementById('m-doom').textContent = m['heartbit_reliability_doom_loops_detected_total'] || 0;
     document.getElementById('m-compactions').textContent = m['heartbit_reliability_context_compactions_total'] || 0;
-    document.getElementById('m-guardrails').textContent = m['heartbit_reliability_guardrail_denials_total'] || 0;
+    document.getElementById('m-guardrails').textContent = sumMetric(m, 'heartbit_reliability_guardrail_denials_total');
+    document.getElementById('m-prunes').textContent = m['heartbit_reliability_session_prunes_total'] || 0;
+    document.getElementById('m-summarizations').textContent = m['heartbit_reliability_context_summarizations_total'] || 0;
 
-    // Tool stats
+    // Agent stats (per-agent breakdown)
+    const agents = extractLabel(m, 'heartbit_agent_runs_started_total', 'agent');
+    const agentCompleted = extractLabel(m, 'heartbit_agent_runs_completed_total', 'agent');
+    const agentDiv = document.getElementById('agent-stats');
+    if (Object.keys(agents).length > 0) {
+      agentDiv.innerHTML = Object.entries(agents)
+        .sort((a,b) => b[1] - a[1])
+        .map(([name, started]) => {
+          const completed = agentCompleted[name] || 0;
+          return `<div class="stat"><span class="stat-label"><span class="agent-pill">${name}</span></span><span class="stat-value">${completed}/${started}</span></div>`;
+        }).join('');
+    }
+
+    // Tool stats (aggregated across agent label, grouped by tool_name)
     const tools = {};
     for (const [k, v] of Object.entries(m)) {
-      const tm = k.match(/heartbit_tool_calls_total\{tool_name="([^"]+)"\}/);
+      const tm = k.match(/heartbit_tool_calls_total\{.*?tool_name="([^"]+)".*?\}/);
       if (tm) tools[tm[1]] = (tools[tm[1]] || 0) + v;
     }
     const toolDiv = document.getElementById('tool-stats');
@@ -230,11 +306,12 @@ async function pollTasks() {
     for (const t of (data.tasks || data || [])) {
       const stateClass = 'state-' + (t.state || 'pending').toLowerCase();
       const shortId = (t.id || '').substring(0, 8);
-      const shortTask = (t.task || '').substring(0, 60) + ((t.task||'').length > 60 ? '...' : '');
+      const source = t.source || '?';
+      const shortTask = (t.task || '').substring(0, 50) + ((t.task||'').length > 50 ? '...' : '');
       const tokens = (t.tokens_used?.input_tokens || 0) + (t.tokens_used?.output_tokens || 0);
       const cost = t.estimated_cost_usd ? '$' + t.estimated_cost_usd.toFixed(4) : '-';
       const row = document.createElement('tr');
-      row.innerHTML = `<td>${shortId}</td><td class="${stateClass}">${t.state}</td><td>${shortTask}</td><td>${fmt(tokens)}</td><td>${cost}</td>`;
+      row.innerHTML = `<td>${shortId}</td><td><span class="source-badge ${source}">${source}</span></td><td class="${stateClass}">${t.state}</td><td>${shortTask}</td><td>${fmt(tokens)}</td><td>${cost}</td>`;
       row.style.cursor = 'pointer';
       row.onclick = () => subscribeToTask(t.id);
       tbody.appendChild(row);
@@ -333,9 +410,11 @@ document.getElementById('task-input').addEventListener('keydown', (e) => {
 // --- Polling loops ---
 setInterval(pollHealth, 3000);
 setInterval(pollMetrics, 2000);
+setInterval(pollStats, 3000);
 setInterval(pollTasks, 3000);
 pollHealth();
 pollMetrics();
+pollStats();
 pollTasks();
 </script>
 </body>

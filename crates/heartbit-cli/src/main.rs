@@ -13,7 +13,8 @@ use tracing_subscriber::EnvFilter;
 use heartbit::tool::Tool;
 use heartbit::{
     A2aClient, AgentEvent, AgentOutput, AgentRunner, AnthropicProvider, Blackboard, BoxedProvider,
-    BuiltinToolsConfig, ContextStrategy, ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard,
+    BuiltinToolsConfig, CascadeConfig, CascadeGateConfig, CascadingProvider, ContextStrategy,
+    ContextStrategyConfig, HeartbitConfig, HeuristicGate, InMemoryBlackboard,
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
     McpServerEntry, Memory, MemoryConfig, MemoryQuery, NamespacedMemory, ObservabilityMode,
     OnApproval, OnEvent, OnQuestion, OnRetry, OnText, OpenRouterProvider, Orchestrator,
@@ -420,6 +421,106 @@ pub(crate) fn build_on_retry(on_event: &Arc<OnEvent>) -> Arc<OnRetry> {
     )
 }
 
+/// Build a base `BoxedProvider` from provider name, model, and prompt caching flag.
+///
+/// Does NOT apply retry or cascade — those are layered on by callers.
+fn build_base_provider(
+    provider_name: &str,
+    model: &str,
+    prompt_caching: bool,
+) -> Result<BoxedProvider> {
+    match provider_name {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
+            let base = if prompt_caching {
+                AnthropicProvider::with_prompt_caching(api_key, model)
+            } else {
+                AnthropicProvider::new(api_key, model)
+            };
+            Ok(BoxedProvider::new(base))
+        }
+        "openrouter" => {
+            if prompt_caching {
+                tracing::warn!(
+                    "prompt_caching is only effective with the 'anthropic' provider; \
+                     ignored for 'openrouter'"
+                );
+            }
+            let api_key = std::env::var("OPENROUTER_API_KEY")
+                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
+            let base = OpenRouterProvider::new(api_key, model);
+            Ok(BoxedProvider::new(base))
+        }
+        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    }
+}
+
+/// Build a `HeuristicGate` from cascade gate configuration.
+fn build_gate_from_config(gate_config: &CascadeGateConfig) -> HeuristicGate {
+    match gate_config {
+        CascadeGateConfig::Heuristic {
+            min_output_tokens,
+            accept_tool_calls,
+            escalate_on_max_tokens,
+        } => HeuristicGate {
+            min_output_tokens: *min_output_tokens,
+            accept_tool_calls: *accept_tool_calls,
+            escalate_on_max_tokens: *escalate_on_max_tokens,
+            ..Default::default()
+        },
+    }
+}
+
+/// Wrap a provider with retry if configured, applying the `on_retry` callback.
+fn wrap_with_retry(
+    provider: BoxedProvider,
+    retry: Option<RetryConfig>,
+    on_retry: Option<Arc<OnRetry>>,
+) -> BoxedProvider {
+    match retry {
+        Some(rc) => {
+            let mut retrying = RetryingProvider::new(provider, rc);
+            if let Some(cb) = on_retry {
+                retrying = retrying.with_on_retry(cb);
+            }
+            BoxedProvider::new(retrying)
+        }
+        None => provider,
+    }
+}
+
+/// Wrap a provider with cascade if configured.
+///
+/// Builds a `CascadingProvider` with the configured tiers (cheapest first)
+/// and the main provider as the final (most expensive) tier.
+fn wrap_with_cascade(
+    main_provider: BoxedProvider,
+    main_model: &str,
+    provider_name: &str,
+    prompt_caching: bool,
+    cascade: &CascadeConfig,
+    retry: Option<RetryConfig>,
+    on_retry: Option<&Arc<OnRetry>>,
+) -> Result<BoxedProvider> {
+    let mut builder = CascadingProvider::builder();
+
+    for tier_cfg in &cascade.tiers {
+        let tier_base = build_base_provider(provider_name, &tier_cfg.model, prompt_caching)?;
+        let tier_provider = wrap_with_retry(tier_base, retry.clone(), on_retry.cloned());
+        builder = builder.add_tier(&tier_cfg.model, tier_provider);
+    }
+
+    // Main model is the final (most expensive) tier
+    builder = builder.add_tier(main_model, main_provider);
+    builder = builder.gate(build_gate_from_config(&cascade.gate));
+
+    let tier_labels: Vec<&str> = cascade.tiers.iter().map(|t| t.model.as_str()).collect();
+    tracing::info!(tiers = ?tier_labels, final_tier = main_model, "cascade provider enabled");
+    let cascading = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(BoxedProvider::new(cascading))
+}
+
 /// Construct a type-erased LLM provider from config.
 ///
 /// When `on_retry` is provided, `RetryingProvider` will invoke it before each retry,
@@ -429,49 +530,31 @@ pub(crate) fn build_provider_from_config(
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
     let retry = retry_config_from(config);
-    match config.provider.name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = if config.provider.prompt_caching {
-                AnthropicProvider::with_prompt_caching(api_key, &config.provider.model)
-            } else {
-                AnthropicProvider::new(api_key, &config.provider.model)
-            };
-            match retry {
-                Some(rc) => {
-                    let mut retrying = RetryingProvider::new(base, rc);
-                    if let Some(cb) = on_retry {
-                        retrying = retrying.with_on_retry(cb);
-                    }
-                    Ok(Arc::new(BoxedProvider::new(retrying)))
-                }
-                None => Ok(Arc::new(BoxedProvider::new(base))),
-            }
-        }
-        "openrouter" => {
-            if config.provider.prompt_caching {
-                tracing::warn!(
-                    "prompt_caching is only effective with the 'anthropic' provider; \
-                     ignored for 'openrouter'"
-                );
-            }
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let base = OpenRouterProvider::new(api_key, &config.provider.model);
-            match retry {
-                Some(rc) => {
-                    let mut retrying = RetryingProvider::new(base, rc);
-                    if let Some(cb) = on_retry {
-                        retrying = retrying.with_on_retry(cb);
-                    }
-                    Ok(Arc::new(BoxedProvider::new(retrying)))
-                }
-                None => Ok(Arc::new(BoxedProvider::new(base))),
-            }
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    let base = build_base_provider(
+        &config.provider.name,
+        &config.provider.model,
+        config.provider.prompt_caching,
+    )?;
+
+    // Cascade wrapping (tiers get their own retry; main provider is the final tier)
+    if let Some(ref cascade) = config.provider.cascade
+        && cascade.enabled
+        && !cascade.tiers.is_empty()
+    {
+        let main_with_retry = wrap_with_retry(base, retry.clone(), on_retry.clone());
+        let cascaded = wrap_with_cascade(
+            main_with_retry,
+            &config.provider.model,
+            &config.provider.name,
+            config.provider.prompt_caching,
+            cascade,
+            retry,
+            on_retry.as_ref(),
+        )?;
+        return Ok(Arc::new(cascaded));
     }
+
+    Ok(Arc::new(wrap_with_retry(base, retry, on_retry)))
 }
 
 /// Build a type-erased LLM provider for a per-agent override.
@@ -483,49 +566,27 @@ fn build_agent_provider(
     retry: Option<RetryConfig>,
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
-    match config.name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = if config.prompt_caching {
-                AnthropicProvider::with_prompt_caching(api_key, &config.model)
-            } else {
-                AnthropicProvider::new(api_key, &config.model)
-            };
-            match retry {
-                Some(rc) => {
-                    let mut retrying = RetryingProvider::new(base, rc);
-                    if let Some(cb) = on_retry {
-                        retrying = retrying.with_on_retry(cb);
-                    }
-                    Ok(Arc::new(BoxedProvider::new(retrying)))
-                }
-                None => Ok(Arc::new(BoxedProvider::new(base))),
-            }
-        }
-        "openrouter" => {
-            if config.prompt_caching {
-                tracing::warn!(
-                    "prompt_caching is only effective with the 'anthropic' provider; \
-                     ignored for 'openrouter'"
-                );
-            }
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let base = OpenRouterProvider::new(api_key, &config.model);
-            match retry {
-                Some(rc) => {
-                    let mut retrying = RetryingProvider::new(base, rc);
-                    if let Some(cb) = on_retry {
-                        retrying = retrying.with_on_retry(cb);
-                    }
-                    Ok(Arc::new(BoxedProvider::new(retrying)))
-                }
-                None => Ok(Arc::new(BoxedProvider::new(base))),
-            }
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    let base = build_base_provider(&config.name, &config.model, config.prompt_caching)?;
+
+    // Cascade wrapping for per-agent provider
+    if let Some(ref cascade) = config.cascade
+        && cascade.enabled
+        && !cascade.tiers.is_empty()
+    {
+        let main_with_retry = wrap_with_retry(base, retry.clone(), on_retry.clone());
+        let cascaded = wrap_with_cascade(
+            main_with_retry,
+            &config.model,
+            &config.name,
+            config.prompt_caching,
+            cascade,
+            retry,
+            on_retry.as_ref(),
+        )?;
+        return Ok(Arc::new(cascaded));
     }
+
+    Ok(Arc::new(wrap_with_retry(base, retry, on_retry)))
 }
 
 async fn run_from_config(
@@ -898,6 +959,13 @@ pub(crate) async fn build_orchestrator_from_config(
         if let Some(m) = max_tools {
             rb = rb.max_tools_per_turn(m);
         }
+        let tool_profile_str = agent
+            .tool_profile
+            .as_deref()
+            .or(config.orchestrator.tool_profile.as_deref());
+        if let Some(p) = tool_profile_str {
+            rb = rb.tool_profile(heartbit::parse_tool_profile(p)?);
+        }
         let doom_loop = agent
             .max_identical_tool_calls
             .or(config.orchestrator.max_identical_tool_calls);
@@ -1184,6 +1252,11 @@ pub(crate) async fn build_orchestrator_from_config(
             enable_reflection: agent.enable_reflection,
             tool_output_compression_threshold: agent.tool_output_compression_threshold,
             max_tools_per_turn: agent.max_tools_per_turn,
+            tool_profile: agent
+                .tool_profile
+                .as_deref()
+                .map(heartbit::parse_tool_profile)
+                .transpose()?,
             max_identical_tool_calls: agent.max_identical_tool_calls,
             session_prune_config: agent.session_prune.as_ref().map(|sp| {
                 heartbit::SessionPruneConfig {
@@ -1557,6 +1630,9 @@ async fn run_default_agent(
         && let Ok(n) = max.parse::<usize>()
     {
         builder = builder.max_tools_per_turn(n);
+    }
+    if let Ok(profile_str) = std::env::var("HEARTBIT_TOOL_PROFILE") {
+        builder = builder.tool_profile(heartbit::parse_tool_profile(&profile_str)?);
     }
     if let Ok(max) = std::env::var("HEARTBIT_MAX_IDENTICAL_TOOL_CALLS")
         && let Ok(n) = max.parse::<u32>()
@@ -1942,6 +2018,9 @@ async fn run_chat_from_env(
         && let Ok(n) = max.parse::<usize>()
     {
         builder = builder.max_tools_per_turn(n);
+    }
+    if let Ok(profile_str) = std::env::var("HEARTBIT_TOOL_PROFILE") {
+        builder = builder.tool_profile(heartbit::parse_tool_profile(&profile_str)?);
     }
     if let Ok(max) = std::env::var("HEARTBIT_MAX_IDENTICAL_TOOL_CALLS")
         && let Ok(n) = max.parse::<u32>()

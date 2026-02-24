@@ -19,7 +19,7 @@ pub use kafka::KafkaCommandProducer;
 pub use metrics::DaemonMetrics;
 pub use store::{InMemoryTaskStore, PostgresTaskStore, TaskStore};
 pub use todo::{FileTodoStore, TodoEntry, TodoList, TodoManageTool};
-pub use types::{DaemonCommand, DaemonTask, TaskState};
+pub use types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 
 /// Object-safe async trait for producing daemon commands to a topic.
 ///

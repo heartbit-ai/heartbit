@@ -398,6 +398,7 @@ mod tests {
                 output_tokens: 3,
                 ..Default::default()
             },
+            model: None,
         };
         let resp: LlmCallResponse = cr.into();
         assert_eq!(resp.text(), "Done");
