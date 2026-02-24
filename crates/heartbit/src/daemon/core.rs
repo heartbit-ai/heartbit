@@ -360,6 +360,7 @@ mod tests {
             telegram: None,
             database_url: None,
             heartbit_pulse: None,
+            auth: None,
         }
     }
 

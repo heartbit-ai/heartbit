@@ -496,6 +496,7 @@ mod tests {
             telegram: None,
             database_url: None,
             heartbit_pulse: None,
+            auth: None,
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =

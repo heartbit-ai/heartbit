@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -442,7 +442,10 @@ async fn cors_middleware(
             .status(204)
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
+            .header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization",
+            )
             .header("Access-Control-Max-Age", "3600")
             .body(axum::body::Body::empty())
             .unwrap()
@@ -454,6 +457,75 @@ async fn cors_middleware(
         .headers_mut()
         .insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     response
+}
+
+/// Merge bearer tokens from config and an optional environment variable into a token set.
+///
+/// Returns `None` when no tokens are available (auth disabled).
+fn resolve_auth_tokens(
+    config_tokens: &[String],
+    env_token: Option<String>,
+) -> Option<Arc<HashSet<String>>> {
+    let mut tokens: HashSet<String> = config_tokens.iter().cloned().collect();
+    if let Some(key) = env_token.filter(|k| !k.is_empty()) {
+        tokens.insert(key);
+    }
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(Arc::new(tokens))
+    }
+}
+
+/// Validate a bearer token from the Authorization header.
+///
+/// Returns `Ok(())` if the token is valid, or an error tuple with status code and message.
+fn validate_bearer_token(
+    auth_header: Option<&str>,
+    tokens: &HashSet<String>,
+) -> Result<(), (StatusCode, &'static str)> {
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let token = &value[7..];
+            if token.is_empty() || !tokens.contains(token) {
+                Err((StatusCode::UNAUTHORIZED, "invalid bearer token"))
+            } else {
+                Ok(())
+            }
+        }
+        Some(_) => Err((StatusCode::BAD_REQUEST, "expected Bearer authentication")),
+        None => Err((StatusCode::UNAUTHORIZED, "missing Authorization header")),
+    }
+}
+
+/// Auth middleware that validates Bearer tokens on protected routes.
+async fn auth_middleware(
+    State(tokens): State<Arc<HashSet<String>>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let raw_header = request.headers().get(axum::http::header::AUTHORIZATION);
+
+    // Distinguish "absent" from "present but non-UTF-8"
+    let auth_header = match raw_header {
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid Authorization header encoding"})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    match validate_bearer_token(auth_header, &tokens) {
+        Ok(()) => next.run(request).await.into_response(),
+        Err((status, msg)) => (status, Json(serde_json::json!({"error": msg}))).into_response(),
+    }
 }
 
 // --- Daemon startup ---
@@ -814,6 +886,22 @@ pub async fn run_daemon(
         Arc::new(InMemorySessionStore::new())
     };
 
+    // Resolve auth tokens from config + env
+    let auth_tokens = resolve_auth_tokens(
+        daemon_config
+            .auth
+            .as_ref()
+            .map(|a| a.bearer_tokens.as_slice())
+            .unwrap_or_default(),
+        std::env::var("HEARTBIT_API_KEY").ok(),
+    );
+
+    if auth_tokens.is_some() {
+        tracing::info!("HTTP API authentication enabled (bearer token)");
+    } else {
+        tracing::warn!("HTTP API authentication disabled — all routes are public");
+    }
+
     // Start HTTP server
     let app_state = AppState {
         handle,
@@ -833,22 +921,37 @@ pub async fn run_daemon(
         tool_cache: tool_cache.clone(),
     };
 
-    let mut routes = Router::new()
+    // Public routes — health, readiness, metrics — never require auth
+    let public_routes = Router::new()
+        .route("/healthz", get(handle_healthz))
+        .route("/readyz", get(handle_readyz))
+        .route("/health", get(handle_healthz))
+        .route("/metrics", get(handle_metrics));
+
+    // Protected routes — tasks, SSE, WS, todo
+    let mut protected_routes = Router::new()
         .route("/tasks", post(handle_submit))
         .route("/tasks", get(handle_list))
         .route("/tasks/{id}", get(handle_get))
         .route("/tasks/{id}", delete(handle_cancel))
         .route("/tasks/{id}/events", get(handle_events))
-        .route("/healthz", get(handle_healthz))
-        .route("/readyz", get(handle_readyz))
-        .route("/health", get(handle_healthz))
-        .route("/metrics", get(handle_metrics))
         .route("/todo", get(handle_todo));
 
     if ws_enabled {
-        routes = routes.route("/ws", get(handle_ws_upgrade));
+        protected_routes = protected_routes.route("/ws", get(handle_ws_upgrade));
         tracing::info!("WebSocket endpoint enabled on /ws");
     }
+
+    // Apply auth middleware only when tokens are configured
+    let routes = if let Some(ref tokens) = auth_tokens {
+        let authed = protected_routes.layer(middleware::from_fn_with_state(
+            tokens.clone(),
+            auth_middleware,
+        ));
+        public_routes.merge(authed)
+    } else {
+        public_routes.merge(protected_routes)
+    };
 
     // Start Telegram adapter if configured
     if let Some(ref tg_config) = daemon_config.telegram
@@ -1585,4 +1688,104 @@ async fn run_interactive_task(
     }
 
     result
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn make_tokens(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn valid_token_accepted() {
+        let tokens = make_tokens(&["secret-key-1", "secret-key-2"]);
+        assert!(validate_bearer_token(Some("Bearer secret-key-1"), &tokens).is_ok());
+        assert!(validate_bearer_token(Some("Bearer secret-key-2"), &tokens).is_ok());
+    }
+
+    #[test]
+    fn invalid_token_rejected() {
+        let tokens = make_tokens(&["secret-key-1"]);
+        let err = validate_bearer_token(Some("Bearer wrong-key"), &tokens).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "invalid bearer token");
+    }
+
+    #[test]
+    fn missing_header_rejected() {
+        let tokens = make_tokens(&["secret-key-1"]);
+        let err = validate_bearer_token(None, &tokens).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "missing Authorization header");
+    }
+
+    #[test]
+    fn non_bearer_rejected() {
+        let tokens = make_tokens(&["secret-key-1"]);
+        let err = validate_bearer_token(Some("Basic dXNlcjpwYXNz"), &tokens).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "expected Bearer authentication");
+    }
+
+    #[test]
+    fn empty_bearer_rejected() {
+        let tokens = make_tokens(&["secret-key-1"]);
+        let err = validate_bearer_token(Some("Bearer "), &tokens).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "invalid bearer token");
+    }
+
+    #[test]
+    fn multiple_tokens_all_accepted() {
+        let tokens = make_tokens(&["key-alpha", "key-beta", "key-gamma"]);
+        assert!(validate_bearer_token(Some("Bearer key-alpha"), &tokens).is_ok());
+        assert!(validate_bearer_token(Some("Bearer key-beta"), &tokens).is_ok());
+        assert!(validate_bearer_token(Some("Bearer key-gamma"), &tokens).is_ok());
+    }
+
+    // --- resolve_auth_tokens tests ---
+
+    #[test]
+    fn resolve_merges_config_and_env() {
+        let result = resolve_auth_tokens(&["config-key".into()], Some("env-key".into()));
+        let tokens = result.unwrap();
+        assert!(tokens.contains("config-key"));
+        assert!(tokens.contains("env-key"));
+    }
+
+    #[test]
+    fn resolve_env_only() {
+        let result = resolve_auth_tokens(&[], Some("env-key".into()));
+        let tokens = result.unwrap();
+        assert!(tokens.contains("env-key"));
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn resolve_config_only() {
+        let result = resolve_auth_tokens(&["config-key".into()], None);
+        let tokens = result.unwrap();
+        assert!(tokens.contains("config-key"));
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn resolve_empty_returns_none() {
+        assert!(resolve_auth_tokens(&[], None).is_none());
+    }
+
+    #[test]
+    fn resolve_ignores_empty_env_var() {
+        // HEARTBIT_API_KEY="" should not enable auth
+        assert!(resolve_auth_tokens(&[], Some(String::new())).is_none());
+    }
+
+    #[test]
+    fn resolve_deduplicates() {
+        let result = resolve_auth_tokens(&["shared-key".into()], Some("shared-key".into()));
+        let tokens = result.unwrap();
+        assert_eq!(tokens.len(), 1);
+    }
 }

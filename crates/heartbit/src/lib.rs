@@ -48,8 +48,8 @@ pub use agent::routing::{
 };
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 pub use config::{
-    ActiveHoursConfig, AgentConfig, AgentProviderConfig, ContextStrategyConfig, DaemonConfig,
-    DispatchMode, EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig,
+    ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, ContextStrategyConfig,
+    DaemonConfig, DispatchMode, EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig,
     KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpServerEntry, MemoryConfig, MetricsConfig,
     OrchestratorConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig,
     SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,

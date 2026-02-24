@@ -523,6 +523,15 @@ pub struct DaemonConfig {
     pub database_url: Option<String>,
     /// Heartbit pulse configuration for autonomous periodic awareness.
     pub heartbit_pulse: Option<HeartbitPulseConfig>,
+    /// HTTP API authentication configuration.
+    pub auth: Option<AuthConfig>,
+}
+
+/// HTTP API authentication configuration for the daemon.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    /// Bearer tokens that grant API access. Multiple tokens support key rotation.
+    pub bearer_tokens: Vec<String>,
 }
 
 /// Heartbit pulse configuration for autonomous periodic awareness.
@@ -1245,6 +1254,22 @@ impl HeartbitConfig {
                             hours.end
                         ))
                     })?;
+                }
+            }
+
+            // Validate auth config
+            if let Some(ref auth) = daemon.auth {
+                if auth.bearer_tokens.is_empty() {
+                    return Err(Error::Config(
+                        "daemon.auth.bearer_tokens must not be empty".into(),
+                    ));
+                }
+                for (i, token) in auth.bearer_tokens.iter().enumerate() {
+                    if token.is_empty() {
+                        return Err(Error::Config(format!(
+                            "daemon.auth.bearer_tokens[{i}] must not be empty"
+                        )));
+                    }
                 }
             }
 
@@ -4630,5 +4655,80 @@ system_prompt = "you are a worker"
 "#;
         let config = HeartbitConfig::from_toml(toml_str).unwrap();
         assert!(!config.orchestrator.escalation);
+    }
+
+    #[test]
+    fn auth_config_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+bearer_tokens = ["my-secret-key", "rotation-key-2"]
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let auth = config.daemon.unwrap().auth.unwrap();
+        assert_eq!(auth.bearer_tokens.len(), 2);
+        assert_eq!(auth.bearer_tokens[0], "my-secret-key");
+    }
+
+    #[test]
+    fn auth_config_empty_tokens_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+bearer_tokens = []
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.bearer_tokens must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_config_empty_token_string_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+bearer_tokens = [""]
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.bearer_tokens[0] must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_config_none_is_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert!(config.daemon.unwrap().auth.is_none());
     }
 }
