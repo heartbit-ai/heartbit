@@ -501,50 +501,57 @@ async fn handle_message(
         .config
         .transcription_api_key
         .clone()
-        .or_else(|| std::env::var("HEARTBIT_TRANSCRIPTION_API_KEY").ok());
-    if let Some(voice) = msg.voice()
-        && let Some(ref api_key) = transcription_key
-    {
-        match download_telegram_file(&adapter.bot, &voice.file.id).await {
-            Ok(data) => {
-                let client = reqwest::Client::new();
-                match transcribe_audio(&client, &data, api_key).await {
-                    Ok(transcript) => {
-                        let prefix = format!("[Voice message] {transcript}");
-                        text = if text.is_empty() {
-                            prefix
-                        } else {
-                            format!("{text}\n\n{prefix}")
-                        };
+        .or_else(|| std::env::var("HEARTBIT_TRANSCRIPTION_API_KEY").ok())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+    if let Some(voice) = msg.voice() {
+        if let Some(ref api_key) = transcription_key {
+            match download_telegram_file(&adapter.bot, &voice.file.id).await {
+                Ok(data) => {
+                    let client = reqwest::Client::new();
+                    match transcribe_audio(&client, &data, api_key).await {
+                        Ok(transcript) => {
+                            let prefix = format!("[Voice message] {transcript}");
+                            text = if text.is_empty() {
+                                prefix
+                            } else {
+                                format!("{text}\n\n{prefix}")
+                            };
+                        }
+                        Err(e) => tracing::warn!(error = %e, "voice transcription failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "voice transcription failed"),
                 }
+                Err(e) => tracing::warn!(error = %e, "failed to download telegram voice"),
             }
-            Err(e) => tracing::warn!(error = %e, "failed to download telegram voice"),
+        } else {
+            tracing::warn!(
+                "voice message received but no transcription API key configured — set transcription_api_key in [daemon.telegram] or HEARTBIT_TRANSCRIPTION_API_KEY env var"
+            );
         }
     }
 
     // Audio file handling: transcribe via Whisper API (same as voice)
-    if let Some(audio) = msg.audio()
-        && let Some(ref api_key) = transcription_key
-    {
-        match download_telegram_file(&adapter.bot, &audio.file.id).await {
-            Ok(data) => {
-                let client = reqwest::Client::new();
-                match transcribe_audio(&client, &data, api_key).await {
-                    Ok(transcript) => {
-                        let title = audio.title.as_deref().unwrap_or("audio");
-                        let prefix = format!("[Audio: {title}] {transcript}");
-                        text = if text.is_empty() {
-                            prefix
-                        } else {
-                            format!("{text}\n\n{prefix}")
-                        };
+    if let Some(audio) = msg.audio() {
+        if let Some(ref api_key) = transcription_key {
+            match download_telegram_file(&adapter.bot, &audio.file.id).await {
+                Ok(data) => {
+                    let client = reqwest::Client::new();
+                    match transcribe_audio(&client, &data, api_key).await {
+                        Ok(transcript) => {
+                            let title = audio.title.as_deref().unwrap_or("audio");
+                            let prefix = format!("[Audio: {title}] {transcript}");
+                            text = if text.is_empty() {
+                                prefix
+                            } else {
+                                format!("{text}\n\n{prefix}")
+                            };
+                        }
+                        Err(e) => tracing::warn!(error = %e, "audio transcription failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "audio transcription failed"),
                 }
+                Err(e) => tracing::warn!(error = %e, "failed to download telegram audio"),
             }
-            Err(e) => tracing::warn!(error = %e, "failed to download telegram audio"),
+        } else {
+            tracing::warn!("audio file received but no transcription API key configured");
         }
     }
 
