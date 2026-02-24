@@ -441,12 +441,6 @@ fn build_base_provider(
             Ok(BoxedProvider::new(base))
         }
         "openrouter" => {
-            if prompt_caching {
-                tracing::warn!(
-                    "prompt_caching is only effective with the 'anthropic' provider; \
-                     ignored for 'openrouter'"
-                );
-            }
             let api_key = std::env::var("OPENROUTER_API_KEY")
                 .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
             let base = OpenRouterProvider::new(api_key, model);
@@ -529,6 +523,13 @@ pub(crate) fn build_provider_from_config(
     config: &HeartbitConfig,
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
+    if config.provider.prompt_caching && config.provider.name != "anthropic" {
+        tracing::warn!(
+            "prompt_caching is only effective with the 'anthropic' provider; \
+             ignored for '{}'",
+            config.provider.name
+        );
+    }
     let retry = retry_config_from(config);
     let base = build_base_provider(
         &config.provider.name,
@@ -566,6 +567,13 @@ fn build_agent_provider(
     retry: Option<RetryConfig>,
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
+    if config.prompt_caching && config.name != "anthropic" {
+        tracing::warn!(
+            "prompt_caching is only effective with the 'anthropic' provider; \
+             ignored for '{}'",
+            config.name
+        );
+    }
     let base = build_base_provider(&config.name, &config.model, config.prompt_caching)?;
 
     // Cascade wrapping for per-agent provider
