@@ -44,6 +44,14 @@ pub struct DaemonMetrics {
 
     // Error classification (prefix: heartbit_errors_)
     errors_total: IntCounterVec,
+
+    // Heartbit pulse (prefix: heartbit_pulse_)
+    pulse_runs_total: IntCounter,
+    pulse_ok_total: IntCounter,
+    pulse_action_total: IntCounter,
+
+    // Task source breakdown (prefix: heartbit_daemon_)
+    tasks_by_source_total: IntCounterVec,
 }
 
 impl DaemonMetrics {
@@ -165,6 +173,27 @@ impl DaemonMetrics {
             &["error_class"],
         )?;
 
+        // -- Heartbit pulse --
+        let pulse_runs_total =
+            IntCounter::new("heartbit_pulse_runs_total", "Total heartbit pulse runs")?;
+        let pulse_ok_total = IntCounter::new(
+            "heartbit_pulse_ok_total",
+            "Total heartbit pulse runs with HEARTBIT_OK (idle)",
+        )?;
+        let pulse_action_total = IntCounter::new(
+            "heartbit_pulse_action_total",
+            "Total heartbit pulse runs that triggered actions",
+        )?;
+
+        // -- Task source breakdown --
+        let tasks_by_source_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_daemon_tasks_by_source_total",
+                "Total tasks processed by source (success + failure)",
+            ),
+            &["source"],
+        )?;
+
         // Register all collectors
         registry.register(Box::new(tasks_submitted_total.clone()))?;
         registry.register(Box::new(tasks_completed_total.clone()))?;
@@ -193,6 +222,11 @@ impl DaemonMetrics {
 
         registry.register(Box::new(errors_total.clone()))?;
 
+        registry.register(Box::new(pulse_runs_total.clone()))?;
+        registry.register(Box::new(pulse_ok_total.clone()))?;
+        registry.register(Box::new(pulse_action_total.clone()))?;
+        registry.register(Box::new(tasks_by_source_total.clone()))?;
+
         Ok(Self {
             registry,
             tasks_submitted_total,
@@ -217,6 +251,10 @@ impl DaemonMetrics {
             context_compactions_total,
             guardrail_denials_total,
             errors_total,
+            pulse_runs_total,
+            pulse_ok_total,
+            pulse_action_total,
+            tasks_by_source_total,
         })
     }
 
@@ -331,6 +369,28 @@ impl DaemonMetrics {
     /// Return a reference to the underlying `Registry`.
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Record a heartbit pulse run.
+    pub fn record_pulse_run(&self) {
+        self.pulse_runs_total.inc();
+    }
+
+    /// Record a heartbit pulse that returned HEARTBIT_OK (idle).
+    pub fn record_pulse_ok(&self) {
+        self.pulse_ok_total.inc();
+    }
+
+    /// Record a heartbit pulse that triggered actions.
+    pub fn record_pulse_action(&self) {
+        self.pulse_action_total.inc();
+    }
+
+    /// Record a completed task by its source (e.g. "api", "heartbit", "sensor:rss", "telegram", "ws").
+    pub fn record_task_by_source(&self, source: &str) {
+        self.tasks_by_source_total
+            .with_label_values(&[source])
+            .inc();
     }
 }
 
@@ -655,5 +715,60 @@ mod tests {
         m.record_task_cancelled();
         let text = m.encode().unwrap();
         assert!(text.contains("heartbit_daemon_tasks_cancelled_total 1"));
+    }
+
+    #[test]
+    fn record_task_by_source() {
+        let m = DaemonMetrics::new().unwrap();
+
+        m.record_task_by_source("heartbit");
+        m.record_task_by_source("heartbit");
+        m.record_task_by_source("api");
+        m.record_task_by_source("sensor:rss");
+        m.record_task_by_source("telegram");
+        m.record_task_by_source("ws");
+
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_by_source_total{source="heartbit"} 2"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_by_source_total{source="api"} 1"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_by_source_total{source="sensor:rss"} 1"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_by_source_total{source="telegram"} 1"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_by_source_total{source="ws"} 1"#),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn record_pulse_metrics() {
+        let m = DaemonMetrics::new().unwrap();
+
+        m.record_pulse_run();
+        m.record_pulse_run();
+        m.record_pulse_ok();
+        m.record_pulse_action();
+
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains("heartbit_pulse_runs_total 2"),
+            "expected 2 pulse runs, got: {}",
+            text.lines()
+                .find(|l| l.contains("pulse_runs"))
+                .unwrap_or("not found")
+        );
+        assert!(text.contains("heartbit_pulse_ok_total 1"));
+        assert!(text.contains("heartbit_pulse_action_total 1"));
     }
 }

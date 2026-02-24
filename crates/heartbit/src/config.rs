@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::agent::permission::PermissionRule;
+use crate::agent::routing::RoutingMode;
 use crate::llm::types::ReasoningEffort;
 
 /// Parse a reasoning effort string into the enum.
@@ -38,6 +39,8 @@ pub struct HeartbitConfig {
     pub lsp: Option<LspConfig>,
     /// Daemon mode configuration for Kafka-backed long-running execution.
     pub daemon: Option<DaemonConfig>,
+    /// Optional workspace configuration for agent home directories.
+    pub workspace: Option<WorkspaceConfig>,
 }
 
 /// LLM provider configuration.
@@ -130,6 +133,20 @@ pub struct OrchestratorConfig {
     /// delegate_task schema constrains `maxItems: 1` so the LLM dispatches
     /// one agent at a time. Defaults to `Parallel` when absent.
     pub dispatch_mode: Option<DispatchMode>,
+    /// Task routing strategy: `auto` (default), `always_orchestrate`, `single_agent`.
+    /// `auto` uses heuristic scoring + capability matching to route simple tasks
+    /// to a single agent and complex tasks to the orchestrator.
+    #[serde(default)]
+    pub routing: RoutingMode,
+    /// Escalate from single-agent to orchestrator on failure. Default: true.
+    /// When a single-agent run fails with MaxTurnsExceeded, doom loop, or
+    /// excessive compaction, the task is re-run through the orchestrator.
+    #[serde(default = "default_true")]
+    pub escalation: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_turns() -> usize {
@@ -157,6 +174,8 @@ impl Default for OrchestratorConfig {
             max_tools_per_turn: None,
             max_identical_tool_calls: None,
             dispatch_mode: None,
+            routing: RoutingMode::default(),
+            escalation: true,
         }
     }
 }
@@ -307,6 +326,24 @@ fn default_preserve_task() -> bool {
     true
 }
 
+/// Workspace configuration for agent home directories.
+///
+/// When configured, each agent gets a persistent home directory where it
+/// can freely create and organize files. File tools resolve relative paths
+/// against this directory.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Workspace root directory. All agents share this single directory.
+    /// Defaults to `~/.heartbit/workspaces` if not specified.
+    #[serde(default = "default_workspace_root")]
+    pub root: String,
+}
+
+fn default_workspace_root() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    format!("{home}/.heartbit/workspaces")
+}
+
 /// Memory configuration for the orchestrator.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -452,10 +489,6 @@ fn default_dead_letter_topic() -> String {
     "heartbit.dead-letter".into()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// Prometheus metrics configuration for daemon mode.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetricsConfig {
@@ -488,6 +521,83 @@ pub struct DaemonConfig {
     /// stored in-memory (lost on restart).
     #[serde(default)]
     pub database_url: Option<String>,
+    /// Heartbit pulse configuration for autonomous periodic awareness.
+    pub heartbit_pulse: Option<HeartbitPulseConfig>,
+}
+
+/// Heartbit pulse configuration for autonomous periodic awareness.
+///
+/// When enabled, the daemon periodically reviews its persistent todo list
+/// and decides what to work on next — a cognitive pulse loop.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeartbitPulseConfig {
+    /// Enable the heartbit pulse. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interval in seconds between heartbit pulse ticks. Defaults to 1800 (30 min).
+    #[serde(default = "default_pulse_interval")]
+    pub interval_seconds: u64,
+    /// Active hours window. When set, the pulse only fires within this window.
+    pub active_hours: Option<ActiveHoursConfig>,
+    /// Custom prompt override for the heartbit pulse. When absent, the
+    /// default built-in prompt is used.
+    pub prompt: Option<String>,
+    /// Number of consecutive HEARTBIT_OK responses before doubling the
+    /// interval (idle backoff). Defaults to 6 (3h at 30min interval).
+    #[serde(default = "default_idle_backoff_threshold")]
+    pub idle_backoff_threshold: u32,
+}
+
+fn default_pulse_interval() -> u64 {
+    1800
+}
+
+fn default_idle_backoff_threshold() -> u32 {
+    6
+}
+
+/// Active hours window for the heartbit pulse.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActiveHoursConfig {
+    /// Start time in "HH:MM" format (24-hour).
+    pub start: String,
+    /// End time in "HH:MM" format (24-hour).
+    pub end: String,
+}
+
+impl ActiveHoursConfig {
+    /// Parse the start hour and minute. Returns `(hour, minute)`.
+    pub fn parse_start(&self) -> Result<(u32, u32), Error> {
+        parse_hhmm(&self.start)
+    }
+
+    /// Parse the end hour and minute. Returns `(hour, minute)`.
+    pub fn parse_end(&self) -> Result<(u32, u32), Error> {
+        parse_hhmm(&self.end)
+    }
+}
+
+fn parse_hhmm(s: &str) -> Result<(u32, u32), Error> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err(Error::Config(format!(
+            "invalid time format '{}': expected HH:MM",
+            s
+        )));
+    }
+    let hour: u32 = parts[0]
+        .parse()
+        .map_err(|_| Error::Config(format!("invalid hour in '{s}'")))?;
+    let minute: u32 = parts[1]
+        .parse()
+        .map_err(|_| Error::Config(format!("invalid minute in '{s}'")))?;
+    if hour > 23 || minute > 59 {
+        return Err(Error::Config(format!(
+            "time '{}' out of range (00:00-23:59)",
+            s
+        )));
+    }
+    Ok((hour, minute))
 }
 
 /// WebSocket configuration for bidirectional user↔agent communication.
@@ -1115,6 +1225,29 @@ impl HeartbitConfig {
                     "daemon.kafka.brokers must not be empty".into(),
                 ));
             }
+            // Validate heartbit pulse config
+            if let Some(ref pulse) = daemon.heartbit_pulse {
+                if pulse.interval_seconds == 0 {
+                    return Err(Error::Config(
+                        "daemon.heartbit_pulse.interval_seconds must be at least 1".into(),
+                    ));
+                }
+                if let Some(ref hours) = pulse.active_hours {
+                    hours.parse_start().map_err(|_| {
+                        Error::Config(format!(
+                            "daemon.heartbit_pulse.active_hours.start '{}' is invalid; expected HH:MM",
+                            hours.start
+                        ))
+                    })?;
+                    hours.parse_end().map_err(|_| {
+                        Error::Config(format!(
+                            "daemon.heartbit_pulse.active_hours.end '{}' is invalid; expected HH:MM",
+                            hours.end
+                        ))
+                    })?;
+                }
+            }
+
             let mut schedule_names = std::collections::HashSet::new();
             for (i, schedule) in daemon.schedules.iter().enumerate() {
                 if schedule.name.is_empty() {
@@ -4188,5 +4321,314 @@ brokers = "localhost:9092"
             config.daemon.unwrap().database_url.as_deref(),
             Some("postgresql://localhost/heartbit_tasks")
         );
+    }
+
+    #[test]
+    fn workspace_config_explicit_root() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_turns = 5
+max_tokens = 4096
+
+[workspace]
+root = "/custom/workspaces"
+
+[[agents]]
+name = "test"
+description = "test"
+system_prompt = "test"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let ws = config.workspace.unwrap();
+        assert_eq!(ws.root, "/custom/workspaces");
+    }
+
+    #[test]
+    fn workspace_config_default_root() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_turns = 5
+max_tokens = 4096
+
+[workspace]
+
+[[agents]]
+name = "test"
+description = "test"
+system_prompt = "test"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let ws = config.workspace.unwrap();
+        // Should use the default path
+        assert!(ws.root.contains(".heartbit/workspaces"));
+    }
+
+    #[test]
+    fn workspace_config_absent() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_turns = 5
+max_tokens = 4096
+
+[[agents]]
+name = "test"
+description = "test"
+system_prompt = "test"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.workspace.is_none());
+    }
+
+    #[test]
+    fn heartbit_pulse_config_parses() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.heartbit_pulse]
+enabled = true
+interval_seconds = 900
+
+[daemon.heartbit_pulse.active_hours]
+start = "08:00"
+end = "22:00"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let daemon = config.daemon.unwrap();
+        let pulse = daemon.heartbit_pulse.unwrap();
+        assert!(pulse.enabled);
+        assert_eq!(pulse.interval_seconds, 900);
+        assert_eq!(pulse.idle_backoff_threshold, 6); // default
+        assert!(pulse.prompt.is_none());
+        let hours = pulse.active_hours.unwrap();
+        assert_eq!(hours.start, "08:00");
+        assert_eq!(hours.end, "22:00");
+    }
+
+    #[test]
+    fn heartbit_pulse_config_defaults() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.heartbit_pulse]
+enabled = true
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        let pulse = config.daemon.unwrap().heartbit_pulse.unwrap();
+        assert!(pulse.enabled);
+        assert_eq!(pulse.interval_seconds, 1800); // default
+        assert_eq!(pulse.idle_backoff_threshold, 6); // default
+        assert!(pulse.active_hours.is_none());
+    }
+
+    #[test]
+    fn heartbit_pulse_config_absent() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert!(config.daemon.unwrap().heartbit_pulse.is_none());
+    }
+
+    #[test]
+    fn active_hours_parse_valid() {
+        let ah = ActiveHoursConfig {
+            start: "08:30".into(),
+            end: "22:00".into(),
+        };
+        assert_eq!(ah.parse_start().unwrap(), (8, 30));
+        assert_eq!(ah.parse_end().unwrap(), (22, 0));
+    }
+
+    #[test]
+    fn active_hours_parse_midnight() {
+        let ah = ActiveHoursConfig {
+            start: "00:00".into(),
+            end: "23:59".into(),
+        };
+        assert_eq!(ah.parse_start().unwrap(), (0, 0));
+        assert_eq!(ah.parse_end().unwrap(), (23, 59));
+    }
+
+    #[test]
+    fn active_hours_parse_invalid_format() {
+        let ah = ActiveHoursConfig {
+            start: "8am".into(),
+            end: "22:00".into(),
+        };
+        assert!(ah.parse_start().is_err());
+    }
+
+    #[test]
+    fn active_hours_parse_out_of_range() {
+        let ah = ActiveHoursConfig {
+            start: "25:00".into(),
+            end: "22:00".into(),
+        };
+        assert!(ah.parse_start().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_pulse_zero_interval() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.heartbit_pulse]
+enabled = true
+interval_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.heartbit_pulse.interval_seconds"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_pulse_invalid_active_hours() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.heartbit_pulse]
+enabled = true
+interval_seconds = 1800
+
+[daemon.heartbit_pulse.active_hours]
+start = "bad"
+end = "22:00"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.heartbit_pulse.active_hours.start"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn routing_defaults_to_auto_when_missing() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-3-5-sonnet"
+
+[[agents]]
+name = "worker"
+description = "worker agent"
+system_prompt = "you are a worker"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert_eq!(config.orchestrator.routing, RoutingMode::Auto);
+        assert!(config.orchestrator.escalation);
+    }
+
+    #[test]
+    fn routing_parses_always_orchestrate() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-3-5-sonnet"
+
+[orchestrator]
+routing = "always_orchestrate"
+
+[[agents]]
+name = "worker"
+description = "worker agent"
+system_prompt = "you are a worker"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert_eq!(config.orchestrator.routing, RoutingMode::AlwaysOrchestrate);
+    }
+
+    #[test]
+    fn routing_parses_single_agent() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-3-5-sonnet"
+
+[orchestrator]
+routing = "single_agent"
+
+[[agents]]
+name = "worker"
+description = "worker agent"
+system_prompt = "you are a worker"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert_eq!(config.orchestrator.routing, RoutingMode::SingleAgent);
+    }
+
+    #[test]
+    fn escalation_defaults_to_true() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-3-5-sonnet"
+
+[[agents]]
+name = "worker"
+description = "worker agent"
+system_prompt = "you are a worker"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert!(config.orchestrator.escalation);
+    }
+
+    #[test]
+    fn escalation_can_be_disabled() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-3-5-sonnet"
+
+[orchestrator]
+escalation = false
+
+[[agents]]
+name = "worker"
+description = "worker agent"
+system_prompt = "you are a worker"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert!(!config.orchestrator.escalation);
     }
 }

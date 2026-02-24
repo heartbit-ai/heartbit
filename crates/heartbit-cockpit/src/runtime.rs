@@ -371,6 +371,7 @@ async fn run_from_config(
             enable_recursive_summarization: agent.recursive_summarization,
             reflection_threshold: agent.reflection_threshold,
             consolidate_on_exit: agent.consolidate_on_exit,
+            workspace: None,
         });
     }
 

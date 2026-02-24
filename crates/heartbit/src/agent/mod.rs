@@ -8,6 +8,7 @@ pub mod observability;
 pub mod orchestrator;
 pub mod permission;
 pub mod pruner;
+pub mod routing;
 pub(crate) mod token_estimator;
 
 use std::collections::HashMap;
@@ -42,6 +43,18 @@ use self::guardrail::{GuardAction, Guardrail};
 pub type OnInput = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
     + Send
     + Sync;
+
+/// Behavioral guidelines appended to every agent's system prompt.
+/// Ensures agents proactively discover capabilities and exhaust options
+/// before claiming they cannot do something.
+const RESOURCEFULNESS_GUIDELINES: &str = "\n\n\
+## Resourcefulness\n\
+Before claiming you cannot do something or lack access to a tool:\n\
+- Use bash to check for installed CLIs (`which <tool>`, `command -v <tool>`).\n\
+- Search for files, configs, and resources before saying they don't exist.\n\
+- Read documentation, help output (`<tool> --help`), and man pages when unsure.\n\
+- Try alternative approaches when the first attempt fails.\n\
+Never say \"I don't have access\" or \"I can't\" without evidence. Investigate first.";
 
 /// Tracks consecutive identical tool-call turns to detect doom loops.
 ///
@@ -222,6 +235,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             reflection_threshold: None,
             consolidate_on_exit: false,
             observability_mode: None,
+            workspace: None,
         }
     }
 
@@ -1637,6 +1651,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     reflection_threshold: Option<u32>,
     consolidate_on_exit: bool,
     observability_mode: Option<observability::ObservabilityMode>,
+    /// Optional workspace root for file tool path resolution and system prompt.
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -1922,6 +1938,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the agent's workspace directory. When set, file tools resolve
+    /// relative paths against this directory, BashTool starts here, and a
+    /// workspace hint is appended to the system prompt.
+    pub fn workspace(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = Some(path.into());
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.name.is_empty() {
             return Err(Error::Config("agent name must not be empty".into()));
@@ -2006,10 +2030,25 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         }
 
         // Prepend instruction text to the system prompt if provided.
-        let system_prompt = match self.instruction_text {
+        let mut system_prompt = match self.instruction_text {
             Some(ref text) => instructions::prepend_instructions(&self.system_prompt, text),
             None => self.system_prompt,
         };
+
+        // Append workspace hint to the system prompt if configured.
+        if let Some(ref ws) = self.workspace {
+            system_prompt.push_str(&format!(
+                "\n\nYour workspace directory is {}. You can freely create, organize, and manage \
+                 files there. Use it for notes, intermediate results, generated artifacts, and \
+                 anything you want to persist. Paths can be relative (resolved against workspace) \
+                 or absolute.",
+                ws.display()
+            ));
+        }
+
+        // Append resourcefulness guidelines — ensures agents always verify
+        // capabilities and explore solutions before claiming they cannot.
+        system_prompt.push_str(RESOURCEFULNESS_GUIDELINES);
 
         Ok(AgentRunner {
             provider: self.provider,
@@ -6515,5 +6554,47 @@ mod tests {
         assert_eq!(output.result, "blocked");
         // Turn 2's "rm -rf /" should be denied by config rule even though
         // we have a learned Allow rule for bash
+    }
+
+    #[tokio::test]
+    async fn workspace_injects_system_prompt_hint() {
+        let provider = MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        }]);
+        let runner = AgentRunner::builder(Arc::new(provider))
+            .name("test")
+            .system_prompt("base prompt")
+            .workspace("/test/workspace")
+            .build()
+            .unwrap();
+
+        // The system prompt should contain the workspace path
+        assert!(runner.system_prompt.contains("/test/workspace"));
+        assert!(runner.system_prompt.contains("base prompt"));
+        assert!(runner.system_prompt.contains("workspace directory"));
+    }
+
+    #[tokio::test]
+    async fn no_workspace_no_prompt_hint() {
+        let provider = MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        }]);
+        let runner = AgentRunner::builder(Arc::new(provider))
+            .name("test")
+            .system_prompt("base prompt")
+            .build()
+            .unwrap();
+
+        assert!(runner.system_prompt.starts_with("base prompt"));
+        assert!(runner.system_prompt.contains("Resourcefulness"));
+        assert!(!runner.system_prompt.contains("workspace"));
     }
 }

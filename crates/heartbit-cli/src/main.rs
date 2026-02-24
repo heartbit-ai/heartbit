@@ -2,6 +2,7 @@ mod daemon;
 mod serve;
 mod submit;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,10 +15,10 @@ use heartbit::{
     A2aClient, AgentEvent, AgentOutput, AgentRunner, AnthropicProvider, Blackboard, BoxedProvider,
     BuiltinToolsConfig, ContextStrategy, ContextStrategyConfig, HeartbitConfig, InMemoryBlackboard,
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
-    McpServerEntry, Memory, MemoryConfig, MemoryQuery, ObservabilityMode, OnApproval, OnEvent,
-    OnQuestion, OnRetry, OnText, OpenRouterProvider, Orchestrator, PostgresMemoryStore,
-    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
-    builtin_tools,
+    McpServerEntry, Memory, MemoryConfig, MemoryQuery, NamespacedMemory, ObservabilityMode,
+    OnApproval, OnEvent, OnQuestion, OnRetry, OnText, OpenRouterProvider, Orchestrator,
+    PostgresMemoryStore, QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider,
+    SubAgentConfig, ToolCall, Workspace, builtin_tools,
 };
 
 #[derive(Parser)]
@@ -238,6 +239,34 @@ pub(crate) fn load_learned_permissions()
             None
         }
     }
+}
+
+/// Provision a workspace directory, creating it if needed.
+///
+/// Returns `Some(path)` on success, logs a warning and returns `None` on failure.
+pub(crate) fn provision_workspace(root: &std::path::Path) -> Option<PathBuf> {
+    match Workspace::open(root) {
+        Ok(ws) => Some(ws.root().to_path_buf()),
+        Err(e) => {
+            tracing::warn!(path = %root.display(), error = %e, "failed to create workspace, continuing without");
+            None
+        }
+    }
+}
+
+/// Resolve workspace root from config, falling back to the default.
+pub(crate) fn workspace_root_from_config(config: &HeartbitConfig) -> PathBuf {
+    config
+        .workspace
+        .as_ref()
+        .map(|ws| PathBuf::from(&ws.root))
+        .unwrap_or_else(default_workspace_root_path)
+}
+
+/// Default workspace root when no config is available (`~/.heartbit/workspaces`).
+fn default_workspace_root_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(format!("{home}/.heartbit/workspaces"))
 }
 
 #[tokio::main]
@@ -531,6 +560,9 @@ async fn run_from_config(
         None
     };
 
+    let ws_root = workspace_root_from_config(&config);
+    let workspace_dir = provision_workspace(&ws_root);
+
     let mut output = build_orchestrator_from_config(
         provider,
         &config,
@@ -540,8 +572,11 @@ async fn run_from_config(
         on_event,
         mode,
         None, // no story_id in CLI run mode
-        None, // CLI uses stdin-based question callback via create_builtin_tools()
+        None, // CLI uses stdin-based question callback
         None, // no external memory in CLI run mode
+        workspace_dir,
+        None, // no daemon todo store in CLI run mode
+        None, // no pre-loaded tools in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -621,13 +656,396 @@ pub(crate) async fn build_orchestrator_from_config(
     story_id: Option<&str>,
     on_question: Option<Arc<OnQuestion>>,
     external_memory: Option<Arc<dyn Memory>>,
+    workspace_dir: Option<std::path::PathBuf>,
+    daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
+    pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn Tool>>>>,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
+
+    // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
+    let builtins = {
+        let btc = BuiltinToolsConfig {
+            on_question: on_question.clone().or_else(|| Some(question_callback())),
+            workspace: workspace_dir.clone(),
+            daemon_todo_store,
+            ..Default::default()
+        };
+        builtin_tools(btc)
+    };
+
+    // ── Shared memory + story context pre-loading ──
+    let mut task_text = task.to_string();
+    let base_memory = if let Some(ext) = external_memory {
+        Some(ext)
+    } else if let Some(ref memory_config) = config.memory {
+        Some(create_memory_store(memory_config).await?)
+    } else {
+        None
+    };
+    if let Some(ref base_memory) = base_memory
+        && let Some(sid) = story_id
+    {
+        let prior = base_memory
+            .recall(MemoryQuery {
+                limit: 10,
+                agent_prefix: Some(sid.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default();
+
+        if !prior.is_empty() {
+            let ctx: String = prior
+                .iter()
+                .map(|e| format!("- [{}] {}", e.category, e.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            task_text = format!("## Prior story context\n{ctx}\n\n## Current task\n{task_text}");
+            tracing::info!(
+                story_id = sid,
+                prior_memories = prior.len(),
+                "loaded story context into task"
+            );
+        }
+    }
+
+    // ── Routing decision ──
+    // Replace static agent-count check with complexity-based routing.
+    // Three modes: Auto (heuristic + capability match), AlwaysOrchestrate, SingleAgent.
+    let routing_mode = heartbit::resolve_routing_mode(config.orchestrator.routing);
+
+    // Event collector for Tier 3 escalation decisions.
+    // When routing in auto mode with escalation enabled, we need to capture
+    // events from the single-agent run to check for doom loops / compactions.
+    let event_collector: Arc<std::sync::Mutex<Vec<heartbit::AgentEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let (route_to_single, selected_agent_index) = match routing_mode {
+        heartbit::RoutingMode::AlwaysOrchestrate => (false, None),
+        heartbit::RoutingMode::SingleAgent => (true, Some(0)),
+        heartbit::RoutingMode::Auto => {
+            if config.agents.len() == 1 {
+                // Single agent configured → skip analysis, zero overhead
+                (true, Some(0))
+            } else if config.agents.is_empty() {
+                (false, None)
+            } else {
+                // Build capability list from agent descriptions.
+                // Tool names aren't known until MCP connection, so we rely on
+                // the agent description for domain extraction.
+                let capabilities: Vec<heartbit::AgentCapability> = config
+                    .agents
+                    .iter()
+                    .map(|a| heartbit::AgentCapability::from_config(&a.name, &a.description, &[]))
+                    .collect();
+                let analyzer = heartbit::TaskComplexityAnalyzer::new(&capabilities);
+                let (decision, signals) = analyzer.analyze(&task_text);
+
+                // Emit TaskRouted event
+                let (is_single, idx) = match &decision {
+                    heartbit::RoutingDecision::SingleAgent { agent_index, .. } => {
+                        (true, Some(*agent_index))
+                    }
+                    heartbit::RoutingDecision::Orchestrate { .. } => (false, None),
+                };
+                if let Some(ref on_ev) = on_event {
+                    let selected_name = idx.map(|i| config.agents[i].name.clone());
+                    on_ev(heartbit::AgentEvent::TaskRouted {
+                        decision: if is_single {
+                            "single_agent".into()
+                        } else {
+                            "orchestrate".into()
+                        },
+                        reason: match &decision {
+                            heartbit::RoutingDecision::SingleAgent { reason, .. }
+                            | heartbit::RoutingDecision::Orchestrate { reason } => {
+                                (*reason).to_string()
+                            }
+                        },
+                        selected_agent: selected_name,
+                        complexity_score: signals.complexity_score,
+                        escalated: false,
+                    });
+                }
+                tracing::info!(
+                    routing = if is_single { "single_agent" } else { "orchestrate" },
+                    score = signals.complexity_score,
+                    domains = ?signals.domain_signals,
+                    "task routing decision"
+                );
+                (is_single, idx)
+            }
+        }
+    };
+
+    if route_to_single {
+        let agent_index = selected_agent_index.unwrap_or(0);
+        if agent_index >= config.agents.len() {
+            anyhow::bail!(
+                "routing selected agent index {agent_index} but only {} agents configured",
+                config.agents.len()
+            );
+        }
+        let agent = &config.agents[agent_index];
+
+        // Load tools: builtins + (cached or fresh) MCP + A2A
+        let mut tools = builtins.clone();
+        match pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
+            Some(cached) => tools.extend(cached.iter().cloned()),
+            None => {
+                tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
+                tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+            }
+        }
+
+        // Provider: agent-specific or global
+        let agent_provider: Arc<BoxedProvider> = match &agent.provider {
+            Some(p) => build_agent_provider(p, retry_config_from(config), on_retry.clone())?,
+            None => Arc::clone(&provider),
+        };
+
+        // Settings: agent overrides, falling back to orchestrator defaults
+        let max_turns = agent.max_turns.unwrap_or(config.orchestrator.max_turns);
+        let max_tokens = agent.max_tokens.unwrap_or(config.orchestrator.max_tokens);
+
+        let mut rb = AgentRunner::builder(agent_provider)
+            .name(&agent.name)
+            .system_prompt(&agent.system_prompt)
+            .tools(tools)
+            .max_turns(max_turns)
+            .max_tokens(max_tokens)
+            .on_text(Arc::clone(&on_text))
+            .observability_mode(observability_mode);
+
+        // Context strategy: agent-level, then orchestrator-level fallback
+        match &agent.context_strategy {
+            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+                rb = rb.context_strategy(ContextStrategy::SlidingWindow {
+                    max_tokens: *max_tokens,
+                });
+            }
+            Some(ContextStrategyConfig::Summarize { threshold }) => {
+                rb = rb.summarize_threshold(*threshold);
+            }
+            Some(ContextStrategyConfig::Unlimited) | None => {
+                if let Some(st) = agent.summarize_threshold {
+                    rb = rb.summarize_threshold(st);
+                } else {
+                    match &config.orchestrator.context_strategy {
+                        Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+                            rb = rb.context_strategy(ContextStrategy::SlidingWindow {
+                                max_tokens: *max_tokens,
+                            });
+                        }
+                        Some(ContextStrategyConfig::Summarize { threshold }) => {
+                            rb = rb.summarize_threshold(*threshold);
+                        }
+                        _ => {
+                            if let Some(threshold) = config.orchestrator.summarize_threshold {
+                                rb = rb.summarize_threshold(threshold);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Timeouts: agent-level, then orchestrator-level fallback
+        let tool_timeout = agent
+            .tool_timeout_seconds
+            .or(config.orchestrator.tool_timeout_seconds)
+            .map(std::time::Duration::from_secs);
+        if let Some(t) = tool_timeout {
+            rb = rb.tool_timeout(t);
+        }
+        let max_tool_output = agent
+            .max_tool_output_bytes
+            .or(config.orchestrator.max_tool_output_bytes);
+        if let Some(m) = max_tool_output {
+            rb = rb.max_tool_output_bytes(m);
+        }
+        let run_timeout = agent
+            .run_timeout_seconds
+            .or(config.orchestrator.run_timeout_seconds)
+            .map(std::time::Duration::from_secs);
+        if let Some(t) = run_timeout {
+            rb = rb.run_timeout(t);
+        }
+
+        // Reasoning / reflection / compression: agent-level, then orchestrator-level
+        let reasoning_effort = agent
+            .reasoning_effort
+            .as_deref()
+            .or(config.orchestrator.reasoning_effort.as_deref());
+        if let Some(effort) = reasoning_effort {
+            rb = rb.reasoning_effort(heartbit::config::parse_reasoning_effort(effort)?);
+        }
+        let reflection = agent
+            .enable_reflection
+            .or(config.orchestrator.enable_reflection);
+        if let Some(true) = reflection {
+            rb = rb.enable_reflection(true);
+        }
+        let compression = agent
+            .tool_output_compression_threshold
+            .or(config.orchestrator.tool_output_compression_threshold);
+        if let Some(t) = compression {
+            rb = rb.tool_output_compression_threshold(t);
+        }
+        let max_tools = agent
+            .max_tools_per_turn
+            .or(config.orchestrator.max_tools_per_turn);
+        if let Some(m) = max_tools {
+            rb = rb.max_tools_per_turn(m);
+        }
+        let doom_loop = agent
+            .max_identical_tool_calls
+            .or(config.orchestrator.max_identical_tool_calls);
+        if let Some(m) = doom_loop {
+            rb = rb.max_identical_tool_calls(m);
+        }
+
+        // Session prune config
+        if let Some(ref sp) = agent.session_prune {
+            rb = rb.session_prune_config(heartbit::SessionPruneConfig {
+                keep_recent_n: sp.keep_recent_n,
+                pruned_tool_result_max_bytes: sp.pruned_tool_result_max_bytes,
+                preserve_task: sp.preserve_task,
+            });
+        }
+        if let Some(true) = agent.recursive_summarization {
+            rb = rb.enable_recursive_summarization(true);
+        }
+        if let Some(t) = agent.reflection_threshold {
+            rb = rb.reflection_threshold(t);
+        }
+        if let Some(true) = agent.consolidate_on_exit {
+            rb = rb.consolidate_on_exit(true);
+        }
+
+        // Callbacks
+        if let Some(ref cb) = on_approval {
+            rb = rb.on_approval(Arc::clone(cb));
+        }
+        // Wrap on_event to also collect events for escalation decisions.
+        {
+            let collector = Arc::clone(&event_collector);
+            let inner_cb = on_event.clone();
+            let collecting_cb: Arc<heartbit::OnEvent> =
+                Arc::new(move |event: heartbit::AgentEvent| {
+                    {
+                        let mut events = collector.lock().expect("event collector lock");
+                        events.push(event.clone());
+                    }
+                    if let Some(ref cb) = inner_cb {
+                        cb(event);
+                    }
+                });
+            rb = rb.on_event(collecting_cb);
+        }
+
+        // Permission rules + learned permissions
+        {
+            let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());
+            if let Some(ref learned) = load_learned_permissions() {
+                let guard = learned.lock().expect("learned permissions lock");
+                ruleset.append_rules(guard.rules());
+                rb = rb.learned_permissions(learned.clone());
+            }
+            if !ruleset.is_empty() {
+                rb = rb.permission_rules(ruleset);
+            }
+        }
+
+        // Instruction text (HEARTBIT.md)
+        if let Some(text) = load_instruction_text() {
+            rb = rb.instruction_text(text);
+        }
+
+        // Workspace
+        if let Some(ref ws) = workspace_dir {
+            rb = rb.workspace(ws.clone());
+        }
+
+        // Memory with namespace
+        if let Some(ref base_memory) = base_memory {
+            let agent_ns = match story_id {
+                Some(sid) => format!("{sid}:{}", agent.name),
+                None => agent.name.clone(),
+            };
+            let namespaced: Arc<dyn Memory> =
+                Arc::new(NamespacedMemory::new(Arc::clone(base_memory), agent_ns));
+            rb = rb.memory(namespaced);
+        }
+
+        // Knowledge base
+        if let Some(ref knowledge_config) = config.knowledge {
+            let kb = load_knowledge_base(knowledge_config).await?;
+            rb = rb.knowledge(kb);
+        }
+
+        // LSP integration
+        if let Some(ref lsp_config) = config.lsp
+            && lsp_config.enabled
+        {
+            let workspace_root = std::env::current_dir().unwrap_or_default();
+            rb = rb.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
+        }
+
+        tracing::info!(
+            agent = %agent.name,
+            max_turns,
+            routing = ?routing_mode,
+            "single-agent path: bypassing orchestrator"
+        );
+
+        let runner = rb.build()?;
+        match runner.execute(&task_text).await {
+            Ok(output) => return Ok(output),
+            Err(err) => {
+                // Tier 3: escalation — if enabled and the failure warrants it,
+                // fall through to orchestrator with partial context.
+                let collected_events = event_collector
+                    .lock()
+                    .expect("event collector lock")
+                    .clone();
+                let should_esc = config.orchestrator.escalation
+                    && config.agents.len() > 1
+                    && heartbit::should_escalate(&err, &collected_events);
+                if should_esc {
+                    if let Some(ref on_ev) = on_event {
+                        on_ev(heartbit::AgentEvent::TaskRouted {
+                            decision: "orchestrate".into(),
+                            reason: format!("escalated after single-agent failure: {err}"),
+                            selected_agent: None,
+                            complexity_score: 0.0,
+                            escalated: true,
+                        });
+                    }
+                    tracing::warn!(
+                        error = %err,
+                        "single-agent failed, escalating to orchestrator"
+                    );
+                    // Fall through to orchestrator path below
+                } else {
+                    return Err(err.into());
+                }
+            }
+        }
+    }
+
+    // ── Multi-agent orchestrator path ──
+
     let mut builder = Orchestrator::builder(provider)
         .max_turns(config.orchestrator.max_turns)
         .max_tokens(config.orchestrator.max_tokens)
         .on_text(on_text)
         .observability_mode(observability_mode);
+
+    // Wire workspace directory for sub-agents
+    if let Some(ref ws) = workspace_dir {
+        builder = builder.workspace(ws.clone());
+    }
 
     // Wire squad formation opt-out from config
     if let Some(enable) = config.orchestrator.enable_squads {
@@ -676,8 +1094,6 @@ pub(crate) async fn build_orchestrator_from_config(
     }
 
     // Wire orchestrator-level context management.
-    // Config validates that context_strategy=(summarize|sliding_window) and summarize_threshold
-    // are mutually exclusive. Unlimited + summarize_threshold is allowed.
     match &config.orchestrator.context_strategy {
         Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
             builder = builder.context_strategy(ContextStrategy::SlidingWindow {
@@ -688,7 +1104,6 @@ pub(crate) async fn build_orchestrator_from_config(
             builder = builder.summarize_threshold(*threshold);
         }
         Some(ContextStrategyConfig::Unlimited) | None => {
-            // No context_strategy.type=summarize — check standalone summarize_threshold
             if let Some(threshold) = config.orchestrator.summarize_threshold {
                 builder = builder.summarize_threshold(threshold);
             }
@@ -711,25 +1126,15 @@ pub(crate) async fn build_orchestrator_from_config(
         builder = builder.on_event(cb);
     }
 
-    // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
-    // When an on_question callback is provided (e.g., from WS bridge), the question
-    // tool uses it instead of the default CLI stdin callback.
-    let builtins = if let Some(ref oq) = on_question {
-        let config = BuiltinToolsConfig {
-            on_question: Some(oq.clone()),
-            ..Default::default()
-        };
-        builtin_tools(config)
-    } else {
-        create_builtin_tools()
-    };
-
     for agent in &config.agents {
-        let mcp_tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
-        let a2a_tools = load_a2a_tools(&agent.name, &agent.a2a_agents).await;
         let mut tools = builtins.clone();
-        tools.extend(mcp_tools);
-        tools.extend(a2a_tools);
+        match pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
+            Some(cached) => tools.extend(cached.iter().cloned()),
+            None => {
+                tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
+                tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+            }
+        }
         let (ctx_strategy, summarize_threshold) = match &agent.context_strategy {
             Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => (
                 Some(ContextStrategy::SlidingWindow {
@@ -790,48 +1195,13 @@ pub(crate) async fn build_orchestrator_from_config(
             enable_recursive_summarization: agent.recursive_summarization,
             reflection_threshold: agent.reflection_threshold,
             consolidate_on_exit: agent.consolidate_on_exit,
+            workspace: None,
         });
     }
 
-    // Wire shared memory: use external_memory if provided, else create from config.
-    // When a story_id is present, use memory_namespace_prefix so all agents read/write
-    // within the story's namespace, and pre-load prior story context into the task text.
-    let mut task_text = task.to_string();
-    let base_memory = if let Some(ext) = external_memory {
-        Some(ext)
-    } else if let Some(ref memory_config) = config.memory {
-        Some(create_memory_store(memory_config).await?)
-    } else {
-        None
-    };
+    // Wire shared memory (story context already pre-loaded above)
     if let Some(base_memory) = base_memory {
-        // Pre-load story context when a story/user namespace is present.
-        // Uses agent_prefix to match all sub-agent namespaces under this story
-        // (e.g. "tg:123" matches "tg:123:assistant", "tg:123:researcher").
         if let Some(sid) = story_id {
-            let prior = base_memory
-                .recall(MemoryQuery {
-                    limit: 10,
-                    agent_prefix: Some(sid.to_string()),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_or_default();
-
-            if !prior.is_empty() {
-                let ctx: String = prior
-                    .iter()
-                    .map(|e| format!("- [{}] {}", e.category, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                task_text =
-                    format!("## Prior story context\n{ctx}\n\n## Current task\n{task_text}");
-                tracing::info!(
-                    story_id = sid,
-                    prior_memories = prior.len(),
-                    "loaded story context into task"
-                );
-            }
             builder = builder.memory_namespace_prefix(sid);
         }
         builder = builder.shared_memory(base_memory);
@@ -1048,8 +1418,19 @@ async fn run_from_env(
         None
     };
 
-    let mut output =
-        run_default_agent(provider, task, on_text, on_approval, on_event, mode).await?;
+    let ws_root = default_workspace_root_path();
+    let workspace_dir = provision_workspace(&ws_root);
+
+    let mut output = run_default_agent(
+        provider,
+        task,
+        on_text,
+        on_approval,
+        on_event,
+        mode,
+        workspace_dir,
+    )
+    .await?;
     output.estimated_cost_usd = heartbit::estimate_cost(&model, &output.tokens_used);
     print_streaming_stats(&output);
     Ok(())
@@ -1084,8 +1465,16 @@ async fn run_default_agent(
     on_approval: Option<Arc<OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
     observability_mode: ObservabilityMode,
+    workspace_dir: Option<PathBuf>,
 ) -> Result<AgentOutput> {
-    let mut tools = create_builtin_tools();
+    let mut tools = {
+        let btc = BuiltinToolsConfig {
+            on_question: Some(question_callback()),
+            workspace: workspace_dir.clone(),
+            ..Default::default()
+        };
+        builtin_tools(btc)
+    };
 
     // Load MCP tools from env: HEARTBIT_MCP_SERVERS=url1,url2
     if let Ok(servers) = std::env::var("HEARTBIT_MCP_SERVERS") {
@@ -1128,6 +1517,10 @@ async fn run_default_agent(
         .tool_timeout(std::time::Duration::from_secs(tool_timeout_secs))
         .on_text(on_text)
         .observability_mode(observability_mode);
+
+    if let Some(ref ws) = workspace_dir {
+        builder = builder.workspace(ws.clone());
+    }
 
     if let Some(cb) = on_approval {
         builder = builder.on_approval(cb);
@@ -1278,8 +1671,18 @@ async fn run_chat_from_config(
         return Ok(());
     };
 
+    let ws_root = workspace_root_from_config(&config);
+    let workspace_dir = provision_workspace(&ws_root);
+
     // Load MCP + A2A tools from all configured agents
-    let mut tools = create_builtin_tools();
+    let mut tools = {
+        let btc = BuiltinToolsConfig {
+            on_question: Some(question_callback()),
+            workspace: workspace_dir.clone(),
+            ..Default::default()
+        };
+        builtin_tools(btc)
+    };
     for agent in &config.agents {
         let mcp_tools = load_mcp_tools(&agent.name, &agent.mcp_servers).await;
         let a2a_tools = load_a2a_tools(&agent.name, &agent.a2a_agents).await;
@@ -1312,6 +1715,10 @@ async fn run_chat_from_config(
         .on_text(on_text)
         .on_input(input_callback())
         .observability_mode(mode);
+
+    if let Some(ref ws) = workspace_dir {
+        builder = builder.workspace(ws.clone());
+    }
 
     // Wire orchestrator-level context management
     match &config.orchestrator.context_strategy {
@@ -1438,7 +1845,17 @@ async fn run_chat_from_env(
         return Ok(());
     };
 
-    let mut tools = create_builtin_tools();
+    let ws_root = default_workspace_root_path();
+    let workspace_dir = provision_workspace(&ws_root);
+
+    let mut tools = {
+        let btc = BuiltinToolsConfig {
+            on_question: Some(question_callback()),
+            workspace: workspace_dir.clone(),
+            ..Default::default()
+        };
+        builtin_tools(btc)
+    };
     if let Ok(servers) = std::env::var("HEARTBIT_MCP_SERVERS") {
         let entries: Vec<McpServerEntry> = parse_csv_env(&servers)
             .into_iter()
@@ -1485,6 +1902,10 @@ async fn run_chat_from_env(
         .on_text(on_text)
         .on_input(input_callback())
         .observability_mode(mode);
+
+    if let Some(ref ws) = workspace_dir {
+        builder = builder.workspace(ws.clone());
+    }
 
     if let Some(cb) = on_approval {
         builder = builder.on_approval(cb);
@@ -1789,18 +2210,6 @@ fn question_callback() -> Arc<OnQuestion> {
             Ok(result)
         })
     })
-}
-
-/// Create the built-in tool set with shared state.
-///
-/// Returns tools ready to pass to sub-agents. The `FileTracker` and `TodoStore`
-/// are shared across all agents that receive these tools.
-pub(crate) fn create_builtin_tools() -> Vec<Arc<dyn Tool>> {
-    let config = BuiltinToolsConfig {
-        on_question: Some(question_callback()),
-        ..Default::default()
-    };
-    builtin_tools(config)
 }
 
 /// Create an event callback that writes each event as one-line JSON to stderr.

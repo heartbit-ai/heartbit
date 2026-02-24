@@ -26,11 +26,13 @@ const DEFAULT_IGNORES: &[&str] = &[
     "*.dylib",
 ];
 
-pub struct ListTool;
+pub struct ListTool {
+    workspace: Option<PathBuf>,
+}
 
 impl ListTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(workspace: Option<PathBuf>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -64,7 +66,7 @@ impl Tool for ListTool {
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let path_str = input.get("path").and_then(|v| v.as_str());
 
             let user_ignores: Vec<String> = input
                 .get("ignore")
@@ -76,7 +78,11 @@ impl Tool for ListTool {
                 })
                 .unwrap_or_default();
 
-            let root = PathBuf::from(path);
+            let root = match path_str {
+                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
+            };
+            let path = root.display().to_string();
             if !root.exists() {
                 return Ok(ToolOutput::error(format!("Path not found: {path}")));
             }
@@ -178,7 +184,7 @@ mod tests {
 
     #[test]
     fn definition_has_correct_name() {
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         assert_eq!(tool.definition().name, "list");
     }
 
@@ -190,7 +196,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub").join("c.rs"), "").unwrap();
 
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({"path": dir.path().to_str().unwrap()}))
             .await
@@ -210,7 +216,7 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         std::fs::create_dir(dir.path().join("node_modules")).unwrap();
 
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({"path": dir.path().to_str().unwrap()}))
             .await
@@ -228,7 +234,7 @@ mod tests {
         std::fs::write(dir.path().join("keep.rs"), "").unwrap();
         std::fs::write(dir.path().join("skip.log"), "").unwrap();
 
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({
                 "path": dir.path().to_str().unwrap(),
@@ -243,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_nonexistent_path() {
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({"path": "/tmp/nonexistent_heartbit_test_dir_12345"}))
             .await
@@ -258,7 +264,7 @@ mod tests {
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "content").unwrap();
 
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({"path": path.to_str().unwrap()}))
             .await
@@ -273,7 +279,7 @@ mod tests {
         std::fs::write(dir.path().join("aaa_file.txt"), "").unwrap();
         std::fs::create_dir(dir.path().join("zzz_dir")).unwrap();
 
-        let tool = ListTool::new();
+        let tool = ListTool::new(None);
         let result = tool
             .execute(json!({"path": dir.path().to_str().unwrap()}))
             .await

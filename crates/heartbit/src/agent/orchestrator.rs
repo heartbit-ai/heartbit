@@ -68,6 +68,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) reflection_threshold: Option<u32>,
     /// Run memory consolidation at session end.
     pub(crate) consolidate_on_exit: Option<bool>,
+    /// Optional workspace root for this sub-agent.
+    pub(crate) workspace: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -144,6 +146,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             lsp_manager: None,
             observability_mode: None,
             dispatch_mode: DispatchMode::Parallel,
+            workspace: None,
         }
     }
 
@@ -338,6 +341,9 @@ impl DelegateTaskTool {
                 }
                 if let Some(true) = agent_def.consolidate_on_exit {
                     builder = builder.consolidate_on_exit(true);
+                }
+                if let Some(ref ws) = agent_def.workspace {
+                    builder = builder.workspace(ws.clone());
                 }
 
                 // Forward permission rules from orchestrator to sub-agents
@@ -714,6 +720,9 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(true) = agent_def.consolidate_on_exit {
                         builder = builder.consolidate_on_exit(true);
+                    }
+                    if let Some(ref ws) = agent_def.workspace {
+                        builder = builder.workspace(ws.clone());
                     }
 
                     // Forward permission rules from orchestrator to squad members
@@ -1139,6 +1148,7 @@ pub(crate) fn build_form_squad_tool_schema(agents: &[(&str, &str, &[String])]) -
 /// Configuration for adding a sub-agent to the orchestrator.
 ///
 /// Used by `OrchestratorBuilder::sub_agent_full` to avoid a long parameter list.
+#[derive(Default)]
 pub struct SubAgentConfig {
     pub name: String,
     pub description: String,
@@ -1182,6 +1192,8 @@ pub struct SubAgentConfig {
     pub reflection_threshold: Option<u32>,
     /// Run memory consolidation at session end for this sub-agent.
     pub consolidate_on_exit: Option<bool>,
+    /// Optional workspace root for this sub-agent's file tools and system prompt.
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -1215,6 +1227,8 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
     observability_mode: Option<super::observability::ObservabilityMode>,
     dispatch_mode: DispatchMode,
+    /// Optional workspace root for all sub-agents. Propagated to sub-agent builders.
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1248,6 +1262,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_recursive_summarization: None,
             reflection_threshold: None,
             consolidate_on_exit: None,
+            workspace: self.workspace.clone(),
         });
         self
     }
@@ -1283,6 +1298,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_recursive_summarization: None,
             reflection_threshold: None,
             consolidate_on_exit: None,
+            workspace: self.workspace.clone(),
         });
         self
     }
@@ -1312,6 +1328,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             enable_recursive_summarization: def.enable_recursive_summarization,
             reflection_threshold: def.reflection_threshold,
             consolidate_on_exit: def.consolidate_on_exit,
+            workspace: def.workspace.or_else(|| self.workspace.clone()),
         });
         self
     }
@@ -1516,6 +1533,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// level, which works even with weaker models that ignore prompt instructions.
     pub fn dispatch_mode(mut self, mode: DispatchMode) -> Self {
         self.dispatch_mode = mode;
+        self
+    }
+
+    /// Set the workspace directory for all sub-agents. Each sub-agent
+    /// shares this workspace unless overridden via `SubAgentConfig.workspace`.
+    pub fn workspace(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = Some(path.into());
         self
     }
 
@@ -2006,6 +2030,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -2889,6 +2914,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build()
             .unwrap();
@@ -2944,6 +2970,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build();
 
@@ -2984,6 +3011,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build();
 
@@ -3089,6 +3117,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build()
             .unwrap();
@@ -3158,6 +3187,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build()
             .unwrap();
@@ -3646,6 +3676,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build()
             .unwrap();
@@ -4130,6 +4161,7 @@ mod tests {
                 | AgentEvent::SessionPruned { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
+                AgentEvent::TaskRouted { decision, .. } => decision,
             }
         }
 
@@ -4497,6 +4529,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .build()
             .unwrap();
@@ -4679,6 +4712,7 @@ mod tests {
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
                 consolidate_on_exit: None,
+                workspace: None,
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)
@@ -4780,6 +4814,7 @@ mod tests {
                 | AgentEvent::SessionPruned { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
+                AgentEvent::TaskRouted { decision, .. } => decision,
             }
         }
 
@@ -4804,6 +4839,7 @@ mod tests {
                 AgentEvent::SessionPruned { .. } => "SessionPruned",
                 AgentEvent::SensorEventProcessed { .. } => "SensorEventProcessed",
                 AgentEvent::StoryUpdated { .. } => "StoryUpdated",
+                AgentEvent::TaskRouted { .. } => "TaskRouted",
             }
         }
 
@@ -5326,6 +5362,63 @@ mod tests {
         assert!(
             bash_events.is_empty(),
             "bash tool calls in squad should be denied (no events), got: {bash_events:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_propagates_from_builder_to_sub_agents() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let builder = Orchestrator::builder(provider)
+            .workspace("/shared/workspace")
+            .sub_agent_full(SubAgentConfig {
+                name: "agent1".into(),
+                description: "test".into(),
+                workspace: None, // Should inherit from builder
+                ..Default::default()
+            });
+
+        let agent = &builder.sub_agents[0];
+        assert_eq!(
+            agent.workspace.as_deref(),
+            Some(std::path::Path::new("/shared/workspace")),
+            "sub-agent should inherit workspace from builder"
+        );
+    }
+
+    #[test]
+    fn sub_agent_workspace_overrides_builder() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let builder = Orchestrator::builder(provider)
+            .workspace("/shared/workspace")
+            .sub_agent_full(SubAgentConfig {
+                name: "agent1".into(),
+                description: "test".into(),
+                workspace: Some("/custom/workspace".into()),
+                ..Default::default()
+            });
+
+        let agent = &builder.sub_agents[0];
+        assert_eq!(
+            agent.workspace.as_deref(),
+            Some(std::path::Path::new("/custom/workspace")),
+            "sub-agent should use its own workspace over builder's"
+        );
+    }
+
+    #[test]
+    fn no_workspace_when_builder_has_none() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let builder = Orchestrator::builder(provider).sub_agent_full(SubAgentConfig {
+            name: "agent1".into(),
+            description: "test".into(),
+            workspace: None,
+            ..Default::default()
+        });
+
+        let agent = &builder.sub_agents[0];
+        assert!(
+            agent.workspace.is_none(),
+            "sub-agent should have no workspace when builder has none"
         );
     }
 }

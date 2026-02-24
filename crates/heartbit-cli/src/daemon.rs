@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,8 +29,9 @@ use heartbit::channel::session::{
 use heartbit::channel::types::{self, WsFrame};
 use heartbit::daemon::kafka;
 use heartbit::{
-    AgentEvent, AgentOutput, CronScheduler, DaemonCore, DaemonHandle, DaemonMetrics,
-    Error as HeartbitError, HeartbitConfig, InMemoryTaskStore, ObservabilityMode,
+    AgentEvent, AgentOutput, ConsolidateSession, CronScheduler, DaemonCore, DaemonHandle,
+    DaemonMetrics, Error as HeartbitError, HeartbitConfig, HeartbitPulseScheduler,
+    InMemoryTaskStore, KafkaCommandProducer, Memory, ObservabilityMode,
 };
 
 use crate::{build_on_retry, build_provider_from_config, init_tracing_from_config};
@@ -101,6 +104,10 @@ struct AppState {
     ws_semaphore: Arc<Semaphore>,
     config: Arc<HeartbitConfig>,
     observability_mode: ObservabilityMode,
+    todo_store: Option<Arc<heartbit::FileTodoStore>>,
+    shared_memory: Option<Arc<dyn Memory>>,
+    workspace_dir: Option<PathBuf>,
+    tool_cache: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>>,
 }
 
 // --- Handlers ---
@@ -344,6 +351,21 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Read the current persistent todo list (heartbit pulse).
+async fn handle_todo(State(state): State<AppState>) -> impl IntoResponse {
+    match state.todo_store {
+        Some(ref store) => {
+            let list = store.get_list();
+            Json(list).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "heartbit pulse not enabled" })),
+        )
+            .into_response(),
+    }
+}
+
 // --- HTTP metrics middleware ---
 
 /// HTTP request metrics registered on the same Prometheus `Registry` as `DaemonMetrics`.
@@ -511,7 +533,7 @@ pub async fn run_daemon(
     if !daemon_config.schedules.is_empty() {
         let cron = CronScheduler::new(
             &daemon_config.schedules,
-            producer.clone(),
+            Arc::new(KafkaCommandProducer::new(producer.clone())),
             &daemon_config.kafka.commands_topic,
         )
         .context("failed to create cron scheduler")?;
@@ -524,6 +546,73 @@ pub async fn run_daemon(
             "cron scheduler started"
         );
     }
+
+    // Start heartbit pulse scheduler if configured and enabled
+    let pulse_todo_store: Option<Arc<heartbit::FileTodoStore>> = if let Some(ref pulse_config) =
+        daemon_config.heartbit_pulse
+        && pulse_config.enabled
+    {
+        let ws_root = crate::workspace_root_from_config(&config);
+        let ws = heartbit::Workspace::open(&ws_root)
+            .context("failed to open workspace for heartbit pulse")?;
+        let pulse = HeartbitPulseScheduler::new(
+            pulse_config,
+            ws.root(),
+            Arc::new(KafkaCommandProducer::new(producer.clone())),
+            &daemon_config.kafka.commands_topic,
+        )
+        .context("failed to create heartbit pulse scheduler")?;
+        let store = pulse.todo_store().clone();
+        let pulse_cancel = cancel.clone();
+        tokio::spawn(async move {
+            pulse.run(pulse_cancel).await;
+        });
+        tracing::info!(
+            interval_secs = pulse_config.interval_seconds,
+            "heartbit pulse scheduler started"
+        );
+        Some(store)
+    } else {
+        None
+    };
+
+    // Create shared memory store (one store for all execution paths)
+    let shared_memory: Option<Arc<dyn Memory>> = if let Some(ref mem_config) = config.memory {
+        match crate::create_memory_store(mem_config).await {
+            Ok(store) => {
+                tracing::info!("daemon shared memory: enabled");
+                Some(store)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create shared memory, continuing without");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Provision workspace once (idempotent, reused by all execution paths)
+    let daemon_workspace_dir =
+        crate::provision_workspace(&crate::workspace_root_from_config(&config));
+
+    // Pre-load MCP + A2A tools once for all agents (daemon reuses across tasks)
+    let tool_cache: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = {
+        let mut cache = HashMap::new();
+        for agent in &config.agents {
+            let mut agent_tools = crate::load_mcp_tools(&agent.name, &agent.mcp_servers).await;
+            agent_tools.extend(crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+            if !agent_tools.is_empty() {
+                tracing::info!(
+                    agent = %agent.name,
+                    tools = agent_tools.len(),
+                    "cached MCP/A2A tools"
+                );
+            }
+            cache.insert(agent.name.clone(), agent_tools);
+        }
+        Arc::new(cache)
+    };
 
     // Create sensor metrics (shared with AppState for /metrics endpoint)
     let sensor_metrics: Option<Arc<heartbit::SensorMetrics>> = if metrics_enabled
@@ -603,8 +692,13 @@ pub async fn run_daemon(
     let config_arc = Arc::new(config);
     let config_for_state = config_arc.clone();
     let runner_metrics = metrics.clone();
+    let runner_todo_store = pulse_todo_store.clone();
+    let runner_memory = shared_memory.clone();
+    let runner_workspace = daemon_workspace_dir.clone();
+    let runner_tools = tool_cache.clone();
     let build_runner = move |_task_id: uuid::Uuid,
                              task_text: String,
+                             source: String,
                              story_id: Option<String>,
                              on_event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>|
           -> std::pin::Pin<
@@ -612,6 +706,10 @@ pub async fn run_daemon(
     > {
         let config = config_arc.clone();
         let task_metrics = runner_metrics.clone();
+        let todo_store = runner_todo_store.clone();
+        let memory = runner_memory.clone();
+        let workspace_dir = runner_workspace.clone();
+        let tools = runner_tools.clone();
         Box::pin(async move {
             // Wrap on_event to also record metrics
             let on_event: Arc<heartbit::OnEvent> = if let Some(ref m) = task_metrics {
@@ -625,17 +723,18 @@ pub async fn run_daemon(
                 on_event_fn
             };
 
-            // Track active tasks
+            let on_retry = build_on_retry(&on_event);
+            let provider = build_provider_from_config(&config, Some(on_retry.clone()))
+                .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
+
+            // Track active tasks (after provider creation to avoid gauge leak on error)
             if let Some(ref m) = task_metrics {
                 m.tasks_active().inc();
             }
             let start = Instant::now();
 
-            let on_retry = build_on_retry(&on_event);
-            let provider = build_provider_from_config(&config, Some(on_retry.clone()))
-                .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
-
             let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -645,8 +744,11 @@ pub async fn run_daemon(
                 Some(on_event),
                 mode,
                 story_id.as_deref(),
-                None, // no interactive question callback in daemon mode
-                None, // no external memory in Kafka runner
+                None,   // no interactive question callback in daemon mode
+                memory, // shared daemon memory
+                workspace_dir,
+                todo_store, // persistent daemon todo store
+                Some(&tools),
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -654,9 +756,21 @@ pub async fn run_daemon(
             let duration_secs = start.elapsed().as_secs_f64();
             if let Some(ref m) = task_metrics {
                 m.tasks_active().dec();
+                m.record_task_by_source(&source);
                 match &result {
                     Ok(_) => m.record_task_completed(duration_secs),
                     Err(_) => m.record_task_failed(duration_secs),
+                }
+                // Record pulse-specific metrics when source is "heartbit"
+                if source == "heartbit" {
+                    m.record_pulse_run();
+                    match &result {
+                        Ok(output) if output.result.contains("HEARTBIT_OK") => {
+                            m.record_pulse_ok();
+                        }
+                        Ok(_) => m.record_pulse_action(),
+                        Err(_) => {} // failures already tracked by record_task_failed
+                    }
                 }
             }
 
@@ -713,6 +827,10 @@ pub async fn run_daemon(
         ws_semaphore: Arc::new(Semaphore::new(ws_max_connections)),
         config: config_for_state,
         observability_mode: mode,
+        todo_store: pulse_todo_store,
+        shared_memory: shared_memory.clone(),
+        workspace_dir: daemon_workspace_dir,
+        tool_cache: tool_cache.clone(),
     };
 
     let mut routes = Router::new()
@@ -724,7 +842,8 @@ pub async fn run_daemon(
         .route("/healthz", get(handle_healthz))
         .route("/readyz", get(handle_readyz))
         .route("/health", get(handle_healthz))
-        .route("/metrics", get(handle_metrics));
+        .route("/metrics", get(handle_metrics))
+        .route("/todo", get(handle_todo));
 
     if ws_enabled {
         routes = routes.route("/ws", get(handle_ws_upgrade));
@@ -752,6 +871,11 @@ pub async fn run_daemon(
         let tg_app_config = app_state.config.clone();
         let tg_metrics = app_state.metrics.clone();
 
+        // Capture shared resources for the Telegram RunTask closure
+        let tg_todo_store = app_state.todo_store.clone();
+        let tg_workspace = app_state.workspace_dir.clone();
+        let tg_tools = app_state.tool_cache.clone();
+
         // Build the RunTask closure that reuses build_orchestrator_from_config
         let run_task: Arc<heartbit::channel::telegram::RunTask> = Arc::new(move |input| {
             let config = tg_app_config.clone();
@@ -759,6 +883,9 @@ pub async fn run_daemon(
             let task_text = input.task_text;
             let user_ns = input.user_namespace;
             let m = tg_metrics.clone();
+            let todo_store = tg_todo_store.clone();
+            let workspace_dir = tg_workspace.clone();
+            let tools = tg_tools.clone();
             Box::pin(async move {
                 // No streaming preview for Telegram — only send the final
                 // HTML-formatted result to avoid a raw-markdown flash.
@@ -770,6 +897,11 @@ pub async fn run_daemon(
                 let provider = build_provider_from_config(&config, Some(on_retry))
                     .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
 
+                // Track active tasks (after provider creation to avoid gauge leak on error)
+                if let Some(ref m) = m {
+                    m.tasks_active().inc();
+                }
+                let start = Instant::now();
                 let result = crate::build_orchestrator_from_config(
                     provider,
                     &config,
@@ -781,35 +913,59 @@ pub async fn run_daemon(
                     user_ns.as_deref(),
                     Some(on_question),
                     input.memory,
+                    workspace_dir,
+                    todo_store,
+                    Some(&tools),
                 )
                 .await
-                .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
+                .map_err(|e| HeartbitError::Daemon(e.to_string()));
 
+                let duration_secs = start.elapsed().as_secs_f64();
                 if let Some(ref m) = m {
-                    m.record_task_completed(0.0); // Duration tracked internally
+                    m.tasks_active().dec();
+                    m.record_task_by_source("telegram");
+                    match &result {
+                        Ok(_) => m.record_task_completed(duration_secs),
+                        Err(_) => m.record_task_failed(duration_secs),
+                    }
                 }
 
-                Ok(result.result)
+                Ok(result?.result)
             })
         });
 
-        // Wire per-user namespaced memory from config (enables preload_memories + consolidation)
-        let tg_memory: Option<Arc<dyn heartbit::Memory>> = if let Some(ref mem_config) =
-            app_state.config.memory
-        {
-            match crate::create_memory_store(mem_config).await {
-                Ok(store) => {
-                    tracing::info!("Telegram memory: enabled");
-                    Some(store)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to create memory store for Telegram, continuing without memory");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Use shared daemon memory for Telegram (avoids duplicate stores)
+        let tg_memory = shared_memory.clone();
+        if tg_memory.is_some() {
+            tracing::info!("Telegram memory: using shared daemon store");
+        }
+
+        // Wire consolidation callback: prune weak memories on idle sessions.
+        //
+        // NOTE: `Memory::prune()` is namespace-blind — it scans all entries in the
+        // underlying store, not just the user's namespace. This is acceptable because
+        // pruning only removes entries that are both weak AND old (entries that should
+        // be cleaned up regardless of which user triggered the sweep).
+        let consolidation_cb: Option<Arc<ConsolidateSession>> = tg_memory.as_ref().map(|mem| {
+            let memory = mem.clone();
+            let cb: Arc<ConsolidateSession> = Arc::new(move |user_id: i64| {
+                let memory = memory.clone();
+                Box::pin(async move {
+                    let pruned = heartbit::prune_weak_entries(
+                        &memory,
+                        heartbit::DEFAULT_MIN_STRENGTH,
+                        heartbit::default_min_age(),
+                    )
+                    .await?;
+                    if pruned > 0 {
+                        tracing::info!(user_id, pruned, "pruned weak memories on idle");
+                    }
+                    Ok(())
+                })
+                    as Pin<Box<dyn std::future::Future<Output = Result<(), HeartbitError>> + Send>>
+            });
+            cb
+        });
 
         let adapter = Arc::new(heartbit::channel::telegram::TelegramAdapter::new(
             bot,
@@ -817,7 +973,7 @@ pub async fn run_daemon(
             tg_sessions,
             tg_memory,
             run_task,
-            None, // Consolidation callback — TODO: wire when memory is present
+            consolidation_cb,
         ));
 
         tokio::spawn(async move {
@@ -1129,6 +1285,10 @@ async fn handle_ws_chat_send(
     let outbound = outbound_tx.clone();
     let mode = state.observability_mode;
     let metrics = state.metrics.clone();
+    let ws_memory = state.shared_memory.clone();
+    let ws_workspace = state.workspace_dir.clone();
+    let ws_todo = state.todo_store.clone();
+    let ws_tools = state.tool_cache.clone();
 
     tokio::spawn(async move {
         let result = run_interactive_task(
@@ -1143,6 +1303,11 @@ async fn handle_ws_chat_send(
                 cancel: task_cancel,
             },
             metrics.as_deref(),
+            ws_memory,
+            ws_workspace,
+            ws_todo,
+            Some(&ws_tools),
+            "ws",
         )
         .await;
 
@@ -1365,11 +1530,17 @@ struct InteractiveTaskParams {
 }
 
 /// Run an interactive task using `build_orchestrator_from_config` with bridge callbacks.
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive_task(
     config: &HeartbitConfig,
     task: &str,
     params: InteractiveTaskParams,
     metrics: Option<&DaemonMetrics>,
+    external_memory: Option<Arc<dyn Memory>>,
+    workspace_dir: Option<PathBuf>,
+    daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
+    pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>>,
+    source: &str,
 ) -> std::result::Result<AgentOutput, HeartbitError> {
     let on_retry = build_on_retry(&params.on_event);
     let provider = build_provider_from_config(config, Some(on_retry))
@@ -1391,7 +1562,10 @@ async fn run_interactive_task(
             params.mode,
             None, // no story_id for interactive sessions
             Some(params.on_question),
-            None, // no external memory for WS interactive sessions
+            external_memory,
+            workspace_dir,
+            daemon_todo_store,
+            pre_loaded_tools,
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }
@@ -1403,6 +1577,7 @@ async fn run_interactive_task(
     let duration_secs = start.elapsed().as_secs_f64();
     if let Some(m) = metrics {
         m.tasks_active().dec();
+        m.record_task_by_source(source);
         match &result {
             Ok(_) => m.record_task_completed(duration_secs),
             Err(_) => m.record_task_failed(duration_secs),

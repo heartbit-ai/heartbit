@@ -13,11 +13,15 @@ use super::file_tracker::FileTracker;
 
 pub struct WriteTool {
     file_tracker: Arc<FileTracker>,
+    workspace: Option<PathBuf>,
 }
 
 impl WriteTool {
-    pub fn new(file_tracker: Arc<FileTracker>) -> Self {
-        Self { file_tracker }
+    pub fn new(file_tracker: Arc<FileTracker>, workspace: Option<PathBuf>) -> Self {
+        Self {
+            file_tracker,
+            workspace,
+        }
     }
 }
 
@@ -33,7 +37,7 @@ impl Tool for WriteTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to write"
+                        "description": "Absolute path, or relative to workspace"
                     },
                     "content": {
                         "type": "string",
@@ -60,7 +64,7 @@ impl Tool for WriteTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("content is required".into()))?;
 
-            let path = PathBuf::from(file_path);
+            let path = super::resolve_path(file_path, self.workspace.as_deref());
 
             // If file exists, enforce read-before-write guard
             if path.exists() {
@@ -110,7 +114,7 @@ mod tests {
     #[test]
     fn definition_has_correct_name() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = WriteTool::new(tracker);
+        let tool = WriteTool::new(tracker, None);
         assert_eq!(tool.definition().name, "write");
     }
 
@@ -120,7 +124,7 @@ mod tests {
         let path = dir.path().join("new.txt");
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = WriteTool::new(tracker.clone());
+        let tool = WriteTool::new(tracker.clone(), None);
 
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap(), "content": "hello world"}))
@@ -144,7 +148,7 @@ mod tests {
         let path = dir.path().join("sub").join("deep").join("file.txt");
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = WriteTool::new(tracker);
+        let tool = WriteTool::new(tracker, None);
 
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap(), "content": "nested"}))
@@ -161,7 +165,7 @@ mod tests {
         std::fs::write(&path, "original").unwrap();
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = WriteTool::new(tracker);
+        let tool = WriteTool::new(tracker, None);
 
         // Try to write without reading first
         let result = tool
@@ -181,7 +185,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = WriteTool::new(tracker);
+        let tool = WriteTool::new(tracker, None);
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap(), "content": "same content"}))
             .await
@@ -199,7 +203,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = WriteTool::new(tracker);
+        let tool = WriteTool::new(tracker, None);
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap(), "content": "updated"}))
             .await

@@ -10,11 +10,13 @@ use crate::tool::{Tool, ToolOutput};
 
 const MAX_RESULTS: usize = 100;
 
-pub struct GlobTool;
+pub struct GlobTool {
+    workspace: Option<PathBuf>,
+}
 
 impl GlobTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(workspace: Option<PathBuf>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -52,9 +54,13 @@ impl Tool for GlobTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("pattern is required".into()))?;
 
-            let base_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let base_path_str = input.get("path").and_then(|v| v.as_str());
 
-            let base = PathBuf::from(base_path);
+            let base = match base_path_str {
+                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
+            };
+            let base_path = base.display().to_string();
             if !base.exists() {
                 return Ok(ToolOutput::error(format!("Path not found: {base_path}")));
             }
@@ -123,7 +129,7 @@ mod tests {
 
     #[test]
     fn definition_has_correct_name() {
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         assert_eq!(tool.definition().name, "glob");
     }
 
@@ -134,7 +140,7 @@ mod tests {
         std::fs::write(dir.path().join("b.rs"), "").unwrap();
         std::fs::write(dir.path().join("c.txt"), "").unwrap();
 
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "*.rs",
@@ -156,7 +162,7 @@ mod tests {
         std::fs::write(dir.path().join("top.rs"), "").unwrap();
         std::fs::write(sub.join("nested.rs"), "").unwrap();
 
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "**/*.rs",
@@ -174,7 +180,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
 
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "*.xyz",
@@ -192,7 +198,7 @@ mod tests {
         std::fs::write(dir.path().join("visible.rs"), "").unwrap();
         std::fs::write(dir.path().join(".hidden.rs"), "").unwrap();
 
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "*.rs",
@@ -207,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_nonexistent_path() {
-        let tool = GlobTool::new();
+        let tool = GlobTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "*.rs",

@@ -26,6 +26,13 @@ impl BashTool {
             cwd: Mutex::new(cwd),
         }
     }
+
+    /// Create a BashTool with the working directory set to a workspace path.
+    pub fn with_workspace(workspace: PathBuf) -> Self {
+        Self {
+            cwd: Mutex::new(workspace),
+        }
+    }
 }
 
 impl Tool for BashTool {

@@ -12,6 +12,7 @@ pub mod store;
 pub mod tool;
 pub(crate) mod util;
 pub mod workflow;
+pub mod workspace;
 
 pub use channel::bridge::{InteractionBridge, OutboundMessage};
 pub use channel::session::{
@@ -41,18 +42,23 @@ pub use agent::permission::{
     LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
 };
 pub use agent::pruner::SessionPruneConfig;
+pub use agent::routing::{
+    AgentCapability, ComplexitySignals, RoutingDecision, RoutingMode, TaskComplexityAnalyzer,
+    resolve_routing_mode, should_escalate,
+};
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 pub use config::{
-    AgentConfig, AgentProviderConfig, ContextStrategyConfig, DaemonConfig, DispatchMode,
-    EmbeddingConfig, HeartbitConfig, KafkaConfig, KnowledgeConfig, KnowledgeSourceConfig,
-    LspConfig, McpServerEntry, MemoryConfig, MetricsConfig, OrchestratorConfig,
-    RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig, SensorRoutingConfig,
-    SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig, TokenBudgetConfig,
-    WsConfig, parse_reasoning_effort,
+    ActiveHoursConfig, AgentConfig, AgentProviderConfig, ContextStrategyConfig, DaemonConfig,
+    DispatchMode, EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig,
+    KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpServerEntry, MemoryConfig, MetricsConfig,
+    OrchestratorConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig,
+    SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,
+    TokenBudgetConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort,
 };
 pub use daemon::{
-    CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics, DaemonTask,
-    InMemoryTaskStore, PostgresTaskStore, TaskState, TaskStore,
+    CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
+    DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
+    PostgresTaskStore, TaskState, TaskStore, TodoEntry, TodoList, TodoManageTool,
 };
 pub use error::Error;
 pub use knowledge::in_memory::InMemoryKnowledgeBase;
@@ -91,7 +97,8 @@ pub use sensor::{Sensor, SensorEvent, SensorModality};
 pub use tool::a2a::A2aClient;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
-    QuestionResponse, TodoStore, builtin_tools,
+    QuestionResponse, TodoPriority, TodoStatus, TodoStore, builtin_tools,
 };
 pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput, validate_tool_input};
+pub use workspace::Workspace;

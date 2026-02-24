@@ -149,11 +149,17 @@ impl DaemonCore {
     /// Run the Kafka consumer loop. Blocks until cancellation.
     ///
     /// `build_runner` is called for each submitted task. It receives the task ID,
-    /// task text, and an event callback, and returns a future that produces the
-    /// agent output.
+    /// task text, source tag, optional story ID, and an event callback, and
+    /// returns a future that produces the agent output.
     pub async fn run<F, Fut>(mut self, build_runner: F) -> Result<(), Error>
     where
-        F: Fn(uuid::Uuid, String, Option<String>, Arc<dyn Fn(AgentEvent) + Send + Sync>) -> Fut
+        F: Fn(
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Arc<dyn Fn(AgentEvent) + Send + Sync>,
+            ) -> Fut
             + Send
             + Sync
             + 'static,
@@ -248,7 +254,7 @@ impl DaemonCore {
                                     })
                                     .ok();
 
-                                let runner = build_runner(id, task, story_id, on_event);
+                                let runner = build_runner(id, task, source, story_id, on_event);
                                 tokio::select! {
                                     result = runner => {
                                         match result {
@@ -353,6 +359,7 @@ mod tests {
             #[cfg(feature = "telegram")]
             telegram: None,
             database_url: None,
+            heartbit_pulse: None,
         }
     }
 

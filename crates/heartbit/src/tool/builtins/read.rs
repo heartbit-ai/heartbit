@@ -17,11 +17,15 @@ const DEFAULT_LIMIT: usize = 2000;
 
 pub struct ReadTool {
     file_tracker: Arc<FileTracker>,
+    workspace: Option<PathBuf>,
 }
 
 impl ReadTool {
-    pub fn new(file_tracker: Arc<FileTracker>) -> Self {
-        Self { file_tracker }
+    pub fn new(file_tracker: Arc<FileTracker>, workspace: Option<PathBuf>) -> Self {
+        Self {
+            file_tracker,
+            workspace,
+        }
     }
 }
 
@@ -37,7 +41,7 @@ impl Tool for ReadTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to read"
+                        "description": "Absolute path, or relative to workspace"
                     },
                     "offset": {
                         "type": "integer",
@@ -75,7 +79,7 @@ impl Tool for ReadTool {
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_LIMIT);
 
-            let path = PathBuf::from(file_path);
+            let path = super::resolve_path(file_path, self.workspace.as_deref());
 
             // Check if it's a directory
             if path.is_dir() {
@@ -201,7 +205,7 @@ mod tests {
     #[test]
     fn definition_has_correct_name() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker);
+        let tool = ReadTool::new(tracker, None);
         assert_eq!(tool.definition().name, "read");
     }
 
@@ -212,7 +216,7 @@ mod tests {
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker.clone());
+        let tool = ReadTool::new(tracker.clone(), None);
 
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap()}))
@@ -241,7 +245,7 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker);
+        let tool = ReadTool::new(tracker, None);
 
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap(), "offset": 3, "limit": 2}))
@@ -257,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn read_nonexistent_file() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker);
+        let tool = ReadTool::new(tracker, None);
 
         let result = tool
             .execute(json!({"file_path": "/tmp/nonexistent_heartbit_test_12345.txt"}))
@@ -271,7 +275,7 @@ mod tests {
     async fn read_directory_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker);
+        let tool = ReadTool::new(tracker, None);
 
         let result = tool
             .execute(json!({"file_path": dir.path().to_str().unwrap()}))
@@ -290,7 +294,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = ReadTool::new(tracker);
+        let tool = ReadTool::new(tracker, None);
 
         let result = tool
             .execute(json!({"file_path": path.to_str().unwrap()}))

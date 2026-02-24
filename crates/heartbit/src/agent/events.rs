@@ -203,6 +203,19 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         priority: Option<String>,
     },
+
+    /// Task was routed to single-agent or orchestrator by the complexity analyzer.
+    TaskRouted {
+        /// "single_agent" or "orchestrate"
+        decision: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_agent: Option<String>,
+        #[serde(default)]
+        complexity_score: f32,
+        #[serde(default)]
+        escalated: bool,
+    },
 }
 
 /// Callback type for receiving structured agent events.
@@ -437,6 +450,13 @@ mod tests {
                 tool_results_pruned: 2,
                 bytes_saved: 1500,
                 tool_results_total: 4,
+            },
+            AgentEvent::TaskRouted {
+                decision: "single_agent".into(),
+                reason: "heuristic score below threshold".into(),
+                selected_agent: Some("coder".into()),
+                complexity_score: 0.15,
+                escalated: false,
             },
         ];
         for event in events {

@@ -11,11 +11,13 @@ use crate::tool::{Tool, ToolOutput};
 
 const MAX_MATCHES: usize = 100;
 
-pub struct GrepTool;
+pub struct GrepTool {
+    workspace: Option<PathBuf>,
+}
 
 impl GrepTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(workspace: Option<PathBuf>) -> Self {
+        Self { workspace }
     }
 }
 
@@ -62,7 +64,7 @@ impl Tool for GrepTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("pattern is required".into()))?;
 
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let path_str = input.get("path").and_then(|v| v.as_str());
 
             let include = input.get("include").and_then(|v| v.as_str());
             let literal = input
@@ -70,13 +72,17 @@ impl Tool for GrepTool {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let search_path = PathBuf::from(path);
+            let search_path = match path_str {
+                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
+            };
+            let path = search_path.display().to_string();
             if !search_path.exists() {
                 return Ok(ToolOutput::error(format!("Path not found: {path}")));
             }
 
             // Try ripgrep first
-            match try_ripgrep(pattern, path, include, literal).await {
+            match try_ripgrep(pattern, &path, include, literal).await {
                 Ok(output) => Ok(output),
                 Err(_) => {
                     // Fallback to built-in regex search (sync IO, run on blocking thread)
@@ -272,7 +278,7 @@ mod tests {
 
     #[test]
     fn definition_has_correct_name() {
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         assert_eq!(tool.definition().name, "grep");
     }
 
@@ -282,7 +288,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world\nfoo bar\nhello again\n").unwrap();
 
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "hello",
@@ -301,7 +307,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world\n").unwrap();
 
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "xyz_not_here",
@@ -319,7 +325,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "price is $5.00\nnot a regex\n").unwrap();
 
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "$5.00",
@@ -334,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_nonexistent_path() {
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "test",
@@ -352,7 +358,7 @@ mod tests {
         std::fs::write(dir.path().join("match.rs"), "fn hello() {}\n").unwrap();
         std::fs::write(dir.path().join("skip.txt"), "fn hello() {}\n").unwrap();
 
-        let tool = GrepTool::new();
+        let tool = GrepTool::new(None);
         let result = tool
             .execute(json!({
                 "pattern": "hello",

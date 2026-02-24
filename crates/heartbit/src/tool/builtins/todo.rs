@@ -25,6 +25,8 @@ pub enum TodoStatus {
     InProgress,
     Completed,
     Cancelled,
+    Failed,
+    Blocked,
 }
 
 impl std::fmt::Display for TodoStatus {
@@ -34,6 +36,8 @@ impl std::fmt::Display for TodoStatus {
             TodoStatus::InProgress => write!(f, "in_progress"),
             TodoStatus::Completed => write!(f, "completed"),
             TodoStatus::Cancelled => write!(f, "cancelled"),
+            TodoStatus::Failed => write!(f, "failed"),
+            TodoStatus::Blocked => write!(f, "blocked"),
         }
     }
 }
@@ -41,6 +45,7 @@ impl std::fmt::Display for TodoStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoPriority {
+    Critical,
     High,
     Medium,
     Low,
@@ -49,6 +54,7 @@ pub enum TodoPriority {
 impl std::fmt::Display for TodoPriority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TodoPriority::Critical => write!(f, "critical"),
             TodoPriority::High => write!(f, "high"),
             TodoPriority::Medium => write!(f, "medium"),
             TodoPriority::Low => write!(f, "low"),
@@ -130,11 +136,11 @@ impl Tool for TodoWriteTool {
                                 "content": {"type": "string"},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "cancelled"]
+                                    "enum": ["pending", "in_progress", "completed", "cancelled", "failed", "blocked"]
                                 },
                                 "priority": {
                                     "type": "string",
-                                    "enum": ["high", "medium", "low"]
+                                    "enum": ["critical", "high", "medium", "low"]
                                 }
                             },
                             "required": ["content", "status", "priority"]
@@ -202,8 +208,11 @@ impl Tool for TodoReadTool {
                     TodoStatus::InProgress => "[>]",
                     TodoStatus::Completed => "[x]",
                     TodoStatus::Cancelled => "[-]",
+                    TodoStatus::Failed => "[!]",
+                    TodoStatus::Blocked => "[B]",
                 };
                 let priority_tag = match todo.priority {
+                    TodoPriority::Critical => " [CRITICAL]",
                     TodoPriority::High => " [HIGH]",
                     TodoPriority::Medium => "",
                     TodoPriority::Low => " [low]",

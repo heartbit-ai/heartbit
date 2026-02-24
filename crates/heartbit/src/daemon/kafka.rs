@@ -1,13 +1,17 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 
 use crate::Error;
 use crate::config::KafkaConfig;
+
+use super::CommandProducer;
 
 /// Create topics if they don't exist. Called once at daemon startup.
 pub async fn ensure_topics(config: &KafkaConfig) -> Result<(), Error> {
@@ -57,6 +61,35 @@ pub fn create_producer(config: &KafkaConfig) -> Result<FutureProducer, Error> {
         .set("linger.ms", "5")
         .create()
         .map_err(|e| Error::Daemon(format!("failed to create producer: {e}")))
+}
+
+/// [`CommandProducer`] backed by a real Kafka [`FutureProducer`].
+pub struct KafkaCommandProducer(FutureProducer);
+
+impl KafkaCommandProducer {
+    pub fn new(producer: FutureProducer) -> Self {
+        Self(producer)
+    }
+}
+
+impl CommandProducer for KafkaCommandProducer {
+    fn send_command<'a>(
+        &'a self,
+        topic: &'a str,
+        key: &'a str,
+        payload: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0
+                .send(
+                    FutureRecord::to(topic).key(key).payload(payload),
+                    rdkafka::util::Timeout::Never,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|(e, _)| Error::Daemon(format!("kafka send failed: {e}")))
+        })
+    }
 }
 
 /// Build a `StreamConsumer` subscribed to the commands topic.
@@ -279,5 +312,303 @@ mod tests {
         // a running broker (connection is lazy).
         let result = create_commands_consumer(&config);
         assert!(result.is_ok());
+    }
+
+    // --- Kafka integration tests (require a running broker) ---
+    //
+    // Run with: cargo test -p heartbit kafka -- --ignored
+    // Requires: Kafka broker at localhost:9092
+
+    fn test_kafka_config(prefix: &str) -> KafkaConfig {
+        let id = uuid::Uuid::new_v4();
+        KafkaConfig {
+            brokers: "localhost:9092".into(),
+            consumer_group: format!("test-{prefix}-{id}"),
+            commands_topic: format!("test.{prefix}.commands.{id}"),
+            events_topic: format!("test.{prefix}.events.{id}"),
+            dead_letter_topic: "test.dead-letter".into(),
+        }
+    }
+
+    async fn cleanup_test_topics(config: &KafkaConfig) {
+        let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+            .set("bootstrap.servers", &config.brokers)
+            .create()
+            .expect("admin client for cleanup");
+        let _ = admin
+            .delete_topics(
+                &[&config.commands_topic, &config.events_topic],
+                &AdminOptions::new(),
+            )
+            .await;
+    }
+
+    fn test_consumer(config: &KafkaConfig) -> StreamConsumer {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.brokers)
+            .set("group.id", &config.consumer_group)
+            .set("auto.offset.reset", "earliest")
+            .set("enable.auto.commit", "true")
+            .create()
+            .expect("create test consumer");
+        rdkafka::consumer::Consumer::subscribe(&consumer, &[&config.commands_topic])
+            .expect("subscribe to test topic");
+        consumer
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Kafka broker at localhost:9092
+    async fn kafka_command_producer_round_trip() {
+        use rdkafka::Message as _;
+
+        let config = test_kafka_config("rt");
+        ensure_topics(&config).await.expect("ensure test topics");
+
+        // Send a command via KafkaCommandProducer
+        let producer =
+            KafkaCommandProducer::new(create_producer(&config).expect("create producer"));
+
+        let id = uuid::Uuid::new_v4();
+        let cmd = super::super::types::DaemonCommand::SubmitTask {
+            id,
+            task: "round trip test".into(),
+            source: "test".into(),
+            story_id: None,
+        };
+        let payload = serde_json::to_vec(&cmd).expect("serialize");
+
+        producer
+            .send_command(&config.commands_topic, &id.to_string(), &payload)
+            .await
+            .expect("send_command failed");
+
+        // Consume it back and verify
+        let consumer = test_consumer(&config);
+        let msg = tokio::time::timeout(Duration::from_secs(10), consumer.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("consume error");
+
+        let key = std::str::from_utf8(msg.key().expect("no key")).expect("key not utf8");
+        assert_eq!(key, id.to_string());
+
+        let received: super::super::types::DaemonCommand =
+            serde_json::from_slice(msg.payload().expect("no payload")).expect("deserialize");
+        match received {
+            super::super::types::DaemonCommand::SubmitTask {
+                id: recv_id,
+                task,
+                source,
+                ..
+            } => {
+                assert_eq!(recv_id, id);
+                assert_eq!(task, "round trip test");
+                assert_eq!(source, "test");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        cleanup_test_topics(&config).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Kafka broker at localhost:9092
+    async fn kafka_pulse_scheduler_produces_command() {
+        use rdkafka::Message as _;
+
+        let config = test_kafka_config("pulse");
+        ensure_topics(&config).await.expect("ensure test topics");
+
+        let producer = std::sync::Arc::new(KafkaCommandProducer::new(
+            create_producer(&config).expect("create producer"),
+        ));
+
+        // Create scheduler with 1-second interval
+        let dir = tempfile::tempdir().unwrap();
+        let pulse_config = crate::config::HeartbitPulseConfig {
+            enabled: true,
+            interval_seconds: 1,
+            active_hours: None,
+            prompt: None,
+            idle_backoff_threshold: 6,
+        };
+        let scheduler = super::super::heartbit_pulse::HeartbitPulseScheduler::new(
+            &pulse_config,
+            dir.path(),
+            producer,
+            &config.commands_topic,
+        )
+        .expect("create scheduler");
+
+        // Add a todo so the scheduler fires
+        scheduler
+            .todo_store()
+            .add(super::super::todo::TodoEntry::new(
+                "Kafka pulse test",
+                "test",
+            ))
+            .expect("add todo");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move { scheduler.run(cancel2).await });
+
+        // Consume the command from Kafka
+        let consumer = test_consumer(&config);
+        let msg = tokio::time::timeout(Duration::from_secs(15), consumer.recv())
+            .await
+            .expect("scheduler did not produce a command within 15s")
+            .expect("consume error");
+
+        let received: super::super::types::DaemonCommand =
+            serde_json::from_slice(msg.payload().expect("no payload")).expect("deserialize");
+        match received {
+            super::super::types::DaemonCommand::SubmitTask { source, task, .. } => {
+                assert_eq!(source, "heartbit");
+                assert!(task.contains("Kafka pulse test"), "task: {task}");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        cancel.cancel();
+        cleanup_test_topics(&config).await;
+    }
+
+    /// End-to-end: pulse scheduler → Kafka → DaemonCore → runner → store updated.
+    #[tokio::test]
+    #[ignore] // Requires Kafka broker at localhost:9092
+    async fn kafka_daemon_processes_heartbit_pulse() {
+        let config = test_kafka_config("e2e");
+        ensure_topics(&config).await.expect("ensure test topics");
+
+        let producer = create_producer(&config).expect("create producer");
+        let consumer = create_commands_consumer(&config).expect("create consumer");
+
+        let daemon_config = crate::config::DaemonConfig {
+            kafka: config.clone(),
+            bind: "127.0.0.1:0".into(),
+            max_concurrent_tasks: 4,
+            schedules: vec![],
+            metrics: None,
+            sensors: None,
+            ws: None,
+            #[cfg(feature = "telegram")]
+            telegram: None,
+            database_url: None,
+            heartbit_pulse: None,
+        };
+
+        let store: std::sync::Arc<dyn super::super::store::TaskStore> =
+            std::sync::Arc::new(super::super::store::InMemoryTaskStore::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let (core, _handle) = super::super::core::DaemonCore::new(
+            &daemon_config,
+            consumer,
+            producer.clone(),
+            store.clone(),
+            cancel.clone(),
+        );
+
+        // Create pulse scheduler with 1-second interval
+        let dir = tempfile::tempdir().unwrap();
+        let pulse_config = crate::config::HeartbitPulseConfig {
+            enabled: true,
+            interval_seconds: 1,
+            active_hours: None,
+            prompt: None,
+            idle_backoff_threshold: 6,
+        };
+        let pulse_producer = std::sync::Arc::new(KafkaCommandProducer::new(
+            create_producer(&config).expect("create pulse producer"),
+        ));
+        let scheduler = super::super::heartbit_pulse::HeartbitPulseScheduler::new(
+            &pulse_config,
+            dir.path(),
+            pulse_producer,
+            &config.commands_topic,
+        )
+        .expect("create scheduler");
+
+        // Add a todo so the pulse fires
+        scheduler
+            .todo_store()
+            .add(super::super::todo::TodoEntry::new(
+                "Deploy new API version",
+                "user",
+            ))
+            .expect("add todo");
+
+        // Channel to signal when the runner has been called
+        let (runner_tx, mut runner_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        // Mock build_runner: captures task text, returns a simple AgentOutput
+        let build_runner = move |_id: uuid::Uuid,
+                                 task: String,
+                                 _source: String,
+                                 _story_id: Option<String>,
+                                 _on_event: std::sync::Arc<
+            dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
+        >| {
+            let tx = runner_tx.clone();
+            async move {
+                let _ = tx.send(task).await;
+                Ok(crate::agent::AgentOutput {
+                    result: "HEARTBIT_OK".into(),
+                    tool_calls_made: 0,
+                    tokens_used: crate::llm::types::TokenUsage::default(),
+                    structured: None,
+                    estimated_cost_usd: None,
+                })
+            }
+        };
+
+        // Spawn daemon core (consumes from Kafka, calls runner)
+        let core_handle = tokio::spawn(async move {
+            let _ = core.run(build_runner).await;
+        });
+
+        // Spawn pulse scheduler (produces to Kafka after 1s)
+        let pulse_cancel = cancel.clone();
+        tokio::spawn(async move { scheduler.run(pulse_cancel).await });
+
+        // Wait for the runner to receive the task
+        let task_text = tokio::time::timeout(Duration::from_secs(15), runner_rx.recv())
+            .await
+            .expect("timed out waiting for daemon to process heartbit pulse")
+            .expect("runner channel closed");
+
+        // Verify the task text contains our todo
+        assert!(
+            task_text.contains("Deploy new API version"),
+            "pulse prompt should contain the todo text, got: {task_text}"
+        );
+        assert!(
+            task_text.contains("HEARTBIT PULSE mode"),
+            "pulse prompt should contain the heartbit header, got: {task_text}"
+        );
+
+        // Poll store until the task is marked Completed
+        let mut completed_task = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok((tasks, _)) = store.list(10, 0) {
+                if let Some(t) = tasks.iter().find(|t| {
+                    t.source == "heartbit" && t.state == super::super::types::TaskState::Completed
+                }) {
+                    completed_task = Some(t.clone());
+                    break;
+                }
+            }
+        }
+
+        let task = completed_task.expect("heartbit task should reach Completed state");
+        assert_eq!(task.result.as_deref(), Some("HEARTBIT_OK"));
+        assert_eq!(task.source, "heartbit");
+
+        // Cleanup
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), core_handle).await;
+        cleanup_test_topics(&config).await;
     }
 }

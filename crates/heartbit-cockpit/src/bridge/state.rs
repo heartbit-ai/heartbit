@@ -715,8 +715,10 @@ impl EventProcessorState {
                 );
             }
 
-            // Sensor events are daemon-only; no cockpit handling needed.
-            AgentEvent::SensorEventProcessed { .. } | AgentEvent::StoryUpdated { .. } => {}
+            // Sensor events and routing events are daemon-only; no cockpit handling needed.
+            AgentEvent::SensorEventProcessed { .. }
+            | AgentEvent::StoryUpdated { .. }
+            | AgentEvent::TaskRouted { .. } => {}
         }
     }
 
