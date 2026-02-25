@@ -524,11 +524,14 @@ pub(crate) fn build_provider_from_config(
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
     if config.provider.prompt_caching && config.provider.name != "anthropic" {
-        tracing::warn!(
-            "prompt_caching is only effective with the 'anthropic' provider; \
-             ignored for '{}'",
-            config.provider.name
-        );
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "prompt_caching is only effective with the 'anthropic' provider; \
+                 ignored for '{}'",
+                config.provider.name
+            );
+        });
     }
     let retry = retry_config_from(config);
     let base = build_base_provider(
@@ -568,11 +571,14 @@ fn build_agent_provider(
     on_retry: Option<Arc<OnRetry>>,
 ) -> Result<Arc<BoxedProvider>> {
     if config.prompt_caching && config.name != "anthropic" {
-        tracing::warn!(
-            "prompt_caching is only effective with the 'anthropic' provider; \
-             ignored for '{}'",
-            config.name
-        );
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "prompt_caching is only effective with the 'anthropic' provider; \
+                 ignored for '{}'",
+                config.name
+            );
+        });
     }
     let base = build_base_provider(&config.name, &config.model, config.prompt_caching)?;
 
