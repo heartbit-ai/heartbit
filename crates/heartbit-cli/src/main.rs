@@ -644,9 +644,12 @@ async fn run_from_config(
         None, // CLI uses stdin-based question callback
         None, // no external memory in CLI run mode
         workspace_dir,
-        None, // no daemon todo store in CLI run mode
-        None, // no pre-loaded tools in CLI run mode
-        None, // no multimodal content in CLI run mode
+        None,   // no daemon todo store in CLI run mode
+        None,   // no pre-loaded tools in CLI run mode
+        None,   // no multimodal content in CLI run mode
+        vec![], // no guardrails in CLI run mode
+        None,   // no memory confidentiality cap in CLI run mode
+        None,   // no memory default confidentiality in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -730,6 +733,9 @@ pub(crate) async fn build_orchestrator_from_config(
     daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
     pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn Tool>>>>,
     content_blocks: Option<Vec<heartbit::ContentBlock>>,
+    guardrails: Vec<Arc<dyn heartbit::Guardrail>>,
+    memory_confidentiality_cap: Option<heartbit::Confidentiality>,
+    memory_default_confidentiality: Option<heartbit::Confidentiality>,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
 
@@ -1087,8 +1093,12 @@ pub(crate) async fn build_orchestrator_from_config(
                 Some(sid) => format!("{sid}:{}", agent.name),
                 None => agent.name.clone(),
             };
-            let namespaced: Arc<dyn Memory> =
-                Arc::new(NamespacedMemory::new(Arc::clone(base_memory), agent_ns));
+            let mut ns = NamespacedMemory::new(Arc::clone(base_memory), agent_ns)
+                .with_max_confidentiality(memory_confidentiality_cap);
+            if let Some(default) = memory_default_confidentiality {
+                ns = ns.with_default_store_confidentiality(default);
+            }
+            let namespaced: Arc<dyn Memory> = Arc::new(ns);
             rb = rb.memory(namespaced);
         }
 
@@ -1104,6 +1114,11 @@ pub(crate) async fn build_orchestrator_from_config(
         {
             let workspace_root = std::env::current_dir().unwrap_or_default();
             rb = rb.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
+        }
+
+        // Wire guardrails (e.g., SensorSecurityGuardrail for sensor tasks)
+        if !guardrails.is_empty() {
+            rb = rb.guardrails(guardrails.clone());
         }
 
         tracing::info!(
@@ -1160,6 +1175,11 @@ pub(crate) async fn build_orchestrator_from_config(
         .max_tokens(config.orchestrator.max_tokens)
         .on_text(on_text)
         .observability_mode(observability_mode);
+
+    // Wire guardrails (e.g., SensorSecurityGuardrail for sensor tasks)
+    if !guardrails.is_empty() {
+        builder = builder.guardrails(guardrails.clone());
+    }
 
     // Wire workspace directory for sub-agents
     if let Some(ref ws) = workspace_dir {
@@ -1293,7 +1313,7 @@ pub(crate) async fn build_orchestrator_from_config(
             run_timeout: agent
                 .run_timeout_seconds
                 .map(std::time::Duration::from_secs),
-            guardrails: vec![],
+            guardrails: guardrails.clone(),
             provider: agent_provider,
             reasoning_effort: agent
                 .reasoning_effort
@@ -1361,11 +1381,16 @@ pub(crate) async fn load_mcp_tools(
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools = Vec::new();
     for entry in mcp_servers {
-        let url = entry.url();
-        tracing::info!(agent = %agent_name, url = %url, "connecting to MCP server");
-        let result = match entry.auth_header() {
-            Some(auth) => McpClient::connect_with_auth(url, auth).await,
-            None => McpClient::connect(url).await,
+        let server_label = entry.display_name();
+        tracing::info!(agent = %agent_name, server = %server_label, "connecting to MCP server");
+        let result = match entry {
+            McpServerEntry::Stdio { command, args, env } => {
+                McpClient::connect_stdio(command, args, env).await
+            }
+            _ => match entry.auth_header() {
+                Some(auth) => McpClient::connect_with_auth(entry.url(), auth).await,
+                None => McpClient::connect(entry.url()).await,
+            },
         };
         match result {
             Ok(client) => {
@@ -1378,7 +1403,7 @@ pub(crate) async fn load_mcp_tools(
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_name,
-                    url = %url,
+                    server = %server_label,
                     error = %e,
                     "failed to connect to MCP server, skipping"
                 );

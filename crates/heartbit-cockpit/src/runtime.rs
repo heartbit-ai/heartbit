@@ -700,11 +700,16 @@ fn resolve_model_from_env() -> String {
 async fn load_mcp_tools(agent_name: &str, mcp_servers: &[McpServerEntry]) -> Vec<Arc<dyn Tool>> {
     let mut tools = Vec::new();
     for entry in mcp_servers {
-        let url = entry.url();
-        tracing::info!(agent = %agent_name, url = %url, "connecting to MCP server");
-        let result = match entry.auth_header() {
-            Some(auth) => McpClient::connect_with_auth(url, auth).await,
-            None => McpClient::connect(url).await,
+        let server_label = entry.display_name();
+        tracing::info!(agent = %agent_name, server = %server_label, "connecting to MCP server");
+        let result = match entry {
+            McpServerEntry::Stdio { command, args, env } => {
+                McpClient::connect_stdio(command, args, env).await
+            }
+            _ => match entry.auth_header() {
+                Some(auth) => McpClient::connect_with_auth(entry.url(), auth).await,
+                None => McpClient::connect(entry.url()).await,
+            },
         };
         match result {
             Ok(client) => {
@@ -715,7 +720,7 @@ async fn load_mcp_tools(agent_name: &str, mcp_servers: &[McpServerEntry]) -> Vec
             }
             Err(e) => {
                 tracing::warn!(
-                    agent = %agent_name, url = %url, error = %e,
+                    agent = %agent_name, server = %server_label, error = %e,
                     "failed to connect to MCP server, skipping"
                 );
             }

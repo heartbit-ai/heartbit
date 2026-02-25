@@ -118,6 +118,7 @@ impl HeartbitPulseScheduler {
                         task: prompt,
                         source: "heartbit".into(),
                         story_id: None,
+                        trust_level: None,
                     };
                     let payload = match serde_json::to_vec(&cmd) {
                         Ok(p) => p,

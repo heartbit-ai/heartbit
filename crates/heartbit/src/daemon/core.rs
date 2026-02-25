@@ -47,6 +47,7 @@ impl DaemonHandle {
             task: task_str,
             source: source_str,
             story_id,
+            trust_level: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -181,8 +182,8 @@ impl DaemonCore {
     /// Run the Kafka consumer loop. Blocks until cancellation.
     ///
     /// `build_runner` is called for each submitted task. It receives the task ID,
-    /// task text, source tag, optional story ID, and an event callback, and
-    /// returns a future that produces the agent output.
+    /// task text, source tag, optional story ID, optional trust level, and an
+    /// event callback, and returns a future that produces the agent output.
     pub async fn run<F, Fut>(mut self, build_runner: F) -> Result<(), Error>
     where
         F: Fn(
@@ -190,6 +191,7 @@ impl DaemonCore {
                 String,
                 String,
                 Option<String>,
+                Option<crate::sensor::triage::context::TrustLevel>,
                 Arc<dyn Fn(AgentEvent) + Send + Sync>,
             ) -> Fut
             + Send
@@ -235,7 +237,7 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id } => {
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level } => {
                             // Re-insert task if missing (e.g. after restart with message replay)
                             if let Ok(None) = self.store.get(id) {
                                 let _ = self.store.insert(DaemonTask::new(id, &task, &source));
@@ -286,7 +288,7 @@ impl DaemonCore {
                                     })
                                     .ok();
 
-                                let runner = build_runner(id, task, source, story_id, on_event);
+                                let runner = build_runner(id, task, source, story_id, trust_level, on_event);
                                 tokio::select! {
                                     result = runner => {
                                         match result {
@@ -393,6 +395,7 @@ mod tests {
             database_url: None,
             heartbit_pulse: None,
             auth: None,
+            owner_emails: vec![],
         }
     }
 

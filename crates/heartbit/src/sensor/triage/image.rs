@@ -141,6 +141,12 @@ impl TriageProcessor for ImageTriageProcessor {
                         summary: fallback_summary,
                         extracted_entities: vec![],
                         estimated_tokens,
+                        action_categories: vec![],
+                        action_hints: vec![],
+                        has_attachments: false,
+                        sender: None,
+                        subject: None,
+                        message_ref: None,
                     });
                 }
             };
@@ -169,6 +175,12 @@ impl TriageProcessor for ImageTriageProcessor {
                 summary,
                 extracted_entities: entities,
                 estimated_tokens,
+                action_categories: vec![],
+                action_hints: vec![],
+                has_attachments: false,
+                sender: None,
+                subject: None,
+                message_ref: None,
             })
         })
     }
@@ -725,6 +737,12 @@ mod tests {
             summary: "Scanned document".into(),
             extracted_entities: vec!["invoice".into()],
             estimated_tokens: 300,
+            action_categories: vec![],
+            action_hints: vec![],
+            has_attachments: false,
+            sender: None,
+            subject: None,
+            message_ref: None,
         };
         let json = serde_json::to_string(&decision).expect("serialize");
         let back: TriageDecision = serde_json::from_str(&json).expect("deserialize");
@@ -734,6 +752,7 @@ mod tests {
             summary,
             extracted_entities,
             estimated_tokens,
+            ..
         } = back
         {
             assert_eq!(priority, Priority::High);

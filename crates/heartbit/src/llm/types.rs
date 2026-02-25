@@ -38,6 +38,10 @@ pub enum ContentBlock {
         media_type: String,
         data: String,
     },
+    Audio {
+        format: String,
+        data: String,
+    },
 }
 
 /// A message in a conversation.
@@ -593,6 +597,22 @@ mod tests {
             let parsed: ReasoningEffort = serde_json::from_str(&json).unwrap();
             assert_eq!(effort, parsed);
         }
+    }
+
+    #[test]
+    fn content_block_audio_roundtrip() {
+        let block = ContentBlock::Audio {
+            format: "ogg".into(),
+            data: "base64audiodata".into(),
+        };
+        let json_str = serde_json::to_string(&block).unwrap();
+        let roundtripped: ContentBlock = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(block, roundtripped);
+
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "audio");
+        assert_eq!(json["format"], "ogg");
+        assert_eq!(json["data"], "base64audiodata");
     }
 
     #[test]

@@ -95,12 +95,6 @@ pub struct TelegramConfig {
     /// (< 20 chars, no question mark). Saves tokens on greetings. Defaults to false.
     #[serde(default)]
     pub memory_skip_trivial: bool,
-
-    /// OpenAI API key for Whisper voice transcription.
-    /// If not set, voice messages are silently ignored.
-    /// Can also use env var `HEARTBIT_TRANSCRIPTION_API_KEY`.
-    #[serde(default)]
-    pub transcription_api_key: Option<String>,
 }
 
 impl Default for TelegramConfig {
@@ -118,7 +112,6 @@ impl Default for TelegramConfig {
             database_url: None,
             memory_recall_limit: default_memory_recall_limit(),
             memory_skip_trivial: false,
-            transcription_api_key: None,
         }
     }
 }

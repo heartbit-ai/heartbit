@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -8,6 +6,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode};
 
 use crate::channel::session::{SessionMessage, SessionRole, SessionStore, format_session_context};
+use crate::channel::{ChannelBridge, ConsolidateSession, MediaAttachment, RunTask, RunTaskInput};
 use crate::error::Error;
 use crate::memory::{Memory, MemoryQuery};
 
@@ -18,40 +17,6 @@ use super::delivery::{RateLimiter, chunk_message, markdown_to_telegram_html};
 use super::extract;
 use super::keyboard::{CallbackAction, parse_callback_data};
 use super::router::{ChatSessionMap, IdleSession};
-use super::transcribe::transcribe_audio;
-
-/// A media attachment from Telegram (photo, voice, document).
-pub struct MediaAttachment {
-    pub media_type: String,
-    pub data: Vec<u8>,
-    pub caption: Option<String>,
-}
-
-/// Callback type for running an agent task with bridge callbacks.
-///
-/// The CLI crate provides this closure to wire `build_orchestrator_from_config`
-/// with the Telegram bridge callbacks. Returns the agent's final text output.
-pub type RunTask = dyn Fn(RunTaskInput) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>
-    + Send
-    + Sync;
-
-/// Input for the `RunTask` callback.
-pub struct RunTaskInput {
-    pub task_text: String,
-    pub bridge: Arc<TelegramBridge>,
-    /// Pre-existing shared memory store so sub-agent memory tools persist
-    /// across tasks. Passed as the raw (un-namespaced) store.
-    pub memory: Option<Arc<dyn Memory>>,
-    /// User-specific namespace prefix (e.g. `"tg:12345"`). Passed as `story_id`
-    /// to `build_orchestrator_from_config` for per-user memory isolation.
-    pub user_namespace: Option<String>,
-    /// Media attachments (photos, documents). Empty for text-only messages.
-    pub attachments: Vec<MediaAttachment>,
-}
-
-/// Callback type for memory consolidation on idle sessions.
-pub type ConsolidateSession =
-    dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> + Send + Sync;
 
 /// The main Telegram adapter that handles the bot lifecycle.
 pub struct TelegramAdapter {
@@ -244,7 +209,7 @@ impl TelegramAdapter {
         let memory = self.memory.clone();
         let input = RunTaskInput {
             task_text,
-            bridge: Arc::clone(&bridge),
+            bridge: Arc::clone(&bridge) as Arc<dyn ChannelBridge>,
             memory,
             user_namespace: Some(format!("tg:{user_id}")),
             attachments,
@@ -496,62 +461,34 @@ async fn handle_message(
         }
     }
 
-    // Voice message handling: transcribe via Whisper API
-    let transcription_key = adapter
-        .config
-        .transcription_api_key
-        .clone()
-        .or_else(|| std::env::var("HEARTBIT_TRANSCRIPTION_API_KEY").ok())
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+    // Voice message handling: send as native audio attachment
     if let Some(voice) = msg.voice() {
-        if let Some(ref api_key) = transcription_key {
-            match download_telegram_file(&adapter.bot, &voice.file.id).await {
-                Ok(data) => {
-                    let client = reqwest::Client::new();
-                    match transcribe_audio(&client, &data, api_key).await {
-                        Ok(transcript) => {
-                            let prefix = format!("[Voice message] {transcript}");
-                            text = if text.is_empty() {
-                                prefix
-                            } else {
-                                format!("{text}\n\n{prefix}")
-                            };
-                        }
-                        Err(e) => tracing::warn!(error = %e, "voice transcription failed"),
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to download telegram voice"),
-            }
-        } else {
-            tracing::warn!(
-                "voice message received but no transcription API key configured — set transcription_api_key in [daemon.telegram] or HEARTBIT_TRANSCRIPTION_API_KEY env var"
-            );
+        match download_telegram_file(&adapter.bot, &voice.file.id).await {
+            Ok(data) => attachments.push(MediaAttachment {
+                media_type: "audio/ogg".into(),
+                data,
+                caption: None,
+            }),
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram voice"),
         }
     }
 
-    // Audio file handling: transcribe via Whisper API (same as voice)
+    // Audio file handling: send as native audio attachment
     if let Some(audio) = msg.audio() {
-        if let Some(ref api_key) = transcription_key {
-            match download_telegram_file(&adapter.bot, &audio.file.id).await {
-                Ok(data) => {
-                    let client = reqwest::Client::new();
-                    match transcribe_audio(&client, &data, api_key).await {
-                        Ok(transcript) => {
-                            let title = audio.title.as_deref().unwrap_or("audio");
-                            let prefix = format!("[Audio: {title}] {transcript}");
-                            text = if text.is_empty() {
-                                prefix
-                            } else {
-                                format!("{text}\n\n{prefix}")
-                            };
-                        }
-                        Err(e) => tracing::warn!(error = %e, "audio transcription failed"),
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to download telegram audio"),
+        match download_telegram_file(&adapter.bot, &audio.file.id).await {
+            Ok(data) => {
+                let mime = audio
+                    .mime_type
+                    .as_ref()
+                    .map(|m| m.as_ref())
+                    .unwrap_or("audio/mpeg");
+                attachments.push(MediaAttachment {
+                    media_type: mime.into(),
+                    data,
+                    caption: audio.title.clone(),
+                });
             }
-        } else {
-            tracing::warn!("audio file received but no transcription API key configured");
+            Err(e) => tracing::warn!(error = %e, "failed to download telegram audio"),
         }
     }
 
@@ -603,6 +540,7 @@ async fn handle_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::RunTask;
     use crate::channel::session::InMemorySessionStore;
 
     fn make_adapter(memory: Option<Arc<dyn Memory>>) -> Arc<TelegramAdapter> {
@@ -641,7 +579,7 @@ mod tests {
     async fn preload_memories_with_store() {
         use crate::memory::in_memory::InMemoryStore;
         use crate::memory::namespaced::NamespacedMemory;
-        use crate::memory::{MemoryEntry, MemoryType};
+        use crate::memory::{Confidentiality, MemoryEntry, MemoryType};
 
         let store = Arc::new(InMemoryStore::new());
 
@@ -666,6 +604,7 @@ mod tests {
             related_ids: Vec::new(),
             source_ids: Vec::new(),
             embedding: None,
+            confidentiality: Confidentiality::default(),
         };
         ns.store(entry).await.unwrap();
 
@@ -851,7 +790,7 @@ mod tests {
     async fn preload_memories_skips_trivial_when_enabled() {
         use crate::memory::in_memory::InMemoryStore;
         use crate::memory::namespaced::NamespacedMemory;
-        use crate::memory::{MemoryEntry, MemoryType};
+        use crate::memory::{Confidentiality, MemoryEntry, MemoryType};
 
         let store = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:123:assistant");
@@ -872,6 +811,7 @@ mod tests {
             related_ids: Vec::new(),
             source_ids: Vec::new(),
             embedding: None,
+            confidentiality: Confidentiality::default(),
         };
         ns.store(entry).await.unwrap();
 
@@ -901,7 +841,7 @@ mod tests {
     async fn preload_memories_respects_recall_limit() {
         use crate::memory::in_memory::InMemoryStore;
         use crate::memory::namespaced::NamespacedMemory;
-        use crate::memory::{MemoryEntry, MemoryType};
+        use crate::memory::{Confidentiality, MemoryEntry, MemoryType};
 
         let store = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:42:assistant");
@@ -925,6 +865,7 @@ mod tests {
                 related_ids: Vec::new(),
                 source_ids: Vec::new(),
                 embedding: None,
+                confidentiality: Confidentiality::default(),
             };
             ns.store(entry).await.unwrap();
         }

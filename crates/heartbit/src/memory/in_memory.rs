@@ -119,6 +119,11 @@ impl Memory for InMemoryStore {
                             return false;
                         }
                     }
+                    if let Some(max_conf) = query.max_confidentiality
+                        && e.confidentiality > max_conf
+                    {
+                        return false;
+                    }
                     true
                 })
                 .cloned()
@@ -277,6 +282,12 @@ impl Memory for InMemoryStore {
             let min_s = query.min_strength.unwrap_or(0.0);
             for related_id in &to_expand {
                 if let Some(related) = entries.get(related_id) {
+                    // Respect confidentiality cap for expanded entries too
+                    if let Some(max_conf) = query.max_confidentiality
+                        && related.confidentiality > max_conf
+                    {
+                        continue;
+                    }
                     let eff = effective_strength(
                         related.strength,
                         related.last_accessed,
@@ -484,7 +495,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    use super::super::MemoryType;
+    use super::super::{Confidentiality, MemoryType};
 
     fn make_entry(id: &str, agent: &str, content: &str, category: &str) -> MemoryEntry {
         MemoryEntry {
@@ -504,6 +515,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 
@@ -531,6 +543,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 
@@ -1666,5 +1679,93 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_max_confidentiality() {
+        use super::super::Confidentiality;
+        let store = InMemoryStore::new();
+
+        let mut public = make_entry("m1", "a", "public fact", "fact");
+        public.confidentiality = Confidentiality::Public;
+        store.store(public).await.unwrap();
+
+        let mut internal = make_entry("m2", "a", "internal note", "fact");
+        internal.confidentiality = Confidentiality::Internal;
+        store.store(internal).await.unwrap();
+
+        let mut confidential = make_entry("m3", "a", "private expense", "fact");
+        confidential.confidentiality = Confidentiality::Confidential;
+        store.store(confidential).await.unwrap();
+
+        let mut restricted = make_entry("m4", "a", "api key", "fact");
+        restricted.confidentiality = Confidentiality::Restricted;
+        store.store(restricted).await.unwrap();
+
+        // Cap at Public — only public entries returned
+        let results = store
+            .recall(MemoryQuery {
+                max_confidentiality: Some(Confidentiality::Public),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "m1");
+
+        // No cap — all entries returned
+        let results = store
+            .recall(MemoryQuery {
+                max_confidentiality: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 4);
+
+        // Cap at Confidential — excludes Restricted
+        let results = store
+            .recall(MemoryQuery {
+                max_confidentiality: Some(Confidentiality::Confidential),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|e| e.id != "m4"));
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_respects_max_confidentiality() {
+        use super::super::Confidentiality;
+        let store = InMemoryStore::new();
+
+        // Public entry with a link to a Confidential entry
+        let mut public = make_entry("m1", "a", "project update", "fact");
+        public.confidentiality = Confidentiality::Public;
+        public.related_ids = vec!["m2".into()];
+        public.keywords = vec!["project".into()];
+        store.store(public).await.unwrap();
+
+        let mut confidential = make_entry("m2", "a", "private expense data", "fact");
+        confidential.confidentiality = Confidentiality::Confidential;
+        confidential.keywords = vec!["expense".into()];
+        store.store(confidential).await.unwrap();
+
+        // Query with Public cap and keyword that matches m1 — should NOT expand to m2
+        let results = store
+            .recall(MemoryQuery {
+                text: Some("project".into()),
+                max_confidentiality: Some(Confidentiality::Public),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().all(|e| e.id != "m2"),
+            "graph expansion should not include Confidential entries when capped at Public"
+        );
+        assert!(results.iter().any(|e| e.id == "m1"));
     }
 }

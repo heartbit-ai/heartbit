@@ -64,10 +64,10 @@ impl AgentContext {
         }
     }
 
-    /// Replace `ContentBlock::Image` blocks in all messages except the last user
-    /// message with a text placeholder. Prevents large base64 payloads from
-    /// accumulating in the conversation history.
-    pub(crate) fn evict_images(&mut self) {
+    /// Replace `ContentBlock::Image` and `ContentBlock::Audio` blocks in all
+    /// messages except the last user message with text placeholders. Prevents
+    /// large base64 payloads from accumulating in the conversation history.
+    pub(crate) fn evict_media(&mut self) {
         // Find the index of the last user message
         let last_user_idx = self.messages.iter().rposition(|m| m.role == Role::User);
 
@@ -76,10 +76,18 @@ impl AgentContext {
                 continue;
             }
             for block in &mut msg.content {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: "[image previously sent]".into(),
-                    };
+                match block {
+                    ContentBlock::Image { .. } => {
+                        *block = ContentBlock::Text {
+                            text: "[image previously sent]".into(),
+                        };
+                    }
+                    ContentBlock::Audio { .. } => {
+                        *block = ContentBlock::Text {
+                            text: "[audio previously sent]".into(),
+                        };
+                    }
+                    _ => {}
                 }
             }
         }
@@ -296,6 +304,9 @@ pub(crate) fn messages_to_text(messages: &[Message]) -> String {
                 }
                 ContentBlock::Image { media_type, .. } => {
                     format!("[Image: {media_type}]")
+                }
+                ContentBlock::Audio { format, .. } => {
+                    format!("[Audio: {format}]")
                 }
             })
             .collect::<Vec<String>>()
@@ -757,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_images_replaces_old_images_with_placeholder() {
+    fn evict_media_replaces_old_images_with_placeholder() {
         let mut ctx = AgentContext::from_content(
             "sys",
             vec![
@@ -781,7 +792,7 @@ mod tests {
             }],
         });
 
-        ctx.evict_images();
+        ctx.evict_media();
 
         // First user message's image should be replaced
         assert_eq!(
@@ -798,11 +809,51 @@ mod tests {
     }
 
     #[test]
-    fn evict_images_noop_when_no_images() {
+    fn evict_media_replaces_old_audio_with_placeholder() {
+        let mut ctx = AgentContext::from_content(
+            "sys",
+            vec![
+                ContentBlock::Text {
+                    text: "listen to this".into(),
+                },
+                ContentBlock::Audio {
+                    format: "ogg".into(),
+                    data: "audiodata1".into(),
+                },
+            ],
+            vec![],
+        );
+        ctx.add_assistant_message(Message::assistant("I heard it."));
+        ctx.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Audio {
+                format: "mp3".into(),
+                data: "audiodata2".into(),
+            }],
+        });
+
+        ctx.evict_media();
+
+        // First user message's audio should be replaced
+        assert_eq!(
+            ctx.messages[0].content[1],
+            ContentBlock::Text {
+                text: "[audio previously sent]".into()
+            }
+        );
+        // Last user message's audio should be preserved
+        assert!(matches!(
+            &ctx.messages[2].content[0],
+            ContentBlock::Audio { format, .. } if format == "mp3"
+        ));
+    }
+
+    #[test]
+    fn evict_media_noop_when_no_media() {
         let mut ctx = AgentContext::new("sys", "task", vec![]);
         ctx.add_assistant_message(Message::assistant("reply"));
         let msg_count = ctx.message_count();
-        ctx.evict_images();
+        ctx.evict_media();
         assert_eq!(ctx.message_count(), msg_count);
     }
 

@@ -763,13 +763,14 @@ pub async fn run_daemon(
         let slm_provider = build_provider_from_config(&config, None)
             .context("failed to build SLM provider for sensor triage")?;
 
-        let sensor_manager = heartbit::SensorManager::new(
+        let sensor_manager = heartbit::SensorManager::with_owner_emails(
             sensor_config.clone(),
             producer.clone(),
             slm_provider,
             sensor_metrics.clone(),
             &daemon_config.kafka.commands_topic,
             &daemon_config.kafka.dead_letter_topic,
+            daemon_config.owner_emails.clone(),
         );
 
         let sensor_cancel = cancel.clone();
@@ -821,6 +822,7 @@ pub async fn run_daemon(
                              task_text: String,
                              source: String,
                              story_id: Option<String>,
+                             trust_level: Option<heartbit::TrustLevel>,
                              on_event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>|
           -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<AgentOutput, HeartbitError>> + Send>,
@@ -856,6 +858,29 @@ pub async fn run_daemon(
 
             let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
 
+            // Wire SensorSecurityGuardrail for sensor-sourced tasks
+            let (guardrails, memory_confidentiality_cap): (
+                Vec<Arc<dyn heartbit::Guardrail>>,
+                Option<heartbit::Confidentiality>,
+            ) = if source.starts_with("sensor:") {
+                let trust = trust_level.unwrap_or(heartbit::TrustLevel::Unknown);
+                let owner_emails = config
+                    .daemon
+                    .as_ref()
+                    .map(|d| d.owner_emails.clone())
+                    .unwrap_or_default();
+                let guardrail =
+                    heartbit::SensorSecurityGuardrail::new(source.clone(), trust, owner_emails);
+                // Memory confidentiality cap based on trust level
+                let cap = match trust {
+                    heartbit::TrustLevel::Owner | heartbit::TrustLevel::Verified => None,
+                    _ => Some(heartbit::Confidentiality::Public),
+                };
+                (vec![Arc::new(guardrail)], cap)
+            } else {
+                (vec![], None)
+            };
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -871,6 +896,9 @@ pub async fn run_daemon(
                 todo_store, // persistent daemon todo store
                 Some(&tools),
                 None, // no multimodal content in Kafka consumer path
+                guardrails,
+                memory_confidentiality_cap,
+                None, // sensor tasks don't override store default
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1032,7 +1060,7 @@ pub async fn run_daemon(
         let tg_handle = app_state.handle.clone();
 
         // Build the RunTask closure that reuses build_orchestrator_from_config
-        let run_task: Arc<heartbit::channel::telegram::RunTask> = Arc::new(move |input| {
+        let run_task: Arc<heartbit::channel::RunTask> = Arc::new(move |input| {
             let config = tg_app_config.clone();
             let bridge = input.bridge;
             let task_text = input.task_text;
@@ -1053,7 +1081,7 @@ pub async fn run_daemon(
                 // No streaming preview for Telegram — only send the final
                 // HTML-formatted result to avoid a raw-markdown flash.
                 let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
-                let on_event = bridge.make_on_event();
+                let on_event = bridge.clone().make_on_event();
                 let on_question = bridge.make_on_question();
 
                 let on_retry = build_on_retry(&on_event);
@@ -1094,10 +1122,22 @@ pub async fn run_daemon(
                         });
                     }
                     for att in &attachments {
-                        blocks.push(heartbit::ContentBlock::Image {
-                            media_type: att.media_type.clone(),
-                            data: base64::engine::general_purpose::STANDARD.encode(&att.data),
-                        });
+                        if att.media_type.starts_with("audio/") {
+                            let format = att
+                                .media_type
+                                .strip_prefix("audio/")
+                                .unwrap_or("ogg")
+                                .to_string();
+                            blocks.push(heartbit::ContentBlock::Audio {
+                                format,
+                                data: base64::engine::general_purpose::STANDARD.encode(&att.data),
+                            });
+                        } else {
+                            blocks.push(heartbit::ContentBlock::Image {
+                                media_type: att.media_type.clone(),
+                                data: base64::engine::general_purpose::STANDARD.encode(&att.data),
+                            });
+                        }
                     }
                     Some(blocks)
                 };
@@ -1118,6 +1158,9 @@ pub async fn run_daemon(
                     todo_store,
                     Some(&tools),
                     content_blocks,
+                    vec![], // no guardrails for Telegram (user-initiated)
+                    None,   // no memory confidentiality cap for Telegram (owner-initiated)
+                    Some(heartbit::Confidentiality::Confidential), // Telegram DM memories are confidential
                 )
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1835,6 +1878,9 @@ async fn run_interactive_task(
             daemon_todo_store,
             pre_loaded_tools,
             None, // no multimodal content in interactive sessions
+            vec![], // no guardrails for interactive sessions
+            None,   // no memory confidentiality cap for interactive sessions
+            None,   // no memory default confidentiality for interactive sessions
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }

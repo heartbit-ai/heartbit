@@ -162,6 +162,15 @@ fn messages_to_anthropic(messages: &[crate::llm::types::Message]) -> Vec<serde_j
                             "data": data,
                         }
                     }),
+                    ContentBlock::Audio { .. } => {
+                        tracing::debug!(
+                            "audio block not supported by Anthropic, replacing with placeholder"
+                        );
+                        serde_json::json!({
+                            "type": "text",
+                            "text": "[audio: not supported by this provider]",
+                        })
+                    }
                 })
                 .collect();
             serde_json::json!({
@@ -1534,6 +1543,34 @@ mod tests {
         assert_eq!(content[1]["source"]["type"], "base64");
         assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
         assert_eq!(content[1]["source"]["data"], "base64data");
+    }
+
+    #[test]
+    fn messages_to_anthropic_audio_replaced_with_placeholder() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "Listen to this".into(),
+                },
+                ContentBlock::Audio {
+                    format: "ogg".into(),
+                    data: "base64audio".into(),
+                },
+            ],
+        }];
+        let result = messages_to_anthropic(&messages);
+        assert_eq!(result.len(), 1);
+        let content = result[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Listen to this");
+        // Audio block should be replaced with a text placeholder
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(
+            content[1]["text"],
+            "[audio: not supported by this provider]"
+        );
     }
 
     #[test]

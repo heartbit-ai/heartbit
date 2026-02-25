@@ -7,6 +7,7 @@ use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Messag
 use uuid::Uuid;
 
 use crate::agent::events::{AgentEvent, OnEvent};
+use crate::channel::ChannelBridge;
 use crate::error::Error;
 use crate::llm::{ApprovalDecision, OnApproval, OnText};
 use crate::tool::builtins::{OnQuestion, QuestionRequest, QuestionResponse};
@@ -402,6 +403,24 @@ impl TelegramBridge {
             .write()
             .expect("question_options lock not poisoned");
         qo.insert(id, options);
+    }
+}
+
+impl ChannelBridge for TelegramBridge {
+    fn make_on_text(self: Arc<Self>) -> Arc<OnText> {
+        TelegramBridge::make_on_text(&self)
+    }
+
+    fn make_on_event(self: Arc<Self>) -> Arc<OnEvent> {
+        TelegramBridge::make_on_event(&self)
+    }
+
+    fn make_on_approval(self: Arc<Self>) -> Arc<OnApproval> {
+        TelegramBridge::make_on_approval(&self)
+    }
+
+    fn make_on_question(self: Arc<Self>) -> Arc<OnQuestion> {
+        TelegramBridge::make_on_question(&self)
     }
 }
 

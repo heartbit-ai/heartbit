@@ -159,6 +159,12 @@ impl TriageProcessor for WebhookTriageProcessor {
                         summary,
                         extracted_entities: vec![],
                         estimated_tokens,
+                        action_categories: vec![],
+                        action_hints: vec![],
+                        has_attachments: false,
+                        sender: None,
+                        subject: None,
+                        message_ref: None,
                     });
                 }
             };
@@ -188,6 +194,12 @@ impl TriageProcessor for WebhookTriageProcessor {
                 summary,
                 extracted_entities: entities,
                 estimated_tokens,
+                action_categories: vec![],
+                action_hints: vec![],
+                has_attachments: false,
+                sender: None,
+                subject: None,
+                message_ref: None,
             })
         })
     }
@@ -750,6 +762,7 @@ mod tests {
             summary,
             extracted_entities,
             estimated_tokens,
+            ..
         } = back
         {
             assert_eq!(priority, Priority::High);

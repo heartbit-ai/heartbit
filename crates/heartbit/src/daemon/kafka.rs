@@ -374,6 +374,7 @@ mod tests {
             task: "round trip test".into(),
             source: "test".into(),
             story_id: None,
+            trust_level: None,
         };
         let payload = serde_json::to_vec(&cmd).expect("serialize");
 
@@ -497,6 +498,7 @@ mod tests {
             database_url: None,
             heartbit_pulse: None,
             auth: None,
+            owner_emails: vec![],
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
@@ -544,25 +546,27 @@ mod tests {
         let (runner_tx, mut runner_rx) = tokio::sync::mpsc::channel::<String>(1);
 
         // Mock build_runner: captures task text, returns a simple AgentOutput
-        let build_runner = move |_id: uuid::Uuid,
-                                 task: String,
-                                 _source: String,
-                                 _story_id: Option<String>,
-                                 _on_event: std::sync::Arc<
-            dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
-        >| {
-            let tx = runner_tx.clone();
-            async move {
-                let _ = tx.send(task).await;
-                Ok(crate::agent::AgentOutput {
-                    result: "HEARTBIT_OK".into(),
-                    tool_calls_made: 0,
-                    tokens_used: crate::llm::types::TokenUsage::default(),
-                    structured: None,
-                    estimated_cost_usd: None,
-                })
-            }
-        };
+        let build_runner =
+            move |_id: uuid::Uuid,
+                  task: String,
+                  _source: String,
+                  _story_id: Option<String>,
+                  _trust_level: Option<crate::sensor::triage::context::TrustLevel>,
+                  _on_event: std::sync::Arc<
+                dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
+            >| {
+                let tx = runner_tx.clone();
+                async move {
+                    let _ = tx.send(task).await;
+                    Ok(crate::agent::AgentOutput {
+                        result: "HEARTBIT_OK".into(),
+                        tool_calls_made: 0,
+                        tokens_used: crate::llm::types::TokenUsage::default(),
+                        structured: None,
+                        estimated_cost_usd: None,
+                    })
+                }
+            };
 
         // Spawn daemon core (consumes from Kafka, calls runner)
         let core_handle = tokio::spawn(async move {

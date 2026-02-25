@@ -61,6 +61,19 @@
   .agent-pill { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; background: #1c2128; color: #79c0ff; margin: 1px 2px; }
 
   .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+
+  .sensor-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: #21262d; margin-top: 4px; }
+  .sensor-bar .bar-received { background: #58a6ff; }
+  .sensor-bar .bar-promoted { background: #3fb950; }
+  .sensor-bar .bar-dropped { background: #484f58; }
+  .sensor-event { padding: 3px 0; border-bottom: 1px solid #21262d; font-size: 11px; }
+  .sensor-event .sensor-name { color: #3fb950; font-weight: bold; }
+  .sensor-event .sensor-ts { color: #484f58; }
+  .sensor-event .sensor-content { color: #c9d1d9; }
+  .sensor-event .sensor-verdict { font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+  .sensor-event .sensor-verdict.promoted { background: #0d2818; color: #3fb950; }
+  .sensor-event .sensor-verdict.dropped { background: #1c1315; color: #8b949e; }
 
   #connection-status { position: fixed; top: 8px; right: 16px; font-size: 11px; padding: 4px 8px; border-radius: 4px; }
   #connection-status.connected { background: #0d1117; color: #3fb950; border: 1px solid #3fb950; }
@@ -107,6 +120,25 @@
   <div class="card">
     <h2>Sources</h2>
     <div id="source-breakdown" style="font-size: 11px; color: #8b949e;">No tasks yet</div>
+  </div>
+</div>
+
+<div class="grid-3">
+  <div class="card">
+    <h2>Sensors</h2>
+    <div class="stat"><span class="stat-label">Events received</span><span class="stat-value blue" id="m-sensor-received">0</span></div>
+    <div class="stat"><span class="stat-label">Promoted</span><span class="stat-value green" id="m-sensor-promoted">0</span></div>
+    <div class="stat"><span class="stat-label">Dropped</span><span class="stat-value" id="m-sensor-dropped" style="color:#484f58">0</span></div>
+    <div class="stat"><span class="stat-label">Active stories</span><span class="stat-value yellow" id="m-sensor-stories">0</span></div>
+    <div class="sensor-bar" id="sensor-bar"><div class="bar-promoted" style="width:0%"></div><div class="bar-dropped" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <h2>Sensor Sources</h2>
+    <div id="sensor-sources" style="font-size: 11px; color: #8b949e;">No sensor events yet</div>
+  </div>
+  <div class="card">
+    <h2>Sensor Activity</h2>
+    <div id="sensor-activity" class="events-log" style="height: 140px;"></div>
   </div>
 </div>
 
@@ -260,6 +292,48 @@ async function pollMetrics() {
     const cost = sumMetric(m, 'heartbit_llm_cost_usd_total');
     document.getElementById('m-llm-cost').textContent = '$' + cost.toFixed(4);
 
+    // Sensors
+    const sensorReceived = sumMetric(m, 'heartbit_sensor_events_received_total');
+    const sensorDropped = sumMetric(m, 'heartbit_sensor_events_dropped_total');
+    const sensorPromoted = Math.max(0, sensorReceived - sensorDropped);
+    const sensorStories = m['heartbit_sensor_stories_active'] || 0;
+
+    document.getElementById('m-sensor-received').textContent = fmt(sensorReceived);
+    document.getElementById('m-sensor-promoted').textContent = fmt(Math.max(0, sensorPromoted));
+    document.getElementById('m-sensor-dropped').textContent = fmt(sensorDropped);
+    document.getElementById('m-sensor-stories').textContent = sensorStories;
+
+    // Sensor bar
+    if (sensorReceived > 0) {
+      const pPct = Math.max(0, sensorPromoted) / sensorReceived * 100;
+      const dPct = sensorDropped / sensorReceived * 100;
+      const bar = document.getElementById('sensor-bar');
+      bar.innerHTML = `<div class="bar-promoted" style="width:${pPct}%" title="${Math.max(0,sensorPromoted)} promoted"></div><div class="bar-dropped" style="width:${dPct}%" title="${sensorDropped} dropped"></div>`;
+    }
+
+    // Per-source breakdown
+    const sensorSources = extractLabel(m, 'heartbit_sensor_events_received_total', 'sensor_name');
+    const sensorDroppedBySource = extractLabel(m, 'heartbit_sensor_events_dropped_total', 'sensor_name');
+    const srcEl = document.getElementById('sensor-sources');
+    if (Object.keys(sensorSources).length > 0) {
+      srcEl.innerHTML = Object.entries(sensorSources)
+        .sort((a,b) => b[1] - a[1])
+        .map(([name, recv]) => {
+          const drop = sensorDroppedBySource[name] || 0;
+          const prom = Math.max(0, recv - drop);
+          const dropPct = recv > 0 ? Math.min(100, Math.round(drop / recv * 100)) : 0;
+          return `<div class="stat" style="margin-bottom:6px">
+            <span class="stat-label"><span class="source-badge sensor">${name}</span></span>
+            <span style="font-size:11px"><span style="color:#3fb950">${prom}</span> / ${recv} <span style="color:#484f58">(${dropPct}% filtered)</span></span>
+          </div>`;
+        }).join('');
+    } else {
+      srcEl.textContent = 'No sensor events yet';
+    }
+
+    // Sensor activity log — show triage counts as they change
+    updateSensorActivity(sensorSources, sensorDroppedBySource);
+
     // Reliability
     document.getElementById('m-retries').textContent = m['heartbit_reliability_retry_attempts_total'] || 0;
     document.getElementById('m-doom').textContent = m['heartbit_reliability_doom_loops_detected_total'] || 0;
@@ -406,6 +480,33 @@ async function submitTask() {
 document.getElementById('task-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') submitTask();
 });
+
+// --- Sensor activity tracking ---
+let prevSensorReceived = {};
+function updateSensorActivity(received, dropped) {
+  const log = document.getElementById('sensor-activity');
+  const ts = new Date().toLocaleTimeString();
+  for (const [name, count] of Object.entries(received)) {
+    const prev = prevSensorReceived[name] || 0;
+    if (count > prev) {
+      const newEvents = count - prev;
+      const drop = (dropped[name] || 0) - (prevSensorReceived['_drop_' + name] || 0);
+      const prom = Math.max(0, newEvents - Math.max(0, drop));
+      const div = document.createElement('div');
+      div.className = 'sensor-event';
+      div.innerHTML = `<span class="sensor-ts">${ts}</span> <span class="sensor-name">${name}</span> `
+        + `<span class="sensor-content">+${newEvents} events</span>`
+        + (prom > 0 ? `<span class="sensor-verdict promoted">${prom} promoted</span>` : '')
+        + (drop > 0 ? `<span class="sensor-verdict dropped">${drop} filtered</span>` : '');
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      // Keep max 50 entries
+      while (log.children.length > 50) log.removeChild(log.firstChild);
+    }
+    prevSensorReceived[name] = count;
+    prevSensorReceived['_drop_' + name] = dropped[name] || 0;
+  }
+}
 
 // --- Polling loops ---
 setInterval(pollHealth, 3000);

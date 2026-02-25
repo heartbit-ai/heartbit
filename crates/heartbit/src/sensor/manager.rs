@@ -16,11 +16,13 @@ use crate::sensor::metrics::SensorMetrics;
 use crate::sensor::sources::audio::AudioSensor;
 use crate::sensor::sources::image::ImageSensor;
 use crate::sensor::sources::jmap::JmapEmailSensor;
+use crate::sensor::sources::mcp::{McpSensor, McpTriageProcessor};
 use crate::sensor::sources::rss::RssSensor;
 use crate::sensor::sources::weather::WeatherSensor;
 use crate::sensor::sources::webhook::WebhookSensor;
 use crate::sensor::stories::StoryCorrelator;
 use crate::sensor::triage::audio::AudioTriageProcessor;
+use crate::sensor::triage::context::{TaskContext, TrustLevel};
 use crate::sensor::triage::email::EmailTriageProcessor;
 use crate::sensor::triage::image::ImageTriageProcessor;
 use crate::sensor::triage::rss::RssTriageProcessor;
@@ -43,6 +45,8 @@ pub struct SensorManager {
     metrics: Option<Arc<SensorMetrics>>,
     commands_topic: String,
     dead_letter_topic: String,
+    /// Owner emails from daemon config for trust resolution.
+    owner_emails: Vec<String>,
 }
 
 impl SensorManager {
@@ -53,6 +57,7 @@ impl SensorManager {
     /// - `slm_provider`: LLM provider used for SLM-powered triage.
     /// - `metrics`: Optional Prometheus metrics.
     /// - `commands_topic`: The main daemon commands topic for promoted events.
+    /// - `owner_emails`: Owner email addresses for trust resolution.
     pub fn new(
         config: SensorConfig,
         producer: FutureProducer,
@@ -61,6 +66,27 @@ impl SensorManager {
         commands_topic: impl Into<String>,
         dead_letter_topic: impl Into<String>,
     ) -> Self {
+        Self::with_owner_emails(
+            config,
+            producer,
+            slm_provider,
+            metrics,
+            commands_topic,
+            dead_letter_topic,
+            vec![],
+        )
+    }
+
+    /// Create a new sensor manager with owner emails for trust resolution.
+    pub fn with_owner_emails(
+        config: SensorConfig,
+        producer: FutureProducer,
+        slm_provider: Arc<dyn DynLlmProvider>,
+        metrics: Option<Arc<SensorMetrics>>,
+        commands_topic: impl Into<String>,
+        dead_letter_topic: impl Into<String>,
+        owner_emails: Vec<String>,
+    ) -> Self {
         Self {
             config,
             producer,
@@ -68,6 +94,7 @@ impl SensorManager {
             metrics,
             commands_topic: commands_topic.into(),
             dead_letter_topic: dead_letter_topic.into(),
+            owner_emails,
         }
     }
 
@@ -107,8 +134,20 @@ impl SensorManager {
         }
 
         // Build and spawn triage consumers
+        // Pair each processor with per-source sender lists for trust resolution.
         let triage_processors = self.build_triage_processors();
-        for processor in triage_processors {
+        let sender_lists: Vec<_> = self
+            .config
+            .sources
+            .iter()
+            .map(|s| {
+                let (p, b) = s.sender_lists();
+                (p.to_vec(), b.to_vec())
+            })
+            .collect();
+        for (processor, (priority_senders, blocked_senders)) in
+            triage_processors.into_iter().zip(sender_lists)
+        {
             let topic = processor.source_topic().to_string();
             let consumer =
                 kafka::create_sensor_consumer(kafka_config, &topic, &topic).map_err(|e| {
@@ -120,6 +159,7 @@ impl SensorManager {
             let producer = self.producer.clone();
             let commands_topic = self.commands_topic.clone();
             let dead_letter_topic = self.dead_letter_topic.clone();
+            let owner_emails = self.owner_emails.clone();
 
             let correlation_window = self
                 .config
@@ -141,6 +181,9 @@ impl SensorManager {
                     &dead_letter_topic,
                     metrics.as_deref(),
                     cancel,
+                    &owner_emails,
+                    &priority_senders,
+                    &blocked_senders,
                 )
                 .await
             });
@@ -252,6 +295,36 @@ impl SensorManager {
                         secret,
                     )));
                 }
+                SensorSourceConfig::Mcp {
+                    name,
+                    server,
+                    tool_name,
+                    tool_args,
+                    kafka_topic,
+                    modality,
+                    poll_interval_seconds,
+                    id_field,
+                    content_field,
+                    items_field,
+                    enrich_tool,
+                    enrich_id_param,
+                    ..
+                } => {
+                    sensors.push(Box::new(McpSensor::new(
+                        name.clone(),
+                        (**server).clone(),
+                        tool_name.clone(),
+                        tool_args.clone(),
+                        kafka_topic.clone(),
+                        *modality,
+                        Duration::from_secs(*poll_interval_seconds),
+                        id_field.clone(),
+                        content_field.clone(),
+                        items_field.clone(),
+                        enrich_tool.clone(),
+                        enrich_id_param.clone(),
+                    )));
+                }
             }
         }
 
@@ -302,6 +375,26 @@ impl SensorManager {
                         &self.slm_provider,
                     ))));
                 }
+                SensorSourceConfig::Mcp {
+                    kafka_topic,
+                    modality,
+                    priority_senders,
+                    blocked_senders,
+                    ..
+                } => {
+                    if kafka_topic == "hb.sensor.email" {
+                        processors.push(Box::new(EmailTriageProcessor::new(
+                            Arc::clone(&self.slm_provider),
+                            priority_senders.clone(),
+                            blocked_senders.clone(),
+                        )));
+                    } else {
+                        processors.push(Box::new(McpTriageProcessor::new(
+                            kafka_topic.clone(),
+                            *modality,
+                        )));
+                    }
+                }
             }
         }
 
@@ -325,6 +418,9 @@ async fn run_triage_consumer(
     dead_letter_topic: &str,
     metrics: Option<&SensorMetrics>,
     cancel: CancellationToken,
+    owner_emails: &[String],
+    priority_senders: &[String],
+    blocked_senders: &[String],
 ) -> (String, Result<(), Error>) {
     let topic = processor.source_topic().to_string();
     // In-memory dedup: event ID → first-seen time. Events within the TTL window are
@@ -419,10 +515,16 @@ async fn run_triage_consumer(
                         priority,
                         summary,
                         extracted_entities,
-                        estimated_tokens,
+                        estimated_tokens: _,
+                        action_categories,
+                        action_hints,
+                        has_attachments,
+                        sender,
+                        subject,
+                        message_ref,
                     } => {
                         let entities: HashSet<String> =
-                            extracted_entities.into_iter().collect();
+                            extracted_entities.iter().cloned().collect();
 
                         let story_id = {
                             let mut corr = correlator.lock().unwrap_or_else(|e| e.into_inner());
@@ -440,16 +542,38 @@ async fn run_triage_consumer(
                             id
                         };
 
+                        // Resolve sender trust level from config lists
+                        let trust_level = TrustLevel::resolve(
+                            sender.as_deref(),
+                            owner_emails,
+                            priority_senders,
+                            blocked_senders,
+                        );
+
+                        // Build rich task context for the agent
+                        let context = TaskContext {
+                            summary: summary.clone(),
+                            action_categories,
+                            action_hints,
+                            sender,
+                            subject,
+                            message_ref,
+                            has_attachments,
+                            entities: extracted_entities,
+                            priority,
+                            story_id: story_id.clone(),
+                            sensor: event.sensor_name.clone(),
+                            source_id: event.source_id.clone(),
+                            trust_level,
+                        };
+
                         // Build a proper DaemonCommand::SubmitTask
                         let cmd = crate::daemon::types::DaemonCommand::SubmitTask {
                             id: uuid::Uuid::new_v4(),
-                            task: format!(
-                                "[sensor:{sensor}] {summary}\n\nStory: {story_id}\nPriority: {priority:?}\nEstimated tokens: {estimated_tokens}\nSource: {source_id}",
-                                sensor = event.sensor_name,
-                                source_id = event.source_id,
-                            ),
+                            task: context.to_task_prompt(),
                             source: format!("sensor:{}", event.sensor_name),
                             story_id: Some(story_id.clone()),
+                            trust_level: Some(context.trust_level),
                         };
 
                         let payload = match serde_json::to_vec(&cmd) {
@@ -482,6 +606,7 @@ async fn run_triage_consumer(
                         } else {
                             tracing::info!(
                                 sensor = %event.sensor_name,
+                                source_id = %event.source_id,
                                 story = %story_id,
                                 priority = ?priority,
                                 "promoted sensor event to commands topic"
@@ -489,8 +614,9 @@ async fn run_triage_consumer(
                         }
                     }
                     TriageDecision::Drop { reason } => {
-                        tracing::debug!(
+                        tracing::info!(
                             sensor = %event.sensor_name,
+                            source_id = %event.source_id,
                             reason = %reason,
                             "dropped sensor event"
                         );
@@ -912,18 +1038,18 @@ mod tests {
     }
 
     #[test]
-    fn build_sensors_all_six_types() {
+    fn build_sensors_all_seven_types() {
         // SAFETY: test-only; no concurrent access to these env vars.
         unsafe {
-            std::env::set_var("TEST_JMAP_PASS_ALL6", "secret");
-            std::env::set_var("TEST_WEATHER_KEY_ALL6", "key");
+            std::env::set_var("TEST_JMAP_PASS_ALL7", "secret");
+            std::env::set_var("TEST_WEATHER_KEY_ALL7", "key");
         }
         let manager = make_manager(vec![
             SensorSourceConfig::JmapEmail {
                 name: "email".into(),
                 server: "https://jmap.example.com".into(),
                 username: "user@example.com".into(),
-                password_env: "TEST_JMAP_PASS_ALL6".into(),
+                password_env: "TEST_JMAP_PASS_ALL7".into(),
                 priority_senders: vec![],
                 blocked_senders: vec![],
                 poll_interval_seconds: 60,
@@ -948,7 +1074,7 @@ mod tests {
             },
             SensorSourceConfig::Weather {
                 name: "weather".into(),
-                api_key_env: "TEST_WEATHER_KEY_ALL6".into(),
+                api_key_env: "TEST_WEATHER_KEY_ALL7".into(),
                 locations: vec!["Paris,FR".into()],
                 poll_interval_seconds: 1800,
                 alert_only: true,
@@ -958,25 +1084,45 @@ mod tests {
                 path: "/webhooks/github".into(),
                 secret_env: None,
             },
+            SensorSourceConfig::Mcp {
+                name: "mcp_calendar".into(),
+                server: Box::new(crate::config::McpServerEntry::Simple(
+                    "http://localhost:3000/mcp".into(),
+                )),
+                tool_name: "list_events".into(),
+                tool_args: serde_json::json!({}),
+                kafka_topic: "hb.sensor.calendar".into(),
+                modality: crate::sensor::SensorModality::Structured,
+                poll_interval_seconds: 300,
+                id_field: "eventId".into(),
+                content_field: Some("summary".into()),
+                items_field: None,
+                priority_senders: vec![],
+                blocked_senders: vec![],
+                enrich_tool: None,
+                enrich_id_param: None,
+            },
         ]);
 
         let sensors = manager.build_sensors();
-        assert_eq!(sensors.len(), 6);
+        assert_eq!(sensors.len(), 7);
         assert_eq!(sensors[0].name(), "email");
         assert_eq!(sensors[1].name(), "rss");
         assert_eq!(sensors[2].name(), "images");
         assert_eq!(sensors[3].name(), "audio");
         assert_eq!(sensors[4].name(), "weather");
         assert_eq!(sensors[5].name(), "webhook");
+        assert_eq!(sensors[6].name(), "mcp_calendar");
 
         let processors = manager.build_triage_processors();
-        assert_eq!(processors.len(), 6);
+        assert_eq!(processors.len(), 7);
         assert_eq!(processors[0].source_topic(), "hb.sensor.email");
         assert_eq!(processors[1].source_topic(), "hb.sensor.rss");
         assert_eq!(processors[2].source_topic(), "hb.sensor.image");
         assert_eq!(processors[3].source_topic(), "hb.sensor.audio");
         assert_eq!(processors[4].source_topic(), "hb.sensor.weather");
         assert_eq!(processors[5].source_topic(), "hb.sensor.webhook");
+        assert_eq!(processors[6].source_topic(), "hb.sensor.calendar");
     }
 
     #[test]
@@ -987,6 +1133,7 @@ mod tests {
             task: "[sensor:rss] Test summary\n\nStory: story-123\nPriority: High\nEstimated tokens: 500\nSource: feed-1".into(),
             source: "sensor:rss".into(),
             story_id: Some("story-123".into()),
+            trust_level: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();
@@ -1006,6 +1153,7 @@ mod tests {
             task: "test task".into(),
             source: "sensor:rss".into(),
             story_id: Some("story-cve-2026-001".into()),
+            trust_level: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();
@@ -1015,5 +1163,149 @@ mod tests {
             }
             _ => panic!("expected SubmitTask"),
         }
+    }
+
+    // --- MCP sensor manager tests ---
+
+    #[test]
+    fn build_sensors_from_mcp_config() {
+        let manager = make_manager(vec![SensorSourceConfig::Mcp {
+            name: "gmail_inbox".into(),
+            server: Box::new(crate::config::McpServerEntry::Simple(
+                "http://localhost:3000/mcp".into(),
+            )),
+            tool_name: "search_emails".into(),
+            tool_args: serde_json::json!({"query": "is:unread"}),
+            kafka_topic: "hb.sensor.email".into(),
+            modality: crate::sensor::SensorModality::Text,
+            poll_interval_seconds: 60,
+            id_field: "messageId".into(),
+            content_field: Some("snippet".into()),
+            items_field: None,
+            priority_senders: vec!["boss@company.com".into()],
+            blocked_senders: vec![],
+            enrich_tool: None,
+            enrich_id_param: None,
+        }]);
+
+        let sensors = manager.build_sensors();
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].name(), "gmail_inbox");
+        assert_eq!(sensors[0].kafka_topic(), "hb.sensor.email");
+        assert_eq!(sensors[0].modality(), crate::sensor::SensorModality::Text);
+    }
+
+    #[test]
+    fn build_triage_mcp_email_topic() {
+        let manager = make_manager(vec![SensorSourceConfig::Mcp {
+            name: "mcp_email".into(),
+            server: Box::new(crate::config::McpServerEntry::Simple(
+                "http://localhost:3000/mcp".into(),
+            )),
+            tool_name: "search_emails".into(),
+            tool_args: serde_json::json!({}),
+            kafka_topic: "hb.sensor.email".into(),
+            modality: crate::sensor::SensorModality::Text,
+            poll_interval_seconds: 60,
+            id_field: "id".into(),
+            content_field: None,
+            items_field: None,
+            priority_senders: vec!["boss@company.com".into()],
+            blocked_senders: vec!["spam@example.com".into()],
+            enrich_tool: None,
+            enrich_id_param: None,
+        }]);
+
+        let processors = manager.build_triage_processors();
+        assert_eq!(processors.len(), 1);
+        // When kafka_topic is "hb.sensor.email", should use EmailTriageProcessor.
+        assert_eq!(processors[0].source_topic(), "hb.sensor.email");
+        assert_eq!(
+            processors[0].modality(),
+            crate::sensor::SensorModality::Text
+        );
+    }
+
+    #[test]
+    fn task_context_built_from_promote_decision_fields() {
+        use crate::sensor::triage::{ActionCategory, Priority};
+
+        // Simulate what the Promote arm in run_triage_consumer does:
+        let summary = "Invoice from Acme Corp";
+        let action_categories = vec![ActionCategory::PayOrProcess, ActionCategory::StoreOrFile];
+        let action_hints = vec!["Download invoice PDF".to_string()];
+        let sender = Some("billing@acme.com".to_string());
+        let subject = Some("Invoice #2024-387".to_string());
+        let message_ref = Some("19abc123".to_string());
+        let has_attachments = true;
+        let extracted_entities = vec!["Acme Corp".to_string(), "consulting".to_string()];
+        let priority = Priority::High;
+
+        let context = TaskContext {
+            summary: summary.to_string(),
+            action_categories,
+            action_hints,
+            sender,
+            subject,
+            message_ref,
+            has_attachments,
+            entities: extracted_entities,
+            priority,
+            story_id: "story-invoice-001".to_string(),
+            sensor: "gmail_inbox".to_string(),
+            source_id: "msg-19abc123@gmail.com".to_string(),
+            trust_level: TrustLevel::default(),
+        };
+
+        let prompt = context.to_task_prompt();
+
+        // Verify the prompt contains all structured sections
+        assert!(prompt.contains("[sensor:gmail_inbox]"));
+        assert!(prompt.contains("## Email Triage Summary"));
+        assert!(prompt.contains("Invoice from Acme Corp"));
+        assert!(prompt.contains("**From:** billing@acme.com"));
+        assert!(prompt.contains("**Subject:** Invoice #2024-387"));
+        assert!(prompt.contains("**Priority:** high"));
+        assert!(prompt.contains("**Attachments:** Yes"));
+        assert!(prompt.contains("pay_or_process"));
+        assert!(prompt.contains("store_or_file"));
+        assert!(prompt.contains("## Suggested Actions"));
+        assert!(prompt.contains("- Download invoice PDF"));
+        assert!(prompt.contains("## How to Access"));
+        assert!(prompt.contains("`gmail_get_message`"));
+        assert!(prompt.contains("`19abc123`"));
+        assert!(prompt.contains("**Story:** story-invoice-001"));
+        assert!(prompt.contains("**Source:** msg-19abc123@gmail.com"));
+    }
+
+    #[test]
+    fn build_triage_mcp_other_topic() {
+        let manager = make_manager(vec![SensorSourceConfig::Mcp {
+            name: "calendar".into(),
+            server: Box::new(crate::config::McpServerEntry::Simple(
+                "http://localhost:3000/mcp".into(),
+            )),
+            tool_name: "list_events".into(),
+            tool_args: serde_json::json!({}),
+            kafka_topic: "hb.sensor.calendar".into(),
+            modality: crate::sensor::SensorModality::Structured,
+            poll_interval_seconds: 300,
+            id_field: "eventId".into(),
+            content_field: Some("summary".into()),
+            items_field: None,
+            priority_senders: vec![],
+            blocked_senders: vec![],
+            enrich_tool: None,
+            enrich_id_param: None,
+        }]);
+
+        let processors = manager.build_triage_processors();
+        assert_eq!(processors.len(), 1);
+        // Non-email topics should use McpTriageProcessor with the configured topic.
+        assert_eq!(processors[0].source_topic(), "hb.sensor.calendar");
+        assert_eq!(
+            processors[0].modality(),
+            crate::sensor::SensorModality::Structured
+        );
     }
 }

@@ -249,11 +249,16 @@ async fn load_mcp_tool_defs(
 ) -> Vec<ToolDefinition> {
     let mut defs = Vec::new();
     for entry in mcp_servers {
-        let url = entry.url();
-        tracing::info!(agent = %agent_name, url = %url, "resolving MCP tool definitions");
-        let result = match entry.auth_header() {
-            Some(auth) => heartbit::McpClient::connect_with_auth(url, auth).await,
-            None => heartbit::McpClient::connect(url).await,
+        let server_label = entry.display_name();
+        tracing::info!(agent = %agent_name, server = %server_label, "resolving MCP tool definitions");
+        let result = match entry {
+            heartbit::McpServerEntry::Stdio { command, args, env } => {
+                heartbit::McpClient::connect_stdio(command, args, env).await
+            }
+            _ => match entry.auth_header() {
+                Some(auth) => heartbit::McpClient::connect_with_auth(entry.url(), auth).await,
+                None => heartbit::McpClient::connect(entry.url()).await,
+            },
         };
         match result {
             Ok(client) => {
@@ -265,7 +270,7 @@ async fn load_mcp_tool_defs(
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_name,
-                    url = %url,
+                    server = %server_label,
                     error = %e,
                     "failed to connect to MCP server, agent will run without these tools"
                 );

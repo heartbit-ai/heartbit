@@ -32,6 +32,26 @@ pub enum MemoryType {
     Reflection,
 }
 
+/// Access classification for memory entries.
+///
+/// Ordered from least to most sensitive — `PartialOrd`/`Ord` derives use
+/// variant declaration order, so `Public < Internal < Confidential < Restricted`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidentiality {
+    /// Shareable with anyone (public facts, general knowledge).
+    #[default]
+    Public,
+    /// Internal context (work items, project details). Shareable with Verified+ senders.
+    Internal,
+    /// Personal/sensitive (expenses, health, private conversations). Owner only.
+    Confidential,
+    /// Secrets (API keys, passwords, tokens). Never included in LLM context.
+    Restricted,
+}
+
 /// A single memory entry stored by an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -68,6 +88,9 @@ pub struct MemoryEntry {
     /// Optional vector embedding for semantic search (hybrid retrieval).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// Access classification — controls which trust levels may read this entry.
+    #[serde(default)]
+    pub confidentiality: Confidentiality,
 }
 
 pub(crate) fn default_importance() -> u8 {
@@ -112,6 +135,9 @@ pub struct MemoryQuery {
     /// is computed and fused with BM25 via Reciprocal Rank Fusion.
     /// Populated automatically by `EmbeddingMemory::recall()`.
     pub query_embedding: Option<Vec<f32>>,
+    /// When set, recall excludes entries with confidentiality above this level.
+    /// `None` means no restriction (all levels returned).
+    pub max_confidentiality: Option<Confidentiality>,
 }
 
 /// Trait for persistent memory stores.
@@ -181,6 +207,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 
@@ -203,6 +230,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: MemoryEntry = serde_json::from_str(&json).unwrap();
@@ -231,6 +259,7 @@ mod tests {
             related_ids: vec!["m2".into(), "m3".into()],
             source_ids: vec!["m0".into()],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: MemoryEntry = serde_json::from_str(&json).unwrap();
@@ -356,6 +385,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: Some(vec![0.1, 0.2, 0.3]),
+            confidentiality: Confidentiality::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"embedding\""));
@@ -379,5 +409,61 @@ mod tests {
         let entry = make_entry("m1", "test");
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("embedding"));
+    }
+
+    #[test]
+    fn confidentiality_default_is_public() {
+        assert_eq!(Confidentiality::default(), Confidentiality::Public);
+    }
+
+    #[test]
+    fn confidentiality_ordering() {
+        assert!(Confidentiality::Public < Confidentiality::Internal);
+        assert!(Confidentiality::Internal < Confidentiality::Confidential);
+        assert!(Confidentiality::Confidential < Confidentiality::Restricted);
+    }
+
+    #[test]
+    fn confidentiality_serde_roundtrip() {
+        for c in [
+            Confidentiality::Public,
+            Confidentiality::Internal,
+            Confidentiality::Confidential,
+            Confidentiality::Restricted,
+        ] {
+            let json = serde_json::to_string(&c).unwrap();
+            let parsed: Confidentiality = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, c);
+        }
+    }
+
+    #[test]
+    fn confidentiality_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Confidentiality::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Confidentiality::Confidential).unwrap(),
+            "\"confidential\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Confidentiality::Restricted).unwrap(),
+            "\"restricted\""
+        );
+    }
+
+    #[test]
+    fn memory_entry_backward_compat_no_confidentiality() {
+        // Old JSON without confidentiality field — should deserialize as Public
+        let json = r#"{"id":"m1","agent":"a","content":"test","category":"fact","tags":[],"created_at":"2024-01-01T00:00:00Z","last_accessed":"2024-01-01T00:00:00Z","access_count":0,"importance":5}"#;
+        let entry: MemoryEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.confidentiality, Confidentiality::Public);
+    }
+
+    #[test]
+    fn memory_query_max_confidentiality_default_is_none() {
+        let q = MemoryQuery::default();
+        assert!(q.max_confidentiality.is_none());
     }
 }

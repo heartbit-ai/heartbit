@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::llm::types::TokenUsage;
+use crate::sensor::triage::context::TrustLevel;
 
 /// Commands serialized to the `heartbit.commands` Kafka topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,9 @@ pub enum DaemonCommand {
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         story_id: Option<String>,
+        /// Sender trust level for security guardrails (sensor tasks only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust_level: Option<TrustLevel>,
     },
     CancelTask {
         id: Uuid,
@@ -107,6 +111,7 @@ mod tests {
             task: "Do something".into(),
             source: "api".into(),
             story_id: None,
+            trust_level: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
@@ -116,6 +121,7 @@ mod tests {
                 task,
                 source,
                 story_id,
+                ..
             } => {
                 assert_eq!(parsed_id, id);
                 assert_eq!(task, "Do something");
@@ -147,6 +153,7 @@ mod tests {
             task: "test".into(),
             source: "api".into(),
             story_id: None,
+            trust_level: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""type":"submit_task""#));
@@ -166,6 +173,7 @@ mod tests {
             task: "Analyze CVE".into(),
             source: "sensor:rss".into(),
             story_id: Some("story-cve-2026-001".into()),
+            trust_level: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("story_id"));

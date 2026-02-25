@@ -3,6 +3,7 @@ pub(crate) mod blackboard_tools;
 pub mod context;
 pub mod events;
 pub mod guardrail;
+pub mod guardrails;
 pub mod instructions;
 pub mod observability;
 pub mod orchestrator;
@@ -756,8 +757,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     content: response.content,
                 });
 
-                // Evict base64 images from older messages to prevent context bloat.
-                ctx.evict_images();
+                // Evict base64 media from older messages to prevent context bloat.
+                ctx.evict_media();
 
                 // Check for structured output: if the LLM called the synthetic `__respond__` tool,
                 // validate its input against the schema, then extract as structured result.
@@ -1316,6 +1317,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         related_ids: vec![],
                         source_ids: vec![],
                         embedding: None,
+                        confidentiality: crate::memory::Confidentiality::default(),
                     };
                     if let Err(e) = memory.store(entry).await {
                         tracing::warn!(
@@ -2153,6 +2155,13 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         if has_power_tools {
             system_prompt.push_str(RESOURCEFULNESS_GUIDELINES);
         }
+
+        // Inject current date/time so the model knows "today".
+        use chrono::Utc;
+        system_prompt.push_str(&format!(
+            "\n\nCurrent date and time: {} UTC",
+            Utc::now().format("%A, %B %-d, %Y %H:%M")
+        ));
 
         Ok(AgentRunner {
             provider: self.provider,
@@ -6909,6 +6918,26 @@ mod tests {
         assert!(
             !runner.system_prompt.contains("Resourcefulness"),
             "should not include guidelines when only memory tools are present"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_current_date() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("prompt")
+            .build()
+            .unwrap();
+        assert!(
+            runner.system_prompt.contains("Current date and time:"),
+            "system prompt should contain current date/time"
+        );
+        // Verify it contains the current year
+        let year = chrono::Utc::now().format("%Y").to_string();
+        assert!(
+            runner.system_prompt.contains(&year),
+            "system prompt should contain current year"
         );
     }
 }

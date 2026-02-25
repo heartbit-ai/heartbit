@@ -228,6 +228,7 @@ impl Tool for SharedMemoryWriteTool {
                 related_ids: vec![],
                 source_ids: vec![],
                 embedding: None,
+                confidentiality: super::Confidentiality::default(),
             };
 
             self.memory.store(entry).await?;

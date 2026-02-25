@@ -4,15 +4,22 @@ use std::sync::Arc;
 
 use crate::error::Error;
 
-use super::{Memory, MemoryEntry, MemoryQuery};
+use super::{Confidentiality, Memory, MemoryEntry, MemoryQuery};
 
 /// Wraps a `Memory` store with namespace prefixing for agent isolation.
 ///
 /// Each agent's memory entries get IDs prefixed with `{agent_name}:` for provenance.
 /// Recall can search within the agent's namespace or across all namespaces.
+///
+/// When `max_confidentiality` is set, recall queries are capped at that level
+/// regardless of what the caller requests. This is the enforcement point for
+/// sensor security — even if the LLM is tricked into calling `memory_recall`,
+/// the store-level filter prevents confidential data from being returned.
 pub struct NamespacedMemory {
     inner: Arc<dyn Memory>,
     agent_name: String,
+    max_confidentiality: Option<Confidentiality>,
+    default_store_confidentiality: Confidentiality,
 }
 
 impl NamespacedMemory {
@@ -20,7 +27,30 @@ impl NamespacedMemory {
         Self {
             inner,
             agent_name: agent_name.into(),
+            max_confidentiality: None,
+            default_store_confidentiality: Confidentiality::Public,
         }
+    }
+
+    /// Set the maximum confidentiality level for recall queries.
+    ///
+    /// When set, all recall queries through this namespace will be capped at this
+    /// level — entries with higher confidentiality are filtered out at the store level.
+    pub fn with_max_confidentiality(mut self, cap: Option<Confidentiality>) -> Self {
+        self.max_confidentiality = cap;
+        self
+    }
+
+    /// Set the minimum confidentiality level for new entries stored through this namespace.
+    ///
+    /// When an entry is stored with a confidentiality level below this floor, it
+    /// will be upgraded to this level. Entries already at or above this level are
+    /// left unchanged. This prevents LLM-driven downgrade attacks and ensures
+    /// private conversations (e.g. Telegram DMs) are stored as `Confidential`
+    /// by default without requiring the LLM to specify it.
+    pub fn with_default_store_confidentiality(mut self, level: Confidentiality) -> Self {
+        self.default_store_confidentiality = level;
+        self
     }
 
     fn prefix_id(&self, id: &str) -> String {
@@ -35,6 +65,13 @@ impl Memory for NamespacedMemory {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         entry.id = self.prefix_id(&entry.id);
         entry.agent = self.agent_name.clone();
+        // Enforce minimum confidentiality floor for this namespace.
+        // If the entry's level is below the namespace default, upgrade it.
+        // This prevents LLM-driven downgrade attacks (e.g. storing as Internal
+        // when the namespace default is Confidential).
+        if entry.confidentiality < self.default_store_confidentiality {
+            entry.confidentiality = self.default_store_confidentiality;
+        }
         Box::pin(async move { self.inner.store(entry).await })
     }
 
@@ -43,7 +80,7 @@ impl Memory for NamespacedMemory {
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
         // If no agent filter specified, default to this agent's namespace
-        let query = if query.agent.is_none() {
+        let mut query = if query.agent.is_none() {
             MemoryQuery {
                 agent: Some(self.agent_name.clone()),
                 ..query
@@ -51,6 +88,13 @@ impl Memory for NamespacedMemory {
         } else {
             query
         };
+        // Enforce max_confidentiality cap — use the stricter of the two
+        if let Some(cap) = self.max_confidentiality {
+            query.max_confidentiality = Some(match query.max_confidentiality {
+                Some(existing) if existing < cap => existing,
+                _ => cap,
+            });
+        }
         let prefix = format!("{}:", self.agent_name);
         Box::pin(async move {
             let mut entries = self.inner.recall(query).await?;
@@ -104,7 +148,7 @@ mod tests {
     use crate::memory::in_memory::InMemoryStore;
     use chrono::Utc;
 
-    use super::super::MemoryType;
+    use super::super::{Confidentiality, MemoryType};
 
     fn make_entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -124,6 +168,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 
@@ -317,6 +362,170 @@ mod tests {
         let m2 = all.iter().find(|e| e.id == "agent_a:m2").unwrap();
         assert!(m1.related_ids.contains(&"agent_a:m2".to_string()));
         assert!(m2.related_ids.contains(&"agent_a:m1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn max_confidentiality_caps_recall() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "agent_a")
+            .with_max_confidentiality(Some(Confidentiality::Public));
+
+        // Store entries at different confidentiality levels
+        let mut public_entry = make_entry("m1", "public data");
+        public_entry.confidentiality = Confidentiality::Public;
+        ns.store(public_entry).await.unwrap();
+
+        let mut confidential_entry = make_entry("m2", "confidential data");
+        confidential_entry.confidentiality = Confidentiality::Confidential;
+        // Store via inner directly to bypass namespace (then prefix manually)
+        confidential_entry.id = "agent_a:m2".into();
+        confidential_entry.agent = "agent_a".into();
+        inner.store(confidential_entry).await.unwrap();
+
+        // Recall should only return the public entry
+        let results = ns
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "public data");
+    }
+
+    #[tokio::test]
+    async fn no_confidentiality_cap_returns_all() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "agent_a");
+
+        let mut public_entry = make_entry("m1", "public data");
+        public_entry.confidentiality = Confidentiality::Public;
+        ns.store(public_entry).await.unwrap();
+
+        let mut confidential_entry = make_entry("m2", "confidential data");
+        confidential_entry.confidentiality = Confidentiality::Confidential;
+        ns.store(confidential_entry).await.unwrap();
+
+        let results = ns
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn confidentiality_cap_uses_stricter_of_two() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        // Namespace cap at Internal
+        let ns = NamespacedMemory::new(inner.clone(), "agent_a")
+            .with_max_confidentiality(Some(Confidentiality::Internal));
+
+        let mut public_entry = make_entry("m1", "public data");
+        public_entry.confidentiality = Confidentiality::Public;
+        ns.store(public_entry).await.unwrap();
+
+        let mut internal_entry = make_entry("m2", "internal data");
+        internal_entry.confidentiality = Confidentiality::Internal;
+        ns.store(internal_entry).await.unwrap();
+
+        let mut confidential_entry = make_entry("m3", "confidential data");
+        confidential_entry.confidentiality = Confidentiality::Confidential;
+        // Store via inner directly (bypassing namespace)
+        confidential_entry.id = "agent_a:m3".into();
+        confidential_entry.agent = "agent_a".into();
+        inner.store(confidential_entry).await.unwrap();
+
+        // Even with query requesting Confidential cap, namespace cap (Internal) wins
+        let results = ns
+            .recall(MemoryQuery {
+                limit: 10,
+                max_confidentiality: Some(Confidentiality::Confidential),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2); // Public + Internal, not Confidential
+
+        // With query requesting Public (stricter than namespace Internal), query wins
+        let results = ns
+            .recall(MemoryQuery {
+                limit: 10,
+                max_confidentiality: Some(Confidentiality::Public),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1); // Only Public
+    }
+
+    #[tokio::test]
+    async fn default_store_confidentiality_upgrades_public() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "tg_agent")
+            .with_default_store_confidentiality(Confidentiality::Confidential);
+
+        // Store with default (Public) → should be upgraded to Confidential
+        let entry = make_entry("m1", "private chat data");
+        ns.store(entry).await.unwrap();
+
+        // Check raw store: entry should be stored as Confidential
+        let all = inner
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].confidentiality, Confidentiality::Confidential);
+    }
+
+    #[tokio::test]
+    async fn default_store_confidentiality_enforces_minimum_floor() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "tg_agent")
+            .with_default_store_confidentiality(Confidentiality::Confidential);
+
+        // Store with Internal (below Confidential floor) → should be upgraded
+        let mut entry = make_entry("m1", "internal data");
+        entry.confidentiality = Confidentiality::Internal;
+        ns.store(entry).await.unwrap();
+
+        let all = inner
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].confidentiality, Confidentiality::Confidential);
+    }
+
+    #[tokio::test]
+    async fn default_store_confidentiality_preserves_higher_level() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns = NamespacedMemory::new(inner.clone(), "tg_agent")
+            .with_default_store_confidentiality(Confidentiality::Confidential);
+
+        // Store with Restricted (above Confidential floor) → should NOT be changed
+        let mut entry = make_entry("m1", "secret data");
+        entry.confidentiality = Confidentiality::Restricted;
+        ns.store(entry).await.unwrap();
+
+        let all = inner
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].confidentiality, Confidentiality::Restricted);
     }
 
     #[tokio::test]

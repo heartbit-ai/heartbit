@@ -130,23 +130,32 @@ fn build_openai_request(
     for msg in &request.messages {
         match msg.role {
             Role::User => {
-                let has_images = msg
+                let has_media = msg
                     .content
                     .iter()
-                    .any(|b| matches!(b, ContentBlock::Image { .. }));
+                    .any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::Audio { .. }));
 
                 let mut text_parts = Vec::new();
-                let mut image_parts = Vec::new();
+                let mut media_parts = Vec::new();
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => {
                             text_parts.push(text.as_str());
                         }
                         ContentBlock::Image { media_type, data } => {
-                            image_parts.push(serde_json::json!({
+                            media_parts.push(serde_json::json!({
                                 "type": "image_url",
                                 "image_url": {
                                     "url": format!("data:{media_type};base64,{data}")
+                                }
+                            }));
+                        }
+                        ContentBlock::Audio { format, data } => {
+                            media_parts.push(serde_json::json!({
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": data,
+                                    "format": format,
                                 }
                             }));
                         }
@@ -172,8 +181,8 @@ fn build_openai_request(
                     }
                 }
 
-                if has_images {
-                    // Use array content format when images are present (OpenAI vision)
+                if has_media {
+                    // Use array content format when images/audio are present
                     let mut content_parts: Vec<serde_json::Value> = Vec::new();
                     if !text_parts.is_empty() {
                         content_parts.push(serde_json::json!({
@@ -181,7 +190,7 @@ fn build_openai_request(
                             "text": text_parts.join("\n\n"),
                         }));
                     }
-                    content_parts.extend(image_parts);
+                    content_parts.extend(media_parts);
                     if !content_parts.is_empty() {
                         messages.push(serde_json::json!({
                             "role": "user",
@@ -1105,6 +1114,64 @@ mod tests {
         // String content, not array
         assert!(messages[0]["content"].is_string());
         assert_eq!(messages[0]["content"], "hello");
+    }
+
+    #[test]
+    fn build_request_user_with_audio_uses_input_audio() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "What does this say?".into(),
+                    },
+                    ContentBlock::Audio {
+                        format: "ogg".into(),
+                        data: "base64audio".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What does this say?");
+        assert_eq!(content[1]["type"], "input_audio");
+        assert_eq!(content[1]["input_audio"]["data"], "base64audio");
+        assert_eq!(content[1]["input_audio"]["format"], "ogg");
+    }
+
+    #[test]
+    fn build_request_audio_only_no_text() {
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Audio {
+                    format: "mp3".into(),
+                    data: "audiodata".into(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+
+        let body = build_openai_request("model", &request).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_audio");
     }
 
     #[test]

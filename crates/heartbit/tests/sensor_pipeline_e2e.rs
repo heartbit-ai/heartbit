@@ -351,6 +351,7 @@ async fn run_triage_once(
         ref summary,
         ref extracted_entities,
         estimated_tokens,
+        ..
     } = decision
     {
         let entities: HashSet<String> = extracted_entities.iter().cloned().collect();
@@ -5048,6 +5049,7 @@ async fn kafka_full_pipeline_rss_source_to_commands() {
                         ref priority,
                         ref extracted_entities,
                         estimated_tokens: _,
+                        ..
                     }) = d
                     {
                         let entities: HashSet<String> =

@@ -9,7 +9,7 @@ use crate::error::Error;
 use super::bm25;
 use super::hybrid;
 use super::scoring::{STRENGTH_DECAY_RATE, ScoringWeights, composite_score, effective_strength};
-use super::{Memory, MemoryEntry, MemoryQuery};
+use super::{Confidentiality, Memory, MemoryEntry, MemoryQuery};
 
 use super::MemoryType;
 
@@ -31,6 +31,7 @@ struct MemoryRow {
     strength: f64,
     related_ids: Vec<String>,
     source_ids: Vec<String>,
+    confidentiality: String,
 }
 
 fn memory_type_from_str(s: &str) -> MemoryType {
@@ -46,6 +47,24 @@ fn memory_type_to_str(mt: MemoryType) -> &'static str {
         MemoryType::Episodic => "episodic",
         MemoryType::Semantic => "semantic",
         MemoryType::Reflection => "reflection",
+    }
+}
+
+fn confidentiality_from_str(s: &str) -> Confidentiality {
+    match s {
+        "internal" => Confidentiality::Internal,
+        "confidential" => Confidentiality::Confidential,
+        "restricted" => Confidentiality::Restricted,
+        _ => Confidentiality::Public,
+    }
+}
+
+fn confidentiality_to_str(c: Confidentiality) -> &'static str {
+    match c {
+        Confidentiality::Public => "public",
+        Confidentiality::Internal => "internal",
+        Confidentiality::Confidential => "confidential",
+        Confidentiality::Restricted => "restricted",
     }
 }
 
@@ -68,6 +87,7 @@ impl From<MemoryRow> for MemoryEntry {
             related_ids: row.related_ids,
             source_ids: row.source_ids,
             embedding: None, // loaded separately when pgvector is available
+            confidentiality: confidentiality_from_str(&row.confidentiality),
         }
     }
 }
@@ -173,10 +193,7 @@ impl PostgresMemoryStore {
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength DOUBLE PRECISION NOT NULL DEFAULT 1.0",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS related_ids TEXT[] NOT NULL DEFAULT '{}'",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ids TEXT[] NOT NULL DEFAULT '{}'",
-            // pgvector extension and embedding column for hybrid retrieval
-            "CREATE EXTENSION IF NOT EXISTS vector",
-            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1536)",
-            "CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops)",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidentiality TEXT NOT NULL DEFAULT 'public'",
         ];
 
         for stmt in statements {
@@ -185,6 +202,21 @@ impl PostgresMemoryStore {
                 .await
                 .map_err(|e| Error::Memory(format!("migration failed on: {stmt}: {e}")))?;
         }
+
+        // pgvector extension and embedding column — optional, not all PostgreSQL
+        // instances have pgvector installed. Failures are logged but non-fatal.
+        let pgvector_stmts = [
+            "CREATE EXTENSION IF NOT EXISTS vector",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1536)",
+            "CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops)",
+        ];
+        for stmt in pgvector_stmts {
+            if let Err(e) = sqlx::query(stmt).execute(&self.pool).await {
+                tracing::warn!("pgvector migration skipped (extension not installed): {e}");
+                break;
+            }
+        }
+
         Ok(())
     }
 }
@@ -202,8 +234,8 @@ impl Memory for PostgresMemoryStore {
             sqlx::query(
                 r#"
                 INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
-                    memory_type, keywords, summary, strength, related_ids, source_ids, embedding)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    memory_type, keywords, summary, strength, related_ids, source_ids, embedding, confidentiality)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 ON CONFLICT (id) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
@@ -215,7 +247,8 @@ impl Memory for PostgresMemoryStore {
                     strength = EXCLUDED.strength,
                     related_ids = EXCLUDED.related_ids,
                     source_ids = EXCLUDED.source_ids,
-                    embedding = EXCLUDED.embedding
+                    embedding = EXCLUDED.embedding,
+                    confidentiality = EXCLUDED.confidentiality
                 "#,
             )
             .bind(&entry.id)
@@ -234,6 +267,7 @@ impl Memory for PostgresMemoryStore {
             .bind(&entry.related_ids)
             .bind(&entry.source_ids)
             .bind(&embedding)
+            .bind(confidentiality_to_str(entry.confidentiality))
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
@@ -248,7 +282,7 @@ impl Memory for PostgresMemoryStore {
         Box::pin(async move {
             // Build dynamic query with filters
             let mut sql = String::from(
-                "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids FROM memories WHERE true",
+                "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality FROM memories WHERE true",
             );
             let mut param_idx = 1u32;
 
@@ -326,6 +360,9 @@ impl Memory for PostgresMemoryStore {
                 param_idx += 1;
             }
 
+            // Note: max_confidentiality is filtered in Rust after fetch,
+            // consistent with InMemoryStore behavior.
+
             // param_idx is intentionally incremented after each filter to keep
             // placeholders consistent if filters are reordered or new ones added.
             let _ = param_idx;
@@ -380,10 +417,16 @@ impl Memory for PostgresMemoryStore {
                         strength: row.get("strength"),
                         related_ids: row.get("related_ids"),
                         source_ids: row.get("source_ids"),
+                        confidentiality: row.get("confidentiality"),
                     };
                     MemoryEntry::from(r)
                 })
                 .collect();
+
+            // Apply confidentiality filter in Rust (consistent with InMemoryStore)
+            if let Some(max_conf) = query.max_confidentiality {
+                entries.retain(|e| e.confidentiality <= max_conf);
+            }
 
             // Apply effective_strength filter (Ebbinghaus decay) for min_strength,
             // matching InMemoryStore's approach. The SQL filter above uses raw strength
@@ -520,7 +563,7 @@ impl Memory for PostgresMemoryStore {
 
             if !related_to_fetch.is_empty() {
                 let expanded_rows = sqlx::query(
-                    "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids FROM memories WHERE id = ANY($1)",
+                    "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality FROM memories WHERE id = ANY($1)",
                 )
                 .bind(&related_to_fetch)
                 .fetch_all(&self.pool)
@@ -546,8 +589,15 @@ impl Memory for PostgresMemoryStore {
                         strength: row.get("strength"),
                         related_ids: row.get("related_ids"),
                         source_ids: row.get("source_ids"),
+                        confidentiality: row.get("confidentiality"),
                     };
                     let related_entry = MemoryEntry::from(r);
+                    // Respect confidentiality cap for expanded entries too
+                    if let Some(max_conf) = query.max_confidentiality
+                        && related_entry.confidentiality > max_conf
+                    {
+                        continue;
+                    }
                     let eff = effective_strength(
                         related_entry.strength,
                         related_entry.last_accessed,
@@ -792,6 +842,7 @@ mod tests {
             strength: 1.0,
             related_ids: vec![],
             source_ids: vec![],
+            confidentiality: "public".into(),
         }
     }
 

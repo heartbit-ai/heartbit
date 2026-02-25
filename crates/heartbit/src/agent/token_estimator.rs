@@ -33,6 +33,10 @@ pub(crate) fn estimate_message_tokens(message: &Message) -> u32 {
                 // we approximate: each 750 base64 chars ≈ 1 token.
                 (data.len() as u32) / 750 + 85 // 85 = overhead for the image block structure
             }
+            ContentBlock::Audio { data, .. } => {
+                // Rough audio token estimate: base64 audio ÷ 750 + overhead.
+                (data.len() as u32) / 750 + 50
+            }
         })
         .sum();
 
@@ -104,6 +108,20 @@ mod tests {
         let tokens = estimate_message_tokens(&msg);
         // 4 overhead + estimate("call-1") + estimate("search results here")
         assert!(tokens > 4);
+    }
+
+    #[test]
+    fn estimate_message_tokens_audio_block() {
+        let msg = Message {
+            role: crate::llm::types::Role::User,
+            content: vec![ContentBlock::Audio {
+                format: "ogg".into(),
+                data: "a".repeat(1500), // 1500 / 750 + 50 = 52
+            }],
+        };
+        let tokens = estimate_message_tokens(&msg);
+        // 4 overhead + 52 audio = 56
+        assert_eq!(tokens, 4 + 52);
     }
 
     #[test]

@@ -150,6 +150,12 @@ impl TriageProcessor for RssTriageProcessor {
                 summary,
                 extracted_entities: entities,
                 estimated_tokens,
+                action_categories: vec![],
+                action_hints: vec![],
+                has_attachments: false,
+                sender: None,
+                subject: None,
+                message_ref: None,
             })
         })
     }

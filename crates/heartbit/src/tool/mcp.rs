@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
@@ -180,9 +182,71 @@ fn mcp_tool_to_definition(tool: &McpToolDef) -> ToolDefinition {
     }
 }
 
-// --- McpSession ---
+/// Process a raw JSON-RPC response string into the result value.
+///
+/// Shared between HTTP and stdio transports.
+fn process_rpc_response(json_str: &str) -> Result<Value, Error> {
+    let rpc_response: JsonRpcResponse = serde_json::from_str(json_str)?;
 
-struct McpSession {
+    if let Some(err) = rpc_response.error {
+        return Err(Error::Mcp(format!(
+            "JSON-RPC error {}: {}",
+            err.code, err.message
+        )));
+    }
+
+    rpc_response
+        .result
+        .ok_or_else(|| Error::Mcp("Response missing both result and error".into()))
+}
+
+/// Read a JSON-RPC response from a stdio stream, skipping notifications.
+///
+/// MCP stdio protocol sends newline-delimited JSON. Notifications (no `id` field
+/// or null id) are skipped. Returns the raw JSON string of the first response
+/// matching `expected_id`.
+async fn read_stdio_response<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    expected_id: u64,
+) -> Result<String, Error> {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .await
+            .map_err(|e| Error::Mcp(format!("stdio read error: {e}")))?;
+        if n == 0 {
+            return Err(Error::Mcp("MCP stdio server closed unexpectedly".into()));
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Try to parse as JSON; skip non-JSON lines (e.g., debug output on stdout).
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Notifications have no "id" or null id — skip them.
+        match value.get("id") {
+            None | Some(&Value::Null) => continue,
+            _ => {}
+        }
+
+        if value.get("id").and_then(|v| v.as_u64()) == Some(expected_id) {
+            return Ok(trimmed.to_string());
+        }
+        // Different ID — skip (shouldn't happen with serialized access, but safe).
+    }
+}
+
+// --- HTTP transport ---
+
+/// HTTP-based transport for Streamable HTTP MCP servers.
+struct HttpTransport {
     client: reqwest::Client,
     endpoint: String,
     session_id: RwLock<Option<String>>,
@@ -190,7 +254,7 @@ struct McpSession {
     auth_header: Option<String>,
 }
 
-impl McpSession {
+impl HttpTransport {
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -265,18 +329,7 @@ impl McpSession {
             body
         };
 
-        let rpc_response: JsonRpcResponse = serde_json::from_str(&json_str)?;
-
-        if let Some(err) = rpc_response.error {
-            return Err(Error::Mcp(format!(
-                "JSON-RPC error {}: {}",
-                err.code, err.message
-            )));
-        }
-
-        rpc_response
-            .result
-            .ok_or_else(|| Error::Mcp("Response missing both result and error".into()))
+        process_rpc_response(&json_str)
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
@@ -317,6 +370,121 @@ impl McpSession {
 
         Ok(())
     }
+}
+
+// --- Stdio transport ---
+
+/// I/O handles for an MCP server running as a child process.
+///
+/// Fields are dropped in declaration order: stdin first (signals EOF to child),
+/// then reader, then the process handle.
+struct StdioIo {
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    _process: tokio::process::Child,
+}
+
+/// Stdio-based transport for MCP servers spawned as child processes.
+///
+/// Communication uses newline-delimited JSON-RPC on stdin/stdout.
+/// Access is serialized via a tokio `Mutex` to prevent interleaved I/O.
+struct StdioTransport {
+    io: tokio::sync::Mutex<StdioIo>,
+    next_id: AtomicU64,
+}
+
+impl StdioTransport {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+        let id = self.next_id();
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            method: method.to_string(),
+            params,
+            id,
+        };
+        let line = serde_json::to_string(&request)? + "\n";
+
+        // Timeout covers the entire write+read cycle to prevent hangs from
+        // both unresponsive writes (server stopped reading stdin) and slow reads.
+        let mut io = self.io.lock().await;
+        let json_str = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            io.stdin
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| Error::Mcp(format!("stdio write error: {e}")))?;
+            io.stdin
+                .flush()
+                .await
+                .map_err(|e| Error::Mcp(format!("stdio flush error: {e}")))?;
+            read_stdio_response(&mut io.reader, id).await
+        })
+        .await
+        .map_err(|_| {
+            Error::Mcp(format!(
+                "MCP stdio server timed out after {}s for request {id}",
+                REQUEST_TIMEOUT.as_secs()
+            ))
+        })??;
+        process_rpc_response(&json_str)
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: method.to_string(),
+            params,
+        };
+        let line = serde_json::to_string(&notification)? + "\n";
+
+        let mut io = self.io.lock().await;
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            io.stdin
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| Error::Mcp(format!("stdio write error: {e}")))?;
+            io.stdin
+                .flush()
+                .await
+                .map_err(|e| Error::Mcp(format!("stdio flush error: {e}")))?;
+            Ok::<(), Error>(())
+        })
+        .await
+        .map_err(|_| {
+            Error::Mcp(format!(
+                "MCP stdio notification timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))
+        })??;
+        Ok(())
+    }
+}
+
+// --- Unified transport ---
+
+/// Unified MCP transport supporting both Streamable HTTP and stdio protocols.
+enum Transport {
+    Http(HttpTransport),
+    Stdio(Box<StdioTransport>),
+}
+
+impl Transport {
+    async fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+        match self {
+            Transport::Http(t) => t.rpc(method, params).await,
+            Transport::Stdio(t) => t.rpc(method, params).await,
+        }
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
+        match self {
+            Transport::Http(t) => t.notify(method, params).await,
+            Transport::Stdio(t) => t.notify(method, params).await,
+        }
+    }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput, Error> {
         // MCP servers expect arguments to be an object, never null.
@@ -340,7 +508,7 @@ impl McpSession {
 // --- McpTool ---
 
 struct McpTool {
-    session: Arc<McpSession>,
+    transport: Arc<Transport>,
     def: ToolDefinition,
 }
 
@@ -354,7 +522,7 @@ impl Tool for McpTool {
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
-            match self.session.call_tool(&self.def.name, input).await {
+            match self.transport.call_tool(&self.def.name, input).await {
                 Ok(output) => Ok(output),
                 Err(e) => {
                     tracing::warn!(
@@ -373,22 +541,23 @@ impl Tool for McpTool {
 
 /// Client for the Model Context Protocol (MCP).
 ///
-/// Connects to an MCP server, performs the handshake, discovers tools,
-/// and produces `Vec<Arc<dyn Tool>>` that plug into `AgentRunnerBuilder::tools()`.
+/// Connects to an MCP server via Streamable HTTP or stdio, performs the
+/// handshake, discovers tools, and produces `Vec<Arc<dyn Tool>>` that plug
+/// into `AgentRunnerBuilder::tools()`.
 pub struct McpClient {
-    session: Arc<McpSession>,
+    transport: Arc<Transport>,
     tools: Vec<McpToolDef>,
 }
 
 impl McpClient {
-    /// Connect to an MCP server and discover available tools.
+    /// Connect to an MCP server over Streamable HTTP and discover available tools.
     ///
     /// Performs the full handshake: initialize → notifications/initialized → tools/list.
     pub async fn connect(endpoint: &str) -> Result<Self, Error> {
-        Self::connect_internal(endpoint, None).await
+        Self::connect_http(endpoint, None).await
     }
 
-    /// Connect to an MCP server with an authorization header.
+    /// Connect to an MCP server over Streamable HTTP with an authorization header.
     ///
     /// Use this for agentgateway or other authenticated MCP proxies.
     /// The `auth_header` is sent as the `Authorization` header value
@@ -397,24 +566,96 @@ impl McpClient {
         endpoint: &str,
         auth_header: impl Into<String>,
     ) -> Result<Self, Error> {
-        Self::connect_internal(endpoint, Some(auth_header.into())).await
+        Self::connect_http(endpoint, Some(auth_header.into())).await
     }
 
-    async fn connect_internal(endpoint: &str, auth_header: Option<String>) -> Result<Self, Error> {
+    /// Connect to an MCP server via stdio (spawns a child process).
+    ///
+    /// The child process communicates using newline-delimited JSON-RPC
+    /// on stdin/stdout (MCP stdio transport). The process is killed
+    /// when the client is dropped.
+    pub async fn connect_stdio(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<Self, Error> {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
+            .envs(env.iter())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            Error::Mcp(format!("Failed to spawn MCP stdio server '{command}': {e}"))
+        })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Mcp("Failed to capture stdin of MCP server".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Mcp("Failed to capture stdout of MCP server".into()))?;
+
+        // Drain stderr in background to prevent pipe buffer deadlocks and log debug output.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                tracing::debug!(
+                                    target: "mcp_stdio_stderr",
+                                    "{}",
+                                    trimmed
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let transport = Arc::new(Transport::Stdio(Box::new(StdioTransport {
+            io: tokio::sync::Mutex::new(StdioIo {
+                stdin,
+                reader: tokio::io::BufReader::new(stdout),
+                _process: child,
+            }),
+            next_id: AtomicU64::new(0),
+        })));
+
+        Self::handshake_and_discover(transport).await
+    }
+
+    async fn connect_http(endpoint: &str, auth_header: Option<String>) -> Result<Self, Error> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()?;
 
-        let session = Arc::new(McpSession {
+        let transport = Arc::new(Transport::Http(HttpTransport {
             client,
             endpoint: endpoint.to_string(),
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
             auth_header,
-        });
+        }));
 
-        // Initialize — rpc() captures Mcp-Session-Id from the response automatically
-        session
+        Self::handshake_and_discover(transport).await
+    }
+
+    /// Perform MCP handshake and tool discovery on the given transport.
+    async fn handshake_and_discover(transport: Arc<Transport>) -> Result<Self, Error> {
+        // Initialize — for HTTP, rpc() captures Mcp-Session-Id automatically.
+        transport
             .rpc(
                 "initialize",
                 Some(serde_json::json!({
@@ -428,14 +669,14 @@ impl McpClient {
             )
             .await?;
 
-        session.notify("notifications/initialized", None).await?;
+        transport.notify("notifications/initialized", None).await?;
 
         // Paginate tools/list — collect all pages via nextCursor
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let params = cursor.as_ref().map(|c| serde_json::json!({"cursor": c}));
-            let tools_result = session.rpc("tools/list", params).await?;
+            let tools_result = transport.rpc("tools/list", params).await?;
             let page: McpToolsListResult = serde_json::from_value(tools_result)?;
             all_tools.extend(page.tools);
             cursor = page.next_cursor;
@@ -445,7 +686,7 @@ impl McpClient {
         }
 
         Ok(Self {
-            session,
+            transport,
             tools: all_tools,
         })
     }
@@ -460,12 +701,12 @@ impl McpClient {
 
     /// Convert discovered MCP tools into `Arc<dyn Tool>` instances.
     pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
-        let session = self.session;
+        let transport = self.transport;
         self.tools
             .into_iter()
             .map(|t| {
                 let tool: Arc<dyn Tool> = Arc::new(McpTool {
-                    session: Arc::clone(&session),
+                    transport: Arc::clone(&transport),
                     def: mcp_tool_to_definition(&t),
                 });
                 tool
@@ -825,11 +1066,163 @@ mod tests {
         assert_eq!(output.content, "real text");
     }
 
-    // --- McpSession tests ---
+    // --- process_rpc_response tests ---
 
     #[test]
-    fn session_next_id_is_monotonic() {
-        let session = McpSession {
+    fn process_rpc_response_success() {
+        let json_str = r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#;
+        let value = process_rpc_response(json_str).unwrap();
+        assert_eq!(value, json!({"tools": []}));
+    }
+
+    #[test]
+    fn process_rpc_response_error() {
+        let json_str =
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#;
+        let err = process_rpc_response(json_str).unwrap_err();
+        assert!(err.to_string().contains("JSON-RPC error -32601"));
+        assert!(err.to_string().contains("Method not found"));
+    }
+
+    #[test]
+    fn process_rpc_response_missing_both() {
+        let json_str = r#"{"jsonrpc":"2.0","id":1}"#;
+        let err = process_rpc_response(json_str).unwrap_err();
+        assert!(err.to_string().contains("missing both result and error"));
+    }
+
+    // --- read_stdio_response tests ---
+
+    #[tokio::test]
+    async fn read_stdio_response_finds_matching_id() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":1}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 1).await.unwrap();
+        assert!(response.contains("\"id\":1"));
+        assert!(response.contains("\"ok\":true"));
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_skips_notifications() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            // Server sends a notification first, then the actual response.
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n")
+                .await
+                .unwrap();
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 1).await.unwrap();
+        assert!(response.contains("\"id\":1"));
+        assert!(response.contains("\"tools\""));
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_skips_null_id() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            // Response with null ID (notification-like), then actual response.
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":null}\n")
+                .await
+                .unwrap();
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"found\":true},\"id\":2}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 2).await.unwrap();
+        assert!(response.contains("\"id\":2"));
+        assert!(response.contains("\"found\":true"));
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_skips_non_json() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            // Server emits debug text before JSON response.
+            tx.write_all(b"[DEBUG] initializing server...\n")
+                .await
+                .unwrap();
+            tx.write_all(b"\n").await.unwrap(); // empty line
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":0}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 0).await.unwrap();
+        assert!(response.contains("\"id\":0"));
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_eof_errors() {
+        let (tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        // Close the write side immediately — simulates process exit.
+        drop(tx);
+
+        let err = read_stdio_response(&mut reader, 0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("closed unexpectedly"),
+            "error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_skips_wrong_id() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            // Response for a different request ID, then the correct one.
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"wrong\":true},\"id\":99}\n")
+                .await
+                .unwrap();
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"right\":true},\"id\":3}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 3).await.unwrap();
+        assert!(response.contains("\"right\":true"));
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_timeout_prevents_hang() {
+        // Simulate a server that never responds — without timeout this would hang forever.
+        let (_tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            read_stdio_response(&mut reader, 0),
+        )
+        .await;
+
+        assert!(result.is_err(), "should have timed out");
+    }
+
+    // --- HttpTransport tests ---
+
+    #[test]
+    fn http_transport_next_id_is_monotonic() {
+        let transport = HttpTransport {
             client: reqwest::Client::new(),
             endpoint: "http://unused".to_string(),
             session_id: RwLock::new(None),
@@ -837,22 +1230,22 @@ mod tests {
             auth_header: None,
         };
 
-        assert_eq!(session.next_id(), 0);
-        assert_eq!(session.next_id(), 1);
-        assert_eq!(session.next_id(), 2);
+        assert_eq!(transport.next_id(), 0);
+        assert_eq!(transport.next_id(), 1);
+        assert_eq!(transport.next_id(), 2);
     }
 
     // --- McpTool tests ---
 
     #[test]
     fn mcp_tool_returns_correct_definition() {
-        let session = Arc::new(McpSession {
+        let transport = Arc::new(Transport::Http(HttpTransport {
             client: reqwest::Client::new(),
             endpoint: "http://unused".to_string(),
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
             auth_header: None,
-        });
+        }));
 
         let expected_def = ToolDefinition {
             name: "read_file".into(),
@@ -864,7 +1257,7 @@ mod tests {
         };
 
         let tool = McpTool {
-            session,
+            transport,
             def: expected_def.clone(),
         };
 
@@ -874,16 +1267,16 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tool_execute_catches_network_errors() {
-        let session = Arc::new(McpSession {
+        let transport = Arc::new(Transport::Http(HttpTransport {
             client: reqwest::Client::new(),
             endpoint: "http://127.0.0.1:1".to_string(), // nothing listening
             session_id: RwLock::new(None),
             next_id: AtomicU64::new(0),
             auth_header: None,
-        });
+        }));
 
         let tool = McpTool {
-            session,
+            transport,
             def: ToolDefinition {
                 name: "test_tool".into(),
                 description: "test".into(),

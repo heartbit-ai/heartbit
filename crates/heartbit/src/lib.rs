@@ -20,19 +20,21 @@ pub use channel::session::{
     format_session_context,
 };
 pub use channel::types::WsFrame;
+pub use channel::{ChannelBridge, ConsolidateSession, MediaAttachment, RunTask, RunTaskInput};
 
 #[cfg(feature = "telegram")]
 pub use channel::telegram::{
-    AccessControl as TelegramAccessControl, CallbackAction, ChatSessionMap, ConsolidateSession,
-    DmPolicy, RateLimiter as TelegramRateLimiter, RunTask, RunTaskInput, StreamBuffer,
-    TelegramAdapter, TelegramBridge, TelegramConfig, approval_buttons, chunk_message,
-    parse_callback_data, question_buttons,
+    AccessControl as TelegramAccessControl, CallbackAction, ChatSessionMap, DmPolicy,
+    RateLimiter as TelegramRateLimiter, StreamBuffer, TelegramAdapter, TelegramBridge,
+    TelegramConfig, approval_buttons, chunk_message, parse_callback_data, question_buttons,
 };
 
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::context::ContextStrategy;
 pub use agent::events::{AgentEvent, OnEvent};
 pub use agent::guardrail::{GuardAction, Guardrail};
+pub use agent::guardrails::ContentFenceGuardrail;
+pub use agent::guardrails::SensorSecurityGuardrail;
 pub use agent::instructions::{
     discover_instruction_files, load_instructions, prepend_instructions,
 };
@@ -81,6 +83,7 @@ pub use llm::types::{
 };
 pub use llm::{BoxedProvider, DynLlmProvider};
 pub use lsp::{Diagnostic as LspDiagnostic, LspManager};
+pub use memory::Confidentiality;
 pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
 pub use memory::embedding::{EmbeddingMemory, EmbeddingProvider, NoopEmbedding, OpenAiEmbedding};
 pub use memory::hybrid::{cosine_similarity, rrf_fuse};
@@ -95,7 +98,9 @@ pub use sensor::manager::SensorManager;
 pub use sensor::metrics::SensorMetrics;
 pub use sensor::routing::{ModelRouter, ModelTier};
 pub use sensor::stories::{Story, StoryCorrelator, StoryStatus, SubjectType};
-pub use sensor::triage::{Priority, TriageDecision, TriageProcessor};
+pub use sensor::triage::context::TaskContext;
+pub use sensor::triage::context::TrustLevel;
+pub use sensor::triage::{ActionCategory, Priority, TriageDecision, TriageProcessor};
 pub use sensor::{Sensor, SensorEvent, SensorModality};
 pub use tool::a2a::A2aClient;
 pub use tool::builtins::{

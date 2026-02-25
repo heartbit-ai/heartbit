@@ -67,6 +67,8 @@ struct StoreInput {
     keywords: Vec<String>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(default)]
+    confidentiality: super::Confidentiality,
 }
 
 impl Tool for MemoryStoreTool {
@@ -107,6 +109,11 @@ impl Tool for MemoryStoreTool {
                     "summary": {
                         "type": "string",
                         "description": "One-sentence summary providing context for this memory."
+                    },
+                    "confidentiality": {
+                        "type": "string",
+                        "enum": ["public", "internal", "confidential", "restricted"],
+                        "description": "Access level. 'public' = shareable, 'internal' = verified+ only, 'confidential' = owner only, 'restricted' = never in LLM context. Default: public."
                     }
                 },
                 "required": ["content"]
@@ -141,6 +148,7 @@ impl Tool for MemoryStoreTool {
                 related_ids: vec![],
                 source_ids: vec![],
                 embedding: None,
+                confidentiality: input.confidentiality,
             };
 
             let importance = entry.importance;
@@ -494,10 +502,16 @@ impl Tool for MemoryConsolidateTool {
             let mut merged_tags: std::collections::HashSet<String> =
                 input.tags.iter().cloned().collect();
 
+            // Preserve the highest confidentiality level from source entries
+            // so consolidation never downgrades access controls.
+            let mut max_confidentiality = super::Confidentiality::default();
             for entry in &sources {
                 if source_set.contains(entry.id.as_str()) {
                     merged_keywords.extend(entry.keywords.iter().cloned());
                     merged_tags.extend(entry.tags.iter().cloned());
+                    if entry.confidentiality > max_confidentiality {
+                        max_confidentiality = entry.confidentiality;
+                    }
                 }
             }
 
@@ -525,6 +539,7 @@ impl Tool for MemoryConsolidateTool {
                 related_ids: vec![],
                 source_ids: input.source_ids.clone(),
                 embedding: None,
+                confidentiality: max_confidentiality,
             };
 
             self.memory.store(entry).await?;
@@ -567,6 +582,7 @@ impl Tool for MemoryConsolidateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::Confidentiality;
     use crate::memory::in_memory::InMemoryStore;
 
     fn setup() -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
@@ -1353,6 +1369,136 @@ mod tests {
         assert!(
             has_links,
             "entries with overlapping keywords should be linked"
+        );
+    }
+
+    // --- confidentiality tests ---
+
+    #[tokio::test]
+    async fn store_tool_default_confidentiality_is_public() {
+        let (store, tools) = setup();
+        let tool = find_tool(&tools, "memory_store");
+
+        tool.execute(json!({"content": "test"})).await.unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].confidentiality,
+            Confidentiality::Public,
+            "omitted confidentiality should default to Public"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_tool_with_confidentiality_param() {
+        let (store, tools) = setup();
+        let tool = find_tool(&tools, "memory_store");
+
+        tool.execute(json!({
+            "content": "private note",
+            "confidentiality": "confidential"
+        }))
+        .await
+        .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries[0].confidentiality, Confidentiality::Confidential);
+    }
+
+    #[tokio::test]
+    async fn store_tool_restricted_confidentiality() {
+        let (store, tools) = setup();
+        let tool = find_tool(&tools, "memory_store");
+
+        tool.execute(json!({
+            "content": "api_key=sk-12345",
+            "confidentiality": "restricted"
+        }))
+        .await
+        .unwrap();
+
+        // With no cap, should be found
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries[0].confidentiality, Confidentiality::Restricted);
+
+        // With Public cap, should be filtered out
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                max_confidentiality: Some(Confidentiality::Public),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            entries.is_empty(),
+            "restricted entry should be filtered by Public cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidate_preserves_max_confidentiality() {
+        let (store, tools) = setup();
+        let store_tool = find_tool(&tools, "memory_store");
+        let consolidate_tool = find_tool(&tools, "memory_consolidate");
+
+        // Store entries with different confidentiality levels
+        store_tool
+            .execute(json!({"content": "public fact", "confidentiality": "public"}))
+            .await
+            .unwrap();
+        store_tool
+            .execute(json!({"content": "private note", "confidentiality": "confidential"}))
+            .await
+            .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+
+        consolidate_tool
+            .execute(json!({
+                "source_ids": ids,
+                "content": "merged result"
+            }))
+            .await
+            .unwrap();
+
+        let entries = store
+            .recall(MemoryQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].confidentiality,
+            Confidentiality::Confidential,
+            "consolidation should preserve the highest confidentiality level"
         );
     }
 

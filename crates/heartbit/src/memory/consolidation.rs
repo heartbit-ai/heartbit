@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::llm::LlmProvider;
 use crate::llm::types::{CompletionRequest, Message, StopReason, TokenUsage};
 
-use super::{Memory, MemoryEntry, MemoryQuery, MemoryType};
+use super::{Confidentiality, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 /// Consolidation pipeline that clusters related memories and merges them.
 ///
@@ -128,6 +128,7 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
                 related_ids: vec![],
                 source_ids: source_ids.clone(),
                 embedding: None,
+                confidentiality: Confidentiality::default(),
             };
 
             self.memory.store(consolidated).await?;
@@ -254,6 +255,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 

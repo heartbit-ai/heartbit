@@ -243,7 +243,7 @@ impl Memory for EmbeddingMemory {
 mod tests {
     use super::*;
     use crate::memory::in_memory::InMemoryStore;
-    use crate::memory::{MemoryEntry, MemoryQuery, MemoryType};
+    use crate::memory::{Confidentiality, MemoryEntry, MemoryQuery, MemoryType};
     use chrono::Utc;
 
     fn make_entry(id: &str, content: &str) -> MemoryEntry {
@@ -264,6 +264,7 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             embedding: None,
+            confidentiality: Confidentiality::default(),
         }
     }
 

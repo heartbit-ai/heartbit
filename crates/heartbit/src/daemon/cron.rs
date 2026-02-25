@@ -89,6 +89,7 @@ impl CronScheduler {
                                 task: parsed.task.clone(),
                                 source: format!("cron:{}", parsed.name),
                                 story_id: None,
+                                trust_level: None,
                             };
                             let payload = match serde_json::to_vec(&cmd) {
                                 Ok(p) => p,

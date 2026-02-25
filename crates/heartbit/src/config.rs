@@ -270,30 +270,41 @@ pub enum ContextStrategyConfig {
     Summarize { threshold: u32 },
 }
 
-/// An MCP server entry: either a bare URL string or a full config with auth.
+/// An MCP server entry: a bare URL string, a full HTTP config with auth, or a
+/// stdio command to spawn as a child process.
 ///
 /// Supports backward-compatible TOML: bare strings (`"http://..."`) deserialize
-/// as `Simple`, while inline tables (`{ url = "...", auth_header = "..." }`)
-/// deserialize as `Full`.
+/// as `Simple`, inline tables with `url` (`{ url = "...", auth_header = "..." }`)
+/// as `Full`, and inline tables with `command` (`{ command = "npx", args = [...] }`)
+/// as `Stdio`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum McpServerEntry {
     /// Bare URL string (backward-compatible).
     Simple(String),
-    /// Full entry with optional auth header.
+    /// Full HTTP entry with optional auth header.
     Full {
         url: String,
         #[serde(default)]
         auth_header: Option<String>,
     },
+    /// Stdio transport — spawn a child process communicating via stdin/stdout.
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+    },
 }
 
 impl McpServerEntry {
-    /// Get the server URL.
+    /// Get the server URL (empty string for stdio entries).
     pub fn url(&self) -> &str {
         match self {
             McpServerEntry::Simple(url) => url,
             McpServerEntry::Full { url, .. } => url,
+            McpServerEntry::Stdio { .. } => "",
         }
     }
 
@@ -302,6 +313,27 @@ impl McpServerEntry {
         match self {
             McpServerEntry::Simple(_) => None,
             McpServerEntry::Full { auth_header, .. } => auth_header.as_deref(),
+            McpServerEntry::Stdio { .. } => None,
+        }
+    }
+
+    /// Whether this entry uses stdio transport.
+    pub fn is_stdio(&self) -> bool {
+        matches!(self, McpServerEntry::Stdio { .. })
+    }
+
+    /// Human-readable description for logging.
+    pub fn display_name(&self) -> String {
+        match self {
+            McpServerEntry::Simple(url) => url.clone(),
+            McpServerEntry::Full { url, .. } => url.clone(),
+            McpServerEntry::Stdio { command, args, .. } => {
+                if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args.join(" "))
+                }
+            }
         }
     }
 }
@@ -609,6 +641,9 @@ pub struct DaemonConfig {
     pub heartbit_pulse: Option<HeartbitPulseConfig>,
     /// HTTP API authentication configuration.
     pub auth: Option<AuthConfig>,
+    /// Email addresses of the system owner (for trust resolution).
+    #[serde(default)]
+    pub owner_emails: Vec<String>,
 }
 
 /// HTTP API authentication configuration for the daemon.
@@ -911,6 +946,48 @@ pub enum SensorSourceConfig {
         /// Environment variable containing the webhook secret.
         secret_env: Option<String>,
     },
+    /// Generic MCP sensor — polls a tool on any MCP server.
+    Mcp {
+        name: String,
+        /// MCP server endpoint (string URL, `{url, auth_header}`, or `{command, args, env}`).
+        server: Box<McpServerEntry>,
+        /// MCP tool to call each poll cycle.
+        tool_name: String,
+        /// Arguments passed to the tool (default: `{}`).
+        #[serde(default = "default_empty_object")]
+        tool_args: serde_json::Value,
+        /// Kafka topic to produce events to.
+        kafka_topic: String,
+        /// Sensory modality of produced events (default: `"text"`).
+        #[serde(default = "default_mcp_modality")]
+        modality: crate::sensor::SensorModality,
+        /// Poll interval in seconds (default: 60).
+        #[serde(default = "default_mcp_poll_interval")]
+        poll_interval_seconds: u64,
+        /// JSON field path for item ID (default: `"id"`).
+        #[serde(default = "default_id_field")]
+        id_field: String,
+        /// JSON field for event content (default: entire item as JSON).
+        #[serde(default)]
+        content_field: Option<String>,
+        /// JSON field containing items array in tool result (default: root is array).
+        #[serde(default)]
+        items_field: Option<String>,
+        /// Priority senders for email triage (only when `kafka_topic = "hb.sensor.email"`).
+        #[serde(default)]
+        priority_senders: Vec<String>,
+        /// Blocked senders for email triage.
+        #[serde(default)]
+        blocked_senders: Vec<String>,
+        /// Optional enrichment tool to call for each new item (e.g., `gmail_get_message`).
+        /// When set, the sensor calls this tool with the item's ID to fetch detailed
+        /// metadata (headers, body, labels) before producing to Kafka.
+        #[serde(default)]
+        enrich_tool: Option<String>,
+        /// Parameter name for the item ID when calling the enrichment tool (default: `"id"`).
+        #[serde(default)]
+        enrich_id_param: Option<String>,
+    },
 }
 
 impl SensorSourceConfig {
@@ -922,7 +999,28 @@ impl SensorSourceConfig {
             | SensorSourceConfig::Image { name, .. }
             | SensorSourceConfig::Audio { name, .. }
             | SensorSourceConfig::Weather { name, .. }
-            | SensorSourceConfig::Webhook { name, .. } => name,
+            | SensorSourceConfig::Webhook { name, .. }
+            | SensorSourceConfig::Mcp { name, .. } => name,
+        }
+    }
+
+    /// Get priority and blocked sender lists for trust resolution.
+    ///
+    /// Returns `(priority_senders, blocked_senders)`. Only email-type sources
+    /// have these lists; other source types return empty slices.
+    pub fn sender_lists(&self) -> (&[String], &[String]) {
+        match self {
+            SensorSourceConfig::JmapEmail {
+                priority_senders,
+                blocked_senders,
+                ..
+            }
+            | SensorSourceConfig::Mcp {
+                priority_senders,
+                blocked_senders,
+                ..
+            } => (priority_senders, blocked_senders),
+            _ => (&[], &[]),
         }
     }
 }
@@ -945,6 +1043,22 @@ fn default_whisper_model() -> String {
 
 fn default_weather_poll_interval() -> u64 {
     1800
+}
+
+fn default_mcp_poll_interval() -> u64 {
+    60
+}
+
+fn default_mcp_modality() -> crate::sensor::SensorModality {
+    crate::sensor::SensorModality::Text
+}
+
+fn default_id_field() -> String {
+    "id".into()
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// Kafka broker connection settings.
@@ -1342,6 +1456,41 @@ impl HeartbitConfig {
                     return Err(Error::Config(format!(
                         "duplicate sensor source name: '{name}'"
                     )));
+                }
+                // MCP-specific field validation.
+                if let SensorSourceConfig::Mcp {
+                    tool_name,
+                    kafka_topic,
+                    server,
+                    ..
+                } = source
+                {
+                    if tool_name.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sensor '{name}': tool_name must not be empty"
+                        )));
+                    }
+                    if kafka_topic.is_empty() {
+                        return Err(Error::Config(format!(
+                            "sensor '{name}': kafka_topic must not be empty"
+                        )));
+                    }
+                    match &**server {
+                        McpServerEntry::Stdio { command, .. } => {
+                            if command.is_empty() {
+                                return Err(Error::Config(format!(
+                                    "sensor '{name}': server command must not be empty"
+                                )));
+                            }
+                        }
+                        _ => {
+                            if server.url().is_empty() {
+                                return Err(Error::Config(format!(
+                                    "sensor '{name}': server URL must not be empty"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5051,5 +5200,436 @@ model = ""
                 .contains("provider.cascade.tiers[0].model must not be empty"),
             "error: {err}"
         );
+    }
+
+    // --- MCP sensor config tests ---
+
+    #[test]
+    fn sensor_source_mcp_serde() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "gmail_inbox"
+server = "http://localhost:3000/mcp"
+tool_name = "search_emails"
+tool_args = { query = "is:unread", max_results = 50 }
+kafka_topic = "hb.sensor.email"
+modality = "text"
+poll_interval_seconds = 60
+id_field = "messageId"
+content_field = "snippet"
+priority_senders = ["boss@company.com"]
+blocked_senders = ["spam@marketing.com"]
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        assert_eq!(sensors.sources.len(), 1);
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp {
+                name,
+                server,
+                tool_name,
+                tool_args,
+                kafka_topic,
+                modality,
+                poll_interval_seconds,
+                id_field,
+                content_field,
+                items_field,
+                priority_senders,
+                blocked_senders,
+                enrich_tool,
+                enrich_id_param,
+            } => {
+                assert_eq!(name, "gmail_inbox");
+                assert_eq!(server.url(), "http://localhost:3000/mcp");
+                assert_eq!(tool_name, "search_emails");
+                assert_eq!(tool_args["query"], "is:unread");
+                assert_eq!(tool_args["max_results"], 50);
+                assert_eq!(kafka_topic, "hb.sensor.email");
+                assert_eq!(*modality, crate::sensor::SensorModality::Text);
+                assert_eq!(*poll_interval_seconds, 60);
+                assert_eq!(id_field, "messageId");
+                assert_eq!(content_field.as_deref(), Some("snippet"));
+                assert!(items_field.is_none());
+                assert_eq!(priority_senders, &["boss@company.com"]);
+                assert_eq!(blocked_senders, &["spam@marketing.com"]);
+                assert!(enrich_tool.is_none());
+                assert!(enrich_id_param.is_none());
+            }
+            other => panic!("expected Mcp variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_defaults() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "test_mcp"
+server = "http://localhost:3000/mcp"
+tool_name = "get_data"
+kafka_topic = "hb.sensor.test"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp {
+                poll_interval_seconds,
+                modality,
+                id_field,
+                tool_args,
+                content_field,
+                items_field,
+                priority_senders,
+                blocked_senders,
+                enrich_tool,
+                enrich_id_param,
+                ..
+            } => {
+                assert_eq!(*poll_interval_seconds, 60, "default poll interval");
+                assert_eq!(
+                    *modality,
+                    crate::sensor::SensorModality::Text,
+                    "default modality"
+                );
+                assert_eq!(id_field, "id", "default id_field");
+                assert_eq!(*tool_args, serde_json::json!({}), "default tool_args");
+                assert!(content_field.is_none(), "default content_field");
+                assert!(items_field.is_none(), "default items_field");
+                assert!(priority_senders.is_empty(), "default priority_senders");
+                assert!(blocked_senders.is_empty(), "default blocked_senders");
+                assert!(enrich_tool.is_none(), "default enrich_tool");
+                assert!(enrich_id_param.is_none(), "default enrich_id_param");
+            }
+            other => panic!("expected Mcp variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_with_enrichment() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "gmail_inbox"
+server = "http://localhost:4000/mcp"
+tool_name = "gmail_list_messages"
+tool_args = { q = "is:unread", maxResults = 20 }
+kafka_topic = "hb.sensor.email"
+id_field = "id"
+content_field = "snippet"
+items_field = "messages"
+enrich_tool = "gmail_get_message"
+enrich_id_param = "messageId"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp {
+                enrich_tool,
+                enrich_id_param,
+                ..
+            } => {
+                assert_eq!(enrich_tool.as_deref(), Some("gmail_get_message"));
+                assert_eq!(enrich_id_param.as_deref(), Some("messageId"));
+            }
+            other => panic!("expected Mcp variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_with_auth_header() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "auth_mcp"
+tool_name = "list_items"
+kafka_topic = "hb.sensor.items"
+
+[daemon.sensors.sources.server]
+url = "http://gateway:3000/mcp"
+auth_header = "Bearer secret-token"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp { server, .. } => {
+                assert_eq!(server.url(), "http://gateway:3000/mcp");
+                assert_eq!(server.auth_header(), Some("Bearer secret-token"));
+            }
+            other => panic!("expected Mcp variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_simple_server() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "simple_mcp"
+server = "http://localhost:8080/mcp"
+tool_name = "poll"
+kafka_topic = "hb.sensor.data"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp { server, .. } => {
+                assert_eq!(server.url(), "http://localhost:8080/mcp");
+                assert!(server.auth_header().is_none());
+            }
+            other => panic!("expected Mcp variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_empty_tool_name_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "bad_mcp"
+server = "http://localhost:3000/mcp"
+tool_name = ""
+kafka_topic = "hb.sensor.test"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("tool_name must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn sensor_source_mcp_empty_kafka_topic_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "bad_mcp"
+server = "http://localhost:3000/mcp"
+tool_name = "get_data"
+kafka_topic = ""
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("kafka_topic must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn sensor_source_mcp_stdio_server() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "gmail_stdio"
+tool_name = "gmail_search"
+kafka_topic = "hb.sensor.email"
+
+[daemon.sensors.sources.server]
+command = "npx"
+args = ["-y", "@anthropic/google-workspace-mcp"]
+
+[daemon.sensors.sources.server.env]
+GOOGLE_OAUTH_CREDENTIALS = "/path/to/creds.json"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp { server, .. } => {
+                assert!(server.is_stdio());
+                assert_eq!(server.url(), ""); // no URL for stdio
+                assert!(server.auth_header().is_none());
+                assert_eq!(
+                    server.display_name(),
+                    "npx -y @anthropic/google-workspace-mcp"
+                );
+                if let McpServerEntry::Stdio { command, args, env } = &**server {
+                    assert_eq!(command, "npx");
+                    assert_eq!(args, &["-y", "@anthropic/google-workspace-mcp"]);
+                    assert_eq!(
+                        env.get("GOOGLE_OAUTH_CREDENTIALS").unwrap(),
+                        "/path/to/creds.json"
+                    );
+                } else {
+                    panic!("expected Stdio variant");
+                }
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_source_mcp_stdio_empty_command_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "bad_stdio"
+tool_name = "search"
+kafka_topic = "hb.sensor.test"
+
+[daemon.sensors.sources.server]
+command = ""
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("server command must not be empty"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn sensor_source_mcp_stdio_defaults() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "stdio_defaults"
+tool_name = "list_events"
+kafka_topic = "hb.sensor.calendar"
+
+[daemon.sensors.sources.server]
+command = "my-mcp-server"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let sensors = config.daemon.unwrap().sensors.unwrap();
+        match &sensors.sources[0] {
+            SensorSourceConfig::Mcp { server, .. } => {
+                if let McpServerEntry::Stdio { command, args, env } = &**server {
+                    assert_eq!(command, "my-mcp-server");
+                    assert!(args.is_empty(), "args should default to empty");
+                    assert!(env.is_empty(), "env should default to empty");
+                } else {
+                    panic!("expected Stdio variant");
+                }
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_entry_stdio_roundtrip() {
+        let stdio = McpServerEntry::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "my-mcp-server".into()],
+            env: std::collections::HashMap::from([("KEY".into(), "val".into())]),
+        };
+        let json = serde_json::to_string(&stdio).unwrap();
+        let parsed: McpServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(stdio, parsed);
+    }
+
+    #[test]
+    fn mcp_server_entry_display_name() {
+        let simple = McpServerEntry::Simple("http://localhost/mcp".into());
+        assert_eq!(simple.display_name(), "http://localhost/mcp");
+
+        let full = McpServerEntry::Full {
+            url: "http://gateway/mcp".into(),
+            auth_header: Some("Bearer tok".into()),
+        };
+        assert_eq!(full.display_name(), "http://gateway/mcp");
+
+        let stdio = McpServerEntry::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "server".into()],
+            env: Default::default(),
+        };
+        assert_eq!(stdio.display_name(), "npx -y server");
+
+        let stdio_no_args = McpServerEntry::Stdio {
+            command: "my-server".into(),
+            args: vec![],
+            env: Default::default(),
+        };
+        assert_eq!(stdio_no_args.display_name(), "my-server");
     }
 }
