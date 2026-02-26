@@ -13,7 +13,7 @@ These are required for building `rdkafka` and other native dependencies.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake libssl-dev pkg-config
+sudo apt-get install -y build-essential cmake libssl-dev libcurl4-openssl-dev pkg-config
 ```
 
 ### macOS

@@ -22,7 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev libcurl4-openssl-dev pkg-config
 
       - name: cargo fmt
         run: cargo fmt -- --check

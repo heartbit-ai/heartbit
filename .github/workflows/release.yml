@@ -36,7 +36,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev libcurl4-openssl-dev pkg-config
 
       - name: Add target (aarch64-apple-darwin)
         if: matrix.target == 'aarch64-apple-darwin'
