@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [2026.226.1] - 2026-02-26
+
+### Added
+
+- Institutional memory: daemon task results auto-persist to shared `"institutional"` namespace, enabling cross-context knowledge flow from sensor pipeline to Telegram chat agents.
+- Telegram dual recall: `preload_memories` now queries both user-private and institutional namespaces concurrently via `tokio::join!`.
+- `institutional_recall_limit` config field for Telegram (default: 3).
+- `story_id` field on `TaskOutcome` for story-scoped provenance tracking.
+
+### Changed
+
+- README rewritten with architecture diagrams, contributor guide, and disclaimer.
+- README updated to highlight Telegram and Google Workspace integrations.
+- README updated with Telegram community link.
+
 ## [2026.2.26] - 2026-02-26
 
 ### Added
