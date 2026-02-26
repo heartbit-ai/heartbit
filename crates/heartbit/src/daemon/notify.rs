@@ -13,6 +13,8 @@ pub struct TaskOutcome {
     pub duration_secs: f64,
     pub tokens: TokenUsage,
     pub cost: Option<f64>,
+    /// The story ID that grouped this task (if any).
+    pub story_id: Option<String>,
 }
 
 /// Callback type for task completion notifications.
@@ -114,6 +116,7 @@ mod tests {
                 ..Default::default()
             },
             cost: Some(0.0042),
+            story_id: None,
         }
     }
 
@@ -229,5 +232,18 @@ mod tests {
         assert_eq!(format_tokens(12_345), "12,345");
         assert_eq!(format_tokens(123_456), "123,456");
         assert_eq!(format_tokens(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn story_id_roundtrips() {
+        let mut outcome = make_outcome(TaskState::Completed);
+        outcome.story_id = Some("story-abc-123".into());
+        assert_eq!(outcome.story_id.as_deref(), Some("story-abc-123"));
+    }
+
+    #[test]
+    fn story_id_defaults_to_none() {
+        let outcome = make_outcome(TaskState::Completed);
+        assert!(outcome.story_id.is_none());
     }
 }

@@ -41,6 +41,10 @@ fn default_memory_recall_limit() -> usize {
     5
 }
 
+fn default_institutional_recall_limit() -> usize {
+    3
+}
+
 /// Configuration for the Telegram bot channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramConfig {
@@ -91,6 +95,12 @@ pub struct TelegramConfig {
     #[serde(default = "default_memory_recall_limit")]
     pub memory_recall_limit: usize,
 
+    /// Maximum number of institutional memory entries to recall per message.
+    /// Institutional memories are shared knowledge from daemon task results.
+    /// Defaults to 3.
+    #[serde(default = "default_institutional_recall_limit")]
+    pub institutional_recall_limit: usize,
+
     /// When true, skip memory recall for very short trivial messages
     /// (< 20 chars, no question mark). Saves tokens on greetings. Defaults to false.
     #[serde(default)]
@@ -116,6 +126,7 @@ impl Default for TelegramConfig {
             stream_debounce_ms: default_stream_debounce_ms(),
             database_url: None,
             memory_recall_limit: default_memory_recall_limit(),
+            institutional_recall_limit: default_institutional_recall_limit(),
             memory_skip_trivial: false,
             notify_chat_ids: Vec::new(),
         }
@@ -159,6 +170,7 @@ mod tests {
         assert_eq!(config.stream_debounce_ms, 500);
         assert!(config.database_url.is_none());
         assert_eq!(config.memory_recall_limit, 5);
+        assert_eq!(config.institutional_recall_limit, 3);
         assert!(!config.memory_skip_trivial);
         assert!(config.notify_chat_ids.is_empty());
     }
@@ -177,6 +189,7 @@ max_concurrent = 10
 stream_debounce_ms = 250
 database_url = "postgres://localhost/heartbit"
 memory_recall_limit = 3
+institutional_recall_limit = 5
 memory_skip_trivial = true
 notify_chat_ids = [111, 222]
 "#;
@@ -195,6 +208,7 @@ notify_chat_ids = [111, 222]
             Some("postgres://localhost/heartbit")
         );
         assert_eq!(config.memory_recall_limit, 3);
+        assert_eq!(config.institutional_recall_limit, 5);
         assert!(config.memory_skip_trivial);
         assert_eq!(config.notify_chat_ids, vec![111, 222]);
     }
@@ -249,5 +263,31 @@ dm_policy = "open"
 "#;
         let config: TelegramConfig = toml::from_str(toml_str).unwrap();
         assert!(config.notify_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn institutional_recall_limit_default() {
+        let config = TelegramConfig::default();
+        assert_eq!(config.institutional_recall_limit, 3);
+    }
+
+    #[test]
+    fn institutional_recall_limit_from_toml() {
+        let toml_str = r#"
+institutional_recall_limit = 5
+"#;
+        let config: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.institutional_recall_limit, 5);
+    }
+
+    #[test]
+    fn institutional_recall_limit_backward_compat() {
+        // Old TOML without institutional_recall_limit should default to 3
+        let toml_str = r#"
+enabled = true
+memory_recall_limit = 10
+"#;
+        let config: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.institutional_recall_limit, 3);
     }
 }

@@ -94,8 +94,11 @@ impl TelegramAdapter {
 
     /// Pre-load relevant memories for a user and format them as context.
     ///
-    /// Uses `agent_prefix` to match all sub-agent namespaces under this user
-    /// (e.g. `"tg:123"` matches `"tg:123:assistant"`, `"tg:123:researcher"`).
+    /// Performs two recalls:
+    /// 1. **User-private**: matches all sub-agent namespaces under this user
+    ///    (e.g. `"tg:123"` matches `"tg:123:assistant"`, `"tg:123:researcher"`).
+    /// 2. **Institutional**: searches the shared `"institutional"` namespace for
+    ///    knowledge persisted from daemon task results.
     async fn preload_memories(&self, user_id: i64, message: &str) -> String {
         let memory = match &self.memory {
             Some(m) => m,
@@ -107,24 +110,51 @@ impl TelegramAdapter {
             return String::new();
         }
 
-        let query = MemoryQuery {
+        let user_query = MemoryQuery {
             text: Some(message.to_string()),
             limit: self.config.memory_recall_limit,
             agent_prefix: Some(format!("tg:{user_id}")),
             ..Default::default()
         };
 
-        match memory.recall(query).await {
-            Ok(entries) if !entries.is_empty() => {
-                let mut ctx = String::from("## Relevant context from memory\n");
-                for entry in &entries {
-                    ctx.push_str(&format!("- {}\n", entry.content));
-                }
-                ctx.push('\n');
-                ctx
-            }
-            _ => String::new(),
+        let institutional_query = MemoryQuery {
+            text: Some(message.to_string()),
+            limit: self.config.institutional_recall_limit,
+            agent_prefix: Some("institutional".to_string()),
+            ..Default::default()
+        };
+
+        let (user_result, inst_result) = tokio::join!(
+            memory.recall(user_query),
+            memory.recall(institutional_query)
+        );
+
+        let user_entries = user_result.unwrap_or_default();
+        let inst_entries = inst_result.unwrap_or_default();
+
+        if user_entries.is_empty() && inst_entries.is_empty() {
+            return String::new();
         }
+
+        let mut ctx = String::new();
+
+        if !user_entries.is_empty() {
+            ctx.push_str("## Relevant context from memory\n");
+            for entry in &user_entries {
+                ctx.push_str(&format!("- {}\n", entry.content));
+            }
+            ctx.push('\n');
+        }
+
+        if !inst_entries.is_empty() {
+            ctx.push_str("### Institutional knowledge\n");
+            for entry in &inst_entries {
+                ctx.push_str(&format!("- {}\n", entry.content));
+            }
+            ctx.push('\n');
+        }
+
+        ctx
     }
 
     /// Handle an incoming message from a Telegram DM (text, photos, documents).
@@ -886,6 +916,127 @@ mod tests {
         assert!(
             entry_count <= 3,
             "expected at most 3 entries but got {entry_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_memories_includes_institutional() {
+        use crate::memory::in_memory::InMemoryStore;
+        use crate::memory::namespaced::NamespacedMemory;
+        use crate::memory::{Confidentiality, MemoryEntry, MemoryType};
+
+        let store = Arc::new(InMemoryStore::new());
+
+        // Store a user-private memory about Rust programming
+        let user_ns =
+            NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:123:assistant");
+        let user_entry = MemoryEntry {
+            id: "user-1".into(),
+            agent: String::new(),
+            content: "User likes Rust programming language".into(),
+            category: "preference".into(),
+            tags: vec!["rust".into()],
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            access_count: 0,
+            importance: 5,
+            memory_type: MemoryType::Episodic,
+            keywords: vec!["rust".into(), "programming".into()],
+            summary: None,
+            strength: 1.0,
+            related_ids: Vec::new(),
+            source_ids: Vec::new(),
+            embedding: None,
+            confidentiality: Confidentiality::default(),
+        };
+        user_ns.store(user_entry).await.unwrap();
+
+        // Store an institutional memory about a Rust release
+        let inst_ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "institutional");
+        let inst_entry = MemoryEntry {
+            id: "institutional:task-1".into(),
+            agent: String::new(),
+            content: "New Rust compiler release improves programming ergonomics".into(),
+            category: "task_result".into(),
+            tags: vec!["sensor:rss".into()],
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            access_count: 0,
+            importance: 7,
+            memory_type: MemoryType::Episodic,
+            keywords: vec!["rust".into(), "release".into(), "programming".into()],
+            summary: None,
+            strength: 1.0,
+            related_ids: Vec::new(),
+            source_ids: Vec::new(),
+            embedding: None,
+            confidentiality: Confidentiality::Internal,
+        };
+        inst_ns.store(inst_entry).await.unwrap();
+
+        let adapter = make_adapter(Some(store));
+        let ctx = adapter
+            .preload_memories(123, "tell me about Rust programming")
+            .await;
+
+        assert!(
+            ctx.contains("Relevant context from memory"),
+            "should contain user memory section, got: {ctx:?}"
+        );
+        assert!(
+            ctx.contains("Rust programming"),
+            "should contain user-private memory"
+        );
+        assert!(
+            ctx.contains("### Institutional knowledge"),
+            "should contain institutional section, got: {ctx:?}"
+        );
+        assert!(
+            ctx.contains("Rust compiler release"),
+            "should contain institutional memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_memories_institutional_does_not_leak_cross_user() {
+        use crate::memory::in_memory::InMemoryStore;
+        use crate::memory::namespaced::NamespacedMemory;
+        use crate::memory::{Confidentiality, MemoryEntry, MemoryType};
+
+        let store = Arc::new(InMemoryStore::new());
+
+        // Store a private memory for user 456
+        let other_ns =
+            NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "tg:456:assistant");
+        let entry = MemoryEntry {
+            id: "other-1".into(),
+            agent: String::new(),
+            content: "Secret info for user 456 about Rust".into(),
+            category: "general".into(),
+            tags: vec!["rust".into()],
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            access_count: 0,
+            importance: 5,
+            memory_type: MemoryType::Episodic,
+            keywords: vec!["rust".into(), "secret".into()],
+            summary: None,
+            strength: 1.0,
+            related_ids: Vec::new(),
+            source_ids: Vec::new(),
+            embedding: None,
+            confidentiality: Confidentiality::Confidential,
+        };
+        other_ns.store(entry).await.unwrap();
+
+        // User 123 should NOT see user 456's memories
+        let adapter = make_adapter(Some(store));
+        let ctx = adapter
+            .preload_memories(123, "tell me about Rust secrets")
+            .await;
+        assert!(
+            !ctx.contains("Secret info for user 456"),
+            "user 123 must NOT see user 456's private memories"
         );
     }
 }

@@ -289,6 +289,7 @@ impl DaemonCore {
                             let task_cancels = self.task_cancels.clone();
                             let build_runner = build_runner.clone();
                             let on_complete = on_complete.clone();
+                            let outcome_story_id = story_id.clone();
 
                             self.active_tasks.spawn(async move {
                                 store
@@ -328,6 +329,7 @@ impl DaemonCore {
                                                         duration_secs,
                                                         tokens,
                                                         cost,
+                                                        story_id: outcome_story_id.clone(),
                                                     });
                                                 }
                                             }
@@ -350,6 +352,7 @@ impl DaemonCore {
                                                         duration_secs,
                                                         tokens: Default::default(),
                                                         cost: None,
+                                                        story_id: outcome_story_id.clone(),
                                                     });
                                                 }
                                             }
@@ -372,6 +375,7 @@ impl DaemonCore {
                                                 duration_secs: start.elapsed().as_secs_f64(),
                                                 tokens: Default::default(),
                                                 cost: None,
+                                                story_id: outcome_story_id.clone(),
                                             });
                                         }
                                     }
