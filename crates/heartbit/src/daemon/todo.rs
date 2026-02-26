@@ -35,6 +35,8 @@ pub struct TodoEntry {
     pub attempt_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_task_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<DateTime<Utc>>,
 }
 
 impl TodoEntry {
@@ -54,6 +56,7 @@ impl TodoEntry {
             tags: Vec::new(),
             attempt_count: 0,
             daemon_task_id: None,
+            snoozed_until: None,
         }
     }
 }
@@ -221,6 +224,132 @@ impl FileTodoStore {
         out
     }
 
+    /// Format the todo list for the heartbit pulse prompt.
+    ///
+    /// Unlike [`format_for_prompt`], this filters out noise:
+    /// - **Actionable** items (Pending/InProgress/Failed/Blocked, not snoozed): full detail
+    /// - **Snoozed** items: one-line count
+    /// - **Terminal** items (Completed/Cancelled): one-line count
+    pub fn format_for_pulse_prompt(&self) -> String {
+        let list = self.cache.read().expect("todo store lock poisoned");
+        if list.entries.is_empty() {
+            return "No items in the todo list.".into();
+        }
+
+        let now = Utc::now();
+        let mut actionable = Vec::new();
+        let mut snoozed_count: usize = 0;
+        let mut completed_count: usize = 0;
+        let mut cancelled_count: usize = 0;
+
+        for entry in &list.entries {
+            match entry.status {
+                TodoStatus::Completed => {
+                    completed_count += 1;
+                    continue;
+                }
+                TodoStatus::Cancelled => {
+                    cancelled_count += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            // Check if snoozed (future snooze = excluded, expired = actionable)
+            if let Some(until) = entry.snoozed_until
+                && until > now
+            {
+                snoozed_count += 1;
+                continue;
+            }
+            actionable.push(entry);
+        }
+
+        let mut out = String::new();
+
+        if actionable.is_empty() {
+            out.push_str("No actionable items.\n");
+        } else {
+            for entry in &actionable {
+                let status_icon = match entry.status {
+                    TodoStatus::Pending => "[ ]",
+                    TodoStatus::InProgress => "[>]",
+                    TodoStatus::Completed => "[x]",
+                    TodoStatus::Cancelled => "[-]",
+                    TodoStatus::Failed => "[!]",
+                    TodoStatus::Blocked => "[B]",
+                };
+                let age = now.signed_duration_since(entry.created_at);
+                let age_str = if age.num_days() > 0 {
+                    format!("{}d", age.num_days())
+                } else if age.num_hours() > 0 {
+                    format!("{}h", age.num_hours())
+                } else {
+                    format!("{}m", age.num_minutes())
+                };
+                out.push_str(&format!(
+                    "- {status_icon} [{priority}] {title} (id: {id}, age: {age}, src: {src}",
+                    priority = entry.priority,
+                    title = entry.title,
+                    id = entry.id,
+                    age = age_str,
+                    src = entry.source,
+                ));
+                if let Some(ref due) = entry.due_at {
+                    out.push_str(&format!(", due: {}", due.format("%Y-%m-%d %H:%M")));
+                }
+                if entry.attempt_count > 0 {
+                    out.push_str(&format!(", attempts: {}", entry.attempt_count));
+                }
+                if !entry.tags.is_empty() {
+                    out.push_str(&format!(", tags: {}", entry.tags.join(",")));
+                }
+                out.push_str(")\n");
+                if let Some(ref desc) = entry.description {
+                    out.push_str(&format!("  {desc}\n"));
+                }
+            }
+        }
+
+        // Summary lines for filtered items
+        let mut summary_parts = Vec::new();
+        if completed_count > 0 {
+            summary_parts.push(format!("{completed_count} completed"));
+        }
+        if cancelled_count > 0 {
+            summary_parts.push(format!("{cancelled_count} cancelled"));
+        }
+        if !summary_parts.is_empty() {
+            out.push_str(&format!(
+                "\n{} — use todo_manage list for details\n",
+                summary_parts.join(", ")
+            ));
+        }
+        if snoozed_count > 0 {
+            out.push_str(&format!("{snoozed_count} items snoozed\n"));
+        }
+
+        if let Some(reviewed) = list.last_reviewed_at {
+            let ago = now.signed_duration_since(reviewed);
+            out.push_str(&format!("\nLast reviewed: {}m ago\n", ago.num_minutes()));
+        }
+
+        out
+    }
+
+    /// Returns `true` if the given entry is actionable (non-terminal, non-snoozed).
+    pub fn is_actionable(entry: &TodoEntry) -> bool {
+        match entry.status {
+            TodoStatus::Completed | TodoStatus::Cancelled => false,
+            _ => {
+                if let Some(until) = entry.snoozed_until {
+                    until <= Utc::now()
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
     /// Path to the backing JSON file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -244,6 +373,7 @@ impl Tool for TodoManageTool {
             name: "todo_manage".into(),
             description: "Manage the persistent todo list. Actions: add (create new), \
                           update (modify existing by id), remove (delete by id), \
+                          snooze (suppress item for N hours), \
                           list (show all entries). The todo list persists across sessions."
                 .into(),
             input_schema: json!({
@@ -251,12 +381,12 @@ impl Tool for TodoManageTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "update", "remove", "list"],
+                        "enum": ["add", "update", "remove", "snooze", "list"],
                         "description": "The action to perform"
                     },
                     "id": {
                         "type": "string",
-                        "description": "UUID of the entry (required for update/remove)"
+                        "description": "UUID of the entry (required for update/remove/snooze)"
                     },
                     "title": {
                         "type": "string",
@@ -292,6 +422,14 @@ impl Tool for TodoManageTool {
                     "source": {
                         "type": "string",
                         "description": "Source of the entry (default: self)"
+                    },
+                    "hours": {
+                        "type": "number",
+                        "description": "Hours to snooze (for snooze action, default: 24)"
+                    },
+                    "snoozed_until": {
+                        "type": ["string", "null"],
+                        "description": "ISO 8601 datetime to snooze until (for update), or null to clear snooze"
                     }
                 },
                 "required": ["action"]
@@ -399,6 +537,21 @@ impl Tool for TodoManageTool {
                         .get("result")
                         .and_then(|v| v.as_str())
                         .map(String::from);
+                    // snoozed_until: string → set, null → clear, absent → no change
+                    let snoozed_until_action = if let Some(val) = input.get("snoozed_until") {
+                        if val.is_null() {
+                            Some(None) // explicit null → clear
+                        } else if let Some(s) = val.as_str() {
+                            let dt = s
+                                .parse::<DateTime<Utc>>()
+                                .map_err(|e| Error::Agent(format!("invalid snoozed_until: {e}")))?;
+                            Some(Some(dt)) // string → set
+                        } else {
+                            None // unexpected type → ignore
+                        }
+                    } else {
+                        None // absent → no change
+                    };
 
                     self.store.update(id, |entry| {
                         if let Some(ref t) = title {
@@ -422,9 +575,34 @@ impl Tool for TodoManageTool {
                         if let Some(ref r) = result_text {
                             entry.result = Some(r.clone());
                         }
+                        if let Some(snooze_val) = snoozed_until_action {
+                            entry.snoozed_until = snooze_val;
+                        }
                     })?;
 
                     Ok(ToolOutput::success(format!("Updated todo entry {id}")))
+                }
+                "snooze" => {
+                    let id_str = input
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| Error::Agent("id is required for snooze".into()))?;
+                    let id: Uuid = id_str
+                        .parse()
+                        .map_err(|e| Error::Agent(format!("invalid id: {e}")))?;
+                    let hours = input.get("hours").and_then(|v| v.as_f64()).unwrap_or(24.0);
+                    if hours <= 0.0 {
+                        return Ok(ToolOutput::error("hours must be positive".to_string()));
+                    }
+                    let until = Utc::now() + chrono::Duration::seconds((hours * 3600.0) as i64);
+
+                    self.store.update(id, |entry| {
+                        entry.snoozed_until = Some(until);
+                    })?;
+
+                    Ok(ToolOutput::success(format!(
+                        "Snoozed todo entry {id} until {until}"
+                    )))
                 }
                 "remove" => {
                     let id_str = input
@@ -442,7 +620,7 @@ impl Tool for TodoManageTool {
                     Ok(ToolOutput::success(formatted))
                 }
                 _ => Ok(ToolOutput::error(format!(
-                    "Unknown action '{action}'. Use: add, update, remove, list"
+                    "Unknown action '{action}'. Use: add, update, remove, snooze, list"
                 ))),
             }
         })
@@ -854,5 +1032,347 @@ mod tests {
         let def = tool.definition();
         assert_eq!(def.name, "todo_manage");
         assert!(def.description.contains("persistent"));
+        assert!(def.description.contains("snooze"));
+    }
+
+    // --- snoozed_until field tests ---
+
+    #[test]
+    fn todo_entry_snoozed_until_default_none() {
+        // Backwards compat: minimal JSON without snoozed_until → None
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "title": "test",
+            "status": "pending",
+            "priority": "medium",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "source": "test"
+        }"#;
+        let entry: TodoEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.snoozed_until.is_none());
+    }
+
+    #[test]
+    fn todo_entry_snoozed_until_roundtrip() {
+        let mut entry = TodoEntry::new("test", "test");
+        let snooze_time = Utc::now() + chrono::Duration::hours(24);
+        entry.snoozed_until = Some(snooze_time);
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: TodoEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.snoozed_until.unwrap().timestamp(),
+            snooze_time.timestamp()
+        );
+    }
+
+    // --- format_for_pulse_prompt tests ---
+
+    #[test]
+    fn format_for_pulse_prompt_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        assert_eq!(
+            store.format_for_pulse_prompt(),
+            "No items in the todo list."
+        );
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_excludes_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        let mut entry = TodoEntry::new("Done task", "user");
+        entry.status = TodoStatus::Completed;
+        store.add(entry).unwrap();
+
+        let mut pending = TodoEntry::new("Open task", "user");
+        pending.status = TodoStatus::Pending;
+        store.add(pending).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(prompt.contains("Open task"));
+        assert!(!prompt.contains("Done task"));
+        assert!(prompt.contains("1 completed"));
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_excludes_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        let mut entry = TodoEntry::new("Cancelled task", "user");
+        entry.status = TodoStatus::Cancelled;
+        store.add(entry).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(!prompt.contains("Cancelled task"));
+        assert!(prompt.contains("1 cancelled"));
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_all_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        let mut c1 = TodoEntry::new("Done 1", "user");
+        c1.status = TodoStatus::Completed;
+        store.add(c1).unwrap();
+        let mut c2 = TodoEntry::new("Done 2", "user");
+        c2.status = TodoStatus::Completed;
+        store.add(c2).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(prompt.contains("No actionable items."));
+        assert!(prompt.contains("2 completed"));
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_excludes_snoozed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        let mut snoozed = TodoEntry::new("Snoozed task", "user");
+        snoozed.snoozed_until = Some(Utc::now() + chrono::Duration::hours(24));
+        store.add(snoozed).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(!prompt.contains("Snoozed task"));
+        assert!(prompt.contains("1 items snoozed"));
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_includes_expired_snooze() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+        let mut expired = TodoEntry::new("Expired snooze", "user");
+        expired.snoozed_until = Some(Utc::now() - chrono::Duration::hours(1));
+        store.add(expired).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(prompt.contains("Expired snooze"));
+        assert!(!prompt.contains("snoozed"));
+    }
+
+    #[test]
+    fn format_for_pulse_prompt_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTodoStore::new(dir.path()).unwrap();
+
+        // Pending (actionable)
+        store.add(TodoEntry::new("Pending task", "user")).unwrap();
+
+        // InProgress (actionable)
+        let mut ip = TodoEntry::new("In progress task", "user");
+        ip.status = TodoStatus::InProgress;
+        store.add(ip).unwrap();
+
+        // Completed (terminal)
+        let mut done = TodoEntry::new("Completed task", "user");
+        done.status = TodoStatus::Completed;
+        store.add(done).unwrap();
+
+        // Snoozed (filtered)
+        let mut snoozed = TodoEntry::new("Snoozed task", "user");
+        snoozed.snoozed_until = Some(Utc::now() + chrono::Duration::hours(24));
+        store.add(snoozed).unwrap();
+
+        let prompt = store.format_for_pulse_prompt();
+        assert!(prompt.contains("Pending task"));
+        assert!(prompt.contains("In progress task"));
+        assert!(!prompt.contains("Completed task"));
+        assert!(!prompt.contains("Snoozed task"));
+        assert!(prompt.contains("1 completed"));
+        assert!(prompt.contains("1 items snoozed"));
+    }
+
+    // --- snooze action tests ---
+
+    #[tokio::test]
+    async fn todo_manage_tool_snooze_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        let entry = TodoEntry::new("Task to snooze", "user");
+        let id = store.add(entry).unwrap();
+
+        let result = tool
+            .execute(json!({
+                "action": "snooze",
+                "id": id.to_string()
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Snoozed"));
+
+        let list = store.get_list();
+        let snoozed = list.entries[0].snoozed_until.unwrap();
+        // Default 24h: should be ~24h from now
+        let diff = snoozed.signed_duration_since(Utc::now());
+        assert!(diff.num_hours() >= 23 && diff.num_hours() <= 24);
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_snooze_custom_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        let entry = TodoEntry::new("Task to snooze", "user");
+        let id = store.add(entry).unwrap();
+
+        let result = tool
+            .execute(json!({
+                "action": "snooze",
+                "id": id.to_string(),
+                "hours": 48
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        let list = store.get_list();
+        let snoozed = list.entries[0].snoozed_until.unwrap();
+        let diff = snoozed.signed_duration_since(Utc::now());
+        assert!(diff.num_hours() >= 47 && diff.num_hours() <= 48);
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_snooze_requires_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store);
+
+        let result = tool.execute(json!({"action": "snooze"})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("id is required"));
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_snooze_rejects_negative_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        let entry = TodoEntry::new("Task", "user");
+        let id = store.add(entry).unwrap();
+
+        let result = tool
+            .execute(json!({
+                "action": "snooze",
+                "id": id.to_string(),
+                "hours": -5
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("hours must be positive"));
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_snooze_rejects_zero_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        let entry = TodoEntry::new("Task", "user");
+        let id = store.add(entry).unwrap();
+
+        let result = tool
+            .execute(json!({
+                "action": "snooze",
+                "id": id.to_string(),
+                "hours": 0
+            }))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("hours must be positive"));
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_update_snoozed_until() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        let entry = TodoEntry::new("Task", "user");
+        let id = store.add(entry).unwrap();
+
+        let snooze_time = "2026-12-31T12:00:00Z";
+        let result = tool
+            .execute(json!({
+                "action": "update",
+                "id": id.to_string(),
+                "snoozed_until": snooze_time
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        let list = store.get_list();
+        let snoozed = list.entries[0].snoozed_until.unwrap();
+        assert_eq!(snoozed, snooze_time.parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn todo_manage_tool_update_clear_snoozed_until() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let tool = TodoManageTool::new(store.clone());
+
+        // Add an entry with a snooze
+        let mut entry = TodoEntry::new("Task", "user");
+        entry.snoozed_until = Some(Utc::now() + chrono::Duration::hours(24));
+        let id = store.add(entry).unwrap();
+
+        // Clear via null
+        let result = tool
+            .execute(json!({
+                "action": "update",
+                "id": id.to_string(),
+                "snoozed_until": null
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        let list = store.get_list();
+        assert!(list.entries[0].snoozed_until.is_none());
+    }
+
+    // --- is_actionable tests ---
+
+    #[test]
+    fn is_actionable_pending() {
+        let entry = TodoEntry::new("test", "test");
+        assert!(FileTodoStore::is_actionable(&entry));
+    }
+
+    #[test]
+    fn is_actionable_completed_false() {
+        let mut entry = TodoEntry::new("test", "test");
+        entry.status = TodoStatus::Completed;
+        assert!(!FileTodoStore::is_actionable(&entry));
+    }
+
+    #[test]
+    fn is_actionable_cancelled_false() {
+        let mut entry = TodoEntry::new("test", "test");
+        entry.status = TodoStatus::Cancelled;
+        assert!(!FileTodoStore::is_actionable(&entry));
+    }
+
+    #[test]
+    fn is_actionable_snoozed_future_false() {
+        let mut entry = TodoEntry::new("test", "test");
+        entry.snoozed_until = Some(Utc::now() + chrono::Duration::hours(24));
+        assert!(!FileTodoStore::is_actionable(&entry));
+    }
+
+    #[test]
+    fn is_actionable_snoozed_expired_true() {
+        let mut entry = TodoEntry::new("test", "test");
+        entry.snoozed_until = Some(Utc::now() - chrono::Duration::hours(1));
+        assert!(FileTodoStore::is_actionable(&entry));
     }
 }

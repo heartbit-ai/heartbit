@@ -200,7 +200,7 @@ impl LlmProvider for CascadingProvider {
                 }
             }
         }
-        unreachable!()
+        unreachable!("cascade stream_complete exhausted all tiers without returning")
     }
 }
 

@@ -1514,6 +1514,21 @@ impl HeartbitConfig {
                     "daemon.kafka.brokers must not be empty".into(),
                 ));
             }
+            if daemon.kafka.consumer_group.is_empty() {
+                return Err(Error::Config(
+                    "daemon.kafka.consumer_group must not be empty".into(),
+                ));
+            }
+            if daemon.kafka.commands_topic.is_empty() {
+                return Err(Error::Config(
+                    "daemon.kafka.commands_topic must not be empty".into(),
+                ));
+            }
+            if daemon.kafka.events_topic.is_empty() {
+                return Err(Error::Config(
+                    "daemon.kafka.events_topic must not be empty".into(),
+                ));
+            }
             // Validate heartbit pulse config
             if let Some(ref pulse) = daemon.heartbit_pulse {
                 if pulse.interval_seconds == 0 {
@@ -1563,6 +1578,12 @@ impl HeartbitConfig {
                 if !schedule_names.insert(&schedule.name) {
                     return Err(Error::Config(format!(
                         "duplicate daemon schedule name: '{}'",
+                        schedule.name
+                    )));
+                }
+                if schedule.task.is_empty() {
+                    return Err(Error::Config(format!(
+                        "daemon.schedules[{i}] '{}': task must not be empty",
                         schedule.name
                     )));
                 }
@@ -5640,5 +5661,83 @@ brokers = "localhost:9092"
             env: Default::default(),
         };
         assert_eq!(stdio_no_args.display_name(), "my-server");
+    }
+
+    // --- Daemon validation tests ---
+
+    #[test]
+    fn validate_daemon_empty_consumer_group() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+consumer_group = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("consumer_group must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_daemon_empty_commands_topic() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+commands_topic = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("commands_topic must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_daemon_empty_events_topic() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+events_topic = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("events_topic must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_daemon_schedule_empty_task() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[[daemon.schedules]]
+name = "noop"
+cron = "0 0 * * * *"
+task = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("task must not be empty"),
+            "got: {err}"
+        );
     }
 }

@@ -111,8 +111,12 @@ impl HeartbitPulseScheduler {
                     // Check if there's anything to review
                     let todo_list = self.todo_store.get_list();
                     let heartbit_md = self.read_heartbit_md();
-                    if todo_list.entries.is_empty() && heartbit_md.is_none() {
-                        tracing::debug!("heartbit pulse: no todos and no HEARTBIT.md, skipping");
+                    let has_any_actionable = todo_list
+                        .entries
+                        .iter()
+                        .any(FileTodoStore::is_actionable);
+                    if !has_any_actionable && heartbit_md.is_none() {
+                        tracing::debug!("heartbit pulse: no actionable todos and no HEARTBIT.md, skipping");
                         // Nothing to review counts as idle — increment backoff
                         consecutive_ok += 1;
                         self.maybe_backoff(&mut current_interval, consecutive_ok);
@@ -178,16 +182,8 @@ impl HeartbitPulseScheduler {
                     // the response since it flows asynchronously.
                     // Use todo-list state as a proxy: actionable items mean
                     // the agent has work to do, so reset backoff.
-                    let has_actionable = todo_list.entries.iter().any(|e| {
-                        matches!(
-                            e.status,
-                            crate::tool::builtins::TodoStatus::Pending
-                                | crate::tool::builtins::TodoStatus::InProgress
-                                | crate::tool::builtins::TodoStatus::Failed
-                        )
-                    });
-
-                    if has_actionable {
+                    // Snoozed items are NOT actionable — don't reset backoff for them.
+                    if has_any_actionable {
                         consecutive_ok = 0;
                         current_interval = self.interval;
                     } else {
@@ -263,7 +259,7 @@ impl HeartbitPulseScheduler {
             return custom.clone();
         }
 
-        let todo_section = self.todo_store.format_for_prompt();
+        let todo_section = self.todo_store.format_for_pulse_prompt();
 
         let mut prompt = String::from(
             "You are in HEARTBIT PULSE mode. Review your state and decide what to do.\n\n",
@@ -294,9 +290,13 @@ impl HeartbitPulseScheduler {
             "## Instructions\n\
              1. Review the todo list. Pick the highest-priority actionable task.\n\
              2. If a task is overdue or urgent, execute it now via delegate_task.\n\
-             3. If you identify new work, add it with todo_manage.\n\
-             4. Update completed/failed tasks with todo_manage.\n\
-             5. If nothing needs attention, respond with HEARTBIT_OK.\n",
+             3. If a task requires HUMAN action (manual review, approval, physical task),\n\
+                snooze it with todo_manage (action: snooze, hours: 24-72) instead of\n\
+                re-notifying every pulse.\n\
+             4. Before adding a new todo, check if the topic is already tracked.\n\
+                Do NOT create duplicate entries for the same work.\n\
+             5. Update completed/failed tasks with todo_manage.\n\
+             6. If nothing needs attention, respond with HEARTBIT_OK.\n",
         );
 
         prompt
@@ -852,10 +852,11 @@ mod tests {
     async fn run_backoff_doubles_interval_after_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
-        // Only completed entries — scheduler fires but considers them non-actionable
+        // Only completed entries (non-actionable) + HEARTBIT.md forces pulse to fire
         let mut entry = super::super::todo::TodoEntry::new("Done task", "user");
         entry.status = crate::tool::builtins::TodoStatus::Completed;
         store.add(entry).unwrap();
+        std::fs::write(dir.path().join("HEARTBIT.md"), "Standing orders").unwrap();
 
         let (producer, mut rx) = mock_producer();
         let scheduler = HeartbitPulseScheduler {
@@ -927,14 +928,230 @@ mod tests {
             .expect("task should not panic");
     }
 
+    #[test]
+    fn assemble_prompt_uses_pulse_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+
+        // Add pending (should show)
+        store
+            .add(super::super::todo::TodoEntry::new("Open task", "user"))
+            .unwrap();
+
+        // Add completed (should NOT show as full item)
+        let mut done = super::super::todo::TodoEntry::new("Done task", "user");
+        done.status = crate::tool::builtins::TodoStatus::Completed;
+        store.add(done).unwrap();
+
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1800),
+            todo_store: store,
+            producer: mock_producer_only(),
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let prompt = scheduler.assemble_prompt(&None);
+        assert!(prompt.contains("Open task"), "pending should appear");
+        assert!(
+            !prompt.contains("Done task"),
+            "completed should not appear as full item"
+        );
+        assert!(
+            prompt.contains("1 completed"),
+            "completed should appear as summary count"
+        );
+    }
+
+    #[test]
+    fn assemble_prompt_contains_snooze_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        store
+            .add(super::super::todo::TodoEntry::new("Task", "user"))
+            .unwrap();
+
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1800),
+            todo_store: store,
+            producer: mock_producer_only(),
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let prompt = scheduler.assemble_prompt(&None);
+        assert!(prompt.contains("snooze"), "prompt should mention snooze");
+        assert!(
+            prompt.contains("HUMAN action"),
+            "prompt should mention human action"
+        );
+    }
+
+    #[test]
+    fn assemble_prompt_contains_dedup_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        store
+            .add(super::super::todo::TodoEntry::new("Task", "user"))
+            .unwrap();
+
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1800),
+            todo_store: store,
+            producer: mock_producer_only(),
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let prompt = scheduler.assemble_prompt(&None);
+        assert!(
+            prompt.contains("Do NOT create duplicate"),
+            "prompt should warn about duplicates"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_skips_when_only_terminal_entries_and_no_heartbit_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        // Only completed entries, no HEARTBIT.md
+        let mut entry = super::super::todo::TodoEntry::new("Done task", "user");
+        entry.status = crate::tool::builtins::TodoStatus::Completed;
+        store.add(entry).unwrap();
+
+        let (producer, mut rx) = mock_producer();
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1),
+            todo_store: store,
+            producer,
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move { scheduler.run(cancel2).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        // Should NOT receive anything — all entries are terminal
+        assert_no_cmd(&mut rx).await;
+
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_skips_when_only_snoozed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        let mut entry = super::super::todo::TodoEntry::new("Snoozed task", "user");
+        entry.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(24));
+        store.add(entry).unwrap();
+
+        let (producer, mut rx) = mock_producer();
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1),
+            todo_store: store,
+            producer,
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move { scheduler.run(cancel2).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        // Should NOT receive anything — all entries are snoozed
+        assert_no_cmd(&mut rx).await;
+
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_treats_snoozed_as_non_actionable_for_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        // Add a pending entry so the pulse fires, plus a snoozed entry
+        store
+            .add(super::super::todo::TodoEntry::new("Active task", "user"))
+            .unwrap();
+        let mut snoozed = super::super::todo::TodoEntry::new("Snoozed task", "user");
+        snoozed.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(24));
+        store.add(snoozed).unwrap();
+
+        let (producer, mut rx) = mock_producer();
+        let store_clone = store.clone();
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(10),
+            todo_store: store_clone,
+            producer,
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 1,
+            active_sensors: vec![],
+        };
+
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move { scheduler.run(cancel2).await });
+
+        // First tick fires (has actionable "Active task")
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let _ = recv_cmd(&mut rx).await;
+
+        // Now remove the active task, leaving only snoozed
+        let active_id = store
+            .get_list()
+            .entries
+            .iter()
+            .find(|e| e.title == "Active task")
+            .unwrap()
+            .id;
+        store.remove(active_id).unwrap();
+
+        // Next tick: snoozed only → pulse should skip (no command produced)
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_no_cmd(&mut rx).await;
+
+        cancel.cancel();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn run_resets_backoff_when_actionable_items_appear() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
-        // Start with only completed entries (non-actionable)
+        // Start with only completed entries (non-actionable) + HEARTBIT.md to force firing
         let mut entry = super::super::todo::TodoEntry::new("Done task", "user");
         entry.status = crate::tool::builtins::TodoStatus::Completed;
         store.add(entry).unwrap();
+        std::fs::write(dir.path().join("HEARTBIT.md"), "Standing orders").unwrap();
 
         let (producer, mut rx) = mock_producer();
         let store_clone = store.clone();
@@ -954,7 +1171,7 @@ mod tests {
         let cancel2 = cancel.clone();
         tokio::spawn(async move { scheduler.run(cancel2).await });
 
-        // First tick: fires (non-actionable → consecutive_ok=1, hits threshold, doubles to 20s)
+        // First tick: fires (HEARTBIT.md present, but non-actionable → consecutive_ok=1, hits threshold, doubles to 20s)
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(11)).await;
         let _ = recv_cmd(&mut rx).await;

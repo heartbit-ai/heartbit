@@ -82,7 +82,13 @@ impl DaemonHandle {
 
     /// Subscribe to real-time events for a task (for SSE).
     pub fn subscribe_events(&self, id: uuid::Uuid) -> Option<broadcast::Receiver<AgentEvent>> {
-        let channels = self.event_channels.read().ok()?;
+        let channels = match self.event_channels.read() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "event_channels lock poisoned in subscribe_events");
+                return None;
+            }
+        };
         channels.get(&id).map(|tx| tx.subscribe())
     }
 
@@ -275,7 +281,13 @@ impl DaemonCore {
                                 Arc::new(move |event: AgentEvent| {
                                     let _ = tx.send(event.clone());
                                     // Fire-and-forget produce to Kafka
-                                    let json = serde_json::to_vec(&event).unwrap_or_default();
+                                    let json = match serde_json::to_vec(&event) {
+                                        Ok(j) => j,
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "failed to serialize agent event for kafka");
+                                            return;
+                                        }
+                                    };
                                     drop(event_producer.send(
                                         FutureRecord::to(&events_topic)
                                             .key(&id.to_string())
