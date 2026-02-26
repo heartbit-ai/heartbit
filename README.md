@@ -11,6 +11,7 @@ Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that exec
 - **Flat agent hierarchy** — orchestrator delegates to sub-agents, sub-agents never spawn further
 - **Parallel tool execution** — `tokio::JoinSet` runs tools concurrently within each turn
 - **Production-grade** — guardrails, context management, memory, cost tracking, OpenTelemetry
+- **Built-in integrations** — Telegram bot, Google Workspace (JMAP email), RSS, webhooks, and more via sensor pipeline
 
 > **Not an OpenClaw fork or clone.** Heartbit is an independent project built from scratch. It shares no code, architecture, or lineage with [OpenClaw](https://github.com/anthropics/openclaw) or any other agent framework. Different design goals, different codebase.
 
@@ -254,21 +255,23 @@ Providers compose via wrapping. The cascade tries cheaper models first.
 Sensors gather data from external sources, triage classifies it, stories aggregate related events into actionable commands.
 
 ```
-  Sources                 Triage              Stories         Daemon
-  ───────                 ──────              ───────         ──────
-  ┌─────────┐
-  │  RSS     │──┐
-  ├─────────┤  │
-  │  JMAP    │──┤     ┌────────────┐     ┌────────────┐    ┌─────────┐
-  ├─────────┤  ├────▶│  Triage     │───▶│  Story      │──▶│ Command  │
-  │  Webhook │──┤     │  (per-type  │    │  Builder    │   │ Producer │
-  ├─────────┤  │     │   scoring)  │    │  (dedup,    │   │ → Kafka  │
-  │  Weather │──┤     └────────────┘    │   merge)    │   └─────────┘
-  ├─────────┤  │                        └────────────┘
-  │  Audio   │──┤
-  ├─────────┤  │
-  │  Image   │──┘
-  └─────────┘
+  Sources                  Triage              Stories         Daemon
+  ───────                  ──────              ───────         ──────
+  ┌──────────┐
+  │  RSS      │──┐
+  ├──────────┤  │
+  │  Email    │──┤      ┌────────────┐     ┌────────────┐   ┌─────────┐
+  │  (JMAP/   │  ├────▶│  Triage     │───▶│  Story      │──▶│ Command  │
+  │  Google)  │──┤      │  (per-type  │    │  Builder    │   │ Producer │
+  ├──────────┤  │      │   scoring)  │    │  (dedup,    │   │ → Kafka  │
+  │  Webhook  │──┤      └────────────┘    │   merge)    │   └─────────┘
+  ├──────────┤  │                         └────────────┘
+  │  Weather  │──┤
+  ├──────────┤  │
+  │  Audio    │──┤
+  ├──────────┤  │
+  │  Image    │──┘
+  └──────────┘
 ```
 
 ## Module Map
@@ -350,7 +353,7 @@ crates/
         stories.rs             # Story builder (dedup, merge)
         routing.rs             # Event routing
         metrics.rs             # Sensor metrics
-        sources/               # 7 sensor sources (RSS, JMAP, webhook, weather, audio, image, MCP)
+        sources/               # 7 sensor sources (RSS, JMAP/Google Workspace, webhook, weather, audio, image, MCP)
         triage/                # Per-modality triage classifiers
         compression/           # Event compression rules
         perception/            # Perceivers for multimodal input
@@ -449,7 +452,7 @@ MemGPT-inspired memory with composite recall scoring.
 
 Data ingestion pipeline from 7 external sources → triage → stories → daemon commands.
 
-**Sources**: RSS, JMAP (email), Webhook, Weather, Audio, Image, MCP — each implements the `Sensor` trait with `name()`, `modality()`, and `run()`.
+**Sources**: RSS, JMAP (Google Workspace / email), Webhook, Weather, Audio, Image, MCP — each implements the `Sensor` trait with `name()`, `modality()`, and `run()`.
 
 **Triage**: per-modality classifiers score urgency and relevance. **Stories**: aggregate related events, deduplicate, and produce actionable `DaemonCommand` entries sent to Kafka.
 
