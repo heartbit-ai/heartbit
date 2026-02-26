@@ -5,10 +5,70 @@
 
 Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that execute LLM-powered reasoning loops with parallel tool execution.
 
-Three execution paths:
-- **Standalone** — in-process via `tokio::JoinSet`, zero infrastructure
-- **Durable** — replay-safe via [Restate](https://restate.dev/) workflows, crash-resilient
-- **Daemon** — long-running Kafka-backed task execution with HTTP API and SSE streaming
+**Why Heartbit?**
+- **Zero-copy agent loops** — ReAct cycle in pure Rust, no Python/Node overhead
+- **Three execution paths** — standalone (zero infra), durable (Restate), daemon (Kafka)
+- **Flat agent hierarchy** — orchestrator delegates to sub-agents, sub-agents never spawn further
+- **Parallel tool execution** — `tokio::JoinSet` runs tools concurrently within each turn
+- **Production-grade** — guardrails, context management, memory, cost tracking, OpenTelemetry
+
+> **Not an OpenClaw fork or clone.** Heartbit is an independent project built from scratch. It shares no code, architecture, or lineage with [OpenClaw](https://github.com/anthropics/openclaw) or any other agent framework. Different design goals, different codebase.
+
+> **Early-stage software — capability over security.** Heartbit prioritizes **capability and velocity** at this stage of development. Security hardening is ongoing but not yet comprehensive. Agents execute tools (including shell commands) with the permissions of the host process. **Do not run untrusted workloads in production environments without your own sandboxing and access controls.** See [Disclaimer](#disclaimer) below.
+
+## Architecture Overview
+
+### System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        heartbit-cli (bin)                          │
+│  Commands: run | chat | serve | daemon | submit | status | approve │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────┐
+│                          heartbit (lib)                             │
+│                                                                     │
+│  ┌─────────────────┐  ┌────────────────┐  ┌──────────────────────┐ │
+│  │   Standalone     │  │    Durable      │  │      Daemon          │ │
+│  │                  │  │                 │  │                      │ │
+│  │  AgentRunner     │  │  AgentWorkflow  │  │  Kafka consumer      │ │
+│  │  Orchestrator    │  │  OrchestratorWf │  │  Axum HTTP API       │ │
+│  │  tokio::JoinSet  │  │  Restate SDK    │  │  SSE + WebSocket     │ │
+│  │                  │  │                 │  │  Cron scheduler      │ │
+│  └────────┬─────────┘  └───────┬────────┘  │  Heartbeat pulse     │ │
+│           │                    │           └──────────┬───────────┘ │
+│           ▼                    ▼                      ▼             │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                      Shared Core                                ││
+│  │                                                                 ││
+│  │  LlmProvider (Anthropic, OpenRouter)    Tool trait + MCP client ││
+│  │  Memory (InMemory, Postgres)            KnowledgeBase           ││
+│  │  Guardrails (pre/post LLM & tool)       Sensor pipeline         ││
+│  │  Context strategies                     Channel adapters         ││
+│  │  Cost tracking + OTel                   Permission system        ││
+│  └─────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Three Execution Paths
+
+| Path | Infrastructure | Use case |
+|------|---------------|----------|
+| **Standalone** | None (in-process) | CLI tasks, scripts, library embedding |
+| **Durable** | [Restate](https://restate.dev/) server | Crash-resilient workflows, exactly-once execution |
+| **Daemon** | Kafka + Axum | Long-running services, cron jobs, event-driven tasks |
+
+### Core Concepts
+
+| Concept | What it does | Key type |
+|---------|-------------|----------|
+| **AgentRunner** | Executes one agent's ReAct loop (LLM → tools → repeat) | `AgentRunner<P>` |
+| **Orchestrator** | Dispatches tasks to sub-agents via `delegate_task` / `form_squad` | `Orchestrator<P>` |
+| **Tool** | A capability the agent can invoke (bash, read, MCP, custom) | `Arc<dyn Tool>` |
+| **LlmProvider** | Sends completion requests to an LLM (Anthropic, OpenRouter) | `Arc<BoxedProvider>` |
+| **Guardrail** | Intercepts the agent loop at 4 hook points | `Arc<dyn Guardrail>` |
+| **Memory** | Persistent agent memory with recall scoring | `Arc<dyn Memory>` |
 
 ## Installation
 
@@ -36,7 +96,7 @@ Building from source requires:
 - Rust stable (latest)
 - cmake, libssl-dev, pkg-config (for rdkafka)
 
-## Quick start
+## Quick Start
 
 ```bash
 # Standalone mode (no config file needed)
@@ -51,9 +111,412 @@ cargo run --release -p heartbit-cli -- "Analyze the Rust ecosystem"
 cargo run --release -p heartbit-cli -- chat
 ```
 
-Without a config file, a single agent runs with 14 built-in tools (bash, read, write, edit, grep, etc.).
+Without a config file, a single agent runs with 14 built-in tools (bash, read, write, edit, patch, glob, grep, etc.).
 
-## CLI
+## How It Works
+
+### The Agent Loop (ReAct Cycle)
+
+Every agent runs the same loop. The orchestrator is just an agent whose tools include `delegate_task` and `form_squad`.
+
+```
+                    ┌──────────────────────┐
+                    │   AgentRunner::      │
+                    │   execute(task)       │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │  Build messages       │
+                    │  [system + history    │
+                    │   + task/tool results]│
+                    └──────────┬───────────┘
+                               │
+              ┌────────────────▼────────────────┐
+              │         LLM call                 │
+              │  (stream_complete / complete)     │
+              │  Provider → Retry → Cascade      │
+              └────────────────┬────────────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │  Response has         │
+                    │  tool calls?          │
+                    └──┬────────────────┬──┘
+                       │ Yes            │ No
+            ┌──────────▼──────────┐     │
+            │  Guardrail:         │     │
+            │  pre_tool checks    │     │
+            └──────────┬──────────┘     │
+                       │                │
+            ┌──────────▼──────────┐     │
+            │  Execute tools in   │     │
+            │  PARALLEL via       │     │
+            │  tokio::JoinSet     │     │
+            └──────────┬──────────┘     │
+                       │                │
+            ┌──────────▼──────────┐     │
+            │  Guardrail:         │     │
+            │  post_tool checks   │     │
+            └──────────┬──────────┘     │
+                       │                │
+            ┌──────────▼──────────┐     │
+            │  Append results     │     │
+            │  to messages        │     │
+            └──────────┬──────────┘     │
+                       │                │
+                       │     ┌──────────▼───────────┐
+                       │     │  Return AgentOutput   │
+                       │     │  { result, tokens,    │
+                       │     │    cost, structured } │
+                       │     └──────────────────────┘
+                       │
+              (loop back to LLM call)
+```
+
+Key behaviors:
+- **Parallel tool execution** — all tool calls in a single turn run concurrently via `JoinSet`
+- **Panic recovery** — a panicked tool task produces an error result without crashing the loop
+- **Context management** — `SlidingWindow` or `Summarize` strategies trim messages before each LLM call
+- **Auto-compaction** — on `ContextOverflow`, the agent summarizes history and retries (max once per turn pair)
+- **Doom loop detection** — detects repeated identical tool-call batches and breaks the cycle
+- **Tool name repair** — Levenshtein distance ≤ 2 auto-corrects misspelled tool names
+
+### Multi-Agent Orchestration
+
+The orchestrator is an `AgentRunner` with two delegation tools. Sub-agents do NOT spawn further agents (flat hierarchy).
+
+```
+                    ┌───────────────────────┐
+                    │     Orchestrator       │
+                    │  (AgentRunner + tools) │
+                    └───────────┬───────────┘
+                                │
+                   LLM decides delegation
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                  │
+   ┌──────────▼──────┐  ┌──────▼────────┐  ┌─────▼──────────┐
+   │  delegate_task   │  │  delegate_task │  │  form_squad     │
+   │  (independent)   │  │  (independent) │  │  (collaborative)│
+   └──────────┬──────┘  └──────┬────────┘  └─────┬──────────┘
+              │                │                  │
+   ┌──────────▼──────┐  ┌─────▼─────────┐  ┌────▼───────────┐
+   │  Sub-Agent A     │  │  Sub-Agent B   │  │  Squad of C, D  │
+   │  (own tools,     │  │  (own tools,   │  │  (shared        │
+   │   own provider)  │  │   own provider)│  │   blackboard)   │
+   └──────────┬──────┘  └──────┬────────┘  └─────┬──────────┘
+              │                │                  │
+              └────────────────┼──────────────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │  Results aggregated   │
+                    │  back to orchestrator │
+                    │  + written to         │
+                    │  blackboard           │
+                    └──────────────────────┘
+```
+
+- **`delegate_task`** — independent parallel subtasks, each sub-agent gets its own `AgentRunner`
+- **`form_squad`** — collaborative subtasks sharing a `Blackboard` (key-value store)
+- **Routing** — `Auto` mode uses heuristic + capability matching; `AlwaysOrchestrate` / `SingleAgent` overrides
+- **Per-agent providers** — each sub-agent can use a different LLM model/provider
+
+### LLM Provider Stack
+
+Providers compose via wrapping. The cascade tries cheaper models first.
+
+```
+     ┌────────────────────────────────────┐
+     │  CascadingProvider (optional)       │
+     │  tier 1: haiku (cheapest)           │
+     │  tier 2: sonnet                     │
+     │  tier 3: opus (most capable)        │
+     │                                     │
+     │  Gate: confidence check after each  │
+     │  tier — escalate on rejection       │
+     └──────────────┬─────────────────────┘
+                    │ wraps
+     ┌──────────────▼─────────────────────┐
+     │  RetryingProvider                   │
+     │  Exponential backoff on:            │
+     │  429, 500, 502, 503, 529            │
+     │  + network errors                   │
+     └──────────────┬─────────────────────┘
+                    │ wraps
+     ┌──────────────▼─────────────────────┐
+     │  AnthropicProvider / OpenRouter     │
+     │  SSE streaming, prompt caching      │
+     │  ToolChoice (Auto/Any/Tool)         │
+     └────────────────────────────────────┘
+```
+
+### Sensor Pipeline (Daemon)
+
+Sensors gather data from external sources, triage classifies it, stories aggregate related events into actionable commands.
+
+```
+  Sources                 Triage              Stories         Daemon
+  ───────                 ──────              ───────         ──────
+  ┌─────────┐
+  │  RSS     │──┐
+  ├─────────┤  │
+  │  JMAP    │──┤     ┌────────────┐     ┌────────────┐    ┌─────────┐
+  ├─────────┤  ├────▶│  Triage     │───▶│  Story      │──▶│ Command  │
+  │  Webhook │──┤     │  (per-type  │    │  Builder    │   │ Producer │
+  ├─────────┤  │     │   scoring)  │    │  (dedup,    │   │ → Kafka  │
+  │  Weather │──┤     └────────────┘    │   merge)    │   └─────────┘
+  ├─────────┤  │                        └────────────┘
+  │  Audio   │──┤
+  ├─────────┤  │
+  │  Image   │──┘
+  └─────────┘
+```
+
+## Module Map
+
+### Crate Structure
+
+```
+crates/
+  heartbit/                    # Library crate — all core logic
+    src/
+      agent/
+        mod.rs                 # AgentRunner: the ReAct loop
+        orchestrator.rs        # Orchestrator: multi-agent dispatch
+        context.rs             # Context strategies (sliding window, summarize)
+        guardrail.rs           # Guardrail trait definition
+        guardrails/            # Built-in guardrail implementations
+        blackboard.rs          # Blackboard trait + InMemoryBlackboard
+        blackboard_tools.rs    # Blackboard read/write/list tools
+        events.rs              # AgentEvent enum (13 variants)
+        routing.rs             # Task routing (Auto/AlwaysOrchestrate/SingleAgent)
+        observability.rs       # Span tracking, TTFT, retry events
+        permission.rs          # Tool permission rules + learned permissions
+        pruner.rs              # Session pruning (trim old tool results)
+        tool_filter.rs         # ToolProfile-based tool pre-filtering
+        instructions.rs        # System prompt construction + resourcefulness
+        token_estimator.rs     # Token count estimation
+      llm/
+        mod.rs                 # LlmProvider trait, BoxedProvider, DynLlmProvider
+        anthropic.rs           # Anthropic provider (SSE, prompt caching)
+        openrouter.rs          # OpenRouter provider (OpenAI-compat SSE)
+        cascade.rs             # CascadingProvider + ConfidenceGate
+        retry.rs               # RetryingProvider (exponential backoff)
+        pricing.rs             # Cost estimation for known models
+        error_class.rs         # Error classification (ContextOverflow, RateLimit, ...)
+        types.rs               # CompletionRequest, CompletionResponse, ToolCall, ...
+      tool/
+        mod.rs                 # Tool trait, ToolDefinition, ToolOutput
+        mcp.rs                 # MCP Streamable HTTP client
+        a2a.rs                 # Agent-to-Agent protocol
+        builtins/
+          mod.rs               # builtin_tools() factory, BuiltinToolsConfig
+          bash.rs              # Shell command execution
+          read.rs              # File reading with line numbers
+          write.rs             # File writing with read-before-write guard
+          edit.rs              # Exact string replacement
+          patch.rs             # Unified diff application
+          glob.rs              # File pattern matching
+          grep.rs              # Content search (regex)
+          list.rs              # Directory tree listing
+          webfetch.rs          # HTTP GET with content extraction
+          websearch.rs         # Exa AI web search
+          todo.rs              # Todo list management
+          question.rs          # Structured agent-to-user questions
+          skill.rs             # SKILL.md-based skill loading
+          file_tracker.rs      # Shared mtime-based read-before-write guard
+      memory/
+        mod.rs                 # Memory trait, MemoryEntry, MemoryQuery, MemoryType
+        in_memory.rs           # InMemoryStore
+        postgres.rs            # PostgresMemoryStore
+        bm25.rs                # BM25 text scoring
+        scoring.rs             # Composite recall scoring (Park et al.)
+        reflection.rs          # ReflectionTracker (importance threshold)
+        consolidation.rs       # ConsolidationPipeline (Jaccard clustering)
+        pruning.rs             # Ebbinghaus strength decay + weak entry pruning
+        namespaced.rs          # NamespacedMemory wrapper
+        embedding.rs           # Embedding support
+        hybrid.rs              # Hybrid recall (BM25 + embedding)
+        tools.rs               # 5 memory tools (store, recall, update, forget, consolidate)
+        shared_tools.rs        # Shared memory for multi-agent
+      knowledge/
+        mod.rs                 # KnowledgeBase trait, Chunk, SearchResult
+        in_memory.rs           # InMemoryKnowledgeBase (keyword search)
+        chunker.rs             # Paragraph-aware chunking with overlap
+        loader.rs              # File, glob, URL loaders
+        tools.rs               # knowledge_search tool
+      sensor/
+        mod.rs                 # Sensor trait, SensorEvent, SensorModality
+        manager.rs             # SensorManager (lifecycle)
+        stories.rs             # Story builder (dedup, merge)
+        routing.rs             # Event routing
+        metrics.rs             # Sensor metrics
+        sources/               # 7 sensor sources (RSS, JMAP, webhook, weather, audio, image, MCP)
+        triage/                # Per-modality triage classifiers
+        compression/           # Event compression rules
+        perception/            # Perceivers for multimodal input
+      channel/
+        mod.rs                 # Channel module
+        bridge.rs              # InteractionBridge (A2H adapter)
+        session.rs             # Session management
+        types.rs               # WebSocket frame types
+        telegram/              # Telegram bot adapter (DMs, streaming, HITL)
+      daemon/
+        core.rs                # DaemonCore: Kafka consumer + task runner
+        kafka.rs               # CommandProducer trait, KafkaCommandProducer
+        cron.rs                # Cron scheduler (6-field expressions)
+        heartbit_pulse.rs      # Periodic awareness loop
+        store.rs               # Task store
+        todo.rs                # FileTodoStore
+        notify.rs              # Notification dispatch
+        metrics.rs             # Daemon metrics
+        types.rs               # DaemonCommand, DaemonEvent
+      workflow/
+        mod.rs                 # Restate module entry
+        agent_service.rs       # Restate service (llm_call + tool_call activities)
+        agent_workflow.rs      # Restate workflow (durable ReAct loop)
+        orchestrator_workflow.rs  # Durable orchestrator
+        blackboard.rs          # Restate virtual object (shared state)
+        budget.rs              # Token budget tracking
+        circuit_breaker.rs     # LLM circuit breaker
+        scheduler.rs           # Recurring task scheduler
+        types.rs               # Workflow types
+      lsp/                     # LSP client integration
+      store/                   # PostgreSQL task/audit store
+      config.rs                # HeartbitConfig from TOML
+      error.rs                 # Error types (thiserror)
+      workspace.rs             # Agent workspace (sandboxed file access)
+      lib.rs                   # Public API re-exports
+  heartbit-cli/                # Binary crate
+    src/
+      main.rs                  # CLI entry point (clap), standalone runner
+      serve.rs                 # Restate HTTP worker
+      submit.rs                # Restate task submission
+      daemon.rs                # Daemon mode entry point
+```
+
+### Key Traits
+
+| Trait | Location | Purpose |
+|-------|----------|---------|
+| `Tool` | `tool/mod.rs` | Define a tool the agent can call |
+| `LlmProvider` | `llm/mod.rs` | Send completions to an LLM |
+| `Memory` | `memory/mod.rs` | Persistent agent memory (store, recall, update, forget) |
+| `KnowledgeBase` | `knowledge/mod.rs` | Document retrieval (index, search) |
+| `Guardrail` | `agent/guardrail.rs` | Intercept agent loop (pre/post LLM/tool hooks) |
+| `Sensor` | `sensor/mod.rs` | Gather data from external sources |
+| `Blackboard` | `agent/blackboard.rs` | Shared key-value store for squad coordination |
+| `CommandProducer` | `daemon/kafka.rs` | Produce commands to Kafka topics |
+
+### Contributor Pathfinder
+
+| I want to... | Start here |
+|---|---|
+| Understand the agent loop | `agent/mod.rs` → `AgentRunner::execute()` |
+| Add a new built-in tool | `tool/builtins/` → implement `Tool` trait |
+| Add an LLM provider | `llm/mod.rs` → implement `LlmProvider` trait |
+| Add a sensor source | `sensor/sources/` → implement `Sensor` trait |
+| Add a guardrail | `agent/guardrail.rs` → implement `Guardrail` trait |
+| Understand multi-agent dispatch | `agent/orchestrator.rs` → `Orchestrator` |
+| Add a memory backend | `memory/mod.rs` → implement `Memory` trait |
+| Understand context management | `agent/context.rs` → `ContextStrategy` |
+| Add a channel adapter | `channel/bridge.rs` → `InteractionBridge` |
+| Understand the daemon | `daemon/core.rs` → `DaemonCore` |
+| Add a Restate workflow | `workflow/` → `agent_workflow.rs` |
+| Understand config loading | `config.rs` → `HeartbitConfig` |
+| Understand cost tracking | `llm/pricing.rs` → `estimate_cost()` |
+| Add a triage classifier | `sensor/triage/` → match on `SensorModality` |
+| Understand task routing | `agent/routing.rs` → `RoutingMode` |
+
+> All paths are relative to `crates/heartbit/src/`.
+
+## Key Subsystems
+
+### Memory
+
+MemGPT-inspired memory with composite recall scoring.
+
+- **Storage**: `InMemoryStore` or `PostgresMemoryStore` (both implement `Memory` trait)
+- **Memory types**: `Episodic` (default), `Semantic`, `Reflection`
+- **Recall scoring**: BM25 keyword search (2x boost) + Park et al. composite (recency + importance + relevance + strength)
+- **Ebbinghaus decay**: `effective_strength()` with decay rate of 0.005/hr (~6-day half-life); strength reinforced +0.2 on access
+- **Reflection**: `ReflectionTracker` triggers reflection prompts when cumulative importance exceeds threshold
+- **Consolidation**: `ConsolidationPipeline` clusters entries by Jaccard keyword similarity, merges into `Semantic` entries
+- **Pruning**: auto-prune weak memories at session end; configurable min strength + min age
+
+5 agent-facing tools: `memory_store`, `memory_recall`, `memory_update`, `memory_forget`, `memory_consolidate`.
+
+### Sensors
+
+Data ingestion pipeline from 7 external sources → triage → stories → daemon commands.
+
+**Sources**: RSS, JMAP (email), Webhook, Weather, Audio, Image, MCP — each implements the `Sensor` trait with `name()`, `modality()`, and `run()`.
+
+**Triage**: per-modality classifiers score urgency and relevance. **Stories**: aggregate related events, deduplicate, and produce actionable `DaemonCommand` entries sent to Kafka.
+
+### Daemon
+
+Long-running Kafka-backed task execution with HTTP API.
+
+- **Kafka consumer** loop processes `DaemonCommand` messages
+- **Axum HTTP API** — submit/list/cancel tasks, stream events via SSE
+- **Cron scheduler** — 6-field cron expressions for recurring tasks
+- **Heartbeat pulse** — periodic awareness loop that reads `HEARTBIT.md` standing orders, checks todos, submits tasks with idle backoff
+- **Bounded concurrency** — `max_concurrent_tasks` limits parallel agent runs
+- **WebSocket + Telegram** — interactive channels via `InteractionBridge`
+
+### Channels
+
+Interactive agent-human communication layer.
+
+`InteractionBridge` adapts callbacks (`OnText`, `OnInput`, `OnApproval`, `OnQuestion`) into async message channels. Currently integrated with:
+- **WebSocket** sessions with session management
+- **Telegram** bot adapter (DMs, streaming responses, HITL approval, keyboard menus)
+
+### Guardrails
+
+Four async hooks intercept the agent loop (standalone path only):
+
+| Hook | When | Can do |
+|------|------|--------|
+| `pre_llm` | Before each LLM call | Modify the `CompletionRequest` |
+| `post_llm` | After LLM response | `Allow` or `Deny { reason }` |
+| `pre_tool` | Before each tool call | `Allow` or `Deny { reason }` |
+| `post_tool` | After each tool call | Inspect or modify `ToolOutput` |
+
+Registered as `Vec<Arc<dyn Guardrail>>` — first `Deny` wins. Built-in guardrails: `ContentFence`, `SensorSecurity`.
+
+### Context Management
+
+Three strategies control how message history is trimmed before LLM calls:
+
+| Strategy | Behavior |
+|----------|----------|
+| `Unlimited` | No trimming (default) |
+| `SlidingWindow { max_tokens }` | Keep system + recent messages within budget; tool use/result pairs kept together |
+| `Summarize { threshold }` | LLM-generated summary injected when context exceeds threshold |
+
+Additional features: session pruning (trim old tool results), recursive summarization (cluster-then-summarize for long conversations), auto-compaction on context overflow.
+
+### Knowledge Base
+
+Document retrieval for agent RAG:
+
+- `InMemoryKnowledgeBase` — keyword search over indexed chunks
+- Paragraph-aware chunking with configurable `chunk_size` and `chunk_overlap`
+- Loaders: file, glob, URL (with HTML tag stripping)
+- FNV-1a hash for deterministic chunk IDs
+- Agent gets a `knowledge_search` tool (standalone path only)
+
+### Durable Execution (Restate)
+
+Crash-resilient agent workflows via [Restate SDK 0.8](https://restate.dev/):
+
+- `AgentService` — `#[restate_sdk::service]` with `llm_call` + `tool_call` activities
+- `AgentWorkflow` — `#[restate_sdk::workflow]` durable ReAct loop with replay
+- `OrchestratorWorkflow` — delegates to child `AgentWorkflow` instances
+- Virtual objects: `Blackboard` (shared state), `Budget` (token tracking), `CircuitBreaker` (LLM fault tolerance), `Scheduler` (recurring tasks)
+
+## CLI Reference
 
 ```
 heartbit [run|chat|serve|daemon|submit|status|approve|result] <args>
@@ -181,7 +644,7 @@ otlp_endpoint = "http://localhost:4317"
 service_name = "heartbit"
 ```
 
-## Environment variables
+## Environment Variables
 
 When running without a config file, the CLI reads these environment variables:
 
@@ -200,112 +663,7 @@ When running without a config file, the CLI reads these environment variables:
 | `EXA_API_KEY` | — | Exa AI API key (for `websearch` built-in tool) |
 | `RUST_LOG` | — | Tracing filter (e.g. `info`, `debug`) |
 
-## Architecture
-
-```
-                    heartbit-cli (bin)
-                         |
-                    heartbit (lib)
-                    /           \
-          Standalone            Durable (Restate)
-          AgentRunner            AgentWorkflow
-          Orchestrator           OrchestratorWorkflow
-          tokio::JoinSet         Restate SDK 0.8
-```
-
-### Key components
-
-**Orchestrator** — an `AgentRunner` with two delegation tools: `delegate_task` (independent parallel subtasks) and `form_squad` (collaborative subtasks with a shared private blackboard). Sub-agents do NOT spawn further agents (flat hierarchy). Squads auto-enable when >= 2 agents are registered; disable with `orchestrator.enable_squads = false`.
-
-**AgentRunner** — the ReAct loop: LLM call -> tool execution -> repeat until done or max turns. Tools execute in parallel via `JoinSet`. Panicked tasks produce error results without crashing the loop.
-
-**Tool trait** — `definition() -> ToolDefinition` + `execute(Value) -> Future<Result<ToolOutput>>`. Input validated against JSON Schema before dispatch.
-
-**MCP client** — Streamable HTTP client (protocol `2025-03-26`). `McpClient::connect(url)` discovers tools automatically. Supports optional `auth_header` for authenticated servers.
-
-**LLM providers** — `AnthropicProvider` and `OpenRouterProvider` with SSE streaming. `RetryingProvider` wraps any provider with exponential backoff on 429/5xx. `BoxedProvider` for type-erased usage. Per-agent provider overrides allow routing different agents to different models.
-
-**Prompt caching** — `AnthropicProvider::with_prompt_caching()` sets `cache_control: {"type": "ephemeral"}` on system messages and tool definitions. Cache reads cost 10% of input rate, cache writes 125%.
-
-### Guardrails
-
-`Guardrail` trait with four async hooks for intercepting the agent loop (standalone path only):
-
-- `pre_llm(&mut CompletionRequest)` — modify or validate requests before LLM calls
-- `post_llm(&CompletionResponse) -> GuardAction` — allow or deny LLM responses
-- `pre_tool(&ToolCall) -> GuardAction` — allow or deny individual tool calls
-- `post_tool(&ToolCall, &mut ToolOutput)` — inspect or modify tool outputs
-
-Registered as `Vec<Arc<dyn Guardrail>>` — first `Deny` wins. Denied `post_llm` responses insert a synthetic assistant placeholder to maintain alternating message roles.
-
-### Agent events
-
-13 structured `AgentEvent` variants emitted via `OnEvent` callback:
-
-`RunStarted`, `TurnStarted`, `LlmResponse`, `ToolCallStarted`, `ToolCallCompleted`, `ApprovalRequested`, `ApprovalDecision`, `SubAgentsDispatched`, `SubAgentCompleted`, `ContextSummarized`, `RunCompleted`, `GuardrailDenied`, `RunFailed`
-
-Use `--verbose` to emit events as JSON to stderr.
-
-### Cost tracking
-
-`estimate_cost(model, usage) -> Option<f64>` returns estimated USD cost for known models (Claude 4, 3.5, and 3 generations, including OpenRouter aliases). Accounts for cache read/write token rates. Displayed in CLI output after each run.
-
-### Built-in tools
-
-14 tools available by default in env-based mode (no config file):
-
-| Tool | Description |
-|------|-------------|
-| `bash` | Execute bash commands. Working directory persists between calls. Default timeout: 120s, max: 600s. |
-| `read` | Read a file with line numbers. Detects binary files. Max size: 256 KB. |
-| `write` | Write content to a file. Creates parent directories. Read-before-write guard. |
-| `edit` | Replace an exact string in a file (must appear exactly once). Read-before-write guard. |
-| `patch` | Apply unified diff patches to one or more files. Single-pass hunk application. |
-| `glob` | Find files matching a glob pattern. Skips hidden files. |
-| `grep` | Search file contents with regex. Uses `rg` when available, falls back to built-in. |
-| `list` | List directory contents as an indented tree. Skips common build artifacts. |
-| `webfetch` | Fetch content from a URL via HTTP GET. Supports text, markdown, HTML. Max: 5 MB. |
-| `websearch` | Search the web via Exa AI. Requires `EXA_API_KEY`. |
-| `todowrite` | Write/replace the full todo list. Only 1 item in progress at a time. |
-| `todoread` | Read the current todo list. |
-| `skill` | Load skill definitions from `SKILL.md` files. |
-| `question` | Ask the user structured questions (only when `on_question` callback is set). |
-
-### Cross-agent coordination
-
-**Blackboard** — shared `Key -> Value` store. Sub-agents get `blackboard_read`, `blackboard_write`, `blackboard_list` tools. After each sub-agent completes, its result is written to `"agent:{name}"`.
-
-**Memory** — `Memory` trait with `store`, `recall`, `update`, `forget`. Implementations: `InMemoryStore`, `PostgresMemoryStore`. Agents get 5 memory tools including `memory_consolidate` (MemGPT pattern). Recall scoring uses Park et al. composite: `recency + importance + relevance`.
-
-**Knowledge** — `KnowledgeBase` trait for document retrieval. `InMemoryKnowledgeBase` provides keyword search over indexed chunks. Loaders: file, glob, URL (with HTML stripping). Paragraph-aware chunking with configurable size and overlap. Agents get a `knowledge_search` tool. Standalone path only.
-
-### Context management
-
-- `Unlimited` — no trimming (default)
-- `SlidingWindow { max_tokens }` — keeps first message + recent messages within budget; tool use/result pairs kept together
-- `Summarize { threshold }` — LLM-generated summary injected when context exceeds threshold
-
-### Structured output
-
-Set `response_schema` (JSON Schema) on an agent. A synthetic `__respond__` tool is injected and `tool_choice` forced to `Any`. The agent calls `__respond__` to produce structured JSON in `AgentOutput::structured`.
-
-### Human-in-the-loop
-
-`--approve` flag enables interactive approval before each tool execution round. Denied tools receive error results — the LLM can adjust and retry. In Restate path, approval uses per-turn promise keys.
-
-### Streaming
-
-`on_text` callback receives text deltas as they arrive from the LLM. Both Anthropic and OpenRouter providers implement SSE streaming. Sub-agents don't stream — only the orchestrator.
-
-### Run timeout
-
-`run_timeout_seconds` sets a wall-clock deadline for the entire agent run. If exceeded, the run stops with `Error::RunTimeout` and returns partial token usage. Configurable at both orchestrator and per-agent level.
-
-### OpenTelemetry
-
-Add a `[telemetry]` section to your config to export traces via OTLP. Works with all commands (`run`, `chat`, `serve`). When absent, a simple `tracing_subscriber::fmt` subscriber is used instead.
-
-## Library usage
+## Library Usage
 
 ```rust
 use std::sync::Arc;
@@ -353,7 +711,195 @@ println!("\nTokens: {} in / {} out", output.tokens_used.input_tokens,
     output.tokens_used.output_tokens);
 ```
 
-## Durable execution (Restate)
+## Extending Heartbit
+
+### Adding a New Tool
+
+Implement the `Tool` trait and register it with the agent builder.
+
+```rust
+use heartbit::{Tool, ToolDefinition, ToolOutput, Error};
+use serde_json::Value;
+use std::pin::Pin;
+use std::future::Future;
+
+pub struct MyTool;
+
+impl Tool for MyTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new("my_tool", "Does something useful")
+            .with_parameter("input", "string", "The input value", true)
+    }
+
+    fn execute(
+        &self,
+        input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let input_str = input["input"].as_str().unwrap_or_default();
+            Ok(ToolOutput::text(format!("Processed: {input_str}")))
+        })
+    }
+}
+
+// Register with an agent:
+// AgentRunnerBuilder::new(provider).tools(vec![Arc::new(MyTool)]).build()
+```
+
+### Adding an LLM Provider
+
+Implement the `LlmProvider` trait. For dynamic dispatch, the framework uses `BoxedProvider` which wraps a `DynLlmProvider` adapter.
+
+```rust
+use heartbit::llm::{LlmProvider, CompletionRequest, CompletionResponse};
+use heartbit::Error;
+
+pub struct MyProvider { /* ... */ }
+
+impl LlmProvider for MyProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, Error> {
+        // Send request to your LLM, return response
+        todo!()
+    }
+
+    // Optional: override for streaming support
+    // async fn stream_complete(&self, request, on_text) -> Result<CompletionResponse, Error>
+
+    fn model_name(&self) -> Option<&str> {
+        Some("my-model")
+    }
+}
+
+// Wrap for use: Arc::new(BoxedProvider::new(MyProvider { ... }))
+```
+
+### Adding a Sensor Source
+
+Implement the `Sensor` trait for a new data source in the daemon pipeline.
+
+```rust
+use heartbit::sensor::{Sensor, SensorModality};
+use heartbit::Error;
+use rdkafka::producer::FutureProducer;
+use tokio_util::sync::CancellationToken;
+use std::pin::Pin;
+use std::future::Future;
+
+pub struct MySensor { /* config */ }
+
+impl Sensor for MySensor {
+    fn name(&self) -> &str { "my_source" }
+
+    fn modality(&self) -> SensorModality { SensorModality::Text }
+
+    fn kafka_topic(&self) -> &str { "heartbit.sensors.my_source" }
+
+    fn run(
+        &self,
+        producer: FutureProducer,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async move {
+            // Poll your source, produce SensorEvent messages to Kafka
+            // Check cancel.is_cancelled() periodically
+            Ok(())
+        })
+    }
+}
+```
+
+### Adding a Guardrail
+
+Implement the `Guardrail` trait. Override only the hooks you need — all default to `Allow`.
+
+```rust
+use heartbit::agent::guardrail::{Guardrail, GuardAction};
+use heartbit::llm::types::ToolCall;
+use heartbit::tool::ToolOutput;
+use heartbit::Error;
+use std::pin::Pin;
+use std::future::Future;
+
+pub struct MyGuardrail;
+
+impl Guardrail for MyGuardrail {
+    fn pre_tool(
+        &self,
+        call: &ToolCall,
+    ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
+        let name = call.name.clone();
+        Box::pin(async move {
+            if name == "bash" {
+                Ok(GuardAction::Deny {
+                    reason: "Bash execution is not allowed".into(),
+                })
+            } else {
+                Ok(GuardAction::Allow)
+            }
+        })
+    }
+}
+
+// Register: AgentRunnerBuilder::new(provider).guardrails(vec![Arc::new(MyGuardrail)]).build()
+```
+
+## Built-in Tools
+
+14 tools available by default in env-based mode (no config file):
+
+| Tool | Description |
+|------|-------------|
+| `bash` | Execute bash commands. Working directory persists between calls. Default timeout: 120s, max: 600s. |
+| `read` | Read a file with line numbers. Detects binary files. Max size: 256 KB. |
+| `write` | Write content to a file. Creates parent directories. Read-before-write guard. |
+| `edit` | Replace an exact string in a file (must appear exactly once). Read-before-write guard. |
+| `patch` | Apply unified diff patches to one or more files. Single-pass hunk application. |
+| `glob` | Find files matching a glob pattern. Skips hidden files. |
+| `grep` | Search file contents with regex. Uses `rg` when available, falls back to built-in. |
+| `list` | List directory contents as an indented tree. Skips common build artifacts. |
+| `webfetch` | Fetch content from a URL via HTTP GET. Supports text, markdown, HTML. Max: 5 MB. |
+| `websearch` | Search the web via Exa AI. Requires `EXA_API_KEY`. |
+| `todowrite` | Write/replace the full todo list. Only 1 item in progress at a time. |
+| `todoread` | Read the current todo list. |
+| `skill` | Load skill definitions from `SKILL.md` files. |
+| `question` | Ask the user structured questions (only when `on_question` callback is set). |
+
+### Cross-Agent Coordination
+
+**Blackboard** — shared `Key -> Value` store. Sub-agents get `blackboard_read`, `blackboard_write`, `blackboard_list` tools. After each sub-agent completes, its result is written to `"agent:{name}"`.
+
+### Structured Output
+
+Set `response_schema` (JSON Schema) on an agent. A synthetic `__respond__` tool is injected and `tool_choice` forced to `Any`. The agent calls `__respond__` to produce structured JSON in `AgentOutput::structured`.
+
+### Human-in-the-Loop
+
+`--approve` flag enables interactive approval before each tool execution round. Denied tools receive error results — the LLM can adjust and retry. In Restate path, approval uses per-turn promise keys.
+
+### Streaming
+
+`on_text` callback receives text deltas as they arrive from the LLM. Both Anthropic and OpenRouter providers implement SSE streaming. Sub-agents don't stream — only the orchestrator.
+
+### Agent Events
+
+13 structured `AgentEvent` variants emitted via `OnEvent` callback:
+
+`RunStarted`, `TurnStarted`, `LlmResponse`, `ToolCallStarted`, `ToolCallCompleted`, `ApprovalRequested`, `ApprovalDecision`, `SubAgentsDispatched`, `SubAgentCompleted`, `ContextSummarized`, `RunCompleted`, `GuardrailDenied`, `RunFailed`
+
+Use `--verbose` to emit events as JSON to stderr.
+
+### Cost Tracking
+
+`estimate_cost(model, usage) -> Option<f64>` returns estimated USD cost for known models (Claude 4, 3.5, and 3 generations, including OpenRouter aliases). Accounts for cache read/write token rates. Displayed in CLI output after each run.
+
+### OpenTelemetry
+
+Add a `[telemetry]` section to your config to export traces via OTLP. Works with all commands (`run`, `chat`, `serve`). When absent, a simple `tracing_subscriber::fmt` subscriber is used instead.
+
+## Durable Execution (Restate)
 
 ```bash
 # Start Restate + worker
@@ -378,9 +924,7 @@ heartbit result <workflow-id>
 
 Restate provides: durable execution with replay, crash recovery, exactly-once tool execution, token budget tracking, circuit breaker for LLM providers, and recurring task scheduling.
 
-## Daemon mode
-
-Long-running Kafka-backed task execution with HTTP API and SSE event streaming.
+## Daemon Mode
 
 ```bash
 # Start Kafka
@@ -403,8 +947,6 @@ curl -N http://localhost:3000/tasks/<id>/events
 # Cancel a task
 curl -X DELETE http://localhost:3000/tasks/<id>
 ```
-
-Features: bounded concurrency, per-task cancellation, cron scheduling, dual event delivery (Kafka durable + in-process SSE), graceful shutdown.
 
 ## Docker
 
@@ -457,38 +999,32 @@ npx -y supergateway \
 # Server at http://localhost:8000/mcp
 ```
 
-2374 tests. TDD mandatory -- red/green/refactor for every feature.
+2374 tests. TDD mandatory — red/green/refactor for every feature.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
-## Project structure
+## Disclaimer
 
-```
-crates/
-  heartbit/           # Library crate
-    src/
-      agent/          # AgentRunner, Orchestrator, context management, blackboard
-        events.rs     # AgentEvent enum (13 variants)
-        guardrail.rs  # Guardrail trait (pre/post LLM/tool hooks)
-      knowledge/      # KnowledgeBase trait, InMemoryKnowledgeBase, chunker, loaders
-      llm/            # LlmProvider trait, Anthropic, OpenRouter, retry, SSE parser
-        pricing.rs    # Cost estimation for known models
-      memory/         # Memory trait, InMemoryStore, PostgresMemoryStore, scoring
-      tool/           # Tool trait, MCP client, validation
-        builtins/     # 14 built-in tools (bash, read, write, edit, patch, glob, grep, etc.)
-      workflow/       # Restate workflows, services, objects
-      config.rs       # TOML configuration
-      error.rs        # Error types (thiserror)
-      lib.rs          # Public API re-exports
-  heartbit-cli/       # Binary crate
-    src/
-      main.rs         # CLI entry point, standalone runner
-      serve.rs        # Restate HTTP worker
-      submit.rs       # Restate task submission
-tests/                # Integration tests
-deploy/               # Systemd service units
-Dockerfile            # Multi-stage build
-docker-compose.yml    # Restate + worker
-```
+Heartbit is **early-stage, capability-first software**. It is provided "as is" without warranty of any kind, express or implied.
+
+**Security is not the primary design driver today.** The project optimizes for agent capability, extensibility, and developer velocity. While guardrails and permission systems exist, they have not been audited and should not be relied upon as a security boundary. Specifically:
+
+- Agents can execute arbitrary shell commands, read/write files, and make network requests with the full permissions of the host process.
+- LLM outputs are inherently unpredictable. Tool calls generated by the model may produce unintended side effects.
+- MCP servers, sensors, and other external integrations expand the attack surface.
+- There is no sandboxing, privilege separation, or capability-based security built in.
+
+**Early adopters are responsible for:**
+- Running Heartbit in appropriately isolated environments (containers, VMs, restricted user accounts).
+- Implementing their own access controls, network policies, and monitoring.
+- Evaluating the risk profile before deploying against sensitive data or production systems.
+
+**The maintainers accept no liability** for data loss, security incidents, unintended actions, costs incurred from LLM API usage, or any other damages arising from the use of this software. Use at your own risk.
+
+If you discover a security vulnerability, please report it privately via GitHub Security Advisories rather than opening a public issue.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
