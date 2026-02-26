@@ -20,13 +20,13 @@
 #   4. Individual test: ./browser_e2e.sh 2   (runs only test 2)
 #
 # Requires: Chrome/Chromium, npx (Node.js), OPENROUTER_API_KEY,
-#           target/release/heartbit-cli
+#           target/release/heartbit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$ROOT_DIR/target/release/heartbit-cli"
+BINARY="$ROOT_DIR/target/release/heartbit"
 WORKDIR="$(mktemp -d)"
 MAX_RETRIES="${MAX_RETRIES:-1}"
 PASS=0

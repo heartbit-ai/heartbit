@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +39,11 @@ pub struct McpSensor {
     enrich_tool_name: Option<String>,
     /// Parameter name for the item ID when calling the enrichment tool (e.g., `messageId`).
     enrich_id_param: Option<String>,
+    /// How long to remember seen IDs before evicting them.
+    dedup_ttl: Duration,
+    /// Directory for persisting dedup state across restarts.
+    /// If `None`, dedup is in-memory only (lost on restart).
+    state_dir: Option<PathBuf>,
 }
 
 impl McpSensor {
@@ -55,6 +61,8 @@ impl McpSensor {
         items_field: Option<String>,
         enrich_tool_name: Option<String>,
         enrich_id_param: Option<String>,
+        dedup_ttl: Duration,
+        state_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -69,6 +77,8 @@ impl McpSensor {
             items_field,
             enrich_tool_name,
             enrich_id_param,
+            dedup_ttl,
+            state_dir,
         }
     }
 }
@@ -98,9 +108,14 @@ impl Sensor for McpSensor {
             // between sequential tool calls on the same session).
             let mut enrich_tool: Option<Arc<dyn Tool>> = None;
             let mut enrich_failures: u32 = 0;
-            // Dedup map: source_id → first-seen time. Entries older than 2h are evicted.
-            let mut seen: HashMap<String, Instant> = HashMap::new();
-            let seen_ttl = Duration::from_secs(2 * 3600);
+            // Dedup map: source_id → first-seen Unix timestamp (epoch seconds).
+            // Persisted to disk so that restarts don't re-process old items.
+            let mut seen: HashMap<String, i64> = load_seen_state(
+                self.state_dir.as_deref(),
+                &self.name,
+                self.dedup_ttl.as_secs() as i64,
+            );
+            let dedup_ttl_secs = self.dedup_ttl.as_secs() as i64;
             let mut last_cleanup = Instant::now();
 
             loop {
@@ -206,7 +221,10 @@ impl Sensor for McpSensor {
                                             if seen.contains_key(&event.source_id) {
                                                 continue;
                                             }
-                                            seen.insert(event.source_id.clone(), Instant::now());
+                                            seen.insert(
+                                                event.source_id.clone(),
+                                                Utc::now().timestamp(),
+                                            );
 
                                             // Enrich new items before producing to Kafka.
                                             if let Some(ref et) = enrich_tool {
@@ -300,6 +318,11 @@ impl Sensor for McpSensor {
                                                 count = produced,
                                                 "produced new sensor events"
                                             );
+                                            save_seen_state(
+                                                self.state_dir.as_deref(),
+                                                &self.name,
+                                                &seen,
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -328,8 +351,9 @@ impl Sensor for McpSensor {
                 // Periodic cleanup of expired dedup entries (every 5 min).
                 let now = Instant::now();
                 if now.duration_since(last_cleanup) >= Duration::from_secs(300) {
+                    let now_epoch = Utc::now().timestamp();
                     let before = seen.len();
-                    seen.retain(|_, first_seen| now.duration_since(*first_seen) < seen_ttl);
+                    seen.retain(|_, &mut first_seen| now_epoch - first_seen < dedup_ttl_secs);
                     if seen.len() < before {
                         tracing::debug!(
                             sensor = %self.name,
@@ -337,6 +361,7 @@ impl Sensor for McpSensor {
                             remaining = seen.len(),
                             "dedup cache cleanup"
                         );
+                        save_seen_state(self.state_dir.as_deref(), &self.name, &seen);
                     }
                     last_cleanup = now;
                 }
@@ -580,6 +605,96 @@ impl TriageProcessor for McpTriageProcessor {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent dedup state
+// ---------------------------------------------------------------------------
+
+/// File path for the sensor's persisted dedup state.
+fn seen_state_path(state_dir: &std::path::Path, sensor_name: &str) -> PathBuf {
+    state_dir.join(format!("{sensor_name}.seen.json"))
+}
+
+/// Load previously seen IDs from disk, filtering out entries older than `ttl_secs`.
+///
+/// Returns an empty map if the file doesn't exist or can't be parsed.
+pub(crate) fn load_seen_state(
+    state_dir: Option<&std::path::Path>,
+    sensor_name: &str,
+    ttl_secs: i64,
+) -> HashMap<String, i64> {
+    let Some(dir) = state_dir else {
+        return HashMap::new();
+    };
+    let path = seen_state_path(dir, sensor_name);
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let mut map: HashMap<String, i64> = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                sensor = sensor_name,
+                path = %path.display(),
+                error = %e,
+                "failed to parse dedup state, starting fresh"
+            );
+            return HashMap::new();
+        }
+    };
+    // Evict expired entries.
+    let now = Utc::now().timestamp();
+    map.retain(|_, &mut ts| now - ts < ttl_secs);
+    tracing::info!(
+        sensor = sensor_name,
+        loaded = map.len(),
+        "loaded persisted dedup state"
+    );
+    map
+}
+
+/// Save the current seen map to disk.
+///
+/// No-op if `state_dir` is `None`. Errors are logged but not propagated.
+pub(crate) fn save_seen_state(
+    state_dir: Option<&std::path::Path>,
+    sensor_name: &str,
+    seen: &HashMap<String, i64>,
+) {
+    let Some(dir) = state_dir else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(
+            sensor = sensor_name,
+            path = %dir.display(),
+            error = %e,
+            "failed to create dedup state directory"
+        );
+        return;
+    }
+    let path = seen_state_path(dir, sensor_name);
+    match serde_json::to_string(seen) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!(
+                    sensor = sensor_name,
+                    path = %path.display(),
+                    error = %e,
+                    "failed to write dedup state"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                sensor = sensor_name,
+                error = %e,
+                "failed to serialize dedup state"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -604,6 +719,8 @@ mod tests {
             None,
             None,
             None,
+            Duration::from_secs(604800),
+            None,
         );
 
         assert_eq!(sensor.name(), "gmail_inbox");
@@ -625,6 +742,8 @@ mod tests {
             Some("summary".into()),
             None,
             None,
+            None,
+            Duration::from_secs(604800),
             None,
         );
 
@@ -969,7 +1088,7 @@ mod tests {
                 "headers": [
                     {"name": "From", "value": "alice@example.com"},
                     {"name": "Subject", "value": "Meeting Tomorrow"},
-                    {"name": "To", "value": "pascal@heartbit.ai"},
+                    {"name": "To", "value": "owner@example.com"},
                     {"name": "Date", "value": "Mon, 24 Feb 2026 10:00:00 +0100"},
                 ],
                 "parts": [
@@ -982,7 +1101,7 @@ mod tests {
         // Headers flattened to lowercase top-level keys.
         assert_eq!(meta["from"], "alice@example.com");
         assert_eq!(meta["subject"], "Meeting Tomorrow");
-        assert_eq!(meta["to"], "pascal@heartbit.ai");
+        assert_eq!(meta["to"], "owner@example.com");
         assert_eq!(meta["date"], "Mon, 24 Feb 2026 10:00:00 +0100");
         // Original fields preserved.
         assert_eq!(meta["id"], "msg-3");
@@ -1042,6 +1161,8 @@ mod tests {
             Some("messages".into()),
             Some("gmail_get_message".into()),
             Some("messageId".into()),
+            Duration::from_secs(604800),
+            None,
         );
 
         assert_eq!(
@@ -1049,5 +1170,77 @@ mod tests {
             Some("gmail_get_message")
         );
         assert_eq!(sensor.enrich_id_param.as_deref(), Some("messageId"));
+    }
+
+    // --- Dedup state persistence tests ---
+
+    #[test]
+    fn load_seen_state_none_dir() {
+        let seen = load_seen_state(None, "test", 3600);
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = HashMap::new();
+        let now = Utc::now().timestamp();
+        seen.insert("msg-1".into(), now);
+        seen.insert("msg-2".into(), now - 100);
+
+        save_seen_state(Some(dir.path()), "gmail", &seen);
+        let loaded = load_seen_state(Some(dir.path()), "gmail", 3600);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["msg-1"], now);
+        assert_eq!(loaded["msg-2"], now - 100);
+    }
+
+    #[test]
+    fn load_evicts_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = HashMap::new();
+        let now = Utc::now().timestamp();
+        seen.insert("fresh".into(), now - 10);
+        seen.insert("expired".into(), now - 7200); // 2h old
+
+        save_seen_state(Some(dir.path()), "sensor", &seen);
+        // TTL of 1h → "expired" should be evicted.
+        let loaded = load_seen_state(Some(dir.path()), "sensor", 3600);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("fresh"));
+        assert!(!loaded.contains_key("expired"));
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_seen_state(Some(dir.path()), "nonexistent", 3600);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_corrupt_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.seen.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        let loaded = load_seen_state(Some(dir.path()), "corrupt", 3600);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn save_creates_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("sub").join("dir");
+        let mut seen = HashMap::new();
+        seen.insert("id-1".into(), Utc::now().timestamp());
+        save_seen_state(Some(&nested), "test", &seen);
+        assert!(nested.join("test.seen.json").exists());
+    }
+
+    #[test]
+    fn save_none_dir_is_noop() {
+        // Should not panic or create anything.
+        let seen = HashMap::new();
+        save_seen_state(None, "test", &seen);
     }
 }

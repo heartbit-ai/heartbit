@@ -103,6 +103,10 @@ impl From<MemoryRow> for MemoryEntry {
 pub struct PostgresMemoryStore {
     pool: PgPool,
     scoring_weights: ScoringWeights,
+    /// Whether the pgvector extension (and `embedding` column) is available.
+    /// When false, INSERT/UPDATE queries omit the `embedding` column entirely
+    /// to avoid "type vector does not exist" errors.
+    has_pgvector: bool,
 }
 
 impl PostgresMemoryStore {
@@ -111,6 +115,7 @@ impl PostgresMemoryStore {
         Self {
             pool,
             scoring_weights: ScoringWeights::default(),
+            has_pgvector: false,
         }
     }
 
@@ -122,6 +127,7 @@ impl PostgresMemoryStore {
         Ok(Self {
             pool,
             scoring_weights: ScoringWeights::default(),
+            has_pgvector: false,
         })
     }
 
@@ -163,7 +169,7 @@ impl PostgresMemoryStore {
     ///
     /// Each statement runs separately because `sqlx` prepared statements
     /// do not support multi-command batches.
-    pub async fn run_migration(&self) -> Result<(), Error> {
+    pub async fn run_migration(&mut self) -> Result<(), Error> {
         let statements = [
             r#"CREATE TABLE IF NOT EXISTS memories (
                 id              TEXT PRIMARY KEY,
@@ -210,12 +216,15 @@ impl PostgresMemoryStore {
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1536)",
             "CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops)",
         ];
+        let mut pgvector_ok = true;
         for stmt in pgvector_stmts {
             if let Err(e) = sqlx::query(stmt).execute(&self.pool).await {
                 tracing::warn!("pgvector migration skipped (extension not installed): {e}");
+                pgvector_ok = false;
                 break;
             }
         }
+        self.has_pgvector = pgvector_ok;
 
         Ok(())
     }
@@ -227,50 +236,92 @@ impl Memory for PostgresMemoryStore {
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async move {
-            let embedding = entry
-                .embedding
-                .as_ref()
-                .map(|v| pgvector::Vector::from(v.clone()));
-            sqlx::query(
-                r#"
-                INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
-                    memory_type, keywords, summary, strength, related_ids, source_ids, embedding, confidentiality)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                ON CONFLICT (id) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    tags = EXCLUDED.tags,
-                    importance = EXCLUDED.importance,
-                    memory_type = EXCLUDED.memory_type,
-                    keywords = EXCLUDED.keywords,
-                    summary = EXCLUDED.summary,
-                    strength = EXCLUDED.strength,
-                    related_ids = EXCLUDED.related_ids,
-                    source_ids = EXCLUDED.source_ids,
-                    embedding = EXCLUDED.embedding,
-                    confidentiality = EXCLUDED.confidentiality
-                "#,
-            )
-            .bind(&entry.id)
-            .bind(&entry.agent)
-            .bind(&entry.content)
-            .bind(&entry.category)
-            .bind(&entry.tags)
-            .bind(entry.created_at)
-            .bind(entry.last_accessed)
-            .bind(entry.access_count as i32)
-            .bind(entry.importance as i16)
-            .bind(memory_type_to_str(entry.memory_type))
-            .bind(&entry.keywords)
-            .bind(&entry.summary)
-            .bind(entry.strength)
-            .bind(&entry.related_ids)
-            .bind(&entry.source_ids)
-            .bind(&embedding)
-            .bind(confidentiality_to_str(entry.confidentiality))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
+            if self.has_pgvector {
+                let embedding = entry
+                    .embedding
+                    .as_ref()
+                    .map(|v| pgvector::Vector::from(v.clone()));
+                sqlx::query(
+                    r#"
+                    INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
+                        memory_type, keywords, summary, strength, related_ids, source_ids, embedding, confidentiality)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        category = EXCLUDED.category,
+                        tags = EXCLUDED.tags,
+                        importance = EXCLUDED.importance,
+                        memory_type = EXCLUDED.memory_type,
+                        keywords = EXCLUDED.keywords,
+                        summary = EXCLUDED.summary,
+                        strength = EXCLUDED.strength,
+                        related_ids = EXCLUDED.related_ids,
+                        source_ids = EXCLUDED.source_ids,
+                        embedding = EXCLUDED.embedding,
+                        confidentiality = EXCLUDED.confidentiality
+                    "#,
+                )
+                .bind(&entry.id)
+                .bind(&entry.agent)
+                .bind(&entry.content)
+                .bind(&entry.category)
+                .bind(&entry.tags)
+                .bind(entry.created_at)
+                .bind(entry.last_accessed)
+                .bind(entry.access_count as i32)
+                .bind(entry.importance as i16)
+                .bind(memory_type_to_str(entry.memory_type))
+                .bind(&entry.keywords)
+                .bind(&entry.summary)
+                .bind(entry.strength)
+                .bind(&entry.related_ids)
+                .bind(&entry.source_ids)
+                .bind(&embedding)
+                .bind(confidentiality_to_str(entry.confidentiality))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
+            } else {
+                // No pgvector — omit embedding column entirely
+                sqlx::query(
+                    r#"
+                    INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
+                        memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        category = EXCLUDED.category,
+                        tags = EXCLUDED.tags,
+                        importance = EXCLUDED.importance,
+                        memory_type = EXCLUDED.memory_type,
+                        keywords = EXCLUDED.keywords,
+                        summary = EXCLUDED.summary,
+                        strength = EXCLUDED.strength,
+                        related_ids = EXCLUDED.related_ids,
+                        source_ids = EXCLUDED.source_ids,
+                        confidentiality = EXCLUDED.confidentiality
+                    "#,
+                )
+                .bind(&entry.id)
+                .bind(&entry.agent)
+                .bind(&entry.content)
+                .bind(&entry.category)
+                .bind(&entry.tags)
+                .bind(entry.created_at)
+                .bind(entry.last_accessed)
+                .bind(entry.access_count as i32)
+                .bind(entry.importance as i16)
+                .bind(memory_type_to_str(entry.memory_type))
+                .bind(&entry.keywords)
+                .bind(&entry.summary)
+                .bind(entry.strength)
+                .bind(&entry.related_ids)
+                .bind(&entry.source_ids)
+                .bind(confidentiality_to_str(entry.confidentiality))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
+            }
             Ok(())
         })
     }

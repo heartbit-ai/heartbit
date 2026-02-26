@@ -1516,7 +1516,7 @@ pub(crate) async fn create_memory_store(config: &MemoryConfig) -> Result<Arc<dyn
             database_url,
             embedding,
         } => {
-            let store = PostgresMemoryStore::connect(database_url)
+            let mut store = PostgresMemoryStore::connect(database_url)
                 .await
                 .context("failed to connect to PostgreSQL for memory store")?;
             store

@@ -570,7 +570,7 @@ mod tests {
 
         // Spawn daemon core (consumes from Kafka, calls runner)
         let core_handle = tokio::spawn(async move {
-            let _ = core.run(build_runner).await;
+            let _ = core.run(build_runner, None).await;
         });
 
         // Spawn pulse scheduler (produces to Kafka after 1s)

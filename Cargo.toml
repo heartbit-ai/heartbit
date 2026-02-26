@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-cockpit"]
+members = ["crates/heartbit", "crates/heartbit-cli"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Pascal Le Clech <pascal@heartbit.ai>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/heartbit-ai/heartbit"
+homepage = "https://github.com/heartbit-ai/heartbit"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -27,8 +34,7 @@ opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.29"
 walkdir = "2"
 regex = "1"
-a2a-sdk = { path = "/home/pleclech/agentgateway/crates/a2a-sdk" }
-slint = "1.15"
+a2a-sdk = "0.7.0"
 rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

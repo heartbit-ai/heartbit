@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# Smoke tests for `heartbit-cli chat`
+# Smoke tests for `heartbit chat`
 #
 # These are NOT CI tests. They call a real LLM and cost money.
 # Run manually after changes to the chat path to sanity-check.
@@ -11,11 +11,11 @@
 #   3. Each test retries up to $MAX_RETRIES times before failing.
 #   4. Tests can be run individually: ./chat_e2e.sh 3   (runs only test 3)
 #
-# Requires: OPENROUTER_API_KEY, target/release/heartbit-cli
+# Requires: OPENROUTER_API_KEY, target/release/heartbit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
-BINARY="$(cd "$(dirname "$0")/.." && pwd)/target/release/heartbit-cli"
+BINARY="$(cd "$(dirname "$0")/.." && pwd)/target/release/heartbit"
 WORKDIR="$(mktemp -d)"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 PASS=0

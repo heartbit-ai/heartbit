@@ -1,3 +1,6 @@
+[![CI](https://github.com/heartbit-ai/heartbit/actions/workflows/ci.yml/badge.svg)](https://github.com/heartbit-ai/heartbit/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+
 # Heartbit
 
 Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that execute LLM-powered reasoning loops with parallel tool execution.
@@ -6,6 +9,32 @@ Three execution paths:
 - **Standalone** — in-process via `tokio::JoinSet`, zero infrastructure
 - **Durable** — replay-safe via [Restate](https://restate.dev/) workflows, crash-resilient
 - **Daemon** — long-running Kafka-backed task execution with HTTP API and SSE streaming
+
+## Installation
+
+### Pre-built binaries
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/heartbit-ai/heartbit/main/install.sh | bash
+```
+
+### From source
+
+```bash
+cargo install --git https://github.com/heartbit-ai/heartbit heartbit-cli
+```
+
+### Docker
+
+```bash
+docker pull ghcr.io/heartbit-ai/heartbit:latest
+```
+
+### Prerequisites
+
+Building from source requires:
+- Rust stable (latest)
+- cmake, libssl-dev, pkg-config (for rdkafka)
 
 ## Quick start
 
@@ -428,7 +457,11 @@ npx -y supergateway \
 # Server at http://localhost:8000/mcp
 ```
 
-658 tests. TDD mandatory — red/green/refactor for every feature.
+2374 tests. TDD mandatory -- red/green/refactor for every feature.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## Project structure
 

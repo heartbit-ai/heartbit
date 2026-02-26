@@ -5,13 +5,13 @@
 # NOT a CI test. Calls a real LLM and costs money.
 # Run manually: ./tests/squad_e2e.sh
 #
-# Requires: OPENROUTER_API_KEY, target/release/heartbit-cli
+# Requires: OPENROUTER_API_KEY, target/release/heartbit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$ROOT_DIR/target/release/heartbit-cli"
+BINARY="$ROOT_DIR/target/release/heartbit"
 CONFIG="$SCRIPT_DIR/squad_e2e.toml"
 WORKDIR="$(mktemp -d)"
 PASS=0

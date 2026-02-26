@@ -15,13 +15,13 @@
 #   3. Each test retries up to $MAX_RETRIES times.
 #   4. Individual test: ./mcp_e2e.sh 2   (runs only test 2)
 #
-# Requires: npx (Node.js), OPENROUTER_API_KEY, target/release/heartbit-cli
+# Requires: npx (Node.js), OPENROUTER_API_KEY, target/release/heartbit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$ROOT_DIR/target/release/heartbit-cli"
+BINARY="$ROOT_DIR/target/release/heartbit"
 WORKDIR="$(mktemp -d)"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 PASS=0

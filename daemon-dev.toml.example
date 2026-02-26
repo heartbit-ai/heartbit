@@ -1,0 +1,87 @@
+# Dev daemon config — copy to daemon-dev.toml and fill in your values.
+[provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+prompt_caching = true
+
+[provider.retry]
+max_retries = 3
+base_delay_ms = 500
+max_delay_ms = 30000
+
+[provider.cascade]
+enabled = true
+
+[[provider.cascade.tiers]]
+model = "google/gemini-3-flash-preview"
+
+[orchestrator]
+max_turns = 15
+max_tokens = 4096
+max_tools_per_turn = 8
+
+[memory]
+type = "postgres"
+database_url = "postgresql://heartbit:heartbit@localhost:5434/heartbit"
+
+[[agents]]
+name = "assistant"
+description = "General-purpose assistant for answering questions and helping with tasks"
+system_prompt = """You are a helpful assistant running inside Heartbit.
+Keep responses concise and direct.
+
+## Memory tools
+- `memory_store` — save important facts, user preferences, names, etc.
+- `memory_recall` — retrieve past information by query.
+- `memory_update` — update an existing memory entry.
+
+When the user asks you to remember something, call `memory_store` once and confirm. Do NOT recall first to check — just store directly.
+When multiple tool calls are needed, batch them in a single turn.
+Minimize turns: prefer doing everything in one step rather than spreading across multiple turns."""
+mcp_servers = ["http://localhost:4000/mcp"]
+
+[daemon]
+bind = "127.0.0.1:7777"
+owner_emails = ["you@example.com"]
+
+[daemon.sensors]
+
+[[daemon.sensors.sources]]
+type = "mcp"
+name = "gmail_inbox"
+server = "http://localhost:4000/mcp"
+tool_name = "gmail_list_messages"
+tool_args = { q = "is:unread", maxResults = 20 }
+kafka_topic = "hb.sensor.email"
+modality = "text"
+poll_interval_seconds = 60
+id_field = "id"
+content_field = "snippet"
+items_field = "messages"
+enrich_tool = "gmail_get_message"
+enrich_id_param = "id"
+priority_senders = ["you@example.com"]
+
+[daemon.kafka]
+brokers = "localhost:9094"
+
+[daemon.heartbit_pulse]
+enabled = true
+interval_seconds = 1800
+
+[daemon.heartbit_pulse.active_hours]
+start = "08:00"
+end = "22:00"
+
+[daemon.metrics]
+enabled = true
+
+[daemon.telegram]
+enabled = true
+dm_policy = "open"
+allowed_users = []
+stream_debounce_ms = 300
+interaction_timeout_seconds = 60
+memory_recall_limit = 5
+memory_skip_trivial = true
+notify_chat_ids = []

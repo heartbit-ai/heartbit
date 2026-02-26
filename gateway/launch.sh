@@ -11,7 +11,7 @@
 #   1. Starts agentgateway in the background (port 3000)
 #   2. Waits until the MCP endpoint is ready
 #   3. Sets HEARTBIT_MCP_SERVERS=http://localhost:3000/mcp
-#   4. Runs heartbit-cli with all arguments passed through
+#   4. Runs heartbit with all arguments passed through
 #   5. Stops agentgateway on exit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -55,19 +55,19 @@ fi
 
 HEARTBIT="${HEARTBIT_BIN:-}"
 if [ -z "$HEARTBIT" ]; then
-    if [ -x "$ROOT_DIR/target/release/heartbit-cli" ]; then
-        HEARTBIT="$ROOT_DIR/target/release/heartbit-cli"
-    elif [ -x "$ROOT_DIR/target/debug/heartbit-cli" ]; then
-        HEARTBIT="$ROOT_DIR/target/debug/heartbit-cli"
+    if [ -x "$ROOT_DIR/target/release/heartbit" ]; then
+        HEARTBIT="$ROOT_DIR/target/release/heartbit"
+    elif [ -x "$ROOT_DIR/target/debug/heartbit" ]; then
+        HEARTBIT="$ROOT_DIR/target/debug/heartbit"
     else
-        bold "No heartbit-cli binary found, building..."
+        bold "No heartbit binary found, building..."
         (cd "$ROOT_DIR" && cargo build --release 2>&1) || { red "Build failed"; exit 1; }
-        HEARTBIT="$ROOT_DIR/target/release/heartbit-cli"
+        HEARTBIT="$ROOT_DIR/target/release/heartbit"
     fi
 fi
 
 if [ $# -eq 0 ]; then
-    red "Usage: ./gateway/launch.sh [heartbit-cli args...]"
+    red "Usage: ./gateway/launch.sh [heartbit args...]"
     red ""
     red "Examples:"
     red "  ./gateway/launch.sh \"List files in /workspace\""
@@ -117,7 +117,7 @@ fi
 # ─── Run heartbit ──────────────────────────────────────────
 
 export HEARTBIT_MCP_SERVERS="http://localhost:$AG_PORT/mcp"
-bold "Running: heartbit-cli $*"
+bold "Running: heartbit $*"
 bold "MCP endpoint: $HEARTBIT_MCP_SERVERS"
 echo "" >&2
 

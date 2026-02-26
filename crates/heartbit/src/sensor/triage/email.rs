@@ -513,8 +513,8 @@ mod tests {
     #[test]
     fn extract_email_name_angle_bracket() {
         assert_eq!(
-            extract_email("Pascal Le Clech <pascal@leclech.fr>"),
-            "pascal@leclech.fr"
+            extract_email("Alice Example <alice@example.com>"),
+            "alice@example.com"
         );
     }
 
@@ -837,14 +837,14 @@ mod tests {
         // Gmail From header: "Name <email>" format — extract_email should parse it
         let processor = EmailTriageProcessor::new(
             Arc::new(MockProvider::with_json(&no_action_slm_json())),
-            vec!["pascal@leclech.fr".into()],
+            vec!["alice@example.com".into()],
             vec![],
         );
 
         let event = make_event(
             "Salut, peux tu envoyer un message ?",
             Some(serde_json::json!({
-                "from": "Pascal Le Clech <pascal@leclech.fr>",
+                "from": "Alice Example <alice@example.com>",
                 "subject": "Salut"
             })),
         );
@@ -861,10 +861,7 @@ mod tests {
         {
             assert!(*priority >= Priority::High);
             // sender in decision retains full name
-            assert_eq!(
-                sender.as_deref(),
-                Some("Pascal Le Clech <pascal@leclech.fr>")
-            );
+            assert_eq!(sender.as_deref(), Some("Alice Example <alice@example.com>"));
         }
     }
 

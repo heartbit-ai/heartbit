@@ -15,6 +15,7 @@ use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
 use crate::config::DaemonConfig;
 
+use super::notify::{OnTaskComplete, TaskOutcome};
 use super::store::TaskStore;
 use super::types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 
@@ -184,7 +185,15 @@ impl DaemonCore {
     /// `build_runner` is called for each submitted task. It receives the task ID,
     /// task text, source tag, optional story ID, optional trust level, and an
     /// event callback, and returns a future that produces the agent output.
-    pub async fn run<F, Fut>(mut self, build_runner: F) -> Result<(), Error>
+    ///
+    /// `on_complete` is an optional callback fired when any task reaches a
+    /// terminal state (Completed, Failed, Cancelled). Used for proactive
+    /// notifications (e.g. Telegram).
+    pub async fn run<F, Fut>(
+        mut self,
+        build_runner: F,
+        on_complete: Option<Arc<OnTaskComplete>>,
+    ) -> Result<(), Error>
     where
         F: Fn(
                 uuid::Uuid,
@@ -279,6 +288,7 @@ impl DaemonCore {
                             let channels = self.event_channels.clone();
                             let task_cancels = self.task_cancels.clone();
                             let build_runner = build_runner.clone();
+                            let on_complete = on_complete.clone();
 
                             self.active_tasks.spawn(async move {
                                 store
@@ -288,30 +298,60 @@ impl DaemonCore {
                                     })
                                     .ok();
 
-                                let runner = build_runner(id, task, source, story_id, trust_level, on_event);
+                                let start = std::time::Instant::now();
+                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event);
                                 tokio::select! {
                                     result = runner => {
+                                        let duration_secs = start.elapsed().as_secs_f64();
                                         match result {
                                             Ok(output) => {
+                                                let tokens = output.tokens_used;
+                                                let cost = output.estimated_cost_usd;
+                                                let result_text = output.result.clone();
                                                 store
                                                     .update(id, &|t| {
                                                         t.state = TaskState::Completed;
                                                         t.completed_at = Some(Utc::now());
-                                                        t.result = Some(output.result.clone());
-                                                        t.tokens_used = output.tokens_used;
+                                                        t.result = Some(result_text.clone());
+                                                        t.tokens_used = tokens;
                                                         t.tool_calls_made = output.tool_calls_made;
-                                                        t.estimated_cost_usd = output.estimated_cost_usd;
+                                                        t.estimated_cost_usd = cost;
                                                     })
                                                     .ok();
+                                                if let Some(ref cb) = on_complete {
+                                                    cb(TaskOutcome {
+                                                        id,
+                                                        source: source.clone(),
+                                                        state: TaskState::Completed,
+                                                        result_summary: Some(result_text),
+                                                        error: None,
+                                                        duration_secs,
+                                                        tokens,
+                                                        cost,
+                                                    });
+                                                }
                                             }
                                             Err(e) => {
+                                                let error_str = e.to_string();
                                                 store
                                                     .update(id, &|t| {
                                                         t.state = TaskState::Failed;
                                                         t.completed_at = Some(Utc::now());
-                                                        t.error = Some(e.to_string());
+                                                        t.error = Some(error_str.clone());
                                                     })
                                                     .ok();
+                                                if let Some(ref cb) = on_complete {
+                                                    cb(TaskOutcome {
+                                                        id,
+                                                        source: source.clone(),
+                                                        state: TaskState::Failed,
+                                                        result_summary: None,
+                                                        error: Some(error_str),
+                                                        duration_secs,
+                                                        tokens: Default::default(),
+                                                        cost: None,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -322,6 +362,18 @@ impl DaemonCore {
                                                 t.completed_at = Some(Utc::now());
                                             })
                                             .ok();
+                                        if let Some(ref cb) = on_complete {
+                                            cb(TaskOutcome {
+                                                id,
+                                                source: source.clone(),
+                                                state: TaskState::Cancelled,
+                                                result_summary: None,
+                                                error: None,
+                                                duration_secs: start.elapsed().as_secs_f64(),
+                                                tokens: Default::default(),
+                                                cost: None,
+                                            });
+                                        }
                                     }
                                 }
 

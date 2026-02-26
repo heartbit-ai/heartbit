@@ -26,6 +26,10 @@ pub struct HeartbitPulseScheduler {
     custom_prompt: Option<String>,
     active_hours: Option<crate::config::ActiveHoursConfig>,
     idle_backoff_threshold: u32,
+    /// Names of active sensor sources (e.g., "gmail_inbox") whose data feeds
+    /// are already handled by the sensor pipeline. The pulse prompt includes
+    /// these so the agent avoids duplicating their work.
+    active_sensors: Vec<String>,
 }
 
 impl std::fmt::Debug for HeartbitPulseScheduler {
@@ -69,7 +73,14 @@ impl HeartbitPulseScheduler {
             custom_prompt: config.prompt.clone(),
             active_hours: config.active_hours.clone(),
             idle_backoff_threshold: config.idle_backoff_threshold,
+            active_sensors: Vec::new(),
         })
+    }
+
+    /// Set the names of active sensor sources so the pulse prompt tells the
+    /// agent not to duplicate data feeds already handled by the sensor pipeline.
+    pub fn set_active_sensors(&mut self, sensors: Vec<String>) {
+        self.active_sensors = sensors;
     }
 
     /// Get a reference to the backing todo store (for injecting into tools).
@@ -268,6 +279,17 @@ impl HeartbitPulseScheduler {
             prompt.push('\n');
         }
 
+        if !self.active_sensors.is_empty() {
+            prompt.push_str("## Active Sensors (do NOT duplicate)\n\
+                             The following data sources are already monitored by the sensor pipeline.\n\
+                             Do NOT call their underlying tools directly — new items are automatically\n\
+                             triaged and appear as tasks in your todo list.\n");
+            for sensor in &self.active_sensors {
+                prompt.push_str(&format!("- {sensor}\n"));
+            }
+            prompt.push('\n');
+        }
+
         prompt.push_str(
             "## Instructions\n\
              1. Review the todo list. Pick the highest-priority actionable task.\n\
@@ -318,6 +340,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let prompt = scheduler.assemble_prompt(&None);
@@ -343,12 +366,64 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let md = Some("- Always check RSS feeds first\n- Report daily".into());
         let prompt = scheduler.assemble_prompt(&md);
         assert!(prompt.contains("Standing Orders"));
         assert!(prompt.contains("Always check RSS feeds first"));
+    }
+
+    #[test]
+    fn assemble_prompt_with_active_sensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        store
+            .add(super::super::todo::TodoEntry::new("Task 1", "user"))
+            .unwrap();
+
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1800),
+            todo_store: store,
+            producer: mock_producer_only(),
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec!["gmail_inbox".into(), "calendar_events".into()],
+        };
+
+        let prompt = scheduler.assemble_prompt(&None);
+        assert!(prompt.contains("Active Sensors (do NOT duplicate)"));
+        assert!(prompt.contains("- gmail_inbox"));
+        assert!(prompt.contains("- calendar_events"));
+        assert!(prompt.contains("Do NOT call their underlying tools directly"));
+    }
+
+    #[test]
+    fn assemble_prompt_no_active_sensors_omits_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileTodoStore::new(dir.path()).unwrap());
+        store
+            .add(super::super::todo::TodoEntry::new("Task 1", "user"))
+            .unwrap();
+
+        let scheduler = HeartbitPulseScheduler {
+            interval: Duration::from_secs(1800),
+            todo_store: store,
+            producer: mock_producer_only(),
+            commands_topic: "test.commands".into(),
+            workspace: dir.path().to_path_buf(),
+            custom_prompt: None,
+            active_hours: None,
+            idle_backoff_threshold: 6,
+            active_sensors: vec![],
+        };
+
+        let prompt = scheduler.assemble_prompt(&None);
+        assert!(!prompt.contains("Active Sensors"));
     }
 
     #[test]
@@ -365,6 +440,7 @@ mod tests {
             custom_prompt: Some("Custom pulse prompt".into()),
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let prompt = scheduler.assemble_prompt(&None);
@@ -385,6 +461,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         assert!(scheduler.read_heartbit_md().is_none());
@@ -409,6 +486,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let md = scheduler.read_heartbit_md().unwrap();
@@ -429,6 +507,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         // No active_hours = always active
@@ -589,6 +668,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let mut interval = Duration::from_secs(1800);
@@ -608,6 +688,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let mut interval = Duration::from_secs(1800);
@@ -627,6 +708,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         // Already at 2x, backoff should cap at 4x (7200)
@@ -651,6 +733,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 0, // disabled
+            active_sensors: vec![],
         };
 
         let mut interval = Duration::from_secs(1800);
@@ -703,6 +786,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let cancel = CancellationToken::new();
@@ -748,6 +832,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let cancel = CancellationToken::new();
@@ -782,6 +867,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 2, // backoff after 2 consecutive idle
+            active_sensors: vec![],
         };
 
         let cancel = CancellationToken::new();
@@ -823,6 +909,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 6,
+            active_sensors: vec![],
         };
 
         let cancel = CancellationToken::new();
@@ -860,6 +947,7 @@ mod tests {
             custom_prompt: None,
             active_hours: None,
             idle_backoff_threshold: 1, // backoff after 1 idle tick
+            active_sensors: vec![],
         };
 
         let cancel = CancellationToken::new();

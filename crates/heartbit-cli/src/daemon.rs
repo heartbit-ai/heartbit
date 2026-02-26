@@ -676,13 +676,23 @@ pub async fn run_daemon(
         let ws_root = crate::workspace_root_from_config(&config);
         let ws = heartbit::Workspace::open(&ws_root)
             .context("failed to open workspace for heartbit pulse")?;
-        let pulse = HeartbitPulseScheduler::new(
+        let mut pulse = HeartbitPulseScheduler::new(
             pulse_config,
             ws.root(),
             Arc::new(KafkaCommandProducer::new(producer.clone())),
             &daemon_config.kafka.commands_topic,
         )
         .context("failed to create heartbit pulse scheduler")?;
+        // Tell the pulse which data sources are already monitored by the
+        // sensor pipeline so it instructs the agent not to duplicate them.
+        if let Some(ref sensors) = daemon_config.sensors {
+            let names: Vec<String> = sensors
+                .sources
+                .iter()
+                .map(|s| s.name().to_string())
+                .collect();
+            pulse.set_active_sensors(names);
+        }
         let store = pulse.todo_store().clone();
         let pulse_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -1285,9 +1295,67 @@ pub async fn run_daemon(
             .ok();
     });
 
+    // Build on_complete callback for proactive Telegram notifications
+    let on_complete: Option<Arc<heartbit::OnTaskComplete>> = {
+        let notify_chat_ids = daemon_config
+            .telegram
+            .as_ref()
+            .map(|tg| tg.notify_chat_ids.clone())
+            .unwrap_or_default();
+
+        if !notify_chat_ids.is_empty() {
+            let token = daemon_config
+                .telegram
+                .as_ref()
+                .and_then(|tg| tg.token.clone())
+                .or_else(|| std::env::var("HEARTBIT_TELEGRAM_TOKEN").ok());
+
+            if let Some(token) = token {
+                let bot = teloxide::Bot::new(&token);
+                let chat_ids: Arc<[i64]> = notify_chat_ids.into();
+                Some(Arc::new(move |outcome: heartbit::TaskOutcome| {
+                    // Skip sources that already have inline feedback
+                    if outcome.source == "telegram" || outcome.source.starts_with("ws") {
+                        return;
+                    }
+                    let bot = bot.clone();
+                    let chat_ids = chat_ids.clone();
+                    let md = heartbit::format_notification(&outcome);
+                    let msg = heartbit::markdown_to_telegram_html(&md);
+                    tokio::spawn(async move {
+                        use teloxide::prelude::*;
+                        use teloxide::types::{ChatId, ParseMode};
+                        for &chat_id in chat_ids.iter() {
+                            let result = bot
+                                .send_message(ChatId(chat_id), &msg)
+                                .parse_mode(ParseMode::Html)
+                                .await;
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    chat_id,
+                                    error = %e,
+                                    "failed to send task notification to Telegram"
+                                );
+                            }
+                        }
+                    });
+                }))
+            } else {
+                tracing::warn!(
+                    "notify_chat_ids configured but no Telegram token available; notifications disabled"
+                );
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     // Run the DaemonCore consumer loop (blocks until cancellation)
     tracing::info!("daemon core started, consuming from Kafka");
-    core.run(build_runner).await.context("daemon core error")?;
+    core.run(build_runner, on_complete)
+        .await
+        .context("daemon core error")?;
 
     tracing::info!("daemon shut down gracefully");
     Ok(())

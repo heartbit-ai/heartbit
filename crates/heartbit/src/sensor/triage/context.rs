@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn resolve_owner() {
         let trust = TrustLevel::resolve(
-            Some("pascal@heartbit.ai"),
-            &["pascal@heartbit.ai".into()],
+            Some("owner@example.com"),
+            &["owner@example.com".into()],
             &[],
             &[],
         );
@@ -469,10 +469,10 @@ mod tests {
     #[test]
     fn owner_trumps_blocked() {
         let trust = TrustLevel::resolve(
-            Some("pascal@heartbit.ai"),
-            &["pascal@heartbit.ai".into()],
+            Some("owner@example.com"),
+            &["owner@example.com".into()],
             &[],
-            &["pascal@heartbit.ai".into()],
+            &["owner@example.com".into()],
         );
         assert_eq!(trust, TrustLevel::Owner);
     }
@@ -480,8 +480,8 @@ mod tests {
     #[test]
     fn resolve_case_insensitive() {
         let trust = TrustLevel::resolve(
-            Some("Pascal@Heartbit.AI"),
-            &["pascal@heartbit.ai".into()],
+            Some("Owner@Example.COM"),
+            &["owner@example.com".into()],
             &[],
             &[],
         );
@@ -585,8 +585,8 @@ mod tests {
     #[test]
     fn resolve_trims_sender_whitespace() {
         let trust = TrustLevel::resolve(
-            Some("  pascal@heartbit.ai  "),
-            &["pascal@heartbit.ai".into()],
+            Some("  owner@example.com  "),
+            &["owner@example.com".into()],
             &[],
             &[],
         );
@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn resolve_trims_list_entry_whitespace() {
         let trust = TrustLevel::resolve(
-            Some("pascal@heartbit.ai"),
-            &["  pascal@heartbit.ai  ".into()],
+            Some("owner@example.com"),
+            &["  owner@example.com  ".into()],
             &[],
             &[],
         );
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn resolve_empty_sender_is_unknown() {
-        let trust = TrustLevel::resolve(Some("   "), &["pascal@heartbit.ai".into()], &[], &[]);
+        let trust = TrustLevel::resolve(Some("   "), &["owner@example.com".into()], &[], &[]);
         assert_eq!(trust, TrustLevel::Unknown);
     }
 }

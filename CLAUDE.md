@@ -37,7 +37,7 @@ All three must pass. No warnings allowed.
 - **Simplicity first**: every change as simple as possible, touch only what's necessary.
 
 ### Architecture
-- 3 crates: `heartbit` (lib), `heartbit-cli` (bin), `heartbit-cockpit` (Slint desktop GUI).
+- 2 crates: `heartbit` (lib), `heartbit-cli` (bin).
 - Flat agent hierarchy: orchestrator spawns sub-agents, sub-agents do NOT spawn.
 - Three execution paths: standalone (`AgentRunner` + `tokio::JoinSet`), durable (`Restate SDK 0.8`), daemon (Kafka-backed).
 - `tokio::JoinSet` for parallel tool execution and sub-agent dispatch (standalone path).

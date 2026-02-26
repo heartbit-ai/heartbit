@@ -1,0 +1,40 @@
+# Telegram test config — copy to telegram-test.toml and fill in your values.
+[provider]
+name = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[provider.retry]
+max_retries = 3
+base_delay_ms = 500
+max_delay_ms = 30000
+
+[orchestrator]
+max_turns = 15
+max_tokens = 4096
+
+[memory]
+type = "postgres"
+database_url = "postgresql://heartbit:heartbit@localhost:5432/heartbit"
+
+[[agents]]
+name = "assistant"
+description = "General-purpose assistant for answering questions and helping with tasks"
+system_prompt = """You are a helpful assistant running inside a Telegram bot.
+Keep responses concise (under 2000 chars) since you're chatting on mobile.
+Be friendly and direct. You have access to memory tools - use store_memory to remember things the user tells you, and recall_memories to retrieve past information.
+You also have access to MCP tools via agentgateway - use them to search the web, read files, interact with git, and more."""
+mcp_servers = ["http://localhost:4000/mcp"]
+
+[daemon]
+bind = "127.0.0.1:7778"
+max_concurrent_tasks = 4
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.telegram]
+enabled = true
+dm_policy = "open"
+allowed_users = []
+stream_debounce_ms = 300
+interaction_timeout_seconds = 60

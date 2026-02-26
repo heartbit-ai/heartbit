@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# Smoke tests for `heartbit-cli daemon`
+# Smoke tests for `heartbit daemon`
 #
 # These are NOT CI tests. They require:
 #   1. Running Kafka broker (docker compose up kafka -d)
 #   2. OPENROUTER_API_KEY or ANTHROPIC_API_KEY set
-#   3. target/release/heartbit-cli built
+#   3. target/release/heartbit built
 #
 # Design rules:
 #   1. Assert on HTTP responses and task state transitions.
@@ -18,7 +18,7 @@
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
-BINARY="$(cd "$(dirname "$0")/.." && pwd)/target/release/heartbit-cli"
+BINARY="$(cd "$(dirname "$0")/.." && pwd)/target/release/heartbit"
 WORKDIR="$(mktemp -d)"
 PASS=0
 FAIL=0

@@ -14,13 +14,13 @@
 #   3. Each test retries up to $MAX_RETRIES times before failing.
 #   4. Tests can be run individually: ./advanced_e2e.sh 3   (runs only test 3)
 #
-# Requires: OPENROUTER_API_KEY, target/release/heartbit-cli
+# Requires: OPENROUTER_API_KEY, target/release/heartbit
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$ROOT_DIR/target/release/heartbit-cli"
+BINARY="$ROOT_DIR/target/release/heartbit"
 WORKDIR="$(mktemp -d)"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 PASS=0

@@ -987,7 +987,14 @@ pub enum SensorSourceConfig {
         /// Parameter name for the item ID when calling the enrichment tool (default: `"id"`).
         #[serde(default)]
         enrich_id_param: Option<String>,
+        /// Dedup TTL in seconds. Seen IDs older than this are evicted. Default: 7 days.
+        #[serde(default = "default_dedup_ttl_seconds")]
+        dedup_ttl_seconds: u64,
     },
+}
+
+fn default_dedup_ttl_seconds() -> u64 {
+    7 * 24 * 3600 // 7 days
 }
 
 impl SensorSourceConfig {
@@ -5249,6 +5256,7 @@ brokers = "localhost:9092"
                 blocked_senders,
                 enrich_tool,
                 enrich_id_param,
+                dedup_ttl_seconds,
             } => {
                 assert_eq!(name, "gmail_inbox");
                 assert_eq!(server.url(), "http://localhost:3000/mcp");
@@ -5264,6 +5272,7 @@ brokers = "localhost:9092"
                 assert_eq!(priority_senders, &["boss@company.com"]);
                 assert_eq!(blocked_senders, &["spam@marketing.com"]);
                 assert!(enrich_tool.is_none());
+                assert_eq!(*dedup_ttl_seconds, 7 * 24 * 3600, "default dedup TTL");
                 assert!(enrich_id_param.is_none());
             }
             other => panic!("expected Mcp variant, got {other:?}"),

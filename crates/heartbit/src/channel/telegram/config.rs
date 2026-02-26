@@ -95,6 +95,11 @@ pub struct TelegramConfig {
     /// (< 20 chars, no question mark). Saves tokens on greetings. Defaults to false.
     #[serde(default)]
     pub memory_skip_trivial: bool,
+
+    /// Chat IDs to receive proactive notifications for background tasks
+    /// (sensor, cron, heartbeat pulse). Empty = no notifications.
+    #[serde(default)]
+    pub notify_chat_ids: Vec<i64>,
 }
 
 impl Default for TelegramConfig {
@@ -112,6 +117,7 @@ impl Default for TelegramConfig {
             database_url: None,
             memory_recall_limit: default_memory_recall_limit(),
             memory_skip_trivial: false,
+            notify_chat_ids: Vec::new(),
         }
     }
 }
@@ -154,6 +160,7 @@ mod tests {
         assert!(config.database_url.is_none());
         assert_eq!(config.memory_recall_limit, 5);
         assert!(!config.memory_skip_trivial);
+        assert!(config.notify_chat_ids.is_empty());
     }
 
     #[test]
@@ -171,6 +178,7 @@ stream_debounce_ms = 250
 database_url = "postgres://localhost/heartbit"
 memory_recall_limit = 3
 memory_skip_trivial = true
+notify_chat_ids = [111, 222]
 "#;
         let config: TelegramConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
@@ -188,6 +196,7 @@ memory_skip_trivial = true
         );
         assert_eq!(config.memory_recall_limit, 3);
         assert!(config.memory_skip_trivial);
+        assert_eq!(config.notify_chat_ids, vec![111, 222]);
     }
 
     #[test]
@@ -214,5 +223,31 @@ dm_policy = "disabled"
     fn dm_policy_invalid_value() {
         let result: Result<DmPolicy, _> = serde_json::from_str("\"invalid\"");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn notify_chat_ids_default_empty() {
+        let config = TelegramConfig::default();
+        assert!(config.notify_chat_ids.is_empty());
+    }
+
+    #[test]
+    fn notify_chat_ids_toml_roundtrip() {
+        let toml_str = r#"
+notify_chat_ids = [111, 222, 333]
+"#;
+        let config: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.notify_chat_ids, vec![111, 222, 333]);
+    }
+
+    #[test]
+    fn notify_chat_ids_backward_compat() {
+        // Old TOML without notify_chat_ids should deserialize with empty vec
+        let toml_str = r#"
+enabled = true
+dm_policy = "open"
+"#;
+        let config: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.notify_chat_ids.is_empty());
     }
 }

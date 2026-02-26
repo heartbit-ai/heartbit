@@ -26,7 +26,8 @@ pub use channel::{ChannelBridge, ConsolidateSession, MediaAttachment, RunTask, R
 pub use channel::telegram::{
     AccessControl as TelegramAccessControl, CallbackAction, ChatSessionMap, DmPolicy,
     RateLimiter as TelegramRateLimiter, StreamBuffer, TelegramAdapter, TelegramBridge,
-    TelegramConfig, approval_buttons, chunk_message, parse_callback_data, question_buttons,
+    TelegramConfig, approval_buttons, chunk_message, markdown_to_telegram_html,
+    parse_callback_data, question_buttons,
 };
 
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
@@ -62,7 +63,8 @@ pub use config::{
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
-    PostgresTaskStore, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
+    OnTaskComplete, PostgresTaskStore, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry,
+    TodoList, TodoManageTool, format_notification,
 };
 pub use error::Error;
 pub use knowledge::in_memory::InMemoryKnowledgeBase;

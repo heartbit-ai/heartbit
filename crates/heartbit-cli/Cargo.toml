@@ -1,7 +1,17 @@
 [package]
 name = "heartbit-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CLI for the Heartbit multi-agent runtime"
+keywords = ["agent", "llm", "cli", "mcp", "ai"]
+
+[[bin]]
+name = "heartbit"
+path = "src/main.rs"
 
 [dependencies]
 heartbit = { path = "../heartbit", features = ["telegram"] }

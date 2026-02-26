@@ -302,7 +302,7 @@ impl TelegramAdapter {
     ///
     /// Converts markdown to Telegram HTML, chunks for the 4096-char limit,
     /// and falls back to plain text if Telegram rejects the HTML.
-    async fn send_html(&self, chat_id: i64, text: &str) {
+    pub async fn send_html(&self, chat_id: i64, text: &str) {
         let html = markdown_to_telegram_html(text);
         let chunks = chunk_message(&html);
         let mut limiter = RateLimiter::new(1000);

@@ -4,3 +4,25 @@
 .env
 gateway/.ag_*.log
 docker-compose.override.yml
+
+# Logs
+*.log
+
+# Secrets / certificates (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+
+# Local dev configs (use *.example templates)
+daemon-dev.toml
+telegram-test.toml
+gateway/config.yaml
+
+# Scratch / test artifacts
+orchestrated.txt
+probe.txt
+summary.txt
+test3-hello.txt
+rust_version.txt

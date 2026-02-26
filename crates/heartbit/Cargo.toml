@@ -1,7 +1,14 @@
 [package]
 name = "heartbit"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Multi-agent runtime with LLM orchestration, MCP tools, and durable execution"
+keywords = ["agent", "llm", "mcp", "orchestration", "ai"]
+categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
 tokio = { workspace = true }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -205,6 +206,12 @@ impl SensorManager {
         Ok(())
     }
 
+    /// Default directory for sensor dedup state (`~/.heartbit/sensors`).
+    fn default_sensor_state_dir() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(format!("{home}/.heartbit/sensors"))
+    }
+
     /// Build sensor instances from config.
     fn build_sensors(&self) -> Vec<Box<dyn Sensor>> {
         let mut sensors: Vec<Box<dyn Sensor>> = Vec::new();
@@ -308,8 +315,10 @@ impl SensorManager {
                     items_field,
                     enrich_tool,
                     enrich_id_param,
+                    dedup_ttl_seconds,
                     ..
                 } => {
+                    let state_dir = Self::default_sensor_state_dir();
                     sensors.push(Box::new(McpSensor::new(
                         name.clone(),
                         (**server).clone(),
@@ -323,6 +332,8 @@ impl SensorManager {
                         items_field.clone(),
                         enrich_tool.clone(),
                         enrich_id_param.clone(),
+                        Duration::from_secs(*dedup_ttl_seconds),
+                        Some(state_dir),
                     )));
                 }
             }
@@ -1101,6 +1112,7 @@ mod tests {
                 blocked_senders: vec![],
                 enrich_tool: None,
                 enrich_id_param: None,
+                dedup_ttl_seconds: 604800,
             },
         ]);
 
@@ -1186,6 +1198,7 @@ mod tests {
             blocked_senders: vec![],
             enrich_tool: None,
             enrich_id_param: None,
+            dedup_ttl_seconds: 604800,
         }]);
 
         let sensors = manager.build_sensors();
@@ -1214,6 +1227,7 @@ mod tests {
             blocked_senders: vec!["spam@example.com".into()],
             enrich_tool: None,
             enrich_id_param: None,
+            dedup_ttl_seconds: 604800,
         }]);
 
         let processors = manager.build_triage_processors();
@@ -1297,6 +1311,7 @@ mod tests {
             blocked_senders: vec![],
             enrich_tool: None,
             enrich_id_param: None,
+            dedup_ttl_seconds: 604800,
         }]);
 
         let processors = manager.build_triage_processors();
