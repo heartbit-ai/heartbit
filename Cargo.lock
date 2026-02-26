@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit"
-version = "0.1.0"
+version = "2026.2.26"
 dependencies = [
  "a2a-sdk",
  "base64",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-cli"
-version = "0.1.0"
+version = "2026.2.26"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
