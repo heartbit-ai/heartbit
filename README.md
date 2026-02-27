@@ -11,7 +11,9 @@ Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that exec
 - **Three execution paths** — standalone (zero infra), durable (Restate), daemon (Kafka)
 - **Flat agent hierarchy** — orchestrator delegates to sub-agents, sub-agents never spawn further
 - **Parallel tool execution** — `tokio::JoinSet` runs tools concurrently within each turn
-- **Production-grade** — guardrails, context management, memory, cost tracking, OpenTelemetry
+- **Production-grade** — 8 guardrails, context management, MemGPT-style memory, cost tracking, OpenTelemetry
+- **Local-first embeddings** — offline semantic search via ONNX Runtime (fastembed), no API keys required
+- **Built-in eval framework** — trajectory scoring, keyword matching, and similarity scoring for agent behavior testing
 - **Built-in integrations** — Telegram bot, Google Workspace (JMAP email), RSS, webhooks, and more via sensor pipeline
 
 > **Not an OpenClaw fork or clone.** Heartbit is an independent project built from scratch. It shares no code, architecture, or lineage with [OpenClaw](https://github.com/anthropics/openclaw) or any other agent framework. Different design goals, different codebase.
@@ -338,7 +340,7 @@ crates/
         consolidation.rs       # ConsolidationPipeline (Jaccard clustering)
         pruning.rs             # Ebbinghaus strength decay + weak entry pruning
         namespaced.rs          # NamespacedMemory wrapper
-        embedding.rs           # Embedding support
+        embedding.rs           # EmbeddingProvider trait + OpenAI, Local (fastembed), Noop
         hybrid.rs              # Hybrid recall (BM25 + embedding)
         tools.rs               # 5 memory tools (store, recall, update, forget, consolidate)
         shared_tools.rs        # Shared memory for multi-agent
@@ -433,21 +435,83 @@ crates/
 
 > All paths are relative to `crates/heartbit/src/`.
 
+## Feature Flags
+
+The `heartbit` crate uses feature flags to keep the default build lightweight. Only `core` is enabled by default.
+
+| Feature | Dependencies | What it enables |
+|---------|-------------|-----------------|
+| `core` (default) | — | Agent runner, orchestrator, LLM providers, tools, memory, config |
+| `kafka` | `rdkafka` | Kafka consumer/producer |
+| `daemon` | kafka + `cron`, `prometheus` | Long-running daemon with HTTP API, cron scheduling, metrics |
+| `sensor` | daemon + `quick-xml`, `hmac`, `sha2`, `hex`, `subtle` | 7 sensor sources, triage pipeline, story correlation |
+| `restate` | `restate-sdk 0.8` | Durable workflow execution (services, workflows, virtual objects) |
+| `postgres` | `sqlx`, `pgvector` | PostgreSQL-backed memory store + task store with vector search |
+| `a2a` | `a2a-sdk` | Agent-to-Agent protocol (endpoint discovery, remote tool invocation) |
+| `telegram` | `teloxide` | Telegram bot (DMs, streaming, HITL approval, keyboard menus) |
+| `local-embedding` | `fastembed` | Local ONNX-based text embeddings (no API keys, offline) |
+| `full` | all of the above (except `local-embedding`) | Everything enabled — used by the CLI |
+
+```bash
+# Default build (core only — no Kafka, no Postgres, no Telegram)
+cargo build -p heartbit
+
+# Full CLI build
+cargo build -p heartbit-cli
+
+# With local embeddings
+cargo build --features local-embedding
+```
+
 ## Key Subsystems
 
 ### Memory
 
-MemGPT-inspired memory with composite recall scoring.
+MemGPT-inspired memory with composite recall scoring and hybrid retrieval.
 
-- **Storage**: `InMemoryStore` or `PostgresMemoryStore` (both implement `Memory` trait)
+- **Storage**: `InMemoryStore`, `PostgresMemoryStore` (pgvector), or `NamespacedMemory` (3-tier: user/agent/session)
 - **Memory types**: `Episodic` (default), `Semantic`, `Reflection`
+- **Confidentiality**: `Public`, `Internal`, `Confidential`, `Restricted` — controls visibility in LLM context
 - **Recall scoring**: BM25 keyword search (2x boost) + Park et al. composite (recency + importance + relevance + strength)
+- **Hybrid retrieval**: BM25 + vector cosine similarity fused via Reciprocal Rank Fusion (RRF)
 - **Ebbinghaus decay**: `effective_strength()` with decay rate of 0.005/hr (~6-day half-life); strength reinforced +0.2 on access
 - **Reflection**: `ReflectionTracker` triggers reflection prompts when cumulative importance exceeds threshold
 - **Consolidation**: `ConsolidationPipeline` clusters entries by Jaccard keyword similarity, merges into `Semantic` entries
 - **Pruning**: auto-prune weak memories at session end; configurable min strength + min age
+- **Session pruning**: `SessionPruneConfig` auto-trims old tool results before LLM calls
+- **Pre-compaction flush**: extracts tool results to episodic memory before context summarization
 
 5 agent-facing tools: `memory_store`, `memory_recall`, `memory_update`, `memory_forget`, `memory_consolidate`.
+
+#### Embedding Providers
+
+Embeddings enable hybrid retrieval (BM25 + vector cosine) for improved recall quality.
+
+| Provider | Config `provider =` | Requirements | Dimension |
+|----------|-------------------|--------------|-----------|
+| `NoopEmbedding` | `"none"` | None | 0 (BM25-only fallback) |
+| `OpenAiEmbedding` | `"openai"` | API key (`OPENAI_API_KEY`) | 1536 (small) / 3072 (large) |
+| `LocalEmbeddingProvider` | `"local"` | `local-embedding` feature flag | 384 (MiniLM) and others |
+
+**Local embeddings** run entirely offline via [fastembed](https://github.com/Anush008/fastembed-rs) (ONNX Runtime) — no API keys, no network, zero cost per query. Models are downloaded once on first use (~30MB).
+
+Supported local models: `all-MiniLM-L6-v2` (default), `all-MiniLM-L12-v2`, `BGE-small-en-v1.5`, `BGE-base-en-v1.5`, `BGE-large-en-v1.5`, `nomic-embed-text-v1`, `nomic-embed-text-v1.5` (plus quantized variants with `-q` suffix).
+
+```toml
+[memory]
+type = "postgres"
+database_url = "postgresql://localhost/heartbit"
+
+[memory.embedding]
+provider = "local"              # or "openai" or "none"
+model = "all-MiniLM-L6-v2"     # optional (this is the default for local)
+cache_dir = "/tmp/fastembed"    # optional model cache directory
+```
+
+Build with local embedding support:
+```bash
+cargo build --features local-embedding
+```
 
 ### Sensors
 
@@ -487,7 +551,20 @@ Four async hooks intercept the agent loop (standalone path only):
 | `pre_tool` | Before each tool call | `Allow` or `Deny { reason }` |
 | `post_tool` | After each tool call | Inspect or modify `ToolOutput` |
 
-Registered as `Vec<Arc<dyn Guardrail>>` — first `Deny` wins. Built-in guardrails: `ContentFence`, `SensorSecurity`.
+Registered as `Vec<Arc<dyn Guardrail>>` — first `Deny` wins.
+
+Built-in guardrails:
+
+| Guardrail | What it does |
+|-----------|-------------|
+| `ContentFenceGuardrail` | Block/allow based on content patterns |
+| `InjectionClassifierGuardrail` | Detect prompt injection attempts (warn or deny mode) |
+| `PiiGuardrail` | Detect PII (email, phone, SSN, credit card) — redact, warn, or deny |
+| `ToolPolicyGuardrail` | Per-tool allow/deny rules with input constraints (patterns, max length) |
+| `LlmJudgeGuardrail` | Safety evaluation via a cheap judge model (fail-open on timeout) |
+| `SensorSecurityGuardrail` | Sensor-specific security rules |
+| `ConditionalGuardrail` | Apply guardrails conditionally based on agent/context |
+| `GuardrailChain` | Compose multiple guardrails; `WarnToDeny` escalates warnings |
 
 ### Context Management
 
@@ -510,6 +587,55 @@ Document retrieval for agent RAG:
 - Loaders: file, glob, URL (with HTML tag stripping)
 - FNV-1a hash for deterministic chunk IDs
 - Agent gets a `knowledge_search` tool (standalone path only)
+
+### Workflow Agents (Deterministic Orchestration)
+
+Three workflow agent types provide deterministic pipelines without LLM cost:
+
+| Agent | What it does |
+|-------|-------------|
+| `SequentialAgent` | Chains agents: output of one becomes input of the next |
+| `ParallelAgent` | Runs agents concurrently via `tokio::JoinSet`, merges results |
+| `LoopAgent` | Repeats an agent until `should_stop(text)` returns true or max iterations |
+
+All return `AgentOutput` with accumulated `TokenUsage`. Builder pattern: `.agent()`, `.agents()`, `.max_iterations()`, `.should_stop()`.
+
+```rust
+use heartbit::{SequentialAgent, ParallelAgent, LoopAgent};
+
+// Pipeline: researcher → writer → reviewer
+let pipeline = SequentialAgent::builder()
+    .agent(researcher)
+    .agent(writer)
+    .agent(reviewer)
+    .build()?;
+let output = pipeline.run("Analyze Rust ecosystem").await?;
+```
+
+### Eval Framework
+
+Built-in evaluation framework for testing agent behavior:
+
+```rust
+use heartbit::{EvalCase, EvalRunner, TrajectoryScorer, KeywordScorer};
+
+let case = EvalCase::new("research-task", "Find info about Rust")
+    .expect_tool("websearch")
+    .expect_output_contains("Rust")
+    .reference_output("Rust is a systems programming language");
+
+let runner = EvalRunner::new(vec![case])
+    .scorer(TrajectoryScorer)    // tool call sequence matching
+    .scorer(KeywordScorer)       // output keyword checking
+    .scorer(SimilarityScorer);   // cosine similarity to reference
+
+let summary = runner.run(agent).await?;
+println!("Pass rate: {:.0}%", summary.pass_rate * 100.0);
+```
+
+### Audit Trail
+
+`AuditTrail` logs agent decisions, tool calls, and guardrail outcomes. `InMemoryAuditTrail` for development, `PostgresAuditTrail` for production persistence.
 
 ### Durable Execution (Restate)
 
@@ -561,10 +687,24 @@ max_retries = 3
 base_delay_ms = 500
 max_delay_ms = 30000
 
+[provider.cascade]                    # optional: try cheaper models first
+enabled = true
+[[provider.cascade.tiers]]
+model = "anthropic/claude-3.5-haiku"  # cheapest tier tried first
+[provider.cascade.gate]
+type = "heuristic"                    # escalate if response is low-quality
+min_output_tokens = 10                # escalate on very short responses
+accept_tool_calls = false             # escalate if cheap model wants to use tools
+escalate_on_max_tokens = false        # escalate on max_tokens stop reason
+
 [orchestrator]
 max_turns = 10
 max_tokens = 4096
 run_timeout_seconds = 300             # wall-clock deadline for the entire run
+routing = "auto"                      # "auto", "always_orchestrate", or "single_agent"
+dispatch_mode = "parallel"            # "parallel" or "sequential" (sub-agent dispatch)
+reasoning_effort = "high"             # "high", "medium", "low", or "none"
+tool_profile = "standard"             # "conversational", "standard", or "full"
 
 [[agents]]
 name = "researcher"
@@ -579,9 +719,16 @@ tool_timeout_seconds = 60
 max_tool_output_bytes = 16384
 run_timeout_seconds = 120             # per-agent wall-clock deadline
 summarize_threshold = 80000
+reasoning_effort = "medium"           # per-agent override
+tool_profile = "full"                 # per-agent override
 context_strategy = { type = "sliding_window", max_tokens = 100000 }
 # context_strategy = { type = "summarize", threshold = 80000 }
 # context_strategy = { type = "unlimited" }
+
+[agents.session_prune]                # optional: trim old tool results before LLM calls
+keep_recent_n = 2                     # keep N most recent message pairs at full fidelity
+pruned_tool_result_max_bytes = 200    # truncate older tool results to this size
+preserve_task = true                  # keep the first user message (task) intact
 
 # MCP server with authentication (alternative to bare URL)
 # mcp_servers = [{ url = "http://localhost:8000/mcp", auth_header = "Bearer tok_xxx" }]
@@ -608,6 +755,12 @@ system_prompt = "You are a writing specialist."
 # Optional sections
 [memory]
 type = "in_memory"                    # or: type = "postgres", database_url = "..."
+
+[memory.embedding]                    # optional: enables hybrid retrieval (BM25 + vector)
+provider = "local"                    # "openai", "local", or "none" (default)
+model = "all-MiniLM-L6-v2"           # model name (provider-specific)
+cache_dir = "/tmp/fastembed"          # local provider only: model cache directory
+# api_key_env = "OPENAI_API_KEY"     # openai provider only
 
 [knowledge]
 chunk_size = 1000                     # max bytes per chunk (default: 1000)
@@ -664,6 +817,22 @@ When running without a config file, the CLI reads these environment variables:
 | `HEARTBIT_MAX_TOOL_OUTPUT_BYTES` | `32768` | Max bytes per tool output before truncation |
 | `HEARTBIT_TOOL_TIMEOUT` | `120` | Tool execution timeout in seconds |
 | `HEARTBIT_MCP_SERVERS` | — | Comma-separated MCP server URLs |
+| `HEARTBIT_A2A_AGENTS` | — | Comma-separated A2A agent URLs |
+| `HEARTBIT_REASONING_EFFORT` | — | Reasoning effort level (`high`, `medium`, `low`, `none`) |
+| `HEARTBIT_ENABLE_REFLECTION` | `false` | Enable reflective reasoning (`1` or `true`) |
+| `HEARTBIT_COMPRESSION_THRESHOLD` | — | Token threshold for context compression |
+| `HEARTBIT_MAX_TOOLS_PER_TURN` | — | Max tool calls per turn |
+| `HEARTBIT_TOOL_PROFILE` | — | Tool pre-filtering (`conversational`, `standard`, `full`) |
+| `HEARTBIT_MAX_IDENTICAL_TOOL_CALLS` | — | Doom loop detection threshold |
+| `HEARTBIT_SESSION_PRUNE` | `false` | Enable session pruning of old tool results (`1` or `true`) |
+| `HEARTBIT_RECURSIVE_SUMMARIZATION` | `false` | Enable cluster-then-summarize for long conversations (`1` or `true`) |
+| `HEARTBIT_REFLECTION_THRESHOLD` | — | Cumulative importance threshold to trigger reflection |
+| `HEARTBIT_CONSOLIDATE_ON_EXIT` | `false` | Consolidate memories at session end (`1` or `true`) |
+| `HEARTBIT_MEMORY` | — | Memory backend (`in_memory` or a PostgreSQL URL) |
+| `HEARTBIT_LSP_ENABLED` | `false` | Enable LSP integration (`1` or `true`) |
+| `HEARTBIT_OBSERVABILITY` | `production` | Observability mode (`production`, `analysis`, `debug`, `off`) |
+| `HEARTBIT_TELEGRAM_TOKEN` | — | Telegram bot token (daemon mode) |
+| `HEARTBIT_API_KEY` | — | API key for daemon HTTP authentication |
 | `EXA_API_KEY` | — | Exa AI API key (for `websearch` built-in tool) |
 | `RUST_LOG` | — | Tracing filter (e.g. `info`, `debug`) |
 
@@ -1003,7 +1172,7 @@ npx -y supergateway \
 # Server at http://localhost:8000/mcp
 ```
 
-2374 tests. TDD mandatory — red/green/refactor for every feature.
+2665+ tests. TDD mandatory — red/green/refactor for every feature.
 
 ## Contributing
 

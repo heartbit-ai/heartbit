@@ -53,6 +53,9 @@ pub enum Error {
     #[error("Sensor error: {0}")]
     Sensor(String),
 
+    #[error("Token budget exceeded: used {used}, limit {limit}")]
+    BudgetExceeded { used: u64, limit: u64 },
+
     #[error("Channel error: {0}")]
     Channel(String),
 
@@ -237,6 +240,39 @@ mod tests {
             }
             other => panic!("expected WithPartialUsage, got: {other}"),
         }
+    }
+
+    #[test]
+    fn error_budget_exceeded_display_message() {
+        let err = Error::BudgetExceeded {
+            used: 150000,
+            limit: 100000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Token budget exceeded: used 150000, limit 100000"
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_with_partial_usage() {
+        let usage = TokenUsage {
+            input_tokens: 100000,
+            output_tokens: 50000,
+            ..Default::default()
+        };
+        let err = Error::BudgetExceeded {
+            used: 150000,
+            limit: 100000,
+        }
+        .with_partial_usage(usage);
+        assert_eq!(
+            err.to_string(),
+            "Token budget exceeded: used 150000, limit 100000"
+        );
+        let partial = err.partial_usage();
+        assert_eq!(partial.input_tokens, 100000);
+        assert_eq!(partial.output_tokens, 50000);
     }
 
     #[test]

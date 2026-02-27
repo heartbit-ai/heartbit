@@ -1,22 +1,33 @@
+// --- Core modules (always available) ---
 pub mod agent;
 pub mod channel;
 pub mod config;
-pub mod daemon;
 pub mod error;
+pub mod eval;
 pub mod knowledge;
 pub mod llm;
-pub mod lsp;
 pub mod memory;
-pub mod sensor;
 pub mod store;
 pub mod tool;
 pub(crate) mod util;
-pub mod workflow;
 pub mod workspace;
 
+pub mod lsp;
+
+// --- Feature-gated modules ---
+#[cfg(feature = "daemon")]
+pub mod daemon;
+#[cfg(feature = "sensor")]
+pub mod sensor;
+#[cfg(feature = "restate")]
+pub mod workflow;
+
+// --- Channel re-exports (always available — lightweight traits) ---
 pub use channel::bridge::{InteractionBridge, OutboundMessage};
+#[cfg(feature = "postgres")]
+pub use channel::session::PostgresSessionStore;
 pub use channel::session::{
-    InMemorySessionStore, PostgresSessionStore, Session, SessionMessage, SessionRole, SessionStore,
+    InMemorySessionStore, Session, SessionMessage, SessionRole, SessionStore,
     format_session_context,
 };
 pub use channel::types::WsFrame;
@@ -30,12 +41,20 @@ pub use channel::telegram::{
     parse_callback_data, question_buttons,
 };
 
+// --- Agent re-exports ---
+pub use agent::audit::{AuditRecord, AuditTrail, InMemoryAuditTrail};
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::context::ContextStrategy;
 pub use agent::events::{AgentEvent, OnEvent};
-pub use agent::guardrail::{GuardAction, Guardrail};
-pub use agent::guardrails::ContentFenceGuardrail;
+pub use agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+#[cfg(feature = "sensor")]
 pub use agent::guardrails::SensorSecurityGuardrail;
+pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
+pub use agent::guardrails::{
+    ConditionalGuardrail, ContentFenceGuardrail, GuardrailChain, GuardrailMode,
+    InjectionClassifierGuardrail, LlmJudgeGuardrail, LlmJudgeGuardrailBuilder, PiiAction,
+    PiiDetector, PiiGuardrail, ToolPolicyGuardrail, WarnToDeny,
+};
 pub use agent::instructions::{
     discover_instruction_files, load_instructions, prepend_instructions,
 };
@@ -46,29 +65,54 @@ pub use agent::permission::{
 };
 pub use agent::pruner::SessionPruneConfig;
 pub use agent::routing::{
-    AgentCapability, ComplexitySignals, RoutingDecision, RoutingMode, TaskComplexityAnalyzer,
-    resolve_routing_mode, should_escalate,
+    AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,
+    RoutingStrategy, TaskComplexityAnalyzer, resolve_routing_mode, should_escalate,
 };
 pub use agent::tool_filter::ToolProfile;
+pub use agent::workflow::{
+    LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
+    SequentialAgentBuilder,
+};
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
+
+// --- Config re-exports (always available — just data structs) ---
 pub use config::{
     ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, CascadeConfig,
     CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig, DispatchMode,
-    EmbeddingConfig, HeartbitConfig, HeartbitPulseConfig, KafkaConfig, KnowledgeConfig,
-    KnowledgeSourceConfig, LspConfig, McpServerEntry, MemoryConfig, MetricsConfig,
-    OrchestratorConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig,
+    EmbeddingConfig, GuardrailsConfig, HeartbitConfig, HeartbitPulseConfig, InjectionConfig,
+    InputConstraintConfig, KafkaConfig, KnowledgeConfig, KnowledgeSourceConfig, LspConfig,
+    McpServerEntry, MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig,
+    RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig, SensorModality,
     SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,
-    TokenBudgetConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
+    TokenBudgetConfig, ToolPolicyConfig, ToolPolicyRuleConfig, WorkspaceConfig, WsConfig,
+    parse_reasoning_effort, parse_tool_profile,
 };
+
+// --- Daemon re-exports (feature-gated) ---
+#[cfg(all(feature = "daemon", feature = "postgres"))]
+pub use daemon::PostgresTaskStore;
+#[cfg(feature = "daemon")]
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
-    OnTaskComplete, PostgresTaskStore, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry,
-    TodoList, TodoManageTool, format_notification,
+    OnTaskComplete, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
+    TodoManageTool, format_notification,
 };
+
+// --- Error re-exports ---
 pub use error::Error;
+
+// --- Eval re-exports ---
+pub use eval::{
+    EvalCase, EvalResult, EvalRunner, EvalScorer, EvalSummary, EventCollector, ExpectedToolCall,
+    KeywordScorer, ScorerResult, SimilarityScorer, TrajectoryScorer, build_eval_agent,
+};
+
+// --- Knowledge re-exports ---
 pub use knowledge::in_memory::InMemoryKnowledgeBase;
 pub use knowledge::{Chunk, DocumentSource, KnowledgeBase, KnowledgeQuery, SearchResult};
+
+// --- LLM re-exports ---
 pub use llm::ApprovalDecision;
 pub use llm::LlmProvider;
 pub use llm::OnApproval;
@@ -84,26 +128,46 @@ pub use llm::types::{
     StopReason, TokenUsage, ToolCall, ToolChoice, ToolDefinition, ToolResult,
 };
 pub use llm::{BoxedProvider, DynLlmProvider};
+
+// --- LSP re-exports ---
 pub use lsp::{Diagnostic as LspDiagnostic, LspManager};
+
+// --- Memory re-exports ---
 pub use memory::Confidentiality;
 pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
+#[cfg(feature = "local-embedding")]
+pub use memory::embedding::LocalEmbeddingProvider;
 pub use memory::embedding::{EmbeddingMemory, EmbeddingProvider, NoopEmbedding, OpenAiEmbedding};
 pub use memory::hybrid::{cosine_similarity, rrf_fuse};
 pub use memory::in_memory::InMemoryStore;
 pub use memory::namespaced::NamespacedMemory;
+#[cfg(feature = "postgres")]
 pub use memory::postgres::PostgresMemoryStore;
 pub use memory::pruning::{DEFAULT_MIN_STRENGTH, default_min_age, prune_weak_entries};
 pub use memory::reflection::ReflectionTracker;
 pub use memory::scoring::ScoringWeights;
 pub use memory::{Memory, MemoryEntry, MemoryQuery, MemoryType};
+
+// --- Sensor re-exports (feature-gated) ---
+#[cfg(feature = "sensor")]
 pub use sensor::manager::SensorManager;
+#[cfg(feature = "sensor")]
 pub use sensor::metrics::SensorMetrics;
+#[cfg(feature = "sensor")]
 pub use sensor::routing::{ModelRouter, ModelTier};
+#[cfg(feature = "sensor")]
 pub use sensor::stories::{Story, StoryCorrelator, StoryStatus, SubjectType};
+#[cfg(feature = "sensor")]
 pub use sensor::triage::context::TaskContext;
-pub use sensor::triage::context::TrustLevel;
+// TrustLevel is always available (defined in config.rs).
+pub use config::TrustLevel;
+#[cfg(feature = "sensor")]
 pub use sensor::triage::{ActionCategory, Priority, TriageDecision, TriageProcessor};
-pub use sensor::{Sensor, SensorEvent, SensorModality};
+#[cfg(feature = "sensor")]
+pub use sensor::{Sensor, SensorEvent};
+
+// --- Tool re-exports ---
+#[cfg(feature = "a2a")]
 pub use tool::a2a::A2aClient;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
@@ -111,4 +175,12 @@ pub use tool::builtins::{
 };
 pub use tool::mcp::McpClient;
 pub use tool::{Tool, ToolOutput, validate_tool_input};
+
+// --- Store re-exports ---
+#[cfg(feature = "postgres")]
+pub use store::PostgresStore;
+#[cfg(feature = "postgres")]
+pub use store::postgres::PostgresAuditTrail;
+
+// --- Workspace re-exports ---
 pub use workspace::Workspace;

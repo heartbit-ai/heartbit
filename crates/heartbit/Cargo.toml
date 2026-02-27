@@ -11,6 +11,7 @@ keywords = ["agent", "llm", "mcp", "orchestration", "ai"]
 categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
+# --- Core (always available) ---
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -20,30 +21,42 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 toml = { workspace = true }
-restate-sdk = { workspace = true }
-sqlx = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 glob = { workspace = true }
 jsonschema = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
-a2a-sdk = { workspace = true }
-rdkafka = { workspace = true }
-cron = { workspace = true }
 tokio-util = { workspace = true }
-prometheus = { workspace = true }
-quick-xml = { workspace = true }
-pgvector = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-subtle = { workspace = true }
-base64 = { workspace = true }
+
+# --- Optional (feature-gated) ---
+rdkafka = { workspace = true, optional = true }
+restate-sdk = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+pgvector = { workspace = true, optional = true }
+a2a-sdk = { workspace = true, optional = true }
+cron = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
 
 [features]
-telegram = ["teloxide"]
+default = ["core"]
+core = []
+kafka = ["dep:rdkafka"]
+daemon = ["kafka", "dep:cron", "dep:prometheus"]
+sensor = ["daemon", "dep:quick-xml", "dep:hmac", "dep:sha2", "dep:hex", "dep:subtle"]
+restate = ["dep:restate-sdk"]
+postgres = ["dep:sqlx", "dep:pgvector"]
+a2a = ["dep:a2a-sdk"]
+telegram = ["dep:teloxide"]
+local-embedding = ["dep:fastembed"]
+full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

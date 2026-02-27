@@ -209,6 +209,69 @@ impl PostgresStore {
     }
 }
 
+/// Audit trail backed by PostgreSQL, bridging to the existing `audit_log` table.
+///
+/// Each `PostgresAuditTrail` is scoped to a single task (via `task_id`).
+pub struct PostgresAuditTrail {
+    store: std::sync::Arc<PostgresStore>,
+    task_id: Uuid,
+}
+
+impl PostgresAuditTrail {
+    pub fn new(store: std::sync::Arc<PostgresStore>, task_id: Uuid) -> Self {
+        Self { store, task_id }
+    }
+}
+
+impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
+    fn record(
+        &self,
+        entry: crate::agent::audit::AuditRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.store
+                .write_audit(
+                    self.task_id,
+                    &entry.agent,
+                    &entry.event_type,
+                    entry.payload,
+                    Some(entry.usage.input_tokens as i32),
+                    Some(entry.usage.output_tokens as i32),
+                )
+                .await
+        })
+    }
+
+    fn entries(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<crate::agent::audit::AuditRecord>, Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let rows = self.store.get_audit_log(self.task_id).await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| crate::agent::audit::AuditRecord {
+                    agent: row.agent_name,
+                    turn: 0,
+                    event_type: row.event_type,
+                    payload: row.payload,
+                    usage: crate::llm::types::TokenUsage {
+                        input_tokens: row.tokens_in.unwrap_or(0) as u32,
+                        output_tokens: row.tokens_out.unwrap_or(0) as u32,
+                        ..Default::default()
+                    },
+                    timestamp: row.created_at,
+                })
+                .collect())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

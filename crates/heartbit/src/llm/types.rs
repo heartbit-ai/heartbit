@@ -167,6 +167,13 @@ pub struct TokenUsage {
     pub reasoning_tokens: u32,
 }
 
+impl TokenUsage {
+    /// Total tokens consumed (input + output) as `u64`.
+    pub fn total(&self) -> u64 {
+        self.input_tokens as u64 + self.output_tokens as u64
+    }
+}
+
 impl std::ops::AddAssign for TokenUsage {
     fn add_assign(&mut self, rhs: Self) {
         self.input_tokens += rhs.input_tokens;
@@ -638,5 +645,25 @@ mod tests {
             response.model.as_deref(),
             Some("anthropic/claude-3.5-haiku")
         );
+    }
+
+    #[test]
+    fn token_usage_total() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        assert_eq!(usage.total(), 150);
+    }
+
+    #[test]
+    fn token_usage_total_no_overflow() {
+        let usage = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(usage.total(), u32::MAX as u64 + u32::MAX as u64);
     }
 }

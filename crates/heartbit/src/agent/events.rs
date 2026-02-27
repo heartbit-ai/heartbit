@@ -129,6 +129,17 @@ pub enum AgentEvent {
         tool_name: Option<String>,
     },
 
+    /// A guardrail issued a warning but allowed the operation to proceed.
+    GuardrailWarned {
+        agent: String,
+        /// Which hook triggered the warning: `"post_llm"` or `"pre_tool"`.
+        hook: String,
+        reason: String,
+        /// Set for `pre_tool` warnings, `None` for `post_llm`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+    },
+
     /// Agent run failed.
     RunFailed {
         agent: String,
@@ -211,6 +222,17 @@ pub enum AgentEvent {
         to_tier: String,
         /// "gate_rejected" or "tier_error"
         reason: String,
+    },
+
+    /// Token budget exceeded: the agent consumed more tokens than the configured limit.
+    BudgetExceeded {
+        agent: String,
+        /// Total tokens consumed (input + output) across all turns.
+        used: u64,
+        /// The configured token budget limit.
+        limit: u64,
+        /// Partial token usage accumulated before the budget was exceeded.
+        partial_usage: TokenUsage,
     },
 
     /// Task was routed to single-agent or orchestrator by the complexity analyzer.
@@ -417,6 +439,18 @@ mod tests {
                 reason: "output too long".into(),
                 tool_name: Some("bash".into()),
             },
+            AgentEvent::GuardrailWarned {
+                agent: "a".into(),
+                hook: "post_llm".into(),
+                reason: "suspicious pattern".into(),
+                tool_name: None,
+            },
+            AgentEvent::GuardrailWarned {
+                agent: "a".into(),
+                hook: "pre_tool".into(),
+                reason: "unusual input".into(),
+                tool_name: Some("bash".into()),
+            },
             AgentEvent::RunFailed {
                 agent: "a".into(),
                 error: "oops".into(),
@@ -465,6 +499,12 @@ mod tests {
                 from_tier: "haiku".into(),
                 to_tier: "sonnet".into(),
                 reason: "gate_rejected".into(),
+            },
+            AgentEvent::BudgetExceeded {
+                agent: "a".into(),
+                used: 150000,
+                limit: 100000,
+                partial_usage: TokenUsage::default(),
             },
             AgentEvent::TaskRouted {
                 decision: "single_agent".into(),
@@ -715,6 +755,45 @@ mod tests {
             }
             other => panic!("expected LlmResponse, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn guardrail_warned_roundtrip() {
+        let event = AgentEvent::GuardrailWarned {
+            agent: "a".into(),
+            hook: "pre_tool".into(),
+            reason: "suspicious input".into(),
+            tool_name: Some("bash".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"guardrail_warned""#));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            AgentEvent::GuardrailWarned {
+                agent,
+                hook,
+                reason,
+                tool_name,
+            } => {
+                assert_eq!(agent, "a");
+                assert_eq!(hook, "pre_tool");
+                assert_eq!(reason, "suspicious input");
+                assert_eq!(tool_name.as_deref(), Some("bash"));
+            }
+            other => panic!("expected GuardrailWarned, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guardrail_warned_no_tool_name_omits_field() {
+        let event = AgentEvent::GuardrailWarned {
+            agent: "a".into(),
+            hook: "post_llm".into(),
+            reason: "test".into(),
+            tool_name: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("tool_name"), "json: {json}");
     }
 
     #[test]

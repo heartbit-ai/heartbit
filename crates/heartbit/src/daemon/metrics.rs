@@ -44,6 +44,7 @@ pub struct DaemonMetrics {
     session_prunes_total: IntCounter,
     session_bytes_saved_total: IntCounter,
     guardrail_denials_total: IntCounterVec,
+    guardrail_warnings_total: IntCounterVec,
 
     // Error classification (prefix: heartbit_errors_)
     errors_total: IntCounterVec,
@@ -225,6 +226,13 @@ impl DaemonMetrics {
             ),
             &["hook"],
         )?;
+        let guardrail_warnings_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_reliability_guardrail_warnings_total",
+                "Total guardrail warnings by hook",
+            ),
+            &["hook"],
+        )?;
 
         // -- Error classification --
         let errors_total = IntCounterVec::new(
@@ -362,6 +370,7 @@ impl DaemonMetrics {
         registry.register(Box::new(session_prunes_total.clone()))?;
         registry.register(Box::new(session_bytes_saved_total.clone()))?;
         registry.register(Box::new(guardrail_denials_total.clone()))?;
+        registry.register(Box::new(guardrail_warnings_total.clone()))?;
 
         registry.register(Box::new(errors_total.clone()))?;
 
@@ -414,6 +423,7 @@ impl DaemonMetrics {
             session_prunes_total,
             session_bytes_saved_total,
             guardrail_denials_total,
+            guardrail_warnings_total,
             errors_total,
             pulse_runs_total,
             pulse_ok_total,
@@ -585,6 +595,16 @@ impl DaemonMetrics {
             } => {
                 self.cascade_escalations_total
                     .with_label_values(&[from_tier, to_tier, reason])
+                    .inc();
+            }
+            AgentEvent::BudgetExceeded { .. } => {
+                self.errors_total
+                    .with_label_values(&["budget_exceeded"])
+                    .inc();
+            }
+            AgentEvent::GuardrailWarned { hook, .. } => {
+                self.guardrail_warnings_total
+                    .with_label_values(&[hook])
                     .inc();
             }
         }

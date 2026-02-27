@@ -206,7 +206,7 @@ impl DaemonCore {
                 String,
                 String,
                 Option<String>,
-                Option<crate::sensor::triage::context::TrustLevel>,
+                Option<crate::config::TrustLevel>,
                 Arc<dyn Fn(AgentEvent) + Send + Sync>,
             ) -> Fut
             + Send

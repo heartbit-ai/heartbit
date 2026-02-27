@@ -72,6 +72,10 @@ pub(crate) struct SubAgentDef {
     pub(crate) consolidate_on_exit: Option<bool>,
     /// Optional workspace root for this sub-agent.
     pub(crate) workspace: Option<std::path::PathBuf>,
+    /// Hard limit on cumulative tokens (input + output) across all turns.
+    pub(crate) max_total_tokens: Option<u64>,
+    /// Optional audit trail for recording untruncated agent decisions.
+    pub(crate) audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -149,6 +153,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             observability_mode: None,
             dispatch_mode: DispatchMode::Parallel,
             workspace: None,
+            audit_trail: None,
         }
     }
 
@@ -349,6 +354,12 @@ impl DelegateTaskTool {
                 }
                 if let Some(ref ws) = agent_def.workspace {
                     builder = builder.workspace(ws.clone());
+                }
+                if let Some(max) = agent_def.max_total_tokens {
+                    builder = builder.max_total_tokens(max);
+                }
+                if let Some(trail) = agent_def.audit_trail {
+                    builder = builder.audit_trail(trail);
                 }
 
                 // Forward permission rules from orchestrator to sub-agents
@@ -731,6 +742,12 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(ref ws) = agent_def.workspace {
                         builder = builder.workspace(ws.clone());
+                    }
+                    if let Some(max) = agent_def.max_total_tokens {
+                        builder = builder.max_total_tokens(max);
+                    }
+                    if let Some(trail) = agent_def.audit_trail {
+                        builder = builder.audit_trail(trail);
                     }
 
                     // Forward permission rules from orchestrator to squad members
@@ -1204,6 +1221,10 @@ pub struct SubAgentConfig {
     pub consolidate_on_exit: Option<bool>,
     /// Optional workspace root for this sub-agent's file tools and system prompt.
     pub workspace: Option<std::path::PathBuf>,
+    /// Hard limit on cumulative tokens (input + output) across all turns.
+    pub max_total_tokens: Option<u64>,
+    /// Optional audit trail for recording untruncated agent decisions.
+    pub audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -1239,6 +1260,8 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     dispatch_mode: DispatchMode,
     /// Optional workspace root for all sub-agents. Propagated to sub-agent builders.
     workspace: Option<std::path::PathBuf>,
+    /// Optional audit trail propagated to all sub-agents.
+    audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1274,6 +1297,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             reflection_threshold: None,
             consolidate_on_exit: None,
             workspace: self.workspace.clone(),
+            max_total_tokens: None,
+            audit_trail: self.audit_trail.clone(),
         });
         self
     }
@@ -1311,6 +1336,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             reflection_threshold: None,
             consolidate_on_exit: None,
             workspace: self.workspace.clone(),
+            max_total_tokens: None,
+            audit_trail: self.audit_trail.clone(),
         });
         self
     }
@@ -1342,6 +1369,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             reflection_threshold: def.reflection_threshold,
             consolidate_on_exit: def.consolidate_on_exit,
             workspace: def.workspace.or_else(|| self.workspace.clone()),
+            max_total_tokens: def.max_total_tokens,
+            audit_trail: def.audit_trail.or_else(|| self.audit_trail.clone()),
         });
         self
     }
@@ -1556,6 +1585,14 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Attach an audit trail propagated to all sub-agents.
+    ///
+    /// Individual sub-agents can override via `SubAgentConfig.audit_trail`.
+    pub fn audit_trail(mut self, trail: Arc<dyn super::audit::AuditTrail>) -> Self {
+        self.audit_trail = Some(trail);
+        self
+    }
+
     pub fn build(self) -> Result<Orchestrator<P>, Error> {
         // Validate sub-agent definitions
         {
@@ -1750,6 +1787,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         }
         if let Some(mode) = self.observability_mode {
             runner_builder = runner_builder.observability_mode(mode);
+        }
+        if let Some(trail) = self.audit_trail {
+            runner_builder = runner_builder.audit_trail(trail);
         }
 
         let runner = runner_builder.build()?;
@@ -2046,6 +2086,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -2966,6 +3008,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build()
             .unwrap();
@@ -3023,6 +3067,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build();
 
@@ -3065,6 +3111,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build();
 
@@ -3175,6 +3223,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build()
             .unwrap();
@@ -3249,6 +3299,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build()
             .unwrap();
@@ -3760,6 +3812,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build()
             .unwrap();
@@ -4249,11 +4303,13 @@ mod tests {
                 | AgentEvent::ApprovalDecision { agent, .. }
                 | AgentEvent::ContextSummarized { agent, .. }
                 | AgentEvent::GuardrailDenied { agent, .. }
+                | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
-                | AgentEvent::ModelEscalated { agent, .. } => agent,
+                | AgentEvent::ModelEscalated { agent, .. }
+                | AgentEvent::BudgetExceeded { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -4627,6 +4683,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .build()
             .unwrap();
@@ -4816,6 +4874,8 @@ mod tests {
                 reflection_threshold: None,
                 consolidate_on_exit: None,
                 workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)
@@ -4911,11 +4971,13 @@ mod tests {
                 | AgentEvent::ApprovalDecision { agent, .. }
                 | AgentEvent::ContextSummarized { agent, .. }
                 | AgentEvent::GuardrailDenied { agent, .. }
+                | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
-                | AgentEvent::ModelEscalated { agent, .. } => agent,
+                | AgentEvent::ModelEscalated { agent, .. }
+                | AgentEvent::BudgetExceeded { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -4937,6 +4999,7 @@ mod tests {
                 AgentEvent::ApprovalDecision { .. } => "ApprovalDecision",
                 AgentEvent::ContextSummarized { .. } => "ContextSummarized",
                 AgentEvent::GuardrailDenied { .. } => "GuardrailDenied",
+                AgentEvent::GuardrailWarned { .. } => "GuardrailWarned",
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",
                 AgentEvent::AutoCompactionTriggered { .. } => "AutoCompactionTriggered",
@@ -4945,6 +5008,7 @@ mod tests {
                 AgentEvent::StoryUpdated { .. } => "StoryUpdated",
                 AgentEvent::TaskRouted { .. } => "TaskRouted",
                 AgentEvent::ModelEscalated { .. } => "ModelEscalated",
+                AgentEvent::BudgetExceeded { .. } => "BudgetExceeded",
             }
         }
 

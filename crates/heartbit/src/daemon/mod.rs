@@ -19,7 +19,9 @@ pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
-pub use store::{InMemoryTaskStore, PostgresTaskStore, TaskStore};
+#[cfg(feature = "postgres")]
+pub use store::PostgresTaskStore;
+pub use store::{InMemoryTaskStore, TaskStore};
 pub use todo::{FileTodoStore, TodoEntry, TodoList, TodoManageTool};
 pub use types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 

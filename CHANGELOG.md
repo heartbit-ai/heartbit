@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.227.1] - 2026-02-27
+
+### Added
+
+- **Local embedding provider** (`LocalEmbeddingProvider`): offline ONNX-based text embeddings via fastembed. No API keys, no network, zero cost per query. Supports 9 models (all-MiniLM-L6-v2 default, BGE variants, nomic variants, plus quantized `-q` suffixes). Feature-gated behind `local-embedding`.
+- **Eval framework** (`eval/mod.rs`): built-in agent behavior testing with `EvalCase`, `EvalRunner`, and pluggable scorers (`TrajectoryScorer`, `KeywordScorer`, `SimilarityScorer`). Concurrent evaluation with per-case and aggregate scoring.
+- **Workflow agents** (`agent/workflow.rs`): deterministic orchestration without LLM cost — `SequentialAgent` (chains output→input), `ParallelAgent` (concurrent via `JoinSet`), `LoopAgent` (repeat until condition).
+- **Audit trail** (`agent/audit.rs`): `AuditTrail` trait with `InMemoryAuditTrail` and `PostgresAuditTrail` for logging agent decisions, tool calls, and guardrail outcomes.
+- **Injection classifier guardrail** (`guardrails/injection.rs`): detect prompt injection attempts with warn or deny mode.
+- **PII guardrail** (`guardrails/pii.rs`): detect PII (email, phone, SSN, credit card) with redact, warn, or deny actions.
+- **Tool policy guardrail** (`guardrails/tool_policy.rs`): declarative per-tool allow/deny rules with input constraints (patterns, max length).
+- **LLM-as-judge guardrail** (`guardrails/llm_judge.rs`): safety evaluation via a cheap judge model with criteria-based prompts. Fail-open on timeout.
+- **Guardrail composition** (`guardrails/compose.rs`): `ConditionalGuardrail`, `GuardrailChain`, and `WarnToDeny` escalation.
+- **`GuardrailMeta` trait**: optional guardrail identification for debugging and audit.
+- **`GuardrailsConfig`** in config: top-level `[guardrails]` section with injection, PII, tool policy, and LLM judge sub-configs. Per-agent `guardrails` override.
+- `cache_dir` field on `EmbeddingConfig` for local provider model cache directory.
+- `local-embedding` feature flag on `heartbit` and `heartbit-cli` crates.
+- `RoutingStrategy` trait and `KeywordRoutingStrategy` for pluggable task routing.
+- `TrustLevel` enum moved to `config.rs` (always available, not sensor-gated).
+- `SensorModality` re-exported from config (always available).
+- Examples: `simple_agent.rs`, `mcp_agent.rs`, `custom_tool.rs`.
+- `llms.md`: LLM-friendly project context file (llmstxt.org pattern).
+- `install.md`: comprehensive installation guide with troubleshooting.
+
+### Changed
+
+- **Feature-gated modules**: `daemon`, `sensor`, `workflow` modules now require their respective feature flags. Previously always compiled.
+- **Feature-gated re-exports**: `PostgresMemoryStore`, `PostgresSessionStore`, `PostgresTaskStore`, `PostgresStore`, `PostgresAuditTrail` gated behind `postgres`; `A2aClient` behind `a2a`; `SensorSecurityGuardrail` behind `sensor`; sensor re-exports behind `sensor`; `LocalEmbeddingProvider` behind `local-embedding`.
+- Agent events expanded from 13 to 18 variants (added `GuardrailWarned`, `LlmRetry`, `ModelEscalated`, `ToolDeselected`, `ReflectionTriggered`).
+- Guardrail re-exports expanded: all 8 guardrails, `GuardrailMode`, `PiiAction`, `PiiDetector`, `InputConstraint`, `ToolRule`, `WarnToDeny` now re-exported from crate root.
+- Config re-exports expanded: `GuardrailsConfig`, `InjectionConfig`, `PiiConfig`, `ToolPolicyConfig`, `InputConstraintConfig`, `ToolPolicyRuleConfig`, `SensorModality`, `TrustLevel`.
+- README comprehensively updated: expanded guardrails (2→8 with table), memory section (embedding providers, hybrid retrieval, confidentiality), feature flags section, workflow agents section, eval framework section, audit trail section, environment variables (12→27), config example (cascade, routing, dispatch_mode, session_prune), test count (2374→2665+).
+
+## [2026.226.2] - 2026-02-26
+
+### Fixed
+
+- Repetitive pulse notifications dumping entire todo list (including completed items) every 30 minutes.
+- Added `snoozed_until` field to `TodoEntry` for suppressing items from pulse.
+- `format_for_pulse_prompt()` filters terminal/snoozed entries.
+- Snooze action added to `TodoManageTool` (default 24h, validates hours > 0).
+- Kafka event serialization: log-and-skip instead of sending empty payload.
+- `subscribe_events`: log on lock poison instead of silent `None`.
+- Validate Kafka `consumer_group`, `commands_topic`, `events_topic` for non-empty.
+
 ## [2026.226.1] - 2026-02-26
 
 ### Added

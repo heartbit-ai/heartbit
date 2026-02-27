@@ -18,30 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Error;
 
-/// Sensory modality — the type of information a sensor captures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SensorModality {
-    /// Email body, RSS content, chat messages.
-    Text,
-    /// Photos, screenshots, documents-as-images.
-    Image,
-    /// Voice notes, calls, podcasts.
-    Audio,
-    /// Weather JSON, GPS coordinates, API responses.
-    Structured,
-}
-
-impl std::fmt::Display for SensorModality {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SensorModality::Text => write!(f, "text"),
-            SensorModality::Image => write!(f, "image"),
-            SensorModality::Audio => write!(f, "audio"),
-            SensorModality::Structured => write!(f, "structured"),
-        }
-    }
-}
+// Re-export SensorModality from config (canonical definition lives there
+// so it's available even when the `sensor` feature is disabled).
+pub use crate::config::SensorModality;
 
 /// A single event observed by a sensor.
 ///

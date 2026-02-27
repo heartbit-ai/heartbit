@@ -4,6 +4,7 @@ pub mod embedding;
 pub mod hybrid;
 pub mod in_memory;
 pub mod namespaced;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod pruning;
 pub mod reflection;

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::agent::guardrail::{GuardAction, Guardrail};
+use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, ToolCall};
 use crate::sensor::triage::context::TrustLevel;
@@ -179,6 +179,12 @@ impl SensorSecurityGuardrail {
         }
 
         policy
+    }
+}
+
+impl GuardrailMeta for SensorSecurityGuardrail {
+    fn name(&self) -> &str {
+        "sensor_security"
     }
 }
 

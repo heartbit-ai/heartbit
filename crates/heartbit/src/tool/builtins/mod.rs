@@ -62,6 +62,7 @@ pub struct BuiltinToolsConfig {
     /// Optional persistent daemon todo store. When set, the `todo_manage`
     /// tool is added to the built-in tools for managing the daemon's
     /// persistent task list.
+    #[cfg(feature = "daemon")]
     pub daemon_todo_store: Option<Arc<crate::daemon::todo::FileTodoStore>>,
 }
 
@@ -72,6 +73,7 @@ impl Default for BuiltinToolsConfig {
             todo_store: Arc::new(TodoStore::new()),
             on_question: None,
             workspace: None,
+            #[cfg(feature = "daemon")]
             daemon_todo_store: None,
         }
     }
@@ -110,6 +112,7 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         tools.push(Arc::new(question::QuestionTool::new(on_question)));
     }
 
+    #[cfg(feature = "daemon")]
     if let Some(daemon_store) = config.daemon_todo_store {
         tools.push(Arc::new(crate::daemon::todo::TodoManageTool::new(
             daemon_store,
@@ -193,6 +196,7 @@ mod tests {
         assert_eq!(tools.len(), 14); // 13 + question tool
     }
 
+    #[cfg(feature = "daemon")]
     #[test]
     fn builtin_tools_with_daemon_todo_store() {
         let dir = tempfile::tempdir().unwrap();

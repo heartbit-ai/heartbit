@@ -148,69 +148,73 @@ impl SessionStore for InMemorySessionStore {
 
 // --- PostgreSQL session store ---
 
-/// Row type for reading sessions from PostgreSQL.
-#[derive(Debug, sqlx::FromRow)]
-struct SessionRow {
-    id: Uuid,
-    title: Option<String>,
-    created_at: DateTime<Utc>,
-}
+#[cfg(feature = "postgres")]
+mod postgres_session {
+    use super::*;
 
-/// Row type for reading session messages from PostgreSQL.
-#[derive(Debug, sqlx::FromRow)]
-struct MessageRow {
-    role: String,
-    content: String,
-    created_at: DateTime<Utc>,
-}
+    /// Row type for reading sessions from PostgreSQL.
+    #[derive(Debug, sqlx::FromRow)]
+    struct SessionRow {
+        id: Uuid,
+        title: Option<String>,
+        created_at: DateTime<Utc>,
+    }
 
-impl From<MessageRow> for SessionMessage {
-    fn from(row: MessageRow) -> Self {
-        Self {
-            role: match row.role.as_str() {
-                "assistant" => SessionRole::Assistant,
-                _ => SessionRole::User,
-            },
-            content: row.content,
-            timestamp: row.created_at,
+    /// Row type for reading session messages from PostgreSQL.
+    #[derive(Debug, sqlx::FromRow)]
+    pub(crate) struct MessageRow {
+        pub(crate) role: String,
+        pub(crate) content: String,
+        pub(crate) created_at: DateTime<Utc>,
+    }
+
+    impl From<MessageRow> for SessionMessage {
+        fn from(row: MessageRow) -> Self {
+            Self {
+                role: match row.role.as_str() {
+                    "assistant" => SessionRole::Assistant,
+                    _ => SessionRole::User,
+                },
+                content: row.content,
+                timestamp: row.created_at,
+            }
         }
     }
-}
 
-fn session_role_to_str(role: SessionRole) -> &'static str {
-    match role {
-        SessionRole::User => "user",
-        SessionRole::Assistant => "assistant",
-    }
-}
-
-/// PostgreSQL-backed session store for durable conversation persistence.
-///
-/// Uses `sqlx` runtime queries (no compile-time macros). Two tables:
-/// `sessions` (id, title, created_at) and `session_messages` (session_id, role,
-/// content, created_at). Foreign key cascade on delete.
-pub struct PostgresSessionStore {
-    pool: sqlx::PgPool,
-}
-
-impl PostgresSessionStore {
-    /// Create from an existing connection pool.
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn session_role_to_str(role: SessionRole) -> &'static str {
+        match role {
+            SessionRole::User => "user",
+            SessionRole::Assistant => "assistant",
+        }
     }
 
-    /// Connect to PostgreSQL using the given URL.
-    pub async fn connect(database_url: &str) -> Result<Self, Error> {
-        let pool = sqlx::PgPool::connect(database_url)
-            .await
-            .map_err(|e| Error::Channel(format!("database connection failed: {e}")))?;
-        Ok(Self { pool })
+    /// PostgreSQL-backed session store for durable conversation persistence.
+    ///
+    /// Uses `sqlx` runtime queries (no compile-time macros). Two tables:
+    /// `sessions` (id, title, created_at) and `session_messages` (session_id, role,
+    /// content, created_at). Foreign key cascade on delete.
+    pub struct PostgresSessionStore {
+        pool: sqlx::PgPool,
     }
 
-    /// Run the session tables migration. Safe to call multiple times.
-    pub async fn run_migration(&self) -> Result<(), Error> {
-        sqlx::query(
-            r#"
+    impl PostgresSessionStore {
+        /// Create from an existing connection pool.
+        pub fn new(pool: sqlx::PgPool) -> Self {
+            Self { pool }
+        }
+
+        /// Connect to PostgreSQL using the given URL.
+        pub async fn connect(database_url: &str) -> Result<Self, Error> {
+            let pool = sqlx::PgPool::connect(database_url)
+                .await
+                .map_err(|e| Error::Channel(format!("database connection failed: {e}")))?;
+            Ok(Self { pool })
+        }
+
+        /// Run the session tables migration. Safe to call multiple times.
+        pub async fn run_migration(&self) -> Result<(), Error> {
+            sqlx::query(
+                r#"
             CREATE TABLE IF NOT EXISTS sessions (
                 id          UUID PRIMARY KEY,
                 title       TEXT,
@@ -227,45 +231,45 @@ impl PostgresSessionStore {
             CREATE INDEX IF NOT EXISTS idx_session_messages_session_id
                 ON session_messages(session_id);
             "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::Channel(format!("session migration failed: {e}")))?;
-        Ok(())
-    }
-}
-
-impl SessionStore for PostgresSessionStore {
-    fn create(&self, title: Option<String>) -> Result<Session, Error> {
-        let pool = self.pool.clone();
-        let session = Session {
-            id: Uuid::new_v4(),
-            title: title.clone(),
-            created_at: Utc::now(),
-            messages: Vec::new(),
-        };
-        let id = session.id;
-        let created_at = session.created_at;
-        // Use block_in_place since SessionStore trait methods are sync.
-        // The pool operations are async but the trait requires sync returns.
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                sqlx::query("INSERT INTO sessions (id, title, created_at) VALUES ($1, $2, $3)")
-                    .bind(id)
-                    .bind(title)
-                    .bind(created_at)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| Error::Channel(format!("failed to create session: {e}")))
-            })
-        })?;
-        Ok(session)
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Channel(format!("session migration failed: {e}")))?;
+            Ok(())
+        }
     }
 
-    fn get(&self, id: Uuid) -> Result<Option<Session>, Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
+    impl SessionStore for PostgresSessionStore {
+        fn create(&self, title: Option<String>) -> Result<Session, Error> {
+            let pool = self.pool.clone();
+            let session = Session {
+                id: Uuid::new_v4(),
+                title: title.clone(),
+                created_at: Utc::now(),
+                messages: Vec::new(),
+            };
+            let id = session.id;
+            let created_at = session.created_at;
+            // Use block_in_place since SessionStore trait methods are sync.
+            // The pool operations are async but the trait requires sync returns.
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    sqlx::query("INSERT INTO sessions (id, title, created_at) VALUES ($1, $2, $3)")
+                        .bind(id)
+                        .bind(title)
+                        .bind(created_at)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| Error::Channel(format!("failed to create session: {e}")))
+                })
+            })?;
+            Ok(session)
+        }
+
+        fn get(&self, id: Uuid) -> Result<Option<Session>, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
                 let row: Option<SessionRow> =
                     sqlx::query_as("SELECT id, title, created_at FROM sessions WHERE id = $1")
                         .bind(id)
@@ -293,13 +297,13 @@ impl SessionStore for PostgresSessionStore {
                     None => Ok(None),
                 }
             })
-        })
-    }
+            })
+        }
 
-    fn list(&self) -> Result<Vec<Session>, Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
+        fn list(&self) -> Result<Vec<Session>, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
                 let rows: Vec<SessionRow> = sqlx::query_as(
                     "SELECT id, title, created_at FROM sessions ORDER BY created_at DESC",
                 )
@@ -324,27 +328,27 @@ impl SessionStore for PostgresSessionStore {
                 }
                 Ok(sessions)
             })
-        })
-    }
-
-    fn delete(&self, id: Uuid) -> Result<bool, Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                let result = sqlx::query("DELETE FROM sessions WHERE id = $1")
-                    .bind(id)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| Error::Channel(format!("failed to delete session: {e}")))?;
-                Ok(result.rows_affected() > 0)
             })
-        })
-    }
+        }
 
-    fn add_message(&self, id: Uuid, message: SessionMessage) -> Result<(), Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
+        fn delete(&self, id: Uuid) -> Result<bool, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let result = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                        .bind(id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| Error::Channel(format!("failed to delete session: {e}")))?;
+                    Ok(result.rows_affected() > 0)
+                })
+            })
+        }
+
+        fn add_message(&self, id: Uuid, message: SessionMessage) -> Result<(), Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
                 // Verify session exists
                 let exists: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1)",
@@ -368,9 +372,13 @@ impl SessionStore for PostgresSessionStore {
                 .map_err(|e| Error::Channel(format!("failed to add message: {e}")))?;
                 Ok(())
             })
-        })
+            })
+        }
     }
-}
+} // mod postgres_session
+
+#[cfg(feature = "postgres")]
+pub use postgres_session::PostgresSessionStore;
 
 #[cfg(test)]
 mod tests {
@@ -609,6 +617,10 @@ mod tests {
 
     // --- PostgresSessionStore unit tests (row conversion, no DB needed) ---
 
+    #[cfg(feature = "postgres")]
+    use postgres_session::*;
+
+    #[cfg(feature = "postgres")]
     #[test]
     fn message_row_to_session_message_user() {
         let row = MessageRow {
@@ -621,6 +633,7 @@ mod tests {
         assert_eq!(msg.content, "hello");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn message_row_to_session_message_assistant() {
         let row = MessageRow {
@@ -633,6 +646,7 @@ mod tests {
         assert_eq!(msg.content, "hi there");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn message_row_unknown_role_defaults_to_user() {
         let row = MessageRow {
@@ -644,12 +658,14 @@ mod tests {
         assert_eq!(msg.role, SessionRole::User);
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn session_role_to_str_roundtrip() {
         assert_eq!(session_role_to_str(SessionRole::User), "user");
         assert_eq!(session_role_to_str(SessionRole::Assistant), "assistant");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn message_row_preserves_timestamp() {
         let ts = Utc::now();

@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::TrustLevel;
 use crate::llm::types::TokenUsage;
-use crate::sensor::triage::context::TrustLevel;
 
 /// Commands serialized to the `heartbit.commands` Kafka topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]

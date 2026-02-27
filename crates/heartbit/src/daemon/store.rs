@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+#[cfg(any(feature = "postgres", test))]
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::types::{DaemonTask, TaskState, TaskStats};
 use crate::Error;
+#[cfg(any(feature = "postgres", test))]
 use crate::llm::types::TokenUsage;
 
 /// Trait for persisting daemon task state.
@@ -198,100 +200,104 @@ impl TaskStore for InMemoryTaskStore {
 
 // --- PostgreSQL task store ---
 
-/// Row type for reading daemon tasks from PostgreSQL.
-#[derive(Debug, sqlx::FromRow)]
-struct TaskRow {
-    id: Uuid,
-    task: String,
-    state: String,
-    created_at: DateTime<Utc>,
-    started_at: Option<DateTime<Utc>>,
-    completed_at: Option<DateTime<Utc>>,
-    result: Option<String>,
-    error: Option<String>,
-    input_tokens: i32,
-    output_tokens: i32,
-    cache_creation_input_tokens: i32,
-    cache_read_input_tokens: i32,
-    reasoning_tokens: i32,
-    tool_calls_made: i32,
-    estimated_cost_usd: Option<f64>,
-    source: String,
-    agent_name: Option<String>,
-}
+#[cfg(feature = "postgres")]
+mod postgres_store {
+    use super::*;
 
-fn task_state_to_str(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Pending => "pending",
-        TaskState::Running => "running",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
+    /// Row type for reading daemon tasks from PostgreSQL.
+    #[derive(Debug, sqlx::FromRow)]
+    pub(crate) struct TaskRow {
+        pub(crate) id: Uuid,
+        pub(crate) task: String,
+        pub(crate) state: String,
+        pub(crate) created_at: DateTime<Utc>,
+        pub(crate) started_at: Option<DateTime<Utc>>,
+        pub(crate) completed_at: Option<DateTime<Utc>>,
+        pub(crate) result: Option<String>,
+        pub(crate) error: Option<String>,
+        pub(crate) input_tokens: i32,
+        pub(crate) output_tokens: i32,
+        pub(crate) cache_creation_input_tokens: i32,
+        pub(crate) cache_read_input_tokens: i32,
+        pub(crate) reasoning_tokens: i32,
+        pub(crate) tool_calls_made: i32,
+        pub(crate) estimated_cost_usd: Option<f64>,
+        pub(crate) source: String,
+        pub(crate) agent_name: Option<String>,
     }
-}
 
-fn str_to_task_state(s: &str) -> TaskState {
-    match s {
-        "running" => TaskState::Running,
-        "completed" => TaskState::Completed,
-        "failed" => TaskState::Failed,
-        "cancelled" => TaskState::Cancelled,
-        _ => TaskState::Pending,
-    }
-}
-
-impl From<TaskRow> for DaemonTask {
-    fn from(row: TaskRow) -> Self {
-        Self {
-            id: row.id,
-            task: row.task,
-            state: str_to_task_state(&row.state),
-            created_at: row.created_at,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            result: row.result,
-            error: row.error,
-            tokens_used: TokenUsage {
-                input_tokens: row.input_tokens as u32,
-                output_tokens: row.output_tokens as u32,
-                cache_creation_input_tokens: row.cache_creation_input_tokens as u32,
-                cache_read_input_tokens: row.cache_read_input_tokens as u32,
-                reasoning_tokens: row.reasoning_tokens as u32,
-            },
-            tool_calls_made: row.tool_calls_made as usize,
-            estimated_cost_usd: row.estimated_cost_usd,
-            source: row.source,
-            agent_name: row.agent_name,
+    pub(crate) fn task_state_to_str(state: TaskState) -> &'static str {
+        match state {
+            TaskState::Pending => "pending",
+            TaskState::Running => "running",
+            TaskState::Completed => "completed",
+            TaskState::Failed => "failed",
+            TaskState::Cancelled => "cancelled",
         }
     }
-}
 
-/// PostgreSQL-backed daemon task store for durable task persistence.
-///
-/// Uses `sqlx` runtime queries (no compile-time macros). Single table
-/// `daemon_tasks` with all lifecycle fields. Read-modify-write for `update()`.
-pub struct PostgresTaskStore {
-    pool: sqlx::PgPool,
-}
-
-impl PostgresTaskStore {
-    /// Create from an existing connection pool.
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn str_to_task_state(s: &str) -> TaskState {
+        match s {
+            "running" => TaskState::Running,
+            "completed" => TaskState::Completed,
+            "failed" => TaskState::Failed,
+            "cancelled" => TaskState::Cancelled,
+            _ => TaskState::Pending,
+        }
     }
 
-    /// Connect to PostgreSQL using the given URL.
-    pub async fn connect(database_url: &str) -> Result<Self, Error> {
-        let pool = sqlx::PgPool::connect(database_url)
-            .await
-            .map_err(|e| Error::Daemon(format!("database connection failed: {e}")))?;
-        Ok(Self { pool })
+    impl From<TaskRow> for DaemonTask {
+        fn from(row: TaskRow) -> Self {
+            Self {
+                id: row.id,
+                task: row.task,
+                state: str_to_task_state(&row.state),
+                created_at: row.created_at,
+                started_at: row.started_at,
+                completed_at: row.completed_at,
+                result: row.result,
+                error: row.error,
+                tokens_used: TokenUsage {
+                    input_tokens: row.input_tokens as u32,
+                    output_tokens: row.output_tokens as u32,
+                    cache_creation_input_tokens: row.cache_creation_input_tokens as u32,
+                    cache_read_input_tokens: row.cache_read_input_tokens as u32,
+                    reasoning_tokens: row.reasoning_tokens as u32,
+                },
+                tool_calls_made: row.tool_calls_made as usize,
+                estimated_cost_usd: row.estimated_cost_usd,
+                source: row.source,
+                agent_name: row.agent_name,
+            }
+        }
     }
 
-    /// Run the daemon_tasks migration. Safe to call multiple times.
-    pub async fn run_migration(&self) -> Result<(), Error> {
-        sqlx::query(
-            r#"
+    /// PostgreSQL-backed daemon task store for durable task persistence.
+    ///
+    /// Uses `sqlx` runtime queries (no compile-time macros). Single table
+    /// `daemon_tasks` with all lifecycle fields. Read-modify-write for `update()`.
+    pub struct PostgresTaskStore {
+        pool: sqlx::PgPool,
+    }
+
+    impl PostgresTaskStore {
+        /// Create from an existing connection pool.
+        pub fn new(pool: sqlx::PgPool) -> Self {
+            Self { pool }
+        }
+
+        /// Connect to PostgreSQL using the given URL.
+        pub async fn connect(database_url: &str) -> Result<Self, Error> {
+            let pool = sqlx::PgPool::connect(database_url)
+                .await
+                .map_err(|e| Error::Daemon(format!("database connection failed: {e}")))?;
+            Ok(Self { pool })
+        }
+
+        /// Run the daemon_tasks migration. Safe to call multiple times.
+        pub async fn run_migration(&self) -> Result<(), Error> {
+            sqlx::query(
+                r#"
             CREATE TABLE IF NOT EXISTS daemon_tasks (
                 id                          UUID PRIMARY KEY,
                 task                        TEXT NOT NULL,
@@ -316,26 +322,26 @@ impl PostgresTaskStore {
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_state
                 ON daemon_tasks(state);
             "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
-
-        // Add agent_name column if not already present (for existing tables).
-        sqlx::query("ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS agent_name TEXT")
+            )
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::Daemon(format!("agent_name migration failed: {e}")))?;
+            .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
 
-        Ok(())
+            // Add agent_name column if not already present (for existing tables).
+            sqlx::query("ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS agent_name TEXT")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Daemon(format!("agent_name migration failed: {e}")))?;
+
+            Ok(())
+        }
     }
-}
 
-impl TaskStore for PostgresTaskStore {
-    fn insert(&self, task: DaemonTask) -> Result<(), Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
+    impl TaskStore for PostgresTaskStore {
+        fn insert(&self, task: DaemonTask) -> Result<(), Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
                 sqlx::query(
                     r#"INSERT INTO daemon_tasks
                         (id, task, state, created_at, started_at, completed_at, result, error,
@@ -366,14 +372,14 @@ impl TaskStore for PostgresTaskStore {
                 .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
                 Ok(())
             })
-        })
-    }
+            })
+        }
 
-    fn get(&self, id: Uuid) -> Result<Option<DaemonTask>, Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                let row: Option<TaskRow> = sqlx::query_as(
+        fn get(&self, id: Uuid) -> Result<Option<DaemonTask>, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let row: Option<TaskRow> = sqlx::query_as(
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
@@ -384,20 +390,20 @@ impl TaskStore for PostgresTaskStore {
                 .fetch_optional(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to get task: {e}")))?;
-                Ok(row.map(DaemonTask::from))
+                    Ok(row.map(DaemonTask::from))
+                })
             })
-        })
-    }
+        }
 
-    fn list(&self, limit: usize, offset: usize) -> Result<(Vec<DaemonTask>, usize), Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM daemon_tasks")
-                    .fetch_one(&pool)
-                    .await
-                    .map_err(|e| Error::Daemon(format!("failed to count tasks: {e}")))?;
-                let rows: Vec<TaskRow> = sqlx::query_as(
+        fn list(&self, limit: usize, offset: usize) -> Result<(Vec<DaemonTask>, usize), Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM daemon_tasks")
+                        .fetch_one(&pool)
+                        .await
+                        .map_err(|e| Error::Daemon(format!("failed to count tasks: {e}")))?;
+                    let rows: Vec<TaskRow> = sqlx::query_as(
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
@@ -409,18 +415,18 @@ impl TaskStore for PostgresTaskStore {
                 .fetch_all(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to list tasks: {e}")))?;
-                let tasks = rows.into_iter().map(DaemonTask::from).collect();
-                Ok((tasks, total as usize))
+                    let tasks = rows.into_iter().map(DaemonTask::from).collect();
+                    Ok((tasks, total as usize))
+                })
             })
-        })
-    }
+        }
 
-    fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                // Read the current task
-                let row: TaskRow = sqlx::query_as(
+        fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    // Read the current task
+                    let row: TaskRow = sqlx::query_as(
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
@@ -433,56 +439,56 @@ impl TaskStore for PostgresTaskStore {
                 .map_err(|e| Error::Daemon(format!("failed to read task for update: {e}")))?
                 .ok_or_else(|| Error::Daemon(format!("task {id} not found")))?;
 
-                // Apply the mutation closure
-                let mut task = DaemonTask::from(row);
-                f(&mut task);
+                    // Apply the mutation closure
+                    let mut task = DaemonTask::from(row);
+                    f(&mut task);
 
-                // Write back all fields
-                sqlx::query(
-                    r#"UPDATE daemon_tasks SET
+                    // Write back all fields
+                    sqlx::query(
+                        r#"UPDATE daemon_tasks SET
                         task = $2, state = $3, started_at = $4, completed_at = $5,
                         result = $6, error = $7, input_tokens = $8, output_tokens = $9,
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
                         estimated_cost_usd = $14, source = $15, agent_name = $16
                     WHERE id = $1"#,
-                )
-                .bind(task.id)
-                .bind(&task.task)
-                .bind(task_state_to_str(task.state))
-                .bind(task.started_at)
-                .bind(task.completed_at)
-                .bind(&task.result)
-                .bind(&task.error)
-                .bind(task.tokens_used.input_tokens as i32)
-                .bind(task.tokens_used.output_tokens as i32)
-                .bind(task.tokens_used.cache_creation_input_tokens as i32)
-                .bind(task.tokens_used.cache_read_input_tokens as i32)
-                .bind(task.tokens_used.reasoning_tokens as i32)
-                .bind(task.tool_calls_made as i32)
-                .bind(task.estimated_cost_usd)
-                .bind(&task.source)
-                .bind(&task.agent_name)
-                .execute(&pool)
-                .await
-                .map_err(|e| Error::Daemon(format!("failed to update task: {e}")))?;
-                Ok(())
+                    )
+                    .bind(task.id)
+                    .bind(&task.task)
+                    .bind(task_state_to_str(task.state))
+                    .bind(task.started_at)
+                    .bind(task.completed_at)
+                    .bind(&task.result)
+                    .bind(&task.error)
+                    .bind(task.tokens_used.input_tokens as i32)
+                    .bind(task.tokens_used.output_tokens as i32)
+                    .bind(task.tokens_used.cache_creation_input_tokens as i32)
+                    .bind(task.tokens_used.cache_read_input_tokens as i32)
+                    .bind(task.tokens_used.reasoning_tokens as i32)
+                    .bind(task.tool_calls_made as i32)
+                    .bind(task.estimated_cost_usd)
+                    .bind(&task.source)
+                    .bind(&task.agent_name)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to update task: {e}")))?;
+                    Ok(())
+                })
             })
-        })
-    }
+        }
 
-    fn list_filtered(
-        &self,
-        limit: usize,
-        offset: usize,
-        source: Option<&str>,
-        state: Option<TaskState>,
-    ) -> Result<(Vec<DaemonTask>, usize), Error> {
-        let pool = self.pool.clone();
-        let source_owned = source.map(String::from);
-        let state_str = state.map(task_state_to_str);
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
+        fn list_filtered(
+            &self,
+            limit: usize,
+            offset: usize,
+            source: Option<&str>,
+            state: Option<TaskState>,
+        ) -> Result<(Vec<DaemonTask>, usize), Error> {
+            let pool = self.pool.clone();
+            let source_owned = source.map(String::from);
+            let state_str = state.map(task_state_to_str);
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
                 // Build dynamic WHERE clause
                 let mut conditions = Vec::new();
                 let mut param_idx = 1;
@@ -542,58 +548,62 @@ impl TaskStore for PostgresTaskStore {
                 let tasks = rows.into_iter().map(DaemonTask::from).collect();
                 Ok((tasks, total as usize))
             })
-        })
-    }
+            })
+        }
 
-    fn stats(&self) -> Result<TaskStats, Error> {
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                // Single query with aggregation grouped by state and source
-                #[derive(sqlx::FromRow)]
-                struct StatsRow {
-                    state: String,
-                    source: String,
-                    cnt: i64,
-                    sum_input: i64,
-                    sum_output: i64,
-                    sum_cache_read: i64,
-                    sum_cache_creation: i64,
-                    sum_cost: f64,
-                }
-                let rows: Vec<StatsRow> = sqlx::query_as(
-                    "SELECT state, source, COUNT(*) AS cnt, \
+        fn stats(&self) -> Result<TaskStats, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    // Single query with aggregation grouped by state and source
+                    #[derive(sqlx::FromRow)]
+                    struct StatsRow {
+                        state: String,
+                        source: String,
+                        cnt: i64,
+                        sum_input: i64,
+                        sum_output: i64,
+                        sum_cache_read: i64,
+                        sum_cache_creation: i64,
+                        sum_cost: f64,
+                    }
+                    let rows: Vec<StatsRow> = sqlx::query_as(
+                        "SELECT state, source, COUNT(*) AS cnt, \
                      COALESCE(SUM(input_tokens), 0) AS sum_input, \
                      COALESCE(SUM(output_tokens), 0) AS sum_output, \
                      COALESCE(SUM(cache_read_input_tokens), 0) AS sum_cache_read, \
                      COALESCE(SUM(cache_creation_input_tokens), 0) AS sum_cache_creation, \
                      COALESCE(SUM(estimated_cost_usd), 0.0) AS sum_cost \
                      FROM daemon_tasks GROUP BY state, source",
-                )
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
+                    )
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
 
-                let mut stats = TaskStats::default();
-                for row in &rows {
-                    let count = row.cnt as usize;
-                    stats.total_tasks += count;
-                    *stats.tasks_by_state.entry(row.state.clone()).or_default() += count;
-                    *stats.tasks_by_source.entry(row.source.clone()).or_default() += count;
-                    if row.state == "running" {
-                        stats.active_tasks += count;
+                    let mut stats = TaskStats::default();
+                    for row in &rows {
+                        let count = row.cnt as usize;
+                        stats.total_tasks += count;
+                        *stats.tasks_by_state.entry(row.state.clone()).or_default() += count;
+                        *stats.tasks_by_source.entry(row.source.clone()).or_default() += count;
+                        if row.state == "running" {
+                            stats.active_tasks += count;
+                        }
+                        stats.total_input_tokens += row.sum_input as u64;
+                        stats.total_output_tokens += row.sum_output as u64;
+                        stats.total_cache_read_tokens += row.sum_cache_read as u64;
+                        stats.total_cache_creation_tokens += row.sum_cache_creation as u64;
+                        stats.total_estimated_cost_usd += row.sum_cost;
                     }
-                    stats.total_input_tokens += row.sum_input as u64;
-                    stats.total_output_tokens += row.sum_output as u64;
-                    stats.total_cache_read_tokens += row.sum_cache_read as u64;
-                    stats.total_cache_creation_tokens += row.sum_cache_creation as u64;
-                    stats.total_estimated_cost_usd += row.sum_cost;
-                }
-                Ok(stats)
+                    Ok(stats)
+                })
             })
-        })
+        }
     }
-}
+} // mod postgres_store
+
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresTaskStore;
 
 #[cfg(test)]
 mod tests {
@@ -762,6 +772,10 @@ mod tests {
 
     // --- PostgresTaskStore unit tests (row conversion, no DB needed) ---
 
+    #[cfg(feature = "postgres")]
+    use postgres_store::*;
+
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_state_str_roundtrip() {
         for state in [
@@ -777,12 +791,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn str_to_task_state_unknown_defaults_to_pending() {
         assert_eq!(str_to_task_state("bogus"), TaskState::Pending);
         assert_eq!(str_to_task_state(""), TaskState::Pending);
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_row_to_daemon_task_pending() {
         let id = Uuid::new_v4();
@@ -818,6 +834,7 @@ mod tests {
         assert_eq!(task.source, "api");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_row_to_daemon_task_completed() {
         let id = Uuid::new_v4();
@@ -854,6 +871,7 @@ mod tests {
         assert_eq!(task.source, "cron:daily");
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_row_to_daemon_task_failed() {
         let now = chrono::Utc::now();
@@ -882,6 +900,7 @@ mod tests {
         assert_eq!(task.error.as_deref(), Some("out of tokens"));
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_row_preserves_timestamps() {
         let created = chrono::Utc::now();
@@ -912,6 +931,7 @@ mod tests {
         assert_eq!(task.completed_at, Some(completed));
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn task_row_with_agent_name() {
         let row = TaskRow {

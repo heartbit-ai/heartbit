@@ -927,6 +927,7 @@ pub(crate) async fn build_orchestrator_from_config(
         let max_turns = agent.max_turns.unwrap_or(config.orchestrator.max_turns);
         let max_tokens = agent.max_tokens.unwrap_or(config.orchestrator.max_tokens);
 
+        let agent_provider_for_judge = Arc::clone(&agent_provider);
         let mut rb = AgentRunner::builder(agent_provider)
             .name(&agent.name)
             .system_prompt(&agent.system_prompt)
@@ -1030,6 +1031,9 @@ pub(crate) async fn build_orchestrator_from_config(
         if let Some(m) = doom_loop {
             rb = rb.max_identical_tool_calls(m);
         }
+        if let Some(budget) = agent.max_total_tokens {
+            rb = rb.max_total_tokens(budget);
+        }
 
         // Session prune config
         if let Some(ref sp) = agent.session_prune {
@@ -1122,9 +1126,21 @@ pub(crate) async fn build_orchestrator_from_config(
             rb = rb.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
         }
 
-        // Wire guardrails (e.g., SensorSecurityGuardrail for sensor tasks)
-        if !guardrails.is_empty() {
-            rb = rb.guardrails(guardrails.clone());
+        // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
+        {
+            let mut all_guardrails = guardrails.clone();
+            // Per-agent guardrails config overrides top-level
+            let guardrails_config = agent.guardrails.as_ref().or(config.guardrails.as_ref());
+            if let Some(gc) = guardrails_config {
+                let judge_provider = gc
+                    .llm_judge
+                    .as_ref()
+                    .map(|_| Arc::clone(&agent_provider_for_judge));
+                all_guardrails.extend(gc.build_with_judge(judge_provider)?);
+            }
+            if !all_guardrails.is_empty() {
+                rb = rb.guardrails(all_guardrails);
+            }
         }
 
         tracing::info!(
@@ -1176,15 +1192,26 @@ pub(crate) async fn build_orchestrator_from_config(
 
     // ── Multi-agent orchestrator path ──
 
+    let provider_for_judge = Arc::clone(&provider);
     let mut builder = Orchestrator::builder(provider)
         .max_turns(config.orchestrator.max_turns)
         .max_tokens(config.orchestrator.max_tokens)
         .on_text(on_text)
         .observability_mode(observability_mode);
 
-    // Wire guardrails (e.g., SensorSecurityGuardrail for sensor tasks)
-    if !guardrails.is_empty() {
-        builder = builder.guardrails(guardrails.clone());
+    // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
+    {
+        let mut all_guardrails = guardrails.clone();
+        if let Some(gc) = &config.guardrails {
+            let judge_provider = gc
+                .llm_judge
+                .as_ref()
+                .map(|_| Arc::clone(&provider_for_judge));
+            all_guardrails.extend(gc.build_with_judge(judge_provider)?);
+        }
+        if !all_guardrails.is_empty() {
+            builder = builder.guardrails(all_guardrails);
+        }
     }
 
     // Wire workspace directory for sub-agents
@@ -1319,7 +1346,20 @@ pub(crate) async fn build_orchestrator_from_config(
             run_timeout: agent
                 .run_timeout_seconds
                 .map(std::time::Duration::from_secs),
-            guardrails: guardrails.clone(),
+            guardrails: {
+                let mut agent_guardrails = guardrails.clone();
+                // Per-agent guardrails config overrides top-level
+                let gc = agent.guardrails.as_ref().or(config.guardrails.as_ref());
+                if let Some(gc) = gc {
+                    let judge_provider = gc.llm_judge.as_ref().map(|_| {
+                        agent_provider
+                            .as_ref()
+                            .map_or_else(|| Arc::clone(&provider_for_judge), Arc::clone)
+                    });
+                    agent_guardrails.extend(gc.build_with_judge(judge_provider)?);
+                }
+                agent_guardrails
+            },
             provider: agent_provider,
             reasoning_effort: agent
                 .reasoning_effort
@@ -1346,6 +1386,8 @@ pub(crate) async fn build_orchestrator_from_config(
             reflection_threshold: agent.reflection_threshold,
             consolidate_on_exit: agent.consolidate_on_exit,
             workspace: None,
+            max_total_tokens: agent.max_total_tokens,
+            audit_trail: None,
         });
     }
 
@@ -1529,6 +1571,28 @@ pub(crate) async fn create_memory_store(config: &MemoryConfig) -> Result<Arc<dyn
             if let Some(emb_config) = embedding
                 && emb_config.provider != "none"
             {
+                if emb_config.provider == "local" {
+                    #[cfg(feature = "local-embedding")]
+                    {
+                        // Treat the OpenAI default model as "unset" for local provider
+                        let model_name = if emb_config.model == "text-embedding-3-small" {
+                            None
+                        } else {
+                            Some(emb_config.model.as_str())
+                        };
+                        let provider = heartbit::LocalEmbeddingProvider::new(
+                            model_name,
+                            emb_config.cache_dir.as_deref().map(std::path::Path::new),
+                        )?;
+                        return Ok(Arc::new(heartbit::EmbeddingMemory::new(
+                            memory,
+                            Arc::new(provider),
+                        )));
+                    }
+                    #[cfg(not(feature = "local-embedding"))]
+                    bail!("local embedding provider requires the 'local-embedding' feature");
+                }
+
                 let api_key = std::env::var(&emb_config.api_key_env).unwrap_or_default();
                 if !api_key.is_empty() {
                     let mut provider = heartbit::OpenAiEmbedding::new(&api_key, &emb_config.model);
@@ -1955,6 +2019,9 @@ async fn run_chat_from_config(
         }
         if let Some(true) = first_agent.consolidate_on_exit {
             builder = builder.consolidate_on_exit(true);
+        }
+        if let Some(budget) = first_agent.max_total_tokens {
+            builder = builder.max_total_tokens(budget);
         }
     }
     // Wire memory if configured

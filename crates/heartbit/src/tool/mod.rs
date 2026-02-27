@@ -1,3 +1,4 @@
+#[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod builtins;
 pub mod mcp;

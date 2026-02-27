@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::agent::guardrail::Guardrail;
+use crate::agent::guardrail::{Guardrail, GuardrailMeta};
 use crate::error::Error;
 use crate::llm::types::ToolCall;
 use crate::tool::ToolOutput;
@@ -34,6 +34,12 @@ fn is_email_tool(name: &str) -> bool {
 /// instead, which provides trust-aware authorization, injection detection,
 /// unique boundary IDs, and action blocking in addition to content fencing.
 pub struct ContentFenceGuardrail;
+
+impl GuardrailMeta for ContentFenceGuardrail {
+    fn name(&self) -> &str {
+        "content_fence"
+    }
+}
 
 impl Guardrail for ContentFenceGuardrail {
     fn post_tool(

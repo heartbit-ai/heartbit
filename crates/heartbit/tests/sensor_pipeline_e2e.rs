@@ -1,3 +1,4 @@
+#![cfg(feature = "sensor")]
 //! Sensor pipeline end-to-end tests.
 //!
 //! These tests exercise the full sensor pipeline through real Kafka:

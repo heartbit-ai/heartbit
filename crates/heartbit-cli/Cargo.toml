@@ -14,7 +14,7 @@ name = "heartbit"
 path = "src/main.rs"
 
 [dependencies]
-heartbit = { path = "../heartbit", features = ["telegram"] }
+heartbit = { path = "../heartbit", features = ["full"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -39,3 +39,6 @@ rdkafka = { workspace = true }
 teloxide = { workspace = true }
 dotenvy = { workspace = true }
 base64 = { workspace = true }
+
+[features]
+local-embedding = ["heartbit/local-embedding"]

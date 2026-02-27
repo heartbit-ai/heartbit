@@ -20,6 +20,9 @@ daemon-dev.toml
 telegram-test.toml
 gateway/config.yaml
 
+# Model cache (fastembed ONNX models)
+.fastembed_cache/
+
 # Scratch / test artifacts
 orchestrated.txt
 probe.txt

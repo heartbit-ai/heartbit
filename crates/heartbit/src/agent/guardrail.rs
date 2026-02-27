@@ -12,6 +12,12 @@ pub enum GuardAction {
     Allow,
     /// Deny the operation with a reason.
     Deny { reason: String },
+    /// Log the concern but allow the operation to proceed.
+    ///
+    /// The agent loop treats `Warn` like `Allow` but emits
+    /// `AgentEvent::GuardrailWarned` and an audit record. This enables
+    /// monitoring mode (shadow enforcement) without blocking production.
+    Warn { reason: String },
 }
 
 impl GuardAction {
@@ -20,6 +26,29 @@ impl GuardAction {
         GuardAction::Deny {
             reason: reason.into(),
         }
+    }
+
+    /// Create a `Warn` action with the given reason.
+    pub fn warn(reason: impl Into<String>) -> Self {
+        GuardAction::Warn {
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns `true` if this action blocks the operation (`Deny`).
+    pub fn is_denied(&self) -> bool {
+        matches!(self, GuardAction::Deny { .. })
+    }
+}
+
+/// Optional metadata for guardrail identification in events and audit records.
+///
+/// All guardrails auto-implement with `"unnamed"` via the blanket default.
+/// Override `name()` to attribute which guardrail fired in logs.
+pub trait GuardrailMeta {
+    /// Human-readable name for this guardrail, used in events and audit.
+    fn name(&self) -> &str {
+        "unnamed"
     }
 }
 
@@ -81,8 +110,42 @@ mod tests {
         let action = GuardAction::deny("PII detected");
         match action {
             GuardAction::Deny { reason } => assert_eq!(reason, "PII detected"),
-            GuardAction::Allow => panic!("expected Deny"),
+            _ => panic!("expected Deny"),
         }
+    }
+
+    #[test]
+    fn guard_action_warn_constructor() {
+        let action = GuardAction::warn("suspicious pattern");
+        match action {
+            GuardAction::Warn { reason } => assert_eq!(reason, "suspicious pattern"),
+            _ => panic!("expected Warn"),
+        }
+    }
+
+    #[test]
+    fn guard_action_is_denied() {
+        assert!(GuardAction::deny("blocked").is_denied());
+        assert!(!GuardAction::Allow.is_denied());
+        assert!(!GuardAction::warn("suspicious").is_denied());
+    }
+
+    #[test]
+    fn guardrail_meta_default_name() {
+        struct MyGuardrail;
+        impl GuardrailMeta for MyGuardrail {}
+        assert_eq!(MyGuardrail.name(), "unnamed");
+    }
+
+    #[test]
+    fn guardrail_meta_custom_name() {
+        struct NamedGuardrail;
+        impl GuardrailMeta for NamedGuardrail {
+            fn name(&self) -> &str {
+                "pii_detector"
+            }
+        }
+        assert_eq!(NamedGuardrail.name(), "pii_detector");
     }
 
     #[tokio::test]

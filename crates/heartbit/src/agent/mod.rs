@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod blackboard;
 pub(crate) mod blackboard_tools;
 pub mod context;
@@ -12,6 +13,7 @@ pub mod pruner;
 pub mod routing;
 pub(crate) mod token_estimator;
 pub mod tool_filter;
+pub mod workflow;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -35,6 +37,7 @@ use crate::memory::Memory;
 
 use crate::tool::builtins::OnQuestion;
 
+use self::audit::{AuditRecord, AuditTrail};
 use self::context::{AgentContext, ContextStrategy};
 use self::events::{AgentEvent, EVENT_MAX_PAYLOAD_BYTES, OnEvent, truncate_for_event};
 use self::guardrail::{GuardAction, Guardrail};
@@ -201,6 +204,11 @@ pub struct AgentRunner<P: LlmProvider> {
     consolidate_on_exit: bool,
     /// Observability verbosity level controlling span attribute recording.
     observability_mode: observability::ObservabilityMode,
+    /// Hard limit on cumulative tokens (input + output) across all turns.
+    /// When exceeded, the agent returns `Error::BudgetExceeded`.
+    max_total_tokens: Option<u64>,
+    /// Optional audit trail for recording untruncated agent decisions.
+    audit_trail: Option<Arc<dyn AuditTrail>>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -242,7 +250,14 @@ impl<P: LlmProvider> AgentRunner<P> {
             consolidate_on_exit: false,
             observability_mode: None,
             workspace: None,
+            max_total_tokens: None,
+            audit_trail: None,
         }
+    }
+
+    /// Returns the agent's name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Read-access to the permission rules (acquires read lock).
@@ -269,6 +284,15 @@ impl<P: LlmProvider> AgentRunner<P> {
     fn emit(&self, event: AgentEvent) {
         if let Some(ref cb) = self.on_event {
             cb(event);
+        }
+    }
+
+    /// Record an audit entry (best-effort). Failures are logged, never abort the agent.
+    async fn audit(&self, record: AuditRecord) {
+        if let Some(ref trail) = self.audit_trail
+            && let Err(e) = trail.record(record).await
+        {
+            tracing::warn!(error = %e, "audit record failed");
         }
     }
 
@@ -386,6 +410,21 @@ impl<P: LlmProvider> AgentRunner<P> {
             },
             None => fut.await,
         };
+
+        // Audit: run failed
+        if let Err(ref e) = result {
+            self.audit(AuditRecord {
+                agent: self.name.clone(),
+                turn: 0,
+                event_type: "run_failed".into(),
+                payload: serde_json::json!({
+                    "error": e.to_string(),
+                }),
+                usage: e.partial_usage(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+        }
 
         // Session-end maintenance (best-effort, errors logged but not propagated).
         if let Ok(ref mut output) = result {
@@ -700,6 +739,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // Update shared accumulator so RunTimeout can retrieve partial usage
                 *usage_acc.lock().expect("usage lock poisoned") = total_usage;
 
+                // Check token budget
+                if let Some(max) = self.max_total_tokens {
+                    let used = total_usage.total();
+                    if used > max {
+                        self.emit(AgentEvent::BudgetExceeded {
+                            agent: self.name.clone(),
+                            used,
+                            limit: max,
+                            partial_usage: total_usage,
+                        });
+                        return Err((
+                            Error::BudgetExceeded { used, limit: max },
+                            total_usage,
+                        ));
+                    }
+                }
+
                 let tool_calls = response.tool_calls();
 
                 self.emit(AgentEvent::LlmResponse {
@@ -717,6 +773,24 @@ impl<P: LlmProvider> AgentRunner<P> {
                     time_to_first_token_ms,
                 });
 
+                // Audit: LLM response (untruncated)
+                self.audit(AuditRecord {
+                    agent: self.name.clone(),
+                    turn: ctx.current_turn(),
+                    event_type: "llm_response".into(),
+                    payload: serde_json::json!({
+                        "text": response.text(),
+                        "stop_reason": format!("{:?}", response.stop_reason),
+                        "tool_call_count": tool_calls.len(),
+                        "latency_ms": llm_latency_ms,
+                        "model": response.model.as_deref()
+                            .or_else(|| self.provider.model_name()),
+                    }),
+                    usage: response.usage,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+
                 // post_llm guardrail: inspect response, first Deny discards it.
                 // When denied, we insert a synthetic assistant message before the
                 // denial feedback to maintain the alternating user/assistant message
@@ -725,6 +799,27 @@ impl<P: LlmProvider> AgentRunner<P> {
                 for g in &self.guardrails {
                     match g.post_llm(&response).await.map_err(|e| (e, total_usage))? {
                         GuardAction::Allow => {}
+                        GuardAction::Warn { reason } => {
+                            self.emit(AgentEvent::GuardrailWarned {
+                                agent: self.name.clone(),
+                                hook: "post_llm".into(),
+                                reason: reason.clone(),
+                                tool_name: None,
+                            });
+                            self.audit(AuditRecord {
+                                agent: self.name.clone(),
+                                turn: ctx.current_turn(),
+                                event_type: "guardrail_warned".into(),
+                                payload: serde_json::json!({
+                                    "hook": "post_llm",
+                                    "reason": reason,
+                                }),
+                                usage: TokenUsage::default(),
+                                timestamp: chrono::Utc::now(),
+                            })
+                            .await;
+                            // Continue — do NOT discard the response
+                        }
                         GuardAction::Deny { reason } => {
                             self.emit(AgentEvent::GuardrailDenied {
                                 agent: self.name.clone(),
@@ -732,6 +827,19 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 reason: reason.clone(),
                                 tool_name: None,
                             });
+                            // Audit: guardrail denied
+                            self.audit(AuditRecord {
+                                agent: self.name.clone(),
+                                turn: ctx.current_turn(),
+                                event_type: "guardrail_denied".into(),
+                                payload: serde_json::json!({
+                                    "hook": "post_llm",
+                                    "reason": reason,
+                                }),
+                                usage: TokenUsage::default(),
+                                timestamp: chrono::Utc::now(),
+                            })
+                            .await;
                             // Maintain alternating roles: assistant placeholder, then user denial
                             ctx.add_assistant_message(Message {
                                 role: crate::llm::types::Role::Assistant,
@@ -802,6 +910,21 @@ impl<P: LlmProvider> AgentRunner<P> {
                         total_usage,
                         tool_calls_made: total_tool_calls,
                     });
+                    // Audit: run completed (structured)
+                    let preview_end =
+                        crate::tool::builtins::floor_char_boundary(&text, 1000);
+                    self.audit(AuditRecord {
+                        agent: self.name.clone(),
+                        turn: ctx.current_turn(),
+                        event_type: "run_completed".into(),
+                        payload: serde_json::json!({
+                            "total_tool_calls": total_tool_calls,
+                            "result_preview": &text[..preview_end],
+                        }),
+                        usage: total_usage,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
                     return Ok(AgentOutput {
                         result: text,
                         tool_calls_made: total_tool_calls,
@@ -860,8 +983,25 @@ impl<P: LlmProvider> AgentRunner<P> {
                         total_usage,
                         tool_calls_made: total_tool_calls,
                     });
+                    let result_text =
+                        ctx.last_assistant_text().unwrap_or_default().to_string();
+                    // Audit: run completed
+                    let preview_end =
+                        crate::tool::builtins::floor_char_boundary(&result_text, 1000);
+                    self.audit(AuditRecord {
+                        agent: self.name.clone(),
+                        turn: ctx.current_turn(),
+                        event_type: "run_completed".into(),
+                        payload: serde_json::json!({
+                            "total_tool_calls": total_tool_calls,
+                            "result_preview": &result_text[..preview_end],
+                        }),
+                        usage: total_usage,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
                     return Ok(AgentOutput {
-                        result: ctx.last_assistant_text().unwrap_or_default().to_string(),
+                        result: result_text,
                         tool_calls_made: total_tool_calls,
                         tokens_used: total_usage,
                         structured: None,
@@ -1040,6 +1180,28 @@ impl<P: LlmProvider> AgentRunner<P> {
                         for g in &self.guardrails {
                             match g.pre_tool(&call).await.map_err(|e| (e, total_usage))? {
                                 GuardAction::Allow => {}
+                                GuardAction::Warn { reason } => {
+                                    self.emit(AgentEvent::GuardrailWarned {
+                                        agent: self.name.clone(),
+                                        hook: "pre_tool".into(),
+                                        reason: reason.clone(),
+                                        tool_name: Some(call.name.clone()),
+                                    });
+                                    self.audit(AuditRecord {
+                                        agent: self.name.clone(),
+                                        turn: ctx.current_turn(),
+                                        event_type: "guardrail_warned".into(),
+                                        payload: serde_json::json!({
+                                            "hook": "pre_tool",
+                                            "reason": reason,
+                                            "tool_name": call.name,
+                                        }),
+                                        usage: TokenUsage::default(),
+                                        timestamp: chrono::Utc::now(),
+                                    })
+                                    .await;
+                                    // Continue — do NOT deny the tool call
+                                }
                                 GuardAction::Deny { reason } => {
                                     self.emit(AgentEvent::GuardrailDenied {
                                         agent: self.name.clone(),
@@ -1047,6 +1209,20 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         reason: reason.clone(),
                                         tool_name: Some(call.name.clone()),
                                     });
+                                    // Audit: pre_tool guardrail denied
+                                    self.audit(AuditRecord {
+                                        agent: self.name.clone(),
+                                        turn: ctx.current_turn(),
+                                        event_type: "guardrail_denied".into(),
+                                        payload: serde_json::json!({
+                                            "hook": "pre_tool",
+                                            "reason": reason,
+                                            "tool_name": call.name,
+                                        }),
+                                        usage: TokenUsage::default(),
+                                        timestamp: chrono::Utc::now(),
+                                    })
+                                    .await;
                                     denied.push(ToolResult::error(
                                         call.id.clone(),
                                         format!("Guardrail denied: {reason}"),
@@ -1074,7 +1250,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     tool_count = allowed_calls.len(),
                 );
                 let mut results = self
-                    .execute_tools_parallel(&allowed_calls)
+                    .execute_tools_parallel(&allowed_calls, ctx.current_turn())
                     .instrument(tool_batch_span)
                     .await;
                 results.extend(denied_results);
@@ -1568,7 +1744,7 @@ impl<P: LlmProvider> AgentRunner<P> {
     ///
     /// Panicked tasks produce an error `ToolResult` so the LLM always gets a
     /// result for every `tool_use_id` it sent.
-    async fn execute_tools_parallel(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+    async fn execute_tools_parallel(&self, calls: &[ToolCall], turn: usize) -> Vec<ToolResult> {
         let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
         let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         let mut join_set = tokio::task::JoinSet::new();
@@ -1599,6 +1775,21 @@ impl<P: LlmProvider> AgentRunner<P> {
                     EVENT_MAX_PAYLOAD_BYTES,
                 ),
             });
+
+            // Audit: tool call (untruncated input)
+            self.audit(AuditRecord {
+                agent: self.name.clone(),
+                turn,
+                event_type: "tool_call".into(),
+                payload: serde_json::json!({
+                    "tool_name": call.name,
+                    "tool_call_id": call.id,
+                    "input": call.input,
+                }),
+                usage: TokenUsage::default(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
 
             // Validate input against the tool's declared schema before dispatching.
             // On failure, produce an error result without executing the tool.
@@ -1673,6 +1864,20 @@ impl<P: LlmProvider> AgentRunner<P> {
                         reason: e.to_string(),
                         tool_name: Some(call_names[idx].clone()),
                     });
+                    // Audit: post_tool guardrail denied
+                    self.audit(AuditRecord {
+                        agent: self.name.clone(),
+                        turn,
+                        event_type: "guardrail_denied".into(),
+                        payload: serde_json::json!({
+                            "hook": "post_tool",
+                            "reason": e.to_string(),
+                            "tool_name": call_names[idx],
+                        }),
+                        usage: TokenUsage::default(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
                     // post_tool error: convert to error output instead of aborting
                     // the entire run (consistent with tool execution errors)
                     output = ToolOutput::error(format!("Guardrail error: {e}"));
@@ -1689,6 +1894,22 @@ impl<P: LlmProvider> AgentRunner<P> {
                 duration_ms,
                 output: truncate_for_event(&output.content, EVENT_MAX_PAYLOAD_BYTES),
             });
+            // Audit: tool result (untruncated output)
+            self.audit(AuditRecord {
+                agent: self.name.clone(),
+                turn,
+                event_type: "tool_result".into(),
+                payload: serde_json::json!({
+                    "tool_name": call_names[idx],
+                    "tool_call_id": call_ids[idx],
+                    "output": output.content,
+                    "is_error": is_error,
+                    "duration_ms": duration_ms,
+                }),
+                usage: TokenUsage::default(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
             results_vec.push(tool_output_to_result(call_ids[idx].clone(), output));
         }
 
@@ -1743,6 +1964,10 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     observability_mode: Option<observability::ObservabilityMode>,
     /// Optional workspace root for file tool path resolution and system prompt.
     workspace: Option<std::path::PathBuf>,
+    /// Hard limit on cumulative tokens (input + output) across all turns.
+    max_total_tokens: Option<u64>,
+    /// Optional audit trail for recording untruncated agent decisions.
+    audit_trail: Option<Arc<dyn AuditTrail>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -2038,6 +2263,27 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a hard limit on cumulative tokens (input + output) across all turns.
+    ///
+    /// When the total tokens consumed exceed this limit, the agent returns
+    /// `Error::BudgetExceeded` with partial usage data.
+    ///
+    /// Default: `None` (no budget).
+    pub fn max_total_tokens(mut self, max: u64) -> Self {
+        self.max_total_tokens = Some(max);
+        self
+    }
+
+    /// Attach an audit trail for recording untruncated agent decisions.
+    ///
+    /// When set, every LLM response, tool call, tool result, run completion,
+    /// run failure, and guardrail denial is recorded with full payloads.
+    /// Recording is best-effort: failures are logged, never abort the agent.
+    pub fn audit_trail(mut self, trail: Arc<dyn AuditTrail>) -> Self {
+        self.audit_trail = Some(trail);
+        self
+    }
+
     /// Set the agent's workspace directory. When set, file tools resolve
     /// relative paths against this directory, BashTool starts here, and a
     /// workspace hint is appended to the system prompt.
@@ -2084,6 +2330,9 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             return Err(Error::Config(
                 "max_identical_tool_calls must be at least 1".into(),
             ));
+        }
+        if self.max_total_tokens == Some(0) {
+            return Err(Error::Config("max_total_tokens must be at least 1".into()));
         }
 
         // Collect all tools, including memory and knowledge tools
@@ -2200,6 +2449,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 None,
                 self.observability_mode,
             ),
+            max_total_tokens: self.max_total_tokens,
+            audit_trail: self.audit_trail,
         })
     }
 }
@@ -6417,6 +6668,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn builder_rejects_zero_max_total_tokens() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .max_total_tokens(0)
+            .build();
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("max_total_tokens must be at least 1"),
+                    "error: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for max_total_tokens(0)"),
+        }
+    }
+
     // --- Permission Rules Integration Tests ---
 
     #[tokio::test]
@@ -6939,5 +7210,276 @@ mod tests {
             runner.system_prompt.contains(&year),
             "system prompt should contain current year"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_exceeded_returns_error() {
+        // Mock: first call returns 60k tokens, second call also returns 60k tokens
+        // Budget is 100k, so the second call should trigger BudgetExceeded
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "echo".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 30000,
+                    output_tokens: 30000,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 30000,
+                    output_tokens: 30000,
+                    ..Default::default()
+                },
+                model: None,
+            },
+        ]));
+        let tool = MockTool::new("echo", "ok");
+        let runner = AgentRunner::builder(provider)
+            .name("budget-test")
+            .system_prompt("test")
+            .tool(Arc::new(tool))
+            .max_total_tokens(100000) // Budget: 100k total tokens
+            .build()
+            .unwrap();
+
+        let result = runner.execute("test task").await;
+        match result {
+            Err(Error::WithPartialUsage { source, usage }) => {
+                assert!(
+                    matches!(
+                        *source,
+                        Error::BudgetExceeded {
+                            used: 120000,
+                            limit: 100000
+                        }
+                    ),
+                    "expected BudgetExceeded, got: {source}"
+                );
+                assert_eq!(usage.total(), 120000);
+            }
+            Err(e) => panic!("expected BudgetExceeded, got: {e}"),
+            Ok(output) => panic!("expected error, got success: {}", output.result),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_not_exceeded_when_under_limit() {
+        // Single LLM call with 100 tokens, budget is 1000
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            model: None,
+        }]));
+        let runner = AgentRunner::builder(provider)
+            .name("budget-ok-test")
+            .system_prompt("test")
+            .max_total_tokens(1000)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("test task").await.unwrap();
+        assert_eq!(output.tokens_used.total(), 100);
+    }
+
+    #[tokio::test]
+    async fn budget_event_emitted_on_exceeded() {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            model: None,
+        }]));
+        let runner = AgentRunner::builder(provider)
+            .name("budget-event-test")
+            .system_prompt("test")
+            .max_total_tokens(50) // Way below what the response will use
+            .on_event(Arc::new(move |event| {
+                events_clone.lock().unwrap().push(event);
+            }))
+            .build()
+            .unwrap();
+
+        let _ = runner.execute("test task").await;
+        let events = events.lock().unwrap();
+        let budget_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::BudgetExceeded { .. }))
+            .collect();
+        assert_eq!(
+            budget_events.len(),
+            1,
+            "expected exactly one BudgetExceeded event"
+        );
+        match &budget_events[0] {
+            AgentEvent::BudgetExceeded { used, limit, .. } => {
+                assert_eq!(*used, 200);
+                assert_eq!(*limit, 50);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_runner_records_audit_trail() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Done!".into(),
+            }],
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stop_reason: StopReason::EndTurn,
+            model: Some("test-model".into()),
+        }]));
+
+        let trail = Arc::new(crate::agent::audit::InMemoryAuditTrail::new());
+        let runner = AgentRunner::builder(provider)
+            .name("audit-test")
+            .system_prompt("You help.")
+            .max_turns(5)
+            .audit_trail(trail.clone())
+            .build()
+            .unwrap();
+
+        let output = runner.execute("hello").await.unwrap();
+        assert_eq!(output.result, "Done!");
+
+        let entries = trail.entries().await.unwrap();
+        let event_types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            event_types.contains(&"llm_response"),
+            "expected llm_response, got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"run_completed"),
+            "expected run_completed, got: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_trail_captures_tool_calls() {
+        let tool = Arc::new(MockTool::new("greet", "Hello!"));
+        let provider = Arc::new(MockProvider::new(vec![
+            // Turn 1: call the tool
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "greet".into(),
+                    input: json!({"name": "world"}),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+                model: None,
+            },
+            // Turn 2: final text
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "All done.".into(),
+                }],
+                usage: TokenUsage {
+                    input_tokens: 15,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::EndTurn,
+                model: None,
+            },
+        ]));
+
+        let trail = Arc::new(crate::agent::audit::InMemoryAuditTrail::new());
+        let runner = AgentRunner::builder(provider)
+            .name("tool-audit-test")
+            .system_prompt("You help.")
+            .tool(tool)
+            .max_turns(5)
+            .audit_trail(trail.clone())
+            .build()
+            .unwrap();
+
+        runner.execute("greet the world").await.unwrap();
+
+        let entries = trail.entries().await.unwrap();
+        let event_types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            event_types.contains(&"tool_call"),
+            "expected tool_call, got: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"tool_result"),
+            "expected tool_result, got: {event_types:?}"
+        );
+
+        // Verify tool_result has untruncated output
+        let tool_result = entries
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .unwrap();
+        assert_eq!(tool_result.payload["output"], "Hello!");
+
+        // Verify tool_call has correct turn (not 0)
+        let tool_call_entry = entries
+            .iter()
+            .find(|e| e.event_type == "tool_call")
+            .unwrap();
+        assert!(
+            tool_call_entry.turn > 0,
+            "tool_call turn should be > 0, got: {}",
+            tool_call_entry.turn
+        );
+        // Verify tool_call has full input
+        assert_eq!(tool_call_entry.payload["input"]["name"], "world");
+    }
+
+    #[tokio::test]
+    async fn audit_trail_none_by_default() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text { text: "OK".into() }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+            model: None,
+        }]));
+
+        // No audit trail set — should not panic
+        let runner = AgentRunner::builder(provider)
+            .name("no-audit")
+            .system_prompt("You help.")
+            .max_turns(5)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("hello").await.unwrap();
+        assert_eq!(output.result, "OK");
     }
 }

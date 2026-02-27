@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/heartbit", "crates/heartbit-cli"]
 
 [workspace.package]
-version = "2026.226.2"
+version = "2026.227.1"
 authors = ["Pascal Le Clech <pascal@heartbit.ai>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/heartbit-ai/heartbit"
@@ -50,3 +50,4 @@ subtle = "2"
 base64 = "0.22"
 teloxide = { version = "0.17", features = ["macros"] }
 dotenvy = "0.15"
+fastembed = { version = "5" }

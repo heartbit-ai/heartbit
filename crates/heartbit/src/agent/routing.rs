@@ -10,6 +10,55 @@ use serde::{Deserialize, Serialize};
 use super::events::AgentEvent;
 use crate::Error;
 
+/// Pluggable routing strategy for deciding single-agent vs orchestrator dispatch.
+///
+/// Implement this trait to replace the default keyword-based heuristic with
+/// domain-specific routing logic (e.g., route to "quoter" when a task mentions
+/// pricing, or route to "miner" when it mentions leads).
+///
+/// # Example
+/// ```ignore
+/// struct DomainRouter;
+///
+/// impl RoutingStrategy for DomainRouter {
+///     fn route(&self, task: &str, agents: &[AgentCapability]) -> (RoutingDecision, ComplexitySignals) {
+///         if task.contains("pricing") || task.contains("quote") {
+///             let idx = agents.iter().position(|a| a.name == "quoter").unwrap_or(0);
+///             return (
+///                 RoutingDecision::SingleAgent { agent_index: idx, reason: "pricing domain" },
+///                 ComplexitySignals::default(),
+///             );
+///         }
+///         // Fallback to default
+///         KeywordRoutingStrategy.route(task, agents)
+///     }
+/// }
+/// ```
+pub trait RoutingStrategy: Send + Sync {
+    /// Analyze a task and decide routing.
+    fn route(&self, task: &str, agents: &[AgentCapability])
+    -> (RoutingDecision, ComplexitySignals);
+}
+
+/// Default routing strategy using keyword-based heuristics and capability matching.
+///
+/// This wraps the existing `TaskComplexityAnalyzer` three-tier cascade:
+/// - Tier 1: fast heuristic scoring
+/// - Tier 2: agent capability matching
+/// - Tier 3: runtime escalation (handled separately)
+pub struct KeywordRoutingStrategy;
+
+impl RoutingStrategy for KeywordRoutingStrategy {
+    fn route(
+        &self,
+        task: &str,
+        agents: &[AgentCapability],
+    ) -> (RoutingDecision, ComplexitySignals) {
+        let analyzer = TaskComplexityAnalyzer::new(agents);
+        analyzer.analyze(task)
+    }
+}
+
 /// User-configurable routing strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -927,6 +976,112 @@ mod tests {
     }
 
     // ── Backward compatibility ──
+
+    // ── RoutingStrategy trait tests ──
+
+    #[test]
+    fn keyword_routing_strategy_routes_simple_to_single() {
+        let agents = make_agents();
+        let strategy = KeywordRoutingStrategy;
+        let (decision, _) = strategy.route("What is Rust?", &agents);
+        assert!(
+            matches!(decision, RoutingDecision::SingleAgent { .. }),
+            "got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_routing_strategy_routes_complex_to_orchestrate() {
+        let agents = make_agents();
+        let strategy = KeywordRoutingStrategy;
+        let task =
+            "Delegate to coder to implement the feature and have researcher find best practices";
+        let (decision, _) = strategy.route(task, &agents);
+        assert!(
+            matches!(decision, RoutingDecision::Orchestrate { .. }),
+            "got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn custom_routing_strategy() {
+        struct AlwaysOrchestrate;
+        impl RoutingStrategy for AlwaysOrchestrate {
+            fn route(
+                &self,
+                _task: &str,
+                _agents: &[AgentCapability],
+            ) -> (RoutingDecision, ComplexitySignals) {
+                (
+                    RoutingDecision::Orchestrate {
+                        reason: "custom: always orchestrate",
+                    },
+                    ComplexitySignals::default(),
+                )
+            }
+        }
+
+        let agents = make_agents();
+        let strategy = AlwaysOrchestrate;
+        let (decision, _) = strategy.route("What is 2+2?", &agents);
+        assert!(
+            matches!(decision, RoutingDecision::Orchestrate { .. }),
+            "got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn custom_routing_strategy_with_domain_matching() {
+        struct PricingRouter;
+        impl RoutingStrategy for PricingRouter {
+            fn route(
+                &self,
+                task: &str,
+                agents: &[AgentCapability],
+            ) -> (RoutingDecision, ComplexitySignals) {
+                let task_lower = task.to_lowercase();
+                if task_lower.contains("pricing") || task_lower.contains("quote") {
+                    let idx = agents.iter().position(|a| a.name == "quoter").unwrap_or(0);
+                    return (
+                        RoutingDecision::SingleAgent {
+                            agent_index: idx,
+                            reason: "pricing domain detected",
+                        },
+                        ComplexitySignals::default(),
+                    );
+                }
+                // Fallback to default
+                KeywordRoutingStrategy.route(task, agents)
+            }
+        }
+
+        let agents = vec![
+            AgentCapability::from_config("miner", "Finds sales leads", &[]),
+            AgentCapability::from_config("quoter", "Generates pricing quotes", &[]),
+        ];
+        let strategy = PricingRouter;
+
+        // Should route to quoter
+        let (decision, _) = strategy.route("Generate a pricing quote for the client", &agents);
+        match decision {
+            RoutingDecision::SingleAgent { agent_index, .. } => assert_eq!(agent_index, 1),
+            other => panic!("expected SingleAgent, got: {other:?}"),
+        }
+
+        // Non-pricing task should fallback
+        let (decision, _) = strategy.route("What is 2+2?", &agents);
+        assert!(matches!(decision, RoutingDecision::SingleAgent { .. }));
+    }
+
+    #[test]
+    fn routing_strategy_dyn_dispatch() {
+        // Verify the trait is object-safe and works with Arc<dyn RoutingStrategy>
+        let strategy: std::sync::Arc<dyn RoutingStrategy> =
+            std::sync::Arc::new(KeywordRoutingStrategy);
+        let agents = make_agents();
+        let (decision, _) = strategy.route("What is Rust?", &agents);
+        assert!(matches!(decision, RoutingDecision::SingleAgent { .. }));
+    }
 
     #[test]
     fn missing_routing_field_defaults_to_auto() {
