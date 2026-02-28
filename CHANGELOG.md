@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.228.2] - 2026-02-28
+
+### Added
+
+- **`[daemon.auth.token_exchange]` config** — RFC 8693 Token Exchange configuration (`exchange_url`, `client_id`, `client_secret`, `agent_token`, `scopes`) for per-user MCP auth delegation. Config validation rejects empty required fields.
+- **Per-task MCP tool loading** — when `token_exchange` is configured and user context is present, each daemon task creates fresh MCP connections with a user-scoped delegated token instead of shared static auth.
+- **`audit_delegation_chain`** on `AgentRunner`, `Orchestrator`, `SubAgentConfig` — records which agent(s) are in the delegation path when acting on behalf of a user. Populated automatically in multi-tenant mode.
+- **Tenant-scoped store queries** — `TaskStore::list_filtered()` and `stats()` accept `tenant_id` parameter, pushing filter to store level. Fixes pagination counts and prevents cross-tenant data in stats.
+- 11 new tests: 6 tenant-filtered store/core, 5 token exchange config validation.
+
 ## [2026.228.1] - 2026-02-28
 
 ### Added
