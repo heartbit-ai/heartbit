@@ -175,12 +175,19 @@ pub trait Memory: Send + Sync {
 
     /// Remove entries whose strength has decayed below `min_strength`
     /// and are older than `min_age`.
+    ///
+    /// When `agent_prefix` is `Some`, only entries whose `agent` field
+    /// starts with the given prefix are candidates for pruning. This
+    /// enables namespace-scoped pruning in multi-tenant setups where
+    /// `NamespacedMemory` must not delete entries from other namespaces.
+    ///
     /// Returns the number of entries pruned.
     /// Default implementation is a no-op for backward compatibility.
     fn prune(
         &self,
         _min_strength: f64,
         _min_age: chrono::Duration,
+        _agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         Box::pin(async { Ok(0) })
     }

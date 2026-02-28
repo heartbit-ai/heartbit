@@ -288,9 +288,12 @@ pub struct TokenExchangeAuthProvider {
     client_id: String,
     client_secret: String,
     agent_token: String,
+    /// Subject tokens for token exchange: key is `"{tenant_id}:{user_id}"`.
+    /// Populated externally (e.g. by the daemon HTTP handler when a user submits a task).
     user_tokens: Arc<RwLock<HashMap<String, String>>>,
-    /// Cache of exchanged tokens: user_id -> (access_token, expires_at).
-    token_cache: RwLock<HashMap<String, (String, std::time::Instant)>>,
+    /// Cache of exchanged tokens: (tenant_id, user_id) -> (access_token, expires_at).
+    /// Keyed by both tenant and user to prevent cross-tenant token leakage.
+    token_cache: RwLock<HashMap<(String, String), (String, std::time::Instant)>>,
 }
 
 /// Token exchange response per RFC 8693.
@@ -327,10 +330,15 @@ impl TokenExchangeAuthProvider {
         }
     }
 
-    /// Set the user tokens map (user_id -> subject_token).
+    /// Set the user tokens map (`"{tenant_id}:{user_id}"` -> subject_token).
     pub fn with_user_tokens(mut self, tokens: Arc<RwLock<HashMap<String, String>>>) -> Self {
         self.user_tokens = tokens;
         self
+    }
+
+    /// Get a reference to the shared user tokens map for external population.
+    pub fn user_tokens(&self) -> &Arc<RwLock<HashMap<String, String>>> {
+        &self.user_tokens
     }
 }
 
@@ -338,24 +346,28 @@ impl AuthProvider for TokenExchangeAuthProvider {
     fn auth_header_for<'a>(
         &'a self,
         user_id: &'a str,
-        _tenant_id: &'a str,
+        tenant_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
         Box::pin(async move {
-            // Check cache first
+            // Check cache first — keyed by (tenant_id, user_id) to prevent cross-tenant leakage
+            let cache_key = (tenant_id.to_string(), user_id.to_string());
             if let Ok(cache) = self.token_cache.read()
-                && let Some((token, expires_at)) = cache.get(user_id)
+                && let Some((token, expires_at)) = cache.get(&cache_key)
                 && std::time::Instant::now() < *expires_at
             {
                 return Ok(Some(format!("Bearer {token}")));
             }
 
+            let token_key = format!("{tenant_id}:{user_id}");
             let subject_token = {
                 let tokens = self
                     .user_tokens
                     .read()
                     .map_err(|e| Error::Mcp(format!("user_tokens lock poisoned: {e}")))?;
-                tokens.get(user_id).cloned().ok_or_else(|| {
-                    Error::Mcp(format!("No subject token found for user '{user_id}'"))
+                tokens.get(&token_key).cloned().ok_or_else(|| {
+                    Error::Mcp(format!(
+                        "No subject token found for user '{user_id}' in tenant '{tenant_id}'"
+                    ))
                 })?
             };
 
@@ -403,16 +415,13 @@ impl AuthProvider for TokenExchangeAuthProvider {
                 .await
                 .map_err(|e| Error::Mcp(format!("Token exchange response parse error: {e}")))?;
 
-            // Cache the exchanged token with expiry (default 5 minutes if not specified)
-            let ttl = token_response.expires_in.unwrap_or(300);
+            // Cache the exchanged token with expiry (default 5 min, max 1 hour)
+            let ttl = token_response.expires_in.unwrap_or(300).min(3600);
             // Expire 30 seconds early to avoid using nearly-expired tokens
             let expires_at =
                 std::time::Instant::now() + std::time::Duration::from_secs(ttl.saturating_sub(30));
             if let Ok(mut cache) = self.token_cache.write() {
-                cache.insert(
-                    user_id.to_string(),
-                    (token_response.access_token.clone(), expires_at),
-                );
+                cache.insert(cache_key, (token_response.access_token.clone(), expires_at));
             }
 
             let token_type = token_response.token_type.as_deref().unwrap_or("Bearer");

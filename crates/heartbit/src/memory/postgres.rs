@@ -831,18 +831,36 @@ impl Memory for PostgresMemoryStore {
         &self,
         min_strength: f64,
         min_age: chrono::Duration,
+        agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+        let owned_prefix = agent_prefix.map(String::from);
         Box::pin(async move {
             // Fetch candidates: entries with raw strength below threshold and old enough.
             // Then filter in Rust using effective_strength (Ebbinghaus decay).
+            // When agent_prefix is set, push the filter to SQL for efficiency.
             let min_age_secs = min_age.num_seconds().max(0);
-            let rows = sqlx::query(
-                "SELECT id, strength, last_accessed, created_at FROM memories WHERE strength < $1 AND created_at < now() - make_interval(secs => $2)",
-            )
-            .bind(min_strength)
-            .bind(min_age_secs as f64)
-            .fetch_all(&self.pool)
-            .await
+            let rows = if let Some(ref prefix) = owned_prefix {
+                let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+                sqlx::query(
+                    "SELECT id, strength, last_accessed, created_at FROM memories \
+                     WHERE strength < $1 AND created_at < now() - make_interval(secs => $2) \
+                     AND agent LIKE $3",
+                )
+                .bind(min_strength)
+                .bind(min_age_secs as f64)
+                .bind(&pattern)
+                .fetch_all(&self.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "SELECT id, strength, last_accessed, created_at FROM memories \
+                     WHERE strength < $1 AND created_at < now() - make_interval(secs => $2)",
+                )
+                .bind(min_strength)
+                .bind(min_age_secs as f64)
+                .fetch_all(&self.pool)
+                .await
+            }
             .map_err(|e| Error::Memory(format!("failed to query for pruning: {e}")))?;
 
             let now = Utc::now();

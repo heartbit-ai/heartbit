@@ -463,7 +463,9 @@ impl Memory for InMemoryStore {
         &self,
         min_strength: f64,
         min_age: chrono::Duration,
+        agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+        let owned_prefix = agent_prefix.map(String::from);
         Box::pin(async move {
             let mut entries = self
                 .entries
@@ -474,6 +476,12 @@ impl Memory for InMemoryStore {
             let to_remove: Vec<String> = entries
                 .values()
                 .filter(|e| {
+                    // If agent_prefix is set, only consider entries whose agent starts with it
+                    if let Some(ref prefix) = owned_prefix
+                        && !e.agent.starts_with(prefix.as_str())
+                    {
+                        return false;
+                    }
                     let eff =
                         effective_strength(e.strength, e.last_accessed, now, STRENGTH_DECAY_RATE);
                     eff < min_strength && now.signed_duration_since(e.created_at) > min_age
@@ -1197,7 +1205,10 @@ mod tests {
         weak.created_at = Utc::now() - chrono::Duration::hours(48);
         store.store(weak).await.unwrap();
 
-        let pruned = store.prune(0.1, chrono::Duration::hours(1)).await.unwrap();
+        let pruned = store
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
         assert_eq!(pruned, 1);
 
         let results = store
@@ -1221,7 +1232,10 @@ mod tests {
         weak_recent.created_at = Utc::now(); // just created
         store.store(weak_recent).await.unwrap();
 
-        let pruned = store.prune(0.1, chrono::Duration::hours(24)).await.unwrap();
+        let pruned = store
+            .prune(0.1, chrono::Duration::hours(24), None)
+            .await
+            .unwrap();
         assert_eq!(pruned, 0, "recent entry should not be pruned");
     }
 
@@ -1247,7 +1261,10 @@ mod tests {
         // Prune with min_strength=0.1, min_age=24h
         // m1: effective ≈ 0.014 < 0.1, age 30d > 24h → pruned
         // m2: effective ≈ 0.5 > 0.1 → kept
-        let pruned = store.prune(0.1, chrono::Duration::hours(24)).await.unwrap();
+        let pruned = store
+            .prune(0.1, chrono::Duration::hours(24), None)
+            .await
+            .unwrap();
         assert_eq!(pruned, 1, "old unaccessed entry should be pruned");
 
         let results = store
@@ -1259,6 +1276,66 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "m2");
+    }
+
+    #[tokio::test]
+    async fn prune_with_agent_prefix_only_removes_matching_agent() {
+        let store = InMemoryStore::new();
+
+        // Weak + old entries from different agents
+        let mut weak_a = make_entry("m1", "agent_a", "weak from A", "fact");
+        weak_a.strength = 0.01;
+        weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(weak_a).await.unwrap();
+
+        let mut weak_b = make_entry("m2", "agent_b", "weak from B", "fact");
+        weak_b.strength = 0.01;
+        weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(weak_b).await.unwrap();
+
+        // Prune with agent_prefix = "agent_a" — should only remove agent_a's entry
+        let pruned = store
+            .prune(0.1, chrono::Duration::hours(1), Some("agent_a"))
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "should only prune agent_a's entry");
+
+        let results = store
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "m2");
+        assert_eq!(results[0].agent, "agent_b");
+    }
+
+    #[tokio::test]
+    async fn prune_none_prefix_removes_all_matching() {
+        let store = InMemoryStore::new();
+
+        let mut weak_a = make_entry("m1", "agent_a", "weak from A", "fact");
+        weak_a.strength = 0.01;
+        weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(weak_a).await.unwrap();
+
+        let mut weak_b = make_entry("m2", "agent_b", "weak from B", "fact");
+        weak_b.strength = 0.01;
+        weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(weak_b).await.unwrap();
+
+        // Prune with None prefix — removes all weak entries
+        let pruned = store
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 2, "should prune all weak entries");
     }
 
     #[tokio::test]

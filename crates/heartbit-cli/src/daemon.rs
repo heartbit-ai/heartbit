@@ -117,6 +117,10 @@ struct AppState {
     /// Used via middleware state; kept here for introspection by future handlers.
     #[allow(dead_code)]
     jwt_validator: Option<Arc<JwtValidator>>,
+    /// Shared subject token map for RFC 8693 token exchange.
+    /// Key: `"{tenant_id}:{user_id}"`, Value: raw JWT.
+    /// Populated by submit handler, consumed by TokenExchangeAuthProvider.
+    user_tokens: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 // --- Handlers ---
@@ -131,6 +135,13 @@ async fn handle_submit(
     }
 
     let result = if let Some(axum::Extension(ref ctx)) = user_context {
+        // Stash the raw JWT for token exchange (consumed by TokenExchangeAuthProvider).
+        if let Some(ref token) = ctx.raw_token {
+            let key = format!("{}:{}", ctx.tenant_id, ctx.user_id);
+            if let Ok(mut tokens) = state.user_tokens.write() {
+                tokens.insert(key, token.clone());
+            }
+        }
         state
             .handle
             .submit_task_with_user(body.task, "api", body.story_id, ctx)
@@ -234,25 +245,31 @@ async fn handle_get(
     user_context: Option<axum::Extension<UserContext>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
-    match state.handle.get_task(id) {
-        Ok(Some(task)) => {
-            // Enforce tenant isolation when user context is present
-            if let Some(axum::Extension(ref ctx)) = user_context
-                && task.tenant_id.as_deref() != Some(&ctx.tenant_id)
-            {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "task not found" })),
-                )
-                    .into_response();
-            }
-            Json(task).into_response()
-        }
-        Ok(None) => (
+    let not_found = || {
+        (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "task not found" })),
         )
-            .into_response(),
+            .into_response()
+    };
+    match state.handle.get_task(id) {
+        Ok(Some(task)) => {
+            // Enforce tenant isolation:
+            // - Authenticated user: must match task's tenant_id
+            // - Unauthenticated: cannot access tenant-scoped tasks
+            match (&user_context, task.tenant_id.as_deref()) {
+                (Some(axum::Extension(ctx)), Some(tid)) if tid != ctx.tenant_id => {
+                    return not_found();
+                }
+                (None, Some(_)) => {
+                    // Task belongs to a tenant but caller is unauthenticated
+                    return not_found();
+                }
+                _ => {}
+            }
+            Json(task).into_response()
+        }
+        Ok(None) => not_found(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -266,31 +283,34 @@ async fn handle_cancel(
     user_context: Option<axum::Extension<UserContext>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "task not found" })),
+        )
+            .into_response()
+    };
     // Verify tenant ownership before cancelling
-    if let Some(axum::Extension(ref ctx)) = user_context {
-        match state.handle.get_task(id) {
-            Ok(Some(task)) if task.tenant_id.as_deref() != Some(&ctx.tenant_id) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "task not found" })),
-                )
-                    .into_response();
+    match state.handle.get_task(id) {
+        Ok(Some(task)) => {
+            match (&user_context, task.tenant_id.as_deref()) {
+                (Some(axum::Extension(ctx)), Some(tid)) if tid != ctx.tenant_id => {
+                    return not_found();
+                }
+                (None, Some(_)) => {
+                    // Task belongs to a tenant but caller is unauthenticated
+                    return not_found();
+                }
+                _ => {}
             }
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "task not found" })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response();
-            }
-            _ => {}
+        }
+        Ok(None) => return not_found(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
         }
     }
     match state.handle.cancel_task(id).await {
@@ -314,24 +334,29 @@ async fn handle_events(
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     // Verify tenant ownership before subscribing to events
-    if let Some(axum::Extension(ref ctx)) = user_context {
-        match state.handle.get_task(id) {
-            Ok(Some(task)) if task.tenant_id.as_deref() != Some(&ctx.tenant_id) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "task not found" })),
-                )
-                    .into_response();
-            }
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "task not found" })),
-                )
-                    .into_response();
-            }
-            _ => {}
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "task not found" })),
+        )
+            .into_response()
+    };
+    match (&user_context, state.handle.get_task(id)) {
+        // Authenticated user: verify tenant match
+        (Some(axum::Extension(ctx)), Ok(Some(ref task)))
+            if task.tenant_id.as_deref() != Some(&ctx.tenant_id) =>
+        {
+            return not_found();
         }
+        // Unauthenticated caller: cannot access tenant-scoped tasks
+        (None, Ok(Some(ref task))) if task.tenant_id.is_some() => {
+            return not_found();
+        }
+        // Task not found
+        (_, Ok(None)) => {
+            return not_found();
+        }
+        _ => {}
     }
     match state.handle.subscribe_events(id) {
         Some(rx) => {
@@ -791,12 +816,14 @@ async fn jwt_auth_middleware(
         && let Some(token) = header.strip_prefix("Bearer ")
     {
         match jwt_state.validator.validate(token).await {
-            Ok(user_ctx) => {
+            Ok(mut user_ctx) => {
                 tracing::debug!(
                     user_id = %user_ctx.user_id,
                     tenant_id = %user_ctx.tenant_id,
                     "JWT validated, user context injected"
                 );
+                // Preserve the raw token for RFC 8693 token exchange
+                user_ctx.raw_token = Some(token.to_string());
                 request.extensions_mut().insert(user_ctx);
             }
             Err(e) => {
@@ -1090,6 +1117,11 @@ pub async fn run_daemon(
         .and_then(|t| t.observability_mode.as_deref());
     let mode = crate::resolve_observability(observability_flag, config_obs, verbose);
 
+    // Shared map for subject tokens: "{tenant_id}:{user_id}" -> raw JWT.
+    // Populated by HTTP submit handler, consumed by TokenExchangeAuthProvider.
+    let user_tokens: Arc<std::sync::RwLock<HashMap<String, String>>> =
+        Arc::new(std::sync::RwLock::new(HashMap::new()));
+
     // Create per-user auth provider from token_exchange config (Phase 1.3: dynamic MCP auth)
     let auth_provider: Option<Arc<dyn heartbit::AuthProvider>> = config
         .daemon
@@ -1102,12 +1134,15 @@ pub async fn run_daemon(
                 client_id = %te.client_id,
                 "token exchange auth provider configured for per-user MCP delegation"
             );
-            Arc::new(heartbit::TokenExchangeAuthProvider::new(
-                &te.exchange_url,
-                &te.client_id,
-                &te.client_secret,
-                &te.agent_token,
-            )) as Arc<dyn heartbit::AuthProvider>
+            Arc::new(
+                heartbit::TokenExchangeAuthProvider::new(
+                    &te.exchange_url,
+                    &te.client_id,
+                    &te.client_secret,
+                    &te.agent_token,
+                )
+                .with_user_tokens(user_tokens.clone()),
+            ) as Arc<dyn heartbit::AuthProvider>
         });
 
     // Build the runner closure that creates an Orchestrator per task
@@ -1119,6 +1154,7 @@ pub async fn run_daemon(
     let runner_workspace = daemon_workspace_dir.clone();
     let runner_tools = tool_cache.clone();
     let runner_auth_provider = auth_provider;
+    let runner_user_tokens = user_tokens.clone();
     let build_runner = move |_task_id: uuid::Uuid,
                              task_text: String,
                              source: String,
@@ -1137,6 +1173,7 @@ pub async fn run_daemon(
         let workspace_dir = runner_workspace.clone();
         let tools = runner_tools.clone();
         let task_auth_provider = runner_auth_provider.clone();
+        let task_user_tokens = runner_user_tokens.clone();
         Box::pin(async move {
             // Wrap on_event to also record metrics
             let on_event: Arc<heartbit::OnEvent> = if let Some(ref m) = task_metrics {
@@ -1309,6 +1346,15 @@ pub async fn run_daemon(
                 None
             };
 
+            // Clean up subject token after exchange — prevent unbounded growth
+            // of the shared user_tokens map across long-lived daemon sessions.
+            if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
+                let key = format!("{tid}:{uid}");
+                if let Ok(mut tokens) = task_user_tokens.write() {
+                    tokens.remove(&key);
+                }
+            }
+
             let effective_tools = user_tools.as_ref().unwrap_or(&tools);
 
             let result = crate::build_orchestrator_from_config(
@@ -1452,6 +1498,7 @@ pub async fn run_daemon(
         workspace_dir: daemon_workspace_dir,
         tool_cache: tool_cache.clone(),
         jwt_validator: jwt_validator.clone(),
+        user_tokens: user_tokens.clone(),
     };
 
     // Public routes — health, readiness, metrics, agent card — never require auth
@@ -1691,21 +1738,21 @@ pub async fn run_daemon(
 
         // Wire consolidation callback: prune weak memories on idle sessions.
         //
-        // NOTE: `Memory::prune()` is namespace-blind — it scans all entries in the
-        // underlying store, not just the user's namespace. This is acceptable because
-        // pruning only removes entries that are both weak AND old (entries that should
-        // be cleaned up regardless of which user triggered the sweep).
+        // Pruning is scoped to the user's Telegram namespace prefix (`tg:{user_id}`)
+        // to prevent cross-user memory deletion in multi-tenant deployments.
         let consolidation_cb: Option<Arc<ConsolidateSession>> = tg_memory.as_ref().map(|mem| {
             let memory = mem.clone();
             let cb: Arc<ConsolidateSession> = Arc::new(move |user_id: i64| {
                 let memory = memory.clone();
+                let user_prefix = format!("tg:{user_id}");
                 Box::pin(async move {
-                    let pruned = heartbit::prune_weak_entries(
-                        &memory,
-                        heartbit::DEFAULT_MIN_STRENGTH,
-                        heartbit::default_min_age(),
-                    )
-                    .await?;
+                    let pruned = memory
+                        .prune(
+                            heartbit::DEFAULT_MIN_STRENGTH,
+                            heartbit::default_min_age(),
+                            Some(&user_prefix),
+                        )
+                        .await?;
                     if pruned > 0 {
                         tracing::info!(user_id, pruned, "pruned weak memories on idle");
                     }
@@ -1881,6 +1928,7 @@ pub async fn run_daemon(
 
 async fn handle_ws_upgrade(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Acquire connection permit
@@ -1895,14 +1943,19 @@ async fn handle_ws_upgrade(
         }
     };
 
+    let user_ctx = user_context.map(|axum::Extension(ctx)| ctx);
     ws.on_upgrade(move |socket| async move {
-        handle_ws_connection(socket, state).await;
+        handle_ws_connection(socket, state, user_ctx).await;
         drop(permit);
     })
     .into_response()
 }
 
-async fn handle_ws_connection(socket: WebSocket, state: AppState) {
+async fn handle_ws_connection(
+    socket: WebSocket,
+    state: AppState,
+    user_context: Option<UserContext>,
+) {
     let (mut ws_tx, mut ws_rx) = futures::StreamExt::split(socket);
 
     // Per-connection outbound channel
@@ -1978,6 +2031,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
                     &outbound_tx,
                     &bridge,
                     &running_tasks,
+                    user_context.as_ref(),
                 )
                 .await;
                 let _ = outbound_tx.try_send(OutboundMessage::RawFrame(response));
@@ -1997,6 +2051,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
 }
 
 /// Dispatch a WS request to the appropriate handler.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_method(
     id: &str,
     method: &str,
@@ -2005,14 +2060,24 @@ async fn dispatch_method(
     outbound_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
     bridge: &Arc<InteractionBridge>,
     running_tasks: &Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
+    user_context: Option<&UserContext>,
 ) -> WsFrame {
     match method {
-        types::method::SESSION_CREATE => handle_ws_session_create(id, params, state),
-        types::method::SESSION_LIST => handle_ws_session_list(id, state),
-        types::method::SESSION_DELETE => handle_ws_session_delete(id, params, state),
-        types::method::CHAT_HISTORY => handle_ws_chat_history(id, params, state),
+        types::method::SESSION_CREATE => handle_ws_session_create(id, params, state, user_context),
+        types::method::SESSION_LIST => handle_ws_session_list(id, state, user_context),
+        types::method::SESSION_DELETE => handle_ws_session_delete(id, params, state, user_context),
+        types::method::CHAT_HISTORY => handle_ws_chat_history(id, params, state, user_context),
         types::method::CHAT_SEND => {
-            handle_ws_chat_send(id, params, state, outbound_tx, bridge, running_tasks).await
+            handle_ws_chat_send(
+                id,
+                params,
+                state,
+                outbound_tx,
+                bridge,
+                running_tasks,
+                user_context,
+            )
+            .await
         }
         types::method::CHAT_ABORT => handle_ws_chat_abort(id, params, running_tasks),
         types::method::APPROVAL_RESOLVE => handle_ws_approval_resolve(id, params, bridge),
@@ -2022,12 +2087,24 @@ async fn dispatch_method(
     }
 }
 
-fn handle_ws_session_create(id: &str, params: serde_json::Value, state: &AppState) -> WsFrame {
+fn handle_ws_session_create(
+    id: &str,
+    params: serde_json::Value,
+    state: &AppState,
+    user_context: Option<&UserContext>,
+) -> WsFrame {
     let title = params
         .get("title")
         .and_then(|v| v.as_str())
         .map(String::from);
-    match state.sessions.create(title) {
+    let result = if let Some(ctx) = user_context {
+        state
+            .sessions
+            .create_with_user(title, &ctx.user_id, &ctx.tenant_id)
+    } else {
+        state.sessions.create(title)
+    };
+    match result {
         Ok(session) => {
             let result = types::SessionCreateResult {
                 session_id: session.id,
@@ -2038,8 +2115,17 @@ fn handle_ws_session_create(id: &str, params: serde_json::Value, state: &AppStat
     }
 }
 
-fn handle_ws_session_list(id: &str, state: &AppState) -> WsFrame {
-    match state.sessions.list() {
+fn handle_ws_session_list(
+    id: &str,
+    state: &AppState,
+    user_context: Option<&UserContext>,
+) -> WsFrame {
+    let sessions_result = if let Some(ctx) = user_context {
+        state.sessions.list_for_tenant(&ctx.tenant_id)
+    } else {
+        state.sessions.list()
+    };
+    match sessions_result {
         Ok(sessions) => {
             let summaries: Vec<types::SessionSummary> = sessions
                 .iter()
@@ -2059,27 +2145,63 @@ fn handle_ws_session_list(id: &str, state: &AppState) -> WsFrame {
     }
 }
 
-fn handle_ws_session_delete(id: &str, params: serde_json::Value, state: &AppState) -> WsFrame {
+/// Check that the caller owns the session (tenant isolation).
+fn verify_session_tenant(session: &heartbit::Session, user_context: Option<&UserContext>) -> bool {
+    match (user_context, session.tenant_id.as_deref()) {
+        // Authenticated user accessing a tenant-scoped session: must match
+        (Some(ctx), Some(tid)) => tid == ctx.tenant_id,
+        // Unauthenticated caller accessing a tenant-scoped session: deny
+        (None, Some(_)) => false,
+        // No tenant on session (legacy) or both unset: allow
+        _ => true,
+    }
+}
+
+fn handle_ws_session_delete(
+    id: &str,
+    params: serde_json::Value,
+    state: &AppState,
+    user_context: Option<&UserContext>,
+) -> WsFrame {
     let parsed: types::SessionDeleteParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return WsFrame::err(id, format!("invalid params: {e}")),
     };
+    // Verify tenant ownership before deleting
+    match state.sessions.get(parsed.session_id) {
+        Ok(Some(ref session)) if !verify_session_tenant(session, user_context) => {
+            return WsFrame::err(id, "session not found");
+        }
+        Ok(None) => return WsFrame::err(id, "session not found"),
+        Err(e) => return WsFrame::err(id, e.to_string()),
+        _ => {}
+    }
     match state.sessions.delete(parsed.session_id) {
         Ok(deleted) => WsFrame::ok(id, serde_json::json!({ "deleted": deleted })),
         Err(e) => WsFrame::err(id, e.to_string()),
     }
 }
 
-fn handle_ws_chat_history(id: &str, params: serde_json::Value, state: &AppState) -> WsFrame {
+fn handle_ws_chat_history(
+    id: &str,
+    params: serde_json::Value,
+    state: &AppState,
+    user_context: Option<&UserContext>,
+) -> WsFrame {
     let parsed: types::ChatHistoryParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return WsFrame::err(id, format!("invalid params: {e}")),
     };
     match state.sessions.get(parsed.session_id) {
-        Ok(Some(session)) => WsFrame::ok(
-            id,
-            serde_json::to_value(&session.messages).unwrap_or_default(),
-        ),
+        Ok(Some(session)) => {
+            if !verify_session_tenant(&session, user_context) {
+                return WsFrame::err(id, "session not found");
+            }
+            WsFrame::ok(
+                id,
+                serde_json::to_value(&session.messages).unwrap_or_default(),
+            )
+        }
         Ok(None) => WsFrame::err(id, "session not found"),
         Err(e) => WsFrame::err(id, e.to_string()),
     }
@@ -2092,6 +2214,7 @@ async fn handle_ws_chat_send(
     outbound_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
     bridge: &Arc<InteractionBridge>,
     running_tasks: &Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
+    user_context: Option<&UserContext>,
 ) -> WsFrame {
     let parsed: types::ChatSendParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -2102,7 +2225,12 @@ async fn handle_ws_chat_send(
 
     // Load session with prior history (before recording new message)
     let session = match state.sessions.get(session_id) {
-        Ok(Some(s)) => s,
+        Ok(Some(s)) => {
+            if !verify_session_tenant(&s, user_context) {
+                return WsFrame::err(id, "session not found");
+            }
+            s
+        }
         Ok(None) => return WsFrame::err(id, "session not found"),
         Err(e) => return WsFrame::err(id, e.to_string()),
     };
@@ -2146,9 +2274,17 @@ async fn handle_ws_chat_send(
     let ws_todo = state.todo_store.clone();
     let ws_tools = state.tool_cache.clone();
     let ws_handle = state.handle.clone();
+    let ws_user_id = user_context.map(|c| c.user_id.clone());
+    let ws_tenant_id = user_context.map(|c| c.tenant_id.clone());
 
-    // Register WS task in store for visibility via GET /tasks
-    if let Err(e) = ws_handle.register_task(task_id, &task_text, "ws") {
+    // Register WS task in store with tenant context when available
+    let register_result = match (&ws_user_id, &ws_tenant_id) {
+        (Some(uid), Some(tid)) => {
+            ws_handle.register_task_with_user(task_id, &task_text, "ws", uid, tid)
+        }
+        _ => ws_handle.register_task(task_id, &task_text, "ws"),
+    };
+    if let Err(e) = register_result {
         tracing::warn!(error = %e, "failed to register ws task in store");
     }
 
@@ -2176,6 +2312,8 @@ async fn handle_ws_chat_send(
             ws_todo,
             Some(&ws_tools),
             "ws",
+            ws_user_id.as_deref(),
+            ws_tenant_id.as_deref(),
         )
         .await;
 
@@ -2436,6 +2574,8 @@ async fn run_interactive_task(
     daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
     pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>>,
     source: &str,
+    user_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> std::result::Result<AgentOutput, HeartbitError> {
     let on_retry = build_on_retry(&params.on_event);
     let provider = build_provider_from_config(config, Some(on_retry))
@@ -2461,12 +2601,12 @@ async fn run_interactive_task(
             workspace_dir,
             daemon_todo_store,
             pre_loaded_tools,
-            None, // no multimodal content in interactive sessions
-            vec![], // no guardrails for interactive sessions
-            None,   // no memory confidentiality cap for interactive sessions
-            None,   // no memory default confidentiality for interactive sessions
-            None,   // no JWT user context for interactive sessions
-            None,   // no JWT tenant context for interactive sessions
+            None,      // no multimodal content in interactive sessions
+            vec![],    // no guardrails for interactive sessions
+            None,      // no memory confidentiality cap for interactive sessions
+            None,      // no memory default confidentiality for interactive sessions
+            user_id,   // JWT user context for multi-tenant isolation
+            tenant_id, // JWT tenant context for multi-tenant isolation
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }

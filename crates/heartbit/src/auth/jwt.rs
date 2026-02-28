@@ -310,6 +310,7 @@ impl JwtValidator {
             user_id,
             tenant_id,
             roles,
+            raw_token: None,
         })
     }
 

@@ -16,7 +16,7 @@ pub async fn prune_weak_entries(
     min_strength: f64,
     min_age: chrono::Duration,
 ) -> Result<usize, Error> {
-    memory.prune(min_strength, min_age).await
+    memory.prune(min_strength, min_age, None).await
 }
 
 /// Default minimum strength below which entries are prunable.

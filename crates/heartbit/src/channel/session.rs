@@ -14,6 +14,12 @@ pub struct Session {
     pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub messages: Vec<SessionMessage>,
+    /// User who owns this session (multi-tenant isolation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Tenant that owns this session (multi-tenant isolation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// A single message within a session.
@@ -66,6 +72,30 @@ pub trait SessionStore: Send + Sync {
     fn delete(&self, id: Uuid) -> Result<bool, Error>;
     /// Append a message to an existing session.
     fn add_message(&self, id: Uuid, message: SessionMessage) -> Result<(), Error>;
+
+    /// Create a session with user/tenant context for multi-tenant isolation.
+    /// Default: delegates to `create()` and patches user/tenant fields.
+    fn create_with_user(
+        &self,
+        title: Option<String>,
+        user_id: &str,
+        tenant_id: &str,
+    ) -> Result<Session, Error> {
+        let mut session = self.create(title)?;
+        session.user_id = Some(user_id.to_string());
+        session.tenant_id = Some(tenant_id.to_string());
+        Ok(session)
+    }
+
+    /// List sessions scoped to a tenant (most recent first).
+    /// Default: calls `list()` and filters in-memory.
+    fn list_for_tenant(&self, tenant_id: &str) -> Result<Vec<Session>, Error> {
+        let all = self.list()?;
+        Ok(all
+            .into_iter()
+            .filter(|s| s.tenant_id.as_deref() == Some(tenant_id))
+            .collect())
+    }
 }
 
 /// In-memory session store using `std::sync::RwLock` (not tokio — matches codebase pattern
@@ -95,6 +125,30 @@ impl SessionStore for InMemorySessionStore {
             title,
             created_at: Utc::now(),
             messages: Vec::new(),
+            user_id: None,
+            tenant_id: None,
+        };
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
+        sessions.insert(session.id, session.clone());
+        Ok(session)
+    }
+
+    fn create_with_user(
+        &self,
+        title: Option<String>,
+        user_id: &str,
+        tenant_id: &str,
+    ) -> Result<Session, Error> {
+        let session = Session {
+            id: Uuid::new_v4(),
+            title,
+            created_at: Utc::now(),
+            messages: Vec::new(),
+            user_id: Some(user_id.to_string()),
+            tenant_id: Some(tenant_id.to_string()),
         };
         let mut sessions = self
             .sessions
@@ -158,6 +212,10 @@ mod postgres_session {
         id: Uuid,
         title: Option<String>,
         created_at: DateTime<Utc>,
+        #[sqlx(default)]
+        user_id: Option<String>,
+        #[sqlx(default)]
+        tenant_id: Option<String>,
     }
 
     /// Row type for reading session messages from PostgreSQL.
@@ -211,6 +269,42 @@ mod postgres_session {
             Ok(Self { pool })
         }
 
+        /// Internal helper: create session with optional user/tenant fields.
+        fn create_with_fields(
+            &self,
+            title: Option<String>,
+            user_id: Option<String>,
+            tenant_id: Option<String>,
+        ) -> Result<Session, Error> {
+            let pool = self.pool.clone();
+            let session = Session {
+                id: Uuid::new_v4(),
+                title: title.clone(),
+                created_at: Utc::now(),
+                messages: Vec::new(),
+                user_id: user_id.clone(),
+                tenant_id: tenant_id.clone(),
+            };
+            let id = session.id;
+            let created_at = session.created_at;
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    sqlx::query(
+                        "INSERT INTO sessions (id, title, created_at, user_id, tenant_id) VALUES ($1, $2, $3, $4, $5)",
+                    )
+                    .bind(id)
+                    .bind(title)
+                    .bind(created_at)
+                    .bind(user_id)
+                    .bind(tenant_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| Error::Channel(format!("failed to create session: {e}")))
+                })
+            })?;
+            Ok(session)
+        }
+
         /// Run the session tables migration. Safe to call multiple times.
         pub async fn run_migration(&self) -> Result<(), Error> {
             sqlx::query(
@@ -218,7 +312,9 @@ mod postgres_session {
             CREATE TABLE IF NOT EXISTS sessions (
                 id          UUID PRIMARY KEY,
                 title       TEXT,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                user_id     TEXT,
+                tenant_id   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS session_messages (
@@ -230,6 +326,14 @@ mod postgres_session {
             );
             CREATE INDEX IF NOT EXISTS idx_session_messages_session_id
                 ON session_messages(session_id);
+
+            -- Add user/tenant columns if upgrading from older schema.
+            DO $$ BEGIN
+                ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_id TEXT;
+                ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$;
+            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);
             "#,
             )
             .execute(&self.pool)
@@ -241,29 +345,20 @@ mod postgres_session {
 
     impl SessionStore for PostgresSessionStore {
         fn create(&self, title: Option<String>) -> Result<Session, Error> {
-            let pool = self.pool.clone();
-            let session = Session {
-                id: Uuid::new_v4(),
-                title: title.clone(),
-                created_at: Utc::now(),
-                messages: Vec::new(),
-            };
-            let id = session.id;
-            let created_at = session.created_at;
-            // Use block_in_place since SessionStore trait methods are sync.
-            // The pool operations are async but the trait requires sync returns.
-            tokio::task::block_in_place(move || {
-                tokio::runtime::Handle::current().block_on(async move {
-                    sqlx::query("INSERT INTO sessions (id, title, created_at) VALUES ($1, $2, $3)")
-                        .bind(id)
-                        .bind(title)
-                        .bind(created_at)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| Error::Channel(format!("failed to create session: {e}")))
-                })
-            })?;
-            Ok(session)
+            self.create_with_fields(title, None, None)
+        }
+
+        fn create_with_user(
+            &self,
+            title: Option<String>,
+            user_id: &str,
+            tenant_id: &str,
+        ) -> Result<Session, Error> {
+            self.create_with_fields(
+                title,
+                Some(user_id.to_string()),
+                Some(tenant_id.to_string()),
+            )
         }
 
         fn get(&self, id: Uuid) -> Result<Option<Session>, Error> {
@@ -271,7 +366,7 @@ mod postgres_session {
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                 let row: Option<SessionRow> =
-                    sqlx::query_as("SELECT id, title, created_at FROM sessions WHERE id = $1")
+                    sqlx::query_as("SELECT id, title, created_at, user_id, tenant_id FROM sessions WHERE id = $1")
                         .bind(id)
                         .fetch_optional(&pool)
                         .await
@@ -292,6 +387,8 @@ mod postgres_session {
                             title: r.title,
                             created_at: r.created_at,
                             messages: messages.into_iter().map(SessionMessage::from).collect(),
+                            user_id: r.user_id,
+                            tenant_id: r.tenant_id,
                         }))
                     }
                     None => Ok(None),
@@ -305,7 +402,7 @@ mod postgres_session {
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                 let rows: Vec<SessionRow> = sqlx::query_as(
-                    "SELECT id, title, created_at FROM sessions ORDER BY created_at DESC",
+                    "SELECT id, title, created_at, user_id, tenant_id FROM sessions ORDER BY created_at DESC",
                 )
                 .fetch_all(&pool)
                 .await
@@ -324,6 +421,43 @@ mod postgres_session {
                         title: r.title,
                         created_at: r.created_at,
                         messages: messages.into_iter().map(SessionMessage::from).collect(),
+                        user_id: r.user_id,
+                        tenant_id: r.tenant_id,
+                    });
+                }
+                Ok(sessions)
+            })
+            })
+        }
+
+        fn list_for_tenant(&self, tenant_id: &str) -> Result<Vec<Session>, Error> {
+            let pool = self.pool.clone();
+            let tid = tenant_id.to_string();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                let rows: Vec<SessionRow> = sqlx::query_as(
+                    "SELECT id, title, created_at, user_id, tenant_id FROM sessions WHERE tenant_id = $1 ORDER BY created_at DESC",
+                )
+                .bind(&tid)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| Error::Channel(format!("failed to list tenant sessions: {e}")))?;
+                let mut sessions = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let messages: Vec<MessageRow> = sqlx::query_as(
+                        "SELECT role, content, created_at FROM session_messages WHERE session_id = $1 ORDER BY created_at, id",
+                    )
+                    .bind(r.id)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| Error::Channel(format!("failed to load messages: {e}")))?;
+                    sessions.push(Session {
+                        id: r.id,
+                        title: r.title,
+                        created_at: r.created_at,
+                        messages: messages.into_iter().map(SessionMessage::from).collect(),
+                        user_id: r.user_id,
+                        tenant_id: r.tenant_id,
                     });
                 }
                 Ok(sessions)
@@ -459,18 +593,24 @@ mod tests {
                 title: Some("old".to_string()),
                 created_at: Utc::now() - chrono::Duration::hours(2),
                 messages: Vec::new(),
+                user_id: None,
+                tenant_id: None,
             };
             let mid = Session {
                 id: Uuid::new_v4(),
                 title: Some("mid".to_string()),
                 created_at: Utc::now() - chrono::Duration::hours(1),
                 messages: Vec::new(),
+                user_id: None,
+                tenant_id: None,
             };
             let new = Session {
                 id: Uuid::new_v4(),
                 title: Some("new".to_string()),
                 created_at: Utc::now(),
                 messages: Vec::new(),
+                user_id: None,
+                tenant_id: None,
             };
 
             // Insert in non-sorted order
@@ -726,5 +866,82 @@ mod tests {
         let result = format_session_context(&history, "Follow-up");
         assert!(result.contains("User: Prior question"));
         assert!(result.contains("Follow-up"));
+    }
+
+    // --- Multi-tenant session tests ---
+
+    #[test]
+    fn create_with_user_sets_fields() {
+        let store = InMemorySessionStore::new();
+        let session = store
+            .create_with_user(Some("Test".into()), "alice", "acme")
+            .unwrap();
+        assert_eq!(session.user_id.as_deref(), Some("alice"));
+        assert_eq!(session.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(session.title.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn create_without_user_has_none_fields() {
+        let store = InMemorySessionStore::new();
+        let session = store.create(None).unwrap();
+        assert!(session.user_id.is_none());
+        assert!(session.tenant_id.is_none());
+    }
+
+    #[test]
+    fn list_for_tenant_filters_by_tenant() {
+        let store = InMemorySessionStore::new();
+        store
+            .create_with_user(Some("acme-1".into()), "alice", "acme")
+            .unwrap();
+        store
+            .create_with_user(Some("acme-2".into()), "bob", "acme")
+            .unwrap();
+        store
+            .create_with_user(Some("globex-1".into()), "charlie", "globex")
+            .unwrap();
+        store.create(Some("legacy".into())).unwrap(); // no tenant
+
+        let acme = store.list_for_tenant("acme").unwrap();
+        assert_eq!(acme.len(), 2);
+        assert!(acme.iter().all(|s| s.tenant_id.as_deref() == Some("acme")));
+
+        let globex = store.list_for_tenant("globex").unwrap();
+        assert_eq!(globex.len(), 1);
+        assert_eq!(globex[0].tenant_id.as_deref(), Some("globex"));
+
+        // Legacy sessions (no tenant) are not returned by list_for_tenant
+        let all = store.list().unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn session_serde_backward_compat() {
+        // Old JSON without user_id/tenant_id should deserialize with None
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","title":"old","created_at":"2026-01-01T00:00:00Z","messages":[]}"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert!(session.user_id.is_none());
+        assert!(session.tenant_id.is_none());
+        assert_eq!(session.title.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn session_serde_with_tenant() {
+        let session = Session {
+            id: Uuid::nil(),
+            title: None,
+            created_at: Utc::now(),
+            messages: Vec::new(),
+            user_id: Some("alice".into()),
+            tenant_id: Some("acme".into()),
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains(r#""user_id":"alice""#));
+        assert!(json.contains(r#""tenant_id":"acme""#));
+
+        let deserialized: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.user_id.as_deref(), Some("alice"));
+        assert_eq!(deserialized.tenant_id.as_deref(), Some("acme"));
     }
 }

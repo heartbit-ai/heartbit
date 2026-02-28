@@ -376,6 +376,10 @@ impl DelegateTaskTool {
                 {
                     builder = builder.audit_user_context(uid.clone(), tid.clone());
                 }
+                if !agent_def.audit_delegation_chain.is_empty() {
+                    builder =
+                        builder.audit_delegation_chain(agent_def.audit_delegation_chain.clone());
+                }
 
                 // Forward permission rules from orchestrator to sub-agents
                 if !permission_rules.is_empty() {
@@ -768,6 +772,10 @@ impl Tool for FormSquadTool {
                         && let Some(tid) = &agent_def.audit_tenant_id
                     {
                         builder = builder.audit_user_context(uid.clone(), tid.clone());
+                    }
+                    if !agent_def.audit_delegation_chain.is_empty() {
+                        builder = builder
+                            .audit_delegation_chain(agent_def.audit_delegation_chain.clone());
                     }
 
                     // Forward permission rules from orchestrator to squad members
@@ -1859,6 +1867,10 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             && let Some(tid) = self.audit_tenant_id
         {
             runner_builder = runner_builder.audit_user_context(uid, tid);
+        }
+        if !self.audit_delegation_chain.is_empty() {
+            runner_builder =
+                runner_builder.audit_delegation_chain(self.audit_delegation_chain.clone());
         }
 
         let runner = runner_builder.build()?;

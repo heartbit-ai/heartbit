@@ -134,13 +134,12 @@ impl Memory for NamespacedMemory {
         &self,
         min_strength: f64,
         min_age: chrono::Duration,
+        _agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
-        // Delegate to inner store. Note: this prunes across ALL namespaces,
-        // not just this one. Namespace-scoped prune requires a trait-level
-        // change (adding an agent filter to `prune`) because `recall()` has
-        // side-effects (strength reinforcement, last_accessed update) that
-        // corrupt the data needed for prune evaluation.
-        self.inner.prune(min_strength, min_age)
+        // Always scope to this namespace — ignore caller-supplied prefix.
+        // This ensures a NamespacedMemory for user A never prunes user B's entries.
+        self.inner
+            .prune(min_strength, min_age, Some(&self.agent_name))
     }
 }
 
@@ -543,7 +542,10 @@ mod tests {
         entry.last_accessed = Utc::now() - chrono::Duration::hours(48);
         ns.store(entry).await.unwrap();
 
-        let pruned = ns.prune(0.1, chrono::Duration::hours(1)).await.unwrap();
+        let pruned = ns
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
         assert_eq!(pruned, 1);
 
         // Verify entry is gone
@@ -557,10 +559,9 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// Prune delegates to inner store and affects ALL namespaces.
-    /// Namespace-scoped prune requires a trait-level change (agent filter on prune).
+    /// Prune via NamespacedMemory only affects this namespace, not others.
     #[tokio::test]
-    async fn prune_affects_all_namespaces() {
+    async fn prune_scoped_to_own_namespace() {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns_a = NamespacedMemory::new(inner.clone(), "agent_a");
         let ns_b = NamespacedMemory::new(inner.clone(), "agent_b");
@@ -577,11 +578,14 @@ mod tests {
         weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
         ns_b.store(weak_b).await.unwrap();
 
-        // Prune via namespace A delegates to inner — removes BOTH weak entries
-        let pruned = ns_a.prune(0.1, chrono::Duration::hours(1)).await.unwrap();
-        assert_eq!(pruned, 2);
+        // Prune via namespace A only removes A's weak entries, not B's
+        let pruned = ns_a
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "should only prune agent_a's entry");
 
-        // Both entries are gone
+        // A's entry is gone
         let a_results = ns_a
             .recall(MemoryQuery {
                 limit: 10,
@@ -591,6 +595,7 @@ mod tests {
             .unwrap();
         assert!(a_results.is_empty());
 
+        // B's entry is still there
         let b_results = ns_b
             .recall(MemoryQuery {
                 limit: 10,
@@ -598,7 +603,110 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(b_results.is_empty());
+        assert_eq!(
+            b_results.len(),
+            1,
+            "agent_b's entry must survive agent_a's prune"
+        );
+        assert_eq!(b_results[0].content, "weak from B");
+    }
+
+    /// Multi-tenant prune isolation: user A's prune never deletes user B's memories.
+    #[tokio::test]
+    async fn multi_tenant_prune_isolation() {
+        let shared: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let alice = NamespacedMemory::new(shared.clone(), "user:alice");
+        let bob = NamespacedMemory::new(shared.clone(), "user:bob");
+
+        // Both users have weak+old entries AND strong entries
+        let mut weak_alice = make_entry("m1", "alice weak");
+        weak_alice.strength = 0.01;
+        weak_alice.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_alice.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        alice.store(weak_alice).await.unwrap();
+
+        let mut strong_alice = make_entry("m2", "alice strong");
+        strong_alice.strength = 0.9;
+        alice.store(strong_alice).await.unwrap();
+
+        let mut weak_bob = make_entry("m1", "bob weak");
+        weak_bob.strength = 0.01;
+        weak_bob.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_bob.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        bob.store(weak_bob).await.unwrap();
+
+        let mut strong_bob = make_entry("m2", "bob strong");
+        strong_bob.strength = 0.9;
+        bob.store(strong_bob).await.unwrap();
+
+        // Alice prunes — should only remove alice's weak entry
+        let pruned = alice
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "should only prune alice's weak entry");
+
+        // Bob prunes — should remove bob's weak entry. The fact that this returns 1
+        // (not 0) proves the entry survived Alice's prune.
+        let pruned = bob
+            .prune(0.1, chrono::Duration::hours(1), None)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "bob's weak entry must survive alice's prune");
+
+        // Verify final state: each user has only their strong entry
+        let alice_results = alice
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_results.len(), 1);
+        assert_eq!(alice_results[0].content, "alice strong");
+
+        let bob_results = bob
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bob_results.len(), 1);
+        assert_eq!(bob_results[0].content, "bob strong");
+    }
+
+    /// Prune ignores caller-supplied agent_prefix — always uses own namespace.
+    #[tokio::test]
+    async fn prune_ignores_explicit_agent_prefix_override() {
+        let shared: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let alice = NamespacedMemory::new(shared.clone(), "user:alice");
+        let bob = NamespacedMemory::new(shared.clone(), "user:bob");
+
+        let mut weak_bob = make_entry("m1", "bob weak");
+        weak_bob.strength = 0.01;
+        weak_bob.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_bob.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        bob.store(weak_bob).await.unwrap();
+
+        // Alice tries to prune with bob's prefix — should still only affect alice's namespace
+        let pruned = alice
+            .prune(0.1, chrono::Duration::hours(1), Some("user:bob"))
+            .await
+            .unwrap();
+        assert_eq!(
+            pruned, 0,
+            "alice's prune must not affect bob even with explicit prefix"
+        );
+
+        let bob_results = bob
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bob_results.len(), 1, "bob's entry must survive");
     }
 
     /// Recall always forces own namespace — explicit agent parameter is ignored.

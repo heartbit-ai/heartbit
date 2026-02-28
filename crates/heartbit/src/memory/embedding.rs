@@ -345,8 +345,9 @@ impl Memory for EmbeddingMemory {
         &self,
         min_strength: f64,
         min_age: chrono::Duration,
+        agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
-        self.inner.prune(min_strength, min_age)
+        self.inner.prune(min_strength, min_age, agent_prefix)
     }
 }
 

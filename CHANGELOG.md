@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.228.3] - 2026-02-28
+
+### Fixed
+
+- **Cross-tenant token cache isolation** — `TokenExchangeAuthProvider` cache now keyed by `(tenant_id, user_id)` tuple instead of `user_id` alone, preventing user "alice" in tenant "acme" from receiving cached tokens belonging to user "alice" in tenant "globex". Token TTL capped at 3600 seconds (1 hour max).
+- **Delegation chain forwarding to sub-agents** — `DelegateTaskTool`, `FormSquadTool`, and `OrchestratorBuilder::build()` now propagate `audit_delegation_chain` to sub-agent runners. Previously, delegation chain was set on the orchestrator but lost when spawning sub-agents.
+- **Unauthenticated cross-tenant task access** — `handle_get`, `handle_cancel`, and `handle_events` now reject unauthenticated callers accessing tenant-scoped tasks. Previously, tasks with `tenant_id` set were accessible to any caller without a JWT.
+- **WebSocket session tenant isolation** — All session operations (`SESSION_CREATE`, `SESSION_LIST`, `SESSION_DELETE`, `CHAT_HISTORY`, `CHAT_SEND`) now enforce tenant boundaries. `UserContext` from JWT middleware is threaded through the WebSocket upgrade → connection → dispatch chain. Sessions are created with `user_id`/`tenant_id` when user context is present.
+- **Subject token wiring for RFC 8693** — `UserContext.raw_token` carries the original JWT. HTTP submit handler populates shared `user_tokens` map (keyed by `"{tenant_id}:{user_id}"`) for `TokenExchangeAuthProvider` consumption.
+- **Interactive WS sessions now pass user_id/tenant_id** to `run_interactive_task` → `build_orchestrator_from_config`, enabling per-user memory namespacing and audit context for WebSocket-initiated agent runs.
+- **WebSocket task registration with tenant context** — WS-initiated tasks now include `user_id`/`tenant_id` in the task store when user context is available. Previously, WS tasks were registered without tenant context, making them accessible to unauthenticated callers via `GET /tasks/{id}`.
+- **Telegram consolidation prune scoped to user namespace** — Telegram idle-session memory pruning now passes user-scoped prefix (`tg:{user_id}`) to `Memory::prune()`. Previously, pruning was global and could delete weak entries from other users' namespaces.
+
+### Changed
+
+- **Namespace-scoped `Memory::prune()`** — `prune()` gains `agent_prefix: Option<&str>` parameter. When set, only entries whose `agent` field starts with the prefix are pruned. `NamespacedMemory::prune()` now always scopes to its own namespace, preventing cross-user memory deletion in multi-tenant setups. Previously, pruning via a `NamespacedMemory` would delete weak entries from ALL namespaces.
+- **Session struct gains `user_id`/`tenant_id`** — `Session` struct, `SessionStore` trait (`create_with_user`, `list_for_tenant` methods), `InMemorySessionStore`, and `PostgresSessionStore` all updated for multi-tenant session isolation. `PostgresSessionStore::list_for_tenant()` uses SQL `WHERE tenant_id = $1` pushdown instead of in-memory filtering. PostgreSQL migration adds `user_id`/`tenant_id` columns with backward-compatible ALTER TABLE. Serde `#[serde(default)]` ensures backward compatibility with existing data.
+- 10 new tests: 4 prune namespace isolation, 5 session multi-tenant isolation and backward compat, 1 register_task_with_user.
+
 ## [2026.228.2] - 2026-02-28
 
 ### Added

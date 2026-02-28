@@ -127,6 +127,10 @@ pub struct UserContext {
     /// Roles granted to this user (typically JWT `roles` claim).
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Original bearer token from the request, used as subject_token in
+    /// RFC 8693 token exchange for per-user MCP auth delegation.
+    #[serde(skip)]
+    pub raw_token: Option<String>,
 }
 
 /// Aggregated statistics across all daemon tasks.
@@ -412,6 +416,7 @@ mod tests {
             user_id: "user-123".into(),
             tenant_id: "acme".into(),
             roles: vec!["sales".into(), "admin".into()],
+            raw_token: None,
         };
         let json = serde_json::to_string(&ctx).unwrap();
         let parsed: UserContext = serde_json::from_str(&json).unwrap();
@@ -435,6 +440,7 @@ mod tests {
             user_id: "u1".into(),
             tenant_id: "t1".into(),
             roles: vec!["r1".into()],
+            raw_token: None,
         };
         let b = a.clone();
         assert_eq!(a, b);

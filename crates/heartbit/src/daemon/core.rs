@@ -154,6 +154,19 @@ impl DaemonHandle {
         self.store.insert(daemon_task)
     }
 
+    /// Register a task with user context for multi-tenant isolation.
+    pub fn register_task_with_user(
+        &self,
+        id: uuid::Uuid,
+        task: impl Into<String>,
+        source: impl Into<String>,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Result<(), Error> {
+        let daemon_task = DaemonTask::new_with_user(id, task, source, user_id, tenant_id);
+        self.store.insert(daemon_task)
+    }
+
     /// Update a registered task's state (for non-Kafka execution paths).
     pub fn update_task(&self, id: uuid::Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error> {
         self.store.update(id, f)
@@ -816,6 +829,20 @@ mod tests {
         let task = handle.get_task(id).unwrap().unwrap();
         assert!(task.user_id.is_none());
         assert!(task.tenant_id.is_none());
+    }
+
+    #[test]
+    fn register_task_with_user_method_stores_context() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        handle
+            .register_task_with_user(id, "user task", "ws", "bob", "globex")
+            .unwrap();
+
+        let task = handle.get_task(id).unwrap().unwrap();
+        assert_eq!(task.user_id.as_deref(), Some("bob"));
+        assert_eq!(task.tenant_id.as_deref(), Some("globex"));
+        assert_eq!(task.source, "ws");
     }
 
     #[tokio::test]
