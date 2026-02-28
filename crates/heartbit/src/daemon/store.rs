@@ -224,6 +224,8 @@ mod postgres_store {
         pub(crate) estimated_cost_usd: Option<f64>,
         pub(crate) source: String,
         pub(crate) agent_name: Option<String>,
+        pub(crate) user_id: Option<String>,
+        pub(crate) tenant_id: Option<String>,
     }
 
     pub(crate) fn task_state_to_str(state: TaskState) -> &'static str {
@@ -268,8 +270,8 @@ mod postgres_store {
                 estimated_cost_usd: row.estimated_cost_usd,
                 source: row.source,
                 agent_name: row.agent_name,
-                user_id: None,
-                tenant_id: None,
+                user_id: row.user_id,
+                tenant_id: row.tenant_id,
             }
         }
     }
@@ -317,23 +319,31 @@ mod postgres_store {
                 tool_calls_made             INTEGER NOT NULL DEFAULT 0,
                 estimated_cost_usd          DOUBLE PRECISION,
                 source                      TEXT NOT NULL,
-                agent_name                  TEXT
+                agent_name                  TEXT,
+                user_id                     TEXT,
+                tenant_id                   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at
                 ON daemon_tasks(created_at);
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_state
                 ON daemon_tasks(state);
+            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_tenant_id
+                ON daemon_tasks(tenant_id);
             "#,
             )
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
 
-            // Add agent_name column if not already present (for existing tables).
-            sqlx::query("ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS agent_name TEXT")
+            // Add columns if not already present (for existing tables).
+            for col in ["agent_name", "user_id", "tenant_id"] {
+                sqlx::query(&format!(
+                    "ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS {col} TEXT"
+                ))
                 .execute(&self.pool)
                 .await
-                .map_err(|e| Error::Daemon(format!("agent_name migration failed: {e}")))?;
+                .map_err(|e| Error::Daemon(format!("{col} migration failed: {e}")))?;
+            }
 
             Ok(())
         }
@@ -349,8 +359,8 @@ mod postgres_store {
                         (id, task, state, created_at, started_at, completed_at, result, error,
                          input_tokens, output_tokens, cache_creation_input_tokens,
                          cache_read_input_tokens, reasoning_tokens, tool_calls_made,
-                         estimated_cost_usd, source, agent_name)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"#,
+                         estimated_cost_usd, source, agent_name, user_id, tenant_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
                 )
                 .bind(task.id)
                 .bind(&task.task)
@@ -369,6 +379,8 @@ mod postgres_store {
                 .bind(task.estimated_cost_usd)
                 .bind(&task.source)
                 .bind(&task.agent_name)
+                .bind(&task.user_id)
+                .bind(&task.tenant_id)
                 .execute(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
@@ -385,7 +397,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -409,7 +421,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
                      FROM daemon_tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit as i64)
@@ -432,7 +444,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -452,7 +464,8 @@ mod postgres_store {
                         result = $6, error = $7, input_tokens = $8, output_tokens = $9,
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
-                        estimated_cost_usd = $14, source = $15, agent_name = $16
+                        estimated_cost_usd = $14, source = $15, agent_name = $16,
+                        user_id = $17, tenant_id = $18
                     WHERE id = $1"#,
                     )
                     .bind(task.id)
@@ -471,6 +484,8 @@ mod postgres_store {
                     .bind(task.estimated_cost_usd)
                     .bind(&task.source)
                     .bind(&task.agent_name)
+                    .bind(&task.user_id)
+                    .bind(&task.tenant_id)
                     .execute(&pool)
                     .await
                     .map_err(|e| Error::Daemon(format!("failed to update task: {e}")))?;
@@ -529,7 +544,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
                      FROM daemon_tasks {where_clause} ORDER BY created_at DESC \
                      LIMIT ${param_idx} OFFSET ${}",
                     param_idx + 1
@@ -823,6 +838,8 @@ mod tests {
             estimated_cost_usd: None,
             source: "api".into(),
             agent_name: None,
+            user_id: None,
+            tenant_id: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.id, id);
@@ -859,6 +876,8 @@ mod tests {
             estimated_cost_usd: Some(0.042),
             source: "cron:daily".into(),
             agent_name: None,
+            user_id: None,
+            tenant_id: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Completed);
@@ -895,6 +914,8 @@ mod tests {
             estimated_cost_usd: Some(0.001),
             source: "sensor:email".into(),
             agent_name: None,
+            user_id: None,
+            tenant_id: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Failed);
@@ -926,6 +947,8 @@ mod tests {
             estimated_cost_usd: None,
             source: "api".into(),
             agent_name: None,
+            user_id: None,
+            tenant_id: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.created_at, created);
@@ -954,6 +977,8 @@ mod tests {
             estimated_cost_usd: None,
             source: "api".into(),
             agent_name: Some("security-bot".into()),
+            user_id: Some("user-42".into()),
+            tenant_id: Some("tenant-a".into()),
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.agent_name.as_deref(), Some("security-bot"));

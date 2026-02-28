@@ -79,14 +79,11 @@ impl Memory for NamespacedMemory {
         &self,
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
-        // If no agent filter specified, default to this agent's namespace
-        let mut query = if query.agent.is_none() {
-            MemoryQuery {
-                agent: Some(self.agent_name.clone()),
-                ..query
-            }
-        } else {
-            query
+        // Always force recall to this agent's namespace. Ignoring caller-supplied
+        // agent values prevents cross-namespace reads via prompt injection.
+        let mut query = MemoryQuery {
+            agent: Some(self.agent_name.clone()),
+            ..query
         };
         // Enforce max_confidentiality cap — use the stricter of the two
         if let Some(cap) = self.max_confidentiality {
@@ -138,7 +135,12 @@ impl Memory for NamespacedMemory {
         min_strength: f64,
         min_age: chrono::Duration,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
-        Box::pin(async move { self.inner.prune(min_strength, min_age).await })
+        // Delegate to inner store. Note: this prunes across ALL namespaces,
+        // not just this one. Namespace-scoped prune requires a trait-level
+        // change (adding an agent filter to `prune`) because `recall()` has
+        // side-effects (strength reinforcement, last_accessed update) that
+        // corrupt the data needed for prune evaluation.
+        self.inner.prune(min_strength, min_age)
     }
 }
 
@@ -235,10 +237,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn namespace_isolation_requires_raw_store_for_cross_agent() {
-        // NamespacedMemory always filters by its own agent. To read across
-        // all agents, callers must use the raw inner store directly
-        // (e.g., via shared_memory_tools).
+    async fn namespace_forces_own_agent_even_with_explicit_override() {
+        // NamespacedMemory always forces its own agent namespace, even when
+        // the caller explicitly sets an agent name. Cross-agent access
+        // requires the raw inner store (e.g., via shared_memory_tools).
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns_a = NamespacedMemory::new(inner.clone(), "agent_a");
         let ns_b = NamespacedMemory::new(inner.clone(), "agent_b");
@@ -246,7 +248,7 @@ mod tests {
         ns_a.store(make_entry("m1", "from A")).await.unwrap();
         ns_b.store(make_entry("m2", "from B")).await.unwrap();
 
-        // Empty agent filter matches nothing — each namespace only sees its own
+        // Even with explicit empty agent, namespace forces own agent
         let results = ns_a
             .recall(MemoryQuery {
                 agent: Some(String::new()),
@@ -255,7 +257,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(results.len(), 0);
+        // Returns agent_a's entries (not empty — the override is ignored)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "from A");
 
         // Cross-agent access requires the raw inner store
         let all = inner
@@ -551,6 +555,74 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// Prune delegates to inner store and affects ALL namespaces.
+    /// Namespace-scoped prune requires a trait-level change (agent filter on prune).
+    #[tokio::test]
+    async fn prune_affects_all_namespaces() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns_a = NamespacedMemory::new(inner.clone(), "agent_a");
+        let ns_b = NamespacedMemory::new(inner.clone(), "agent_b");
+
+        let mut weak_a = make_entry("m1", "weak from A");
+        weak_a.strength = 0.01;
+        weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        ns_a.store(weak_a).await.unwrap();
+
+        let mut weak_b = make_entry("m1", "weak from B");
+        weak_b.strength = 0.01;
+        weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        ns_b.store(weak_b).await.unwrap();
+
+        // Prune via namespace A delegates to inner — removes BOTH weak entries
+        let pruned = ns_a.prune(0.1, chrono::Duration::hours(1)).await.unwrap();
+        assert_eq!(pruned, 2);
+
+        // Both entries are gone
+        let a_results = ns_a
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(a_results.is_empty());
+
+        let b_results = ns_b
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(b_results.is_empty());
+    }
+
+    /// Recall always forces own namespace — explicit agent parameter is ignored.
+    #[tokio::test]
+    async fn recall_ignores_explicit_agent_override() {
+        let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let ns_a = NamespacedMemory::new(inner.clone(), "user:alice");
+        let ns_b = NamespacedMemory::new(inner.clone(), "user:bob");
+
+        ns_a.store(make_entry("m1", "alice data")).await.unwrap();
+        ns_b.store(make_entry("m1", "bob data")).await.unwrap();
+
+        // Even if we explicitly request bob's namespace, alice's NamespacedMemory
+        // should still return only alice's entries (prevents prompt injection).
+        let results = ns_a
+            .recall(MemoryQuery {
+                agent: Some("user:bob".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "alice data");
     }
 
     /// Multi-tenant isolation: two users with `user:{id}` namespaces on the

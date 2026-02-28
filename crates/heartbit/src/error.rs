@@ -17,6 +17,9 @@ pub enum Error {
     #[error("Agent error: {0}")]
     Agent(String),
 
+    #[error("Authentication error: {0}")]
+    Auth(String),
+
     #[error("Max turns ({0}) exceeded")]
     MaxTurnsExceeded(usize),
 
@@ -115,6 +118,12 @@ mod tests {
 
         let err = Error::Truncated;
         assert_eq!(err.to_string(), "Response truncated (max_tokens reached)");
+    }
+
+    #[test]
+    fn error_auth_display_message() {
+        let err = Error::Auth("invalid token".into());
+        assert_eq!(err.to_string(), "Authentication error: invalid token");
     }
 
     #[test]

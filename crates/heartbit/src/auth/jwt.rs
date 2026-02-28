@@ -102,10 +102,10 @@ impl JwksClient {
             .get(&self.jwks_url)
             .send()
             .await
-            .map_err(|e| Error::Agent(format!("JWKS fetch failed: {e}")))?;
+            .map_err(|e| Error::Auth(format!("JWKS fetch failed: {e}")))?;
 
         if !response.status().is_success() {
-            return Err(Error::Agent(format!(
+            return Err(Error::Auth(format!(
                 "JWKS endpoint returned status {}",
                 response.status()
             )));
@@ -114,7 +114,7 @@ impl JwksClient {
         let jwks: JwksResponse = response
             .json()
             .await
-            .map_err(|e| Error::Agent(format!("JWKS parse failed: {e}")))?;
+            .map_err(|e| Error::Auth(format!("JWKS parse failed: {e}")))?;
 
         Ok(jwks.keys)
     }
@@ -125,13 +125,13 @@ impl JwksClient {
                 .iter()
                 .find(|k| k.kid.as_deref() == Some(kid))
                 .cloned()
-                .ok_or_else(|| Error::Agent(format!("No JWK found with kid={kid}"))),
+                .ok_or_else(|| Error::Auth(format!("No JWK found with kid={kid}"))),
             None => {
                 // No kid specified — use first RSA key
                 keys.iter()
                     .find(|k| k.kty == "RSA")
                     .cloned()
-                    .ok_or_else(|| Error::Agent("No RSA key in JWKS".into()))
+                    .ok_or_else(|| Error::Auth("No RSA key in JWKS".into()))
             }
         }
     }
@@ -142,15 +142,15 @@ impl JwksClient {
                 let n = key
                     .n
                     .as_ref()
-                    .ok_or_else(|| Error::Agent("JWK missing 'n' component".into()))?;
+                    .ok_or_else(|| Error::Auth("JWK missing 'n' component".into()))?;
                 let e = key
                     .e
                     .as_ref()
-                    .ok_or_else(|| Error::Agent("JWK missing 'e' component".into()))?;
+                    .ok_or_else(|| Error::Auth("JWK missing 'e' component".into()))?;
                 DecodingKey::from_rsa_components(n, e)
-                    .map_err(|e| Error::Agent(format!("Invalid RSA JWK: {e}")))
+                    .map_err(|e| Error::Auth(format!("Invalid RSA JWK: {e}")))
             }
-            other => Err(Error::Agent(format!("Unsupported key type: {other}"))),
+            other => Err(Error::Auth(format!("Unsupported key type: {other}"))),
         }
     }
 }
@@ -256,9 +256,17 @@ impl JwtValidator {
     /// Verifies the token signature against JWKS, checks issuer/audience,
     /// and extracts user_id, tenant_id, and roles from the configured claims.
     pub async fn validate(&self, token: &str) -> Result<UserContext, Error> {
+        if token.is_empty() {
+            return Err(Error::Auth("JWT token is empty".into()));
+        }
+        // 16 KiB is generous for a JWT — reject oversized tokens to prevent DoS
+        if token.len() > 16_384 {
+            return Err(Error::Auth("JWT token exceeds maximum length".into()));
+        }
+
         // Decode header to get kid
         let header =
-            decode_header(token).map_err(|e| Error::Agent(format!("Invalid JWT header: {e}")))?;
+            decode_header(token).map_err(|e| Error::Auth(format!("Invalid JWT header: {e}")))?;
 
         // Get decoding key from JWKS
         let decoding_key = self.jwks.decoding_key(header.kid.as_deref()).await?;
@@ -279,20 +287,20 @@ impl JwtValidator {
 
         // Decode and validate
         let token_data: TokenData<JwtClaims> = decode(token, &decoding_key, &validation)
-            .map_err(|e| Error::Agent(format!("JWT validation failed: {e}")))?;
+            .map_err(|e| Error::Auth(format!("JWT validation failed: {e}")))?;
 
         let claims = token_data.claims;
 
         // Extract user_id from configured claim
         let user_id = self.extract_string_claim(&claims, &self.user_id_claim)?;
         if user_id.is_empty() {
-            return Err(Error::Agent("JWT user_id claim is empty".into()));
+            return Err(Error::Auth("JWT user_id claim is empty".into()));
         }
 
         // Extract tenant_id from configured claim
         let tenant_id = self.extract_string_claim(&claims, &self.tenant_id_claim)?;
         if tenant_id.is_empty() {
-            return Err(Error::Agent("JWT tenant_id claim is empty".into()));
+            return Err(Error::Auth("JWT tenant_id claim is empty".into()));
         }
 
         // Extract roles from configured claim
@@ -328,13 +336,16 @@ impl JwtValidator {
 
         // Fall back to extra claims
         if let Some(value) = claims.extra.get(claim_name) {
-            match value {
-                serde_json::Value::String(s) => return Ok(s.clone()),
-                other => return Ok(other.to_string()),
-            }
+            return match value {
+                serde_json::Value::String(s) => Ok(s.clone()),
+                serde_json::Value::Number(n) => Ok(n.to_string()),
+                _ => Err(Error::Auth(format!(
+                    "Claim '{claim_name}' has unsupported type (expected string or number)"
+                ))),
+            };
         }
 
-        Err(Error::Agent(format!(
+        Err(Error::Auth(format!(
             "Required claim '{claim_name}' not found in JWT"
         )))
     }
@@ -705,5 +716,122 @@ mod tests {
         assert_eq!(validator.user_id_claim, "user_id");
         assert_eq!(validator.tenant_id_claim, "organization_id");
         assert_eq!(validator.roles_claim, "permissions");
+    }
+
+    // --- Token pre-validation tests ---
+
+    #[tokio::test]
+    async fn validate_empty_token_rejected() {
+        let validator = JwtValidator::new("http://unused", None, None);
+        let err = validator.validate("").await.unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn validate_oversized_token_rejected() {
+        let validator = JwtValidator::new("http://unused", None, None);
+        let huge = "x".repeat(20_000);
+        let err = validator.validate(&huge).await.unwrap_err();
+        assert!(err.to_string().contains("maximum length"));
+    }
+
+    // --- Non-string claim coercion tests ---
+
+    #[test]
+    fn extract_string_claim_from_numeric_extra() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("org_id".into(), serde_json::json!(12345));
+        let claims = JwtClaims {
+            sub: None,
+            iss: None,
+            aud: None,
+            exp: None,
+            tid: None,
+            roles: None,
+            extra,
+        };
+        let validator = JwtValidator::new("http://unused", None, None);
+        assert_eq!(
+            validator.extract_string_claim(&claims, "org_id").unwrap(),
+            "12345"
+        );
+    }
+
+    #[test]
+    fn extract_string_claim_rejects_boolean() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("active".into(), serde_json::json!(true));
+        let claims = JwtClaims {
+            sub: None,
+            iss: None,
+            aud: None,
+            exp: None,
+            tid: None,
+            roles: None,
+            extra,
+        };
+        let validator = JwtValidator::new("http://unused", None, None);
+        let err = validator
+            .extract_string_claim(&claims, "active")
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported type"));
+    }
+
+    #[test]
+    fn extract_string_claim_rejects_null() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("tenant".into(), serde_json::Value::Null);
+        let claims = JwtClaims {
+            sub: None,
+            iss: None,
+            aud: None,
+            exp: None,
+            tid: None,
+            roles: None,
+            extra,
+        };
+        let validator = JwtValidator::new("http://unused", None, None);
+        let err = validator
+            .extract_string_claim(&claims, "tenant")
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported type"));
+    }
+
+    #[test]
+    fn extract_string_claim_rejects_object() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("nested".into(), serde_json::json!({"key": "value"}));
+        let claims = JwtClaims {
+            sub: None,
+            iss: None,
+            aud: None,
+            exp: None,
+            tid: None,
+            roles: None,
+            extra,
+        };
+        let validator = JwtValidator::new("http://unused", None, None);
+        let err = validator
+            .extract_string_claim(&claims, "nested")
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported type"));
+    }
+
+    // --- Error variant tests ---
+
+    #[test]
+    fn auth_errors_use_auth_variant() {
+        let validator = JwtValidator::new("http://unused", None, None);
+        let claims = JwtClaims {
+            sub: None,
+            iss: None,
+            aud: None,
+            exp: None,
+            tid: None,
+            roles: None,
+            extra: Default::default(),
+        };
+        let err = validator.extract_string_claim(&claims, "sub").unwrap_err();
+        assert!(err.to_string().contains("Authentication error"));
     }
 }

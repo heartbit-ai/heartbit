@@ -289,12 +289,22 @@ pub struct TokenExchangeAuthProvider {
     client_secret: String,
     agent_token: String,
     user_tokens: Arc<RwLock<HashMap<String, String>>>,
+    /// Cache of exchanged tokens: user_id -> (access_token, expires_at).
+    token_cache: RwLock<HashMap<String, (String, std::time::Instant)>>,
 }
 
+/// Token exchange response per RFC 8693.
 #[derive(Deserialize)]
 struct TokenExchangeResponse {
     access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    token_type: Option<String>,
 }
+
+/// Request timeout for token exchange calls.
+const TOKEN_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl TokenExchangeAuthProvider {
     pub fn new(
@@ -304,12 +314,16 @@ impl TokenExchangeAuthProvider {
         agent_token: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(TOKEN_EXCHANGE_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             exchange_url: exchange_url.into(),
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             agent_token: agent_token.into(),
             user_tokens: Arc::new(RwLock::new(HashMap::new())),
+            token_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -327,6 +341,14 @@ impl AuthProvider for TokenExchangeAuthProvider {
         _tenant_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
         Box::pin(async move {
+            // Check cache first
+            if let Ok(cache) = self.token_cache.read()
+                && let Some((token, expires_at)) = cache.get(user_id)
+                && std::time::Instant::now() < *expires_at
+            {
+                return Ok(Some(format!("Bearer {token}")));
+            }
+
             let subject_token = {
                 let tokens = self
                     .user_tokens
@@ -365,8 +387,14 @@ impl AuthProvider for TokenExchangeAuthProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
+                // Truncate error body to avoid leaking sensitive IdP details in logs
+                let truncated = if body.len() > 512 {
+                    &body[..512]
+                } else {
+                    &body
+                };
                 return Err(Error::Mcp(format!(
-                    "Token exchange failed (HTTP {status}): {body}"
+                    "Token exchange failed (HTTP {status}): {truncated}"
                 )));
             }
 
@@ -375,7 +403,23 @@ impl AuthProvider for TokenExchangeAuthProvider {
                 .await
                 .map_err(|e| Error::Mcp(format!("Token exchange response parse error: {e}")))?;
 
-            Ok(Some(format!("Bearer {}", token_response.access_token)))
+            // Cache the exchanged token with expiry (default 5 minutes if not specified)
+            let ttl = token_response.expires_in.unwrap_or(300);
+            // Expire 30 seconds early to avoid using nearly-expired tokens
+            let expires_at =
+                std::time::Instant::now() + std::time::Duration::from_secs(ttl.saturating_sub(30));
+            if let Ok(mut cache) = self.token_cache.write() {
+                cache.insert(
+                    user_id.to_string(),
+                    (token_response.access_token.clone(), expires_at),
+                );
+            }
+
+            let token_type = token_response.token_type.as_deref().unwrap_or("Bearer");
+            Ok(Some(format!(
+                "{token_type} {}",
+                token_response.access_token
+            )))
         })
     }
 }
