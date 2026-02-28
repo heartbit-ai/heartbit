@@ -1072,7 +1072,21 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     /// Bearer tokens that grant API access. Multiple tokens support key rotation.
+    #[serde(default)]
     pub bearer_tokens: Vec<String>,
+    /// JWKS endpoint URL for JWT signature verification
+    /// (e.g. `"https://idp.example.com/.well-known/jwks.json"`).
+    pub jwks_url: Option<String>,
+    /// Expected JWT issuer (`iss` claim). Validated when present.
+    pub issuer: Option<String>,
+    /// Expected JWT audience (`aud` claim). Validated when present.
+    pub audience: Option<String>,
+    /// JWT claim to extract user ID from. Defaults to `"sub"`.
+    pub user_id_claim: Option<String>,
+    /// JWT claim to extract tenant ID from. Defaults to `"tid"`.
+    pub tenant_id_claim: Option<String>,
+    /// JWT claim to extract roles from. Defaults to `"roles"`.
+    pub roles_claim: Option<String>,
 }
 
 /// Heartbit pulse configuration for autonomous periodic awareness.
@@ -1982,9 +1996,9 @@ impl HeartbitConfig {
 
             // Validate auth config
             if let Some(ref auth) = daemon.auth {
-                if auth.bearer_tokens.is_empty() {
+                if auth.bearer_tokens.is_empty() && auth.jwks_url.is_none() {
                     return Err(Error::Config(
-                        "daemon.auth.bearer_tokens must not be empty".into(),
+                        "daemon.auth requires at least bearer_tokens or jwks_url".into(),
                     ));
                 }
                 for (i, token) in auth.bearer_tokens.iter().enumerate() {
@@ -1993,6 +2007,13 @@ impl HeartbitConfig {
                             "daemon.auth.bearer_tokens[{i}] must not be empty"
                         )));
                     }
+                }
+                if let Some(ref url) = auth.jwks_url
+                    && url.is_empty()
+                {
+                    return Err(Error::Config(
+                        "daemon.auth.jwks_url must not be empty".into(),
+                    ));
                 }
             }
 
@@ -5477,7 +5498,7 @@ bearer_tokens = []
         let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
         assert!(
             err.to_string()
-                .contains("daemon.auth.bearer_tokens must not be empty"),
+                .contains("daemon.auth requires at least bearer_tokens or jwks_url"),
             "got: {err}"
         );
     }
@@ -5515,6 +5536,75 @@ brokers = "localhost:9092"
 "#;
         let config = HeartbitConfig::from_toml(toml_str).unwrap();
         assert!(config.daemon.unwrap().auth.is_none());
+    }
+
+    #[test]
+    fn auth_config_jwks_only_is_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+issuer = "https://idp.example.com"
+audience = "heartbit-api"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let auth = config.daemon.unwrap().auth.unwrap();
+        assert!(auth.bearer_tokens.is_empty());
+        assert_eq!(
+            auth.jwks_url.as_deref(),
+            Some("https://idp.example.com/.well-known/jwks.json")
+        );
+        assert_eq!(auth.issuer.as_deref(), Some("https://idp.example.com"));
+        assert_eq!(auth.audience.as_deref(), Some("heartbit-api"));
+    }
+
+    #[test]
+    fn auth_config_empty_jwks_url_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+bearer_tokens = ["valid-token"]
+jwks_url = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.jwks_url must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_config_no_tokens_no_jwks_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+issuer = "https://idp.example.com"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth requires at least bearer_tokens or jwks_url"),
+            "got: {err}"
+        );
     }
 
     // --- Cascade config ---
@@ -6809,5 +6899,77 @@ provider = "local"
             }
             _ => panic!("expected Postgres memory config"),
         }
+    }
+
+    #[test]
+    fn auth_config_backward_compat() {
+        let toml_str = r#"
+            bearer_tokens = ["tok-abc", "tok-xyz"]
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.bearer_tokens, vec!["tok-abc", "tok-xyz"]);
+        assert!(auth.jwks_url.is_none());
+        assert!(auth.issuer.is_none());
+        assert!(auth.audience.is_none());
+        assert!(auth.user_id_claim.is_none());
+        assert!(auth.tenant_id_claim.is_none());
+        assert!(auth.roles_claim.is_none());
+    }
+
+    #[test]
+    fn auth_config_with_jwks() {
+        let toml_str = r#"
+            bearer_tokens = ["tok-1"]
+            jwks_url = "https://idp.example.com/.well-known/jwks.json"
+            issuer = "https://idp.example.com"
+            audience = "heartbit-api"
+            user_id_claim = "sub"
+            tenant_id_claim = "org_id"
+            roles_claim = "permissions"
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.bearer_tokens, vec!["tok-1"]);
+        assert_eq!(
+            auth.jwks_url.as_deref(),
+            Some("https://idp.example.com/.well-known/jwks.json")
+        );
+        assert_eq!(auth.issuer.as_deref(), Some("https://idp.example.com"));
+        assert_eq!(auth.audience.as_deref(), Some("heartbit-api"));
+        assert_eq!(auth.user_id_claim.as_deref(), Some("sub"));
+        assert_eq!(auth.tenant_id_claim.as_deref(), Some("org_id"));
+        assert_eq!(auth.roles_claim.as_deref(), Some("permissions"));
+    }
+
+    #[test]
+    fn auth_config_empty_is_valid() {
+        let toml_str = "";
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert!(auth.bearer_tokens.is_empty());
+        assert!(auth.jwks_url.is_none());
+        assert!(auth.issuer.is_none());
+        assert!(auth.audience.is_none());
+        assert!(auth.user_id_claim.is_none());
+        assert!(auth.tenant_id_claim.is_none());
+        assert!(auth.roles_claim.is_none());
+    }
+
+    #[test]
+    fn auth_config_mixed() {
+        let toml_str = r#"
+            bearer_tokens = ["static-key"]
+            jwks_url = "https://auth.corp.io/.well-known/jwks.json"
+            audience = "heartbit"
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.bearer_tokens, vec!["static-key"]);
+        assert_eq!(
+            auth.jwks_url.as_deref(),
+            Some("https://auth.corp.io/.well-known/jwks.json")
+        );
+        assert!(auth.issuer.is_none());
+        assert_eq!(auth.audience.as_deref(), Some("heartbit"));
+        assert!(auth.user_id_claim.is_none());
+        assert!(auth.tenant_id_claim.is_none());
+        assert!(auth.roles_claim.is_none());
     }
 }

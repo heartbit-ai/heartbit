@@ -49,6 +49,57 @@ impl DaemonHandle {
             source: source_str,
             story_id,
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
+        };
+        let payload = serde_json::to_vec(&cmd)
+            .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
+
+        self.producer
+            .send(
+                FutureRecord::to(&self.commands_topic)
+                    .key(&id.to_string())
+                    .payload(&payload),
+                rdkafka::util::Timeout::Never,
+            )
+            .await
+            .map_err(|(e, _)| Error::Daemon(format!("failed to produce command: {e}")))?;
+
+        Ok(id)
+    }
+
+    /// Submit a task with user context for multi-tenant isolation.
+    ///
+    /// Like `submit_task`, but attaches user/tenant identity to the command
+    /// and creates the task record with user context.
+    pub async fn submit_task_with_user(
+        &self,
+        task: impl Into<String>,
+        source: impl Into<String>,
+        story_id: Option<String>,
+        user_context: &super::types::UserContext,
+    ) -> Result<uuid::Uuid, Error> {
+        let id = uuid::Uuid::new_v4();
+        let task_str = task.into();
+        let source_str = source.into();
+
+        let daemon_task = DaemonTask::new_with_user(
+            id,
+            &task_str,
+            &source_str,
+            &user_context.user_id,
+            &user_context.tenant_id,
+        );
+        self.store.insert(daemon_task)?;
+
+        let cmd = DaemonCommand::SubmitTask {
+            id,
+            task: task_str,
+            source: source_str,
+            story_id,
+            trust_level: None,
+            user_id: Some(user_context.user_id.clone()),
+            tenant_id: Some(user_context.tenant_id.clone()),
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -208,6 +259,8 @@ impl DaemonCore {
                 Option<String>,
                 Option<crate::config::TrustLevel>,
                 Arc<dyn Fn(AgentEvent) + Send + Sync>,
+                Option<String>, // user_id
+                Option<String>, // tenant_id
             ) -> Fut
             + Send
             + Sync
@@ -252,10 +305,16 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level } => {
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id } => {
                             // Re-insert task if missing (e.g. after restart with message replay)
                             if let Ok(None) = self.store.get(id) {
-                                let _ = self.store.insert(DaemonTask::new(id, &task, &source));
+                                if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
+                                    let _ = self.store.insert(DaemonTask::new_with_user(
+                                        id, &task, &source, uid, tid,
+                                    ));
+                                } else {
+                                    let _ = self.store.insert(DaemonTask::new(id, &task, &source));
+                                }
                             }
 
                             let permit = match self.semaphore.clone().acquire_owned().await {
@@ -312,7 +371,7 @@ impl DaemonCore {
                                     .ok();
 
                                 let start = std::time::Instant::now();
-                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event);
+                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event, user_id, tenant_id);
                                 tokio::select! {
                                     result = runner => {
                                         let duration_secs = start.elapsed().as_secs_f64();
@@ -687,6 +746,30 @@ mod tests {
         assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
         assert_eq!(stats.total_input_tokens, 100);
         assert!((stats.total_estimated_cost_usd - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn register_task_with_user_stores_user_context() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        let task = DaemonTask::new_with_user(id, "check deals", "api", "alice", "acme");
+        handle.store.insert(task).unwrap();
+
+        let fetched = handle.get_task(id).unwrap().unwrap();
+        assert_eq!(fetched.user_id.as_deref(), Some("alice"));
+        assert_eq!(fetched.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(fetched.task, "check deals");
+    }
+
+    #[test]
+    fn register_task_without_user_has_none_context() {
+        let handle = test_handle();
+        let id = uuid::Uuid::new_v4();
+        handle.register_task(id, "basic task", "api").unwrap();
+
+        let task = handle.get_task(id).unwrap().unwrap();
+        assert!(task.user_id.is_none());
+        assert!(task.tenant_id.is_none());
     }
 
     #[tokio::test]

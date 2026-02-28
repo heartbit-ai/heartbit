@@ -656,6 +656,8 @@ async fn run_from_config(
         vec![], // no guardrails in CLI run mode
         None,   // no memory confidentiality cap in CLI run mode
         None,   // no memory default confidentiality in CLI run mode
+        None,   // no audit user context in CLI run mode
+        None,   // no audit tenant context in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -742,6 +744,8 @@ pub(crate) async fn build_orchestrator_from_config(
     guardrails: Vec<Arc<dyn heartbit::Guardrail>>,
     memory_confidentiality_cap: Option<heartbit::Confidentiality>,
     memory_default_confidentiality: Option<heartbit::Confidentiality>,
+    audit_user_id: Option<&str>,
+    audit_tenant_id: Option<&str>,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
 
@@ -936,6 +940,13 @@ pub(crate) async fn build_orchestrator_from_config(
             .max_tokens(max_tokens)
             .on_text(Arc::clone(&on_text))
             .observability_mode(observability_mode);
+
+        // Wire audit user context for multi-tenant enrichment
+        if let Some(uid) = audit_user_id
+            && let Some(tid) = audit_tenant_id
+        {
+            rb = rb.audit_user_context(uid, tid);
+        }
 
         // Context strategy: agent-level, then orchestrator-level fallback
         match &agent.context_strategy {
@@ -1199,6 +1210,13 @@ pub(crate) async fn build_orchestrator_from_config(
         .on_text(on_text)
         .observability_mode(observability_mode);
 
+    // Wire audit user context for multi-tenant enrichment
+    if let Some(uid) = audit_user_id
+        && let Some(tid) = audit_tenant_id
+    {
+        builder = builder.audit_user_context(uid, tid);
+    }
+
     // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
     {
         let mut all_guardrails = guardrails.clone();
@@ -1388,6 +1406,8 @@ pub(crate) async fn build_orchestrator_from_config(
             workspace: None,
             max_total_tokens: agent.max_total_tokens,
             audit_trail: None,
+            audit_user_id: audit_user_id.map(String::from),
+            audit_tenant_id: audit_tenant_id.map(String::from),
         });
     }
 

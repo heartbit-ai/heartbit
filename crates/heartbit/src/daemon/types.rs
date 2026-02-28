@@ -20,6 +20,12 @@ pub enum DaemonCommand {
         /// Sender trust level for security guardrails (sensor tasks only).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trust_level: Option<TrustLevel>,
+        /// Authenticated user ID for multi-tenant isolation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        /// Tenant ID for multi-tenant isolation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant_id: Option<String>,
     },
     CancelTask {
         id: Uuid,
@@ -61,6 +67,12 @@ pub struct DaemonTask {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// Authenticated user ID for multi-tenant isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Tenant ID for multi-tenant isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl DaemonTask {
@@ -80,8 +92,41 @@ impl DaemonTask {
             estimated_cost_usd: None,
             source: source.into(),
             agent_name: None,
+            user_id: None,
+            tenant_id: None,
         }
     }
+
+    /// Create a new pending task with user context for multi-tenant isolation.
+    pub fn new_with_user(
+        id: Uuid,
+        task: impl Into<String>,
+        source: impl Into<String>,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: Some(user_id.into()),
+            tenant_id: Some(tenant_id.into()),
+            ..Self::new(id, task, source)
+        }
+    }
+}
+
+/// Authenticated user context extracted from JWT or API token.
+///
+/// Propagated through the daemon to scope memory, workspace, audit, and MCP auth
+/// to the authenticated user. All fields are strings to avoid coupling to a
+/// specific identity provider's ID format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserContext {
+    /// User identifier (typically JWT `sub` claim).
+    pub user_id: String,
+    /// Tenant identifier for multi-tenant isolation (typically JWT `tid` claim).
+    pub tenant_id: String,
+    /// Roles granted to this user (typically JWT `roles` claim).
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Aggregated statistics across all daemon tasks.
@@ -112,6 +157,8 @@ mod tests {
             source: "api".into(),
             story_id: None,
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
@@ -154,6 +201,8 @@ mod tests {
             source: "api".into(),
             story_id: None,
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""type":"submit_task""#));
@@ -174,6 +223,8 @@ mod tests {
             source: "sensor:rss".into(),
             story_id: Some("story-cve-2026-001".into()),
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("story_id"));
@@ -254,6 +305,8 @@ mod tests {
         assert!(task.estimated_cost_usd.is_none());
         assert_eq!(task.source, "api");
         assert!(task.agent_name.is_none());
+        assert!(task.user_id.is_none());
+        assert!(task.tenant_id.is_none());
     }
 
     #[test]
@@ -349,5 +402,137 @@ mod tests {
         assert!(stats.tasks_by_state.is_empty());
         assert_eq!(stats.total_input_tokens, 0);
         assert_eq!(stats.total_estimated_cost_usd, 0.0);
+    }
+
+    // --- Multi-tenant / UserContext tests ---
+
+    #[test]
+    fn user_context_serde_roundtrip() {
+        let ctx = UserContext {
+            user_id: "user-123".into(),
+            tenant_id: "acme".into(),
+            roles: vec!["sales".into(), "admin".into()],
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let parsed: UserContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.user_id, "user-123");
+        assert_eq!(parsed.tenant_id, "acme");
+        assert_eq!(parsed.roles, vec!["sales", "admin"]);
+    }
+
+    #[test]
+    fn user_context_empty_roles_default() {
+        let json = r#"{"user_id":"u1","tenant_id":"t1"}"#;
+        let ctx: UserContext = serde_json::from_str(json).unwrap();
+        assert_eq!(ctx.user_id, "u1");
+        assert_eq!(ctx.tenant_id, "t1");
+        assert!(ctx.roles.is_empty());
+    }
+
+    #[test]
+    fn user_context_equality() {
+        let a = UserContext {
+            user_id: "u1".into(),
+            tenant_id: "t1".into(),
+            roles: vec!["r1".into()],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn daemon_task_new_with_user() {
+        let id = Uuid::new_v4();
+        let task = DaemonTask::new_with_user(id, "crm query", "api", "user-42", "acme-corp");
+        assert_eq!(task.id, id);
+        assert_eq!(task.task, "crm query");
+        assert_eq!(task.source, "api");
+        assert_eq!(task.user_id.as_deref(), Some("user-42"));
+        assert_eq!(task.tenant_id.as_deref(), Some("acme-corp"));
+        assert_eq!(task.state, TaskState::Pending);
+    }
+
+    #[test]
+    fn daemon_task_user_fields_omitted_when_none() {
+        let task = DaemonTask::new(Uuid::nil(), "test", "api");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(!json.contains("user_id"));
+        assert!(!json.contains("tenant_id"));
+    }
+
+    #[test]
+    fn daemon_task_user_fields_present_when_set() {
+        let task = DaemonTask::new_with_user(Uuid::nil(), "test", "api", "alice", "acme");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""user_id":"alice""#));
+        assert!(json.contains(r#""tenant_id":"acme""#));
+    }
+
+    #[test]
+    fn daemon_task_backward_compat_no_user_fields() {
+        // Old JSON without user_id/tenant_id should deserialize with None
+        let json = r#"{"id":"00000000-0000-0000-0000-000000000000","task":"test","state":"pending","created_at":"2026-01-01T00:00:00Z","tokens_used":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0},"tool_calls_made":0,"source":"api"}"#;
+        let parsed: DaemonTask = serde_json::from_str(json).unwrap();
+        assert!(parsed.user_id.is_none());
+        assert!(parsed.tenant_id.is_none());
+    }
+
+    #[test]
+    fn submit_command_with_user_context() {
+        let id = Uuid::new_v4();
+        let cmd = DaemonCommand::SubmitTask {
+            id,
+            task: "list deals".into(),
+            source: "api".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: Some("alice".into()),
+            tenant_id: Some("acme".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains(r#""user_id":"alice""#));
+        assert!(json.contains(r#""tenant_id":"acme""#));
+        let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonCommand::SubmitTask {
+                user_id, tenant_id, ..
+            } => {
+                assert_eq!(user_id.as_deref(), Some("alice"));
+                assert_eq!(tenant_id.as_deref(), Some("acme"));
+            }
+            _ => panic!("expected SubmitTask"),
+        }
+    }
+
+    #[test]
+    fn submit_command_user_fields_omitted_when_none() {
+        let cmd = DaemonCommand::SubmitTask {
+            id: Uuid::nil(),
+            task: "test".into(),
+            source: "api".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: None,
+            tenant_id: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(!json.contains("user_id"));
+        assert!(!json.contains("tenant_id"));
+    }
+
+    #[test]
+    fn submit_command_backward_compat_no_user_fields() {
+        // Old JSON without user_id/tenant_id
+        let json = r#"{"type":"submit_task","id":"00000000-0000-0000-0000-000000000000","task":"test","source":"api"}"#;
+        let parsed: DaemonCommand = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonCommand::SubmitTask {
+                user_id, tenant_id, ..
+            } => {
+                assert!(user_id.is_none());
+                assert!(tenant_id.is_none());
+            }
+            _ => panic!("expected SubmitTask"),
+        }
     }
 }

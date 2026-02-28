@@ -386,9 +386,11 @@ crates/
         circuit_breaker.rs     # LLM circuit breaker
         scheduler.rs           # Recurring task scheduler
         types.rs               # Workflow types
+      auth/
+        jwt.rs                 # JwksClient, JwtValidator → UserContext
       lsp/                     # LSP client integration
       store/                   # PostgreSQL task/audit store
-      config.rs                # HeartbitConfig from TOML
+      config.rs                # HeartbitConfig from TOML (incl. AuthConfig)
       error.rs                 # Error types (thiserror)
       workspace.rs             # Agent workspace (sandboxed file access)
       lib.rs                   # Public API re-exports
@@ -411,6 +413,7 @@ crates/
 | `Guardrail` | `agent/guardrail.rs` | Intercept agent loop (pre/post LLM/tool hooks) |
 | `Sensor` | `sensor/mod.rs` | Gather data from external sources |
 | `Blackboard` | `agent/blackboard.rs` | Shared key-value store for squad coordination |
+| `AuthProvider` | `tool/mcp.rs` | Per-user auth header resolution for MCP servers |
 | `CommandProducer` | `daemon/kafka.rs` | Produce commands to Kafka topics |
 
 ### Contributor Pathfinder
@@ -427,6 +430,8 @@ crates/
 | Understand context management | `agent/context.rs` → `ContextStrategy` |
 | Add a channel adapter | `channel/bridge.rs` → `InteractionBridge` |
 | Understand the daemon | `daemon/core.rs` → `DaemonCore` |
+| Add JWT/multi-tenant auth | `auth/jwt.rs` → `JwtValidator` |
+| Add an MCP auth provider | `tool/mcp.rs` → `AuthProvider` trait |
 | Add a Restate workflow | `workflow/` → `agent_workflow.rs` |
 | Understand config loading | `config.rs` → `HeartbitConfig` |
 | Understand cost tracking | `llm/pricing.rs` → `estimate_cost()` |
@@ -531,6 +536,50 @@ Long-running Kafka-backed task execution with HTTP API.
 - **Heartbeat pulse** — periodic awareness loop that reads `HEARTBIT.md` standing orders, checks todos, submits tasks with idle backoff
 - **Bounded concurrency** — `max_concurrent_tasks` limits parallel agent runs
 - **WebSocket + Telegram** — interactive channels via `InteractionBridge`
+- **Multi-tenant isolation** — JWT/JWKS authentication extracts `UserContext` per request; tasks, memory, and workspaces scoped per user/tenant
+- **A2A Agent Card** — `GET /.well-known/agent.json` for agent discovery (name, skills, auth schemes, endpoint)
+
+#### Multi-Tenant Authentication
+
+The daemon supports two auth modes (both can be active simultaneously):
+
+| Mode | Config key | How it works |
+|------|-----------|-------------|
+| **Bearer tokens** | `daemon.auth.bearer_tokens` | Static API keys; supports multiple tokens for rotation |
+| **JWT/JWKS** | `daemon.auth.jwks_url` | RS256 tokens verified against a JWKS endpoint; extracts `UserContext` |
+
+JWT claim names are configurable to accommodate different identity providers:
+
+```toml
+[daemon.auth]
+bearer_tokens = ["$YOUR_API_KEY"]          # static API keys
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+issuer = "https://idp.example.com"       # optional: validate iss claim
+audience = "heartbit-daemon"             # optional: validate aud claim
+user_id_claim = "sub"                    # default: "sub"
+tenant_id_claim = "tid"                  # default: "tid"
+roles_claim = "roles"                    # default: "roles"
+```
+
+When JWT auth is configured, authenticated requests carry a `UserContext` (user_id, tenant_id, roles) through the entire request lifecycle:
+- **Memory** — wrapped with `NamespacedMemory` using `tenant:{tid}:user:{uid}` prefix; users never see each other's memories
+- **Workspace** — scoped to `{base}/{tenant_id}/{user_id}/`
+- **Tasks** — filtered by authenticated tenant
+- **Audit** — records include `user_id`, `tenant_id`, and `delegation_chain`
+
+#### Dynamic MCP Authentication
+
+For multi-tenant MCP server access, the `AuthProvider` trait enables per-user token injection:
+
+```rust
+pub trait AuthProvider: Send + Sync {
+    fn auth_header_for(&self, user_id: &str, tenant_id: &str)
+        -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + '_>>;
+}
+```
+
+- **`StaticAuthProvider`** — returns the same auth header for all users (backward-compatible)
+- **`TokenExchangeAuthProvider`** — implements RFC 8693 token exchange against an IdP, caching per-user tokens
 
 ### Channels
 
@@ -635,7 +684,7 @@ println!("Pass rate: {:.0}%", summary.pass_rate * 100.0);
 
 ### Audit Trail
 
-`AuditTrail` logs agent decisions, tool calls, and guardrail outcomes. `InMemoryAuditTrail` for development, `PostgresAuditTrail` for production persistence.
+`AuditTrail` logs agent decisions, tool calls, and guardrail outcomes. `InMemoryAuditTrail` for development, `PostgresAuditTrail` for production persistence. In multi-tenant mode, audit records include `user_id`, `tenant_id`, and `delegation_chain` (RFC 8693 actor chain) for full provenance tracking.
 
 ### Durable Execution (Restate)
 
@@ -784,6 +833,15 @@ endpoint = "http://localhost:9070"
 [daemon]
 bind = "127.0.0.1:3000"            # HTTP API bind address
 max_concurrent_tasks = 4            # bounded concurrency
+
+[daemon.auth]                       # optional: daemon API authentication
+bearer_tokens = ["$YOUR_API_KEY"]     # static API keys (multiple for rotation)
+jwks_url = "https://idp.example.com/.well-known/jwks.json"  # JWT/JWKS auth
+issuer = "https://idp.example.com"  # optional: validate iss claim
+audience = "heartbit-daemon"        # optional: validate aud claim
+# user_id_claim = "sub"             # JWT claim for user ID (default: "sub")
+# tenant_id_claim = "tid"           # JWT claim for tenant ID (default: "tid")
+# roles_claim = "roles"             # JWT claim for roles (default: "roles")
 
 [daemon.kafka]
 brokers = "localhost:9092"
@@ -1106,16 +1164,27 @@ docker compose up kafka -d
 # Run the daemon
 heartbit daemon --config heartbit.toml
 
-# Submit a task
+# Submit a task (with bearer token auth)
 curl -X POST http://localhost:3000/tasks \
   -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer $YOUR_API_KEY' \
+  -d '{"task":"Analyze the codebase"}'
+
+# Submit a task (with JWT auth — multi-tenant)
+curl -X POST http://localhost:3000/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <jwt-token>' \
   -d '{"task":"Analyze the codebase"}'
 
 # List tasks
-curl http://localhost:3000/tasks
+curl http://localhost:3000/tasks \
+  -H 'Authorization: Bearer $YOUR_API_KEY'
 
 # Stream events (SSE)
 curl -N http://localhost:3000/tasks/<id>/events
+
+# Agent discovery
+curl http://localhost:3000/.well-known/agent.json
 
 # Cancel a task
 curl -X DELETE http://localhost:3000/tasks/<id>
@@ -1172,7 +1241,7 @@ npx -y supergateway \
 # Server at http://localhost:8000/mcp
 ```
 
-2665+ tests. TDD mandatory — red/green/refactor for every feature.
+2720+ tests. TDD mandatory — red/green/refactor for every feature.
 
 ## Contributing
 

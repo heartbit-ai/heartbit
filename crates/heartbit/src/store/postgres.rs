@@ -266,8 +266,34 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
                         ..Default::default()
                     },
                     timestamp: row.created_at,
+                    user_id: None,
+                    tenant_id: None,
+                    delegation_chain: Vec::new(),
                 })
                 .collect())
+        })
+    }
+
+    fn entries_for_tenant(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<crate::agent::audit::AuditRecord>, Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        let tenant_id = tenant_id.map(String::from);
+        Box::pin(async move {
+            let all = self.entries().await?;
+            match tenant_id {
+                None => Ok(all),
+                Some(ref tid) => Ok(all
+                    .into_iter()
+                    .filter(|r| r.tenant_id.as_deref() == Some(tid.as_str()))
+                    .collect()),
+            }
         })
     }
 }

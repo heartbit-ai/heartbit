@@ -31,7 +31,7 @@ use heartbit::daemon::kafka;
 use heartbit::{
     AgentEvent, AgentOutput, ConsolidateSession, CronScheduler, DaemonCore, DaemonHandle,
     DaemonMetrics, Error as HeartbitError, HeartbitConfig, HeartbitPulseScheduler,
-    InMemoryTaskStore, KafkaCommandProducer, Memory, ObservabilityMode,
+    InMemoryTaskStore, JwtValidator, KafkaCommandProducer, Memory, ObservabilityMode, UserContext,
 };
 
 use crate::{build_on_retry, build_provider_from_config, init_tracing_from_config};
@@ -112,22 +112,37 @@ struct AppState {
     shared_memory: Option<Arc<dyn Memory>>,
     workspace_dir: Option<PathBuf>,
     tool_cache: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>>,
+    /// JWT validator for multi-tenant auth. When present, extracts `UserContext`
+    /// from JWTs and inserts it into request extensions for handlers.
+    /// Used via middleware state; kept here for introspection by future handlers.
+    #[allow(dead_code)]
+    jwt_validator: Option<Arc<JwtValidator>>,
 }
 
 // --- Handlers ---
 
 async fn handle_submit(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     Json(body): Json<SubmitRequest>,
 ) -> impl IntoResponse {
     if let Some(ref m) = state.metrics {
         m.record_task_submitted();
     }
-    match state
-        .handle
-        .submit_task(body.task, "api", body.story_id)
-        .await
-    {
+
+    let result = if let Some(axum::Extension(ref ctx)) = user_context {
+        state
+            .handle
+            .submit_task_with_user(body.task, "api", body.story_id, ctx)
+            .await
+    } else {
+        state
+            .handle
+            .submit_task(body.task, "api", body.story_id)
+            .await
+    };
+
+    match result {
         Ok(id) => (
             StatusCode::CREATED,
             Json(SubmitResponse {
@@ -146,6 +161,7 @@ async fn handle_submit(
 
 async fn handle_list(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
     let state_filter = query.state.as_deref().and_then(parse_task_state);
@@ -155,7 +171,19 @@ async fn handle_list(
         query.source.as_deref(),
         state_filter,
     ) {
-        Ok((tasks, total)) => Json(ListResponse { tasks, total }).into_response(),
+        Ok((tasks, _total)) => {
+            // Filter by tenant when user context is present
+            let tasks = if let Some(axum::Extension(ref ctx)) = user_context {
+                tasks
+                    .into_iter()
+                    .filter(|t| t.tenant_id.as_deref() == Some(&ctx.tenant_id))
+                    .collect::<Vec<_>>()
+            } else {
+                tasks
+            };
+            let total = tasks.len();
+            Json(ListResponse { tasks, total }).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -205,10 +233,23 @@ async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn handle_get(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     match state.handle.get_task(id) {
-        Ok(Some(task)) => Json(task).into_response(),
+        Ok(Some(task)) => {
+            // Enforce tenant isolation when user context is present
+            if let Some(axum::Extension(ref ctx)) = user_context
+                && task.tenant_id.as_deref() != Some(&ctx.tenant_id)
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "task not found" })),
+                )
+                    .into_response();
+            }
+            Json(task).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "task not found" })),
@@ -224,8 +265,36 @@ async fn handle_get(
 
 async fn handle_cancel(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
+    // Verify tenant ownership before cancelling
+    if let Some(axum::Extension(ref ctx)) = user_context {
+        match state.handle.get_task(id) {
+            Ok(Some(task)) if task.tenant_id.as_deref() != Some(&ctx.tenant_id) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "task not found" })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "task not found" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
     match state.handle.cancel_task(id).await {
         Ok(()) => {
             if let Some(ref m) = state.metrics {
@@ -243,8 +312,29 @@ async fn handle_cancel(
 
 async fn handle_events(
     State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
+    // Verify tenant ownership before subscribing to events
+    if let Some(axum::Extension(ref ctx)) = user_context {
+        match state.handle.get_task(id) {
+            Ok(Some(task)) if task.tenant_id.as_deref() != Some(&ctx.tenant_id) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "task not found" })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "task not found" })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
     match state.handle.subscribe_events(id) {
         Some(rx) => {
             let stream = BroadcastStream::new(rx).filter_map(
@@ -415,6 +505,108 @@ async fn handle_todo(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+// --- A2A Agent Card endpoint ---
+
+/// Returns an A2A Agent Card (JSON) describing this daemon's capabilities.
+///
+/// Endpoint: `GET /.well-known/agent.json`
+///
+/// The agent card follows the A2A protocol specification, enabling other agents
+/// to discover and interact with this daemon's agents.
+async fn handle_agent_card(State(state): State<AppState>) -> impl IntoResponse {
+    let config = &state.config;
+
+    // Build skills from configured agents
+    let skills: Vec<serde_json::Value> = config
+        .agents
+        .iter()
+        .map(|agent| {
+            serde_json::json!({
+                "id": agent.name,
+                "name": agent.name,
+                "description": agent.description,
+                "inputModes": ["text"],
+                "outputModes": ["text"],
+            })
+        })
+        .collect();
+
+    // Determine auth schemes from daemon.auth config
+    let auth = config.daemon.as_ref().and_then(|d| d.auth.as_ref());
+    let has_bearer = auth.map(|a| !a.bearer_tokens.is_empty()).unwrap_or(false);
+    let has_jwt = auth.and_then(|a| a.jwks_url.as_ref()).is_some();
+
+    let mut security_schemes = serde_json::Map::new();
+    let mut security = Vec::new();
+
+    if has_bearer {
+        security_schemes.insert(
+            "bearerAuth".to_string(),
+            serde_json::json!({
+                "type": "http",
+                "scheme": "bearer"
+            }),
+        );
+        security.push(serde_json::json!({"bearerAuth": []}));
+    }
+
+    if has_jwt {
+        let jwks_url = auth
+            .and_then(|a| a.jwks_url.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        security_schemes.insert(
+            "openIdConnect".to_string(),
+            serde_json::json!({
+                "type": "openIdConnect",
+                "openIdConnectUrl": jwks_url
+            }),
+        );
+        security.push(serde_json::json!({"openIdConnect": []}));
+    }
+
+    // Determine the daemon URL from bind address
+    let bind_addr = config
+        .daemon
+        .as_ref()
+        .map(|d| d.bind.as_str())
+        .unwrap_or("0.0.0.0:9080");
+    let url = format!("http://{bind_addr}");
+
+    // Use first agent's name/description or fallback defaults
+    let agent_name = config
+        .agents
+        .first()
+        .map(|a| a.name.as_str())
+        .unwrap_or("heartbit");
+
+    let description = config
+        .agents
+        .first()
+        .map(|a| a.description.as_str())
+        .unwrap_or("Heartbit multi-agent runtime");
+
+    let card = serde_json::json!({
+        "name": agent_name,
+        "description": description,
+        "url": format!("{url}/tasks"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": "0.2.1",
+        "capabilities": {
+            "streaming": true,
+            "pushNotifications": false,
+            "stateTransitionHistory": true,
+        },
+        "defaultInputModes": ["text"],
+        "defaultOutputModes": ["text"],
+        "skills": skills,
+        "security": security,
+        "securitySchemes": security_schemes,
+    });
+
+    Json(card)
+}
+
 // --- HTTP metrics middleware ---
 
 /// HTTP request metrics registered on the same Prometheus `Registry` as `DaemonMetrics`.
@@ -508,6 +700,25 @@ async fn cors_middleware(
     response
 }
 
+/// Validate that a string is safe to use as a filesystem path component.
+///
+/// Rejects empty strings, path separators, `..` traversal, and absolute paths.
+fn validate_path_component(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("empty path component".into());
+    }
+    if s.contains('/') || s.contains('\\') {
+        return Err(format!("path separator in component: {s:?}"));
+    }
+    if s == "." || s == ".." || s.contains("..") {
+        return Err(format!("path traversal in component: {s:?}"));
+    }
+    if std::path::Path::new(s).is_absolute() {
+        return Err(format!("absolute path in component: {s:?}"));
+    }
+    Ok(())
+}
+
 /// Merge bearer tokens from config and an optional environment variable into a token set.
 ///
 /// Returns `None` when no tokens are available (auth disabled).
@@ -549,6 +760,67 @@ fn validate_bearer_token(
 }
 
 /// Auth middleware that validates Bearer tokens on protected routes.
+/// State for JWT auth middleware, including whether JWT is required or optional.
+#[derive(Clone)]
+struct JwtMiddlewareState {
+    validator: Arc<JwtValidator>,
+    /// When true, requests without a JWT are rejected (JWT is sole auth).
+    /// When false, requests without a JWT pass through (bearer token auth handles gating).
+    required: bool,
+}
+
+/// Middleware that validates JWTs and injects `UserContext` into request extensions.
+///
+/// When a valid JWT is present, the extracted `UserContext` is available to handlers
+/// via `Option<axum::Extension<UserContext>>`.
+///
+/// Behavior depends on `required`:
+/// - `required = false`: enrich-only mode — requests without JWTs pass through
+/// - `required = true`: requests without a valid JWT are rejected with 401
+async fn jwt_auth_middleware(
+    State(jwt_state): State<JwtMiddlewareState>,
+    mut request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Extract bearer token from Authorization header
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    if let Some(ref header) = auth_header
+        && let Some(token) = header.strip_prefix("Bearer ")
+    {
+        match jwt_state.validator.validate(token).await {
+            Ok(user_ctx) => {
+                tracing::debug!(
+                    user_id = %user_ctx.user_id,
+                    tenant_id = %user_ctx.tenant_id,
+                    "JWT validated, user context injected"
+                );
+                request.extensions_mut().insert(user_ctx);
+            }
+            Err(e) => {
+                tracing::warn!("JWT validation failed: {e}");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "invalid or expired token"})),
+                )
+                    .into_response();
+            }
+        }
+    } else if jwt_state.required {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Authorization header with Bearer token required"})),
+        )
+            .into_response();
+    }
+
+    next.run(request).await.into_response()
+}
+
 async fn auth_middleware(
     State(tokens): State<Arc<HashSet<String>>>,
     request: axum::http::Request<axum::body::Body>,
@@ -833,7 +1105,9 @@ pub async fn run_daemon(
                              source: String,
                              story_id: Option<String>,
                              trust_level: Option<heartbit::TrustLevel>,
-                             on_event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>|
+                             on_event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>,
+                             user_id: Option<String>,
+                             tenant_id: Option<String>|
           -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<AgentOutput, HeartbitError>> + Send>,
     > {
@@ -891,6 +1165,54 @@ pub async fn run_daemon(
                 (vec![], None)
             };
 
+            // Per-user memory namespace: wrap shared memory with user-scoped prefix
+            let task_memory: Option<Arc<dyn heartbit::Memory>> = if let Some(ref uid) = user_id
+                && let Some(ref tid) = tenant_id
+                && let Some(ref mem) = memory
+            {
+                let ns_prefix = format!("tenant:{tid}:user:{uid}");
+                let ns = heartbit::NamespacedMemory::new(mem.clone(), ns_prefix.clone());
+                tracing::debug!(namespace = %ns_prefix, "memory namespaced to tenant/user");
+                Some(Arc::new(ns))
+            } else {
+                memory
+            };
+
+            // Per-user workspace isolation: scope to {workspace}/{tenant_id}/{user_id}/
+            // Sanitize IDs to prevent path traversal (reject /, \, .., absolute paths)
+            let task_workspace = if let (Some(base), Some(tid), Some(uid)) =
+                (&workspace_dir, &tenant_id, &user_id)
+            {
+                if let Err(e) =
+                    validate_path_component(tid).and_then(|_| validate_path_component(uid))
+                {
+                    tracing::error!(
+                        tenant_id = %tid,
+                        user_id = %uid,
+                        error = %e,
+                        "rejected unsafe tenant/user ID in workspace path"
+                    );
+                    return Err(HeartbitError::Daemon(format!(
+                        "invalid tenant/user ID for workspace: {e}"
+                    )));
+                }
+                let scoped = base.join(tid).join(uid);
+                if let Err(e) = tokio::fs::create_dir_all(&scoped).await {
+                    tracing::warn!(
+                        path = %scoped.display(),
+                        error = %e,
+                        "failed to create per-user workspace"
+                    );
+                }
+                tracing::debug!(
+                    path = %scoped.display(),
+                    "workspace scoped to tenant/user"
+                );
+                Some(scoped)
+            } else {
+                workspace_dir
+            };
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -900,15 +1222,17 @@ pub async fn run_daemon(
                 Some(on_event),
                 mode,
                 story_id.as_deref(),
-                None,   // no interactive question callback in daemon mode
-                memory, // shared daemon memory
-                workspace_dir,
-                todo_store, // persistent daemon todo store
+                None,           // no interactive question callback in daemon mode
+                task_memory,    // per-user namespaced or shared daemon memory
+                task_workspace, // per-user scoped or shared workspace
+                todo_store,     // persistent daemon todo store
                 Some(&tools),
                 None, // no multimodal content in Kafka consumer path
                 guardrails,
                 memory_confidentiality_cap,
                 None, // sensor tasks don't override store default
+                user_id.as_deref(),
+                tenant_id.as_deref(),
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -990,6 +1314,28 @@ pub async fn run_daemon(
         tracing::warn!("HTTP API authentication disabled — all routes are public");
     }
 
+    // Build JWT validator from config (for multi-tenant auth)
+    let jwt_validator = daemon_config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.jwks_url.as_ref())
+        .map(|jwks_url| {
+            let auth = daemon_config.auth.as_ref().unwrap();
+            let mut validator =
+                JwtValidator::new(jwks_url.clone(), auth.issuer.clone(), auth.audience.clone());
+            if let Some(ref claim) = auth.user_id_claim {
+                validator = validator.with_user_id_claim(claim.clone());
+            }
+            if let Some(ref claim) = auth.tenant_id_claim {
+                validator = validator.with_tenant_id_claim(claim.clone());
+            }
+            if let Some(ref claim) = auth.roles_claim {
+                validator = validator.with_roles_claim(claim.clone());
+            }
+            tracing::info!("JWT/JWKS authentication enabled ({})", jwks_url);
+            Arc::new(validator)
+        });
+
     // Start HTTP server
     let app_state = AppState {
         handle,
@@ -1007,14 +1353,17 @@ pub async fn run_daemon(
         shared_memory: shared_memory.clone(),
         workspace_dir: daemon_workspace_dir,
         tool_cache: tool_cache.clone(),
+        jwt_validator: jwt_validator.clone(),
     };
 
-    // Public routes — health, readiness, metrics — never require auth
+    // Public routes — health, readiness, metrics, agent card — never require auth
     let public_routes = Router::new()
         .route("/healthz", get(handle_healthz))
         .route("/readyz", get(handle_readyz))
         .route("/health", get(handle_healthz))
-        .route("/metrics", get(handle_metrics));
+        .route("/metrics", get(handle_metrics))
+        // A2A Agent Card (protocol discovery)
+        .route("/.well-known/agent.json", get(handle_agent_card));
 
     // Protected routes — tasks, SSE, WS, todo, stats
     let mut protected_routes = Router::new()
@@ -1031,7 +1380,24 @@ pub async fn run_daemon(
         tracing::info!("WebSocket endpoint enabled on /ws");
     }
 
-    // Apply auth middleware only when tokens are configured
+    // Apply auth middleware layers.
+    // JWT middleware (innermost): validates JWT, injects UserContext into extensions.
+    // Bearer token middleware (outermost): gates access by static token.
+    // Layers execute outer-to-inner, so bearer auth runs first, then JWT enrichment.
+    let jwt_is_sole_auth = jwt_validator.is_some() && auth_tokens.is_none();
+    if let Some(ref validator) = jwt_validator {
+        let jwt_state = JwtMiddlewareState {
+            validator: validator.clone(),
+            // When JWT is the only auth, it must reject unauthenticated requests.
+            // When bearer tokens are also configured, JWT only enriches.
+            required: jwt_is_sole_auth,
+        };
+        protected_routes = protected_routes.layer(middleware::from_fn_with_state(
+            jwt_state,
+            jwt_auth_middleware,
+        ));
+    }
+
     let routes = if let Some(ref tokens) = auth_tokens {
         let authed = protected_routes.layer(middleware::from_fn_with_state(
             tokens.clone(),
@@ -1039,6 +1405,7 @@ pub async fn run_daemon(
         ));
         public_routes.merge(authed)
     } else {
+        // Either JWT-only auth (required=true rejects unauthenticated) or no auth at all
         public_routes.merge(protected_routes)
     };
 
@@ -1171,6 +1538,8 @@ pub async fn run_daemon(
                     vec![], // no guardrails for Telegram (user-initiated)
                     None,   // no memory confidentiality cap for Telegram (owner-initiated)
                     Some(heartbit::Confidentiality::Confidential), // Telegram DM memories are confidential
+                    None, // no JWT user context for Telegram (uses Telegram user ID)
+                    None, // no JWT tenant context for Telegram
                 )
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1998,6 +2367,8 @@ async fn run_interactive_task(
             vec![], // no guardrails for interactive sessions
             None,   // no memory confidentiality cap for interactive sessions
             None,   // no memory default confidentiality for interactive sessions
+            None,   // no JWT user context for interactive sessions
+            None,   // no JWT tenant context for interactive sessions
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }

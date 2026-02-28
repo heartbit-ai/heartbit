@@ -1592,6 +1592,7 @@ name = "heartbit"
 version = "2026.227.1"
 dependencies = [
  "a2a-sdk",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "cron",
@@ -1601,6 +1602,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonschema",
+ "jsonwebtoken",
  "pgvector",
  "prometheus",
  "quick-xml",

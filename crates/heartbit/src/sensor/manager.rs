@@ -585,6 +585,8 @@ async fn run_triage_consumer(
                             source: format!("sensor:{}", event.sensor_name),
                             story_id: Some(story_id.clone()),
                             trust_level: Some(context.trust_level),
+                            user_id: None,
+                            tenant_id: None,
                         };
 
                         let payload = match serde_json::to_vec(&cmd) {
@@ -1146,6 +1148,8 @@ mod tests {
             source: "sensor:rss".into(),
             story_id: Some("story-123".into()),
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();
@@ -1166,6 +1170,8 @@ mod tests {
             source: "sensor:rss".into(),
             story_id: Some("story-cve-2026-001".into()),
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();

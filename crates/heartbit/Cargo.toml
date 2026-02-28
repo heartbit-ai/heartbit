@@ -44,12 +44,14 @@ hex = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [features]
 default = ["core"]
 core = []
 kafka = ["dep:rdkafka"]
-daemon = ["kafka", "dep:cron", "dep:prometheus"]
+daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken", "dep:base64"]
 sensor = ["daemon", "dep:quick-xml", "dep:hmac", "dep:sha2", "dep:hex", "dep:subtle"]
 restate = ["dep:restate-sdk"]
 postgres = ["dep:sqlx", "dep:pgvector"]

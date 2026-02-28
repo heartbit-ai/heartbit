@@ -11,8 +11,10 @@
 - 14 built-in tools, 8 guardrails, MemGPT-style memory with Ebbinghaus decay
 - Local-first ONNX embeddings (fastembed) or OpenAI API
 - Built-in eval framework for agent behavior testing
+- Multi-tenant daemon with JWT/JWKS auth, per-user memory namespacing, dynamic MCP token injection
+- A2A Agent Card (`/.well-known/agent.json`) for agent discovery
 - Integrations: Telegram bot, Google Workspace (JMAP email), RSS, webhooks via sensor pipeline
-- 2665+ tests, TDD mandatory, zero `unwrap()` in library code
+- 2720+ tests, TDD mandatory, zero `unwrap()` in library code
 
 ## Feature Flags
 
@@ -130,6 +132,20 @@ pub trait Sensor: Send + Sync {
 }
 ```
 
+### AuthProvider
+
+```rust
+pub trait AuthProvider: Send + Sync {
+    fn auth_header_for<'a>(
+        &'a self,
+        user_id: &'a str,
+        tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>>;
+}
+```
+
+Two implementations: `StaticAuthProvider` (backward-compatible static header) and `TokenExchangeAuthProvider` (RFC 8693 token exchange with in-memory caching).
+
 ### CommandProducer (feature: `daemon`)
 
 ```rust
@@ -187,6 +203,13 @@ pub trait CommandProducer: Send + Sync {
 - `OnInput = dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>>` — interactive mode
 - `OnEvent = Arc<dyn Fn(AgentEvent)>` — event callback
 - `OnQuestion` — structured agent-to-user questions
+
+### Multi-Tenant (feature: `daemon`)
+
+- `UserContext` — user_id, tenant_id, roles (extracted from JWT claims)
+- `JwksClient` — fetches and caches JWKS keys (5-min TTL, auto-refetch on key rotation)
+- `JwtValidator` — validates RS256 JWTs against JWKS, extracts `UserContext` with configurable claim names
+- `AuditRecord` — agent, turn, event_type, payload, usage, timestamp, user_id, tenant_id, delegation_chain
 
 ### Eval
 
@@ -408,6 +431,19 @@ type = "in_memory"                    # or "postgres" with database_url
 provider = "local"                    # openai | local | none
 model = "all-MiniLM-L6-v2"
 
+[daemon]
+bind = "127.0.0.1:3000"
+max_concurrent_tasks = 4
+
+[daemon.auth]
+bearer_tokens = ["your-api-key-1"]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+issuer = "https://idp.example.com"
+audience = "heartbit-daemon"
+# user_id_claim = "sub"              # configurable claim names
+# tenant_id_claim = "tid"
+# roles_claim = "roles"
+
 [telemetry]
 otlp_endpoint = "http://localhost:4317"
 ```
@@ -455,18 +491,19 @@ Flags: `--config <path>`, `--approve` (HITL), `-v`/`--verbose` (events as JSON t
 
 ```
 crates/heartbit/src/
-  agent/           AgentRunner, Orchestrator, context, guardrails, routing, events, workflow
+  agent/           AgentRunner, Orchestrator, context, guardrails, routing, events, workflow, audit
+  auth/            JwksClient, JwtValidator → UserContext (JWT/JWKS authentication)
   llm/             LlmProvider, Anthropic, OpenRouter, cascade, retry, pricing, error_class
-  tool/            Tool trait, MCP client, A2A client, builtins/ (14 tools)
-  memory/          Memory trait, BM25, scoring, reflection, consolidation, embedding, hybrid
+  tool/            Tool trait, MCP client (AuthProvider), A2A client, builtins/ (14 tools)
+  memory/          Memory trait, BM25, scoring, reflection, consolidation, embedding, hybrid, namespaced
   knowledge/       KnowledgeBase trait, chunker, loader
   sensor/          Sensor trait, 7 sources, triage, stories, compression
   channel/         InteractionBridge, sessions, telegram/
-  daemon/          DaemonCore, Kafka, cron, heartbeat pulse, store, metrics
+  daemon/          DaemonCore, Kafka, cron, heartbeat pulse, store, metrics, types (UserContext)
   workflow/        Restate services, workflows, virtual objects
   store/           PostgreSQL task/audit store
   eval/            EvalCase, EvalRunner, scorers
-  config.rs        HeartbitConfig from TOML
+  config.rs        HeartbitConfig from TOML (incl. AuthConfig)
   error.rs         Error enum (thiserror)
   lib.rs           Public API re-exports
 ```

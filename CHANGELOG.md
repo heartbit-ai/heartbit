@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-tenant daemon** — single daemon instance serves multiple users with per-request tenant isolation. JWT-authenticated API ensures tasks, memory, and workspaces are scoped per user/tenant.
+- **JWT/JWKS authentication** (`auth/jwt.rs`): `JwksClient` fetches and caches JWKS keys (5-minute TTL, auto-refetch on key rotation). `JwtValidator` verifies RS256 tokens, extracts `UserContext` (user_id, tenant_id, roles) from configurable claim names.
+- **`UserContext` struct** (`daemon/types.rs`): carries `user_id`, `tenant_id`, and `roles` through every request. Extracted from JWT claims by auth middleware, injected into request extensions.
+- **`[daemon.auth]` config section** (`config.rs`): `bearer_tokens` (static API keys with rotation support), `jwks_url` (JWKS endpoint), `issuer`/`audience` (JWT validation), `user_id_claim`/`tenant_id_claim`/`roles_claim` (configurable claim names for different IdPs).
+- **Per-user memory namespacing** — daemon wraps memory store with `NamespacedMemory` using `tenant:{tid}:user:{uid}` prefix. Users cannot access each other's memories. Institutional memory remains shared via `shared_memory_read` tool.
+- **Dynamic MCP token injection** (`tool/mcp.rs`): `AuthProvider` trait with `auth_header_for(user_id, tenant_id)` enables per-request authentication. `StaticAuthProvider` for backward-compatible static headers. `TokenExchangeAuthProvider` implements RFC 8693 token exchange against an IdP (e.g. xavyo-idp) to obtain user-scoped MCP tokens with in-memory caching.
+- **Per-user workspace isolation** — workspace root becomes `{base}/{tenant_id}/{user_id}/` in multi-tenant mode. Path traversal prevention already enforced.
+- **Audit trail enrichment** (`agent/audit.rs`): `AuditRecord` gains `user_id`, `tenant_id`, and `delegation_chain` fields. `AuditTrail` trait gains `entries_for_tenant()` for tenant-scoped queries.
+- **A2A Agent Card** — daemon serves `GET /.well-known/agent.json` for agent discovery. Card includes agent name, description, skills (from config agents), auth schemes (bearer/JWT), and endpoint URL.
+- 22 new tests for JWT validation (JwkKey, JwksClient, JwtValidator, claim extraction, audience handling, role parsing).
+
 ## [2026.227.1] - 2026-02-27
 
 ### Added

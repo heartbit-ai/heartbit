@@ -552,4 +552,95 @@ mod tests {
             .unwrap();
         assert!(results.is_empty());
     }
+
+    /// Multi-tenant isolation: two users with `user:{id}` namespaces on the
+    /// same backing store cannot see each other's memories.
+    #[tokio::test]
+    async fn per_user_namespace_isolation() {
+        let shared: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let alice = NamespacedMemory::new(shared.clone(), "user:alice");
+        let bob = NamespacedMemory::new(shared.clone(), "user:bob");
+
+        alice
+            .store(make_entry("m1", "Alice's deal notes"))
+            .await
+            .unwrap();
+        bob.store(make_entry("m1", "Bob's pipeline review"))
+            .await
+            .unwrap();
+
+        // Alice only sees her own memory
+        let alice_results = alice
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_results.len(), 1);
+        assert_eq!(alice_results[0].content, "Alice's deal notes");
+        assert_eq!(alice_results[0].id, "m1"); // unprefixed
+
+        // Bob only sees his own memory
+        let bob_results = bob
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bob_results.len(), 1);
+        assert_eq!(bob_results[0].content, "Bob's pipeline review");
+
+        // Raw store has both, namespaced
+        let all = shared
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"user:alice:m1"));
+        assert!(ids.contains(&"user:bob:m1"));
+    }
+
+    /// Shared/institutional memory is accessible alongside per-user memory
+    /// when the raw inner store is used directly (e.g., via shared_memory_read tool).
+    #[tokio::test]
+    async fn per_user_can_coexist_with_shared_institutional_memory() {
+        let shared: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+
+        // Institutional memory stored without namespace (directly on shared store)
+        let mut institutional = make_entry("shared:playbook", "Always follow up within 24h");
+        institutional.agent = "shared".into();
+        institutional.id = "shared:playbook".into();
+        shared.store(institutional).await.unwrap();
+
+        // Per-user memory via namespace
+        let alice = NamespacedMemory::new(shared.clone(), "user:alice");
+        alice.store(make_entry("m1", "Alice's note")).await.unwrap();
+
+        // Alice sees only her own memories through namespace
+        let alice_results = alice
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice_results.len(), 1);
+        assert_eq!(alice_results[0].content, "Alice's note");
+
+        // Raw store has both: institutional + Alice's namespaced entry
+        let all = shared
+            .recall(MemoryQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
 }

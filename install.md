@@ -188,6 +188,33 @@ See the [README](README.md#configuration) for the full config reference. Example
 | `heartbit.toml` | Multi-agent orchestrator example |
 | `daemon-dev.toml` | Daemon with sensors and Telegram |
 
+### Daemon authentication
+
+The daemon supports two authentication modes (can be combined):
+
+**Bearer tokens** (static API keys):
+
+```toml
+[daemon.auth]
+bearer_tokens = ["your-api-key-1", "your-api-key-2"]  # multiple for key rotation
+```
+
+**JWT/JWKS** (multi-tenant with identity provider):
+
+```toml
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+issuer = "https://idp.example.com"     # optional: validate iss claim
+audience = "heartbit-daemon"           # optional: validate aud claim
+user_id_claim = "sub"                  # claim for user ID (default: "sub")
+tenant_id_claim = "tid"                # claim for tenant ID (default: "tid")
+roles_claim = "roles"                  # claim for roles (default: "roles")
+```
+
+When JWT auth is active, the daemon extracts `UserContext` (user_id, tenant_id, roles) from each request. Memory, workspace, and tasks are automatically scoped per user/tenant.
+
+Claim names are configurable to accommodate different identity providers (e.g., `"org_id"` for tenant, `"permissions"` for roles).
+
 ## Optional External Services
 
 These are only needed for specific execution paths:
@@ -283,7 +310,7 @@ heartbit chat
 cargo fmt -- --check && cargo clippy -- -D warnings && cargo test
 ```
 
-2665+ tests should pass.
+2720+ tests should pass.
 
 ## Troubleshooting
 

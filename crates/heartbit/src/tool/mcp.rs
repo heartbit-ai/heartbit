@@ -243,6 +243,143 @@ async fn read_stdio_response<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+// --- Auth providers ---
+
+/// Provides authorization headers for MCP requests on a per-user basis.
+///
+/// Implementations can fetch tokens dynamically (e.g., via RFC 8693 token exchange)
+/// instead of using a single static auth header for all requests.
+pub trait AuthProvider: Send + Sync {
+    /// Return the Authorization header value for the given user/tenant context.
+    /// Returns `None` if no auth is needed.
+    fn auth_header_for<'a>(
+        &'a self,
+        user_id: &'a str,
+        tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>>;
+}
+
+/// Auth provider that always returns the same static auth header.
+pub struct StaticAuthProvider {
+    header: Option<String>,
+}
+
+impl StaticAuthProvider {
+    pub fn new(header: Option<String>) -> Self {
+        Self { header }
+    }
+}
+
+impl AuthProvider for StaticAuthProvider {
+    fn auth_header_for<'a>(
+        &'a self,
+        _user_id: &'a str,
+        _tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.header.clone()) })
+    }
+}
+
+/// Auth provider that exchanges a subject token for a user-scoped delegated token
+/// via RFC 8693 Token Exchange.
+pub struct TokenExchangeAuthProvider {
+    client: reqwest::Client,
+    exchange_url: String,
+    client_id: String,
+    client_secret: String,
+    agent_token: String,
+    user_tokens: Arc<RwLock<HashMap<String, String>>>,
+}
+
+#[derive(Deserialize)]
+struct TokenExchangeResponse {
+    access_token: String,
+}
+
+impl TokenExchangeAuthProvider {
+    pub fn new(
+        exchange_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+        agent_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            exchange_url: exchange_url.into(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            agent_token: agent_token.into(),
+            user_tokens: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Set the user tokens map (user_id -> subject_token).
+    pub fn with_user_tokens(mut self, tokens: Arc<RwLock<HashMap<String, String>>>) -> Self {
+        self.user_tokens = tokens;
+        self
+    }
+}
+
+impl AuthProvider for TokenExchangeAuthProvider {
+    fn auth_header_for<'a>(
+        &'a self,
+        user_id: &'a str,
+        _tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let subject_token = {
+                let tokens = self
+                    .user_tokens
+                    .read()
+                    .map_err(|e| Error::Mcp(format!("user_tokens lock poisoned: {e}")))?;
+                tokens.get(user_id).cloned().ok_or_else(|| {
+                    Error::Mcp(format!("No subject token found for user '{user_id}'"))
+                })?
+            };
+
+            let response = self
+                .client
+                .post(&self.exchange_url)
+                .form(&[
+                    (
+                        "grant_type",
+                        "urn:ietf:params:oauth:grant-type:token-exchange",
+                    ),
+                    ("subject_token", &subject_token),
+                    (
+                        "subject_token_type",
+                        "urn:ietf:params:oauth:token-type:access_token",
+                    ),
+                    ("actor_token", &self.agent_token),
+                    (
+                        "actor_token_type",
+                        "urn:ietf:params:oauth:token-type:access_token",
+                    ),
+                    ("client_id", &self.client_id),
+                    ("client_secret", &self.client_secret),
+                ])
+                .send()
+                .await
+                .map_err(|e| Error::Mcp(format!("Token exchange request failed: {e}")))?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(Error::Mcp(format!(
+                    "Token exchange failed (HTTP {status}): {body}"
+                )));
+            }
+
+            let token_response: TokenExchangeResponse = response
+                .json()
+                .await
+                .map_err(|e| Error::Mcp(format!("Token exchange response parse error: {e}")))?;
+
+            Ok(Some(format!("Bearer {}", token_response.access_token)))
+        })
+    }
+}
+
 // --- HTTP transport ---
 
 /// HTTP-based transport for Streamable HTTP MCP servers.
@@ -1263,6 +1400,51 @@ mod tests {
 
         let def = tool.definition();
         assert_eq!(def, expected_def);
+    }
+
+    // --- AuthProvider tests ---
+
+    #[tokio::test]
+    async fn static_auth_provider_returns_header() {
+        let provider = StaticAuthProvider::new(Some("Bearer xyz".to_string()));
+        let result = provider.auth_header_for("user1", "tenant1").await.unwrap();
+        assert_eq!(result, Some("Bearer xyz".to_string()));
+    }
+
+    #[tokio::test]
+    async fn static_auth_provider_returns_none() {
+        let provider = StaticAuthProvider::new(None);
+        let result = provider.auth_header_for("user1", "tenant1").await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn static_auth_provider_ignores_user_tenant() {
+        let provider = StaticAuthProvider::new(Some("Bearer abc".to_string()));
+        let r1 = provider.auth_header_for("alice", "acme").await.unwrap();
+        let r2 = provider.auth_header_for("bob", "globex").await.unwrap();
+        assert_eq!(r1, r2);
+        assert_eq!(r1, Some("Bearer abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_provider_missing_user_token() {
+        let user_tokens = Arc::new(std::sync::RwLock::new(HashMap::<String, String>::new()));
+        let provider = TokenExchangeAuthProvider::new(
+            "https://idp.example.com/token",
+            "client-id",
+            "client-secret",
+            "agent-token-xyz",
+        )
+        .with_user_tokens(user_tokens);
+
+        let result = provider.auth_header_for("unknown-user", "tenant1").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown-user"),
+            "error should mention the user_id: {err_msg}"
+        );
     }
 
     #[tokio::test]

@@ -268,6 +268,8 @@ mod postgres_store {
                 estimated_cost_usd: row.estimated_cost_usd,
                 source: row.source,
                 agent_name: row.agent_name,
+                user_id: None,
+                tenant_id: None,
             }
         }
     }

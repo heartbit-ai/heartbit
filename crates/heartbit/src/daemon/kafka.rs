@@ -375,6 +375,8 @@ mod tests {
             source: "test".into(),
             story_id: None,
             trust_level: None,
+            user_id: None,
+            tenant_id: None,
         };
         let payload = serde_json::to_vec(&cmd).expect("serialize");
 
@@ -553,7 +555,9 @@ mod tests {
                                  _trust_level: Option<crate::config::TrustLevel>,
                                  _on_event: std::sync::Arc<
             dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
-        >| {
+        >,
+                                 _user_id: Option<String>,
+                                 _tenant_id: Option<String>| {
             let tx = runner_tx.clone();
             async move {
                 let _ = tx.send(task).await;

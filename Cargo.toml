@@ -51,3 +51,4 @@ base64 = "0.22"
 teloxide = { version = "0.17", features = ["macros"] }
 dotenvy = "0.15"
 fastembed = { version = "5" }
+jsonwebtoken = "9"

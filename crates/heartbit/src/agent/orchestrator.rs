@@ -76,6 +76,10 @@ pub(crate) struct SubAgentDef {
     pub(crate) max_total_tokens: Option<u64>,
     /// Optional audit trail for recording untruncated agent decisions.
     pub(crate) audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
+    /// Optional user ID for multi-tenant audit enrichment.
+    pub(crate) audit_user_id: Option<String>,
+    /// Optional tenant ID for multi-tenant audit enrichment.
+    pub(crate) audit_tenant_id: Option<String>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -154,6 +158,8 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             dispatch_mode: DispatchMode::Parallel,
             workspace: None,
             audit_trail: None,
+            audit_user_id: None,
+            audit_tenant_id: None,
         }
     }
 
@@ -360,6 +366,11 @@ impl DelegateTaskTool {
                 }
                 if let Some(trail) = agent_def.audit_trail {
                     builder = builder.audit_trail(trail);
+                }
+                if let Some(uid) = &agent_def.audit_user_id
+                    && let Some(tid) = &agent_def.audit_tenant_id
+                {
+                    builder = builder.audit_user_context(uid.clone(), tid.clone());
                 }
 
                 // Forward permission rules from orchestrator to sub-agents
@@ -748,6 +759,11 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(trail) = agent_def.audit_trail {
                         builder = builder.audit_trail(trail);
+                    }
+                    if let Some(uid) = &agent_def.audit_user_id
+                        && let Some(tid) = &agent_def.audit_tenant_id
+                    {
+                        builder = builder.audit_user_context(uid.clone(), tid.clone());
                     }
 
                     // Forward permission rules from orchestrator to squad members
@@ -1225,6 +1241,10 @@ pub struct SubAgentConfig {
     pub max_total_tokens: Option<u64>,
     /// Optional audit trail for recording untruncated agent decisions.
     pub audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
+    /// Optional user ID for multi-tenant audit enrichment.
+    pub audit_user_id: Option<String>,
+    /// Optional tenant ID for multi-tenant audit enrichment.
+    pub audit_tenant_id: Option<String>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -1262,6 +1282,10 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     workspace: Option<std::path::PathBuf>,
     /// Optional audit trail propagated to all sub-agents.
     audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
+    /// Optional user ID for multi-tenant audit enrichment (propagated to all sub-agents).
+    audit_user_id: Option<String>,
+    /// Optional tenant ID for multi-tenant audit enrichment (propagated to all sub-agents).
+    audit_tenant_id: Option<String>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1299,6 +1323,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             workspace: self.workspace.clone(),
             max_total_tokens: None,
             audit_trail: self.audit_trail.clone(),
+            audit_user_id: self.audit_user_id.clone(),
+            audit_tenant_id: self.audit_tenant_id.clone(),
         });
         self
     }
@@ -1338,6 +1364,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             workspace: self.workspace.clone(),
             max_total_tokens: None,
             audit_trail: self.audit_trail.clone(),
+            audit_user_id: self.audit_user_id.clone(),
+            audit_tenant_id: self.audit_tenant_id.clone(),
         });
         self
     }
@@ -1371,6 +1399,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             workspace: def.workspace.or_else(|| self.workspace.clone()),
             max_total_tokens: def.max_total_tokens,
             audit_trail: def.audit_trail.or_else(|| self.audit_trail.clone()),
+            audit_user_id: def.audit_user_id.or_else(|| self.audit_user_id.clone()),
+            audit_tenant_id: def.audit_tenant_id.or_else(|| self.audit_tenant_id.clone()),
         });
         self
     }
@@ -1593,6 +1623,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Set user context for multi-tenant audit enrichment.
+    /// Propagated to all sub-agents and the orchestrator's own runner.
+    pub fn audit_user_context(
+        mut self,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        self.audit_user_id = Some(user_id.into());
+        self.audit_tenant_id = Some(tenant_id.into());
+        self
+    }
+
     pub fn build(self) -> Result<Orchestrator<P>, Error> {
         // Validate sub-agent definitions
         {
@@ -1790,6 +1832,11 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         }
         if let Some(trail) = self.audit_trail {
             runner_builder = runner_builder.audit_trail(trail);
+        }
+        if let Some(uid) = self.audit_user_id
+            && let Some(tid) = self.audit_tenant_id
+        {
+            runner_builder = runner_builder.audit_user_context(uid, tid);
         }
 
         let runner = runner_builder.build()?;
@@ -2088,6 +2135,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -3010,6 +3059,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build()
             .unwrap();
@@ -3069,6 +3120,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build();
 
@@ -3113,6 +3166,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build();
 
@@ -3225,6 +3280,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build()
             .unwrap();
@@ -3301,6 +3358,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build()
             .unwrap();
@@ -3814,6 +3873,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build()
             .unwrap();
@@ -4685,6 +4746,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .build()
             .unwrap();
@@ -4876,6 +4939,8 @@ mod tests {
                 workspace: None,
                 max_total_tokens: None,
                 audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)

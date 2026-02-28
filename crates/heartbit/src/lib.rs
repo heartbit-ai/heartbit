@@ -16,6 +16,8 @@ pub mod lsp;
 
 // --- Feature-gated modules ---
 #[cfg(feature = "daemon")]
+pub mod auth;
+#[cfg(feature = "daemon")]
 pub mod daemon;
 #[cfg(feature = "sensor")]
 pub mod sensor;
@@ -88,6 +90,10 @@ pub use config::{
     parse_reasoning_effort, parse_tool_profile,
 };
 
+// --- Auth re-exports (feature-gated) ---
+#[cfg(feature = "daemon")]
+pub use auth::{JwksClient, JwtValidator};
+
 // --- Daemon re-exports (feature-gated) ---
 #[cfg(all(feature = "daemon", feature = "postgres"))]
 pub use daemon::PostgresTaskStore;
@@ -96,7 +102,7 @@ pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
     OnTaskComplete, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, format_notification,
+    TodoManageTool, UserContext, format_notification,
 };
 
 // --- Error re-exports ---
@@ -173,7 +179,7 @@ pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
     QuestionResponse, TodoPriority, TodoStatus, TodoStore, builtin_tools,
 };
-pub use tool::mcp::McpClient;
+pub use tool::mcp::{AuthProvider, McpClient, StaticAuthProvider, TokenExchangeAuthProvider};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
 
 // --- Store re-exports ---

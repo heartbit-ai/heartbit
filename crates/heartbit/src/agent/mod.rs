@@ -209,6 +209,9 @@ pub struct AgentRunner<P: LlmProvider> {
     max_total_tokens: Option<u64>,
     /// Optional audit trail for recording untruncated agent decisions.
     audit_trail: Option<Arc<dyn AuditTrail>>,
+    /// Optional user context for multi-tenant audit enrichment.
+    audit_user_id: Option<String>,
+    audit_tenant_id: Option<String>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -252,6 +255,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             workspace: None,
             max_total_tokens: None,
             audit_trail: None,
+            audit_user_id: None,
+            audit_tenant_id: None,
         }
     }
 
@@ -422,6 +427,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }),
                 usage: e.partial_usage(),
                 timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
             })
             .await;
         }
@@ -788,6 +796,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }),
                     usage: response.usage,
                     timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                 })
                 .await;
 
@@ -816,6 +827,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 }),
                                 usage: TokenUsage::default(),
                                 timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                             })
                             .await;
                             // Continue — do NOT discard the response
@@ -838,6 +852,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 }),
                                 usage: TokenUsage::default(),
                                 timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                             })
                             .await;
                             // Maintain alternating roles: assistant placeholder, then user denial
@@ -923,6 +940,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                         }),
                         usage: total_usage,
                         timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                     })
                     .await;
                     return Ok(AgentOutput {
@@ -998,6 +1018,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                         }),
                         usage: total_usage,
                         timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                     })
                     .await;
                     return Ok(AgentOutput {
@@ -1198,6 +1221,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         }),
                                         usage: TokenUsage::default(),
                                         timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                                     })
                                     .await;
                                     // Continue — do NOT deny the tool call
@@ -1221,6 +1247,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         }),
                                         usage: TokenUsage::default(),
                                         timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
                                     })
                                     .await;
                                     denied.push(ToolResult::error(
@@ -1788,6 +1817,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }),
                 usage: TokenUsage::default(),
                 timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
             })
             .await;
 
@@ -1876,6 +1908,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                         }),
                         usage: TokenUsage::default(),
                         timestamp: chrono::Utc::now(),
+                        user_id: None,
+                        tenant_id: None,
+                        delegation_chain: Vec::new(),
                     })
                     .await;
                     // post_tool error: convert to error output instead of aborting
@@ -1908,6 +1943,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }),
                 usage: TokenUsage::default(),
                 timestamp: chrono::Utc::now(),
+                user_id: self.audit_user_id.clone(),
+                tenant_id: self.audit_tenant_id.clone(),
+                delegation_chain: Vec::new(),
             })
             .await;
             results_vec.push(tool_output_to_result(call_ids[idx].clone(), output));
@@ -1968,6 +2006,9 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     max_total_tokens: Option<u64>,
     /// Optional audit trail for recording untruncated agent decisions.
     audit_trail: Option<Arc<dyn AuditTrail>>,
+    /// Optional user context for multi-tenant audit enrichment.
+    audit_user_id: Option<String>,
+    audit_tenant_id: Option<String>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -2284,6 +2325,18 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set user context for multi-tenant audit enrichment.
+    /// When set, all `AuditRecord` entries include the user and tenant IDs.
+    pub fn audit_user_context(
+        mut self,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        self.audit_user_id = Some(user_id.into());
+        self.audit_tenant_id = Some(tenant_id.into());
+        self
+    }
+
     /// Set the agent's workspace directory. When set, file tools resolve
     /// relative paths against this directory, BashTool starts here, and a
     /// workspace hint is appended to the system prompt.
@@ -2451,6 +2504,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             ),
             max_total_tokens: self.max_total_tokens,
             audit_trail: self.audit_trail,
+            audit_user_id: self.audit_user_id,
+            audit_tenant_id: self.audit_tenant_id,
         })
     }
 }
@@ -7481,5 +7536,34 @@ mod tests {
 
         let output = runner.execute("hello").await.unwrap();
         assert_eq!(output.result, "OK");
+    }
+
+    #[test]
+    fn audit_user_context_builder_sets_fields() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test-agent")
+            .system_prompt("prompt")
+            .max_turns(5)
+            .audit_user_context("alice", "acme")
+            .build()
+            .unwrap();
+
+        assert_eq!(runner.audit_user_id.as_deref(), Some("alice"));
+        assert_eq!(runner.audit_tenant_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn audit_user_context_defaults_to_none() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test-agent")
+            .system_prompt("prompt")
+            .max_turns(5)
+            .build()
+            .unwrap();
+
+        assert!(runner.audit_user_id.is_none());
+        assert!(runner.audit_tenant_id.is_none());
     }
 }
