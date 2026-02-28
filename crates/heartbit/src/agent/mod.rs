@@ -212,6 +212,8 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Optional user context for multi-tenant audit enrichment.
     audit_user_id: Option<String>,
     audit_tenant_id: Option<String>,
+    /// Delegation chain for audit records (e.g., `["heartbit-agent"]` when acting on behalf of user).
+    audit_delegation_chain: Vec<String>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -257,6 +259,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             audit_trail: None,
             audit_user_id: None,
             audit_tenant_id: None,
+            audit_delegation_chain: Vec::new(),
         }
     }
 
@@ -429,7 +432,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                 timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
             })
             .await;
         }
@@ -798,7 +801,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                 })
                 .await;
 
@@ -829,7 +832,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                             })
                             .await;
                             // Continue — do NOT discard the response
@@ -854,7 +857,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                             })
                             .await;
                             // Maintain alternating roles: assistant placeholder, then user denial
@@ -942,7 +945,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                     })
                     .await;
                     return Ok(AgentOutput {
@@ -1020,7 +1023,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                     })
                     .await;
                     return Ok(AgentOutput {
@@ -1223,7 +1226,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                                     })
                                     .await;
                                     // Continue — do NOT deny the tool call
@@ -1249,7 +1252,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
                                     })
                                     .await;
                                     denied.push(ToolResult::error(
@@ -1819,7 +1822,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                 timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
             })
             .await;
 
@@ -1910,7 +1913,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         timestamp: chrono::Utc::now(),
                         user_id: None,
                         tenant_id: None,
-                        delegation_chain: Vec::new(),
+                        delegation_chain: self.audit_delegation_chain.clone(),
                     })
                     .await;
                     // post_tool error: convert to error output instead of aborting
@@ -1945,7 +1948,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                 timestamp: chrono::Utc::now(),
                 user_id: self.audit_user_id.clone(),
                 tenant_id: self.audit_tenant_id.clone(),
-                delegation_chain: Vec::new(),
+                delegation_chain: self.audit_delegation_chain.clone(),
             })
             .await;
             results_vec.push(tool_output_to_result(call_ids[idx].clone(), output));
@@ -2009,6 +2012,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     /// Optional user context for multi-tenant audit enrichment.
     audit_user_id: Option<String>,
     audit_tenant_id: Option<String>,
+    /// Delegation chain for audit records (e.g., `["heartbit-agent"]` when acting OBO user).
+    audit_delegation_chain: Vec<String>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -2337,6 +2342,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the delegation chain for audit records.
+    ///
+    /// Populated when the daemon acts on behalf of a user via RFC 8693 token exchange.
+    /// The chain records which agent(s) are in the delegation path.
+    pub fn audit_delegation_chain(mut self, chain: Vec<String>) -> Self {
+        self.audit_delegation_chain = chain;
+        self
+    }
+
     /// Set the agent's workspace directory. When set, file tools resolve
     /// relative paths against this directory, BashTool starts here, and a
     /// workspace hint is appended to the system prompt.
@@ -2506,6 +2520,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             audit_trail: self.audit_trail,
             audit_user_id: self.audit_user_id,
             audit_tenant_id: self.audit_tenant_id,
+            audit_delegation_chain: self.audit_delegation_chain,
         })
     }
 }

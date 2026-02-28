@@ -941,11 +941,13 @@ pub(crate) async fn build_orchestrator_from_config(
             .on_text(Arc::clone(&on_text))
             .observability_mode(observability_mode);
 
-        // Wire audit user context for multi-tenant enrichment
+        // Wire audit user context and delegation chain for multi-tenant enrichment
         if let Some(uid) = audit_user_id
             && let Some(tid) = audit_tenant_id
         {
-            rb = rb.audit_user_context(uid, tid);
+            rb = rb
+                .audit_user_context(uid, tid)
+                .audit_delegation_chain(vec![agent.name.clone()]);
         }
 
         // Context strategy: agent-level, then orchestrator-level fallback
@@ -1210,11 +1212,13 @@ pub(crate) async fn build_orchestrator_from_config(
         .on_text(on_text)
         .observability_mode(observability_mode);
 
-    // Wire audit user context for multi-tenant enrichment
+    // Wire audit user context and delegation chain for multi-tenant enrichment
     if let Some(uid) = audit_user_id
         && let Some(tid) = audit_tenant_id
     {
-        builder = builder.audit_user_context(uid, tid);
+        builder = builder
+            .audit_user_context(uid, tid)
+            .audit_delegation_chain(vec!["heartbit-daemon".into()]);
     }
 
     // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
@@ -1408,6 +1412,7 @@ pub(crate) async fn build_orchestrator_from_config(
             audit_trail: None,
             audit_user_id: audit_user_id.map(String::from),
             audit_tenant_id: audit_tenant_id.map(String::from),
+            audit_delegation_chain: Vec::new(),
         });
     }
 

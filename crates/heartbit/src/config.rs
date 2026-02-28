@@ -1087,6 +1087,29 @@ pub struct AuthConfig {
     pub tenant_id_claim: Option<String>,
     /// JWT claim to extract roles from. Defaults to `"roles"`.
     pub roles_claim: Option<String>,
+    /// RFC 8693 Token Exchange configuration for per-user MCP auth delegation.
+    /// When configured, the daemon exchanges user JWTs for MCP-scoped delegated tokens.
+    pub token_exchange: Option<TokenExchangeConfig>,
+}
+
+/// RFC 8693 Token Exchange configuration for per-user MCP auth delegation.
+///
+/// When configured, each task submitted with a JWT gets a user-scoped delegated
+/// token injected into MCP requests. The daemon acts as the agent (actor) and
+/// exchanges the user's subject token for a scoped access token.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenExchangeConfig {
+    /// Token exchange endpoint URL (e.g. `"https://idp.example.com/oauth/token"`).
+    pub exchange_url: String,
+    /// OAuth client ID for the daemon/agent.
+    pub client_id: String,
+    /// OAuth client secret for the daemon/agent.
+    pub client_secret: String,
+    /// The agent's own credential token (used as `actor_token` in RFC 8693).
+    pub agent_token: String,
+    /// OAuth scopes to request for the delegated token. Defaults to empty.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// Heartbit pulse configuration for autonomous periodic awareness.
@@ -2014,6 +2037,28 @@ impl HeartbitConfig {
                     return Err(Error::Config(
                         "daemon.auth.jwks_url must not be empty".into(),
                     ));
+                }
+                if let Some(ref te) = auth.token_exchange {
+                    if te.exchange_url.is_empty() {
+                        return Err(Error::Config(
+                            "daemon.auth.token_exchange.exchange_url must not be empty".into(),
+                        ));
+                    }
+                    if te.client_id.is_empty() {
+                        return Err(Error::Config(
+                            "daemon.auth.token_exchange.client_id must not be empty".into(),
+                        ));
+                    }
+                    if te.client_secret.is_empty() {
+                        return Err(Error::Config(
+                            "daemon.auth.token_exchange.client_secret must not be empty".into(),
+                        ));
+                    }
+                    if te.agent_token.is_empty() {
+                        return Err(Error::Config(
+                            "daemon.auth.token_exchange.agent_token must not be empty".into(),
+                        ));
+                    }
                 }
             }
 
@@ -5607,6 +5652,143 @@ issuer = "https://idp.example.com"
         );
     }
 
+    // --- Token exchange config ---
+
+    #[test]
+    fn token_exchange_config_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+
+[daemon.auth.token_exchange]
+exchange_url = "https://idp.example.com/oauth/token"
+client_id = "heartbit-agent"
+client_secret = "secret123"
+agent_token = "agent-cred-token"
+scopes = ["crm:read", "crm:write"]
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        let te = config.daemon.unwrap().auth.unwrap().token_exchange.unwrap();
+        assert_eq!(te.exchange_url, "https://idp.example.com/oauth/token");
+        assert_eq!(te.client_id, "heartbit-agent");
+        assert_eq!(te.client_secret, "secret123");
+        assert_eq!(te.agent_token, "agent-cred-token");
+        assert_eq!(te.scopes, vec!["crm:read", "crm:write"]);
+    }
+
+    #[test]
+    fn token_exchange_empty_exchange_url_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+
+[daemon.auth.token_exchange]
+exchange_url = ""
+client_id = "heartbit-agent"
+client_secret = "secret123"
+agent_token = "agent-cred-token"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.token_exchange.exchange_url must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn token_exchange_empty_client_id_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+
+[daemon.auth.token_exchange]
+exchange_url = "https://idp.example.com/oauth/token"
+client_id = ""
+client_secret = "secret123"
+agent_token = "agent-cred-token"
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.token_exchange.client_id must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn token_exchange_empty_agent_token_rejected() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+
+[daemon.auth.token_exchange]
+exchange_url = "https://idp.example.com/oauth/token"
+client_id = "heartbit-agent"
+client_secret = "secret123"
+agent_token = ""
+"#;
+        let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("daemon.auth.token_exchange.agent_token must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn token_exchange_none_is_valid() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+
+[daemon.auth]
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+"#;
+        let config = HeartbitConfig::from_toml(toml_str).unwrap();
+        assert!(
+            config
+                .daemon
+                .unwrap()
+                .auth
+                .unwrap()
+                .token_exchange
+                .is_none()
+        );
+    }
+
     // --- Cascade config ---
 
     #[test]
@@ -6914,6 +7096,7 @@ provider = "local"
         assert!(auth.user_id_claim.is_none());
         assert!(auth.tenant_id_claim.is_none());
         assert!(auth.roles_claim.is_none());
+        assert!(auth.token_exchange.is_none());
     }
 
     #[test]

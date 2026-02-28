@@ -159,20 +159,22 @@ impl DaemonHandle {
         self.store.update(id, f)
     }
 
-    /// List tasks with optional source/state filters.
+    /// List tasks with optional source/state/tenant filters.
     pub fn list_tasks_filtered(
         &self,
         limit: usize,
         offset: usize,
         source: Option<&str>,
         state: Option<TaskState>,
+        tenant_id: Option<&str>,
     ) -> Result<(Vec<DaemonTask>, usize), Error> {
-        self.store.list_filtered(limit, offset, source, state)
+        self.store
+            .list_filtered(limit, offset, source, state, tenant_id)
     }
 
-    /// Aggregate stats across all tasks.
-    pub fn stats(&self) -> Result<TaskStats, Error> {
-        self.store.stats()
+    /// Aggregate stats, optionally scoped to a tenant.
+    pub fn stats(&self, tenant_id: Option<&str>) -> Result<TaskStats, Error> {
+        self.store.stats(tenant_id)
     }
 
     /// Produce a `CancelTask` command.
@@ -692,7 +694,7 @@ mod tests {
         }
 
         let (tasks, total) = handle
-            .list_tasks_filtered(10, 0, Some("telegram"), None)
+            .list_tasks_filtered(10, 0, Some("telegram"), None, None)
             .unwrap();
         assert_eq!(total, 2);
         assert_eq!(tasks.len(), 2);
@@ -711,7 +713,7 @@ mod tests {
             .unwrap();
 
         let (tasks, total) = handle
-            .list_tasks_filtered(10, 0, None, Some(TaskState::Running))
+            .list_tasks_filtered(10, 0, None, Some(TaskState::Running), None)
             .unwrap();
         assert_eq!(total, 1);
         assert_eq!(tasks[0].id, id1);
@@ -737,7 +739,7 @@ mod tests {
             })
             .unwrap();
 
-        let stats = handle.stats().unwrap();
+        let stats = handle.stats(None).unwrap();
         assert_eq!(stats.total_tasks, 3);
         assert_eq!(stats.active_tasks, 1);
         assert_eq!(stats.tasks_by_source.get("api"), Some(&2));
@@ -746,6 +748,50 @@ mod tests {
         assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
         assert_eq!(stats.total_input_tokens, 100);
         assert!((stats.total_estimated_cost_usd - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn handle_list_filtered_by_tenant() {
+        let handle = test_handle();
+        let task1 = DaemonTask::new_with_user(uuid::Uuid::new_v4(), "a", "api", "alice", "acme");
+        let task2 = DaemonTask::new_with_user(uuid::Uuid::new_v4(), "b", "api", "bob", "globex");
+        let task3 =
+            DaemonTask::new_with_user(uuid::Uuid::new_v4(), "c", "telegram", "carol", "acme");
+        handle.store.insert(task1).unwrap();
+        handle.store.insert(task2).unwrap();
+        handle.store.insert(task3).unwrap();
+
+        let (tasks, total) = handle
+            .list_tasks_filtered(10, 0, None, None, Some("acme"))
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.tenant_id.as_deref() == Some("acme")));
+    }
+
+    #[test]
+    fn handle_stats_filtered_by_tenant() {
+        let handle = test_handle();
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let task1 = DaemonTask::new_with_user(id1, "a", "api", "alice", "acme");
+        let task2 = DaemonTask::new_with_user(id2, "b", "api", "bob", "globex");
+        handle.store.insert(task1).unwrap();
+        handle.store.insert(task2).unwrap();
+        handle
+            .update_task(id1, &|t| t.tokens_used.input_tokens = 50)
+            .unwrap();
+        handle
+            .update_task(id2, &|t| t.tokens_used.input_tokens = 100)
+            .unwrap();
+
+        let stats = handle.stats(Some("acme")).unwrap();
+        assert_eq!(stats.total_tasks, 1);
+        assert_eq!(stats.total_input_tokens, 50);
+
+        let stats = handle.stats(None).unwrap();
+        assert_eq!(stats.total_tasks, 2);
+        assert_eq!(stats.total_input_tokens, 150);
     }
 
     #[test]

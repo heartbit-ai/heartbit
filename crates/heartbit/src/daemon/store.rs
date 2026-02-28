@@ -26,33 +26,38 @@ pub trait TaskStore: Send + Sync {
     /// is not found.
     fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error>;
 
-    /// List tasks with optional source and state filters. Returns `(tasks, total_matching)`.
+    /// List tasks with optional source, state, and tenant filters. Returns `(tasks, total_matching)`.
     fn list_filtered(
         &self,
         limit: usize,
         offset: usize,
         source: Option<&str>,
         state: Option<TaskState>,
+        tenant_id: Option<&str>,
     ) -> Result<(Vec<DaemonTask>, usize), Error> {
         let (all_tasks, _) = self.list(usize::MAX, 0)?;
         let filtered: Vec<DaemonTask> = all_tasks
             .into_iter()
             .filter(|t| source.is_none_or(|s| t.source == s))
             .filter(|t| state.is_none_or(|s| t.state == s))
+            .filter(|t| tenant_id.is_none_or(|tid| t.tenant_id.as_deref() == Some(tid)))
             .collect();
         let total = filtered.len();
         let tasks = filtered.into_iter().skip(offset).take(limit).collect();
         Ok((tasks, total))
     }
 
-    /// Compute aggregate statistics across all tasks.
-    fn stats(&self) -> Result<TaskStats, Error> {
+    /// Compute aggregate statistics, optionally scoped to a tenant.
+    fn stats(&self, tenant_id: Option<&str>) -> Result<TaskStats, Error> {
         let (all_tasks, _) = self.list(usize::MAX, 0)?;
-        let mut stats = TaskStats {
-            total_tasks: all_tasks.len(),
-            ..Default::default()
-        };
+        let mut stats = TaskStats::default();
         for task in &all_tasks {
+            if let Some(tid) = tenant_id
+                && task.tenant_id.as_deref() != Some(tid)
+            {
+                continue;
+            }
+            stats.total_tasks += 1;
             let state_key = match task.state {
                 TaskState::Pending => "pending",
                 TaskState::Running => "running",
@@ -175,6 +180,7 @@ impl TaskStore for InMemoryTaskStore {
         offset: usize,
         source: Option<&str>,
         state: Option<TaskState>,
+        tenant_id: Option<&str>,
     ) -> Result<(Vec<DaemonTask>, usize), Error> {
         let tasks = self
             .tasks
@@ -190,6 +196,7 @@ impl TaskStore for InMemoryTaskStore {
             .filter_map(|id| tasks.get(id))
             .filter(|t| source.is_none_or(|s| t.source == s))
             .filter(|t| state.is_none_or(|s| t.state == s))
+            .filter(|t| tenant_id.is_none_or(|tid| t.tenant_id.as_deref() == Some(tid)))
             .cloned()
             .collect();
         let total = filtered.len();
@@ -500,10 +507,12 @@ mod postgres_store {
             offset: usize,
             source: Option<&str>,
             state: Option<TaskState>,
+            tenant_id: Option<&str>,
         ) -> Result<(Vec<DaemonTask>, usize), Error> {
             let pool = self.pool.clone();
             let source_owned = source.map(String::from);
             let state_str = state.map(task_state_to_str);
+            let tenant_owned = tenant_id.map(String::from);
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                 // Build dynamic WHERE clause
@@ -516,6 +525,10 @@ mod postgres_store {
                 }
                 if state_str.is_some() {
                     conditions.push(format!("state = ${param_idx}"));
+                    param_idx += 1;
+                }
+                if tenant_owned.is_some() {
+                    conditions.push(format!("tenant_id = ${param_idx}"));
                     param_idx += 1;
                 }
 
@@ -533,6 +546,9 @@ mod postgres_store {
                 }
                 if let Some(st) = state_str {
                     count_query = count_query.bind(st);
+                }
+                if let Some(ref tid) = tenant_owned {
+                    count_query = count_query.bind(tid);
                 }
                 let total: i64 = count_query
                     .fetch_one(&pool)
@@ -556,6 +572,9 @@ mod postgres_store {
                 if let Some(st) = state_str {
                     data_query = data_query.bind(st);
                 }
+                if let Some(ref tid) = tenant_owned {
+                    data_query = data_query.bind(tid);
+                }
                 data_query = data_query.bind(limit as i64).bind(offset as i64);
 
                 let rows: Vec<TaskRow> = data_query
@@ -568,8 +587,9 @@ mod postgres_store {
             })
         }
 
-        fn stats(&self) -> Result<TaskStats, Error> {
+        fn stats(&self, tenant_id: Option<&str>) -> Result<TaskStats, Error> {
             let pool = self.pool.clone();
+            let tenant_owned = tenant_id.map(String::from);
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                     // Single query with aggregation grouped by state and source
@@ -584,18 +604,37 @@ mod postgres_store {
                         sum_cache_creation: i64,
                         sum_cost: f64,
                     }
-                    let rows: Vec<StatsRow> = sqlx::query_as(
-                        "SELECT state, source, COUNT(*) AS cnt, \
-                     COALESCE(SUM(input_tokens), 0) AS sum_input, \
-                     COALESCE(SUM(output_tokens), 0) AS sum_output, \
-                     COALESCE(SUM(cache_read_input_tokens), 0) AS sum_cache_read, \
-                     COALESCE(SUM(cache_creation_input_tokens), 0) AS sum_cache_creation, \
-                     COALESCE(SUM(estimated_cost_usd), 0.0) AS sum_cost \
-                     FROM daemon_tasks GROUP BY state, source",
-                    )
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
+                    let (sql, rows): (String, Vec<StatsRow>) = if let Some(ref tid) = tenant_owned {
+                        let sql = "SELECT state, source, COUNT(*) AS cnt, \
+                         COALESCE(SUM(input_tokens), 0) AS sum_input, \
+                         COALESCE(SUM(output_tokens), 0) AS sum_output, \
+                         COALESCE(SUM(cache_read_input_tokens), 0) AS sum_cache_read, \
+                         COALESCE(SUM(cache_creation_input_tokens), 0) AS sum_cache_creation, \
+                         COALESCE(SUM(estimated_cost_usd), 0.0) AS sum_cost \
+                         FROM daemon_tasks WHERE tenant_id = $1 GROUP BY state, source"
+                            .to_string();
+                        let rows = sqlx::query_as(&sql)
+                            .bind(tid)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
+                        (sql, rows)
+                    } else {
+                        let sql = "SELECT state, source, COUNT(*) AS cnt, \
+                         COALESCE(SUM(input_tokens), 0) AS sum_input, \
+                         COALESCE(SUM(output_tokens), 0) AS sum_output, \
+                         COALESCE(SUM(cache_read_input_tokens), 0) AS sum_cache_read, \
+                         COALESCE(SUM(cache_creation_input_tokens), 0) AS sum_cache_creation, \
+                         COALESCE(SUM(estimated_cost_usd), 0.0) AS sum_cost \
+                         FROM daemon_tasks GROUP BY state, source"
+                            .to_string();
+                        let rows = sqlx::query_as(&sql)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(|e| Error::Daemon(format!("failed to compute stats: {e}")))?;
+                        (sql, rows)
+                    };
+                    let _ = sql; // used for query lifetime
 
                     let mut stats = TaskStats::default();
                     for row in &rows {
@@ -999,7 +1038,7 @@ mod tests {
             .insert(DaemonTask::new(Uuid::new_v4(), "t3", "api"))
             .unwrap();
 
-        let (tasks, total) = store.list_filtered(10, 0, Some("api"), None).unwrap();
+        let (tasks, total) = store.list_filtered(10, 0, Some("api"), None, None).unwrap();
         assert_eq!(total, 2);
         assert_eq!(tasks.len(), 2);
         for t in &tasks {
@@ -1025,7 +1064,7 @@ mod tests {
             .unwrap();
 
         let (tasks, total) = store
-            .list_filtered(10, 0, None, Some(TaskState::Running))
+            .list_filtered(10, 0, None, Some(TaskState::Running), None)
             .unwrap();
         assert_eq!(total, 2);
         assert_eq!(tasks.len(), 2);
@@ -1052,7 +1091,7 @@ mod tests {
             .unwrap();
 
         let (tasks, total) = store
-            .list_filtered(10, 0, Some("api"), Some(TaskState::Running))
+            .list_filtered(10, 0, Some("api"), Some(TaskState::Running), None)
             .unwrap();
         assert_eq!(total, 1);
         assert_eq!(tasks.len(), 1);
@@ -1068,7 +1107,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (tasks, total) = store.list_filtered(10, 0, None, None).unwrap();
+        let (tasks, total) = store.list_filtered(10, 0, None, None, None).unwrap();
         assert_eq!(total, 4);
         assert_eq!(tasks.len(), 4);
     }
@@ -1082,7 +1121,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (tasks, total) = store.list_filtered(2, 1, Some("api"), None).unwrap();
+        let (tasks, total) = store.list_filtered(2, 1, Some("api"), None, None).unwrap();
         assert_eq!(total, 5);
         assert_eq!(tasks.len(), 2);
     }
@@ -1092,7 +1131,7 @@ mod tests {
     #[test]
     fn stats_empty_store() {
         let store = InMemoryTaskStore::new();
-        let stats = store.stats().unwrap();
+        let stats = store.stats(None).unwrap();
         assert_eq!(stats.total_tasks, 0);
         assert!(stats.tasks_by_state.is_empty());
         assert!(stats.tasks_by_source.is_empty());
@@ -1139,7 +1178,7 @@ mod tests {
             })
             .unwrap();
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats(None).unwrap();
         assert_eq!(stats.total_tasks, 3);
         assert_eq!(stats.tasks_by_state.get("running"), Some(&1));
         assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
@@ -1168,7 +1207,7 @@ mod tests {
             .insert(DaemonTask::new(Uuid::new_v4(), "t4", "sensor:rss"))
             .unwrap();
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats(None).unwrap();
         assert_eq!(stats.tasks_by_source.get("api"), Some(&2));
         assert_eq!(stats.tasks_by_source.get("cron"), Some(&1));
         assert_eq!(stats.tasks_by_source.get("sensor:rss"), Some(&1));
@@ -1192,9 +1231,174 @@ mod tests {
             .unwrap();
         // id3 stays Pending
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats(None).unwrap();
         assert_eq!(stats.active_tasks, 2);
         assert_eq!(stats.tasks_by_state.get("running"), Some(&2));
         assert_eq!(stats.tasks_by_state.get("pending"), Some(&1));
+    }
+
+    // --- tenant filter tests ---
+
+    #[test]
+    fn list_filtered_by_tenant() {
+        let store = InMemoryTaskStore::new();
+        store
+            .insert(DaemonTask::new_with_user(
+                Uuid::new_v4(),
+                "t1",
+                "api",
+                "alice",
+                "acme",
+            ))
+            .unwrap();
+        store
+            .insert(DaemonTask::new_with_user(
+                Uuid::new_v4(),
+                "t2",
+                "api",
+                "bob",
+                "acme",
+            ))
+            .unwrap();
+        store
+            .insert(DaemonTask::new_with_user(
+                Uuid::new_v4(),
+                "t3",
+                "api",
+                "carol",
+                "globex",
+            ))
+            .unwrap();
+
+        let (tasks, total) = store
+            .list_filtered(10, 0, None, None, Some("acme"))
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.tenant_id.as_deref() == Some("acme")));
+
+        let (tasks, total) = store
+            .list_filtered(10, 0, None, None, Some("globex"))
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].tenant_id.as_deref(), Some("globex"));
+    }
+
+    #[test]
+    fn list_filtered_tenant_with_pagination() {
+        let store = InMemoryTaskStore::new();
+        for i in 0..5 {
+            store
+                .insert(DaemonTask::new_with_user(
+                    Uuid::new_v4(),
+                    format!("t{i}"),
+                    "api",
+                    "alice",
+                    "acme",
+                ))
+                .unwrap();
+        }
+        store
+            .insert(DaemonTask::new_with_user(
+                Uuid::new_v4(),
+                "other",
+                "api",
+                "dave",
+                "globex",
+            ))
+            .unwrap();
+
+        // Page 1 of acme tasks (limit 2)
+        let (tasks, total) = store.list_filtered(2, 0, None, None, Some("acme")).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(tasks.len(), 2);
+
+        // Page 3 of acme tasks (only 1 remaining)
+        let (tasks, total) = store.list_filtered(2, 4, None, None, Some("acme")).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn stats_filtered_by_tenant() {
+        let store = InMemoryTaskStore::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        store
+            .insert(DaemonTask::new_with_user(id1, "t1", "api", "alice", "acme"))
+            .unwrap();
+        store
+            .insert(DaemonTask::new_with_user(
+                id2, "t2", "telegram", "bob", "acme",
+            ))
+            .unwrap();
+        store
+            .insert(DaemonTask::new_with_user(
+                id3, "t3", "api", "carol", "globex",
+            ))
+            .unwrap();
+
+        store
+            .update(id1, &|t| {
+                t.state = TaskState::Running;
+                t.tokens_used.input_tokens = 100;
+            })
+            .unwrap();
+        store
+            .update(id3, &|t| {
+                t.state = TaskState::Completed;
+                t.tokens_used.input_tokens = 200;
+            })
+            .unwrap();
+
+        // acme-scoped stats
+        let stats = store.stats(Some("acme")).unwrap();
+        assert_eq!(stats.total_tasks, 2);
+        assert_eq!(stats.active_tasks, 1);
+        assert_eq!(stats.total_input_tokens, 100);
+        assert_eq!(stats.tasks_by_source.get("api"), Some(&1));
+        assert_eq!(stats.tasks_by_source.get("telegram"), Some(&1));
+
+        // globex-scoped stats
+        let stats = store.stats(Some("globex")).unwrap();
+        assert_eq!(stats.total_tasks, 1);
+        assert_eq!(stats.active_tasks, 0);
+        assert_eq!(stats.total_input_tokens, 200);
+
+        // unscoped stats (all tenants)
+        let stats = store.stats(None).unwrap();
+        assert_eq!(stats.total_tasks, 3);
+        assert_eq!(stats.total_input_tokens, 300);
+    }
+
+    #[test]
+    fn list_filtered_tenant_none_includes_tasks_without_tenant() {
+        let store = InMemoryTaskStore::new();
+        // Task without tenant (old-style)
+        store
+            .insert(DaemonTask::new(Uuid::new_v4(), "old", "api"))
+            .unwrap();
+        // Task with tenant
+        store
+            .insert(DaemonTask::new_with_user(
+                Uuid::new_v4(),
+                "new",
+                "api",
+                "alice",
+                "acme",
+            ))
+            .unwrap();
+
+        // No tenant filter: both visible
+        let (_, total) = store.list_filtered(10, 0, None, None, None).unwrap();
+        assert_eq!(total, 2);
+
+        // Tenant filter: only matching
+        let (_, total) = store
+            .list_filtered(10, 0, None, None, Some("acme"))
+            .unwrap();
+        assert_eq!(total, 1);
     }
 }

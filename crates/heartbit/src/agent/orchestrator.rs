@@ -80,6 +80,9 @@ pub(crate) struct SubAgentDef {
     pub(crate) audit_user_id: Option<String>,
     /// Optional tenant ID for multi-tenant audit enrichment.
     pub(crate) audit_tenant_id: Option<String>,
+    /// Delegation chain for audit records (propagated from orchestrator).
+    #[allow(dead_code)]
+    pub(crate) audit_delegation_chain: Vec<String>,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -160,6 +163,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             audit_trail: None,
             audit_user_id: None,
             audit_tenant_id: None,
+            audit_delegation_chain: Vec::new(),
         }
     }
 
@@ -1245,6 +1249,9 @@ pub struct SubAgentConfig {
     pub audit_user_id: Option<String>,
     /// Optional tenant ID for multi-tenant audit enrichment.
     pub audit_tenant_id: Option<String>,
+    /// Delegation chain for audit records (propagated to sub-agents).
+    #[allow(dead_code)]
+    pub audit_delegation_chain: Vec<String>,
 }
 
 pub struct OrchestratorBuilder<P: LlmProvider> {
@@ -1286,6 +1293,8 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     audit_user_id: Option<String>,
     /// Optional tenant ID for multi-tenant audit enrichment (propagated to all sub-agents).
     audit_tenant_id: Option<String>,
+    /// Delegation chain for audit records (propagated to all sub-agents).
+    audit_delegation_chain: Vec<String>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1325,6 +1334,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             audit_trail: self.audit_trail.clone(),
             audit_user_id: self.audit_user_id.clone(),
             audit_tenant_id: self.audit_tenant_id.clone(),
+            audit_delegation_chain: self.audit_delegation_chain.clone(),
         });
         self
     }
@@ -1366,6 +1376,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             audit_trail: self.audit_trail.clone(),
             audit_user_id: self.audit_user_id.clone(),
             audit_tenant_id: self.audit_tenant_id.clone(),
+            audit_delegation_chain: self.audit_delegation_chain.clone(),
         });
         self
     }
@@ -1401,6 +1412,11 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             audit_trail: def.audit_trail.or_else(|| self.audit_trail.clone()),
             audit_user_id: def.audit_user_id.or_else(|| self.audit_user_id.clone()),
             audit_tenant_id: def.audit_tenant_id.or_else(|| self.audit_tenant_id.clone()),
+            audit_delegation_chain: if def.audit_delegation_chain.is_empty() {
+                self.audit_delegation_chain.clone()
+            } else {
+                def.audit_delegation_chain
+            },
         });
         self
     }
@@ -1632,6 +1648,12 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     ) -> Self {
         self.audit_user_id = Some(user_id.into());
         self.audit_tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Set the delegation chain for all sub-agent audit records.
+    pub fn audit_delegation_chain(mut self, chain: Vec<String>) -> Self {
+        self.audit_delegation_chain = chain;
         self
     }
 
@@ -2137,6 +2159,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -3061,6 +3084,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build()
             .unwrap();
@@ -3122,6 +3146,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build();
 
@@ -3168,6 +3193,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build();
 
@@ -3282,6 +3308,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build()
             .unwrap();
@@ -3360,6 +3387,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build()
             .unwrap();
@@ -3875,6 +3903,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build()
             .unwrap();
@@ -4748,6 +4777,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .build()
             .unwrap();
@@ -4941,6 +4971,7 @@ mod tests {
                 audit_trail: None,
                 audit_user_id: None,
                 audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)

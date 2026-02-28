@@ -165,25 +165,17 @@ async fn handle_list(
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
     let state_filter = query.state.as_deref().and_then(parse_task_state);
+    let tenant_filter = user_context
+        .as_ref()
+        .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
     match state.handle.list_tasks_filtered(
         query.limit,
         query.offset,
         query.source.as_deref(),
         state_filter,
+        tenant_filter.as_deref(),
     ) {
-        Ok((tasks, _total)) => {
-            // Filter by tenant when user context is present
-            let tasks = if let Some(axum::Extension(ref ctx)) = user_context {
-                tasks
-                    .into_iter()
-                    .filter(|t| t.tenant_id.as_deref() == Some(&ctx.tenant_id))
-                    .collect::<Vec<_>>()
-            } else {
-                tasks
-            };
-            let total = tasks.len();
-            Json(ListResponse { tasks, total }).into_response()
-        }
+        Ok((tasks, total)) => Json(ListResponse { tasks, total }).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -203,8 +195,14 @@ fn parse_task_state(s: &str) -> Option<heartbit::TaskState> {
     }
 }
 
-async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
-    match state.handle.stats() {
+async fn handle_stats(
+    State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
+) -> impl IntoResponse {
+    let tenant_filter = user_context
+        .as_ref()
+        .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
+    match state.handle.stats(tenant_filter.as_deref()) {
         Ok(stats) => {
             let uptime_seconds = state.start_time.elapsed().as_secs();
             Json(serde_json::json!({
@@ -1092,6 +1090,26 @@ pub async fn run_daemon(
         .and_then(|t| t.observability_mode.as_deref());
     let mode = crate::resolve_observability(observability_flag, config_obs, verbose);
 
+    // Create per-user auth provider from token_exchange config (Phase 1.3: dynamic MCP auth)
+    let auth_provider: Option<Arc<dyn heartbit::AuthProvider>> = config
+        .daemon
+        .as_ref()
+        .and_then(|d| d.auth.as_ref())
+        .and_then(|a| a.token_exchange.as_ref())
+        .map(|te| {
+            tracing::info!(
+                exchange_url = %te.exchange_url,
+                client_id = %te.client_id,
+                "token exchange auth provider configured for per-user MCP delegation"
+            );
+            Arc::new(heartbit::TokenExchangeAuthProvider::new(
+                &te.exchange_url,
+                &te.client_id,
+                &te.client_secret,
+                &te.agent_token,
+            )) as Arc<dyn heartbit::AuthProvider>
+        });
+
     // Build the runner closure that creates an Orchestrator per task
     let config_arc = Arc::new(config);
     let config_for_state = config_arc.clone();
@@ -1100,6 +1118,7 @@ pub async fn run_daemon(
     let runner_memory = shared_memory.clone();
     let runner_workspace = daemon_workspace_dir.clone();
     let runner_tools = tool_cache.clone();
+    let runner_auth_provider = auth_provider;
     let build_runner = move |_task_id: uuid::Uuid,
                              task_text: String,
                              source: String,
@@ -1117,6 +1136,7 @@ pub async fn run_daemon(
         let memory = runner_memory.clone();
         let workspace_dir = runner_workspace.clone();
         let tools = runner_tools.clone();
+        let task_auth_provider = runner_auth_provider.clone();
         Box::pin(async move {
             // Wrap on_event to also record metrics
             let on_event: Arc<heartbit::OnEvent> = if let Some(ref m) = task_metrics {
@@ -1213,6 +1233,84 @@ pub async fn run_daemon(
                 workspace_dir
             };
 
+            // Phase 1.3: Dynamic MCP auth — load per-user MCP tools when
+            // token_exchange auth_provider is configured and user context is present.
+            // Each task gets its own MCP connections with a user-scoped delegated token.
+            let user_tools: Option<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = if let (
+                Some(ap),
+                Some(uid),
+                Some(tid),
+            ) =
+                (&task_auth_provider, &user_id, &tenant_id)
+            {
+                match ap.auth_header_for(uid, tid).await {
+                    Ok(Some(user_auth)) => {
+                        tracing::debug!(
+                            user_id = %uid,
+                            tenant_id = %tid,
+                            "resolved per-user auth for MCP tools"
+                        );
+                        let mut cache = HashMap::new();
+                        for agent in &config.agents {
+                            let mut agent_tools = Vec::new();
+                            for entry in &agent.mcp_servers {
+                                if entry.is_stdio() {
+                                    // Stdio transports don't use auth headers
+                                    agent_tools.extend(
+                                        crate::load_mcp_tools(
+                                            &agent.name,
+                                            std::slice::from_ref(entry),
+                                        )
+                                        .await,
+                                    );
+                                } else {
+                                    // HTTP MCP: use per-user auth
+                                    match heartbit::McpClient::connect_with_auth(
+                                        entry.url(),
+                                        &user_auth,
+                                    )
+                                    .await
+                                    {
+                                        Ok(client) => {
+                                            agent_tools.extend(client.into_tools());
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                agent = %agent.name,
+                                                server = %entry.display_name(),
+                                                error = %e,
+                                                "failed to connect MCP with user auth, falling back to cached"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // Also load A2A tools (these use their own auth)
+                            agent_tools.extend(
+                                crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await,
+                            );
+                            cache.insert(agent.name.clone(), agent_tools);
+                        }
+                        Some(cache)
+                    }
+                    Ok(None) => {
+                        tracing::debug!("no auth token for user, using cached MCP tools");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "token exchange failed, falling back to cached MCP tools"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let effective_tools = user_tools.as_ref().unwrap_or(&tools);
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -1226,7 +1324,7 @@ pub async fn run_daemon(
                 task_memory,    // per-user namespaced or shared daemon memory
                 task_workspace, // per-user scoped or shared workspace
                 todo_store,     // persistent daemon todo store
-                Some(&tools),
+                Some(effective_tools),
                 None, // no multimodal content in Kafka consumer path
                 guardrails,
                 memory_confidentiality_cap,

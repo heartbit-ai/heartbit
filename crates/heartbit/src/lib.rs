@@ -86,8 +86,8 @@ pub use config::{
     McpServerEntry, MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig,
     RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig, SensorModality,
     SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,
-    TokenBudgetConfig, ToolPolicyConfig, ToolPolicyRuleConfig, WorkspaceConfig, WsConfig,
-    parse_reasoning_effort, parse_tool_profile,
+    TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig,
+    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
 };
 
 // --- Auth re-exports (feature-gated) ---
