@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.228.1] - 2026-02-28
+
 ### Added
 
 - **Multi-tenant daemon** — single daemon instance serves multiple users with per-request tenant isolation. JWT-authenticated API ensures tasks, memory, and workspaces are scoped per user/tenant.
@@ -17,7 +19,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Per-user workspace isolation** — workspace root becomes `{base}/{tenant_id}/{user_id}/` in multi-tenant mode. Path traversal prevention already enforced.
 - **Audit trail enrichment** (`agent/audit.rs`): `AuditRecord` gains `user_id`, `tenant_id`, and `delegation_chain` fields. `AuditTrail` trait gains `entries_for_tenant()` for tenant-scoped queries.
 - **A2A Agent Card** — daemon serves `GET /.well-known/agent.json` for agent discovery. Card includes agent name, description, skills (from config agents), auth schemes (bearer/JWT), and endpoint URL.
-- 22 new tests for JWT validation (JwkKey, JwksClient, JwtValidator, claim extraction, audience handling, role parsing).
+- `Error::Auth` variant for authentication-specific errors (distinct from infrastructure errors).
+- `PostgresTaskStore` gains `user_id` and `tenant_id` columns with ALTER TABLE migration for existing databases.
+- 32 new tests for JWT validation, claim extraction, cross-namespace isolation, and token exchange hardening.
+
+### Changed
+
+- All JWT/auth errors now use `Error::Auth` (previously used `Error::Agent`, making 401 vs 502 indistinguishable).
+- `NamespacedMemory::recall()` always forces own namespace — ignores caller-supplied agent parameter to prevent cross-namespace reads via prompt injection.
+- `TokenExchangeAuthProvider` hardened: token cache with TTL (30s early expiry), 10-second HTTP timeout, error body truncated to 512 bytes, respects `token_type` from response.
+- `JwtValidator::validate()` rejects empty tokens and tokens exceeding 16 KiB.
+- `extract_string_claim()` rejects null, boolean, object, and array claim values (accepts only string and number).
 
 ## [2026.227.1] - 2026-02-27
 
