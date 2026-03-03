@@ -3,7 +3,7 @@
 
 [provider]
 name = "openrouter"
-model = "qwen/qwen3-30b-a3b"
+model = "moonshotai/kimi-k2-thinking"
 
 [provider.retry]
 max_retries = 2

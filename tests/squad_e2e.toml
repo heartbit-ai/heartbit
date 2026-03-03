@@ -4,7 +4,7 @@
 
 [provider]
 name = "openrouter"
-model = "anthropic/claude-sonnet-4"
+model = "moonshotai/kimi-k2-thinking"
 
 [provider.retry]
 max_retries = 3
