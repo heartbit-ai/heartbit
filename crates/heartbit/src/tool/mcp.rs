@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -300,13 +300,13 @@ pub struct TokenExchangeAuthProvider {
     scopes: Vec<String>,
     /// Cache for the auto-fetched agent token: (access_token, expires_at).
     /// Uses std::sync::RwLock because the lock is never held across `.await`.
-    agent_token_cache: RwLock<Option<(String, std::time::Instant)>>,
+    agent_token_cache: RwLock<Option<(String, Instant)>>,
     /// Subject tokens for token exchange: key is `"{tenant_id}:{user_id}"`.
     /// Populated externally (e.g. by the daemon HTTP handler when a user submits a task).
     user_tokens: Arc<RwLock<HashMap<String, String>>>,
     /// Cache of exchanged tokens: (tenant_id, user_id) -> (access_token, expires_at).
     /// Keyed by both tenant and user to prevent cross-tenant token leakage.
-    token_cache: RwLock<HashMap<(String, String), (String, std::time::Instant)>>,
+    token_cache: RwLock<HashMap<(String, String), (String, Instant)>>,
 }
 
 /// Token exchange response per RFC 8693.
@@ -382,7 +382,7 @@ impl TokenExchangeAuthProvider {
                 .read()
                 .map_err(|e| Error::Mcp(format!("agent_token_cache lock poisoned: {e}")))?;
             if let Some((token, expires_at)) = &*cache
-                && std::time::Instant::now() < *expires_at
+                && Instant::now() < *expires_at
             {
                 return Ok(token.clone());
             }
@@ -424,7 +424,7 @@ impl TokenExchangeAuthProvider {
                 .map_err(|e| Error::Mcp(format!("Agent token response parse error: {e}")))?;
 
             let ttl = resp.expires_in.unwrap_or(300).min(3600).saturating_sub(30);
-            let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+            let expires_at = Instant::now() + Duration::from_secs(ttl);
             *self
                 .agent_token_cache
                 .write()
@@ -448,7 +448,7 @@ impl AuthProvider for TokenExchangeAuthProvider {
             let cache_key = (tenant_id.to_string(), user_id.to_string());
             if let Ok(cache) = self.token_cache.read()
                 && let Some((token, expires_at)) = cache.get(&cache_key)
-                && std::time::Instant::now() < *expires_at
+                && Instant::now() < *expires_at
             {
                 return Ok(Some(format!("Bearer {token}")));
             }
@@ -512,8 +512,8 @@ impl AuthProvider for TokenExchangeAuthProvider {
             // Cache the exchanged token with expiry (default 5 min, max 1 hour)
             let ttl = token_response.expires_in.unwrap_or(300).min(3600);
             // Expire 30 seconds early to avoid using nearly-expired tokens
-            let now = std::time::Instant::now();
-            let expires_at = now + std::time::Duration::from_secs(ttl.saturating_sub(30));
+            let now = Instant::now();
+            let expires_at = now + Duration::from_secs(ttl.saturating_sub(30));
             if let Ok(mut cache) = self.token_cache.write() {
                 // Prune expired entries to prevent unbounded growth in multi-tenant deployments
                 cache.retain(|_, (_, exp)| now < *exp);

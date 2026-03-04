@@ -174,6 +174,9 @@ struct AppState {
     /// Key: `"{tenant_id}:{user_id}"`, Value: raw JWT.
     /// Populated by submit handler, consumed by TokenExchangeAuthProvider.
     user_tokens: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// Per-user MCP auth provider for RFC 8693 token exchange.
+    /// When present, both HTTP and WS tasks receive user-scoped MCP credentials.
+    auth_provider: Option<Arc<dyn heartbit::AuthProvider>>,
 }
 
 // --- Handlers ---
@@ -1244,6 +1247,7 @@ pub async fn run_daemon(
     let runner_workspace = daemon_workspace_dir.clone();
     let runner_tools = tool_cache.clone();
     let runner_auth_provider = auth_provider;
+    let state_auth_provider = runner_auth_provider.clone();
     let runner_user_tokens = user_tokens.clone();
     let build_runner = move |_task_id: uuid::Uuid,
                              task_text: String,
@@ -1589,6 +1593,7 @@ pub async fn run_daemon(
         tool_cache: tool_cache.clone(),
         jwt_validator: jwt_validator.clone(),
         user_tokens: user_tokens.clone(),
+        auth_provider: state_auth_provider,
     };
 
     // Public routes — health, readiness, metrics, agent card — never require auth
@@ -2362,10 +2367,21 @@ async fn handle_ws_chat_send(
     let ws_memory = state.shared_memory.clone();
     let ws_workspace = state.workspace_dir.clone();
     let ws_todo = state.todo_store.clone();
-    let ws_tools = state.tool_cache.clone();
     let ws_handle = state.handle.clone();
     let ws_user_id = user_context.map(|c| c.user_id.clone());
     let ws_tenant_id = user_context.map(|c| c.tenant_id.clone());
+    // Stash raw JWT for per-user token exchange (mirrors HTTP submit handler)
+    if let Some(ctx) = user_context
+        && let Some(ref token) = ctx.raw_token
+    {
+        let key = format!("{}:{}", ctx.tenant_id, ctx.user_id);
+        if let Ok(mut tokens) = state.user_tokens.write() {
+            tokens.insert(key, token.clone());
+        }
+    }
+    let ws_auth_provider = state.auth_provider.clone();
+    let ws_user_tokens = state.user_tokens.clone();
+    let ws_default_tools = state.tool_cache.clone();
 
     // Register WS task in store with tenant context when available
     let register_result = match (&ws_user_id, &ws_tenant_id) {
@@ -2384,6 +2400,76 @@ async fn handle_ws_chat_send(
             t.state = heartbit::TaskState::Running;
             t.started_at = Some(chrono::Utc::now());
         });
+
+        // Phase 1.3: resolve per-user MCP tools via token exchange (WS sessions)
+        let ws_tools: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = if let (
+            Some(ap),
+            Some(uid),
+            Some(tid),
+        ) =
+            (&ws_auth_provider, &ws_user_id, &ws_tenant_id)
+        {
+            match ap.auth_header_for(uid, tid).await {
+                Ok(Some(user_auth)) => {
+                    tracing::debug!(
+                        user_id = %uid,
+                        tenant_id = %tid,
+                        "resolved per-user auth for WS MCP tools"
+                    );
+                    let mut cache = HashMap::new();
+                    for agent in &config.agents {
+                        let mut agent_tools = Vec::new();
+                        for entry in &agent.mcp_servers {
+                            if entry.is_stdio() {
+                                agent_tools.extend(
+                                    crate::load_mcp_tools(&agent.name, std::slice::from_ref(entry))
+                                        .await,
+                                );
+                            } else {
+                                match heartbit::McpClient::connect_with_auth(
+                                    entry.url(),
+                                    &user_auth,
+                                )
+                                .await
+                                {
+                                    Ok(client) => agent_tools.extend(client.into_tools()),
+                                    Err(e) => tracing::warn!(
+                                        agent = %agent.name,
+                                        server = %entry.display_name(),
+                                        error = %e,
+                                        "failed to connect MCP with user auth for WS, falling back to cached"
+                                    ),
+                                }
+                            }
+                        }
+                        agent_tools
+                            .extend(crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+                        cache.insert(agent.name.clone(), agent_tools);
+                    }
+                    Arc::new(cache)
+                }
+                Ok(None) => {
+                    tracing::debug!("no auth token for WS user, using cached MCP tools");
+                    ws_default_tools
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "WS token exchange failed, falling back to cached MCP tools"
+                    );
+                    ws_default_tools
+                }
+            }
+        } else {
+            ws_default_tools
+        };
+        // Clean up subject token — prevent unbounded map growth
+        if let (Some(uid), Some(tid)) = (&ws_user_id, &ws_tenant_id) {
+            let key = format!("{tid}:{uid}");
+            if let Ok(mut tokens) = ws_user_tokens.write() {
+                tokens.remove(&key);
+            }
+        }
 
         let result = run_interactive_task(
             &config,
