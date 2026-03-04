@@ -17,6 +17,8 @@ const HEAD_TAIL_SIZE: usize = 14_000;
 pub struct BashTool {
     /// Tracked working directory that persists across calls.
     cwd: Mutex<PathBuf>,
+    /// Optional workspace root. When set, cwd is jailed to this directory.
+    workspace: Option<PathBuf>,
 }
 
 impl BashTool {
@@ -24,13 +26,15 @@ impl BashTool {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         Self {
             cwd: Mutex::new(cwd),
+            workspace: None,
         }
     }
 
     /// Create a BashTool with the working directory set to a workspace path.
     pub fn with_workspace(workspace: PathBuf) -> Self {
         Self {
-            cwd: Mutex::new(workspace),
+            cwd: Mutex::new(workspace.clone()),
+            workspace: Some(workspace),
         }
     }
 }
@@ -124,8 +128,19 @@ impl Tool for BashTool {
             // Extract new cwd from the output
             let (user_stdout, new_cwd) = extract_cwd(&stdout);
             if let Some(new_dir) = new_cwd {
+                let new_path = PathBuf::from(&new_dir);
                 let mut guard = self.cwd.lock().expect("bash cwd lock poisoned");
-                *guard = PathBuf::from(new_dir);
+
+                if let Some(ref ws) = self.workspace {
+                    // Jail check: pwd output is already absolute/canonical,
+                    // so a direct starts_with is sufficient (no extra I/O).
+                    if new_path.starts_with(ws) {
+                        *guard = new_path;
+                    }
+                    // If outside workspace, silently keep old cwd
+                } else {
+                    *guard = new_path;
+                }
             }
 
             // Combine output
@@ -337,6 +352,43 @@ mod tests {
     #[test]
     fn shell_escape_empty_string() {
         assert_eq!(shell_escape(""), "''");
+    }
+
+    #[tokio::test]
+    async fn bash_workspace_cd_outside_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let tool = BashTool::with_workspace(ws.clone());
+
+        // Try to cd outside workspace
+        tool.execute(json!({"command": "cd /tmp"})).await.unwrap();
+
+        // Verify cwd stayed inside workspace
+        let result = tool.execute(json!({"command": "pwd"})).await.unwrap();
+        assert!(
+            result.content.contains(&ws.display().to_string()),
+            "cwd should stay in workspace after cd /tmp, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_workspace_cd_inside_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let sub = ws.join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+
+        let tool = BashTool::with_workspace(ws);
+
+        tool.execute(json!({"command": "cd subdir"})).await.unwrap();
+
+        let result = tool.execute(json!({"command": "pwd"})).await.unwrap();
+        assert!(
+            result.content.contains("subdir"),
+            "cwd should be in subdir, got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

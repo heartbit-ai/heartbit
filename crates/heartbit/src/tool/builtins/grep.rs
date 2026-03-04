@@ -73,7 +73,10 @@ impl Tool for GrepTool {
                 .unwrap_or(false);
 
             let search_path = match path_str {
-                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                Some(p) => match super::resolve_path(p, self.workspace.as_deref()) {
+                    Ok(p) => p,
+                    Err(msg) => return Ok(ToolOutput::error(msg)),
+                },
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
             let path = search_path.display().to_string();

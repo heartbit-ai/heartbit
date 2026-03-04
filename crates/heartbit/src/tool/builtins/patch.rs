@@ -64,30 +64,31 @@ impl Tool for PatchTool {
                 ));
             }
 
-            // Pre-check: all modified files must have been read
+            // Resolve all paths once and pre-check: modified files must have been read
+            let mut resolved_paths = Vec::with_capacity(file_patches.len());
             for fp in &file_patches {
+                let resolved = match super::resolve_path(&fp.path, self.workspace.as_deref()) {
+                    Ok(p) => p,
+                    Err(msg) => return Ok(ToolOutput::error(msg)),
+                };
                 if fp.is_new {
-                    if super::resolve_path(&fp.path, self.workspace.as_deref()).exists() {
+                    if resolved.exists() {
                         return Ok(ToolOutput::error(format!(
                             "File {} already exists (patch says it's new)",
                             fp.path
                         )));
                     }
-                } else if let Err(msg) = self
-                    .file_tracker
-                    .check_unmodified(&super::resolve_path(&fp.path, self.workspace.as_deref()))
-                {
+                } else if let Err(msg) = self.file_tracker.check_unmodified(&resolved) {
                     return Ok(ToolOutput::error(msg));
                 }
+                resolved_paths.push(resolved);
             }
 
             let mut files_changed = 0;
             let mut additions = 0;
             let mut removals = 0;
 
-            for fp in &file_patches {
-                let path = super::resolve_path(&fp.path, self.workspace.as_deref());
-
+            for (fp, path) in file_patches.iter().zip(resolved_paths.iter()) {
                 if fp.is_delete {
                     if path.exists() {
                         tokio::fs::remove_file(&path)
@@ -228,7 +229,7 @@ impl Tool for PatchTool {
                     .await
                     .map_err(|e| Error::Agent(format!("Cannot write {}: {e}", fp.path)))?;
 
-                let _ = self.file_tracker.record_read(&path);
+                let _ = self.file_tracker.record_read(path);
                 files_changed += 1;
             }
 

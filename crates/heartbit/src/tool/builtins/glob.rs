@@ -57,7 +57,10 @@ impl Tool for GlobTool {
             let base_path_str = input.get("path").and_then(|v| v.as_str());
 
             let base = match base_path_str {
-                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                Some(p) => match super::resolve_path(p, self.workspace.as_deref()) {
+                    Ok(p) => p,
+                    Err(msg) => return Ok(ToolOutput::error(msg)),
+                },
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
             let base_path = base.display().to_string();
@@ -78,6 +81,9 @@ impl Tool for GlobTool {
 
             let mut paths: Vec<String> = Vec::new();
 
+            // Workspace is already canonical (from builtin_tools()).
+            let ws_ref = self.workspace.as_deref();
+
             for entry in entries {
                 match entry {
                     Ok(path) => {
@@ -87,6 +93,18 @@ impl Tool for GlobTool {
                             .components()
                             .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')));
                         if has_hidden {
+                            continue;
+                        }
+
+                        // Symlink post-filter: only canonicalize actual symlinks
+                        // to avoid O(results) syscalls for regular files.
+                        if let Some(ws) = ws_ref
+                            && path
+                                .symlink_metadata()
+                                .is_ok_and(|m| m.file_type().is_symlink())
+                            && let Ok(canonical) = path.canonicalize()
+                            && !canonical.starts_with(ws)
+                        {
                             continue;
                         }
 

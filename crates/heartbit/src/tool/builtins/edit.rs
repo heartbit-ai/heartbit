@@ -73,7 +73,10 @@ impl Tool for EditTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("new_string is required".into()))?;
 
-            let path = super::resolve_path(file_path, self.workspace.as_deref());
+            let path = match super::resolve_path(file_path, self.workspace.as_deref()) {
+                Ok(p) => p,
+                Err(msg) => return Ok(ToolOutput::error(msg)),
+            };
 
             if !path.exists() {
                 return Ok(ToolOutput::error(format!("File not found: {file_path}")));

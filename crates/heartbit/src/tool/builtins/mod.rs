@@ -18,16 +18,65 @@ use std::sync::Arc;
 
 use crate::tool::Tool;
 
-/// Resolve a file path: absolute paths pass through, relative paths are
-/// resolved against the workspace root (or CWD if no workspace is set).
-pub(crate) fn resolve_path(path: &str, workspace: Option<&std::path::Path>) -> PathBuf {
+/// Resolve a file path with workspace jail enforcement.
+///
+/// When `workspace` is `Some(ws)`:
+/// - **Absolute paths are rejected** (agents must use relative paths).
+/// - Relative paths are joined to `ws`, normalized, and checked for containment.
+/// - If the resolved path exists, symlinks are resolved via `canonicalize()` and
+///   re-checked to prevent symlink escapes.
+///
+/// When `workspace` is `None` (CLI/standalone), behavior is unchanged: absolute
+/// paths pass through, relative paths are returned as-is.
+///
+/// The `workspace` path should be pre-canonicalized (done once in `builtin_tools()`).
+pub(crate) fn resolve_path(
+    path: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
     let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
+
     match workspace {
-        Some(ws) => ws.join(p),
-        None => p.to_path_buf(),
+        Some(ws) => {
+            // Reject absolute paths — agents must stay inside workspace
+            if p.is_absolute() {
+                return Err(format!(
+                    "Absolute paths are not allowed when workspace is set. \
+                     Use a relative path instead of '{path}'."
+                ));
+            }
+
+            // Normalize to resolve .. without touching the filesystem
+            let candidate = ws.join(p);
+            let normalized = crate::workspace::normalize_path(&candidate);
+
+            if !normalized.starts_with(ws) {
+                return Err(format!(
+                    "Path '{path}' escapes the workspace root ({}).",
+                    ws.display()
+                ));
+            }
+
+            // Symlink check: canonicalize and re-verify against the workspace
+            // root (which is already canonical from builtin_tools()).
+            // TOCTOU note: a symlink could be swapped between this check and
+            // the actual file open. Acceptable for agent tool jail; closing
+            // it requires O_NOFOLLOW or OS-level namespaces.
+            if let Ok(canonical) = normalized.canonicalize()
+                && !canonical.starts_with(ws)
+            {
+                return Err(format!(
+                    "Path '{path}' resolves to {} which is outside the workspace.",
+                    canonical.display()
+                ));
+            }
+
+            Ok(normalized)
+        }
+        None => {
+            // No workspace — pass through unchanged
+            Ok(p.to_path_buf())
+        }
     }
 }
 
@@ -83,7 +132,8 @@ impl Default for BuiltinToolsConfig {
 ///
 /// Returns a `Vec<Arc<dyn Tool>>` ready to pass to `AgentRunnerBuilder::tools()`.
 pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
-    let ws = config.workspace.clone();
+    // Pre-canonicalize workspace once so tools don't repeat canonicalize() on every call.
+    let ws = config.workspace.map(|w| w.canonicalize().unwrap_or(w));
     let bash_tool: Arc<dyn Tool> = match &ws {
         Some(path) => Arc::new(bash::BashTool::with_workspace(path.clone())),
         None => Arc::new(bash::BashTool::new()),
@@ -145,36 +195,96 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_absolute_passthrough_with_workspace() {
-        let ws = Some(std::path::Path::new("/workspace"));
-        let result = resolve_path("/absolute/path", ws);
-        assert_eq!(result, PathBuf::from("/absolute/path"));
+    fn resolve_path_absolute_rejected_with_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let result = resolve_path("/absolute/path", Some(ws));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Absolute paths are not allowed")
+        );
     }
 
     #[test]
     fn resolve_path_absolute_passthrough_without_workspace() {
         let result = resolve_path("/absolute/path", None);
-        assert_eq!(result, PathBuf::from("/absolute/path"));
+        assert_eq!(result.unwrap(), PathBuf::from("/absolute/path"));
     }
 
     #[test]
     fn resolve_path_relative_with_workspace() {
-        let ws = Some(std::path::Path::new("/workspace"));
-        let result = resolve_path("notes.md", ws);
-        assert_eq!(result, PathBuf::from("/workspace/notes.md"));
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("notes.md", Some(&ws));
+        assert_eq!(result.unwrap(), ws.join("notes.md"));
     }
 
     #[test]
     fn resolve_path_relative_nested_with_workspace() {
-        let ws = Some(std::path::Path::new("/workspace"));
-        let result = resolve_path("subdir/notes.md", ws);
-        assert_eq!(result, PathBuf::from("/workspace/subdir/notes.md"));
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("subdir/notes.md", Some(&ws));
+        assert_eq!(result.unwrap(), ws.join("subdir/notes.md"));
     }
 
     #[test]
     fn resolve_path_relative_without_workspace() {
         let result = resolve_path("notes.md", None);
-        assert_eq!(result, PathBuf::from("notes.md"));
+        assert_eq!(result.unwrap(), PathBuf::from("notes.md"));
+    }
+
+    #[test]
+    fn resolve_path_traversal_rejected_with_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("../../etc/passwd", Some(&ws));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn resolve_path_internal_dotdot_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("sub/../file.txt", Some(&ws));
+        assert_eq!(result.unwrap(), ws.join("file.txt"));
+    }
+
+    #[test]
+    fn resolve_path_boundary_dotdot_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        // Exactly at the boundary: going up from root of workspace
+        let result = resolve_path("../escape", Some(&ws));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn resolve_path_symlink_escape_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("secret.txt"), "secret").unwrap();
+
+        // Create symlink inside workspace pointing outside
+        let link_path = ws.join("escape_link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target.path(), &link_path).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Skip on non-unix
+            return;
+        }
+
+        let result = resolve_path("escape_link/secret.txt", Some(&ws));
+        assert!(
+            result.is_err(),
+            "symlink escape should be rejected: {:?}",
+            result
+        );
     }
 
     #[test]

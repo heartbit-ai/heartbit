@@ -79,7 +79,10 @@ impl Tool for ListTool {
                 .unwrap_or_default();
 
             let root = match path_str {
-                Some(p) => super::resolve_path(p, self.workspace.as_deref()),
+                Some(p) => match super::resolve_path(p, self.workspace.as_deref()) {
+                    Ok(p) => p,
+                    Err(msg) => return Ok(ToolOutput::error(msg)),
+                },
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
             let path = root.display().to_string();

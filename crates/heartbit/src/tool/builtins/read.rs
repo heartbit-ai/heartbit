@@ -79,7 +79,10 @@ impl Tool for ReadTool {
                 .map(|v| v as usize)
                 .unwrap_or(DEFAULT_LIMIT);
 
-            let path = super::resolve_path(file_path, self.workspace.as_deref());
+            let path = match super::resolve_path(file_path, self.workspace.as_deref()) {
+                Ok(p) => p,
+                Err(msg) => return Ok(ToolOutput::error(msg)),
+            };
 
             // Check if it's a directory
             if path.is_dir() {

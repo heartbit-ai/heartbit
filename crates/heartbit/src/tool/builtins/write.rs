@@ -64,7 +64,10 @@ impl Tool for WriteTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("content is required".into()))?;
 
-            let path = super::resolve_path(file_path, self.workspace.as_deref());
+            let path = match super::resolve_path(file_path, self.workspace.as_deref()) {
+                Ok(p) => p,
+                Err(msg) => return Ok(ToolOutput::error(msg)),
+            };
 
             // If file exists, enforce read-before-write guard
             if path.exists() {
