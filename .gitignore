@@ -17,6 +17,7 @@ docker-compose.override.yml
 
 # Local dev configs (use *.example templates)
 daemon-dev.toml
+daemon-crm.toml
 telegram-test.toml
 gateway/config.yaml
 
