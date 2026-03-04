@@ -280,6 +280,9 @@ impl AuthProvider for StaticAuthProvider {
     }
 }
 
+/// HTTP header name used to pass the tenant ID to the IdP/MCP authorization server.
+const TENANT_ID_HEADER: &str = "X-Tenant-ID";
+
 /// Auth provider that exchanges a subject token for a user-scoped delegated token
 /// via RFC 8693 Token Exchange.
 pub struct TokenExchangeAuthProvider {
@@ -287,7 +290,17 @@ pub struct TokenExchangeAuthProvider {
     exchange_url: String,
     client_id: String,
     client_secret: String,
+    /// NHI tenant ID for `client_credentials` grant. When set, `agent_token` is
+    /// auto-fetched and cached; the static `agent_token` field is ignored.
+    tenant_id: Option<String>,
+    /// Static fallback agent token. Used only when `tenant_id` is absent.
     agent_token: String,
+    /// OAuth scopes for the `client_credentials` agent token grant.
+    /// Defaults to `["openid"]` when empty.
+    scopes: Vec<String>,
+    /// Cache for the auto-fetched agent token: (access_token, expires_at).
+    /// Uses std::sync::RwLock because the lock is never held across `.await`.
+    agent_token_cache: RwLock<Option<(String, std::time::Instant)>>,
     /// Subject tokens for token exchange: key is `"{tenant_id}:{user_id}"`.
     /// Populated externally (e.g. by the daemon HTTP handler when a user submits a task).
     user_tokens: Arc<RwLock<HashMap<String, String>>>,
@@ -324,10 +337,25 @@ impl TokenExchangeAuthProvider {
             exchange_url: exchange_url.into(),
             client_id: client_id.into(),
             client_secret: client_secret.into(),
+            tenant_id: None,
             agent_token: agent_token.into(),
+            scopes: Vec::new(),
+            agent_token_cache: RwLock::new(None),
             user_tokens: Arc::new(RwLock::new(HashMap::new())),
             token_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Set the NHI tenant ID for automatic `client_credentials` agent token fetch.
+    pub fn with_tenant_id(mut self, tenant_id: Option<String>) -> Self {
+        self.tenant_id = tenant_id;
+        self
+    }
+
+    /// Set the OAuth scopes for the `client_credentials` agent token grant.
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
     }
 
     /// Set the user tokens map (`"{tenant_id}:{user_id}"` -> subject_token).
@@ -339,6 +367,73 @@ impl TokenExchangeAuthProvider {
     /// Get a reference to the shared user tokens map for external population.
     pub fn user_tokens(&self) -> &Arc<RwLock<HashMap<String, String>>> {
         &self.user_tokens
+    }
+
+    /// Returns a valid agent token, fetching a fresh one via `client_credentials` if needed.
+    ///
+    /// When `tenant_id` is configured, auto-fetches and caches the token using
+    /// `client_credentials` grant (AWS/GCP SDK pattern). Falls back to the static
+    /// `agent_token` when `tenant_id` is absent.
+    async fn ensure_valid_agent_token(&self) -> Result<String, Error> {
+        // Check cache (read lock — not held across .await per codebase convention)
+        {
+            let cache = self
+                .agent_token_cache
+                .read()
+                .map_err(|e| Error::Mcp(format!("agent_token_cache lock poisoned: {e}")))?;
+            if let Some((token, expires_at)) = &*cache
+                && std::time::Instant::now() < *expires_at
+            {
+                return Ok(token.clone());
+            }
+        }
+        // Auto-fetch via client_credentials when tenant_id is configured
+        if let Some(tenant_id) = &self.tenant_id {
+            let scope = if self.scopes.is_empty() {
+                "openid".to_string()
+            } else {
+                self.scopes.join(" ")
+            };
+            let response = self
+                .client
+                .post(&self.exchange_url)
+                .header(TENANT_ID_HEADER, tenant_id)
+                .form(&[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", &self.client_id),
+                    ("client_secret", &self.client_secret),
+                    ("scope", &scope),
+                ])
+                .send()
+                .await
+                .map_err(|e| Error::Mcp(format!("Agent token fetch failed: {e}")))?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let cut = crate::tool::builtins::floor_char_boundary(&body, 512);
+                return Err(Error::Mcp(format!(
+                    "Agent token fetch failed (HTTP {status}): {}",
+                    &body[..cut]
+                )));
+            }
+
+            let resp: TokenExchangeResponse = response
+                .json()
+                .await
+                .map_err(|e| Error::Mcp(format!("Agent token response parse error: {e}")))?;
+
+            let ttl = resp.expires_in.unwrap_or(300).min(3600).saturating_sub(30);
+            let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+            *self
+                .agent_token_cache
+                .write()
+                .map_err(|e| Error::Mcp(format!("agent_token_cache lock poisoned: {e}")))? =
+                Some((resp.access_token.clone(), expires_at));
+            return Ok(resp.access_token);
+        }
+        // Fallback: static token from config
+        Ok(self.agent_token.clone())
     }
 }
 
@@ -371,9 +466,11 @@ impl AuthProvider for TokenExchangeAuthProvider {
                 })?
             };
 
+            let agent_token = self.ensure_valid_agent_token().await?;
             let response = self
                 .client
                 .post(&self.exchange_url)
+                .header(TENANT_ID_HEADER, tenant_id)
                 .form(&[
                     (
                         "grant_type",
@@ -384,7 +481,7 @@ impl AuthProvider for TokenExchangeAuthProvider {
                         "subject_token_type",
                         "urn:ietf:params:oauth:token-type:access_token",
                     ),
-                    ("actor_token", &self.agent_token),
+                    ("actor_token", &agent_token),
                     (
                         "actor_token_type",
                         "urn:ietf:params:oauth:token-type:access_token",
@@ -400,13 +497,10 @@ impl AuthProvider for TokenExchangeAuthProvider {
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 // Truncate error body to avoid leaking sensitive IdP details in logs
-                let truncated = if body.len() > 512 {
-                    &body[..512]
-                } else {
-                    &body
-                };
+                let cut = crate::tool::builtins::floor_char_boundary(&body, 512);
                 return Err(Error::Mcp(format!(
-                    "Token exchange failed (HTTP {status}): {truncated}"
+                    "Token exchange failed (HTTP {status}): {}",
+                    &body[..cut]
                 )));
             }
 
@@ -418,9 +512,11 @@ impl AuthProvider for TokenExchangeAuthProvider {
             // Cache the exchanged token with expiry (default 5 min, max 1 hour)
             let ttl = token_response.expires_in.unwrap_or(300).min(3600);
             // Expire 30 seconds early to avoid using nearly-expired tokens
-            let expires_at =
-                std::time::Instant::now() + std::time::Duration::from_secs(ttl.saturating_sub(30));
+            let now = std::time::Instant::now();
+            let expires_at = now + std::time::Duration::from_secs(ttl.saturating_sub(30));
             if let Ok(mut cache) = self.token_cache.write() {
+                // Prune expired entries to prevent unbounded growth in multi-tenant deployments
+                cache.retain(|_, (_, exp)| now < *exp);
                 cache.insert(cache_key, (token_response.access_token.clone(), expires_at));
             }
 

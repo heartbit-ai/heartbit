@@ -4232,7 +4232,7 @@ mod tests {
     #[tokio::test]
     async fn full_audit_trail_end_to_end() {
         // Build a long tool output to test truncation
-        let long_output = "x".repeat(8000); // > EVENT_MAX_PAYLOAD_BYTES (4096)
+        let long_output = "x".repeat(70_000); // > EVENT_MAX_PAYLOAD_BYTES (65536)
 
         let provider = Arc::new(MockProvider::new(vec![
             // 1: Orchestrator decides to delegate to both agents (with reasoning text)
@@ -4588,10 +4588,10 @@ mod tests {
                 output, is_error, ..
             } => {
                 assert!(!is_error);
-                // The web_search tool returns 8000 bytes, exceeds EVENT_MAX_PAYLOAD_BYTES (4096)
+                // The web_search tool returns 70_000 bytes, exceeds EVENT_MAX_PAYLOAD_BYTES (65536)
                 assert!(
                     output.contains("[truncated:"),
-                    "web_search output (8000 bytes) should be truncated in event, got {} bytes: {}",
+                    "web_search output (70000 bytes) should be truncated in event, got {} bytes: {}",
                     output.len(),
                     &output[..output.len().min(100)]
                 );

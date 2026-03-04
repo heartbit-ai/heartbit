@@ -1105,7 +1105,12 @@ pub struct TokenExchangeConfig {
     pub client_id: String,
     /// OAuth client secret for the daemon/agent.
     pub client_secret: String,
-    /// The agent's own credential token (used as `actor_token` in RFC 8693).
+    /// NHI tenant ID — used for `X-Tenant-ID` header in `client_credentials` grant.
+    /// When set, `agent_token` is fetched and cached automatically; no static token needed.
+    pub tenant_id: Option<String>,
+    /// Static fallback agent token (`actor_token` in RFC 8693).
+    /// Used only when `tenant_id` is absent (backward-compat).
+    #[serde(default)]
     pub agent_token: String,
     /// OAuth scopes to request for the delegated token. Defaults to empty.
     #[serde(default)]
@@ -2054,9 +2059,9 @@ impl HeartbitConfig {
                             "daemon.auth.token_exchange.client_secret must not be empty".into(),
                         ));
                     }
-                    if te.agent_token.is_empty() {
+                    if te.tenant_id.is_none() && te.agent_token.is_empty() {
                         return Err(Error::Config(
-                            "daemon.auth.token_exchange.agent_token must not be empty".into(),
+                            "daemon.auth.token_exchange: set tenant_id for auto-fetch, or provide a static agent_token".into(),
                         ));
                     }
                 }
@@ -5759,7 +5764,7 @@ agent_token = ""
         let err = HeartbitConfig::from_toml(toml_str).unwrap_err();
         assert!(
             err.to_string()
-                .contains("daemon.auth.token_exchange.agent_token must not be empty"),
+                .contains("daemon.auth.token_exchange: set tenant_id for auto-fetch"),
             "got: {err}"
         );
     }

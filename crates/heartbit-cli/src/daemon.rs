@@ -43,6 +43,32 @@ pub struct SubmitRequest {
     pub task: String,
     #[serde(default)]
     pub story_id: Option<String>,
+    /// Optional user context passed in the request body (used when the caller
+    /// authenticates with a service API key rather than a user JWT). When a JWT
+    /// middleware UserContext is already present, that takes precedence.
+    #[serde(default)]
+    pub user_context: Option<SubmitUserContext>,
+    /// Optional CRM entity context injected by the frontend when the user is on
+    /// an entity detail page. Prepended to the task text so the agent starts
+    /// with full page context without needing an MCP prefetch round-trip.
+    #[serde(default)]
+    pub entity_context: Option<serde_json::Value>,
+}
+
+/// User context embedded in the task submission body.
+/// Mirrors the fields of `UserContext` so CRM can pass user identity alongside
+/// a service-level API key, enabling per-user memory/workspace isolation and
+/// RFC 8693 OBO token exchange without requiring user JWT on every request.
+#[derive(Deserialize)]
+pub struct SubmitUserContext {
+    pub user_id: Option<String>,
+    pub tenant_id: Option<String>,
+    /// The user's original JWT — stored in the shared `user_tokens` map so that
+    /// `TokenExchangeAuthProvider` can exchange it for a per-user OBO token
+    /// when calling MCP servers on behalf of this user.
+    pub user_token: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +121,33 @@ pub struct ReadinessCheck {
 
 // --- Axum state ---
 
+/// Returns `true` if the caller is allowed to access a task with the given `tenant_id`.
+///
+/// Rules:
+/// - Authenticated service (static bearer `ServiceAuth`): can access all tasks.
+/// - Authenticated user (JWT `UserContext`): can only access tasks whose `tenant_id` matches.
+/// - Truly unauthenticated (neither): cannot access tenant-scoped tasks.
+fn task_tenant_allowed(
+    task_tenant_id: Option<&str>,
+    user_context: Option<&axum::Extension<UserContext>>,
+    service_auth: Option<&axum::Extension<ServiceAuth>>,
+) -> bool {
+    match (user_context, task_tenant_id) {
+        // JWT user: must match task tenant
+        (Some(axum::Extension(ctx)), Some(tid)) => tid == ctx.tenant_id,
+        // Unauthenticated: blocked from tenant-scoped tasks unless service auth present
+        (None, Some(_)) => service_auth.is_some(),
+        // No tenant on task, or user has no context restriction
+        _ => true,
+    }
+}
+
+/// Marker extension set by `auth_middleware` when a valid static bearer token is present.
+/// Handlers use this to distinguish "authenticated service caller" (user_context = None, ServiceAuth = Some)
+/// from "authenticated user" (user_context = Some) and "truly unauthenticated" (neither).
+#[derive(Clone, Copy)]
+struct ServiceAuth;
+
 #[derive(Clone)]
 struct AppState {
     handle: DaemonHandle,
@@ -134,7 +187,42 @@ async fn handle_submit(
         m.record_task_submitted();
     }
 
-    let result = if let Some(axum::Extension(ref ctx)) = user_context {
+    // Resolve user context: JWT middleware takes precedence; fall back to body user_context
+    // (used when the caller authenticates with a service API key, e.g. CRM→Heartbit).
+    let body_ctx: Option<UserContext> = user_context
+        .is_none()
+        .then(|| {
+            body.user_context.as_ref().and_then(|bc| {
+                let uid = bc.user_id.clone()?;
+                let tid = bc.tenant_id.clone()?;
+                Some(UserContext {
+                    user_id: uid,
+                    tenant_id: tid,
+                    roles: bc.roles.clone(),
+                    raw_token: bc.user_token.clone(),
+                })
+            })
+        })
+        .flatten();
+
+    let effective_ctx: Option<&UserContext> = user_context
+        .as_ref()
+        .map(|axum::Extension(ctx)| ctx as &UserContext)
+        .or(body_ctx.as_ref());
+
+    // If entity_context was provided, prepend it to the task text so the agent
+    // starts with full page context (L0 grounding) without an MCP round-trip.
+    let task_text = if let Some(ref ctx) = body.entity_context {
+        let ctx_str = serde_json::to_string(ctx).unwrap_or_default();
+        format!(
+            "<entity_context>\n{ctx_str}\n</entity_context>\n\n{}",
+            body.task
+        )
+    } else {
+        body.task
+    };
+
+    let result = if let Some(ctx) = effective_ctx {
         // Stash the raw JWT for token exchange (consumed by TokenExchangeAuthProvider).
         if let Some(ref token) = ctx.raw_token {
             let key = format!("{}:{}", ctx.tenant_id, ctx.user_id);
@@ -144,12 +232,12 @@ async fn handle_submit(
         }
         state
             .handle
-            .submit_task_with_user(body.task, "api", body.story_id, ctx)
+            .submit_task_with_user(task_text, "api", body.story_id, ctx)
             .await
     } else {
         state
             .handle
-            .submit_task(body.task, "api", body.story_id)
+            .submit_task(task_text, "api", body.story_id)
             .await
     };
 
@@ -243,6 +331,7 @@ async fn handle_stats(
 async fn handle_get(
     State(state): State<AppState>,
     user_context: Option<axum::Extension<UserContext>>,
+    service_auth: Option<axum::Extension<ServiceAuth>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     let not_found = || {
@@ -254,18 +343,12 @@ async fn handle_get(
     };
     match state.handle.get_task(id) {
         Ok(Some(task)) => {
-            // Enforce tenant isolation:
-            // - Authenticated user: must match task's tenant_id
-            // - Unauthenticated: cannot access tenant-scoped tasks
-            match (&user_context, task.tenant_id.as_deref()) {
-                (Some(axum::Extension(ctx)), Some(tid)) if tid != ctx.tenant_id => {
-                    return not_found();
-                }
-                (None, Some(_)) => {
-                    // Task belongs to a tenant but caller is unauthenticated
-                    return not_found();
-                }
-                _ => {}
+            if !task_tenant_allowed(
+                task.tenant_id.as_deref(),
+                user_context.as_ref(),
+                service_auth.as_ref(),
+            ) {
+                return not_found();
             }
             Json(task).into_response()
         }
@@ -281,6 +364,7 @@ async fn handle_get(
 async fn handle_cancel(
     State(state): State<AppState>,
     user_context: Option<axum::Extension<UserContext>>,
+    service_auth: Option<axum::Extension<ServiceAuth>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     let not_found = || {
@@ -293,15 +377,12 @@ async fn handle_cancel(
     // Verify tenant ownership before cancelling
     match state.handle.get_task(id) {
         Ok(Some(task)) => {
-            match (&user_context, task.tenant_id.as_deref()) {
-                (Some(axum::Extension(ctx)), Some(tid)) if tid != ctx.tenant_id => {
-                    return not_found();
-                }
-                (None, Some(_)) => {
-                    // Task belongs to a tenant but caller is unauthenticated
-                    return not_found();
-                }
-                _ => {}
+            if !task_tenant_allowed(
+                task.tenant_id.as_deref(),
+                user_context.as_ref(),
+                service_auth.as_ref(),
+            ) {
+                return not_found();
             }
         }
         Ok(None) => return not_found(),
@@ -331,6 +412,7 @@ async fn handle_cancel(
 async fn handle_events(
     State(state): State<AppState>,
     user_context: Option<axum::Extension<UserContext>>,
+    service_auth: Option<axum::Extension<ServiceAuth>>,
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     // Verify tenant ownership before subscribing to events
@@ -341,22 +423,24 @@ async fn handle_events(
         )
             .into_response()
     };
-    match (&user_context, state.handle.get_task(id)) {
-        // Authenticated user: verify tenant match
-        (Some(axum::Extension(ctx)), Ok(Some(ref task)))
-            if task.tenant_id.as_deref() != Some(&ctx.tenant_id) =>
-        {
-            return not_found();
+    match state.handle.get_task(id) {
+        Ok(Some(ref task)) => {
+            if !task_tenant_allowed(
+                task.tenant_id.as_deref(),
+                user_context.as_ref(),
+                service_auth.as_ref(),
+            ) {
+                return not_found();
+            }
         }
-        // Unauthenticated caller: cannot access tenant-scoped tasks
-        (None, Ok(Some(ref task))) if task.tenant_id.is_some() => {
-            return not_found();
+        Ok(None) => return not_found(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
         }
-        // Task not found
-        (_, Ok(None)) => {
-            return not_found();
-        }
-        _ => {}
     }
     match state.handle.subscribe_events(id) {
         Some(rx) => {
@@ -848,7 +932,7 @@ async fn jwt_auth_middleware(
 
 async fn auth_middleware(
     State(tokens): State<Arc<HashSet<String>>>,
-    request: axum::http::Request<axum::body::Body>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
     let raw_header = request.headers().get(axum::http::header::AUTHORIZATION);
@@ -869,7 +953,11 @@ async fn auth_middleware(
     };
 
     match validate_bearer_token(auth_header, &tokens) {
-        Ok(()) => next.run(request).await.into_response(),
+        Ok(()) => {
+            // Mark as service-authenticated so handlers can distinguish from truly unauthenticated callers.
+            request.extensions_mut().insert(ServiceAuth);
+            next.run(request).await.into_response()
+        }
         Err((status, msg)) => (status, Json(serde_json::json!({"error": msg}))).into_response(),
     }
 }
@@ -1141,6 +1229,8 @@ pub async fn run_daemon(
                     &te.client_secret,
                     &te.agent_token,
                 )
+                .with_tenant_id(te.tenant_id.clone())
+                .with_scopes(te.scopes.clone())
                 .with_user_tokens(user_tokens.clone()),
             ) as Arc<dyn heartbit::AuthProvider>
         });

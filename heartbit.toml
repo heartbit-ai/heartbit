@@ -42,6 +42,25 @@ Always confirm what file you wrote and its path."""
 mcp_servers = ["http://localhost:8000/mcp"]
 max_turns = 3         # writing is quick
 
+# Tool policy guardrails — classify CRM MCP tools by risk tier.
+# First matching rule wins. HIGH-risk tools require explicit user approval
+# before execution; this prevents the agent from autonomously deleting or
+# bulk-modifying CRM data without human confirmation.
+[guardrails.tool_policy]
+default_action = "allow"
+
+[[guardrails.tool_policy.rules]]
+tool = "delete_*"
+action = "deny"
+# Destructive ops are denied by default — must be explicitly re-enabled via
+# a role-specific config or per-request approval in a future approval gate.
+
+[[guardrails.tool_policy.rules]]
+tool = "bulk_*"
+action = "warn"
+# Bulk operations emit a guardrail warning so they appear in agent observability;
+# a future UserRoleGuardrail can upgrade to "deny" for viewer-role users.
+
 # Uncomment when Restate is set up
 # [restate]
 # endpoint = "http://localhost:9070"
