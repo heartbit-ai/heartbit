@@ -15,6 +15,10 @@ pub struct TaskOutcome {
     pub cost: Option<f64>,
     /// The story ID that grouped this task (if any).
     pub story_id: Option<String>,
+    /// User ID of the user who submitted this task (multi-tenant authorship).
+    pub user_id: Option<String>,
+    /// Tenant ID of the user who submitted this task (multi-tenant authorship).
+    pub tenant_id: Option<String>,
 }
 
 /// Callback type for task completion notifications.
@@ -61,11 +65,21 @@ pub fn format_notification(outcome: &TaskOutcome) -> String {
         TaskState::Cancelled => {
             format!("\u{26a0}\u{fe0f} **{}** \u{2014} cancelled", outcome.source,)
         }
-        // Pending/Running are not terminal — shouldn't happen, but handle gracefully.
+        TaskState::Rejected => {
+            let mut msg = format!("\u{1f6ab} **{}** \u{2014} rejected", outcome.source,);
+            if let Some(ref error) = outcome.error {
+                let truncated = truncate_summary(error, 500);
+                msg.push_str("\n\nReason: ");
+                msg.push_str(truncated);
+            }
+            msg
+        }
+        // Non-terminal states (Pending, Running, InputRequired, AuthRequired)
+        // shouldn't appear in a TaskOutcome, but handle gracefully.
         _ => format!(
             "\u{2139}\u{fe0f} **{}** \u{2014} {}",
             outcome.source,
-            format!("{:?}", outcome.state).to_lowercase(),
+            outcome.state.as_str(),
         ),
     }
 }
@@ -117,6 +131,8 @@ mod tests {
             },
             cost: Some(0.0042),
             story_id: None,
+            user_id: None,
+            tenant_id: None,
         }
     }
 
@@ -165,7 +181,7 @@ mod tests {
         let msg = format_notification(&outcome);
         assert!(msg.contains("\u{26a0}"));
         assert!(msg.contains("**sensor:gmail_inbox**"));
-        assert!(msg.contains("cancelled"));
+        assert!(msg.contains(TaskState::Cancelled.as_str()));
     }
 
     #[test]
@@ -245,5 +261,35 @@ mod tests {
     fn story_id_defaults_to_none() {
         let outcome = make_outcome(TaskState::Completed);
         assert!(outcome.story_id.is_none());
+    }
+
+    #[test]
+    fn format_rejected() {
+        let outcome = make_outcome(TaskState::Rejected);
+        let msg = format_notification(&outcome);
+        assert!(msg.contains("\u{1f6ab}"), "missing 🚫 emoji for rejected");
+        assert!(msg.contains("**sensor:gmail_inbox**"));
+        assert!(msg.contains(TaskState::Rejected.as_str()));
+    }
+
+    #[test]
+    fn format_rejected_with_reason() {
+        let mut outcome = make_outcome(TaskState::Rejected);
+        outcome.error = Some("tool_policy: delete_* is denied".into());
+        let msg = format_notification(&outcome);
+        assert!(msg.contains("\u{1f6ab}"));
+        assert!(msg.contains("Reason: tool_policy: delete_* is denied"));
+    }
+
+    #[test]
+    fn format_non_terminal_fallback() {
+        // Non-terminal states use as_str() — no Debug format, no to_lowercase allocation.
+        let outcome = make_outcome(TaskState::InputRequired);
+        let msg = format_notification(&outcome);
+        assert!(
+            msg.contains("\u{2139}"),
+            "missing ℹ️ emoji for non-terminal fallback"
+        );
+        assert!(msg.contains(TaskState::InputRequired.as_str()));
     }
 }

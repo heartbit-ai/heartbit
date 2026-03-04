@@ -129,6 +129,8 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
                 source_ids: source_ids.clone(),
                 embedding: None,
                 confidentiality: Confidentiality::default(),
+                author_user_id: None,
+                author_tenant_id: None,
             };
 
             self.memory.store(consolidated).await?;
@@ -256,6 +258,8 @@ mod tests {
             source_ids: vec![],
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         }
     }
 

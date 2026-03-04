@@ -26,6 +26,11 @@ pub enum DaemonCommand {
         /// Tenant ID for multi-tenant isolation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant_id: Option<String>,
+        /// Roles granted to the user (from JWT). Used for role-gated access control
+        /// (e.g. restricting shared institutional memory writes).
+        /// Absent in old messages → deserialized as empty Vec (backward compatible).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     CancelTask {
         id: Uuid,
@@ -33,14 +38,60 @@ pub enum DaemonCommand {
 }
 
 /// State machine for daemon task lifecycle.
+///
+/// Serialization names match the A2A spec (2025-11-25):
+/// `running` → `"working"`, `cancelled` → `"canceled"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Pending,
+    #[serde(rename = "working")]
     Running,
     Completed,
     Failed,
+    #[serde(rename = "canceled")]
     Cancelled,
+    /// Agent is waiting for human input (HITL).
+    InputRequired,
+    /// Agent requires additional authorization before proceeding.
+    AuthRequired,
+    /// Task was explicitly rejected by the agent or policy.
+    Rejected,
+}
+
+impl TaskState {
+    /// Returns the canonical DB storage string for this state.
+    ///
+    /// Note: intentionally different from the A2A JSON names (`serde` renames)
+    /// for `Running` ("working") and `Cancelled` ("canceled").
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::InputRequired => "input_required",
+            Self::AuthRequired => "auth_required",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    /// Parse a DB storage string back to `TaskState`.
+    /// Returns `None` for unknown strings (use `.unwrap_or(Pending)` for DB reads).
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "input_required" => Some(Self::InputRequired),
+            "auth_required" => Some(Self::AuthRequired),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
 }
 
 /// A daemon task with its full lifecycle state.
@@ -163,6 +214,7 @@ mod tests {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
@@ -207,6 +259,7 @@ mod tests {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""type":"submit_task""#));
@@ -229,6 +282,7 @@ mod tests {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("story_id"));
@@ -255,6 +309,28 @@ mod tests {
     }
 
     #[test]
+    fn task_state_from_db_str_roundtrip() {
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+            TaskState::Rejected,
+        ] {
+            let s = state.as_str();
+            assert_eq!(
+                TaskState::from_db_str(s),
+                Some(state),
+                "from_db_str roundtrip failed for {s}"
+            );
+        }
+        assert_eq!(TaskState::from_db_str("unknown"), None);
+    }
+
+    #[test]
     fn task_state_roundtrip() {
         for state in [
             TaskState::Pending,
@@ -262,6 +338,9 @@ mod tests {
             TaskState::Completed,
             TaskState::Failed,
             TaskState::Cancelled,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+            TaskState::Rejected,
         ] {
             let json = serde_json::to_string(&state).unwrap();
             let parsed: TaskState = serde_json::from_str(&json).unwrap();
@@ -270,14 +349,15 @@ mod tests {
     }
 
     #[test]
-    fn task_state_snake_case() {
+    fn task_state_a2a_names() {
+        // A2A spec serialization names (2025-11-25)
         assert_eq!(
             serde_json::to_string(&TaskState::Pending).unwrap(),
             r#""pending""#
         );
         assert_eq!(
             serde_json::to_string(&TaskState::Running).unwrap(),
-            r#""running""#
+            r#""working""#
         );
         assert_eq!(
             serde_json::to_string(&TaskState::Completed).unwrap(),
@@ -289,7 +369,19 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&TaskState::Cancelled).unwrap(),
-            r#""cancelled""#
+            r#""canceled""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskState::InputRequired).unwrap(),
+            r#""input_required""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskState::AuthRequired).unwrap(),
+            r#""auth_required""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskState::Rejected).unwrap(),
+            r#""rejected""#
         );
     }
 
@@ -378,7 +470,9 @@ mod tests {
     fn task_stats_serde_roundtrip() {
         let mut stats = TaskStats::default();
         stats.total_tasks = 10;
-        stats.tasks_by_state.insert("running".into(), 3);
+        stats
+            .tasks_by_state
+            .insert(TaskState::Running.as_str().into(), 3);
         stats.tasks_by_source.insert("api".into(), 7);
         stats.active_tasks = 3;
         stats.total_input_tokens = 5000;
@@ -388,7 +482,10 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         let parsed: TaskStats = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.total_tasks, 10);
-        assert_eq!(parsed.tasks_by_state.get("running"), Some(&3));
+        assert_eq!(
+            parsed.tasks_by_state.get(TaskState::Running.as_str()),
+            Some(&3)
+        );
         assert_eq!(parsed.tasks_by_source.get("api"), Some(&7));
         assert_eq!(parsed.active_tasks, 3);
         assert_eq!(parsed.total_input_tokens, 5000);
@@ -494,6 +591,7 @@ mod tests {
             trust_level: None,
             user_id: Some("alice".into()),
             tenant_id: Some("acme".into()),
+            roles: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""user_id":"alice""#));
@@ -520,6 +618,7 @@ mod tests {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains("user_id"));

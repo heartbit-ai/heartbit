@@ -377,6 +377,8 @@ mod tests {
             source_ids: vec![],
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         }
     }
 

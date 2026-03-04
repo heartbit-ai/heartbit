@@ -92,6 +92,7 @@ impl CronScheduler {
                                 trust_level: None,
                                 user_id: None,
                                 tenant_id: None,
+                                roles: vec![],
                             };
                             let payload = match serde_json::to_vec(&cmd) {
                                 Ok(p) => p,

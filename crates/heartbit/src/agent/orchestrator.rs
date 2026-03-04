@@ -164,6 +164,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             audit_user_id: None,
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
+            allow_shared_write: true,
         }
     }
 
@@ -238,6 +239,8 @@ struct DelegateTaskTool {
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
     /// Observability mode inherited from the orchestrator, forwarded to sub-agents.
     observability_mode: super::observability::ObservabilityMode,
+    /// Whether sub-agents may write to shared institutional memory.
+    allow_shared_write: bool,
 }
 
 impl DelegateTaskTool {
@@ -300,6 +303,7 @@ impl DelegateTaskTool {
             let lsp_manager = self.lsp_manager.clone();
             let permission_rules = self.permission_rules.clone();
             let observability_mode = self.observability_mode;
+            let allow_shared_write = self.allow_shared_write;
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -417,6 +421,7 @@ impl DelegateTaskTool {
                     builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                         memory.clone(),
                         &agent_ns,
+                        allow_shared_write,
                     ));
                 }
 
@@ -595,6 +600,8 @@ struct FormSquadTool {
     cached_definition: ToolDefinition,
     /// Observability mode inherited from the orchestrator, forwarded to squad members.
     observability_mode: super::observability::ObservabilityMode,
+    /// Whether squad members may write to shared institutional memory.
+    allow_shared_write: bool,
 }
 
 impl Tool for FormSquadTool {
@@ -697,6 +704,7 @@ impl Tool for FormSquadTool {
                 let lsp_manager = self.lsp_manager.clone();
                 let permission_rules = self.permission_rules.clone();
                 let observability_mode = self.observability_mode;
+                let allow_shared_write = self.allow_shared_write;
 
                 info!(agent = %agent_def.name, task = %task.task, "spawning squad member");
 
@@ -814,6 +822,7 @@ impl Tool for FormSquadTool {
                         builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                             memory.clone(),
                             &agent_ns,
+                            allow_shared_write,
                         ));
                     }
 
@@ -1303,6 +1312,10 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (propagated to all sub-agents).
     audit_delegation_chain: Vec<String>,
+    /// Whether sub-agents are allowed to write to shared institutional memory.
+    /// Defaults to `true` for backward compatibility. Set to `false` to restrict
+    /// write access based on user roles.
+    allow_shared_write: bool,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1476,6 +1489,16 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// This enables per-user or per-story isolation without nesting `NamespacedMemory`.
     pub fn memory_namespace_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.memory_namespace_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Control whether sub-agents are allowed to write to shared institutional memory.
+    ///
+    /// When `false`, only `shared_memory_read` is provided — agents can read company
+    /// knowledge but cannot write to it. Use this to enforce role-based write access.
+    /// Defaults to `true` for backward compatibility.
+    pub fn allow_shared_write(mut self, allow: bool) -> Self {
+        self.allow_shared_write = allow;
         self
     }
 
@@ -1725,7 +1748,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .zip(tool_names.iter())
             .map(|(a, names)| (a.name.as_str(), a.description.as_str(), names.as_slice()))
             .collect();
-        let system = build_system_prompt(&triples, squads_enabled, self.dispatch_mode);
+        let mut system = build_system_prompt(&triples, squads_enabled, self.dispatch_mode);
+        // Append user identity context so the orchestrator knows who it is serving.
+        if let (Some(uid), Some(tid)) = (&self.audit_user_id, &self.audit_tenant_id) {
+            system.push_str(&format!(
+                "\n---\nYou are operating on behalf of **{uid}** in organization **{tid}**.\nKeep this user's information private. Do not share their data with other users."
+            ));
+        }
         let cached_definition = build_delegate_tool_schema(&triples, self.dispatch_mode);
         let form_squad_definition = if squads_enabled {
             Some(build_form_squad_tool_schema(&triples))
@@ -1767,6 +1796,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             on_text: self.on_text.clone(),
             lsp_manager: self.lsp_manager.clone(),
             observability_mode: resolved_mode,
+            allow_shared_write: self.allow_shared_write,
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -1796,6 +1826,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 lsp_manager: self.lsp_manager.clone(),
                 cached_definition: squad_def,
                 observability_mode: resolved_mode,
+                allow_shared_write: self.allow_shared_write,
             });
             runner_builder = runner_builder.tool(form_squad_tool);
         }
@@ -2186,6 +2217,7 @@ mod tests {
             on_text: None,
             lsp_manager: None,
             observability_mode: crate::ObservabilityMode::Production,
+            allow_shared_write: true,
         };
 
         let def = tool.definition();

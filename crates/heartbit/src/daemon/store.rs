@@ -58,13 +58,7 @@ pub trait TaskStore: Send + Sync {
                 continue;
             }
             stats.total_tasks += 1;
-            let state_key = match task.state {
-                TaskState::Pending => "pending",
-                TaskState::Running => "running",
-                TaskState::Completed => "completed",
-                TaskState::Failed => "failed",
-                TaskState::Cancelled => "cancelled",
-            };
+            let state_key = task.state.as_str();
             *stats
                 .tasks_by_state
                 .entry(state_key.to_string())
@@ -235,24 +229,10 @@ mod postgres_store {
         pub(crate) tenant_id: Option<String>,
     }
 
-    pub(crate) fn task_state_to_str(state: TaskState) -> &'static str {
-        match state {
-            TaskState::Pending => "pending",
-            TaskState::Running => "running",
-            TaskState::Completed => "completed",
-            TaskState::Failed => "failed",
-            TaskState::Cancelled => "cancelled",
-        }
-    }
-
+    /// Parse a DB task state string back to `TaskState`.
+    /// Unknown strings fall back to `Pending` for forward-compatibility with future state additions.
     pub(crate) fn str_to_task_state(s: &str) -> TaskState {
-        match s {
-            "running" => TaskState::Running,
-            "completed" => TaskState::Completed,
-            "failed" => TaskState::Failed,
-            "cancelled" => TaskState::Cancelled,
-            _ => TaskState::Pending,
-        }
+        TaskState::from_db_str(s).unwrap_or(TaskState::Pending)
     }
 
     impl From<TaskRow> for DaemonTask {
@@ -371,7 +351,7 @@ mod postgres_store {
                 )
                 .bind(task.id)
                 .bind(&task.task)
-                .bind(task_state_to_str(task.state))
+                .bind(task.state.as_str())
                 .bind(task.created_at)
                 .bind(task.started_at)
                 .bind(task.completed_at)
@@ -477,7 +457,7 @@ mod postgres_store {
                     )
                     .bind(task.id)
                     .bind(&task.task)
-                    .bind(task_state_to_str(task.state))
+                    .bind(task.state.as_str())
                     .bind(task.started_at)
                     .bind(task.completed_at)
                     .bind(&task.result)
@@ -511,7 +491,7 @@ mod postgres_store {
         ) -> Result<(Vec<DaemonTask>, usize), Error> {
             let pool = self.pool.clone();
             let source_owned = source.map(String::from);
-            let state_str = state.map(task_state_to_str);
+            let state_str = state.map(TaskState::as_str);
             let tenant_owned = tenant_id.map(String::from);
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
@@ -642,7 +622,7 @@ mod postgres_store {
                         stats.total_tasks += count;
                         *stats.tasks_by_state.entry(row.state.clone()).or_default() += count;
                         *stats.tasks_by_source.entry(row.source.clone()).or_default() += count;
-                        if row.state == "running" {
+                        if row.state == TaskState::Running.as_str() {
                             stats.active_tasks += count;
                         }
                         stats.total_input_tokens += row.sum_input as u64;
@@ -840,8 +820,11 @@ mod tests {
             TaskState::Completed,
             TaskState::Failed,
             TaskState::Cancelled,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+            TaskState::Rejected,
         ] {
-            let s = task_state_to_str(state);
+            let s = state.as_str();
             let back = str_to_task_state(s);
             assert_eq!(back, state, "roundtrip failed for {s}");
         }
@@ -1180,9 +1163,18 @@ mod tests {
 
         let stats = store.stats(None).unwrap();
         assert_eq!(stats.total_tasks, 3);
-        assert_eq!(stats.tasks_by_state.get("running"), Some(&1));
-        assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
-        assert_eq!(stats.tasks_by_state.get("failed"), Some(&1));
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Running.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Completed.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Failed.as_str()),
+            Some(&1)
+        );
         assert_eq!(stats.active_tasks, 1); // only Running
         assert_eq!(stats.total_input_tokens, 350);
         assert_eq!(stats.total_output_tokens, 130);
@@ -1233,8 +1225,14 @@ mod tests {
 
         let stats = store.stats(None).unwrap();
         assert_eq!(stats.active_tasks, 2);
-        assert_eq!(stats.tasks_by_state.get("running"), Some(&2));
-        assert_eq!(stats.tasks_by_state.get("pending"), Some(&1));
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Running.as_str()),
+            Some(&2)
+        );
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Pending.as_str()),
+            Some(&1)
+        );
     }
 
     // --- tenant filter tests ---

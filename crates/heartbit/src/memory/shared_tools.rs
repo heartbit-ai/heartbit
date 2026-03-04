@@ -15,18 +15,24 @@ use super::{Memory, MemoryEntry, MemoryQuery};
 
 /// Create shared memory tools for cross-agent memory access.
 ///
-/// - `shared_memory_read`: read memories from any agent's namespace
+/// - `shared_memory_read`: read memories from any agent's namespace (always included)
 /// - `shared_memory_write`: write to a shared namespace visible to all agents
-pub fn shared_memory_tools(memory: Arc<dyn Memory>, agent_name: &str) -> Vec<Arc<dyn Tool>> {
-    vec![
-        Arc::new(SharedMemoryReadTool {
-            memory: memory.clone(),
-        }),
-        Arc::new(SharedMemoryWriteTool {
+///   (only included when `include_write` is `true`)
+pub fn shared_memory_tools(
+    memory: Arc<dyn Memory>,
+    agent_name: &str,
+    include_write: bool,
+) -> Vec<Arc<dyn Tool>> {
+    let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(SharedMemoryReadTool {
+        memory: memory.clone(),
+    })];
+    if include_write {
+        tools.push(Arc::new(SharedMemoryWriteTool {
             memory,
             agent_name: agent_name.into(),
-        }),
-    ]
+        }));
+    }
+    tools
 }
 
 // --- shared_memory_read ---
@@ -229,6 +235,8 @@ impl Tool for SharedMemoryWriteTool {
                 source_ids: vec![],
                 embedding: None,
                 confidentiality: super::Confidentiality::default(),
+                author_user_id: None,
+                author_tenant_id: None,
             };
 
             self.memory.store(entry).await?;
@@ -246,7 +254,7 @@ mod tests {
 
     fn setup() -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = shared_memory_tools(store.clone(), "agent_a");
+        let tools = shared_memory_tools(store.clone(), "agent_a", true);
         (store, tools)
     }
 
@@ -300,8 +308,8 @@ mod tests {
     #[tokio::test]
     async fn shared_memory_visible_to_all_agents() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools_a = shared_memory_tools(store.clone(), "agent_a");
-        let tools_b = shared_memory_tools(store.clone(), "agent_b");
+        let tools_a = shared_memory_tools(store.clone(), "agent_a", true);
+        let tools_b = shared_memory_tools(store.clone(), "agent_b", true);
 
         // Agent A writes
         let write_a = find_tool(&tools_a, "shared_memory_write");
@@ -319,8 +327,8 @@ mod tests {
     #[tokio::test]
     async fn filter_by_agent() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools_a = shared_memory_tools(store.clone(), "agent_a");
-        let tools_b = shared_memory_tools(store.clone(), "agent_b");
+        let tools_a = shared_memory_tools(store.clone(), "agent_a", true);
+        let tools_b = shared_memory_tools(store.clone(), "agent_b", true);
 
         let write_a = find_tool(&tools_a, "shared_memory_write");
         let write_b = find_tool(&tools_b, "shared_memory_write");
@@ -344,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn write_with_keywords_and_summary() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = shared_memory_tools(store.clone(), "agent_a");
+        let tools = shared_memory_tools(store.clone(), "agent_a", true);
         let write_tool = find_tool(&tools, "shared_memory_write");
 
         write_tool

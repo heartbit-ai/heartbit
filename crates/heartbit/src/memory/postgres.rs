@@ -88,6 +88,8 @@ impl From<MemoryRow> for MemoryEntry {
             source_ids: row.source_ids,
             embedding: None, // loaded separately when pgvector is available
             confidentiality: confidentiality_from_str(&row.confidentiality),
+            author_user_id: None,
+            author_tenant_id: None,
         }
     }
 }

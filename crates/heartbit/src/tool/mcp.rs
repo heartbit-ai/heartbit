@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
-const PROTOCOL_VERSION: &str = "2025-03-26";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- JSON-RPC types ---
@@ -946,10 +946,12 @@ impl McpClient {
                 "initialize",
                 Some(serde_json::json!({
                     "protocolVersion": PROTOCOL_VERSION,
+                    // Empty: Heartbit does not implement MCP Roots or Sampling (client capabilities).
+                    // Resources and Prompts are server capabilities, not declared here.
                     "capabilities": {},
                     "clientInfo": {
                         "name": "heartbit",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
             )

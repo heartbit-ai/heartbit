@@ -266,7 +266,10 @@ async fn handle_list(
     user_context: Option<axum::Extension<UserContext>>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let state_filter = query.state.as_deref().and_then(parse_task_state);
+    let state_filter = query
+        .state
+        .as_deref()
+        .and_then(heartbit::TaskState::from_db_str);
     let tenant_filter = user_context
         .as_ref()
         .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
@@ -283,17 +286,6 @@ async fn handle_list(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-    }
-}
-
-fn parse_task_state(s: &str) -> Option<heartbit::TaskState> {
-    match s {
-        "pending" => Some(heartbit::TaskState::Pending),
-        "running" => Some(heartbit::TaskState::Running),
-        "completed" => Some(heartbit::TaskState::Completed),
-        "failed" => Some(heartbit::TaskState::Failed),
-        "cancelled" => Some(heartbit::TaskState::Cancelled),
-        _ => None,
     }
 }
 
@@ -1256,7 +1248,8 @@ pub async fn run_daemon(
                              trust_level: Option<heartbit::TrustLevel>,
                              on_event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>,
                              user_id: Option<String>,
-                             tenant_id: Option<String>|
+                             tenant_id: Option<String>,
+                             user_roles: Vec<String>|
           -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<AgentOutput, HeartbitError>> + Send>,
     > {
@@ -1451,6 +1444,17 @@ pub async fn run_daemon(
 
             let effective_tools = user_tools.as_ref().unwrap_or(&tools);
 
+            // Compute role-gated shared memory write permission.
+            // If shared_write_roles is empty (default), all users can write (backward compat).
+            // Otherwise, only users with at least one matching role can write.
+            let allow_shared_write = config
+                .daemon
+                .as_ref()
+                .map(|d| &d.memory.shared_write_roles)
+                .is_none_or(|roles| {
+                    roles.is_empty() || user_roles.iter().any(|r| roles.contains(r))
+                });
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -1471,6 +1475,7 @@ pub async fn run_daemon(
                 None, // sensor tasks don't override store default
                 user_id.as_deref(),
                 tenant_id.as_deref(),
+                allow_shared_write,
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1780,6 +1785,7 @@ pub async fn run_daemon(
                     Some(heartbit::Confidentiality::Confidential), // Telegram DM memories are confidential
                     None, // no JWT user context for Telegram (uses Telegram user ID)
                     None, // no JWT tenant context for Telegram
+                    true, // Telegram users authenticate via Telegram, not JWT — no RBAC roles available
                 )
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -1955,6 +1961,8 @@ pub async fn run_daemon(
                         &outcome.source,
                         result,
                         outcome.story_id.as_deref(),
+                        outcome.user_id.as_deref(),
+                        outcome.tenant_id.as_deref(),
                     );
                     tokio::spawn(async move {
                         if let Err(e) = memory.store(entry).await {
@@ -2353,7 +2361,39 @@ async fn handle_ws_chat_send(
 
     // Build callbacks from connection-level bridge
     let on_text = bridge.make_on_text(session_id);
-    let on_event = bridge.make_on_event(session_id);
+    let base_on_event = bridge.make_on_event(session_id);
+    // Wrap on_event to transition task state when HITL approval is requested/resolved.
+    // ApprovalRequested → InputRequired (agent is waiting for human input)
+    // ApprovalDecision  → Running      (human responded, agent resumes)
+    let hitl_handle = state.handle.clone();
+    let on_event: Arc<heartbit::OnEvent> = Arc::new(move |event: AgentEvent| {
+        match &event {
+            AgentEvent::ApprovalRequested { .. } => {
+                if let Err(e) = hitl_handle.update_task(task_id, &|t| {
+                    t.state = heartbit::TaskState::InputRequired;
+                }) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to set task state to InputRequired on HITL approval request"
+                    );
+                }
+            }
+            AgentEvent::ApprovalDecision { .. } => {
+                if let Err(e) = hitl_handle.update_task(task_id, &|t| {
+                    t.state = heartbit::TaskState::Running;
+                }) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to restore task state to Running after HITL approval decision"
+                    );
+                }
+            }
+            _ => {}
+        }
+        base_on_event(event);
+    });
     let on_approval = bridge.make_on_approval(session_id);
     let on_question = bridge.make_on_question(session_id);
 
@@ -2368,8 +2408,12 @@ async fn handle_ws_chat_send(
     let ws_workspace = state.workspace_dir.clone();
     let ws_todo = state.todo_store.clone();
     let ws_handle = state.handle.clone();
-    let ws_user_id = user_context.map(|c| c.user_id.clone());
-    let ws_tenant_id = user_context.map(|c| c.tenant_id.clone());
+    let ws_user_id = user_context.as_ref().map(|c| c.user_id.clone());
+    let ws_tenant_id = user_context.as_ref().map(|c| c.tenant_id.clone());
+    let ws_roles: Vec<String> = user_context
+        .as_ref()
+        .map(|c| c.roles.clone())
+        .unwrap_or_default();
     // Stash raw JWT for per-user token exchange (mirrors HTTP submit handler)
     if let Some(ctx) = user_context
         && let Some(ref token) = ctx.raw_token
@@ -2490,6 +2534,7 @@ async fn handle_ws_chat_send(
             "ws",
             ws_user_id.as_deref(),
             ws_tenant_id.as_deref(),
+            &ws_roles,
         )
         .await;
 
@@ -2752,6 +2797,7 @@ async fn run_interactive_task(
     source: &str,
     user_id: Option<&str>,
     tenant_id: Option<&str>,
+    user_roles: &[String],
 ) -> std::result::Result<AgentOutput, HeartbitError> {
     let on_retry = build_on_retry(&params.on_event);
     let provider = build_provider_from_config(config, Some(on_retry))
@@ -2783,6 +2829,13 @@ async fn run_interactive_task(
             None,      // no memory default confidentiality for interactive sessions
             user_id,   // JWT user context for multi-tenant isolation
             tenant_id, // JWT tenant context for multi-tenant isolation
+            config
+                .daemon
+                .as_ref()
+                .map(|d| &d.memory.shared_write_roles)
+                .is_none_or(|roles| {
+                    roles.is_empty() || user_roles.iter().any(|r| roles.contains(r))
+                }),
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }
@@ -2852,6 +2905,8 @@ fn build_institutional_entry(
     source: &str,
     result: &str,
     story_id: Option<&str>,
+    user_id: Option<&str>,
+    tenant_id: Option<&str>,
 ) -> heartbit::MemoryEntry {
     // Truncate long results to 2000 chars
     let content = if result.len() > 2000 {
@@ -2887,6 +2942,8 @@ fn build_institutional_entry(
         source_ids: Vec::new(),
         embedding: None,
         confidentiality: heartbit::Confidentiality::Internal,
+        author_user_id: user_id.map(String::from),
+        author_tenant_id: tenant_id.map(String::from),
     }
 }
 
@@ -3059,7 +3116,7 @@ mod institutional_memory_tests {
     #[test]
     fn build_institutional_entry_empty_result_produces_empty_content() {
         let id = uuid::Uuid::new_v4();
-        let entry = build_institutional_entry(&id, "api", "", None);
+        let entry = build_institutional_entry(&id, "api", "", None, None, None);
         assert!(entry.content.is_empty());
         // The on_complete guard (result.is_empty()) prevents this from being stored,
         // but verify the builder doesn't panic on empty input.
@@ -3068,7 +3125,8 @@ mod institutional_memory_tests {
     #[test]
     fn build_institutional_entry_basic() {
         let id = uuid::Uuid::nil();
-        let entry = build_institutional_entry(&id, "sensor:rss", "Some analysis result", None);
+        let entry =
+            build_institutional_entry(&id, "sensor:rss", "Some analysis result", None, None, None);
 
         assert_eq!(entry.id, format!("institutional:{}", uuid::Uuid::nil()));
         assert_eq!(entry.agent, "institutional");
@@ -3086,7 +3144,14 @@ mod institutional_memory_tests {
     #[test]
     fn build_institutional_entry_with_story_id() {
         let id = uuid::Uuid::new_v4();
-        let entry = build_institutional_entry(&id, "sensor:rss", "Result text", Some("story-abc"));
+        let entry = build_institutional_entry(
+            &id,
+            "sensor:rss",
+            "Result text",
+            Some("story-abc"),
+            None,
+            None,
+        );
 
         assert!(entry.tags.contains(&"story-abc".to_string()));
         assert!(entry.summary.as_ref().unwrap().contains("story-abc"));
@@ -3096,7 +3161,7 @@ mod institutional_memory_tests {
     fn build_institutional_entry_truncates_long_result() {
         let long_result = "x".repeat(5000);
         let id = uuid::Uuid::new_v4();
-        let entry = build_institutional_entry(&id, "api", &long_result, None);
+        let entry = build_institutional_entry(&id, "api", &long_result, None, None, None);
 
         assert!(
             entry.content.len() <= 2000,
@@ -3108,8 +3173,8 @@ mod institutional_memory_tests {
     #[test]
     fn build_institutional_entry_idempotent_id() {
         let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let entry1 = build_institutional_entry(&id, "api", "result", None);
-        let entry2 = build_institutional_entry(&id, "api", "result", None);
+        let entry1 = build_institutional_entry(&id, "api", "result", None, None, None);
+        let entry2 = build_institutional_entry(&id, "api", "result", None, None, None);
 
         assert_eq!(
             entry1.id, entry2.id,
@@ -3131,6 +3196,8 @@ mod institutional_memory_tests {
             "sensor:rss",
             "Analysis: Claude 4.6 has new features",
             Some("story-123"),
+            None,
+            None,
         );
 
         memory.store(entry).await.unwrap();

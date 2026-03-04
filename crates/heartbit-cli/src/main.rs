@@ -658,6 +658,7 @@ async fn run_from_config(
         None,   // no memory default confidentiality in CLI run mode
         None,   // no audit user context in CLI run mode
         None,   // no audit tenant context in CLI run mode
+        true,   // no role restrictions in CLI run mode
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -746,8 +747,18 @@ pub(crate) async fn build_orchestrator_from_config(
     memory_default_confidentiality: Option<heartbit::Confidentiality>,
     audit_user_id: Option<&str>,
     audit_tenant_id: Option<&str>,
+    allow_shared_write: bool,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
+
+    // ── User identity context for system prompt ──
+    // When user context is present, append identity block so the agent knows who it serves.
+    let user_context_suffix = match (audit_user_id, audit_tenant_id) {
+        (Some(uid), Some(tid)) => Some(format!(
+            "\n---\nYou are operating on behalf of **{uid}** in organization **{tid}**.\nKeep this user's information private. Do not share their data with other users."
+        )),
+        _ => None,
+    };
 
     // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
     let builtins = {
@@ -932,9 +943,14 @@ pub(crate) async fn build_orchestrator_from_config(
         let max_tokens = agent.max_tokens.unwrap_or(config.orchestrator.max_tokens);
 
         let agent_provider_for_judge = Arc::clone(&agent_provider);
+        let system_prompt = if let Some(ref suffix) = user_context_suffix {
+            format!("{}{suffix}", agent.system_prompt)
+        } else {
+            agent.system_prompt.clone()
+        };
         let mut rb = AgentRunner::builder(agent_provider)
             .name(&agent.name)
-            .system_prompt(&agent.system_prompt)
+            .system_prompt(&system_prompt)
             .tools(tools)
             .max_turns(max_turns)
             .max_tokens(max_tokens)
@@ -1210,7 +1226,8 @@ pub(crate) async fn build_orchestrator_from_config(
         .max_turns(config.orchestrator.max_turns)
         .max_tokens(config.orchestrator.max_tokens)
         .on_text(on_text)
-        .observability_mode(observability_mode);
+        .observability_mode(observability_mode)
+        .allow_shared_write(allow_shared_write);
 
     // Wire audit user context and delegation chain for multi-tenant enrichment
     if let Some(uid) = audit_user_id
@@ -1354,7 +1371,11 @@ pub(crate) async fn build_orchestrator_from_config(
         builder = builder.sub_agent_full(SubAgentConfig {
             name: agent.name.clone(),
             description: agent.description.clone(),
-            system_prompt: agent.system_prompt.clone(),
+            system_prompt: if let Some(ref suffix) = user_context_suffix {
+                format!("{}{suffix}", agent.system_prompt)
+            } else {
+                agent.system_prompt.clone()
+            },
             tools,
             context_strategy: ctx_strategy,
             summarize_threshold,

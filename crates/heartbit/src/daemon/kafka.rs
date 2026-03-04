@@ -377,6 +377,7 @@ mod tests {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let payload = serde_json::to_vec(&cmd).expect("serialize");
 
@@ -501,6 +502,7 @@ mod tests {
             heartbit_pulse: None,
             auth: None,
             owner_emails: vec![],
+            memory: crate::config::DaemonMemoryConfig::default(),
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
@@ -557,7 +559,8 @@ mod tests {
             dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
         >,
                                  _user_id: Option<String>,
-                                 _tenant_id: Option<String>| {
+                                 _tenant_id: Option<String>,
+                                 _roles: Vec<String>| {
             let tx = runner_tx.clone();
             async move {
                 let _ = tx.send(task).await;

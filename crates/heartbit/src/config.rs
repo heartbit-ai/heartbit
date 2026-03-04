@@ -1066,6 +1066,24 @@ pub struct DaemonConfig {
     /// Email addresses of the system owner (for trust resolution).
     #[serde(default)]
     pub owner_emails: Vec<String>,
+    /// Memory access control configuration.
+    #[serde(default)]
+    pub memory: DaemonMemoryConfig,
+}
+
+/// Memory access control configuration for the daemon.
+///
+/// Controls which users can write to shared institutional memory.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DaemonMemoryConfig {
+    /// Roles that are allowed to write to shared institutional memory.
+    ///
+    /// When empty (the default), all users can write — backward compatible.
+    /// When non-empty, only users with at least one of these roles can write.
+    ///
+    /// Example: `["admin", "knowledge_manager"]`
+    #[serde(default)]
+    pub shared_write_roles: Vec<String>,
 }
 
 /// HTTP API authentication configuration for the daemon.

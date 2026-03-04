@@ -1526,6 +1526,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                         source_ids: vec![],
                         embedding: None,
                         confidentiality: crate::memory::Confidentiality::default(),
+                        author_user_id: None,
+                        author_tenant_id: None,
                     };
                     if let Err(e) = memory.store(entry).await {
                         tracing::warn!(

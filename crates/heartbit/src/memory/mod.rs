@@ -92,6 +92,12 @@ pub struct MemoryEntry {
     /// Access classification — controls which trust levels may read this entry.
     #[serde(default)]
     pub confidentiality: Confidentiality,
+    /// User ID of the agent/user who authored this entry (multi-tenant authorship).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_user_id: Option<String>,
+    /// Tenant ID of the agent/user who authored this entry (multi-tenant authorship).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_tenant_id: Option<String>,
 }
 
 pub(crate) fn default_importance() -> u8 {
@@ -216,6 +222,8 @@ mod tests {
             source_ids: vec![],
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         }
     }
 
@@ -239,6 +247,8 @@ mod tests {
             source_ids: vec![],
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: MemoryEntry = serde_json::from_str(&json).unwrap();
@@ -268,6 +278,8 @@ mod tests {
             source_ids: vec!["m0".into()],
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: MemoryEntry = serde_json::from_str(&json).unwrap();
@@ -394,6 +406,8 @@ mod tests {
             source_ids: vec![],
             embedding: Some(vec![0.1, 0.2, 0.3]),
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"embedding\""));

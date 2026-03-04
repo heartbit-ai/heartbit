@@ -149,6 +149,8 @@ impl Tool for MemoryStoreTool {
                 source_ids: vec![],
                 embedding: None,
                 confidentiality: input.confidentiality,
+                author_user_id: None,
+                author_tenant_id: None,
             };
 
             let importance = entry.importance;
@@ -540,6 +542,8 @@ impl Tool for MemoryConsolidateTool {
                 source_ids: input.source_ids.clone(),
                 embedding: None,
                 confidentiality: max_confidentiality,
+                author_user_id: None,
+                author_tenant_id: None,
             };
 
             self.memory.store(entry).await?;

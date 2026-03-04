@@ -635,6 +635,8 @@ mod tests {
             source_ids: Vec::new(),
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         ns.store(entry).await.unwrap();
 
@@ -842,6 +844,8 @@ mod tests {
             source_ids: Vec::new(),
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         ns.store(entry).await.unwrap();
 
@@ -896,6 +900,8 @@ mod tests {
                 source_ids: Vec::new(),
                 embedding: None,
                 confidentiality: Confidentiality::default(),
+                author_user_id: None,
+                author_tenant_id: None,
             };
             ns.store(entry).await.unwrap();
         }
@@ -948,6 +954,8 @@ mod tests {
             source_ids: Vec::new(),
             embedding: None,
             confidentiality: Confidentiality::default(),
+            author_user_id: None,
+            author_tenant_id: None,
         };
         user_ns.store(user_entry).await.unwrap();
 
@@ -971,6 +979,8 @@ mod tests {
             source_ids: Vec::new(),
             embedding: None,
             confidentiality: Confidentiality::Internal,
+            author_user_id: None,
+            author_tenant_id: None,
         };
         inst_ns.store(inst_entry).await.unwrap();
 
@@ -1026,6 +1036,8 @@ mod tests {
             source_ids: Vec::new(),
             embedding: None,
             confidentiality: Confidentiality::Confidential,
+            author_user_id: None,
+            author_tenant_id: None,
         };
         other_ns.store(entry).await.unwrap();
 

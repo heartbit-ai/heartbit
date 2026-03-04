@@ -682,6 +682,15 @@ let summary = runner.run(agent).await?;
 println!("Pass rate: {:.0}%", summary.pass_rate * 100.0);
 ```
 
+### Protocol Coverage
+
+| Protocol | Version | Coverage | Notes |
+|----------|---------|----------|-------|
+| MCP client | 2025-11-25 | Tools only | `tools/list` + `tools/call` over Streamable HTTP and stdio. Resources, Prompts, and Sampling are not implemented. |
+| A2A | 0.2.x | Agent card + 8-state task lifecycle | `pending`, `working`, `completed`, `failed`, `canceled`, `input_required`, `auth_required`, `rejected`. Push notifications not yet supported. |
+| RFC 8693 | stable | Token exchange for MCP OBO | `TokenExchangeAuthProvider` exchanges user JWT for per-user MCP credentials. |
+| RFC 9449 (DPoP) | stable | Not implemented | Bearer tokens only. Sender-constrained tokens are a future hardening item. |
+
 ### Audit Trail
 
 `AuditTrail` logs agent decisions, tool calls, and guardrail outcomes. `InMemoryAuditTrail` for development, `PostgresAuditTrail` for production persistence. In multi-tenant mode, audit records include `user_id`, `tenant_id`, and `delegation_chain` (RFC 8693 actor chain) for full provenance tracking.

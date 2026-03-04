@@ -51,6 +51,7 @@ impl DaemonHandle {
             trust_level: None,
             user_id: None,
             tenant_id: None,
+            roles: vec![],
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -100,6 +101,7 @@ impl DaemonHandle {
             trust_level: None,
             user_id: Some(user_context.user_id.clone()),
             tenant_id: Some(user_context.tenant_id.clone()),
+            roles: user_context.roles.clone(),
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -276,6 +278,7 @@ impl DaemonCore {
                 Arc<dyn Fn(AgentEvent) + Send + Sync>,
                 Option<String>, // user_id
                 Option<String>, // tenant_id
+                Vec<String>,    // roles
             ) -> Fut
             + Send
             + Sync
@@ -320,7 +323,7 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id } => {
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles } => {
                             // Re-insert task if missing (e.g. after restart with message replay)
                             if let Ok(None) = self.store.get(id) {
                                 if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
@@ -376,6 +379,8 @@ impl DaemonCore {
                             let build_runner = build_runner.clone();
                             let on_complete = on_complete.clone();
                             let outcome_story_id = story_id.clone();
+                            let outcome_user_id = user_id.clone();
+                            let outcome_tenant_id = tenant_id.clone();
 
                             self.active_tasks.spawn(async move {
                                 store
@@ -386,7 +391,7 @@ impl DaemonCore {
                                     .ok();
 
                                 let start = std::time::Instant::now();
-                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event, user_id, tenant_id);
+                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event, user_id, tenant_id, roles);
                                 tokio::select! {
                                     result = runner => {
                                         let duration_secs = start.elapsed().as_secs_f64();
@@ -416,6 +421,8 @@ impl DaemonCore {
                                                         tokens,
                                                         cost,
                                                         story_id: outcome_story_id.clone(),
+                                                        user_id: outcome_user_id.clone(),
+                                                        tenant_id: outcome_tenant_id.clone(),
                                                     });
                                                 }
                                             }
@@ -439,6 +446,8 @@ impl DaemonCore {
                                                         tokens: Default::default(),
                                                         cost: None,
                                                         story_id: outcome_story_id.clone(),
+                                                        user_id: outcome_user_id.clone(),
+                                                        tenant_id: outcome_tenant_id.clone(),
                                                     });
                                                 }
                                             }
@@ -462,6 +471,8 @@ impl DaemonCore {
                                                 tokens: Default::default(),
                                                 cost: None,
                                                 story_id: outcome_story_id.clone(),
+                                                user_id: outcome_user_id.clone(),
+                                                tenant_id: outcome_tenant_id,
                                             });
                                         }
                                     }
@@ -538,6 +549,7 @@ mod tests {
             heartbit_pulse: None,
             auth: None,
             owner_emails: vec![],
+            memory: crate::config::DaemonMemoryConfig::default(),
         }
     }
 
@@ -757,8 +769,14 @@ mod tests {
         assert_eq!(stats.active_tasks, 1);
         assert_eq!(stats.tasks_by_source.get("api"), Some(&2));
         assert_eq!(stats.tasks_by_source.get("telegram"), Some(&1));
-        assert_eq!(stats.tasks_by_state.get("running"), Some(&1));
-        assert_eq!(stats.tasks_by_state.get("completed"), Some(&1));
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Running.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            stats.tasks_by_state.get(TaskState::Completed.as_str()),
+            Some(&1)
+        );
         assert_eq!(stats.total_input_tokens, 100);
         assert!((stats.total_estimated_cost_usd - 0.01).abs() < 1e-9);
     }
