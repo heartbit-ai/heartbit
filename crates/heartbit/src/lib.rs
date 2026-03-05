@@ -1,3 +1,67 @@
+//! # Heartbit
+//!
+//! Multi-agent enterprise runtime with LLM orchestration, MCP tools, and durable execution.
+//!
+//! Heartbit provides a complete framework for building LLM-powered agents in Rust:
+//! an orchestrator that dispatches tasks to sub-agents, each running a ReAct loop
+//! with parallel tool execution via `tokio::JoinSet`. Three execution paths cover
+//! different deployment needs: standalone (zero infra), durable (Restate SDK), and
+//! daemon (Kafka-backed with HTTP API).
+//!
+//! ## Feature Flags
+//!
+//! | Feature | What it enables |
+//! |---------|-----------------|
+//! | `core` (default) | Agent runner, orchestrator, LLM providers, tools, memory, config |
+//! | `kafka` | Kafka consumer/producer |
+//! | `daemon` | Daemon with HTTP API, cron scheduling, metrics |
+//! | `sensor` | 7 sensor sources, triage pipeline, story correlation |
+//! | `restate` | Durable workflow execution via Restate SDK 0.8 |
+//! | `postgres` | PostgreSQL-backed memory and task store (pgvector) |
+//! | `a2a` | Agent-to-Agent protocol |
+//! | `telegram` | Telegram bot adapter |
+//! | `local-embedding` | Local ONNX embeddings via fastembed (no API keys) |
+//! | `full` | All of the above (except `local-embedding`) |
+//!
+//! ## Quick Start
+//!
+//! ```rust,no_run
+//! use std::sync::Arc;
+//! use heartbit::{
+//!     AnthropicProvider, BoxedProvider, RetryingProvider,
+//!     AgentRunner,
+//! };
+//!
+//! # async fn run() -> Result<(), heartbit::Error> {
+//! let provider = Arc::new(BoxedProvider::new(
+//!     RetryingProvider::with_defaults(
+//!         AnthropicProvider::new("sk-...", "claude-sonnet-4-20250514")
+//!     )
+//! ));
+//!
+//! let mut agent = AgentRunner::builder(provider)
+//!     .system_prompt("You are a helpful assistant.")
+//!     .on_text(Arc::new(|text| print!("{text}")))
+//!     .build()?;
+//!
+//! let output = agent.execute("What is Rust?").await?;
+//! println!("Tokens: {} in / {} out",
+//!     output.tokens_used.input_tokens,
+//!     output.tokens_used.output_tokens);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Key Types
+//!
+//! - [`AgentRunner`] / [`AgentRunnerBuilder`] — single agent ReAct loop
+//! - [`Orchestrator`] / [`OrchestratorBuilder`] — multi-agent dispatch
+//! - [`AnthropicProvider`] / [`OpenRouterProvider`] — LLM backends
+//! - [`Tool`] — trait for agent-callable tools
+//! - [`Memory`] / [`InMemoryStore`] — persistent agent memory
+//! - [`Guardrail`] — pre/post LLM and tool hooks
+//! - [`EvalRunner`] / [`EvalCase`] — evaluation framework
+
 // --- Core modules (always available) ---
 pub mod agent;
 pub mod channel;

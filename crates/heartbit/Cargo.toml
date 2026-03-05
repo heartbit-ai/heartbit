@@ -7,8 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Multi-agent runtime with LLM orchestration, MCP tools, and durable execution"
+readme = "../../README.md"
 keywords = ["agent", "llm", "mcp", "orchestration", "ai"]
-categories = ["command-line-utilities", "web-programming"]
+categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 # --- Core (always available) ---

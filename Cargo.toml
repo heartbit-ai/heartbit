@@ -8,6 +8,7 @@ authors = ["Pascal Le Clech <pascal@heartbit.ai>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/heartbit-ai/heartbit"
 homepage = "https://github.com/heartbit-ai/heartbit"
+documentation = "https://docs.rs/heartbit"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
