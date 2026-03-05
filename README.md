@@ -16,8 +16,6 @@ Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that exec
 - **Built-in eval framework** — trajectory scoring, keyword matching, and similarity scoring for agent behavior testing
 - **Built-in integrations** — Telegram bot, Google Workspace (JMAP email), RSS, webhooks, and more via sensor pipeline
 
-> **Not an OpenClaw fork or clone.** Heartbit is an independent project built from scratch. It shares no code, architecture, or lineage with [OpenClaw](https://github.com/anthropics/openclaw) or any other agent framework. Different design goals, different codebase.
-
 > **Early-stage software — capability over security.** Heartbit prioritizes **capability and velocity** at this stage of development. Security hardening is ongoing but not yet comprehensive. Agents execute tools (including shell commands) with the permissions of the host process. **Do not run untrusted workloads in production environments without your own sandboxing and access controls.** See [Disclaimer](#disclaimer) below.
 
 ## Architecture Overview
