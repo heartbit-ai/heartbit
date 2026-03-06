@@ -13,10 +13,14 @@ Multi-agent enterprise runtime in Rust. Orchestrator spawns sub-agents that exec
 - **Zero-copy agent loops** — ReAct cycle in pure Rust, no Python/Node overhead
 - **Three execution paths** — standalone (zero infra), durable (Restate), daemon (Kafka)
 - **Flat agent hierarchy** — orchestrator delegates to sub-agents, sub-agents never spawn further
+- **8 orchestration patterns** — Sequential, Parallel, Loop, Debate, Voting, Mixture-of-Agents, DAG, Batch
 - **Parallel tool execution** — `tokio::JoinSet` runs tools concurrently within each turn
-- **Production-grade** — 8 guardrails, context management, MemGPT-style memory, cost tracking, OpenTelemetry
+- **Production-grade** — 8 guardrails, workspace jailing, permission system, context management, MemGPT-style memory, cost tracking, OpenTelemetry
+- **Smart context optimization** — ToolProfile-based filtering, recursive summarization, response caching, auto-compaction
+- **Reasoning & structured output** — extended thinking, reflection prompts, `__respond__` tool for schema-validated output
 - **Local-first embeddings** — offline semantic search via ONNX Runtime (fastembed), no API keys required
-- **Built-in eval framework** — trajectory scoring, keyword matching, and similarity scoring for agent behavior testing
+- **Built-in eval framework** — 7 scorers (trajectory, keyword, similarity, cost, latency, tool count, safety) + A/B comparison
+- **25 observable events** — streaming event system with OpenTelemetry, TTFT tracking, observability modes
 - **Built-in integrations** — Telegram bot, Google Workspace (JMAP email), RSS, webhooks, and more via sensor pipeline
 
 > **Early-stage software — capability over security.** Heartbit prioritizes **capability and velocity** at this stage of development. Security hardening is ongoing but not yet comprehensive. Agents execute tools (including shell commands) with the permissions of the host process. **Do not run untrusted workloads in production environments without your own sandboxing and access controls.** See [Disclaimer](#disclaimer) below.
@@ -149,6 +153,9 @@ Providers compose via wrapping:
 - **`CascadingProvider`** — tries cheaper models first, escalates on gate rejection
 - **`RetryingProvider`** — exponential backoff on 429/500/502/503/529
 - **`AnthropicProvider`** / **`OpenRouterProvider`** — SSE streaming, prompt caching
+- **Reasoning mode** — extended thinking with configurable `ReasoningEffort` (low/medium/high) and token budgets
+- **Reflection** — automatic self-critique prompts for improved response quality
+- **Structured output** — `__respond__` tool injection with JSON schema validation
 
 </details>
 
@@ -162,6 +169,7 @@ MemGPT-inspired memory with composite recall scoring and hybrid retrieval.
 - **Recall**: BM25 + Park et al. composite + optional vector cosine (hybrid RRF)
 - **Decay**: Ebbinghaus strength decay (~6-day half-life)
 - **Local embeddings**: offline ONNX (fastembed), no API keys needed
+- **Institutional memory**: 3-tier namespace (user/agent/session), cross-context knowledge bridge, role-gated shared writes
 
 See [docs/memory.md](docs/memory.md) for full details.
 
@@ -181,7 +189,8 @@ Built-in: `ContentFenceGuardrail`, `InjectionClassifierGuardrail`, `PiiGuardrail
 
 - **Unlimited** — no trimming (default)
 - **SlidingWindow** — keep system + recent messages within token budget
-- **Summarize** — LLM-generated summary when context exceeds threshold
+- **Summarize** — LLM-generated summary when context exceeds threshold, recursive summarization for long conversations
+- **ToolProfile** — Conversational/Standard/Full query classification to reduce input tokens
 - Auto-compaction on context overflow, doom loop detection, tool name repair
 
 </details>
@@ -189,22 +198,33 @@ Built-in: `ContentFenceGuardrail`, `InjectionClassifierGuardrail`, `PiiGuardrail
 <details>
 <summary><strong>Workflow Agents (Deterministic)</strong></summary>
 
-Three workflow agent types for pipelines without LLM cost:
+Eight orchestration patterns — three simple, five advanced:
 
 - `SequentialAgent` — chains output → input across agents
 - `ParallelAgent` — concurrent execution via `tokio::JoinSet`
 - `LoopAgent` — repeats until stop condition or max iterations
+- `DebateAgent` — multi-round debate between agents with a judge that picks the winner
+- `VotingAgent` — parallel proposals with configurable majority vote and tie-breaking
+- `MixtureOfAgentsAgent` — proposer → synthesizer layers (Mixture-of-Agents pattern)
+- `DagAgent` — directed acyclic graph with conditional edges and transforms (petgraph)
+- `BatchExecutor` — semaphore-controlled concurrent batch processing
 
 </details>
 
 <details>
 <summary><strong>Eval Framework</strong></summary>
 
-Built-in evaluation for testing agent behavior:
+Built-in evaluation for testing agent behavior with 7 scorers:
 
 - `TrajectoryScorer` — tool call sequence matching
 - `KeywordScorer` — output keyword checking
 - `SimilarityScorer` — cosine similarity to reference
+- `CostScorer` — token cost budget enforcement
+- `LatencyScorer` — execution time budget enforcement
+- `ToolCallCountScorer` — tool call count budget enforcement
+- `SafetyScorer` — guardrail violation detection
+
+Plus `EvalComparison` for A/B regression testing between agent versions. All types derive `Serialize` for JSON reports.
 
 See [docs/eval.md](docs/eval.md) for full details.
 
@@ -234,6 +254,49 @@ See [docs/sensors.md](docs/sensors.md) for full details.
 Crash-resilient workflows via Restate SDK 0.8: durable ReAct loops, exactly-once tool execution, token budget tracking, circuit breaker.
 
 See [docs/restate.md](docs/restate.md) for full details.
+
+</details>
+
+<details>
+<summary><strong>Response Caching</strong></summary>
+
+LRU response cache with FNV-1a hash keys. Cache key computed from system prompt + messages + sorted tool names. Reduces cost and latency for repeated or similar queries.
+
+```rust
+use heartbit::ResponseCache;
+
+let cache = ResponseCache::new(128); // 128-entry LRU
+let mut agent = AgentRunner::builder(provider)
+    .response_cache(cache)
+    .build()?;
+```
+
+</details>
+
+<details>
+<summary><strong>Workspace Jailing</strong></summary>
+
+Filesystem boundary enforcement at the tool layer. All 8 filesystem built-in tools validate paths through `resolve_path()` — rejects absolute paths, prevents `../` escapes, blocks symlink traversal.
+
+```rust
+let mut agent = AgentRunner::builder(provider)
+    .allowed_dirs(vec!["/home/user/project".into()])
+    .build()?;
+```
+
+</details>
+
+<details>
+<summary><strong>Permission System</strong></summary>
+
+Human-in-the-loop approval with persistent learned rules. `PermissionRuleset` uses first-match-wins with glob patterns. `ApprovalDecision` supports Allow, Deny, AlwaysAllow, and AlwaysDeny — the latter two persist rules to disk for future sessions.
+
+</details>
+
+<details>
+<summary><strong>Observability</strong></summary>
+
+25 `AgentEvent` variants across 5 categories (lifecycle, LLM, tool, guardrail, orchestration). Streaming via `OnEvent` callback, JSON output with `--verbose`, OpenTelemetry OTLP export, TTFT tracking, payload truncation (64KB).
 
 </details>
 
@@ -280,8 +343,9 @@ Building from source requires: Rust stable, cmake, libssl-dev, pkg-config (for r
 | `postgres` | `sqlx`, `pgvector` | PostgreSQL memory + task store |
 | `a2a` | `a2a-sdk` | Agent-to-Agent protocol |
 | `telegram` | `teloxide` | Telegram bot |
+| `macro` | `heartbit-macro` | `#[tool]` proc-macro for deriving Tool trait |
 | `local-embedding` | `fastembed` | Local ONNX embeddings (no API keys) |
-| `full` | all above (except `local-embedding`) | Everything |
+| `full` | all above (except `local-embedding`, `macro`) | Everything |
 
 ## Configuration
 
@@ -338,6 +402,8 @@ heartbit <task>                  # shorthand for 'run'
 | RFC 8693 | stable | Token exchange for MCP on-behalf-of |
 
 ## Documentation
+
+Full documentation is available at **[heartbit.ai](https://heartbit.ai)**.
 
 | Guide | Description |
 |-------|-------------|
