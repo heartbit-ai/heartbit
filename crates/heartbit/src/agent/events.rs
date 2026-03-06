@@ -235,6 +235,15 @@ pub enum AgentEvent {
         partial_usage: TokenUsage,
     },
 
+    /// A dynamic agent was spawned at runtime by the orchestrator.
+    AgentSpawned {
+        agent: String,
+        spawned_name: String,
+        tools: Vec<String>,
+        #[serde(default)]
+        task: String,
+    },
+
     /// Task was routed to single-agent or orchestrator by the complexity analyzer.
     TaskRouted {
         /// "single_agent" or "orchestrate"
@@ -505,6 +514,12 @@ mod tests {
                 used: 150000,
                 limit: 100000,
                 partial_usage: TokenUsage::default(),
+            },
+            AgentEvent::AgentSpawned {
+                agent: "orchestrator".into(),
+                spawned_name: "spawn:tax_specialist".into(),
+                tools: vec!["read".into(), "grep".into()],
+                task: "analyze tax implications".into(),
             },
             AgentEvent::TaskRouted {
                 decision: "single_agent".into(),

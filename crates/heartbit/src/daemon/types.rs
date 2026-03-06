@@ -124,6 +124,9 @@ pub struct DaemonTask {
     /// Tenant ID for multi-tenant isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// The LLM model used for this task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
 }
 
 impl DaemonTask {
@@ -145,6 +148,7 @@ impl DaemonTask {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            model_name: None,
         }
     }
 
@@ -197,6 +201,63 @@ pub struct TaskStats {
     pub total_cache_read_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_estimated_cost_usd: f64,
+}
+
+/// Query parameters for usage statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageQuery {
+    /// Start of time range (inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<DateTime<Utc>>,
+    /// End of time range (exclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Grouping dimension. `None` returns a single total row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<UsageGroupBy>,
+}
+
+/// Dimension for grouping usage statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageGroupBy {
+    Agent,
+    Model,
+    User,
+    Tenant,
+    Source,
+    Day,
+}
+
+/// One row of aggregated usage statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageRow {
+    /// The group key value (e.g. model name, date string). `None` for ungrouped totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
+    pub task_count: u64,
+    pub completed_count: u64,
+    pub failed_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub tool_calls: u64,
+    pub estimated_cost_usd: f64,
+    /// Average task duration in seconds (completed tasks only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_duration_secs: Option<f64>,
 }
 
 #[cfg(test)]
@@ -403,6 +464,7 @@ mod tests {
         assert!(task.agent_name.is_none());
         assert!(task.user_id.is_none());
         assert!(task.tenant_id.is_none());
+        assert!(task.model_name.is_none());
     }
 
     #[test]
@@ -573,11 +635,34 @@ mod tests {
 
     #[test]
     fn daemon_task_backward_compat_no_user_fields() {
-        // Old JSON without user_id/tenant_id should deserialize with None
+        // Old JSON without user_id/tenant_id/model_name should deserialize with None
         let json = r#"{"id":"00000000-0000-0000-0000-000000000000","task":"test","state":"pending","created_at":"2026-01-01T00:00:00Z","tokens_used":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0},"tool_calls_made":0,"source":"api"}"#;
         let parsed: DaemonTask = serde_json::from_str(json).unwrap();
         assert!(parsed.user_id.is_none());
         assert!(parsed.tenant_id.is_none());
+        assert!(parsed.model_name.is_none());
+    }
+
+    #[test]
+    fn daemon_task_model_name_roundtrip() {
+        let id = Uuid::new_v4();
+        let mut task = DaemonTask::new(id, "test", "api");
+        task.model_name = Some("claude-sonnet-4-6-20250610".into());
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("model_name"));
+        assert!(json.contains("claude-sonnet-4-6-20250610"));
+        let parsed: DaemonTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.model_name.as_deref(),
+            Some("claude-sonnet-4-6-20250610")
+        );
+    }
+
+    #[test]
+    fn daemon_task_model_name_omitted_when_none() {
+        let task = DaemonTask::new(Uuid::nil(), "test", "api");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(!json.contains("model_name"));
     }
 
     #[test]
@@ -639,5 +724,85 @@ mod tests {
             }
             _ => panic!("expected SubmitTask"),
         }
+    }
+
+    // --- UsageQuery / UsageGroupBy / UsageRow tests ---
+
+    #[test]
+    fn usage_query_default_is_empty() {
+        let q = UsageQuery::default();
+        assert!(q.from.is_none());
+        assert!(q.to.is_none());
+        assert!(q.tenant_id.is_none());
+        assert!(q.group_by.is_none());
+    }
+
+    #[test]
+    fn usage_query_serde_roundtrip() {
+        let q = UsageQuery {
+            from: Some(Utc::now()),
+            group_by: Some(UsageGroupBy::Model),
+            model_name: Some("claude-sonnet-4-6-20250610".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        let parsed: UsageQuery = serde_json::from_str(&json).unwrap();
+        assert!(parsed.from.is_some());
+        assert_eq!(parsed.group_by, Some(UsageGroupBy::Model));
+        assert_eq!(
+            parsed.model_name.as_deref(),
+            Some("claude-sonnet-4-6-20250610")
+        );
+    }
+
+    #[test]
+    fn usage_group_by_serde_names() {
+        assert_eq!(
+            serde_json::to_string(&UsageGroupBy::Agent).unwrap(),
+            r#""agent""#
+        );
+        assert_eq!(
+            serde_json::to_string(&UsageGroupBy::Model).unwrap(),
+            r#""model""#
+        );
+        assert_eq!(
+            serde_json::to_string(&UsageGroupBy::User).unwrap(),
+            r#""user""#
+        );
+        assert_eq!(
+            serde_json::to_string(&UsageGroupBy::Day).unwrap(),
+            r#""day""#
+        );
+    }
+
+    #[test]
+    fn usage_row_default_is_zero() {
+        let row = UsageRow::default();
+        assert_eq!(row.task_count, 0);
+        assert_eq!(row.completed_count, 0);
+        assert_eq!(row.estimated_cost_usd, 0.0);
+        assert!(row.group_key.is_none());
+        assert!(row.avg_duration_secs.is_none());
+    }
+
+    #[test]
+    fn usage_row_serde_roundtrip() {
+        let row = UsageRow {
+            group_key: Some("claude-sonnet-4-6-20250610".into()),
+            task_count: 10,
+            completed_count: 8,
+            failed_count: 2,
+            input_tokens: 5000,
+            output_tokens: 2000,
+            estimated_cost_usd: 1.23,
+            avg_duration_secs: Some(4.5),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        let parsed: UsageRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.task_count, 10);
+        assert_eq!(parsed.completed_count, 8);
+        assert_eq!(parsed.estimated_cost_usd, 1.23);
+        assert_eq!(parsed.avg_duration_secs, Some(4.5));
     }
 }

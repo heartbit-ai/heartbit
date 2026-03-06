@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use crate::error::Error;
@@ -15,6 +16,10 @@ use crate::llm::types::TokenUsage;
 
 use super::AgentOutput;
 use super::AgentRunner;
+use super::dag::DagAgent;
+use super::debate::DebateAgent;
+use super::mixture::MixtureOfAgentsAgent;
+use super::voting::VotingAgent;
 
 /// Termination condition for [`LoopAgent`]. Returns `true` to stop the loop.
 type StopCondition = Box<dyn Fn(&str) -> bool + Send + Sync>;
@@ -58,17 +63,11 @@ impl<P: LlmProvider> SequentialAgent<P> {
         let mut last_output: Option<AgentOutput> = None;
 
         for agent in &self.agents {
-            let result = agent.execute(&current_input).await.map_err(|e| {
-                // Accumulate partial usage from succeeded agents + error's own partial
-                let mut partial = total_usage;
-                partial += e.partial_usage();
-                e.with_partial_usage(partial)
-            })?;
-            total_usage += result.tokens_used;
-            total_tool_calls += result.tool_calls_made;
-            if let Some(cost) = result.estimated_cost_usd {
-                *total_cost.get_or_insert(0.0) += cost;
-            }
+            let result = agent
+                .execute(&current_input)
+                .await
+                .map_err(|e| e.accumulate_usage(total_usage))?;
+            result.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
             current_input = result.result.clone();
             last_output = Some(result);
         }
@@ -159,16 +158,8 @@ impl<P: LlmProvider + 'static> ParallelAgent<P> {
         while let Some(join_result) = set.join_next().await {
             let (name, agent_result) = join_result
                 .map_err(|e| Error::Agent(format!("parallel agent task panicked: {e}")))?;
-            let output = agent_result.map_err(|e| {
-                let mut partial = total_usage;
-                partial += e.partial_usage();
-                e.with_partial_usage(partial)
-            })?;
-            total_usage += output.tokens_used;
-            total_tool_calls += output.tool_calls_made;
-            if let Some(cost) = output.estimated_cost_usd {
-                *total_cost.get_or_insert(0.0) += cost;
-            }
+            let output = agent_result.map_err(|e| e.accumulate_usage(total_usage))?;
+            output.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
             results.push((name, output));
         }
 
@@ -187,6 +178,7 @@ impl<P: LlmProvider + 'static> ParallelAgent<P> {
             tokens_used: total_usage,
             structured: None,
             estimated_cost_usd: total_cost,
+            model_name: None,
         })
     }
 }
@@ -263,16 +255,12 @@ impl<P: LlmProvider> LoopAgent<P> {
         let mut last_output: Option<AgentOutput> = None;
 
         for _ in 0..self.max_iterations {
-            let result = self.agent.execute(&current_input).await.map_err(|e| {
-                let mut partial = total_usage;
-                partial += e.partial_usage();
-                e.with_partial_usage(partial)
-            })?;
-            total_usage += result.tokens_used;
-            total_tool_calls += result.tool_calls_made;
-            if let Some(cost) = result.estimated_cost_usd {
-                *total_cost.get_or_insert(0.0) += cost;
-            }
+            let result = self
+                .agent
+                .execute(&current_input)
+                .await
+                .map_err(|e| e.accumulate_usage(total_usage))?;
+            result.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
             current_input = result.result.clone();
             let should_stop = (self.should_stop)(&result.result);
             last_output = Some(result);
@@ -334,6 +322,121 @@ impl<P: LlmProvider> LoopAgentBuilder<P> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WorkflowType
+// ---------------------------------------------------------------------------
+
+/// Identifies which workflow pattern to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowType {
+    Sequential,
+    Parallel,
+    Loop,
+    Dag,
+    Debate,
+    Voting,
+    Mixture,
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowRouter
+// ---------------------------------------------------------------------------
+
+/// Routes execution to one of the workflow agent types.
+/// Allows config-driven workflow selection without hardcoding the type.
+pub enum WorkflowRouter<P: LlmProvider + 'static> {
+    Sequential(Box<SequentialAgent<P>>),
+    Parallel(Box<ParallelAgent<P>>),
+    Loop(Box<LoopAgent<P>>),
+    Dag(Box<DagAgent<P>>),
+    Debate(Box<DebateAgent<P>>),
+    Voting(Box<VotingAgent<P>>),
+    Mixture(Box<MixtureOfAgentsAgent<P>>),
+}
+
+impl<P: LlmProvider + 'static> WorkflowRouter<P> {
+    /// Execute the contained workflow agent.
+    ///
+    /// Note: `Voting` returns only the winning voter's `AgentOutput`; the
+    /// `VoteResult` metadata (winner string, tally) is discarded. Use
+    /// `VotingAgent::execute()` directly when you need the full result.
+    pub async fn execute(&self, task: &str) -> Result<AgentOutput, Error> {
+        match self {
+            Self::Sequential(a) => a.execute(task).await,
+            Self::Parallel(a) => a.execute(task).await,
+            Self::Loop(a) => a.execute(task).await,
+            Self::Dag(a) => a.execute(task).await,
+            Self::Debate(a) => a.execute(task).await,
+            Self::Mixture(a) => a.execute(task).await,
+            Self::Voting(a) => a.execute(task).await.map(|vr| vr.output),
+        }
+    }
+
+    /// Returns which workflow type this router contains.
+    pub fn workflow_type(&self) -> WorkflowType {
+        match self {
+            Self::Sequential(_) => WorkflowType::Sequential,
+            Self::Parallel(_) => WorkflowType::Parallel,
+            Self::Loop(_) => WorkflowType::Loop,
+            Self::Dag(_) => WorkflowType::Dag,
+            Self::Debate(_) => WorkflowType::Debate,
+            Self::Voting(_) => WorkflowType::Voting,
+            Self::Mixture(_) => WorkflowType::Mixture,
+        }
+    }
+}
+
+impl<P: LlmProvider + 'static> std::fmt::Debug for WorkflowRouter<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WorkflowRouter")
+            .field(&self.workflow_type())
+            .finish()
+    }
+}
+
+impl<P: LlmProvider + 'static> From<SequentialAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: SequentialAgent<P>) -> Self {
+        Self::Sequential(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<ParallelAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: ParallelAgent<P>) -> Self {
+        Self::Parallel(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<LoopAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: LoopAgent<P>) -> Self {
+        Self::Loop(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<DagAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: DagAgent<P>) -> Self {
+        Self::Dag(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<DebateAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: DebateAgent<P>) -> Self {
+        Self::Debate(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<VotingAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: VotingAgent<P>) -> Self {
+        Self::Voting(Box::new(agent))
+    }
+}
+
+impl<P: LlmProvider + 'static> From<MixtureOfAgentsAgent<P>> for WorkflowRouter<P> {
+    fn from(agent: MixtureOfAgentsAgent<P>) -> Self {
+        Self::Mixture(Box::new(agent))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -341,62 +444,7 @@ impl<P: LlmProvider> LoopAgentBuilder<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock, StopReason};
-    use std::sync::Mutex;
-
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
-
-    struct MockProvider {
-        responses: Mutex<Vec<CompletionResponse>>,
-    }
-
-    impl MockProvider {
-        fn new(responses: Vec<CompletionResponse>) -> Self {
-            Self {
-                responses: Mutex::new(responses),
-            }
-        }
-
-        fn text_response(text: &str, input_tokens: u32, output_tokens: u32) -> CompletionResponse {
-            CompletionResponse {
-                content: vec![ContentBlock::Text {
-                    text: text.to_string(),
-                }],
-                stop_reason: StopReason::EndTurn,
-                usage: TokenUsage {
-                    input_tokens,
-                    output_tokens,
-                    ..Default::default()
-                },
-                model: None,
-            }
-        }
-    }
-
-    impl LlmProvider for MockProvider {
-        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
-            let mut responses = self.responses.lock().expect("mock lock poisoned");
-            if responses.is_empty() {
-                return Err(Error::Agent("no more mock responses".into()));
-            }
-            Ok(responses.remove(0))
-        }
-
-        fn model_name(&self) -> Option<&str> {
-            Some("mock-model")
-        }
-    }
-
-    fn make_agent(provider: Arc<MockProvider>, name: &str) -> AgentRunner<MockProvider> {
-        AgentRunner::builder(provider)
-            .name(name)
-            .system_prompt("test system prompt")
-            .max_turns(1)
-            .build()
-            .expect("failed to build test agent")
-    }
+    use crate::agent::test_helpers::{MockProvider, make_agent};
 
     // -----------------------------------------------------------------------
     // SequentialAgent builder tests
@@ -841,5 +889,169 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![]));
         let agent = make_agent(provider, "test-agent");
         assert_eq!(agent.name(), "test-agent");
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkflowType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workflow_type_serde_roundtrip() {
+        for wt in [
+            WorkflowType::Sequential,
+            WorkflowType::Parallel,
+            WorkflowType::Loop,
+            WorkflowType::Dag,
+            WorkflowType::Debate,
+            WorkflowType::Voting,
+            WorkflowType::Mixture,
+        ] {
+            let json = serde_json::to_string(&wt).unwrap();
+            let back: WorkflowType = serde_json::from_str(&json).unwrap();
+            assert_eq!(wt, back);
+        }
+    }
+
+    #[test]
+    fn workflow_type_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Sequential).unwrap(),
+            "\"sequential\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Parallel).unwrap(),
+            "\"parallel\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Loop).unwrap(),
+            "\"loop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Dag).unwrap(),
+            "\"dag\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Debate).unwrap(),
+            "\"debate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Voting).unwrap(),
+            "\"voting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Mixture).unwrap(),
+            "\"mixture\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkflowRouter tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn router_sequential() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "seq-out", 10, 5,
+        )]));
+        let seq = SequentialAgent::builder()
+            .agent(make_agent(provider, "s"))
+            .build()
+            .unwrap();
+        let router = WorkflowRouter::Sequential(Box::new(seq));
+        assert_eq!(router.workflow_type(), WorkflowType::Sequential);
+        let output = router.execute("task").await.unwrap();
+        assert_eq!(output.result, "seq-out");
+    }
+
+    #[tokio::test]
+    async fn router_parallel() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "par-out", 10, 5,
+        )]));
+        let par = ParallelAgent::builder()
+            .agent(make_agent(provider, "p"))
+            .build()
+            .unwrap();
+        let router = WorkflowRouter::Parallel(Box::new(par));
+        assert_eq!(router.workflow_type(), WorkflowType::Parallel);
+        let output = router.execute("task").await.unwrap();
+        assert!(output.result.contains("par-out"));
+    }
+
+    #[tokio::test]
+    async fn router_loop() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "loop-out", 10, 5,
+        )]));
+        let lp = LoopAgent::builder()
+            .agent(make_agent(provider, "l"))
+            .max_iterations(1)
+            .should_stop(|_| true)
+            .build()
+            .unwrap();
+        let router = WorkflowRouter::Loop(Box::new(lp));
+        assert_eq!(router.workflow_type(), WorkflowType::Loop);
+        let output = router.execute("task").await.unwrap();
+        assert_eq!(output.result, "loop-out");
+    }
+
+    #[tokio::test]
+    async fn router_dag() {
+        use crate::agent::dag::DagAgent;
+
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "dag-out", 10, 5,
+        )]));
+        let dag = DagAgent::builder()
+            .node("A", make_agent(provider, "A"))
+            .build()
+            .unwrap();
+        let router = WorkflowRouter::Dag(Box::new(dag));
+        assert_eq!(router.workflow_type(), WorkflowType::Dag);
+        let output = router.execute("task").await.unwrap();
+        assert_eq!(output.result, "dag-out");
+    }
+
+    #[test]
+    fn router_from_sequential() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "x", 1, 1,
+        )]));
+        let seq = SequentialAgent::builder()
+            .agent(make_agent(provider, "s"))
+            .build()
+            .unwrap();
+        let router: WorkflowRouter<MockProvider> = seq.into();
+        assert_eq!(router.workflow_type(), WorkflowType::Sequential);
+    }
+
+    #[test]
+    fn router_from_dag() {
+        use crate::agent::dag::DagAgent;
+
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "x", 1, 1,
+        )]));
+        let dag = DagAgent::builder()
+            .node("A", make_agent(provider, "A"))
+            .build()
+            .unwrap();
+        let router: WorkflowRouter<MockProvider> = dag.into();
+        assert_eq!(router.workflow_type(), WorkflowType::Dag);
+    }
+
+    #[test]
+    fn router_debug() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "x", 1, 1,
+        )]));
+        let seq = SequentialAgent::builder()
+            .agent(make_agent(provider, "s"))
+            .build()
+            .unwrap();
+        let router = WorkflowRouter::Sequential(Box::new(seq));
+        let debug = format!("{router:?}");
+        assert!(debug.contains("WorkflowRouter"));
+        assert!(debug.contains("Sequential"));
     }
 }

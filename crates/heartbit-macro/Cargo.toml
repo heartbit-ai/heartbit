@@ -1,0 +1,15 @@
+[package]
+name = "heartbit-macro"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+description = "Proc macros for heartbit agent tools"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

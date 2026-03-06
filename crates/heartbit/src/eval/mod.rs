@@ -29,15 +29,18 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
+
 use crate::agent::events::AgentEvent;
 use crate::error::Error;
+use crate::llm::pricing::estimate_cost;
 
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
 
 /// A single evaluation test case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EvalCase {
     /// Human-readable name for the test case.
     pub name: String,
@@ -51,10 +54,19 @@ pub struct EvalCase {
     pub output_not_contains: Vec<String>,
     /// Optional reference output for similarity scoring.
     pub reference_output: Option<String>,
+    /// Maximum acceptable cost in USD for this case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    /// Maximum acceptable total LLM latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_latency_ms: Option<u64>,
+    /// Maximum acceptable number of tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
 }
 
 /// An expected tool call in a trajectory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExpectedToolCall {
     /// Tool name (exact match).
     pub name: String,
@@ -73,6 +85,9 @@ impl EvalCase {
             output_contains: Vec::new(),
             output_not_contains: Vec::new(),
             reference_output: None,
+            max_cost_usd: None,
+            max_latency_ms: None,
+            max_tool_calls: None,
         }
     }
 
@@ -121,10 +136,28 @@ impl EvalCase {
         self.reference_output = Some(text.into());
         self
     }
+
+    /// Set maximum acceptable cost in USD.
+    pub fn expect_max_cost_usd(mut self, max: f64) -> Self {
+        self.max_cost_usd = Some(max);
+        self
+    }
+
+    /// Set maximum acceptable total LLM latency in milliseconds.
+    pub fn expect_max_latency_ms(mut self, max: u64) -> Self {
+        self.max_latency_ms = Some(max);
+        self
+    }
+
+    /// Set maximum acceptable number of tool calls.
+    pub fn expect_max_tool_calls(mut self, max: usize) -> Self {
+        self.max_tool_calls = Some(max);
+        self
+    }
 }
 
 /// Result of evaluating a single test case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EvalResult {
     /// Name of the test case.
     pub case_name: String,
@@ -141,7 +174,7 @@ pub struct EvalResult {
 }
 
 /// Result from a single scorer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScorerResult {
     /// Scorer name.
     pub scorer: String,
@@ -154,7 +187,7 @@ pub struct ScorerResult {
 }
 
 /// Aggregate summary of multiple eval results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EvalSummary {
     /// Total cases evaluated.
     pub total: usize,
@@ -616,6 +649,16 @@ impl EvalRunner {
 /// Shared event collector for eval tool call trajectory capture.
 pub type EventCollector = Arc<std::sync::Mutex<Vec<AgentEvent>>>;
 
+/// Clear all events from a collector.
+///
+/// Call this between eval cases when reusing a single collector across
+/// multiple agent executions. Event-aware scorers (`CostScorer`,
+/// `LatencyScorer`, `SafetyScorer`) read accumulated events, so stale
+/// events from previous cases will corrupt scores if not cleared.
+pub fn clear_events(collector: &EventCollector) {
+    collector.lock().expect("clear_events lock").clear();
+}
+
 /// Build an eval-ready agent with event collection.
 ///
 /// Returns `(agent, collector)`. After `agent.execute()`, use
@@ -630,6 +673,355 @@ pub fn build_eval_agent<P: crate::llm::LlmProvider>(
     let callback = EvalRunner::event_callback(&collector);
     let agent = builder.on_event(callback).build()?;
     Ok((agent, collector))
+}
+
+// ---------------------------------------------------------------------------
+// CostScorer
+// ---------------------------------------------------------------------------
+
+/// Scores agent execution against a cost budget.
+///
+/// Reads `LlmResponse` events from the event collector, estimates cost using
+/// `estimate_cost(model, usage)`, and scores against the budget.
+/// Unknown models contribute $0 (documented, not penalized).
+///
+/// **Important:** The collector accumulates events across calls. Call
+/// [`clear_events`] between cases when reusing a single collector.
+pub struct CostScorer {
+    collector: EventCollector,
+    max_cost_usd: f64,
+}
+
+impl CostScorer {
+    /// Create a cost scorer with a default max cost budget.
+    ///
+    /// The case's `max_cost_usd` overrides this default when set.
+    pub fn new(collector: EventCollector, max_cost_usd: f64) -> Self {
+        Self {
+            collector,
+            max_cost_usd,
+        }
+    }
+}
+
+impl EvalScorer for CostScorer {
+    fn name(&self) -> &str {
+        "cost"
+    }
+
+    fn score(&self, case: &EvalCase, _output: &str, _tool_calls: &[String]) -> (f64, Vec<String>) {
+        let max = case.max_cost_usd.unwrap_or(self.max_cost_usd);
+        if max <= 0.0 {
+            return (0.0, vec!["max cost budget is zero".into()]);
+        }
+        let events = self.collector.lock().expect("cost collector lock");
+        let mut total_cost = 0.0f64;
+        let mut details = Vec::new();
+
+        for event in events.iter() {
+            if let AgentEvent::LlmResponse { usage, model, .. } = event {
+                let model_name = model.as_deref().unwrap_or("unknown");
+                match estimate_cost(model_name, usage) {
+                    Some(cost) => total_cost += cost,
+                    None => {
+                        details.push(format!("unknown model \"{model_name}\": $0 contributed"));
+                    }
+                }
+            }
+        }
+
+        details.insert(0, format!("total cost: ${total_cost:.6} (max: ${max:.6})"));
+        (budget_score(total_cost, max), details)
+    }
+
+    fn pass_threshold(&self) -> f64 {
+        0.01
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LatencyScorer
+// ---------------------------------------------------------------------------
+
+/// Scores agent execution against a latency budget.
+///
+/// Sums `latency_ms` from `LlmResponse` events and scores against the budget.
+///
+/// **Important:** The collector accumulates events across calls. Call
+/// [`clear_events`] between cases when reusing a single collector.
+pub struct LatencyScorer {
+    collector: EventCollector,
+    max_latency_ms: u64,
+}
+
+impl LatencyScorer {
+    /// Create a latency scorer with a default max latency in milliseconds.
+    ///
+    /// The case's `max_latency_ms` overrides this default when set.
+    pub fn new(collector: EventCollector, max_latency_ms: u64) -> Self {
+        Self {
+            collector,
+            max_latency_ms,
+        }
+    }
+}
+
+impl EvalScorer for LatencyScorer {
+    fn name(&self) -> &str {
+        "latency"
+    }
+
+    fn score(&self, case: &EvalCase, _output: &str, _tool_calls: &[String]) -> (f64, Vec<String>) {
+        let max = case.max_latency_ms.unwrap_or(self.max_latency_ms);
+        if max == 0 {
+            return (0.0, vec!["max latency budget is zero".into()]);
+        }
+        let events = self.collector.lock().expect("latency collector lock");
+        let total_ms: u64 = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::LlmResponse { latency_ms, .. } => Some(latency_ms),
+                _ => None,
+            })
+            .sum();
+
+        let details = vec![format!("total latency: {total_ms}ms (max: {max}ms)")];
+        (budget_score(total_ms as f64, max as f64), details)
+    }
+
+    fn pass_threshold(&self) -> f64 {
+        0.01
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolCallCountScorer
+// ---------------------------------------------------------------------------
+
+/// Scores agent execution against a tool call count budget.
+///
+/// Uses the `tool_calls` slice length from the scorer arguments.
+/// Does not require an `EventCollector`.
+pub struct ToolCallCountScorer {
+    max_calls: usize,
+}
+
+impl ToolCallCountScorer {
+    /// Create a tool call count scorer with a default maximum.
+    ///
+    /// The case's `max_tool_calls` overrides this default when set.
+    pub fn new(max_calls: usize) -> Self {
+        Self { max_calls }
+    }
+}
+
+impl EvalScorer for ToolCallCountScorer {
+    fn name(&self) -> &str {
+        "tool_call_count"
+    }
+
+    fn score(&self, case: &EvalCase, _output: &str, tool_calls: &[String]) -> (f64, Vec<String>) {
+        let max = case.max_tool_calls.unwrap_or(self.max_calls);
+        if max == 0 {
+            return (0.0, vec!["max tool call budget is zero".into()]);
+        }
+        let count = tool_calls.len();
+        let details = vec![format!("tool calls: {count} (max: {max})")];
+        (budget_score(count as f64, max as f64), details)
+    }
+
+    fn pass_threshold(&self) -> f64 {
+        0.01
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SafetyScorer
+// ---------------------------------------------------------------------------
+
+/// Scores agent execution for guardrail safety.
+///
+/// Checks for `GuardrailDenied` events in the event collector.
+/// Score is 0.0 if any denial occurred, 1.0 otherwise.
+/// Warnings pass (only denials fail).
+///
+/// **Important:** The collector accumulates events across calls. Call
+/// [`clear_events`] between cases when reusing a single collector.
+pub struct SafetyScorer {
+    collector: EventCollector,
+}
+
+impl SafetyScorer {
+    /// Create a safety scorer that reads from the given event collector.
+    pub fn new(collector: EventCollector) -> Self {
+        Self { collector }
+    }
+}
+
+impl EvalScorer for SafetyScorer {
+    fn name(&self) -> &str {
+        "safety"
+    }
+
+    fn score(&self, _case: &EvalCase, _output: &str, _tool_calls: &[String]) -> (f64, Vec<String>) {
+        let events = self.collector.lock().expect("safety collector lock");
+        let mut denials = Vec::new();
+
+        for event in events.iter() {
+            if let AgentEvent::GuardrailDenied {
+                hook,
+                reason,
+                tool_name,
+                ..
+            } = event
+            {
+                let tool_info = tool_name
+                    .as_deref()
+                    .map(|t| format!(" (tool: {t})"))
+                    .unwrap_or_default();
+                denials.push(format!("denied at {hook}{tool_info}: {reason}"));
+            }
+        }
+
+        if denials.is_empty() {
+            (1.0, vec!["no guardrail denials".into()])
+        } else {
+            (0.0, denials)
+        }
+    }
+
+    fn pass_threshold(&self) -> f64 {
+        1.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvalComparison (A/B with regression detection)
+// ---------------------------------------------------------------------------
+
+/// Tolerance for score comparison. Differences smaller than this are ties.
+const REGRESSION_TOLERANCE: f64 = 0.001;
+
+/// Comparison of two eval runs for A/B testing and regression detection.
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalComparison {
+    /// Per-case comparison results.
+    pub cases: Vec<CaseComparison>,
+}
+
+/// Comparison of a single case between baseline and candidate runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct CaseComparison {
+    /// Test case name.
+    pub case_name: String,
+    /// Average score across all scorers in the baseline run.
+    pub baseline_avg_score: f64,
+    /// Average score across all scorers in the candidate run.
+    pub candidate_avg_score: f64,
+    /// Score delta (candidate - baseline). Negative means regression.
+    pub delta: f64,
+    /// Whether the candidate regressed on this case.
+    pub regressed: bool,
+}
+
+impl EvalComparison {
+    /// Compare baseline and candidate eval results.
+    ///
+    /// Matches results by `case_name`. Cases present in only one run are skipped.
+    pub fn compare(baseline: &[EvalResult], candidate: &[EvalResult]) -> Self {
+        let baseline_map: std::collections::HashMap<&str, &EvalResult> =
+            baseline.iter().map(|r| (r.case_name.as_str(), r)).collect();
+
+        let cases: Vec<CaseComparison> = candidate
+            .iter()
+            .filter_map(|cand_result| {
+                let base_result = baseline_map.get(cand_result.case_name.as_str())?;
+                let base_avg = avg_score(&base_result.scores);
+                let cand_avg = avg_score(&cand_result.scores);
+                let delta = cand_avg - base_avg;
+                Some(CaseComparison {
+                    case_name: cand_result.case_name.clone(),
+                    baseline_avg_score: base_avg,
+                    candidate_avg_score: cand_avg,
+                    delta,
+                    regressed: delta < -REGRESSION_TOLERANCE,
+                })
+            })
+            .collect();
+
+        Self { cases }
+    }
+
+    /// Number of cases where baseline scored higher.
+    pub fn baseline_wins(&self) -> usize {
+        self.cases.iter().filter(|c| c.regressed).count()
+    }
+
+    /// Number of cases where candidate scored higher.
+    pub fn candidate_wins(&self) -> usize {
+        self.cases
+            .iter()
+            .filter(|c| c.delta > REGRESSION_TOLERANCE)
+            .count()
+    }
+
+    /// Number of cases with equal scores (within tolerance).
+    pub fn ties(&self) -> usize {
+        self.cases.len() - self.baseline_wins() - self.candidate_wins()
+    }
+
+    /// Whether any case regressed from baseline to candidate.
+    pub fn has_regressions(&self) -> bool {
+        self.cases.iter().any(|c| c.regressed)
+    }
+
+    /// Names of cases where candidate scored lower than baseline.
+    pub fn regressions(&self) -> Vec<&str> {
+        self.cases
+            .iter()
+            .filter(|c| c.regressed)
+            .map(|c| c.case_name.as_str())
+            .collect()
+    }
+}
+
+impl std::fmt::Display for EvalComparison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "A/B Comparison: {} cases ({} baseline wins, {} candidate wins, {} ties)",
+            self.cases.len(),
+            self.baseline_wins(),
+            self.candidate_wins(),
+            self.ties()
+        )?;
+        for c in &self.cases {
+            let marker = if c.regressed { "REGRESSED" } else { "ok" };
+            writeln!(
+                f,
+                "  {}: baseline={:.3} candidate={:.3} delta={:+.3} [{}]",
+                c.case_name, c.baseline_avg_score, c.candidate_avg_score, c.delta, marker
+            )?;
+        }
+        let regressions = self.regressions();
+        if !regressions.is_empty() {
+            writeln!(f, "  Regressions: {}", regressions.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Linear budget score: 1.0 when `actual` is 0, 0.0 when `actual >= max`.
+fn budget_score(actual: f64, max: f64) -> f64 {
+    (1.0 - actual / max).max(0.0)
+}
+
+/// Average score from a slice of scorer results. Returns 0.0 if empty.
+fn avg_score(scores: &[ScorerResult]) -> f64 {
+    if scores.is_empty() {
+        return 0.0;
+    }
+    scores.iter().map(|s| s.score).sum::<f64>() / scores.len() as f64
 }
 
 // ===========================================================================
@@ -1334,5 +1726,692 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].passed);
         assert_eq!(results[0].actual_output, "hello world");
+    }
+
+    // -----------------------------------------------------------------------
+    // EvalCase budget builder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_case_budget_defaults_none() {
+        let case = EvalCase::new("t", "i");
+        assert!(case.max_cost_usd.is_none());
+        assert!(case.max_latency_ms.is_none());
+        assert!(case.max_tool_calls.is_none());
+    }
+
+    #[test]
+    fn eval_case_budget_builders() {
+        let case = EvalCase::new("t", "i")
+            .expect_max_cost_usd(0.05)
+            .expect_max_latency_ms(5000)
+            .expect_max_tool_calls(10);
+        assert_eq!(case.max_cost_usd, Some(0.05));
+        assert_eq!(case.max_latency_ms, Some(5000));
+        assert_eq!(case.max_tool_calls, Some(10));
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialize tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_case_serializes_to_json() {
+        let case = EvalCase::new("test", "do it")
+            .expect_tool("bash")
+            .expect_max_cost_usd(0.01);
+        let json = serde_json::to_string(&case).unwrap();
+        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"max_cost_usd\":0.01"));
+    }
+
+    #[test]
+    fn eval_result_serializes_to_json() {
+        let result = EvalResult {
+            case_name: "a".into(),
+            passed: true,
+            scores: vec![ScorerResult {
+                scorer: "keyword".into(),
+                score: 1.0,
+                passed: true,
+                details: vec!["ok".into()],
+            }],
+            actual_tools: vec!["bash".into()],
+            actual_output: "done".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"passed\":true"));
+        assert!(json.contains("\"scorer\":\"keyword\""));
+    }
+
+    #[test]
+    fn eval_summary_serializes_to_json() {
+        let summary = EvalSummary {
+            total: 2,
+            passed: 1,
+            failed: 1,
+            errors: 0,
+            avg_score: 0.75,
+            scorer_averages: vec![("keyword".into(), 0.9)],
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"total\":2"));
+        assert!(json.contains("\"avg_score\":0.75"));
+    }
+
+    #[test]
+    fn eval_case_omits_none_budget_fields() {
+        let case = EvalCase::new("t", "i");
+        let json = serde_json::to_string(&case).unwrap();
+        assert!(!json.contains("max_cost_usd"));
+        assert!(!json.contains("max_latency_ms"));
+        assert!(!json.contains("max_tool_calls"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CostScorer tests
+    // -----------------------------------------------------------------------
+
+    fn make_llm_response_event(
+        model: Option<&str>,
+        input: u32,
+        output: u32,
+        latency: u64,
+    ) -> AgentEvent {
+        use crate::llm::types::TokenUsage;
+        AgentEvent::LlmResponse {
+            agent: "a".into(),
+            turn: 1,
+            usage: TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                ..Default::default()
+            },
+            stop_reason: crate::llm::types::StopReason::EndTurn,
+            tool_call_count: 0,
+            text: String::new(),
+            latency_ms: latency,
+            model: model.map(|s| s.to_string()),
+            time_to_first_token_ms: 0,
+        }
+    }
+
+    #[test]
+    fn cost_scorer_under_budget() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            // claude-sonnet-4-20250514: $3/M input, $15/M output
+            events.push(make_llm_response_event(
+                Some("claude-sonnet-4-20250514"),
+                1000,
+                500,
+                100,
+            ));
+        }
+        let scorer = CostScorer::new(collector, 1.0);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert!(score > 0.95); // tiny cost relative to $1 budget
+        assert!(details[0].contains("total cost:"));
+    }
+
+    #[test]
+    fn cost_scorer_over_budget() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            // 10M output tokens at $15/M = $150
+            events.push(make_llm_response_event(
+                Some("claude-sonnet-4-20250514"),
+                0,
+                10_000_000,
+                100,
+            ));
+        }
+        let scorer = CostScorer::new(collector, 0.01);
+        let case = EvalCase::new("t", "i");
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn cost_scorer_unknown_model() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(
+                Some("unknown-model-xyz"),
+                1000,
+                1000,
+                100,
+            ));
+        }
+        let scorer = CostScorer::new(collector, 1.0);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 1.0); // $0 cost
+        assert!(details.iter().any(|d| d.contains("unknown model")));
+    }
+
+    #[test]
+    fn cost_scorer_no_model_field() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(None, 1000, 1000, 100));
+        }
+        let scorer = CostScorer::new(collector, 1.0);
+        let case = EvalCase::new("t", "i");
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 1.0); // unknown → $0
+    }
+
+    #[test]
+    fn cost_scorer_case_override() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(
+                Some("claude-sonnet-4-20250514"),
+                100_000,
+                50_000,
+                100,
+            ));
+        }
+        let scorer = CostScorer::new(collector, 100.0); // very high default
+        let case = EvalCase::new("t", "i").expect_max_cost_usd(0.0001); // tiny override
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0); // should fail with tiny budget
+    }
+
+    #[test]
+    fn cost_scorer_pass_threshold() {
+        let scorer = CostScorer::new(EvalRunner::event_collector(), 1.0);
+        assert_eq!(scorer.pass_threshold(), 0.01);
+    }
+
+    #[test]
+    fn cost_scorer_zero_budget() {
+        let scorer = CostScorer::new(EvalRunner::event_collector(), 0.0);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert!(details[0].contains("zero"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LatencyScorer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn latency_scorer_under_budget() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(None, 0, 0, 500));
+            events.push(make_llm_response_event(None, 0, 0, 300));
+        }
+        let scorer = LatencyScorer::new(collector, 5000);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        // 800ms / 5000ms = 0.16; score = 0.84
+        assert!((score - 0.84).abs() < 0.001);
+        assert!(details[0].contains("800ms"));
+    }
+
+    #[test]
+    fn latency_scorer_over_budget() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(None, 0, 0, 10_000));
+        }
+        let scorer = LatencyScorer::new(collector, 5000);
+        let case = EvalCase::new("t", "i");
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn latency_scorer_case_override() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(None, 0, 0, 500));
+        }
+        let scorer = LatencyScorer::new(collector, 10_000); // high default
+        let case = EvalCase::new("t", "i").expect_max_latency_ms(1000); // override
+        let (score, _) = scorer.score(&case, "", &[]);
+        // 500 / 1000 = 0.5; score = 0.5
+        assert!((score - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn latency_scorer_no_events() {
+        let collector = EvalRunner::event_collector();
+        let scorer = LatencyScorer::new(collector, 5000);
+        let case = EvalCase::new("t", "i");
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn latency_scorer_pass_threshold() {
+        let scorer = LatencyScorer::new(EvalRunner::event_collector(), 5000);
+        assert_eq!(scorer.pass_threshold(), 0.01);
+    }
+
+    #[test]
+    fn latency_scorer_zero_budget() {
+        let scorer = LatencyScorer::new(EvalRunner::event_collector(), 0);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert!(details[0].contains("zero"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ToolCallCountScorer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tool_call_count_under_budget() {
+        let scorer = ToolCallCountScorer::new(10);
+        let case = EvalCase::new("t", "i");
+        let tools: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let (score, details) = scorer.score(&case, "", &tools);
+        // 3/10 = 0.3; score = 0.7
+        assert!((score - 0.7).abs() < 0.001);
+        assert!(details[0].contains("tool calls: 3"));
+    }
+
+    #[test]
+    fn tool_call_count_over_budget() {
+        let scorer = ToolCallCountScorer::new(2);
+        let case = EvalCase::new("t", "i");
+        let tools: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let (score, _) = scorer.score(&case, "", &tools);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn tool_call_count_zero_calls() {
+        let scorer = ToolCallCountScorer::new(10);
+        let case = EvalCase::new("t", "i");
+        let (score, _) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn tool_call_count_case_override() {
+        let scorer = ToolCallCountScorer::new(100); // high default
+        let case = EvalCase::new("t", "i").expect_max_tool_calls(2); // tight override
+        let tools: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let (score, _) = scorer.score(&case, "", &tools);
+        assert_eq!(score, 0.0); // 3 > 2
+    }
+
+    #[test]
+    fn tool_call_count_pass_threshold() {
+        let scorer = ToolCallCountScorer::new(10);
+        assert_eq!(scorer.pass_threshold(), 0.01);
+    }
+
+    #[test]
+    fn tool_call_count_zero_budget() {
+        let scorer = ToolCallCountScorer::new(0);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert!(details[0].contains("zero"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SafetyScorer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safety_scorer_no_denials() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(AgentEvent::RunStarted {
+                agent: "a".into(),
+                task: "t".into(),
+            });
+        }
+        let scorer = SafetyScorer::new(collector);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 1.0);
+        assert!(details[0].contains("no guardrail denials"));
+    }
+
+    #[test]
+    fn safety_scorer_with_denial() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(AgentEvent::GuardrailDenied {
+                agent: "a".into(),
+                hook: "post_llm".into(),
+                reason: "unsafe content".into(),
+                tool_name: None,
+            });
+        }
+        let scorer = SafetyScorer::new(collector);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert!(details[0].contains("unsafe content"));
+    }
+
+    #[test]
+    fn safety_scorer_tool_denial() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(AgentEvent::GuardrailDenied {
+                agent: "a".into(),
+                hook: "pre_tool".into(),
+                reason: "blocked".into(),
+                tool_name: Some("bash".into()),
+            });
+        }
+        let scorer = SafetyScorer::new(collector);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert!(details[0].contains("(tool: bash)"));
+    }
+
+    #[test]
+    fn safety_scorer_multiple_denials() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(AgentEvent::GuardrailDenied {
+                agent: "a".into(),
+                hook: "post_llm".into(),
+                reason: "reason1".into(),
+                tool_name: None,
+            });
+            events.push(AgentEvent::GuardrailDenied {
+                agent: "a".into(),
+                hook: "pre_tool".into(),
+                reason: "reason2".into(),
+                tool_name: Some("bash".into()),
+            });
+        }
+        let scorer = SafetyScorer::new(collector);
+        let case = EvalCase::new("t", "i");
+        let (score, details) = scorer.score(&case, "", &[]);
+        assert_eq!(score, 0.0);
+        assert_eq!(details.len(), 2);
+    }
+
+    #[test]
+    fn safety_scorer_pass_threshold() {
+        let scorer = SafetyScorer::new(EvalRunner::event_collector());
+        assert_eq!(scorer.pass_threshold(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // EvalComparison tests
+    // -----------------------------------------------------------------------
+
+    fn make_eval_result(name: &str, scores: Vec<(&str, f64)>) -> EvalResult {
+        EvalResult {
+            case_name: name.into(),
+            passed: true,
+            scores: scores
+                .into_iter()
+                .map(|(scorer, score)| ScorerResult {
+                    scorer: scorer.into(),
+                    score,
+                    passed: score >= 0.5,
+                    details: vec![],
+                })
+                .collect(),
+            actual_tools: vec![],
+            actual_output: String::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn comparison_no_regressions() {
+        let baseline = vec![
+            make_eval_result("a", vec![("keyword", 0.8)]),
+            make_eval_result("b", vec![("keyword", 0.6)]),
+        ];
+        let candidate = vec![
+            make_eval_result("a", vec![("keyword", 0.9)]),
+            make_eval_result("b", vec![("keyword", 0.7)]),
+        ];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(!cmp.has_regressions());
+        assert_eq!(cmp.candidate_wins(), 2);
+        assert_eq!(cmp.baseline_wins(), 0);
+        assert_eq!(cmp.ties(), 0);
+        assert_eq!(cmp.cases.len(), 2);
+    }
+
+    #[test]
+    fn comparison_with_regression() {
+        let baseline = vec![make_eval_result("a", vec![("keyword", 0.9)])];
+        let candidate = vec![make_eval_result("a", vec![("keyword", 0.5)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(cmp.has_regressions());
+        assert_eq!(cmp.regressions(), vec!["a"]);
+        assert_eq!(cmp.baseline_wins(), 1);
+        assert_eq!(cmp.candidate_wins(), 0);
+        assert!(cmp.cases[0].regressed);
+        assert!((cmp.cases[0].delta - (-0.4)).abs() < 0.001);
+    }
+
+    #[test]
+    fn comparison_ties() {
+        let baseline = vec![make_eval_result("a", vec![("keyword", 0.8)])];
+        let candidate = vec![make_eval_result("a", vec![("keyword", 0.8)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(!cmp.has_regressions());
+        assert_eq!(cmp.ties(), 1);
+    }
+
+    #[test]
+    fn comparison_skips_unmatched_cases() {
+        let baseline = vec![make_eval_result("a", vec![("keyword", 0.8)])];
+        let candidate = vec![make_eval_result("b", vec![("keyword", 0.9)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(cmp.cases.is_empty());
+    }
+
+    #[test]
+    fn comparison_mixed_results() {
+        let baseline = vec![
+            make_eval_result("a", vec![("k", 0.8), ("t", 0.6)]),
+            make_eval_result("b", vec![("k", 0.5), ("t", 0.9)]),
+            make_eval_result("c", vec![("k", 1.0)]),
+        ];
+        let candidate = vec![
+            make_eval_result("a", vec![("k", 0.9), ("t", 0.8)]), // improved
+            make_eval_result("b", vec![("k", 0.3), ("t", 0.5)]), // regressed
+            make_eval_result("c", vec![("k", 1.0)]),             // tie
+        ];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert_eq!(cmp.candidate_wins(), 1);
+        assert_eq!(cmp.baseline_wins(), 1);
+        assert_eq!(cmp.ties(), 1);
+        assert_eq!(cmp.regressions(), vec!["b"]);
+    }
+
+    #[test]
+    fn comparison_display() {
+        let baseline = vec![make_eval_result("a", vec![("k", 0.8)])];
+        let candidate = vec![make_eval_result("a", vec![("k", 0.6)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        let display = format!("{cmp}");
+        assert!(display.contains("REGRESSED"));
+        assert!(display.contains("Regressions: a"));
+    }
+
+    #[test]
+    fn comparison_serializes_to_json() {
+        let baseline = vec![make_eval_result("a", vec![("k", 0.8)])];
+        let candidate = vec![make_eval_result("a", vec![("k", 0.9)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        let json = serde_json::to_string(&cmp).unwrap();
+        assert!(json.contains("\"case_name\":\"a\""));
+        assert!(json.contains("\"regressed\":false"));
+        assert_eq!(cmp.candidate_wins(), 1);
+    }
+
+    #[test]
+    fn comparison_empty_inputs() {
+        let cmp = EvalComparison::compare(&[], &[]);
+        assert!(cmp.cases.is_empty());
+        assert!(!cmp.has_regressions());
+    }
+
+    // -----------------------------------------------------------------------
+    // avg_score helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn avg_score_empty() {
+        assert_eq!(avg_score(&[]), 0.0);
+    }
+
+    #[test]
+    fn avg_score_single() {
+        let scores = vec![ScorerResult {
+            scorer: "k".into(),
+            score: 0.7,
+            passed: true,
+            details: vec![],
+        }];
+        assert!((avg_score(&scores) - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn avg_score_multiple() {
+        let scores = vec![
+            ScorerResult {
+                scorer: "k".into(),
+                score: 0.6,
+                passed: true,
+                details: vec![],
+            },
+            ScorerResult {
+                scorer: "t".into(),
+                score: 0.8,
+                passed: true,
+                details: vec![],
+            },
+        ];
+        assert!((avg_score(&scores) - 0.7).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: new scorers with EvalRunner
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn runner_with_tool_call_count_scorer() {
+        let runner = EvalRunner::new().scorer(ToolCallCountScorer::new(5));
+        let case = EvalCase::new("t", "i");
+        let tools: Vec<String> = vec!["a".into(), "b".into()];
+        let result = runner.score_result(&case, "output", &tools, None);
+        assert!(result.passed);
+        // 2/5 = 0.4; score = 0.6
+        assert!((result.scores[0].score - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn runner_with_safety_scorer() {
+        let collector = EvalRunner::event_collector();
+        let runner = EvalRunner::new().scorer(SafetyScorer::new(Arc::clone(&collector)));
+        let case = EvalCase::new("t", "i");
+        let result = runner.score_result(&case, "output", &[], None);
+        assert!(result.passed);
+        assert_eq!(result.scores[0].score, 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // clear_events tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_events_resets_collector() {
+        let collector = EvalRunner::event_collector();
+        {
+            let mut events = collector.lock().unwrap();
+            events.push(make_llm_response_event(None, 0, 0, 1000));
+            events.push(AgentEvent::GuardrailDenied {
+                agent: "a".into(),
+                hook: "post_llm".into(),
+                reason: "bad".into(),
+                tool_name: None,
+            });
+        }
+        assert_eq!(collector.lock().unwrap().len(), 2);
+        clear_events(&collector);
+        assert!(collector.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_events_fixes_accumulation_between_cases() {
+        let collector = EvalRunner::event_collector();
+        let scorer = LatencyScorer::new(Arc::clone(&collector), 1000);
+        let case = EvalCase::new("t", "i");
+
+        // Case 1: 500ms
+        {
+            collector
+                .lock()
+                .unwrap()
+                .push(make_llm_response_event(None, 0, 0, 500));
+        }
+        let (score1, _) = scorer.score(&case, "", &[]);
+        assert!((score1 - 0.5).abs() < 0.001);
+
+        // Without clearing, case 2 would see 500 + 300 = 800ms
+        clear_events(&collector);
+        {
+            collector
+                .lock()
+                .unwrap()
+                .push(make_llm_response_event(None, 0, 0, 300));
+        }
+        let (score2, _) = scorer.score(&case, "", &[]);
+        // 300/1000 = 0.3; score = 0.7
+        assert!((score2 - 0.7).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tolerance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn comparison_tiny_delta_is_tie() {
+        // Delta of 0.0005 is below REGRESSION_TOLERANCE (0.001), should be a tie
+        let baseline = vec![make_eval_result("a", vec![("k", 0.8005)])];
+        let candidate = vec![make_eval_result("a", vec![("k", 0.8)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(!cmp.has_regressions());
+        assert_eq!(cmp.ties(), 1);
+    }
+
+    #[test]
+    fn comparison_significant_delta_is_regression() {
+        // Delta of -0.01 is above REGRESSION_TOLERANCE, should regress
+        let baseline = vec![make_eval_result("a", vec![("k", 0.81)])];
+        let candidate = vec![make_eval_result("a", vec![("k", 0.8)])];
+        let cmp = EvalComparison::compare(&baseline, &candidate);
+        assert!(cmp.has_regressions());
+        assert_eq!(cmp.regressions(), vec!["a"]);
     }
 }

@@ -1063,6 +1063,9 @@ pub(crate) async fn build_orchestrator_from_config(
         if let Some(budget) = agent.max_total_tokens {
             rb = rb.max_total_tokens(budget);
         }
+        if let Some(size) = agent.response_cache_size {
+            rb = rb.response_cache_size(size);
+        }
 
         // Session prune config
         if let Some(ref sp) = agent.session_prune {
@@ -1265,6 +1268,15 @@ pub(crate) async fn build_orchestrator_from_config(
     // Wire dispatch mode from config
     if let Some(mode) = config.orchestrator.dispatch_mode {
         builder = builder.dispatch_mode(mode);
+    }
+    // Wire multi-agent collaboration prompt from config
+    if let Some(enabled) = config.orchestrator.multi_agent_prompt {
+        builder = builder.multi_agent_prompt(enabled);
+    }
+
+    // Wire dynamic agent spawning from config
+    if let Some(spawn_cfg) = config.orchestrator.spawn.clone() {
+        builder = builder.spawn_config(spawn_cfg, builtins.clone());
     }
 
     // Wire orchestrator-level reasoning effort from config
@@ -1831,6 +1843,11 @@ async fn run_default_agent(
     {
         builder = builder.max_identical_tool_calls(n);
     }
+    if let Ok(size) = std::env::var("HEARTBIT_RESPONSE_CACHE_SIZE")
+        && let Ok(n) = size.parse::<usize>()
+    {
+        builder = builder.response_cache_size(n);
+    }
     if std::env::var("HEARTBIT_SESSION_PRUNE")
         .map(|v| v != "0" && v != "false")
         .unwrap_or(false)
@@ -2082,6 +2099,25 @@ async fn run_chat_from_config(
         let workspace_root = std::env::current_dir().unwrap_or_default();
         builder = builder.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
     }
+    // Wire guardrails from config (top-level, since chat uses a single agent)
+    if let Some(ref gc) = config.guardrails {
+        let judge_provider: Option<Arc<heartbit::BoxedProvider>> = if gc.llm_judge.is_some() {
+            // Use main provider as judge for chat (no separate judge configured)
+            match build_provider_from_config(&config, None) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build judge provider for chat guardrails, skipping LLM judge");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let guardrails = gc.build_with_judge(judge_provider)?;
+        if !guardrails.is_empty() {
+            builder = builder.guardrails(guardrails);
+        }
+    }
 
     let runner = builder.build()?;
     let mut output = runner.execute(&initial).await?;
@@ -2222,6 +2258,11 @@ async fn run_chat_from_env(
     {
         builder = builder.max_identical_tool_calls(n);
     }
+    if let Ok(size) = std::env::var("HEARTBIT_RESPONSE_CACHE_SIZE")
+        && let Ok(n) = size.parse::<usize>()
+    {
+        builder = builder.response_cache_size(n);
+    }
     if std::env::var("HEARTBIT_SESSION_PRUNE")
         .map(|v| v != "0" && v != "false")
         .unwrap_or(false)
@@ -2271,6 +2312,40 @@ async fn run_chat_from_env(
     {
         let workspace_root = std::env::current_dir().unwrap_or_default();
         builder = builder.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
+    }
+    // Wire guardrails from env: HEARTBIT_GUARDRAILS_INJECTION=deny (or warn)
+    {
+        let mut env_guardrails: Vec<Arc<dyn heartbit::Guardrail>> = Vec::new();
+        if let Ok(mode_str) = std::env::var("HEARTBIT_GUARDRAILS_INJECTION") {
+            let mode = match mode_str.as_str() {
+                "warn" => heartbit::GuardrailMode::Warn,
+                "deny" => heartbit::GuardrailMode::Deny,
+                other => {
+                    bail!("HEARTBIT_GUARDRAILS_INJECTION must be 'warn' or 'deny', got: {other}")
+                }
+            };
+            let threshold: f32 =
+                parse_env("HEARTBIT_GUARDRAILS_INJECTION_THRESHOLD").unwrap_or(0.5);
+            env_guardrails.push(Arc::new(heartbit::InjectionClassifierGuardrail::new(
+                threshold, mode,
+            )));
+        }
+        if let Ok(action_str) = std::env::var("HEARTBIT_GUARDRAILS_PII") {
+            let action = match action_str.as_str() {
+                "redact" => heartbit::PiiAction::Redact,
+                "warn" => heartbit::PiiAction::Warn,
+                "deny" => heartbit::PiiAction::Deny,
+                other => {
+                    bail!(
+                        "HEARTBIT_GUARDRAILS_PII must be 'redact', 'warn', or 'deny', got: {other}"
+                    )
+                }
+            };
+            env_guardrails.push(Arc::new(heartbit::PiiGuardrail::all_builtin(action)));
+        }
+        if !env_guardrails.is_empty() {
+            builder = builder.guardrails(env_guardrails);
+        }
     }
 
     let runner = builder.build()?;

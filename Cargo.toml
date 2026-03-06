@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli"]
+members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro"]
 
 [workspace.package]
 version = "2026.306.3"
@@ -53,3 +53,7 @@ teloxide = { version = "0.17", features = ["macros"] }
 dotenvy = "0.15"
 fastembed = { version = "5" }
 jsonwebtoken = "9"
+petgraph = "0.7"
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

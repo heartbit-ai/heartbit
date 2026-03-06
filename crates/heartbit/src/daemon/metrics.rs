@@ -14,10 +14,10 @@ pub struct DaemonMetrics {
     registry: Registry,
 
     // Task lifecycle (prefix: heartbit_daemon_)
-    tasks_submitted_total: IntCounter,
-    tasks_completed_total: IntCounter,
-    tasks_failed_total: IntCounter,
-    tasks_cancelled_total: IntCounter,
+    tasks_submitted_total: IntCounterVec,
+    tasks_completed_total: IntCounterVec,
+    tasks_failed_total: IntCounterVec,
+    tasks_cancelled_total: IntCounterVec,
     tasks_active: IntGauge,
     task_duration_seconds: Histogram,
 
@@ -89,21 +89,33 @@ impl DaemonMetrics {
         let registry = Registry::new();
 
         // -- Task lifecycle --
-        let tasks_submitted_total = IntCounter::new(
-            "heartbit_daemon_tasks_submitted_total",
-            "Total tasks submitted to the daemon",
+        let tasks_submitted_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_daemon_tasks_submitted_total",
+                "Total tasks submitted to the daemon",
+            ),
+            &["tenant", "source"],
         )?;
-        let tasks_completed_total = IntCounter::new(
-            "heartbit_daemon_tasks_completed_total",
-            "Total tasks completed successfully",
+        let tasks_completed_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_daemon_tasks_completed_total",
+                "Total tasks completed successfully",
+            ),
+            &["tenant"],
         )?;
-        let tasks_failed_total = IntCounter::new(
-            "heartbit_daemon_tasks_failed_total",
-            "Total tasks that failed",
+        let tasks_failed_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_daemon_tasks_failed_total",
+                "Total tasks that failed",
+            ),
+            &["tenant"],
         )?;
-        let tasks_cancelled_total = IntCounter::new(
-            "heartbit_daemon_tasks_cancelled_total",
-            "Total tasks cancelled",
+        let tasks_cancelled_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_daemon_tasks_cancelled_total",
+                "Total tasks cancelled",
+            ),
+            &["tenant"],
         )?;
         let tasks_active = IntGauge::new(
             "heartbit_daemon_tasks_active",
@@ -119,10 +131,10 @@ impl DaemonMetrics {
             ]),
         )?;
 
-        // -- LLM (per-agent) --
+        // -- LLM (per-agent + per-tenant) --
         let llm_calls_total = IntCounterVec::new(
             Opts::new("heartbit_llm_calls_total", "Total LLM calls made"),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
         let llm_call_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -145,35 +157,35 @@ impl DaemonMetrics {
                 "heartbit_llm_tokens_input_total",
                 "Total LLM input tokens consumed",
             ),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
         let llm_tokens_output_total = IntCounterVec::new(
             Opts::new(
                 "heartbit_llm_tokens_output_total",
                 "Total LLM output tokens generated",
             ),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
         let llm_tokens_cache_read_total = IntCounterVec::new(
             Opts::new(
                 "heartbit_llm_tokens_cache_read_total",
                 "Total tokens read from prompt cache",
             ),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
         let llm_tokens_cache_creation_total = IntCounterVec::new(
             Opts::new(
                 "heartbit_llm_tokens_cache_creation_total",
                 "Total tokens used to create prompt cache entries",
             ),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
         let llm_cost_usd_total = CounterVec::new(
             Opts::new(
                 "heartbit_llm_cost_usd_total",
                 "Estimated total LLM cost in USD",
             ),
-            &["agent"],
+            &["agent", "tenant"],
         )?;
 
         // -- Tool (per-agent + per-name) --
@@ -445,7 +457,11 @@ impl DaemonMetrics {
     }
 
     /// Process an `AgentEvent` and update the relevant metrics.
-    pub fn record_event(&self, event: &AgentEvent) {
+    ///
+    /// `tenant_id` is the optional tenant context for per-tenant metric dimensions.
+    /// When `None`, the label value `"_none"` is used.
+    pub fn record_event(&self, event: &AgentEvent, tenant_id: Option<&str>) {
+        let tenant = tenant_id.unwrap_or("_none");
         match event {
             AgentEvent::RunStarted { agent, .. } => {
                 self.agent_runs_started_total
@@ -463,7 +479,10 @@ impl DaemonMetrics {
                 time_to_first_token_ms,
                 ..
             } => {
-                self.llm_calls_total.with_label_values(&[agent]).inc();
+                let agent: &str = agent;
+                self.llm_calls_total
+                    .with_label_values(&[agent, tenant])
+                    .inc();
                 self.llm_call_duration_seconds
                     .with_label_values(&[agent])
                     .observe(*latency_ms as f64 / 1000.0);
@@ -473,22 +492,22 @@ impl DaemonMetrics {
                         .observe(*time_to_first_token_ms as f64 / 1000.0);
                 }
                 self.llm_tokens_input_total
-                    .with_label_values(&[agent])
+                    .with_label_values(&[agent, tenant])
                     .inc_by(u64::from(usage.input_tokens));
                 self.llm_tokens_output_total
-                    .with_label_values(&[agent])
+                    .with_label_values(&[agent, tenant])
                     .inc_by(u64::from(usage.output_tokens));
                 self.llm_tokens_cache_read_total
-                    .with_label_values(&[agent])
+                    .with_label_values(&[agent, tenant])
                     .inc_by(u64::from(usage.cache_read_input_tokens));
                 self.llm_tokens_cache_creation_total
-                    .with_label_values(&[agent])
+                    .with_label_values(&[agent, tenant])
                     .inc_by(u64::from(usage.cache_creation_input_tokens));
                 if let Some(model_name) = model
                     && let Some(cost) = estimate_cost(model_name, usage)
                 {
                     self.llm_cost_usd_total
-                        .with_label_values(&[agent])
+                        .with_label_values(&[agent, tenant])
                         .inc_by(cost);
                 }
             }
@@ -607,29 +626,42 @@ impl DaemonMetrics {
                     .with_label_values(&[hook])
                     .inc();
             }
+            AgentEvent::AgentSpawned { .. } => {
+                // Spawn events are informational — no metric needed yet.
+            }
         }
     }
 
-    /// Record a task submission.
-    pub fn record_task_submitted(&self) {
-        self.tasks_submitted_total.inc();
+    /// Record a task submission with tenant and source labels.
+    pub fn record_task_submitted(&self, tenant_id: Option<&str>, source: &str) {
+        let tenant = tenant_id.unwrap_or("_none");
+        self.tasks_submitted_total
+            .with_label_values(&[tenant, source])
+            .inc();
     }
 
-    /// Record a successful task completion with its duration.
-    pub fn record_task_completed(&self, duration_secs: f64) {
-        self.tasks_completed_total.inc();
+    /// Record a successful task completion with its duration and tenant label.
+    pub fn record_task_completed(&self, duration_secs: f64, tenant_id: Option<&str>) {
+        let tenant = tenant_id.unwrap_or("_none");
+        self.tasks_completed_total
+            .with_label_values(&[tenant])
+            .inc();
         self.task_duration_seconds.observe(duration_secs);
     }
 
-    /// Record a task failure with its duration.
-    pub fn record_task_failed(&self, duration_secs: f64) {
-        self.tasks_failed_total.inc();
+    /// Record a task failure with its duration and tenant label.
+    pub fn record_task_failed(&self, duration_secs: f64, tenant_id: Option<&str>) {
+        let tenant = tenant_id.unwrap_or("_none");
+        self.tasks_failed_total.with_label_values(&[tenant]).inc();
         self.task_duration_seconds.observe(duration_secs);
     }
 
-    /// Record a task cancellation.
-    pub fn record_task_cancelled(&self) {
-        self.tasks_cancelled_total.inc();
+    /// Record a task cancellation with tenant label.
+    pub fn record_task_cancelled(&self, tenant_id: Option<&str>) {
+        let tenant = tenant_id.unwrap_or("_none");
+        self.tasks_cancelled_total
+            .with_label_values(&[tenant])
+            .inc();
     }
 
     /// Return a reference to the active tasks gauge for external inc/dec.
@@ -692,11 +724,7 @@ mod tests {
     fn new_starts_at_zero() {
         let m = DaemonMetrics::new().unwrap();
         let text = m.encode().unwrap();
-        // Scalar counters should be present and at 0.
-        assert!(text.contains("heartbit_daemon_tasks_submitted_total 0"));
-        assert!(text.contains("heartbit_daemon_tasks_completed_total 0"));
-        assert!(text.contains("heartbit_daemon_tasks_failed_total 0"));
-        assert!(text.contains("heartbit_daemon_tasks_cancelled_total 0"));
+        // Vec counters don't emit lines until first use; just verify registry is valid.
         assert!(text.contains("heartbit_daemon_tasks_active 0"));
         assert!(text.contains("heartbit_reliability_retry_attempts_total 0"));
         assert!(text.contains("heartbit_reliability_doom_loops_detected_total 0"));
@@ -742,32 +770,36 @@ mod tests {
             model: Some("claude-sonnet-4-20250514".into()),
             time_to_first_token_ms: 250,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
-            text.contains(r#"heartbit_llm_calls_total{agent="test"} 1"#),
+            text.contains(r#"heartbit_llm_calls_total{agent="test",tenant="_none"} 1"#),
             "text: {text}"
         );
         assert!(
-            text.contains(r#"heartbit_llm_tokens_input_total{agent="test"} 100"#),
+            text.contains(r#"heartbit_llm_tokens_input_total{agent="test",tenant="_none"} 100"#),
             "text: {text}"
         );
         assert!(
-            text.contains(r#"heartbit_llm_tokens_output_total{agent="test"} 50"#),
+            text.contains(r#"heartbit_llm_tokens_output_total{agent="test",tenant="_none"} 50"#),
             "text: {text}"
         );
         assert!(
-            text.contains(r#"heartbit_llm_tokens_cache_read_total{agent="test"} 20"#),
+            text.contains(
+                r#"heartbit_llm_tokens_cache_read_total{agent="test",tenant="_none"} 20"#
+            ),
             "text: {text}"
         );
         assert!(
-            text.contains(r#"heartbit_llm_tokens_cache_creation_total{agent="test"} 10"#),
+            text.contains(
+                r#"heartbit_llm_tokens_cache_creation_total{agent="test",tenant="_none"} 10"#
+            ),
             "text: {text}"
         );
         // Cost should be non-zero for a known model
         assert!(
-            m.cost_usd().with_label_values(&["test"]).get() > 0.0,
+            m.cost_usd().with_label_values(&["test", "_none"]).get() > 0.0,
             "cost should be positive"
         );
     }
@@ -792,17 +824,17 @@ mod tests {
             model: None,
             time_to_first_token_ms: 0,
         };
-        m.record_event(&make_event("alpha"));
-        m.record_event(&make_event("alpha"));
-        m.record_event(&make_event("beta"));
+        m.record_event(&make_event("alpha"), None);
+        m.record_event(&make_event("alpha"), None);
+        m.record_event(&make_event("beta"), None);
 
         let text = m.encode().unwrap();
         assert!(
-            text.contains(r#"heartbit_llm_calls_total{agent="alpha"} 2"#),
+            text.contains(r#"heartbit_llm_calls_total{agent="alpha",tenant="_none"} 2"#),
             "text: {text}"
         );
         assert!(
-            text.contains(r#"heartbit_llm_calls_total{agent="beta"} 1"#),
+            text.contains(r#"heartbit_llm_calls_total{agent="beta",tenant="_none"} 1"#),
             "text: {text}"
         );
     }
@@ -818,7 +850,7 @@ mod tests {
             duration_ms: 500,
             output: "results".into(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -843,7 +875,7 @@ mod tests {
             duration_ms: 100,
             output: "error: not found".into(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -866,7 +898,7 @@ mod tests {
             delay_ms: 500,
             error_class: "rate_limited".into(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(text.contains("heartbit_reliability_retry_attempts_total 1"));
@@ -881,7 +913,7 @@ mod tests {
             consecutive_count: 3,
             tool_names: vec!["web_search".into()],
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(text.contains("heartbit_reliability_doom_loops_detected_total 1"));
@@ -896,7 +928,7 @@ mod tests {
             success: true,
             usage: TokenUsage::default(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(text.contains("heartbit_reliability_context_compactions_total 1"));
@@ -911,7 +943,7 @@ mod tests {
             success: false,
             usage: TokenUsage::default(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         // Should NOT increment on failure
@@ -927,7 +959,7 @@ mod tests {
             reason: "unsafe content".into(),
             tool_name: None,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -944,7 +976,7 @@ mod tests {
             error: "something broke".into(),
             partial_usage: TokenUsage::default(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -960,7 +992,7 @@ mod tests {
             agent: "researcher".into(),
             task: "find info".into(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -977,8 +1009,8 @@ mod tests {
             turn: 3,
             max_turns: 10,
         };
-        m.record_event(&event);
-        m.record_event(&event);
+        m.record_event(&event, None);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -995,7 +1027,7 @@ mod tests {
             total_usage: TokenUsage::default(),
             tool_calls_made: 5,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1011,8 +1043,8 @@ mod tests {
             agent: "orchestrator".into(),
             agents: vec!["a".into(), "b".into()],
         };
-        m.record_event(&event);
-        m.record_event(&event);
+        m.record_event(&event, None);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1034,9 +1066,9 @@ mod tests {
             success: false,
             usage: TokenUsage::default(),
         };
-        m.record_event(&success_event);
-        m.record_event(&success_event);
-        m.record_event(&failure_event);
+        m.record_event(&success_event, None);
+        m.record_event(&success_event, None);
+        m.record_event(&failure_event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1057,7 +1089,7 @@ mod tests {
             turn: 1,
             tool_names: vec!["bash".into()],
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1079,9 +1111,9 @@ mod tests {
             turn: 2,
             approved: false,
         };
-        m.record_event(&approved);
-        m.record_event(&approved);
-        m.record_event(&denied);
+        m.record_event(&approved, None);
+        m.record_event(&approved, None);
+        m.record_event(&denied, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1102,7 +1134,7 @@ mod tests {
             turn: 5,
             usage: TokenUsage::default(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1121,7 +1153,7 @@ mod tests {
             bytes_saved: 12345,
             tool_results_total: 10,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1144,7 +1176,7 @@ mod tests {
             bytes_saved: 0,
             tool_results_total: 0,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1172,9 +1204,9 @@ mod tests {
             priority: None,
             story_id: None,
         };
-        m.record_event(&promote);
-        m.record_event(&promote);
-        m.record_event(&drop);
+        m.record_event(&promote, None);
+        m.record_event(&promote, None);
+        m.record_event(&drop, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1200,8 +1232,8 @@ mod tests {
             event_count: 3,
             priority: None,
         };
-        m.record_event(&event);
-        m.record_event(&event);
+        m.record_event(&event, None);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1220,7 +1252,7 @@ mod tests {
             complexity_score: 0.15,
             escalated: false,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1243,7 +1275,7 @@ mod tests {
             complexity_score: 0.85,
             escalated: true,
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1267,7 +1299,7 @@ mod tests {
             tool_call_id: "c1".into(),
             input: "{}".into(),
         };
-        m.record_event(&event);
+        m.record_event(&event, None);
 
         let after = m.encode().unwrap();
         assert_eq!(before, after, "ToolCallStarted should be a noop");
@@ -1278,9 +1310,12 @@ mod tests {
         let m = DaemonMetrics::new().unwrap();
 
         // Submit
-        m.record_task_submitted();
+        m.record_task_submitted(Some("acme"), "api");
         let text = m.encode().unwrap();
-        assert!(text.contains("heartbit_daemon_tasks_submitted_total 1"));
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_submitted_total{source="api",tenant="acme"} 1"#),
+            "text: {text}"
+        );
 
         // Active
         m.tasks_active().inc();
@@ -1289,24 +1324,38 @@ mod tests {
 
         // Complete
         m.tasks_active().dec();
-        m.record_task_completed(12.5);
+        m.record_task_completed(12.5, Some("acme"));
         let text = m.encode().unwrap();
-        assert!(text.contains("heartbit_daemon_tasks_completed_total 1"));
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_completed_total{tenant="acme"} 1"#),
+            "text: {text}"
+        );
         assert!(text.contains("heartbit_daemon_tasks_active 0"));
 
         // Submit + fail
-        m.record_task_submitted();
+        m.record_task_submitted(None, "api");
         m.tasks_active().inc();
         m.tasks_active().dec();
-        m.record_task_failed(3.0);
+        m.record_task_failed(3.0, None);
         let text = m.encode().unwrap();
-        assert!(text.contains("heartbit_daemon_tasks_submitted_total 2"));
-        assert!(text.contains("heartbit_daemon_tasks_failed_total 1"));
+        assert!(
+            text.contains(
+                r#"heartbit_daemon_tasks_submitted_total{source="api",tenant="_none"} 1"#
+            ),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_failed_total{tenant="_none"} 1"#),
+            "text: {text}"
+        );
 
         // Cancel
-        m.record_task_cancelled();
+        m.record_task_cancelled(Some("acme"));
         let text = m.encode().unwrap();
-        assert!(text.contains("heartbit_daemon_tasks_cancelled_total 1"));
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_cancelled_total{tenant="acme"} 1"#),
+            "text: {text}"
+        );
     }
 
     #[test]
@@ -1496,9 +1545,15 @@ mod tests {
                 to_tier: "sonnet".into(),
                 reason: "gate_rejected".into(),
             },
+            AgentEvent::AgentSpawned {
+                agent: "orchestrator".into(),
+                spawned_name: "spawn:test".into(),
+                tools: vec!["read".into()],
+                task: "test".into(),
+            },
         ];
         for event in &events {
-            m.record_event(event);
+            m.record_event(event, None);
         }
 
         let text = m.encode().unwrap();
@@ -1514,8 +1569,8 @@ mod tests {
             to_tier: "sonnet".into(),
             reason: "gate_rejected".into(),
         };
-        m.record_event(&event);
-        m.record_event(&event);
+        m.record_event(&event, None);
+        m.record_event(&event, None);
 
         let text = m.encode().unwrap();
         assert!(
@@ -1524,5 +1579,127 @@ mod tests {
             ),
             "text: {text}"
         );
+    }
+
+    #[test]
+    fn record_event_with_tenant_label() {
+        let m = DaemonMetrics::new().unwrap();
+        let event = AgentEvent::LlmResponse {
+            agent: "coordinator".into(),
+            turn: 1,
+            usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 80,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+            tool_call_count: 0,
+            text: String::new(),
+            latency_ms: 500,
+            model: None,
+            time_to_first_token_ms: 0,
+        };
+        m.record_event(&event, Some("acme"));
+
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains(
+                r#"heartbit_llm_tokens_input_total{agent="coordinator",tenant="acme"} 200"#
+            ),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(
+                r#"heartbit_llm_tokens_output_total{agent="coordinator",tenant="acme"} 80"#
+            ),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_llm_calls_total{agent="coordinator",tenant="acme"} 1"#),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn record_task_submitted_with_tenant_and_source() {
+        let m = DaemonMetrics::new().unwrap();
+
+        m.record_task_submitted(Some("acme"), "api");
+        m.record_task_submitted(Some("acme"), "ws");
+        m.record_task_submitted(None, "telegram");
+
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_submitted_total{source="api",tenant="acme"} 1"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(r#"heartbit_daemon_tasks_submitted_total{source="ws",tenant="acme"} 1"#),
+            "text: {text}"
+        );
+        assert!(
+            text.contains(
+                r#"heartbit_daemon_tasks_submitted_total{source="telegram",tenant="_none"} 1"#
+            ),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn record_event_without_tenant_uses_none() {
+        let m = DaemonMetrics::new().unwrap();
+        let event = AgentEvent::LlmResponse {
+            agent: "a".into(),
+            turn: 1,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+            tool_call_count: 0,
+            text: String::new(),
+            latency_ms: 100,
+            model: None,
+            time_to_first_token_ms: 0,
+        };
+        m.record_event(&event, None);
+
+        let text = m.encode().unwrap();
+        assert!(
+            text.contains(r#"heartbit_llm_tokens_input_total{agent="a",tenant="_none"} 10"#),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn encode_includes_tenant_labels() {
+        let m = DaemonMetrics::new().unwrap();
+        m.record_task_submitted(Some("acme"), "api");
+        let event = AgentEvent::LlmResponse {
+            agent: "test".into(),
+            turn: 1,
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 25,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+            tool_call_count: 0,
+            text: String::new(),
+            latency_ms: 100,
+            model: None,
+            time_to_first_token_ms: 0,
+        };
+        m.record_event(&event, Some("acme"));
+
+        let text = m.encode().unwrap();
+        assert!(text.contains(r#"tenant="acme""#), "text: {text}");
     }
 }

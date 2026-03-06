@@ -23,20 +23,8 @@ impl Default for ChunkConfig {
 /// Uses a simple FNV-1a hash for stability across process restarts and
 /// Rust versions (unlike `DefaultHasher` which uses randomized SipHash).
 fn chunk_id(uri: &str, index: usize) -> String {
-    let hash = fnv1a_hash(uri.as_bytes());
+    let hash = crate::util::fnv1a_hash(uri.as_bytes());
     format!("{hash:016x}-{index}")
-}
-
-/// FNV-1a 64-bit hash — deterministic across all platforms and runs.
-fn fnv1a_hash(data: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }
 
 /// Split text into overlapping chunks, respecting paragraph boundaries.

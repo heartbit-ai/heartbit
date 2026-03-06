@@ -23,7 +23,10 @@ pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
 pub use store::PostgresTaskStore;
 pub use store::{InMemoryTaskStore, TaskStore};
 pub use todo::{FileTodoStore, TodoEntry, TodoList, TodoManageTool};
-pub use types::{DaemonCommand, DaemonTask, TaskState, TaskStats, UserContext};
+pub use types::{
+    DaemonCommand, DaemonTask, TaskState, TaskStats, UsageGroupBy, UsageQuery, UsageRow,
+    UserContext,
+};
 
 /// Object-safe async trait for producing daemon commands to a topic.
 ///

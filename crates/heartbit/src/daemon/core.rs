@@ -192,6 +192,14 @@ impl DaemonHandle {
         self.store.stats(tenant_id)
     }
 
+    /// Query usage statistics with filters and grouping.
+    pub fn usage_stats(
+        &self,
+        query: &super::types::UsageQuery,
+    ) -> Result<Vec<super::types::UsageRow>, Error> {
+        self.store.usage_stats(query)
+    }
+
     /// Produce a `CancelTask` command.
     pub async fn cancel_task(&self, id: uuid::Uuid) -> Result<(), Error> {
         let cmd = DaemonCommand::CancelTask { id };
@@ -408,6 +416,7 @@ impl DaemonCore {
                                                         t.tokens_used = tokens;
                                                         t.tool_calls_made = output.tool_calls_made;
                                                         t.estimated_cost_usd = cost;
+                                                        t.model_name = output.model_name.clone();
                                                     })
                                                     .ok();
                                                 if let Some(ref cb) = on_complete {
@@ -550,6 +559,7 @@ mod tests {
             auth: None,
             owner_emails: vec![],
             memory: crate::config::DaemonMemoryConfig::default(),
+            mcp_server: None,
         }
     }
 

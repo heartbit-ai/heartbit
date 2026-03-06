@@ -1,19 +1,29 @@
 pub mod audit;
+pub mod batch;
 pub mod blackboard;
 pub(crate) mod blackboard_tools;
+pub mod cache;
 pub mod context;
+pub mod dag;
+pub mod debate;
 pub mod events;
 pub mod guardrail;
 pub mod guardrails;
 pub mod instructions;
+pub mod mixture;
 pub mod observability;
 pub mod orchestrator;
 pub mod permission;
+pub mod prompts;
 pub mod pruner;
 pub mod routing;
 pub(crate) mod token_estimator;
 pub mod tool_filter;
+pub mod voting;
 pub mod workflow;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -125,6 +135,26 @@ pub struct AgentOutput {
     /// unknown or cost estimation is not available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
+    /// The model name used for this run. For cascading providers, this is the
+    /// last model that produced a response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+}
+
+impl AgentOutput {
+    /// Accumulate this output's usage, tool calls, and cost into running totals.
+    pub(crate) fn accumulate_into(
+        &self,
+        total_usage: &mut TokenUsage,
+        total_tool_calls: &mut usize,
+        total_cost: &mut Option<f64>,
+    ) {
+        *total_usage += self.tokens_used;
+        *total_tool_calls += self.tool_calls_made;
+        if let Some(cost) = self.estimated_cost_usd {
+            *total_cost.get_or_insert(0.0) += cost;
+        }
+    }
 }
 
 /// Runs an agent loop: LLM call → tool execution → repeat until done.
@@ -214,6 +244,9 @@ pub struct AgentRunner<P: LlmProvider> {
     audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (e.g., `["heartbit-agent"]` when acting on behalf of user).
     audit_delegation_chain: Vec<String>,
+    /// Optional LRU cache for LLM completion responses. Skips the LLM call
+    /// when an identical request (system prompt + messages + tool names) is found.
+    response_cache: Option<cache::ResponseCache>,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -260,6 +293,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             audit_user_id: None,
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
+            response_cache_size: None,
         }
     }
 
@@ -505,6 +539,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
+            let mut last_model_name: Option<String> = None;
             // Prevents infinite compaction loops: set true after compaction,
             // cleared at the start of each normal iteration.
             let mut compacted_last_turn = false;
@@ -582,6 +617,21 @@ impl<P: LlmProvider> AgentRunner<P> {
                         return Err((e, total_usage));
                     }
                 }
+                // Response cache: compute key for non-streaming requests.
+                let cache_key = if self.response_cache.is_some() && self.on_text.is_none() {
+                    let tool_names: Vec<&str> =
+                        request.tools.iter().map(|t| t.name.as_str()).collect();
+                    Some(cache::ResponseCache::compute_key(
+                        &request.system,
+                        &request.messages,
+                        &tool_names,
+                    ))
+                } else {
+                    None
+                };
+                // Check cache before calling LLM
+                let cache_hit = cache_key
+                    .and_then(|k| self.response_cache.as_ref().and_then(|c| c.get(k)));
                 let llm_start = Instant::now();
                 let llm_span = info_span!(
                     "heartbit.agent.llm_call",
@@ -595,39 +645,67 @@ impl<P: LlmProvider> AgentRunner<P> {
                     tool_call_count = tracing::field::Empty,
                     ttft_ms = tracing::field::Empty,
                     response_text = tracing::field::Empty,
+                    cache_hit = tracing::field::Empty,
                 );
-                // TTFT: wrap on_text to capture time-to-first-token
-                let ttft_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let llm_result = async {
-                    match &self.on_text {
-                        Some(cb) => {
-                            let ttft_ref = ttft_ms.clone();
-                            let start = llm_start;
-                            let inner_cb = cb.clone();
-                            let wrapper: Box<crate::llm::OnText> = Box::new(move |text: &str| {
-                                ttft_ref
-                                    .compare_exchange(
-                                        0,
-                                        start.elapsed().as_millis() as u64,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    )
-                                    .ok();
-                                inner_cb(text);
-                            });
-                            self.provider.stream_complete(request, &*wrapper).await
-                        }
-                        None => self.provider.complete(request).await,
+                let llm_result = if let Some(cached) = cache_hit {
+                    tracing::debug!(
+                        agent = %self.name,
+                        turn = ctx.current_turn(),
+                        "response cache hit, skipping LLM call"
+                    );
+                    if mode.includes_metrics() {
+                        llm_span.record("cache_hit", true);
                     }
-                }
-                .instrument(llm_span.clone())
-                .await;
+                    Ok(cached)
+                } else {
+                    // TTFT: wrap on_text to capture time-to-first-token
+                    let ttft_ms_inner = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let ttft_ref = ttft_ms_inner.clone();
+                    let result = async {
+                        match &self.on_text {
+                            Some(cb) => {
+                                let ttft_ref = ttft_ref.clone();
+                                let start = llm_start;
+                                let inner_cb = cb.clone();
+                                let wrapper: Box<crate::llm::OnText> =
+                                    Box::new(move |text: &str| {
+                                        ttft_ref
+                                            .compare_exchange(
+                                                0,
+                                                start.elapsed().as_millis() as u64,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            )
+                                            .ok();
+                                        inner_cb(text);
+                                    });
+                                self.provider.stream_complete(request, &*wrapper).await
+                            }
+                            None => self.provider.complete(request).await,
+                        }
+                    }
+                    .instrument(llm_span.clone())
+                    .await;
+                    // Store successful non-streaming responses in cache.
+                    // Only cache EndTurn responses — ToolUse responses trigger
+                    // side-effecting tool execution and must not be replayed.
+                    if let (Ok(resp), Some(key)) = (&result, cache_key)
+                        && resp.stop_reason == crate::llm::types::StopReason::EndTurn
+                        && let Some(ref c) = self.response_cache
+                    {
+                        c.put(key, resp.clone());
+                    }
+                    if mode.includes_metrics() {
+                        let ttft = ttft_ms_inner.load(std::sync::atomic::Ordering::Relaxed);
+                        llm_span.record("ttft_ms", ttft);
+                        llm_span.record("cache_hit", false);
+                    }
+                    result
+                };
                 let llm_latency_ms = llm_start.elapsed().as_millis() as u64;
-                let time_to_first_token_ms = ttft_ms.load(std::sync::atomic::Ordering::Relaxed);
                 // Record LLM call span attributes
                 if mode.includes_metrics() {
                     llm_span.record("latency_ms", llm_latency_ms);
-                    llm_span.record("ttft_ms", time_to_first_token_ms);
                     if let Ok(ref r) = llm_result {
                         if let Some(ref model) = r.model {
                             llm_span.record(observability::GEN_AI_REQUEST_MODEL, model.as_str());
@@ -741,11 +819,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                     .model
                     .as_deref()
                     .or_else(|| self.provider.model_name());
-                if let Some(model) = turn_model
-                    && let Some(cost) =
+                if let Some(model) = turn_model {
+                    last_model_name = Some(model.to_string());
+                    if let Some(cost) =
                         crate::llm::pricing::estimate_cost(model, &response.usage)
-                {
-                    total_cost += cost;
+                    {
+                        total_cost += cost;
+                    }
                 }
                 // Update shared accumulator so RunTimeout can retrieve partial usage
                 *usage_acc.lock().expect("usage lock poisoned") = total_usage;
@@ -781,7 +861,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         .model
                         .clone()
                         .or_else(|| self.provider.model_name().map(|s| s.to_string())),
-                    time_to_first_token_ms,
+                    time_to_first_token_ms: 0,
                 });
 
                 // Audit: LLM response (untruncated)
@@ -958,6 +1038,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         } else {
                             self.estimate_cost(&total_usage)
                         },
+                        model_name: last_model_name.clone(),
                     });
                 }
 
@@ -1036,6 +1117,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         } else {
                             self.estimate_cost(&total_usage)
                         },
+                        model_name: last_model_name.clone(),
                     });
                 }
 
@@ -2016,6 +2098,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (e.g., `["heartbit-agent"]` when acting OBO user).
     audit_delegation_chain: Vec<String>,
+    /// Optional LRU response cache size. When set, builds a `ResponseCache`.
+    response_cache_size: Option<usize>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -2353,6 +2437,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Enable an LRU response cache with the given maximum number of entries.
+    /// Identical requests (same system prompt, messages, and tool names) return
+    /// cached responses without calling the LLM. Only non-streaming calls are cached.
+    /// Size must be at least 1.
+    pub fn response_cache_size(mut self, size: usize) -> Self {
+        self.response_cache_size = Some(size);
+        self
+    }
+
     /// Set the agent's workspace directory. When set, file tools resolve
     /// relative paths against this directory, BashTool starts here, and a
     /// workspace hint is appended to the system prompt.
@@ -2402,6 +2495,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         }
         if self.max_total_tokens == Some(0) {
             return Err(Error::Config("max_total_tokens must be at least 1".into()));
+        }
+        if self.response_cache_size == Some(0) {
+            return Err(Error::Config(
+                "response_cache_size must be at least 1".into(),
+            ));
         }
 
         // Collect all tools, including memory and knowledge tools
@@ -2523,6 +2621,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             audit_user_id: self.audit_user_id,
             audit_tenant_id: self.audit_tenant_id,
             audit_delegation_chain: self.audit_delegation_chain,
+            response_cache: self.response_cache_size.map(cache::ResponseCache::new),
         })
     }
 }
@@ -4031,6 +4130,7 @@ mod tests {
             },
             structured: Some(json!({"answer": "42"})),
             estimated_cost_usd: Some(0.0342),
+            model_name: Some("claude-sonnet-4-6-20250610".into()),
         };
         let json_str = serde_json::to_string(&output).unwrap();
         let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
@@ -4039,6 +4139,10 @@ mod tests {
         assert_eq!(parsed.tokens_used.input_tokens, 100);
         assert_eq!(parsed.structured, Some(json!({"answer": "42"})));
         assert_eq!(parsed.estimated_cost_usd, Some(0.0342));
+        assert_eq!(
+            parsed.model_name.as_deref(),
+            Some("claude-sonnet-4-6-20250610")
+        );
     }
 
     #[test]
@@ -4049,10 +4153,21 @@ mod tests {
             tokens_used: TokenUsage::default(),
             structured: None,
             estimated_cost_usd: None,
+            model_name: None,
         };
         let json_str = serde_json::to_string(&output).unwrap();
         let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
         assert!(parsed.structured.is_none());
+        assert!(parsed.model_name.is_none());
+    }
+
+    #[test]
+    fn agent_output_backward_compat_no_model_name() {
+        // Old JSON without model_name field should deserialize with None
+        let json = r#"{"result":"ok","tool_calls_made":0,"tokens_used":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0}}"#;
+        let parsed: AgentOutput = serde_json::from_str(json).unwrap();
+        assert!(parsed.model_name.is_none());
+        assert_eq!(parsed.result, "ok");
     }
 
     #[tokio::test]
@@ -6760,6 +6875,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn builder_rejects_zero_response_cache_size() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .response_cache_size(0)
+            .build();
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("response_cache_size must be at least 1"),
+                    "error: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for response_cache_size(0)"),
+        }
+    }
+
     // --- Permission Rules Integration Tests ---
 
     #[tokio::test]
@@ -7582,5 +7717,121 @@ mod tests {
 
         assert!(runner.audit_user_id.is_none());
         assert!(runner.audit_tenant_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_llm_warn_does_not_block_execution() {
+        // A Warn guardrail should emit an event but NOT discard the response.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WarnAlways;
+        impl Guardrail for WarnAlways {
+            fn post_llm(
+                &self,
+                _response: &crate::llm::types::CompletionResponse,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(GuardAction::warn("suspicious but allowed")) })
+            }
+        }
+
+        let warned = Arc::new(AtomicBool::new(false));
+        let warned_clone = warned.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            model: None,
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .guardrail(Arc::new(WarnAlways))
+            .on_event(Arc::new(move |event| {
+                if matches!(event, AgentEvent::GuardrailWarned { .. }) {
+                    warned_clone.store(true, Ordering::Relaxed);
+                }
+            }))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("hello").await.unwrap();
+        // Response was NOT discarded — Warn allows execution to continue
+        assert_eq!(output.result, "answer");
+        // GuardrailWarned event was emitted
+        assert!(
+            warned.load(Ordering::Relaxed),
+            "GuardrailWarned event should have fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_warn_does_not_block_tool_execution() {
+        // A Warn on pre_tool should emit event but still execute the tool.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WarnPreTool;
+        impl Guardrail for WarnPreTool {
+            fn pre_tool(
+                &self,
+                _call: &crate::llm::types::ToolCall,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(GuardAction::warn("risky tool usage")) })
+            }
+        }
+
+        let warned = Arc::new(AtomicBool::new(false));
+        let warned_clone = warned.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Done with search.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "search result")))
+            .guardrail(Arc::new(WarnPreTool))
+            .on_event(Arc::new(move |event| {
+                if matches!(event, AgentEvent::GuardrailWarned { .. }) {
+                    warned_clone.store(true, Ordering::Relaxed);
+                }
+            }))
+            .build()
+            .unwrap();
+
+        let output = runner.execute("search something").await.unwrap();
+        // Tool was executed despite the Warn
+        assert_eq!(output.result, "Done with search.");
+        assert_eq!(output.tool_calls_made, 1);
+        // GuardrailWarned event was emitted
+        assert!(
+            warned.load(Ordering::Relaxed),
+            "GuardrailWarned event should have fired"
+        );
     }
 }

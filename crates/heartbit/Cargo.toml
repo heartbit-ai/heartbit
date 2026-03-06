@@ -29,6 +29,7 @@ jsonschema = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 tokio-util = { workspace = true }
+petgraph = { workspace = true }
 
 # --- Optional (feature-gated) ---
 rdkafka = { workspace = true, optional = true }
@@ -47,6 +48,7 @@ teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+heartbit-macro = { path = "../heartbit-macro", optional = true }
 
 [features]
 default = ["core"]
@@ -59,6 +61,7 @@ postgres = ["dep:sqlx", "dep:pgvector"]
 a2a = ["dep:a2a-sdk"]
 telegram = ["dep:teloxide"]
 local-embedding = ["dep:fastembed"]
+macro = ["dep:heartbit-macro"]
 full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram"]
 
 [dev-dependencies]

@@ -50,12 +50,7 @@ fn is_audio_extension(ext: &str) -> bool {
 
 /// Compute an FNV-1a hash of the given bytes and return as hex string.
 fn fnv1a_hex(data: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", crate::util::fnv1a_hash(data))
 }
 
 /// Build a `SensorEvent` from file metadata.

@@ -503,6 +503,7 @@ mod tests {
             auth: None,
             owner_emails: vec![],
             memory: crate::config::DaemonMemoryConfig::default(),
+            mcp_server: None,
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
@@ -570,6 +571,7 @@ mod tests {
                     tokens_used: crate::llm::types::TokenUsage::default(),
                     structured: None,
                     estimated_cost_usd: None,
+                    model_name: None,
                 })
             }
         };

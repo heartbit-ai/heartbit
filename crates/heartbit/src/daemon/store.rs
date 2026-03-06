@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-#[cfg(any(feature = "postgres", test))]
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::types::{DaemonTask, TaskState, TaskStats};
+use super::types::{DaemonTask, TaskState, TaskStats, UsageGroupBy, UsageQuery, UsageRow};
 use crate::Error;
 #[cfg(any(feature = "postgres", test))]
 use crate::llm::types::TokenUsage;
@@ -80,6 +79,104 @@ pub trait TaskStore: Send + Sync {
             }
         }
         Ok(stats)
+    }
+
+    /// Query usage statistics with time-range, filters, and optional grouping.
+    fn usage_stats(&self, query: &UsageQuery) -> Result<Vec<UsageRow>, Error> {
+        let (all_tasks, _) = self.list(usize::MAX, 0)?;
+        let filtered: Vec<&DaemonTask> = all_tasks
+            .iter()
+            .filter(|t| query.from.is_none_or(|from| t.created_at >= from))
+            .filter(|t| query.to.is_none_or(|to| t.created_at < to))
+            .filter(|t| {
+                query
+                    .tenant_id
+                    .as_deref()
+                    .is_none_or(|tid| t.tenant_id.as_deref() == Some(tid))
+            })
+            .filter(|t| {
+                query
+                    .user_id
+                    .as_deref()
+                    .is_none_or(|uid| t.user_id.as_deref() == Some(uid))
+            })
+            .filter(|t| {
+                query
+                    .agent_name
+                    .as_deref()
+                    .is_none_or(|a| t.agent_name.as_deref() == Some(a))
+            })
+            .filter(|t| {
+                query
+                    .model_name
+                    .as_deref()
+                    .is_none_or(|m| t.model_name.as_deref() == Some(m))
+            })
+            .filter(|t| query.source.as_deref().is_none_or(|s| t.source == s))
+            .collect();
+
+        // Group tasks
+        let mut groups: HashMap<Option<String>, Vec<&DaemonTask>> = HashMap::new();
+        for task in &filtered {
+            let key = match query.group_by {
+                None => None,
+                Some(UsageGroupBy::Agent) => task.agent_name.clone(),
+                Some(UsageGroupBy::Model) => task.model_name.clone(),
+                Some(UsageGroupBy::User) => task.user_id.clone(),
+                Some(UsageGroupBy::Tenant) => task.tenant_id.clone(),
+                Some(UsageGroupBy::Source) => Some(task.source.clone()),
+                Some(UsageGroupBy::Day) => Some(task.created_at.format("%Y-%m-%d").to_string()),
+            };
+            groups.entry(key).or_default().push(task);
+        }
+
+        // If no tasks matched and no grouping, return a single zero row
+        if groups.is_empty() {
+            return Ok(vec![UsageRow::default()]);
+        }
+
+        let mut rows: Vec<UsageRow> = groups
+            .into_iter()
+            .map(|(key, tasks)| {
+                let mut row = UsageRow {
+                    group_key: key,
+                    task_count: tasks.len() as u64,
+                    ..Default::default()
+                };
+                let mut duration_sum = 0.0f64;
+                let mut duration_count = 0u64;
+                for t in &tasks {
+                    if t.state == TaskState::Completed {
+                        row.completed_count += 1;
+                    }
+                    if t.state == TaskState::Failed {
+                        row.failed_count += 1;
+                    }
+                    row.input_tokens += t.tokens_used.input_tokens as u64;
+                    row.output_tokens += t.tokens_used.output_tokens as u64;
+                    row.cache_read_tokens += t.tokens_used.cache_read_input_tokens as u64;
+                    row.cache_creation_tokens += t.tokens_used.cache_creation_input_tokens as u64;
+                    row.reasoning_tokens += t.tokens_used.reasoning_tokens as u64;
+                    row.tool_calls += t.tool_calls_made as u64;
+                    if let Some(cost) = t.estimated_cost_usd {
+                        row.estimated_cost_usd += cost;
+                    }
+                    if let (Some(started), Some(completed)) = (t.started_at, t.completed_at) {
+                        let dur = (completed - started).num_milliseconds() as f64 / 1000.0;
+                        duration_sum += dur;
+                        duration_count += 1;
+                    }
+                }
+                if duration_count > 0 {
+                    row.avg_duration_secs = Some(duration_sum / duration_count as f64);
+                }
+                row
+            })
+            .collect();
+
+        // Sort by group_key for deterministic output
+        rows.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+        Ok(rows)
     }
 }
 
@@ -227,6 +324,7 @@ mod postgres_store {
         pub(crate) agent_name: Option<String>,
         pub(crate) user_id: Option<String>,
         pub(crate) tenant_id: Option<String>,
+        pub(crate) model_name: Option<String>,
     }
 
     /// Parse a DB task state string back to `TaskState`.
@@ -259,6 +357,7 @@ mod postgres_store {
                 agent_name: row.agent_name,
                 user_id: row.user_id,
                 tenant_id: row.tenant_id,
+                model_name: row.model_name,
             }
         }
     }
@@ -308,7 +407,8 @@ mod postgres_store {
                 source                      TEXT NOT NULL,
                 agent_name                  TEXT,
                 user_id                     TEXT,
-                tenant_id                   TEXT
+                tenant_id                   TEXT,
+                model_name                  TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at
                 ON daemon_tasks(created_at);
@@ -316,6 +416,14 @@ mod postgres_store {
                 ON daemon_tasks(state);
             CREATE INDEX IF NOT EXISTS idx_daemon_tasks_tenant_id
                 ON daemon_tasks(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_model_name
+                ON daemon_tasks(model_name);
+            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_agent_name
+                ON daemon_tasks(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_user_id
+                ON daemon_tasks(user_id);
+            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_source
+                ON daemon_tasks(source);
             "#,
             )
             .execute(&self.pool)
@@ -323,7 +431,7 @@ mod postgres_store {
             .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
 
             // Add columns if not already present (for existing tables).
-            for col in ["agent_name", "user_id", "tenant_id"] {
+            for col in ["agent_name", "user_id", "tenant_id", "model_name"] {
                 sqlx::query(&format!(
                     "ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS {col} TEXT"
                 ))
@@ -346,8 +454,8 @@ mod postgres_store {
                         (id, task, state, created_at, started_at, completed_at, result, error,
                          input_tokens, output_tokens, cache_creation_input_tokens,
                          cache_read_input_tokens, reasoning_tokens, tool_calls_made,
-                         estimated_cost_usd, source, agent_name, user_id, tenant_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
+                         estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"#,
                 )
                 .bind(task.id)
                 .bind(&task.task)
@@ -368,6 +476,7 @@ mod postgres_store {
                 .bind(&task.agent_name)
                 .bind(&task.user_id)
                 .bind(&task.tenant_id)
+                .bind(&task.model_name)
                 .execute(&pool)
                 .await
                 .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
@@ -384,7 +493,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -408,7 +517,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
                      FROM daemon_tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit as i64)
@@ -431,7 +540,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -452,7 +561,7 @@ mod postgres_store {
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
                         estimated_cost_usd = $14, source = $15, agent_name = $16,
-                        user_id = $17, tenant_id = $18
+                        user_id = $17, tenant_id = $18, model_name = $19
                     WHERE id = $1"#,
                     )
                     .bind(task.id)
@@ -473,6 +582,7 @@ mod postgres_store {
                     .bind(&task.agent_name)
                     .bind(&task.user_id)
                     .bind(&task.tenant_id)
+                    .bind(&task.model_name)
                     .execute(&pool)
                     .await
                     .map_err(|e| Error::Daemon(format!("failed to update task: {e}")))?;
@@ -540,7 +650,7 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
                      FROM daemon_tasks {where_clause} ORDER BY created_at DESC \
                      LIMIT ${param_idx} OFFSET ${}",
                     param_idx + 1
@@ -632,6 +742,157 @@ mod postgres_store {
                         stats.total_estimated_cost_usd += row.sum_cost;
                     }
                     Ok(stats)
+                })
+            })
+        }
+
+        fn usage_stats(&self, query: &UsageQuery) -> Result<Vec<UsageRow>, Error> {
+            let pool = self.pool.clone();
+            let query = query.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    // Build dynamic SQL
+                    let mut conditions = Vec::new();
+                    let mut param_idx = 1u32;
+
+                    if query.from.is_some() {
+                        conditions.push(format!("created_at >= ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.to.is_some() {
+                        conditions.push(format!("created_at < ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.tenant_id.is_some() {
+                        conditions.push(format!("tenant_id = ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.user_id.is_some() {
+                        conditions.push(format!("user_id = ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.agent_name.is_some() {
+                        conditions.push(format!("agent_name = ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.model_name.is_some() {
+                        conditions.push(format!("model_name = ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    if query.source.is_some() {
+                        conditions.push(format!("source = ${param_idx}"));
+                        param_idx += 1;
+                    }
+                    let _ = param_idx;
+
+                    let where_clause = if conditions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("WHERE {}", conditions.join(" AND "))
+                    };
+
+                    let group_col = match query.group_by {
+                        Some(UsageGroupBy::Agent) => Some("agent_name"),
+                        Some(UsageGroupBy::Model) => Some("model_name"),
+                        Some(UsageGroupBy::User) => Some("user_id"),
+                        Some(UsageGroupBy::Tenant) => Some("tenant_id"),
+                        Some(UsageGroupBy::Source) => Some("source"),
+                        Some(UsageGroupBy::Day) => {
+                            Some("DATE_TRUNC('day', created_at)::date::text")
+                        }
+                        None => None,
+                    };
+
+                    let (select_key, group_by_clause) = match group_col {
+                        Some(col) => (format!("{col} AS group_key"), format!("GROUP BY {col}")),
+                        None => ("NULL AS group_key".to_string(), String::new()),
+                    };
+
+                    let sql = format!(
+                        "SELECT {select_key}, \
+                         COUNT(*) AS task_count, \
+                         COUNT(*) FILTER (WHERE state = 'completed') AS completed_count, \
+                         COUNT(*) FILTER (WHERE state = 'failed') AS failed_count, \
+                         COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                         COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                         COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_tokens, \
+                         COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_tokens, \
+                         COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, \
+                         COALESCE(SUM(tool_calls_made), 0) AS tool_calls, \
+                         COALESCE(SUM(estimated_cost_usd), 0.0) AS estimated_cost_usd, \
+                         AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) \
+                           FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) \
+                           AS avg_duration_secs \
+                         FROM daemon_tasks {where_clause} {group_by_clause} \
+                         ORDER BY group_key NULLS FIRST"
+                    );
+
+                    #[derive(sqlx::FromRow)]
+                    struct Row {
+                        group_key: Option<String>,
+                        task_count: i64,
+                        completed_count: i64,
+                        failed_count: i64,
+                        input_tokens: i64,
+                        output_tokens: i64,
+                        cache_read_tokens: i64,
+                        cache_creation_tokens: i64,
+                        reasoning_tokens: i64,
+                        tool_calls: i64,
+                        estimated_cost_usd: f64,
+                        avg_duration_secs: Option<f64>,
+                    }
+
+                    let mut qb = sqlx::query_as::<_, Row>(&sql);
+                    // Bind parameters in the same order as conditions
+                    if let Some(ref v) = query.from {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.to {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.tenant_id {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.user_id {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.agent_name {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.model_name {
+                        qb = qb.bind(v);
+                    }
+                    if let Some(ref v) = query.source {
+                        qb = qb.bind(v);
+                    }
+
+                    let rows: Vec<Row> = qb
+                        .fetch_all(&pool)
+                        .await
+                        .map_err(|e| Error::Daemon(format!("usage_stats query failed: {e}")))?;
+
+                    if rows.is_empty() {
+                        return Ok(vec![UsageRow::default()]);
+                    }
+
+                    Ok(rows
+                        .into_iter()
+                        .map(|r| UsageRow {
+                            group_key: r.group_key,
+                            task_count: r.task_count as u64,
+                            completed_count: r.completed_count as u64,
+                            failed_count: r.failed_count as u64,
+                            input_tokens: r.input_tokens as u64,
+                            output_tokens: r.output_tokens as u64,
+                            cache_read_tokens: r.cache_read_tokens as u64,
+                            cache_creation_tokens: r.cache_creation_tokens as u64,
+                            reasoning_tokens: r.reasoning_tokens as u64,
+                            tool_calls: r.tool_calls as u64,
+                            estimated_cost_usd: r.estimated_cost_usd,
+                            avg_duration_secs: r.avg_duration_secs,
+                        })
+                        .collect())
                 })
             })
         }
@@ -862,6 +1123,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            model_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.id, id);
@@ -900,6 +1162,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            model_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Completed);
@@ -938,6 +1201,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            model_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.state, TaskState::Failed);
@@ -971,6 +1235,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            model_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.created_at, created);
@@ -1001,6 +1266,7 @@ mod tests {
             agent_name: Some("security-bot".into()),
             user_id: Some("user-42".into()),
             tenant_id: Some("tenant-a".into()),
+            model_name: None,
         };
         let task = DaemonTask::from(row);
         assert_eq!(task.agent_name.as_deref(), Some("security-bot"));
@@ -1398,5 +1664,290 @@ mod tests {
             .list_filtered(10, 0, None, None, Some("acme"))
             .unwrap();
         assert_eq!(total, 1);
+    }
+
+    // --- usage_stats tests ---
+
+    fn make_task_with(
+        source: &str,
+        state: TaskState,
+        agent: Option<&str>,
+        model: Option<&str>,
+        tokens: u32,
+        cost: Option<f64>,
+        created_at: DateTime<Utc>,
+    ) -> DaemonTask {
+        let mut t = DaemonTask::new(Uuid::new_v4(), "task", source);
+        t.state = state;
+        t.agent_name = agent.map(String::from);
+        t.model_name = model.map(String::from);
+        t.tokens_used.input_tokens = tokens;
+        t.tokens_used.output_tokens = tokens / 2;
+        t.estimated_cost_usd = cost;
+        t.created_at = created_at;
+        if state == TaskState::Completed || state == TaskState::Failed {
+            t.started_at = Some(created_at);
+            t.completed_at = Some(created_at + chrono::Duration::seconds(10));
+        }
+        t
+    }
+
+    #[test]
+    fn usage_stats_empty_store() {
+        let store = InMemoryTaskStore::new();
+        let rows = store.usage_stats(&UsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_count, 0);
+        assert_eq!(rows[0].estimated_cost_usd, 0.0);
+        assert!(rows[0].group_key.is_none());
+    }
+
+    #[test]
+    fn usage_stats_no_group_single_total() {
+        let store = InMemoryTaskStore::new();
+        let now = Utc::now();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                Some("bot-a"),
+                Some("claude-sonnet-4-6-20250610"),
+                100,
+                Some(0.01),
+                now,
+            ))
+            .unwrap();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Failed,
+                Some("bot-b"),
+                Some("claude-haiku-4-5-20251001"),
+                50,
+                Some(0.005),
+                now,
+            ))
+            .unwrap();
+
+        let rows = store.usage_stats(&UsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_count, 2);
+        assert_eq!(rows[0].completed_count, 1);
+        assert_eq!(rows[0].failed_count, 1);
+        assert_eq!(rows[0].input_tokens, 150);
+        assert!((rows[0].estimated_cost_usd - 0.015).abs() < 1e-9);
+        assert!(rows[0].avg_duration_secs.is_some());
+    }
+
+    #[test]
+    fn usage_stats_time_range_filter() {
+        let store = InMemoryTaskStore::new();
+        let t1 = Utc::now() - chrono::Duration::hours(48);
+        let t2 = Utc::now() - chrono::Duration::hours(1);
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                None,
+                100,
+                Some(0.01),
+                t1,
+            ))
+            .unwrap();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                None,
+                200,
+                Some(0.02),
+                t2,
+            ))
+            .unwrap();
+
+        // Only recent task in range
+        let rows = store
+            .usage_stats(&UsageQuery {
+                from: Some(Utc::now() - chrono::Duration::hours(24)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_count, 1);
+        assert_eq!(rows[0].input_tokens, 200);
+    }
+
+    #[test]
+    fn usage_stats_group_by_agent() {
+        let store = InMemoryTaskStore::new();
+        let now = Utc::now();
+        for agent in &["bot-a", "bot-a", "bot-b"] {
+            store
+                .insert(make_task_with(
+                    "api",
+                    TaskState::Completed,
+                    Some(agent),
+                    None,
+                    100,
+                    Some(0.01),
+                    now,
+                ))
+                .unwrap();
+        }
+
+        let rows = store
+            .usage_stats(&UsageQuery {
+                group_by: Some(UsageGroupBy::Agent),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Sorted: bot-a, bot-b
+        assert_eq!(rows[0].group_key.as_deref(), Some("bot-a"));
+        assert_eq!(rows[0].task_count, 2);
+        assert_eq!(rows[1].group_key.as_deref(), Some("bot-b"));
+        assert_eq!(rows[1].task_count, 1);
+    }
+
+    #[test]
+    fn usage_stats_group_by_model() {
+        let store = InMemoryTaskStore::new();
+        let now = Utc::now();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                Some("claude-sonnet-4-6-20250610"),
+                100,
+                Some(0.01),
+                now,
+            ))
+            .unwrap();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                Some("claude-haiku-4-5-20251001"),
+                50,
+                Some(0.002),
+                now,
+            ))
+            .unwrap();
+
+        let rows = store
+            .usage_stats(&UsageQuery {
+                group_by: Some(UsageGroupBy::Model),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].group_key.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(
+            rows[1].group_key.as_deref(),
+            Some("claude-sonnet-4-6-20250610")
+        );
+    }
+
+    #[test]
+    fn usage_stats_group_by_day() {
+        let store = InMemoryTaskStore::new();
+        let day1 = DateTime::parse_from_rfc3339("2026-03-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let day2 = DateTime::parse_from_rfc3339("2026-03-02T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                None,
+                100,
+                Some(0.01),
+                day1,
+            ))
+            .unwrap();
+        store
+            .insert(make_task_with(
+                "api",
+                TaskState::Completed,
+                None,
+                None,
+                200,
+                Some(0.02),
+                day2,
+            ))
+            .unwrap();
+
+        let rows = store
+            .usage_stats(&UsageQuery {
+                group_by: Some(UsageGroupBy::Day),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].group_key.as_deref(), Some("2026-03-01"));
+        assert_eq!(rows[1].group_key.as_deref(), Some("2026-03-02"));
+    }
+
+    #[test]
+    fn usage_stats_combined_filters() {
+        let store = InMemoryTaskStore::new();
+        let now = Utc::now();
+        let mut t = make_task_with(
+            "api",
+            TaskState::Completed,
+            None,
+            None,
+            100,
+            Some(0.01),
+            now,
+        );
+        t.tenant_id = Some("acme".into());
+        store.insert(t).unwrap();
+
+        let mut t = make_task_with(
+            "cron",
+            TaskState::Completed,
+            None,
+            None,
+            200,
+            Some(0.02),
+            now,
+        );
+        t.tenant_id = Some("acme".into());
+        store.insert(t).unwrap();
+
+        let mut t = make_task_with(
+            "api",
+            TaskState::Completed,
+            None,
+            None,
+            300,
+            Some(0.03),
+            now,
+        );
+        t.tenant_id = Some("other".into());
+        store.insert(t).unwrap();
+
+        // Filter: tenant=acme, source=api
+        let rows = store
+            .usage_stats(&UsageQuery {
+                tenant_id: Some("acme".into()),
+                source: Some("api".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_count, 1);
+        assert_eq!(rows[0].input_tokens, 100);
     }
 }

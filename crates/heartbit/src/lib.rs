@@ -62,6 +62,8 @@
 //! - [`Guardrail`] — pre/post LLM and tool hooks
 //! - [`EvalRunner`] / [`EvalCase`] — evaluation framework
 
+extern crate self as heartbit;
+
 // --- Core modules (always available) ---
 pub mod agent;
 pub mod channel;
@@ -109,8 +111,12 @@ pub use channel::telegram::{
 
 // --- Agent re-exports ---
 pub use agent::audit::{AuditRecord, AuditTrail, InMemoryAuditTrail};
+pub use agent::batch::{BatchConfig, BatchExecutor, BatchExecutorBuilder, BatchResult};
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
+pub use agent::cache::ResponseCache;
 pub use agent::context::ContextStrategy;
+pub use agent::dag::{DagAgent, DagAgentBuilder};
+pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
 pub use agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
 #[cfg(feature = "sensor")]
@@ -124,34 +130,37 @@ pub use agent::guardrails::{
 pub use agent::instructions::{
     discover_instruction_files, load_instructions, prepend_instructions,
 };
+pub use agent::mixture::{MixtureOfAgentsAgent, MixtureOfAgentsAgentBuilder};
 pub use agent::observability::ObservabilityMode;
 pub use agent::orchestrator::{Orchestrator, OrchestratorBuilder, SubAgentConfig};
 pub use agent::permission::{
     LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
 };
+pub use agent::prompts::MULTI_AGENT_COLLAB_PROMPT;
 pub use agent::pruner::SessionPruneConfig;
 pub use agent::routing::{
     AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,
     RoutingStrategy, TaskComplexityAnalyzer, resolve_routing_mode, should_escalate,
 };
 pub use agent::tool_filter::ToolProfile;
+pub use agent::voting::{VoteResult, VotingAgent, VotingAgentBuilder};
 pub use agent::workflow::{
     LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
-    SequentialAgentBuilder,
+    SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
 // --- Config re-exports (always available — just data structs) ---
 pub use config::{
     ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, CascadeConfig,
-    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig, DispatchMode,
-    EmbeddingConfig, GuardrailsConfig, HeartbitConfig, HeartbitPulseConfig, InjectionConfig,
-    InputConstraintConfig, KafkaConfig, KnowledgeConfig, KnowledgeSourceConfig, LspConfig,
-    McpServerEntry, MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig,
-    RetryProviderConfig, SalienceConfig, ScheduleEntry, SensorConfig, SensorModality,
-    SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, StoryCorrelationConfig,
-    TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig,
-    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
+    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig,
+    DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
+    HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KafkaConfig, KnowledgeConfig,
+    KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry, MemoryConfig, MetricsConfig,
+    OrchestratorConfig, PiiConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry,
+    SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml,
+    SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
+    ToolPolicyRuleConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
 };
 
 // --- Auth re-exports (feature-gated) ---
@@ -166,7 +175,7 @@ pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
     OnTaskComplete, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, UserContext, format_notification,
+    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
 };
 
 // --- Error re-exports ---
@@ -174,8 +183,10 @@ pub use error::Error;
 
 // --- Eval re-exports ---
 pub use eval::{
-    EvalCase, EvalResult, EvalRunner, EvalScorer, EvalSummary, EventCollector, ExpectedToolCall,
-    KeywordScorer, ScorerResult, SimilarityScorer, TrajectoryScorer, build_eval_agent,
+    CaseComparison, CostScorer, EvalCase, EvalComparison, EvalResult, EvalRunner, EvalScorer,
+    EvalSummary, EventCollector, ExpectedToolCall, KeywordScorer, LatencyScorer, SafetyScorer,
+    ScorerResult, SimilarityScorer, ToolCallCountScorer, TrajectoryScorer, build_eval_agent,
+    clear_events,
 };
 
 // --- Knowledge re-exports ---
@@ -243,8 +254,18 @@ pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
     QuestionResponse, TodoPriority, TodoStatus, TodoStore, builtin_tools,
 };
-pub use tool::mcp::{AuthProvider, McpClient, StaticAuthProvider, TokenExchangeAuthProvider};
+pub use tool::mcp::{
+    AuthProvider, McpClient, McpPromptArgument, McpPromptDef, McpPromptMessage,
+    McpPromptMessageContent, McpResourceContent, McpResourceDef, McpRoot, SamplingContent,
+    SamplingHandler, SamplingMessage, SamplingModelHint, SamplingModelPreferences, SamplingRequest,
+    StaticAuthProvider, TokenExchangeAuthProvider,
+};
+pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
+
+// --- Macro re-exports (feature-gated) ---
+#[cfg(feature = "macro")]
+pub use heartbit_macro::heartbit_tool;
 
 // --- Store re-exports ---
 #[cfg(feature = "postgres")]

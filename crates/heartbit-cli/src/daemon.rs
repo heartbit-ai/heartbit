@@ -93,6 +93,45 @@ fn default_limit() -> usize {
     50
 }
 
+#[derive(Deserialize)]
+pub struct UsageQueryParams {
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub group_by: Option<heartbit::UsageGroupBy>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Parse an optional RFC 3339 date string into `DateTime<Utc>`.
+/// Returns `Err` with a 400 response if the string is present but malformed.
+fn parse_rfc3339(
+    s: &Option<String>,
+    field: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<serde_json::Value>)> {
+    match s.as_deref() {
+        None | Some("") => Ok(None),
+        Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+            .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("invalid RFC 3339 date for '{field}': {v}")
+                    })),
+                )
+            }),
+    }
+}
+
 #[derive(Serialize)]
 pub struct ListResponse {
     pub tasks: Vec<heartbit::DaemonTask>,
@@ -148,6 +187,9 @@ fn task_tenant_allowed(
 #[derive(Clone, Copy)]
 struct ServiceAuth;
 
+type PendingApprovals =
+    Arc<std::sync::Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<heartbit::ApprovalDecision>>>>;
+
 #[derive(Clone)]
 struct AppState {
     handle: DaemonHandle,
@@ -177,6 +219,12 @@ struct AppState {
     /// Per-user MCP auth provider for RFC 8693 token exchange.
     /// When present, both HTTP and WS tasks receive user-scoped MCP credentials.
     auth_provider: Option<Arc<dyn heartbit::AuthProvider>>,
+    /// Pending approval senders for REST/SSE tasks (keyed by task_id).
+    /// The `on_approval` callback blocks on the receiver; the REST endpoint
+    /// sends the decision via the stored sender.
+    pending_approvals: PendingApprovals,
+    /// MCP server for exposing heartbit tools/resources to external MCP clients.
+    mcp_server: Option<Arc<heartbit::McpServer>>,
 }
 
 // --- Handlers ---
@@ -186,10 +234,6 @@ async fn handle_submit(
     user_context: Option<axum::Extension<UserContext>>,
     Json(body): Json<SubmitRequest>,
 ) -> impl IntoResponse {
-    if let Some(ref m) = state.metrics {
-        m.record_task_submitted();
-    }
-
     // Resolve user context: JWT middleware takes precedence; fall back to body user_context
     // (used when the caller authenticates with a service API key, e.g. CRM→Heartbit).
     let body_ctx: Option<UserContext> = user_context
@@ -245,14 +289,19 @@ async fn handle_submit(
     };
 
     match result {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(SubmitResponse {
-                id,
-                state: heartbit::TaskState::Pending,
-            }),
-        )
-            .into_response(),
+        Ok(id) => {
+            if let Some(ref m) = state.metrics {
+                m.record_task_submitted(effective_ctx.map(|c| c.tenant_id.as_str()), "api");
+            }
+            (
+                StatusCode::CREATED,
+                Json(SubmitResponse {
+                    id,
+                    state: heartbit::TaskState::Pending,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -292,29 +341,139 @@ async fn handle_list(
 async fn handle_stats(
     State(state): State<AppState>,
     user_context: Option<axum::Extension<UserContext>>,
+    Query(params): Query<UsageQueryParams>,
 ) -> impl IntoResponse {
     let tenant_filter = user_context
         .as_ref()
         .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
-    match state.handle.stats(tenant_filter.as_deref()) {
-        Ok(stats) => {
-            let uptime_seconds = state.start_time.elapsed().as_secs();
-            Json(serde_json::json!({
-                "total_tasks": stats.total_tasks,
-                "tasks_by_state": stats.tasks_by_state,
-                "tasks_by_source": stats.tasks_by_source,
-                "active_tasks": stats.active_tasks,
-                "total_tokens": {
-                    "input_tokens": stats.total_input_tokens,
-                    "output_tokens": stats.total_output_tokens,
-                    "cache_read_tokens": stats.total_cache_read_tokens,
-                    "cache_creation_tokens": stats.total_cache_creation_tokens,
-                },
-                "total_estimated_cost_usd": stats.total_estimated_cost_usd,
-                "uptime_seconds": uptime_seconds,
-            }))
-            .into_response()
+
+    // If from/to provided, use usage_stats for filtered totals
+    if params.from.is_some() || params.to.is_some() {
+        let from = match parse_rfc3339(&params.from, "from") {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+        let to = match parse_rfc3339(&params.to, "to") {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+        let query = heartbit::UsageQuery {
+            from,
+            to,
+            tenant_id: tenant_filter,
+            ..Default::default()
+        };
+        match state.handle.usage_stats(&query) {
+            Ok(rows) => {
+                let row = rows.first().cloned().unwrap_or_default();
+                let uptime_seconds = state.start_time.elapsed().as_secs();
+                Json(serde_json::json!({
+                    "total_tasks": row.task_count,
+                    "completed_tasks": row.completed_count,
+                    "failed_tasks": row.failed_count,
+                    "total_tokens": {
+                        "input_tokens": row.input_tokens,
+                        "output_tokens": row.output_tokens,
+                        "cache_read_tokens": row.cache_read_tokens,
+                        "cache_creation_tokens": row.cache_creation_tokens,
+                    },
+                    "total_estimated_cost_usd": row.estimated_cost_usd,
+                    "uptime_seconds": uptime_seconds,
+                }))
+                .into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
         }
+    } else {
+        match state.handle.stats(tenant_filter.as_deref()) {
+            Ok(stats) => {
+                let uptime_seconds = state.start_time.elapsed().as_secs();
+                let mut json = serde_json::json!({
+                    "total_tasks": stats.total_tasks,
+                    "tasks_by_state": stats.tasks_by_state,
+                    "tasks_by_source": stats.tasks_by_source,
+                    "active_tasks": stats.active_tasks,
+                    "total_tokens": {
+                        "input_tokens": stats.total_input_tokens,
+                        "output_tokens": stats.total_output_tokens,
+                        "cache_read_tokens": stats.total_cache_read_tokens,
+                        "cache_creation_tokens": stats.total_cache_creation_tokens,
+                    },
+                    "total_estimated_cost_usd": stats.total_estimated_cost_usd,
+                    "uptime_seconds": uptime_seconds,
+                });
+                // Include per-tenant breakdown when no tenant filter is applied (admin view)
+                if tenant_filter.is_none()
+                    && let Ok(tenant_rows) = state.handle.usage_stats(&heartbit::UsageQuery {
+                        group_by: Some(heartbit::UsageGroupBy::Tenant),
+                        ..Default::default()
+                    })
+                {
+                    let by_tenant: serde_json::Map<String, serde_json::Value> = tenant_rows
+                        .into_iter()
+                        .filter_map(|r| {
+                            let key = r.group_key?;
+                            Some((
+                                key,
+                                serde_json::json!({
+                                    "task_count": r.task_count,
+                                    "input_tokens": r.input_tokens,
+                                    "output_tokens": r.output_tokens,
+                                    "estimated_cost_usd": r.estimated_cost_usd,
+                                }),
+                            ))
+                        })
+                        .collect();
+                    if !by_tenant.is_empty() {
+                        json["by_tenant"] = serde_json::Value::Object(by_tenant);
+                    }
+                }
+                Json(json).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+async fn handle_usage(
+    State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
+    Query(params): Query<UsageQueryParams>,
+) -> impl IntoResponse {
+    let from = match parse_rfc3339(&params.from, "from") {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let to = match parse_rfc3339(&params.to, "to") {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    // If JWT present, force tenant_id from JWT (tenant isolation)
+    let tenant_id = user_context
+        .as_ref()
+        .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
+
+    let query = heartbit::UsageQuery {
+        from,
+        to,
+        tenant_id,
+        user_id: params.user_id,
+        agent_name: params.agent_name,
+        model_name: params.model_name,
+        source: params.source,
+        group_by: params.group_by,
+    };
+
+    match state.handle.usage_stats(&query) {
+        Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -389,16 +548,90 @@ async fn handle_cancel(
                 .into_response();
         }
     }
+    let cancel_tenant = user_context
+        .as_ref()
+        .map(|axum::Extension(ctx)| ctx.tenant_id.clone());
     match state.handle.cancel_task(id).await {
         Ok(()) => {
             if let Some(ref m) = state.metrics {
-                m.record_task_cancelled();
+                m.record_task_cancelled(cancel_tenant.as_deref());
             }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// REST approval endpoint for SSE-based tasks.
+///
+/// CRM (and other REST callers) send `{ "approved": true/false }` to resolve
+/// a pending HITL approval gate. The corresponding `on_approval` callback
+/// unblocks and the agent resumes or aborts the tool call.
+#[derive(Deserialize)]
+struct ApprovalBody {
+    approved: bool,
+}
+
+async fn handle_approval(
+    State(state): State<AppState>,
+    user_context: Option<axum::Extension<UserContext>>,
+    service_auth: Option<axum::Extension<ServiceAuth>>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<ApprovalBody>,
+) -> impl IntoResponse {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "task not found" })),
+        )
+            .into_response()
+    };
+    match state.handle.get_task(id) {
+        Ok(Some(task)) => {
+            if !task_tenant_allowed(
+                task.tenant_id.as_deref(),
+                user_context.as_ref(),
+                service_auth.as_ref(),
+            ) {
+                return not_found();
+            }
+        }
+        Ok(None) => return not_found(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    let decision = if body.approved {
+        heartbit::ApprovalDecision::Allow
+    } else {
+        heartbit::ApprovalDecision::Deny
+    };
+
+    // Take the sender out of the pending map and send the decision
+    let sender = {
+        let mut pending = state
+            .pending_approvals
+            .lock()
+            .expect("pending_approvals lock");
+        pending.remove(&id)
+    };
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(decision);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "no pending approval for this task" })),
         )
             .into_response(),
     }
@@ -605,6 +838,44 @@ async fn handle_todo(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+// --- MCP Server endpoint ---
+
+async fn handle_mcp_request(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let server = match state.mcp_server {
+        Some(ref s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "MCP server not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    let session_id = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok());
+
+    let (response, sid) = server.handle_request(&body, session_id).await;
+
+    if response.is_empty() {
+        // Notification — return 202 Accepted
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "application/json"),
+            ("Mcp-Session-Id", &sid),
+        ],
+        response,
+    )
+        .into_response()
 }
 
 // --- A2A Agent Card endpoint ---
@@ -1241,7 +1512,10 @@ pub async fn run_daemon(
     let runner_auth_provider = auth_provider;
     let state_auth_provider = runner_auth_provider.clone();
     let runner_user_tokens = user_tokens.clone();
-    let build_runner = move |_task_id: uuid::Uuid,
+    // Shared pending approvals map: REST endpoint writes decisions, on_approval callback reads them.
+    let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let runner_pending_approvals = pending_approvals.clone();
+    let build_runner = move |task_id: uuid::Uuid,
                              task_text: String,
                              source: String,
                              story_id: Option<String>,
@@ -1261,13 +1535,15 @@ pub async fn run_daemon(
         let tools = runner_tools.clone();
         let task_auth_provider = runner_auth_provider.clone();
         let task_user_tokens = runner_user_tokens.clone();
+        let task_pending_approvals = runner_pending_approvals.clone();
         Box::pin(async move {
             // Wrap on_event to also record metrics
             let on_event: Arc<heartbit::OnEvent> = if let Some(ref m) = task_metrics {
                 let inner = on_event_fn;
                 let metrics = m.clone();
+                let tenant_label = tenant_id.clone();
                 Arc::new(move |event: AgentEvent| {
-                    metrics.record_event(&event);
+                    metrics.record_event(&event, tenant_label.as_deref());
                     inner(event);
                 })
             } else {
@@ -1278,16 +1554,39 @@ pub async fn run_daemon(
             let provider = build_provider_from_config(&config, Some(on_retry.clone()))
                 .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
 
-            // Track active tasks (after provider creation to avoid gauge leak on error)
+            // Record submission and track active tasks (after provider creation to avoid gauge leak on error)
             if let Some(ref m) = task_metrics {
+                m.record_task_submitted(tenant_id.as_deref(), &source);
                 m.tasks_active().inc();
             }
             let start = Instant::now();
 
             let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
 
+            // Build on_approval callback for REST/SSE tasks: blocks on mpsc channel,
+            // resolved by POST /tasks/{id}/approval endpoint.
+            let approval_task_id = task_id;
+            let approval_map = task_pending_approvals;
+            let on_approval: Arc<heartbit::OnApproval> = Arc::new(move |_tool_calls| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                {
+                    let mut pending = approval_map.lock().expect("pending_approvals lock");
+                    pending.insert(approval_task_id, tx);
+                }
+                // block_in_place tells tokio this thread is about to block, so it can
+                // compensate by spawning additional worker threads.
+                tokio::task::block_in_place(|| match rx.recv_timeout(Duration::from_secs(300)) {
+                    Ok(decision) => decision,
+                    Err(_) => {
+                        let mut pending = approval_map.lock().expect("pending_approvals lock");
+                        pending.remove(&approval_task_id);
+                        heartbit::ApprovalDecision::Deny
+                    }
+                })
+            });
+
             // Wire SensorSecurityGuardrail for sensor-sourced tasks
-            let (guardrails, memory_confidentiality_cap): (
+            let (mut guardrails, memory_confidentiality_cap): (
                 Vec<Arc<dyn heartbit::Guardrail>>,
                 Option<heartbit::Confidentiality>,
             ) = if source.starts_with("sensor:") {
@@ -1308,6 +1607,16 @@ pub async fn run_daemon(
             } else {
                 (vec![], None)
             };
+
+            // Append config-based guardrails (injection, PII, tool policy, LLM judge)
+            if let Some(ref gc) = config.guardrails {
+                match gc.build() {
+                    Ok(config_guardrails) => guardrails.extend(config_guardrails),
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to build config guardrails for daemon task, skipping");
+                    }
+                }
+            }
 
             // Per-user memory namespace: wrap shared memory with user-scoped prefix
             let task_memory: Option<Arc<dyn heartbit::Memory>> = if let Some(ref uid) = user_id
@@ -1460,7 +1769,7 @@ pub async fn run_daemon(
                 &config,
                 &task_text,
                 on_text,
-                None, // no approval in daemon mode
+                Some(on_approval),
                 Some(on_event),
                 mode,
                 story_id.as_deref(),
@@ -1485,8 +1794,8 @@ pub async fn run_daemon(
                 m.tasks_active().dec();
                 m.record_task_by_source(&source);
                 match &result {
-                    Ok(_) => m.record_task_completed(duration_secs),
-                    Err(_) => m.record_task_failed(duration_secs),
+                    Ok(_) => m.record_task_completed(duration_secs, tenant_id.as_deref()),
+                    Err(_) => m.record_task_failed(duration_secs, tenant_id.as_deref()),
                 }
                 // Record pulse-specific metrics when source is "heartbit"
                 if source == "heartbit" {
@@ -1579,6 +1888,32 @@ pub async fn run_daemon(
             Arc::new(validator)
         });
 
+    // Build MCP server if configured
+    let mcp_server = daemon_config.mcp_server.as_ref().map(|mcp_cfg| {
+        let server_config = heartbit::McpServerConfig {
+            name: mcp_cfg.name.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            expose_tools: mcp_cfg.expose_tools,
+            expose_resources: mcp_cfg.expose_resources,
+            expose_prompts: mcp_cfg.expose_prompts,
+        };
+        let mut server = heartbit::McpServer::new(server_config);
+
+        // Collect all cached tools across agents
+        if mcp_cfg.expose_tools {
+            let all_tools: Vec<Arc<dyn heartbit::tool::Tool>> = tool_cache
+                .values()
+                .flat_map(|v| v.iter().cloned())
+                .collect();
+            if !all_tools.is_empty() {
+                tracing::info!(count = all_tools.len(), "MCP server exposing tools");
+                server = server.with_tools(all_tools);
+            }
+        }
+
+        Arc::new(server)
+    });
+
     // Start HTTP server
     let app_state = AppState {
         handle,
@@ -1599,6 +1934,8 @@ pub async fn run_daemon(
         jwt_validator: jwt_validator.clone(),
         user_tokens: user_tokens.clone(),
         auth_provider: state_auth_provider,
+        pending_approvals,
+        mcp_server,
     };
 
     // Public routes — health, readiness, metrics, agent card — never require auth
@@ -1617,8 +1954,11 @@ pub async fn run_daemon(
         .route("/tasks/{id}", get(handle_get))
         .route("/tasks/{id}", delete(handle_cancel))
         .route("/tasks/{id}/events", get(handle_events))
+        .route("/tasks/{id}/approval", post(handle_approval))
         .route("/stats", get(handle_stats))
-        .route("/todo", get(handle_todo));
+        .route("/usage", get(handle_usage))
+        .route("/todo", get(handle_todo))
+        .route("/mcp", post(handle_mcp_request));
 
     if ws_enabled {
         protected_routes = protected_routes.route("/ws", get(handle_ws_upgrade));
@@ -1699,11 +2039,24 @@ pub async fn run_daemon(
                 if let Err(e) = handle.register_task(task_id, &task_text, "telegram") {
                     tracing::warn!(error = %e, "failed to register telegram task in store");
                 }
+                if let Some(ref m) = m {
+                    m.record_task_submitted(None, "telegram");
+                }
 
                 // No streaming preview for Telegram — only send the final
                 // HTML-formatted result to avoid a raw-markdown flash.
                 let on_text: Arc<heartbit::OnText> = Arc::new(|_: &str| {});
-                let on_event = bridge.clone().make_on_event();
+                let base_on_event = bridge.clone().make_on_event();
+                // Wrap on_event to record per-event metrics (Telegram has no tenant)
+                let on_event: Arc<heartbit::OnEvent> = if let Some(ref tg_metrics) = m {
+                    let metrics = tg_metrics.clone();
+                    Arc::new(move |event: AgentEvent| {
+                        metrics.record_event(&event, None);
+                        base_on_event(event);
+                    })
+                } else {
+                    base_on_event
+                };
                 let on_question = bridge.make_on_question();
 
                 let on_retry = build_on_retry(&on_event);
@@ -1795,8 +2148,8 @@ pub async fn run_daemon(
                     m.tasks_active().dec();
                     m.record_task_by_source("telegram");
                     match &result {
-                        Ok(_) => m.record_task_completed(duration_secs),
-                        Err(_) => m.record_task_failed(duration_secs),
+                        Ok(_) => m.record_task_completed(duration_secs, None),
+                        Err(_) => m.record_task_failed(duration_secs, None),
                     }
                 }
 
@@ -1808,6 +2161,7 @@ pub async fn run_daemon(
                         let cost = output.estimated_cost_usd;
                         let tool_calls = output.tool_calls_made;
                         let res = output.result.clone();
+                        let model = output.model_name.clone();
                         let _ = handle.update_task(task_id, &|t| {
                             t.state = heartbit::TaskState::Completed;
                             t.completed_at = Some(now);
@@ -1815,6 +2169,7 @@ pub async fn run_daemon(
                             t.tokens_used = tokens;
                             t.tool_calls_made = tool_calls;
                             t.estimated_cost_usd = cost;
+                            t.model_name = model.clone();
                         });
                     }
                     Err(e) => {
@@ -2362,11 +2717,16 @@ async fn handle_ws_chat_send(
     // Build callbacks from connection-level bridge
     let on_text = bridge.make_on_text(session_id);
     let base_on_event = bridge.make_on_event(session_id);
-    // Wrap on_event to transition task state when HITL approval is requested/resolved.
-    // ApprovalRequested → InputRequired (agent is waiting for human input)
-    // ApprovalDecision  → Running      (human responded, agent resumes)
+    // Wrap on_event to transition task state when HITL approval is requested/resolved
+    // and record per-event metrics with tenant context.
     let hitl_handle = state.handle.clone();
+    let event_metrics = state.metrics.clone();
+    let event_tenant_id = user_context.as_ref().map(|c| c.tenant_id.clone());
     let on_event: Arc<heartbit::OnEvent> = Arc::new(move |event: AgentEvent| {
+        // Record metrics with tenant label
+        if let Some(ref m) = event_metrics {
+            m.record_event(&event, event_tenant_id.as_deref());
+        }
         match &event {
             AgentEvent::ApprovalRequested { .. } => {
                 if let Err(e) = hitl_handle.update_task(task_id, &|t| {
@@ -2404,12 +2764,51 @@ async fn handle_ws_chat_send(
     let outbound = outbound_tx.clone();
     let mode = state.observability_mode;
     let metrics = state.metrics.clone();
-    let ws_memory = state.shared_memory.clone();
-    let ws_workspace = state.workspace_dir.clone();
     let ws_todo = state.todo_store.clone();
     let ws_handle = state.handle.clone();
     let ws_user_id = user_context.as_ref().map(|c| c.user_id.clone());
     let ws_tenant_id = user_context.as_ref().map(|c| c.tenant_id.clone());
+
+    // Per-user memory namespace: wrap shared memory with tenant/user-scoped prefix
+    // to prevent cross-tenant memory leakage (mirrors Kafka path at line ~1580).
+    let ws_memory: Option<Arc<dyn heartbit::Memory>> =
+        if let (Some(uid), Some(tid)) = (&ws_user_id, &ws_tenant_id) {
+            state.shared_memory.as_ref().map(|mem| {
+                let ns_prefix = format!("tenant:{tid}:user:{uid}");
+                tracing::debug!(namespace = %ns_prefix, "WS memory namespaced to tenant/user");
+                Arc::new(heartbit::NamespacedMemory::new(mem.clone(), ns_prefix))
+                    as Arc<dyn heartbit::Memory>
+            })
+        } else {
+            state.shared_memory.clone()
+        };
+
+    // Per-user workspace isolation: scope to {workspace}/{tenant_id}/{user_id}/
+    // to prevent cross-tenant file access (mirrors Kafka path at line ~1592).
+    let ws_workspace = if let (Some(base), Some(tid), Some(uid)) =
+        (&state.workspace_dir, &ws_tenant_id, &ws_user_id)
+    {
+        if validate_path_component(tid).is_ok() && validate_path_component(uid).is_ok() {
+            let scoped = base.join(tid.as_str()).join(uid.as_str());
+            if let Err(e) = tokio::fs::create_dir_all(&scoped).await {
+                tracing::warn!(
+                    path = %scoped.display(),
+                    error = %e,
+                    "failed to create per-user WS workspace"
+                );
+            }
+            Some(scoped)
+        } else {
+            tracing::error!(
+                tenant_id = %tid,
+                user_id = %uid,
+                "rejected unsafe tenant/user ID in WS workspace path"
+            );
+            state.workspace_dir.clone()
+        }
+    } else {
+        state.workspace_dir.clone()
+    };
     let ws_roles: Vec<String> = user_context
         .as_ref()
         .map(|c| c.roles.clone())
@@ -2436,6 +2835,9 @@ async fn handle_ws_chat_send(
     };
     if let Err(e) = register_result {
         tracing::warn!(error = %e, "failed to register ws task in store");
+    }
+    if let Some(ref m) = state.metrics {
+        m.record_task_submitted(ws_tenant_id.as_deref(), "ws");
     }
 
     tokio::spawn(async move {
@@ -2546,6 +2948,7 @@ async fn handle_ws_chat_send(
                 let cost = output.estimated_cost_usd;
                 let tool_calls = output.tool_calls_made;
                 let res = output.result.clone();
+                let model = output.model_name.clone();
                 let _ = ws_handle.update_task(task_id, &|t| {
                     t.state = heartbit::TaskState::Completed;
                     t.completed_at = Some(now);
@@ -2553,6 +2956,7 @@ async fn handle_ws_chat_send(
                     t.tokens_used = tokens;
                     t.tool_calls_made = tool_calls;
                     t.estimated_cost_usd = cost;
+                    t.model_name = model.clone();
                 });
             }
             Err(e) => {
@@ -2849,8 +3253,8 @@ async fn run_interactive_task(
         m.tasks_active().dec();
         m.record_task_by_source(source);
         match &result {
-            Ok(_) => m.record_task_completed(duration_secs),
-            Err(_) => m.record_task_failed(duration_secs),
+            Ok(_) => m.record_task_completed(duration_secs, tenant_id),
+            Err(_) => m.record_task_failed(duration_secs, tenant_id),
         }
     }
 

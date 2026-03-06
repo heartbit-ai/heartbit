@@ -327,6 +327,55 @@ pub struct OrchestratorConfig {
     /// excessive compaction, the task is re-run through the orchestrator.
     #[serde(default = "default_true")]
     pub escalation: bool,
+    /// Append the multi-agent collaboration prompt to sub-agent system prompts.
+    /// Teaches sub-agents blackboard protocol, dedup, cross-verification, and
+    /// structured execution. Default: true.
+    #[serde(default)]
+    pub multi_agent_prompt: Option<bool>,
+    /// Dynamic agent spawning configuration. When present, enables the `spawn_agent`
+    /// tool on the orchestrator, allowing the LLM to create specialist agents at runtime.
+    pub spawn: Option<SpawnConfig>,
+}
+
+/// Configuration for dynamic agent spawning via `spawn_agent`.
+///
+/// Controls security boundaries: which tools spawned agents may use,
+/// how many can be created, and their token budgets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpawnConfig {
+    /// Maximum number of agents that can be spawned per orchestrator run.
+    #[serde(default = "default_max_spawned_agents")]
+    pub max_spawned_agents: u32,
+    /// Allowlist of tool names that spawned agents may use.
+    /// Only builtin tools from this list are available; unknown names
+    /// are rejected at build time.
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
+    /// Maximum turns per spawned agent.
+    #[serde(default = "default_spawn_max_turns")]
+    pub max_turns: usize,
+    /// Maximum tokens per LLM call for spawned agents.
+    #[serde(default = "default_spawn_max_tokens")]
+    pub max_tokens: u32,
+    /// Cumulative token budget across ALL spawned agents in a single run.
+    #[serde(default = "default_max_total_tokens")]
+    pub max_total_tokens: u64,
+}
+
+fn default_max_spawned_agents() -> u32 {
+    3
+}
+
+fn default_spawn_max_turns() -> usize {
+    15
+}
+
+fn default_spawn_max_tokens() -> u32 {
+    4096
+}
+
+fn default_max_total_tokens() -> u64 {
+    50_000
 }
 
 fn default_true() -> bool {
@@ -361,6 +410,8 @@ impl Default for OrchestratorConfig {
             dispatch_mode: None,
             routing: RoutingMode::default(),
             escalation: true,
+            multi_agent_prompt: None,
+            spawn: None,
         }
     }
 }
@@ -527,6 +578,30 @@ pub struct AgentConfig {
     /// Per-agent guardrails override. When set, overrides the top-level
     /// `[guardrails]` section for this agent.
     pub guardrails: Option<GuardrailsConfig>,
+    /// LRU response cache capacity (number of entries). When set, identical
+    /// LLM requests (same system prompt, messages, tool names) return cached
+    /// responses without calling the LLM. Only non-streaming calls are cached.
+    #[serde(default)]
+    pub response_cache_size: Option<usize>,
+    /// How MCP resources are surfaced to the agent.
+    /// `"tools"` (default) — resources become callable tools.
+    /// `"context"` — pre-fetch and inject into system prompt.
+    /// `"none"` — skip resource discovery.
+    #[serde(default)]
+    pub mcp_resources: McpResourceMode,
+}
+
+/// How MCP resources are surfaced to agents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpResourceMode {
+    /// Resources become callable tools (agent decides when to read).
+    #[default]
+    Tools,
+    /// Pre-fetch resource content and inject into system prompt.
+    Context,
+    /// Skip resource discovery entirely.
+    None,
 }
 
 /// TOML representation of session pruning configuration.
@@ -832,24 +907,27 @@ impl GuardrailsConfig {
         }
 
         // 4. LLM-as-judge
-        if let Some(cfg) = &self.llm_judge
-            && let Some(provider) = judge_provider
-        {
-            let mut builder =
-                crate::agent::guardrails::llm_judge::LlmJudgeGuardrail::builder(provider)
-                    .criteria(cfg.criteria.clone())
-                    .timeout(std::time::Duration::from_secs(cfg.timeout_seconds))
-                    .max_judge_tokens(cfg.max_judge_tokens);
-            if cfg.evaluate_tool_inputs {
-                builder = builder.evaluate_tool_inputs(true);
+        if let Some(cfg) = &self.llm_judge {
+            if let Some(provider) = judge_provider {
+                let mut builder =
+                    crate::agent::guardrails::llm_judge::LlmJudgeGuardrail::builder(provider)
+                        .criteria(cfg.criteria.clone())
+                        .timeout(std::time::Duration::from_secs(cfg.timeout_seconds))
+                        .max_judge_tokens(cfg.max_judge_tokens);
+                if cfg.evaluate_tool_inputs {
+                    builder = builder.evaluate_tool_inputs(true);
+                }
+                let judge = builder
+                    .build()
+                    .map_err(|e| Error::Config(format!("llm_judge guardrail build failed: {e}")))?;
+                guardrails.push(Arc::new(judge));
+            } else {
+                tracing::warn!(
+                    "[guardrails.llm_judge] is configured but no judge provider was supplied — \
+                     LLM judge guardrail will NOT be active. Use build_with_judge(Some(provider))."
+                );
             }
-            let judge = builder
-                .build()
-                .map_err(|e| Error::Config(format!("llm_judge guardrail build failed: {e}")))?;
-            guardrails.push(Arc::new(judge));
         }
-        // If no judge_provider supplied, silently skip — caller should use
-        // `build_with_judge(Some(provider))` when `[guardrails.llm_judge]` is set.
 
         Ok(guardrails)
     }
@@ -1069,6 +1147,32 @@ pub struct DaemonConfig {
     /// Memory access control configuration.
     #[serde(default)]
     pub memory: DaemonMemoryConfig,
+    /// MCP server configuration — expose heartbit as an MCP server.
+    pub mcp_server: Option<DaemonMcpServerConfig>,
+}
+
+/// MCP server configuration for the daemon.
+///
+/// When present, the daemon exposes an MCP-compatible endpoint at `/mcp`
+/// so external MCP clients can discover and call heartbit tools/resources.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonMcpServerConfig {
+    /// Server name reported in the `initialize` response. Defaults to `"heartbit"`.
+    #[serde(default = "default_mcp_server_name")]
+    pub name: String,
+    /// Whether to expose heartbit tools via MCP. Default: `true`.
+    #[serde(default = "default_true")]
+    pub expose_tools: bool,
+    /// Whether to expose resources (tasks, memory, knowledge) via MCP. Default: `true`.
+    #[serde(default = "default_true")]
+    pub expose_resources: bool,
+    /// Whether to expose prompts via MCP. Default: `false`.
+    #[serde(default)]
+    pub expose_prompts: bool,
+}
+
+fn default_mcp_server_name() -> String {
+    "heartbit".into()
 }
 
 /// Memory access control configuration for the daemon.
@@ -1674,6 +1778,35 @@ impl HeartbitConfig {
             return Err(Error::Config(
                 "orchestrator.max_identical_tool_calls must be at least 1".into(),
             ));
+        }
+
+        // Validate spawn config
+        if let Some(ref spawn) = self.orchestrator.spawn {
+            if spawn.max_spawned_agents == 0 {
+                return Err(Error::Config(
+                    "orchestrator.spawn.max_spawned_agents must be at least 1".into(),
+                ));
+            }
+            if spawn.max_turns == 0 {
+                return Err(Error::Config(
+                    "orchestrator.spawn.max_turns must be at least 1".into(),
+                ));
+            }
+            if spawn.max_tokens == 0 {
+                return Err(Error::Config(
+                    "orchestrator.spawn.max_tokens must be at least 1".into(),
+                ));
+            }
+            if spawn.max_total_tokens == 0 {
+                return Err(Error::Config(
+                    "orchestrator.spawn.max_total_tokens must be at least 1".into(),
+                ));
+            }
+            if spawn.tool_allowlist.is_empty() {
+                tracing::warn!(
+                    "orchestrator.spawn.tool_allowlist is empty — spawned agents will be reasoning-only"
+                );
+            }
         }
 
         // Validate cascade config: enabled requires at least one tier
@@ -7177,5 +7310,131 @@ provider = "local"
         assert!(auth.user_id_claim.is_none());
         assert!(auth.tenant_id_claim.is_none());
         assert!(auth.roles_claim.is_none());
+    }
+
+    #[test]
+    fn mcp_resource_mode_default_is_tools() {
+        let mode: McpResourceMode = Default::default();
+        assert_eq!(mode, McpResourceMode::Tools);
+    }
+
+    #[test]
+    fn mcp_resource_mode_deserialize() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            mode: McpResourceMode,
+        }
+        let w: Wrapper = toml::from_str(r#"mode = "tools""#).unwrap();
+        assert_eq!(w.mode, McpResourceMode::Tools);
+        let w: Wrapper = toml::from_str(r#"mode = "context""#).unwrap();
+        assert_eq!(w.mode, McpResourceMode::Context);
+        let w: Wrapper = toml::from_str(r#"mode = "none""#).unwrap();
+        assert_eq!(w.mode, McpResourceMode::None);
+    }
+
+    #[test]
+    fn agent_config_mcp_resources_default() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_turns = 10
+
+[[agents]]
+name = "test"
+description = "A test agent"
+system_prompt = "You are a test."
+"#;
+        let config: HeartbitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agents[0].mcp_resources, McpResourceMode::Tools);
+    }
+
+    #[test]
+    fn agent_config_mcp_resources_explicit() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_turns = 10
+
+[[agents]]
+name = "test"
+description = "A test agent"
+system_prompt = "You are a test."
+mcp_resources = "none"
+"#;
+        let config: HeartbitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agents[0].mcp_resources, McpResourceMode::None);
+    }
+
+    #[test]
+    fn daemon_mcp_server_config_defaults() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+consumer_group = "test"
+commands_topic = "test.commands"
+events_topic = "test.events"
+
+[daemon.mcp_server]
+"#;
+        let config: HeartbitConfig = toml::from_str(toml_str).unwrap();
+        let mcp = config.daemon.unwrap().mcp_server.unwrap();
+        assert_eq!(mcp.name, "heartbit");
+        assert!(mcp.expose_tools);
+        assert!(mcp.expose_resources);
+        assert!(!mcp.expose_prompts);
+    }
+
+    #[test]
+    fn daemon_mcp_server_config_custom() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+consumer_group = "test"
+commands_topic = "test.commands"
+events_topic = "test.events"
+
+[daemon.mcp_server]
+name = "my-heartbit"
+expose_tools = true
+expose_resources = false
+expose_prompts = true
+"#;
+        let config: HeartbitConfig = toml::from_str(toml_str).unwrap();
+        let mcp = config.daemon.unwrap().mcp_server.unwrap();
+        assert_eq!(mcp.name, "my-heartbit");
+        assert!(mcp.expose_tools);
+        assert!(!mcp.expose_resources);
+        assert!(mcp.expose_prompts);
+    }
+
+    #[test]
+    fn daemon_without_mcp_server_config() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon.kafka]
+brokers = "localhost:9092"
+consumer_group = "test"
+commands_topic = "test.commands"
+events_topic = "test.events"
+"#;
+        let config: HeartbitConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.daemon.unwrap().mcp_server.is_none());
     }
 }

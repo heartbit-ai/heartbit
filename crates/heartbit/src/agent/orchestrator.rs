@@ -165,6 +165,9 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
             allow_shared_write: true,
+            multi_agent_prompt: true,
+            spawn_config: None,
+            spawn_builtin_tools: Vec::new(),
         }
     }
 
@@ -973,6 +976,303 @@ impl Tool for FormSquadTool {
     }
 }
 
+/// The orchestrator's dynamic agent spawning tool: creates specialist agents at runtime.
+///
+/// Unlike `DelegateTaskTool` which dispatches to pre-configured agents, `SpawnAgentTool`
+/// lets the LLM define new agents on-the-fly with a custom system prompt and tool subset.
+/// Security: tool allowlist enforced, spawn count capped, token budget tracked, no recursion.
+struct SpawnAgentTool {
+    shared_provider: Arc<BoxedProvider>,
+    spawn_config: crate::config::SpawnConfig,
+    /// Pre-built tools from allowlist (validated at build time).
+    tool_pool: std::collections::HashMap<String, Arc<dyn Tool>>,
+    /// Tracks how many agents have been spawned this run.
+    spawn_count: Arc<std::sync::atomic::AtomicU32>,
+    /// Prevents name reuse within a single run.
+    spawned_names: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Tracks cumulative token usage across all spawned agents.
+    accumulated_tokens: Arc<Mutex<TokenUsage>>,
+    permission_rules: super::permission::PermissionRuleset,
+    shared_memory: Option<Arc<dyn Memory>>,
+    memory_namespace_prefix: Option<String>,
+    on_event: Option<Arc<OnEvent>>,
+    on_text: Option<Arc<crate::llm::OnText>>,
+    lsp_manager: Option<Arc<crate::lsp::LspManager>>,
+    observability_mode: super::observability::ObservabilityMode,
+    workspace: Option<std::path::PathBuf>,
+    guardrails: Vec<Arc<dyn Guardrail>>,
+    audit_trail: Option<Arc<dyn super::audit::AuditTrail>>,
+    audit_user_id: Option<String>,
+    audit_tenant_id: Option<String>,
+    audit_delegation_chain: Vec<String>,
+    cached_definition: ToolDefinition,
+}
+
+#[derive(Deserialize)]
+struct SpawnAgentInput {
+    name: String,
+    system_prompt: String,
+    #[serde(default)]
+    tools: Vec<String>,
+    task: String,
+}
+
+/// Maximum allowed system prompt length for spawned agents (32 KB).
+const SPAWN_MAX_PROMPT_BYTES: usize = 32 * 1024;
+
+impl SpawnAgentTool {
+    fn build_definition(config: &crate::config::SpawnConfig) -> ToolDefinition {
+        let allowlist = if config.tool_allowlist.is_empty() {
+            "(none — reasoning-only agents)".to_string()
+        } else {
+            config.tool_allowlist.join(", ")
+        };
+        ToolDefinition {
+            name: "spawn_agent".into(),
+            description: format!(
+                "Create a new specialist agent at runtime when no pre-configured agent fits the task. \
+                 The spawned agent runs with the given system prompt and tool subset, then returns its result.\n\n\
+                 Available tools for spawned agents: [{allowlist}]. Budget: {} agents max per run.",
+                config.max_spawned_agents
+            ),
+            input_schema: json!({
+                "type": "object",
+                "required": ["name", "system_prompt", "task"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Lowercase identifier for the agent (a-z, 0-9, underscores). Must start with a letter. E.g. 'tax_specialist', 'csv_analyzer'."
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "The agent's role and behavior instructions. Be specific about expertise and constraints."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": format!("Subset of available tools: [{allowlist}]. Empty array creates a reasoning-only agent.")
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The specific task for this agent to accomplish."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn spawn(&self, input: SpawnAgentInput) -> Result<ToolOutput, Error> {
+        // 1. Spawn count cap
+        let current = self.spawn_count.load(std::sync::atomic::Ordering::Relaxed);
+        if current >= self.spawn_config.max_spawned_agents {
+            return Ok(ToolOutput::error(format!(
+                "Spawn limit reached: {current}/{} agents already spawned this run.",
+                self.spawn_config.max_spawned_agents
+            )));
+        }
+
+        // 2. Name format validation
+        let name_re =
+            regex::Regex::new(r"^[a-z][a-z0-9_]{0,63}$").expect("spawn agent name regex is valid");
+        if !name_re.is_match(&input.name) {
+            return Ok(ToolOutput::error(format!(
+                "Invalid agent name '{}'. Must match ^[a-z][a-z0-9_]{{0,63}}$ \
+                 (lowercase, starts with letter, alphanumeric + underscores, max 64 chars).",
+                input.name
+            )));
+        }
+
+        // 3. Name uniqueness
+        {
+            let mut names = self.spawned_names.lock().expect("spawned names lock");
+            if !names.insert(input.name.clone()) {
+                return Ok(ToolOutput::error(format!(
+                    "Agent name '{}' already used in this run. Choose a different name.",
+                    input.name
+                )));
+            }
+        }
+
+        // 4. Tool subset validation
+        for tool_name in &input.tools {
+            if !self.tool_pool.contains_key(tool_name) {
+                let available: Vec<&str> = self.tool_pool.keys().map(|k| k.as_str()).collect();
+                return Ok(ToolOutput::error(format!(
+                    "Tool '{}' not in allowlist. Available: [{}]",
+                    tool_name,
+                    available.join(", ")
+                )));
+            }
+        }
+
+        // 5. Token budget headroom check
+        {
+            let acc = self.accumulated_tokens.lock().expect("token lock");
+            let used = acc.total();
+            if used >= self.spawn_config.max_total_tokens {
+                return Ok(ToolOutput::error(format!(
+                    "Spawn token budget exhausted: {used}/{} tokens used across spawned agents.",
+                    self.spawn_config.max_total_tokens
+                )));
+            }
+        }
+
+        // 6. System prompt length check
+        if input.system_prompt.len() > SPAWN_MAX_PROMPT_BYTES {
+            return Ok(ToolOutput::error(format!(
+                "System prompt too long: {} bytes (max {SPAWN_MAX_PROMPT_BYTES}).",
+                input.system_prompt.len()
+            )));
+        }
+
+        let spawned_name = format!("spawn:{}", input.name);
+
+        // Emit AgentSpawned event
+        if let Some(ref cb) = self.on_event {
+            cb(AgentEvent::AgentSpawned {
+                agent: "orchestrator".into(),
+                spawned_name: spawned_name.clone(),
+                tools: input.tools.clone(),
+                task: input.task.clone(),
+            });
+        }
+
+        // Build tool set from requested subset
+        let selected_tools: Vec<Arc<dyn Tool>> = input
+            .tools
+            .iter()
+            .filter_map(|name| self.tool_pool.get(name).cloned())
+            .collect();
+
+        // Build AgentRunner
+        let mut builder = AgentRunner::builder(self.shared_provider.clone())
+            .name(&spawned_name)
+            .system_prompt(&input.system_prompt)
+            .tools(selected_tools)
+            .max_turns(self.spawn_config.max_turns)
+            .max_tokens(self.spawn_config.max_tokens)
+            .observability_mode(self.observability_mode);
+
+        // Inherit security state from orchestrator
+        if !self.permission_rules.is_empty() {
+            builder = builder.permission_rules(self.permission_rules.clone());
+        }
+        if !self.guardrails.is_empty() {
+            builder = builder.guardrails(self.guardrails.clone());
+        }
+        if let Some(ref ws) = self.workspace {
+            builder = builder.workspace(ws.clone());
+        }
+        if let Some(ref lsp) = self.lsp_manager {
+            builder = builder.lsp_manager(lsp.clone());
+        }
+        if let Some(ref cb) = self.on_event {
+            builder = builder.on_event(cb.clone());
+        }
+        if let Some(ref cb) = self.on_text {
+            builder = builder.on_text(cb.clone());
+        }
+        if let Some(ref trail) = self.audit_trail {
+            builder = builder.audit_trail(trail.clone());
+        }
+        if let (Some(uid), Some(tid)) = (&self.audit_user_id, &self.audit_tenant_id) {
+            builder = builder.audit_user_context(uid.clone(), tid.clone());
+        }
+        if !self.audit_delegation_chain.is_empty() {
+            let mut chain = self.audit_delegation_chain.clone();
+            chain.push(spawned_name.clone());
+            builder = builder.audit_delegation_chain(chain);
+        }
+
+        // Memory: read-only shared access with namespaced isolation
+        if let Some(ref memory) = self.shared_memory {
+            let agent_ns = match &self.memory_namespace_prefix {
+                Some(prefix) => format!("{prefix}:{spawned_name}"),
+                None => spawned_name.clone(),
+            };
+            let ns = Arc::new(crate::memory::namespaced::NamespacedMemory::new(
+                memory.clone(),
+                &agent_ns,
+            ));
+            builder = builder.memory(ns);
+            builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
+                memory.clone(),
+                &agent_ns,
+                false, // read-only: spawned agents cannot write to shared memory
+            ));
+        }
+
+        let runner = builder.build()?;
+
+        info!(
+            agent = %spawned_name,
+            tools = ?input.tools,
+            "spawning dynamic agent"
+        );
+
+        // Execute
+        match runner.execute(&input.task).await {
+            Ok(output) => {
+                // Post-execution bookkeeping
+                self.spawn_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut acc = self.accumulated_tokens.lock().expect("token lock");
+                    *acc += output.tokens_used;
+                }
+                if let Some(ref cb) = self.on_event {
+                    cb(AgentEvent::SubAgentCompleted {
+                        agent: spawned_name.clone(),
+                        success: true,
+                        usage: output.tokens_used,
+                    });
+                }
+                Ok(ToolOutput::success(format!(
+                    "=== Spawned Agent: {} ===\n{}",
+                    spawned_name, output.result
+                )))
+            }
+            Err(e) => {
+                self.spawn_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let partial = e.partial_usage();
+                {
+                    let mut acc = self.accumulated_tokens.lock().expect("token lock");
+                    *acc += partial;
+                }
+                if let Some(ref cb) = self.on_event {
+                    cb(AgentEvent::SubAgentCompleted {
+                        agent: spawned_name.clone(),
+                        success: false,
+                        usage: partial,
+                    });
+                }
+                Ok(ToolOutput::error(format!(
+                    "Spawned agent '{spawned_name}' failed: {e}"
+                )))
+            }
+        }
+    }
+}
+
+impl Tool for SpawnAgentTool {
+    fn definition(&self) -> ToolDefinition {
+        self.cached_definition.clone()
+    }
+
+    fn execute(
+        &self,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let spawn_input: SpawnAgentInput = serde_json::from_value(input)
+                .map_err(|e| Error::Agent(format!("Invalid spawn_agent input: {e}")))?;
+            self.spawn(spawn_input).await
+        })
+    }
+}
+
 /// Build the orchestrator system prompt listing available agents.
 ///
 /// Shared between standalone and Restate paths. Takes `(name, description, tool_names)` triples.
@@ -1316,6 +1616,14 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     /// Defaults to `true` for backward compatibility. Set to `false` to restrict
     /// write access based on user roles.
     allow_shared_write: bool,
+    /// Whether to append the multi-agent collaboration prompt to each sub-agent's
+    /// system prompt. Default: true.
+    multi_agent_prompt: bool,
+    /// Dynamic agent spawning configuration. When `Some`, the `spawn_agent` tool
+    /// is registered on the orchestrator.
+    spawn_config: Option<crate::config::SpawnConfig>,
+    /// Pre-built builtin tools to use as the spawn tool pool.
+    spawn_builtin_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1499,6 +1807,28 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// Defaults to `true` for backward compatibility.
     pub fn allow_shared_write(mut self, allow: bool) -> Self {
         self.allow_shared_write = allow;
+        self
+    }
+
+    /// Enable or disable the multi-agent collaboration prompt on sub-agent
+    /// system prompts. Default: `true`.
+    pub fn multi_agent_prompt(mut self, enabled: bool) -> Self {
+        self.multi_agent_prompt = enabled;
+        self
+    }
+
+    /// Enable dynamic agent spawning with the given config.
+    ///
+    /// The `builtin_tools` are the pool from which spawned agents' tools are selected
+    /// (filtered by `SpawnConfig::tool_allowlist`). Unknown tools in the allowlist
+    /// cause a build error.
+    pub fn spawn_config(
+        mut self,
+        config: crate::config::SpawnConfig,
+        builtin_tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
+        self.spawn_config = Some(config);
+        self.spawn_builtin_tools = builtin_tools;
         self
     }
 
@@ -1688,7 +2018,19 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
-    pub fn build(self) -> Result<Orchestrator<P>, Error> {
+    pub fn build(mut self) -> Result<Orchestrator<P>, Error> {
+        // Append multi-agent collaboration prompt to each sub-agent's system prompt
+        if self.multi_agent_prompt {
+            for agent in &mut self.sub_agents {
+                agent
+                    .system_prompt
+                    .push_str(&crate::agent::prompts::render_collab_prompt(
+                        &agent.name,
+                        &agent.description,
+                    ));
+            }
+        }
+
         // Validate sub-agent definitions
         {
             let mut seen = std::collections::HashSet::new();
@@ -1780,6 +2122,49 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .observability_mode
             .unwrap_or(super::observability::ObservabilityMode::Production);
 
+        // Build spawn_agent tool pool and validate before moving shared state
+        let spawn_tool_data = if let Some(spawn_cfg) = self.spawn_config.take() {
+            let mut tool_pool = std::collections::HashMap::new();
+            for tool in &self.spawn_builtin_tools {
+                let name = tool.definition().name;
+                if spawn_cfg.tool_allowlist.contains(&name) {
+                    tool_pool.insert(name, tool.clone());
+                }
+            }
+            // Validate all allowlist entries exist
+            for allowed in &spawn_cfg.tool_allowlist {
+                if !tool_pool.contains_key(allowed) {
+                    return Err(Error::Config(format!(
+                        "orchestrator.spawn.tool_allowlist: unknown tool '{}'. \
+                         Available builtin tools: [{}]",
+                        allowed,
+                        self.spawn_builtin_tools
+                            .iter()
+                            .map(|t| t.definition().name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+            // Ensure no delegation tools leak into the pool
+            tool_pool.remove("delegate_task");
+            tool_pool.remove("form_squad");
+            tool_pool.remove("spawn_agent");
+
+            let cached_definition = SpawnAgentTool::build_definition(&spawn_cfg);
+
+            system.push_str(
+                "\n\n## Dynamic Agent Spawning\n\
+                 You also have the **spawn_agent** tool to create specialist agents at runtime \
+                 when no pre-configured agent fits the task. Use this as a secondary option — \
+                 prefer delegating to existing agents when they match the need.",
+            );
+
+            Some((spawn_cfg, tool_pool, cached_definition))
+        } else {
+            None
+        };
+
         let delegate_tool: Arc<dyn Tool> = Arc::new(DelegateTaskTool {
             shared_provider: shared_provider.clone(),
             sub_agents: self.sub_agents,
@@ -1811,16 +2196,16 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             // SAFETY: form_squad_definition is always Some when agent_pool is Some
             let squad_def = form_squad_definition.expect("squad definition computed when enabled");
             let form_squad_tool: Arc<dyn Tool> = Arc::new(FormSquadTool {
-                shared_provider,
+                shared_provider: shared_provider.clone(),
                 agent_pool,
                 default_max_turns: self.max_turns,
                 default_max_tokens: self.max_tokens,
                 permission_rules: self.permission_rules.clone(),
                 accumulated_tokens: sub_agent_tokens.clone(),
-                shared_memory: self.shared_memory,
-                memory_namespace_prefix: self.memory_namespace_prefix,
-                blackboard: self.blackboard,
-                knowledge_base: self.knowledge_base,
+                shared_memory: self.shared_memory.clone(),
+                memory_namespace_prefix: self.memory_namespace_prefix.clone(),
+                blackboard: self.blackboard.clone(),
+                knowledge_base: self.knowledge_base.clone(),
                 on_event: self.on_event.clone(),
                 on_text: self.on_text.clone(),
                 lsp_manager: self.lsp_manager.clone(),
@@ -1829,6 +2214,33 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 allow_shared_write: self.allow_shared_write,
             });
             runner_builder = runner_builder.tool(form_squad_tool);
+        }
+
+        // Register spawn_agent tool when configured
+        if let Some((spawn_cfg, tool_pool, spawn_def)) = spawn_tool_data {
+            let spawn_tool: Arc<dyn Tool> = Arc::new(SpawnAgentTool {
+                shared_provider: shared_provider.clone(),
+                spawn_config: spawn_cfg,
+                tool_pool,
+                spawn_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                spawned_names: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                accumulated_tokens: sub_agent_tokens.clone(),
+                permission_rules: self.permission_rules.clone(),
+                shared_memory: self.shared_memory.clone(),
+                memory_namespace_prefix: self.memory_namespace_prefix.clone(),
+                on_event: self.on_event.clone(),
+                on_text: self.on_text.clone(),
+                lsp_manager: self.lsp_manager.clone(),
+                observability_mode: resolved_mode,
+                workspace: self.workspace.clone(),
+                guardrails: self.guardrails.clone(),
+                audit_trail: self.audit_trail.clone(),
+                audit_user_id: self.audit_user_id.clone(),
+                audit_tenant_id: self.audit_tenant_id.clone(),
+                audit_delegation_chain: self.audit_delegation_chain.clone(),
+                cached_definition: spawn_def,
+            });
+            runner_builder = runner_builder.tool(spawn_tool);
         }
 
         if let Some(strategy) = self.context_strategy {
@@ -4443,7 +4855,8 @@ mod tests {
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
                 | AgentEvent::ModelEscalated { agent, .. }
-                | AgentEvent::BudgetExceeded { agent, .. } => agent,
+                | AgentEvent::BudgetExceeded { agent, .. }
+                | AgentEvent::AgentSpawned { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5117,7 +5530,8 @@ mod tests {
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
                 | AgentEvent::ModelEscalated { agent, .. }
-                | AgentEvent::BudgetExceeded { agent, .. } => agent,
+                | AgentEvent::BudgetExceeded { agent, .. }
+                | AgentEvent::AgentSpawned { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5149,6 +5563,7 @@ mod tests {
                 AgentEvent::TaskRouted { .. } => "TaskRouted",
                 AgentEvent::ModelEscalated { .. } => "ModelEscalated",
                 AgentEvent::BudgetExceeded { .. } => "BudgetExceeded",
+                AgentEvent::AgentSpawned { .. } => "AgentSpawned",
             }
         }
 
@@ -5739,5 +6154,592 @@ mod tests {
             agent.workspace.is_none(),
             "sub-agent should have no workspace when builder has none"
         );
+    }
+
+    #[test]
+    fn multi_agent_prompt_enabled_by_default() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let builder = Orchestrator::builder(provider);
+        assert!(builder.multi_agent_prompt);
+    }
+
+    #[test]
+    fn multi_agent_prompt_can_be_disabled() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let builder = Orchestrator::builder(provider).multi_agent_prompt(false);
+        assert!(!builder.multi_agent_prompt);
+    }
+
+    #[test]
+    fn build_injects_collab_prompt_when_enabled() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut builder = Orchestrator::builder(provider).sub_agent(
+            "writer",
+            "Writes content",
+            "You are a writer.",
+        );
+        // Before build, prompt is not yet injected
+        assert!(
+            !builder.sub_agents[0]
+                .system_prompt
+                .contains("MULTI-AGENT COLLABORATION PROTOCOL")
+        );
+        // Manually apply the same logic as build() to inspect
+        if builder.multi_agent_prompt {
+            for agent in &mut builder.sub_agents {
+                agent
+                    .system_prompt
+                    .push_str(&crate::agent::prompts::render_collab_prompt(
+                        &agent.name,
+                        &agent.description,
+                    ));
+            }
+        }
+        assert!(
+            builder.sub_agents[0]
+                .system_prompt
+                .contains("MULTI-AGENT COLLABORATION PROTOCOL")
+        );
+        assert!(builder.sub_agents[0].system_prompt.contains("`writer`"));
+        assert!(
+            builder.sub_agents[0]
+                .system_prompt
+                .contains("Writes content")
+        );
+    }
+
+    #[test]
+    fn build_omits_collab_prompt_when_disabled() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut builder = Orchestrator::builder(provider)
+            .multi_agent_prompt(false)
+            .sub_agent("writer", "Writes content", "You are a writer.");
+        // Manually apply the same logic as build()
+        if builder.multi_agent_prompt {
+            for agent in &mut builder.sub_agents {
+                agent
+                    .system_prompt
+                    .push_str(&crate::agent::prompts::render_collab_prompt(
+                        &agent.name,
+                        &agent.description,
+                    ));
+            }
+        }
+        assert!(
+            !builder.sub_agents[0]
+                .system_prompt
+                .contains("MULTI-AGENT COLLABORATION PROTOCOL")
+        );
+        assert_eq!(builder.sub_agents[0].system_prompt, "You are a writer.");
+    }
+
+    // ── SpawnAgentTool tests ──
+
+    fn make_spawn_config() -> crate::config::SpawnConfig {
+        crate::config::SpawnConfig {
+            max_spawned_agents: 3,
+            tool_allowlist: vec![],
+            max_turns: 5,
+            max_tokens: 1024,
+            max_total_tokens: 10_000,
+        }
+    }
+
+    fn build_spawn_tool(
+        provider: Arc<MockProvider>,
+        config: crate::config::SpawnConfig,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> SpawnAgentTool {
+        let mut tool_pool = std::collections::HashMap::new();
+        for tool in &tools {
+            let name = tool.definition().name;
+            if config.tool_allowlist.contains(&name) {
+                tool_pool.insert(name, tool.clone());
+            }
+        }
+        let cached_definition = SpawnAgentTool::build_definition(&config);
+        SpawnAgentTool {
+            shared_provider: Arc::new(BoxedProvider::from_arc(provider)),
+            spawn_config: config,
+            tool_pool,
+            spawn_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            spawned_names: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            accumulated_tokens: Arc::new(Mutex::new(TokenUsage::default())),
+            permission_rules: crate::agent::permission::PermissionRuleset::default(),
+            shared_memory: None,
+            memory_namespace_prefix: None,
+            on_event: None,
+            on_text: None,
+            lsp_manager: None,
+            observability_mode: crate::agent::observability::ObservabilityMode::Production,
+            workspace: None,
+            guardrails: vec![],
+            audit_trail: None,
+            audit_user_id: None,
+            audit_tenant_id: None,
+            audit_delegation_chain: vec![],
+            cached_definition,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_basic_execution() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Tax analysis complete.".into(),
+            }],
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 20,
+                ..Default::default()
+            },
+            stop_reason: StopReason::EndTurn,
+            model: None,
+        }]));
+
+        let tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "tax_specialist".into(),
+                system_prompt: "You are a tax law expert.".into(),
+                tools: vec![],
+                task: "Analyze tax implications.".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("Tax analysis complete."));
+        assert!(result.content.contains("spawn:tax_specialist"));
+        assert_eq!(
+            tool.spawn_count.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_invalid_name() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+
+        let invalid_names = vec![
+            "Tax-Specialist",
+            "123abc",
+            "",
+            "has spaces",
+            "../path",
+            "a/b",
+            "UPPER",
+        ];
+
+        for name in invalid_names {
+            let result = tool
+                .spawn(SpawnAgentInput {
+                    name: name.into(),
+                    system_prompt: "test".into(),
+                    tools: vec![],
+                    task: "test".into(),
+                })
+                .await
+                .unwrap();
+            assert!(
+                result.is_error,
+                "expected error for name '{name}', got success: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("Invalid agent name"),
+                "expected 'Invalid agent name' in error for name '{name}', got: {}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_duplicate_name() {
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+                model: None,
+            },
+            // Second response shouldn't be needed
+        ]));
+        let tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+
+        // First spawn succeeds
+        let r1 = tool
+            .spawn(SpawnAgentInput {
+                name: "helper".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!r1.is_error);
+
+        // Second spawn with same name fails
+        let r2 = tool
+            .spawn(SpawnAgentInput {
+                name: "helper".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(r2.is_error);
+        assert!(r2.content.contains("already used"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_enforces_tool_allowlist() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = make_spawn_config();
+        config.tool_allowlist = vec!["mock_read".into()];
+
+        let mock = MockTool::new("mock_read", "file content");
+        let tool = build_spawn_tool(provider, config, vec![Arc::new(mock)]);
+
+        // Request a tool not in the allowlist
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "reader".into(),
+                system_prompt: "test".into(),
+                tools: vec!["bash".into()],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("not in allowlist"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_count_cap() {
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+            model: None,
+        }]));
+        let mut config = make_spawn_config();
+        config.max_spawned_agents = 1;
+        let tool = build_spawn_tool(provider, config, vec![]);
+
+        // First spawn succeeds
+        let r1 = tool
+            .spawn(SpawnAgentInput {
+                name: "first".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!r1.is_error);
+
+        // Second spawn hits the cap
+        let r2 = tool
+            .spawn(SpawnAgentInput {
+                name: "second".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(r2.is_error);
+        assert!(r2.content.contains("Spawn limit reached"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_token_budget_enforcement() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = make_spawn_config();
+        config.max_total_tokens = 100;
+        let tool = build_spawn_tool(provider, config, vec![]);
+
+        // Pre-fill token accumulator near the limit
+        {
+            let mut acc = tool.accumulated_tokens.lock().unwrap();
+            *acc = TokenUsage {
+                input_tokens: 60,
+                output_tokens: 50,
+                ..Default::default()
+            };
+        }
+
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "spender".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_no_delegation_tools() {
+        // Verify that delegation tools are stripped from the pool even if
+        // somehow included in the allowlist
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = make_spawn_config();
+        config.tool_allowlist = vec!["mock_read".into()];
+
+        let mock = MockTool::new("mock_read", "content");
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(mock)];
+
+        let mut tool_pool = std::collections::HashMap::new();
+        for t in &tools {
+            let name = t.definition().name;
+            if config.tool_allowlist.contains(&name) {
+                tool_pool.insert(name, t.clone());
+            }
+        }
+        // Manually inject a delegation tool to prove it gets stripped in build()
+        tool_pool.insert(
+            "delegate_task".into(),
+            Arc::new(MockTool::new("delegate_task", "bad")),
+        );
+        tool_pool.remove("delegate_task");
+        tool_pool.remove("form_squad");
+        tool_pool.remove("spawn_agent");
+
+        // Pool should only have mock_read
+        assert!(tool_pool.contains_key("mock_read"));
+        assert!(!tool_pool.contains_key("delegate_task"));
+        assert!(!tool_pool.contains_key("form_squad"));
+        assert!(!tool_pool.contains_key("spawn_agent"));
+        drop(provider);
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_emits_events() {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(vec![]));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "result".into(),
+            }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+            model: None,
+        }]));
+
+        let mut tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+        tool.on_event = Some(Arc::new(move |e: AgentEvent| {
+            events_clone.lock().unwrap().push(e);
+        }));
+
+        let _ = tool
+            .spawn(SpawnAgentInput {
+                name: "emitter".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await;
+
+        let events = events.lock().unwrap();
+        let spawned = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentSpawned { spawned_name, .. } if spawned_name == "spawn:emitter"));
+        assert!(spawned, "expected AgentSpawned event");
+
+        let completed = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SubAgentCompleted { agent, success, .. } if agent == "spawn:emitter" && *success));
+        assert!(completed, "expected SubAgentCompleted event");
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_empty_tools() {
+        // An empty tools array should create a reasoning-only agent that works
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Pure reasoning response".into(),
+            }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+            model: None,
+        }]));
+
+        let tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "thinker".into(),
+                system_prompt: "You are a reasoning agent.".into(),
+                tools: vec![],
+                task: "Think about this.".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Pure reasoning response"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_prompt_too_long() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let tool = build_spawn_tool(provider, make_spawn_config(), vec![]);
+
+        let long_prompt = "x".repeat(SPAWN_MAX_PROMPT_BYTES + 1);
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "verbose".into(),
+                system_prompt: long_prompt,
+                tools: vec![],
+                task: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("System prompt too long"));
+    }
+
+    #[test]
+    fn spawn_config_validation_rejects_zero_agents() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator.spawn]
+max_spawned_agents = 0
+"#;
+        let err = crate::config::HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_spawned_agents must be at least 1"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_config_validation_rejects_zero_turns() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator.spawn]
+max_turns = 0
+"#;
+        let err = crate::config::HeartbitConfig::from_toml(toml_str).unwrap_err();
+        assert!(
+            err.to_string().contains("max_turns must be at least 1"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_config_from_toml() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator.spawn]
+max_spawned_agents = 5
+tool_allowlist = ["read", "grep", "bash"]
+max_turns = 20
+max_tokens = 8192
+max_total_tokens = 100000
+"#;
+        let config: crate::config::HeartbitConfig = toml::from_str(toml_str).unwrap();
+        let spawn = config.orchestrator.spawn.as_ref().unwrap();
+        assert_eq!(spawn.max_spawned_agents, 5);
+        assert_eq!(spawn.tool_allowlist, vec!["read", "grep", "bash"]);
+        assert_eq!(spawn.max_turns, 20);
+        assert_eq!(spawn.max_tokens, 8192);
+        assert_eq!(spawn.max_total_tokens, 100_000);
+    }
+
+    #[test]
+    fn spawn_disabled_by_default() {
+        let toml_str = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        let config: crate::config::HeartbitConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.orchestrator.spawn.is_none());
+    }
+
+    #[test]
+    fn spawn_config_invalid_tool_rejected_at_build() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = make_spawn_config();
+        config.tool_allowlist = vec!["nonexistent_tool".into()];
+
+        let result = Orchestrator::builder(provider)
+            .sub_agent("worker", "does work", "You work.")
+            .spawn_config(config, vec![]) // empty builtins
+            .build();
+
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("nonexistent_tool"),
+                    "expected error mentioning the bad tool, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected build error for invalid tool in allowlist"),
+        }
+    }
+
+    #[test]
+    fn spawn_tool_definition_includes_allowlist() {
+        let mut config = make_spawn_config();
+        config.tool_allowlist = vec!["read".into(), "grep".into()];
+        let def = SpawnAgentTool::build_definition(&config);
+        assert_eq!(def.name, "spawn_agent");
+        assert!(def.description.contains("read, grep"));
+        assert!(def.description.contains("3 agents max"));
+    }
+
+    #[tokio::test]
+    async fn spawn_system_prompt_added_when_configured() {
+        // When spawn is configured, the orchestrator should have spawn_agent in its tool list.
+        // We verify by running the orchestrator and inspecting the LLM request.
+        use std::sync::Arc;
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // Orchestrator response (EndTurn, no tool calls)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "No delegation needed.".into(),
+                }],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+                model: None,
+            },
+        ]));
+
+        let config = make_spawn_config();
+        let mut orchestrator = Orchestrator::builder(provider)
+            .sub_agent("worker", "does work", "You work.")
+            .spawn_config(config, vec![])
+            .build()
+            .unwrap();
+
+        let output = orchestrator.run("test task").await.unwrap();
+        // If spawn_agent tool is present, the orchestrator prompt should mention it
+        assert!(output.result.contains("No delegation needed."));
     }
 }

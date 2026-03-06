@@ -82,6 +82,174 @@ struct McpCallToolResult {
     is_error: bool,
 }
 
+// --- Server capabilities (parsed from initialize response) ---
+
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+struct ServerCapabilities {
+    #[serde(default)]
+    resources: Option<ResourcesCapability>,
+    #[serde(default)]
+    prompts: Option<PromptsCapability>,
+    #[serde(default)]
+    logging: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct ResourcesCapability {
+    #[serde(default)]
+    subscribe: bool,
+    #[serde(default)]
+    list_changed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PromptsCapability {
+    #[serde(default)]
+    list_changed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct InitializeResult {
+    #[serde(default)]
+    capabilities: ServerCapabilities,
+    #[serde(default)]
+    server_info: Option<Value>,
+}
+
+// --- Resource types ---
+
+/// A resource definition from an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceDef {
+    pub uri: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpResourcesListResult {
+    resources: Vec<McpResourceDef>,
+    #[serde(default, rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+/// Content returned by `resources/read`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpResourceReadResult {
+    contents: Vec<McpResourceContent>,
+}
+
+// --- Prompt types ---
+
+/// A prompt definition from an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// An argument for an MCP prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpPromptsListResult {
+    prompts: Vec<McpPromptDef>,
+    #[serde(default, rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+/// A message returned by `prompts/get`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: McpPromptMessageContent,
+}
+
+/// Content of a prompt message.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptMessageContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct McpPromptGetResult {
+    #[serde(default)]
+    description: Option<String>,
+    messages: Vec<McpPromptMessage>,
+}
+
+// --- MCP Logging support ---
+
+/// Forward an MCP server log notification to tracing.
+///
+/// Called by stdio and HTTP transports when they encounter a notification
+/// with `method: "notifications/message"`.
+fn handle_log_notification(value: &Value) {
+    if let Some(params) = value.get("params") {
+        let level = params
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info");
+        let logger = params
+            .get("logger")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mcp");
+        let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        match level {
+            "error" | "critical" | "alert" | "emergency" => {
+                tracing::error!(target: "mcp_server", logger = logger, "{data}");
+            }
+            "warning" => {
+                tracing::warn!(target: "mcp_server", logger = logger, "{data}");
+            }
+            "debug" => {
+                tracing::debug!(target: "mcp_server", logger = logger, "{data}");
+            }
+            _ => {
+                tracing::info!(target: "mcp_server", logger = logger, "{data}");
+            }
+        }
+    }
+}
+
 // --- Pure helper functions ---
 
 /// Parse all SSE data payloads from a `text/event-stream` body.
@@ -124,10 +292,15 @@ fn extract_sse_events(body: &str) -> Result<Vec<String>, Error> {
 /// or null the ID in error responses).
 fn find_rpc_response(events: &[String], expected_id: u64) -> Result<String, Error> {
     for event in events {
-        if let Ok(value) = serde_json::from_str::<Value>(event)
-            && value.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
-        {
-            return Ok(event.clone());
+        if let Ok(value) = serde_json::from_str::<Value>(event) {
+            // Forward log notifications from SSE events
+            if value.get("method").and_then(|m| m.as_str()) == Some("notifications/message") {
+                handle_log_notification(&value);
+                continue;
+            }
+            if value.get("id").and_then(|v| v.as_u64()) == Some(expected_id) {
+                return Ok(event.clone());
+            }
         }
     }
     // Fallback: no event matched the ID — return the last payload
@@ -230,9 +403,14 @@ async fn read_stdio_response<R: tokio::io::AsyncBufRead + Unpin>(
             Err(_) => continue,
         };
 
-        // Notifications have no "id" or null id — skip them.
+        // Notifications have no "id" or null id — handle logging, skip others.
         match value.get("id") {
-            None | Some(&Value::Null) => continue,
+            None | Some(&Value::Null) => {
+                if value.get("method").and_then(|m| m.as_str()) == Some("notifications/message") {
+                    handle_log_notification(&value);
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -825,17 +1003,264 @@ impl Tool for McpTool {
 
 // --- McpClient ---
 
+// --- McpResourceTool ---
+
+/// Bridge that exposes an MCP resource as a callable tool.
+///
+/// Tool name: `mcp_resource_{sanitized_name}`. Calling it reads the resource
+/// and returns its content as text.
+struct McpResourceTool {
+    transport: Arc<Transport>,
+    resource: McpResourceDef,
+    tool_name: String,
+}
+
+impl Tool for McpResourceTool {
+    fn definition(&self) -> ToolDefinition {
+        let desc = self
+            .resource
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Read MCP resource: {}", self.resource.uri));
+        ToolDefinition {
+            name: self.tool_name.clone(),
+            description: desc,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let params = serde_json::json!({ "uri": self.resource.uri });
+            match self.transport.rpc("resources/read", Some(params)).await {
+                Ok(value) => {
+                    let result: McpResourceReadResult = serde_json::from_value(value)?;
+                    let text: String = result
+                        .contents
+                        .iter()
+                        .filter_map(|c| c.text.as_deref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() {
+                        Ok(ToolOutput::success(format!(
+                            "[Resource {} returned no text content]",
+                            self.resource.uri
+                        )))
+                    } else {
+                        Ok(ToolOutput::success(text))
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        resource = %self.resource.uri,
+                        error = %e,
+                        "MCP resource read failed"
+                    );
+                    Ok(ToolOutput::error(e.to_string()))
+                }
+            }
+        })
+    }
+}
+
+// --- McpPromptTool ---
+
+/// Bridge that exposes an MCP prompt as a callable tool.
+struct McpPromptTool {
+    transport: Arc<Transport>,
+    prompt: McpPromptDef,
+    tool_name: String,
+}
+
+impl Tool for McpPromptTool {
+    fn definition(&self) -> ToolDefinition {
+        let desc = self
+            .prompt
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Get MCP prompt: {}", self.prompt.name));
+        // Build input schema from prompt arguments
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for arg in &self.prompt.arguments {
+            let mut prop = serde_json::Map::new();
+            prop.insert("type".into(), serde_json::json!("string"));
+            if let Some(desc) = &arg.description {
+                prop.insert("description".into(), serde_json::json!(desc));
+            }
+            properties.insert(arg.name.clone(), Value::Object(prop));
+            if arg.required {
+                required.push(serde_json::json!(arg.name));
+            }
+        }
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+        });
+        if !required.is_empty() {
+            schema["required"] = Value::Array(required);
+        }
+        ToolDefinition {
+            name: self.tool_name.clone(),
+            description: desc,
+            input_schema: schema,
+        }
+    }
+
+    fn execute(
+        &self,
+        input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let arguments = if input.is_null() || input.as_object().is_some_and(|m| m.is_empty()) {
+                None
+            } else {
+                Some(input)
+            };
+            let mut params = serde_json::json!({ "name": self.prompt.name });
+            if let Some(args) = arguments {
+                params["arguments"] = args;
+            }
+            match self.transport.rpc("prompts/get", Some(params)).await {
+                Ok(value) => {
+                    let result: McpPromptGetResult = serde_json::from_value(value)?;
+                    let text: String = result
+                        .messages
+                        .iter()
+                        .map(|m| {
+                            let content = m.content.text.as_deref().unwrap_or("");
+                            format!("[{}] {}", m.role, content)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(ToolOutput::success(text))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        prompt = %self.prompt.name,
+                        error = %e,
+                        "MCP prompt get failed"
+                    );
+                    Ok(ToolOutput::error(e.to_string()))
+                }
+            }
+        })
+    }
+}
+
+// --- McpClient ---
+
+// --- Sampling types (Phase 3) ---
+
+/// Request from MCP server asking the client to create an LLM completion.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingRequest {
+    pub messages: Vec<SamplingMessage>,
+    #[serde(default)]
+    pub model_preferences: Option<SamplingModelPreferences>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingMessage {
+    pub role: String,
+    pub content: SamplingContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingModelPreferences {
+    #[serde(default)]
+    pub hints: Vec<SamplingModelHint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamplingModelHint {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Response to a `sampling/createMessage` request.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct SamplingResponse {
+    role: String,
+    content: SamplingContent,
+    model: String,
+}
+
+/// Callback for handling sampling requests from MCP servers.
+///
+/// Takes a `SamplingRequest` and returns the model's response text and model name.
+pub type SamplingHandler = Arc<
+    dyn Fn(SamplingRequest) -> Pin<Box<dyn Future<Output = Result<(String, String), Error>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Sanitize a name into a valid tool identifier (alphanumeric + underscores).
+fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Client for the Model Context Protocol (MCP).
 ///
 /// Connects to an MCP server via Streamable HTTP or stdio, performs the
-/// handshake, discovers tools, and produces `Vec<Arc<dyn Tool>>` that plug
-/// into `AgentRunnerBuilder::tools()`.
+/// handshake, discovers tools/resources/prompts, and produces `Vec<Arc<dyn Tool>>`
+/// that plug into `AgentRunnerBuilder::tools()`.
+/// A root directory exposed to MCP servers via the `roots` capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRoot {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 pub struct McpClient {
     transport: Arc<Transport>,
     tools: Vec<McpToolDef>,
+    resources: Vec<McpResourceDef>,
+    prompts: Vec<McpPromptDef>,
+    capabilities: ServerCapabilities,
+    sampling_handler: Option<SamplingHandler>,
+    /// Root directories exposed to the MCP server via `roots/list` requests.
+    /// Populated via `with_roots()`.
+    roots: Vec<McpRoot>,
 }
 
 impl McpClient {
+    /// Get the configured roots.
+    pub fn roots(&self) -> &[McpRoot] {
+        &self.roots
+    }
+
     /// Connect to an MCP server over Streamable HTTP and discover available tools.
     ///
     /// Performs the full handshake: initialize → notifications/initialized → tools/list.
@@ -853,6 +1278,27 @@ impl McpClient {
         auth_header: impl Into<String>,
     ) -> Result<Self, Error> {
         Self::connect_http(endpoint, Some(auth_header.into())).await
+    }
+
+    /// Set a sampling handler to respond to `sampling/createMessage` requests
+    /// from the MCP server. This enables the server to request LLM completions
+    /// from the client.
+    pub fn with_sampling(mut self, handler: SamplingHandler) -> Self {
+        self.sampling_handler = Some(handler);
+        self
+    }
+
+    /// Set root directories to expose to MCP servers via the `roots` capability.
+    pub fn with_roots(mut self, roots: Vec<McpRoot>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    /// Notify the server that the list of roots has changed.
+    pub async fn send_roots_changed(&self) -> Result<(), Error> {
+        self.transport
+            .notify("notifications/roots/list_changed", None)
+            .await
     }
 
     /// Connect to an MCP server via stdio (spawns a child process).
@@ -938,17 +1384,18 @@ impl McpClient {
         Self::handshake_and_discover(transport).await
     }
 
-    /// Perform MCP handshake and tool discovery on the given transport.
+    /// Perform MCP handshake and tool/resource/prompt discovery on the given transport.
     async fn handshake_and_discover(transport: Arc<Transport>) -> Result<Self, Error> {
         // Initialize — for HTTP, rpc() captures Mcp-Session-Id automatically.
-        transport
+        let init_result = transport
             .rpc(
                 "initialize",
                 Some(serde_json::json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    // Empty: Heartbit does not implement MCP Roots or Sampling (client capabilities).
-                    // Resources and Prompts are server capabilities, not declared here.
-                    "capabilities": {},
+                    "capabilities": {
+                        "sampling": {},
+                        "roots": { "listChanged": true }
+                    },
                     "clientInfo": {
                         "name": "heartbit",
                         "version": env!("CARGO_PKG_VERSION")
@@ -956,6 +1403,8 @@ impl McpClient {
                 })),
             )
             .await?;
+
+        let init: InitializeResult = serde_json::from_value(init_result).unwrap_or_default();
 
         transport.notify("notifications/initialized", None).await?;
 
@@ -973,9 +1422,60 @@ impl McpClient {
             }
         }
 
+        // Discover resources if the server advertises support
+        let mut all_resources = Vec::new();
+        if init.capabilities.resources.is_some() {
+            let mut cursor: Option<String> = None;
+            loop {
+                let params = cursor.as_ref().map(|c| serde_json::json!({"cursor": c}));
+                match transport.rpc("resources/list", params).await {
+                    Ok(value) => {
+                        let page: McpResourcesListResult = serde_json::from_value(value)?;
+                        all_resources.extend(page.resources);
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "resources/list failed, skipping resource discovery");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Discover prompts if the server advertises support
+        let mut all_prompts = Vec::new();
+        if init.capabilities.prompts.is_some() {
+            let mut cursor: Option<String> = None;
+            loop {
+                let params = cursor.as_ref().map(|c| serde_json::json!({"cursor": c}));
+                match transport.rpc("prompts/list", params).await {
+                    Ok(value) => {
+                        let page: McpPromptsListResult = serde_json::from_value(value)?;
+                        all_prompts.extend(page.prompts);
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "prompts/list failed, skipping prompt discovery");
+                        break;
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             transport,
             tools: all_tools,
+            resources: all_resources,
+            prompts: all_prompts,
+            capabilities: init.capabilities,
+            sampling_handler: None,
+            roots: Vec::new(),
         })
     }
 
@@ -985,6 +1485,63 @@ impl McpClient {
     /// and don't need the executable tool instances.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(mcp_tool_to_definition).collect()
+    }
+
+    /// Get discovered resource definitions.
+    pub fn resource_definitions(&self) -> &[McpResourceDef] {
+        &self.resources
+    }
+
+    /// Get discovered prompt definitions.
+    pub fn prompt_definitions(&self) -> &[McpPromptDef] {
+        &self.prompts
+    }
+
+    /// Whether the server supports resource subscriptions.
+    pub fn supports_resource_subscribe(&self) -> bool {
+        self.capabilities
+            .resources
+            .as_ref()
+            .is_some_and(|r| r.subscribe)
+    }
+
+    /// Read a specific resource by URI.
+    pub async fn resource_read(&self, uri: &str) -> Result<Vec<McpResourceContent>, Error> {
+        let params = serde_json::json!({ "uri": uri });
+        let value = self.transport.rpc("resources/read", Some(params)).await?;
+        let result: McpResourceReadResult = serde_json::from_value(value)?;
+        Ok(result.contents)
+    }
+
+    /// Set the server's log level via `logging/setLevel`.
+    pub async fn set_log_level(&self, level: &str) -> Result<(), Error> {
+        let params = serde_json::json!({ "level": level });
+        self.transport.rpc("logging/setLevel", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Subscribe to resource change notifications.
+    pub async fn resource_subscribe(&self, uri: &str) -> Result<(), Error> {
+        let params = serde_json::json!({ "uri": uri });
+        self.transport
+            .rpc("resources/subscribe", Some(params))
+            .await?;
+        Ok(())
+    }
+
+    /// Get a prompt by name with optional arguments.
+    pub async fn prompt_get(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Vec<McpPromptMessage>, Error> {
+        let mut params = serde_json::json!({ "name": name });
+        if let Some(args) = arguments {
+            params["arguments"] = args;
+        }
+        let value = self.transport.rpc("prompts/get", Some(params)).await?;
+        let result: McpPromptGetResult = serde_json::from_value(value)?;
+        Ok(result.messages)
     }
 
     /// Convert discovered MCP tools into `Arc<dyn Tool>` instances.
@@ -1000,6 +1557,74 @@ impl McpClient {
                 tool
             })
             .collect()
+    }
+
+    /// Convert discovered MCP resources into callable `Arc<dyn Tool>` instances.
+    ///
+    /// Each resource becomes a tool named `mcp_resource_{sanitized_name}`.
+    pub fn into_resource_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.resources
+            .iter()
+            .map(|r| {
+                let tool_name = format!("mcp_resource_{}", sanitize_tool_name(&r.name));
+                let tool: Arc<dyn Tool> = Arc::new(McpResourceTool {
+                    transport: Arc::clone(&self.transport),
+                    resource: r.clone(),
+                    tool_name,
+                });
+                tool
+            })
+            .collect()
+    }
+
+    /// Convert discovered MCP prompts into callable `Arc<dyn Tool>` instances.
+    ///
+    /// Each prompt becomes a tool named `mcp_prompt_{sanitized_name}`.
+    pub fn into_prompt_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.prompts
+            .iter()
+            .map(|p| {
+                let tool_name = format!("mcp_prompt_{}", sanitize_tool_name(&p.name));
+                let tool: Arc<dyn Tool> = Arc::new(McpPromptTool {
+                    transport: Arc::clone(&self.transport),
+                    prompt: p.clone(),
+                    tool_name,
+                });
+                tool
+            })
+            .collect()
+    }
+
+    /// Convert all discovered capabilities (tools + resources + prompts) into `Arc<dyn Tool>`.
+    pub fn into_all_tools(self) -> Vec<Arc<dyn Tool>> {
+        let transport = &self.transport;
+        let mut all: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .map(|t| -> Arc<dyn Tool> {
+                Arc::new(McpTool {
+                    transport: Arc::clone(transport),
+                    def: mcp_tool_to_definition(t),
+                })
+            })
+            .collect();
+        for r in &self.resources {
+            let tool_name = format!("mcp_resource_{}", sanitize_tool_name(&r.name));
+            all.push(Arc::new(McpResourceTool {
+                transport: Arc::clone(transport),
+                resource: r.clone(),
+                tool_name,
+            }));
+        }
+        for p in &self.prompts {
+            let tool_name = format!("mcp_prompt_{}", sanitize_tool_name(&p.name));
+            all.push(Arc::new(McpPromptTool {
+                transport: Arc::clone(transport),
+                prompt: p.clone(),
+                tool_name,
+            }));
+        }
+        all
     }
 }
 
@@ -1622,5 +2247,760 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.is_error);
         assert!(!result.content.is_empty());
+    }
+
+    // --- Server capabilities parsing ---
+
+    #[test]
+    fn server_capabilities_parses_full() {
+        let json = json!({
+            "capabilities": {
+                "resources": { "subscribe": true, "listChanged": true },
+                "prompts": { "listChanged": false },
+                "logging": {},
+                "tools": { "listChanged": true }
+            },
+            "serverInfo": { "name": "test-server", "version": "1.0" }
+        });
+        let result: InitializeResult = serde_json::from_value(json).unwrap();
+        assert!(result.capabilities.resources.is_some());
+        let res = result.capabilities.resources.unwrap();
+        assert!(res.subscribe);
+        assert!(res.list_changed);
+        assert!(result.capabilities.prompts.is_some());
+    }
+
+    #[test]
+    fn server_capabilities_parses_empty() {
+        let json = json!({
+            "capabilities": {},
+        });
+        let result: InitializeResult = serde_json::from_value(json).unwrap();
+        assert!(result.capabilities.resources.is_none());
+        assert!(result.capabilities.prompts.is_none());
+    }
+
+    #[test]
+    fn server_capabilities_defaults_on_missing() {
+        let json = json!({});
+        let result: InitializeResult = serde_json::from_value(json).unwrap();
+        assert!(result.capabilities.resources.is_none());
+        assert!(result.capabilities.prompts.is_none());
+    }
+
+    #[test]
+    fn server_capabilities_resources_only() {
+        let json = json!({
+            "capabilities": {
+                "resources": {}
+            }
+        });
+        let result: InitializeResult = serde_json::from_value(json).unwrap();
+        assert!(result.capabilities.resources.is_some());
+        let res = result.capabilities.resources.unwrap();
+        assert!(!res.subscribe); // defaults to false
+        assert!(!res.list_changed);
+        assert!(result.capabilities.prompts.is_none());
+    }
+
+    // --- Resource types ---
+
+    #[test]
+    fn resource_def_serde_roundtrip() {
+        let def = McpResourceDef {
+            uri: "file:///README.md".into(),
+            name: "README".into(),
+            description: Some("Project readme".into()),
+            mime_type: Some("text/markdown".into()),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["uri"], "file:///README.md");
+        assert_eq!(json["name"], "README");
+        let parsed: McpResourceDef = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.uri, "file:///README.md");
+        assert_eq!(parsed.mime_type.as_deref(), Some("text/markdown"));
+    }
+
+    #[test]
+    fn resource_def_minimal() {
+        let json = json!({"uri": "test://x", "name": "x"});
+        let def: McpResourceDef = serde_json::from_value(json).unwrap();
+        assert_eq!(def.uri, "test://x");
+        assert!(def.description.is_none());
+        assert!(def.mime_type.is_none());
+    }
+
+    #[test]
+    fn resources_list_result_parsing() {
+        let json = json!({
+            "resources": [
+                {
+                    "uri": "file:///config.toml",
+                    "name": "config",
+                    "description": "App configuration",
+                    "mimeType": "application/toml"
+                },
+                {
+                    "uri": "db://users/schema",
+                    "name": "users_schema"
+                }
+            ]
+        });
+        let result: McpResourcesListResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(result.resources[0].uri, "file:///config.toml");
+        assert_eq!(result.resources[0].name, "config");
+        assert_eq!(
+            result.resources[0].mime_type.as_deref(),
+            Some("application/toml")
+        );
+        assert_eq!(result.resources[1].name, "users_schema");
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn resources_list_with_cursor() {
+        let json = json!({
+            "resources": [{"uri": "a://1", "name": "one"}],
+            "nextCursor": "page2"
+        });
+        let result: McpResourcesListResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.next_cursor.as_deref(), Some("page2"));
+    }
+
+    #[test]
+    fn resource_content_parsing() {
+        let json = json!({
+            "uri": "file:///README.md",
+            "mimeType": "text/markdown",
+            "text": "# Hello World"
+        });
+        let content: McpResourceContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.uri, "file:///README.md");
+        assert_eq!(content.mime_type.as_deref(), Some("text/markdown"));
+        assert_eq!(content.text.as_deref(), Some("# Hello World"));
+        assert!(content.blob.is_none());
+    }
+
+    #[test]
+    fn resource_read_result_parsing() {
+        let json = json!({
+            "contents": [
+                {"uri": "file:///a.txt", "text": "content A"},
+                {"uri": "file:///b.txt", "text": "content B"}
+            ]
+        });
+        let result: McpResourceReadResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.contents.len(), 2);
+        assert_eq!(result.contents[0].text.as_deref(), Some("content A"));
+    }
+
+    // --- Prompt types ---
+
+    #[test]
+    fn prompt_def_serde_roundtrip() {
+        let def = McpPromptDef {
+            name: "summarize".into(),
+            description: Some("Summarize text".into()),
+            arguments: vec![McpPromptArgument {
+                name: "text".into(),
+                description: Some("Text to summarize".into()),
+                required: true,
+            }],
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["name"], "summarize");
+        let parsed: McpPromptDef = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.arguments.len(), 1);
+        assert!(parsed.arguments[0].required);
+    }
+
+    #[test]
+    fn prompt_def_minimal() {
+        let json = json!({"name": "greet"});
+        let def: McpPromptDef = serde_json::from_value(json).unwrap();
+        assert_eq!(def.name, "greet");
+        assert!(def.description.is_none());
+        assert!(def.arguments.is_empty());
+    }
+
+    #[test]
+    fn prompts_list_result_parsing() {
+        let json = json!({
+            "prompts": [
+                {
+                    "name": "code_review",
+                    "description": "Review code for issues",
+                    "arguments": [
+                        {"name": "code", "description": "Code to review", "required": true},
+                        {"name": "language", "description": "Programming language", "required": false}
+                    ]
+                }
+            ]
+        });
+        let result: McpPromptsListResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.prompts.len(), 1);
+        assert_eq!(result.prompts[0].name, "code_review");
+        assert_eq!(result.prompts[0].arguments.len(), 2);
+        assert!(result.prompts[0].arguments[0].required);
+        assert!(!result.prompts[0].arguments[1].required);
+    }
+
+    #[test]
+    fn prompt_get_result_parsing() {
+        let json = json!({
+            "description": "A helpful prompt",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {"type": "text", "text": "Please help me with this code"}
+                },
+                {
+                    "role": "assistant",
+                    "content": {"type": "text", "text": "I'd be happy to help!"}
+                }
+            ]
+        });
+        let result: McpPromptGetResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].role, "user");
+        assert_eq!(
+            result.messages[0].content.text.as_deref(),
+            Some("Please help me with this code")
+        );
+        assert_eq!(result.messages[1].role, "assistant");
+    }
+
+    // --- sanitize_tool_name ---
+
+    #[test]
+    fn sanitize_tool_name_alphanumeric() {
+        assert_eq!(sanitize_tool_name("hello_world"), "hello_world");
+        assert_eq!(sanitize_tool_name("test123"), "test123");
+    }
+
+    #[test]
+    fn sanitize_tool_name_special_chars() {
+        assert_eq!(sanitize_tool_name("my-resource"), "my_resource");
+        assert_eq!(sanitize_tool_name("path/to/thing"), "path_to_thing");
+        assert_eq!(sanitize_tool_name("file.txt"), "file_txt");
+        assert_eq!(sanitize_tool_name("a b c"), "a_b_c");
+    }
+
+    // --- McpResourceTool ---
+
+    #[test]
+    fn resource_tool_definition() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let tool = McpResourceTool {
+            transport,
+            resource: McpResourceDef {
+                uri: "file:///README.md".into(),
+                name: "readme".into(),
+                description: Some("Project readme".into()),
+                mime_type: None,
+            },
+            tool_name: "mcp_resource_readme".into(),
+        };
+
+        let def = tool.definition();
+        assert_eq!(def.name, "mcp_resource_readme");
+        assert_eq!(def.description, "Project readme");
+        assert_eq!(
+            def.input_schema,
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn resource_tool_definition_default_description() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let tool = McpResourceTool {
+            transport,
+            resource: McpResourceDef {
+                uri: "db://users".into(),
+                name: "users".into(),
+                description: None,
+                mime_type: None,
+            },
+            tool_name: "mcp_resource_users".into(),
+        };
+
+        let def = tool.definition();
+        assert!(def.description.contains("db://users"));
+    }
+
+    // --- McpPromptTool ---
+
+    #[test]
+    fn prompt_tool_definition_with_args() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let tool = McpPromptTool {
+            transport,
+            prompt: McpPromptDef {
+                name: "review".into(),
+                description: Some("Code review".into()),
+                arguments: vec![
+                    McpPromptArgument {
+                        name: "code".into(),
+                        description: Some("Code to review".into()),
+                        required: true,
+                    },
+                    McpPromptArgument {
+                        name: "language".into(),
+                        description: None,
+                        required: false,
+                    },
+                ],
+            },
+            tool_name: "mcp_prompt_review".into(),
+        };
+
+        let def = tool.definition();
+        assert_eq!(def.name, "mcp_prompt_review");
+        assert_eq!(def.description, "Code review");
+        let schema = &def.input_schema;
+        assert!(schema["properties"]["code"].is_object());
+        assert_eq!(
+            schema["properties"]["code"]["description"],
+            "Code to review"
+        );
+        assert_eq!(schema["required"], json!(["code"]));
+        // language is not required, shouldn't be in required array
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("language"))
+        );
+    }
+
+    #[test]
+    fn prompt_tool_definition_no_args() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let tool = McpPromptTool {
+            transport,
+            prompt: McpPromptDef {
+                name: "greet".into(),
+                description: None,
+                arguments: vec![],
+            },
+            tool_name: "mcp_prompt_greet".into(),
+        };
+
+        let def = tool.definition();
+        assert_eq!(def.name, "mcp_prompt_greet");
+        assert!(def.description.contains("greet"));
+        // No required array when no required args
+        assert!(def.input_schema.get("required").is_none());
+    }
+
+    // --- into_resource_tools / into_prompt_tools ---
+
+    #[test]
+    fn into_resource_tools_creates_correct_names() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![
+                McpResourceDef {
+                    uri: "file:///a.txt".into(),
+                    name: "readme-file".into(),
+                    description: None,
+                    mime_type: None,
+                },
+                McpResourceDef {
+                    uri: "db://schema".into(),
+                    name: "db schema".into(),
+                    description: Some("Database schema".into()),
+                    mime_type: None,
+                },
+            ],
+            prompts: vec![],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+
+        let tools = client.into_resource_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].definition().name, "mcp_resource_readme_file");
+        assert_eq!(tools[1].definition().name, "mcp_resource_db_schema");
+        assert_eq!(tools[1].definition().description, "Database schema");
+    }
+
+    #[test]
+    fn into_prompt_tools_creates_correct_names() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![McpPromptDef {
+                name: "code-review".into(),
+                description: Some("Review code".into()),
+                arguments: vec![],
+            }],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+
+        let tools = client.into_prompt_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].definition().name, "mcp_prompt_code_review");
+    }
+
+    #[test]
+    fn into_all_tools_combines_everything() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let client = McpClient {
+            transport,
+            tools: vec![McpToolDef {
+                name: "read_file".into(),
+                description: Some("Read a file".into()),
+                input_schema: Some(json!({"type": "object"})),
+            }],
+            resources: vec![McpResourceDef {
+                uri: "file:///a.txt".into(),
+                name: "readme".into(),
+                description: None,
+                mime_type: None,
+            }],
+            prompts: vec![McpPromptDef {
+                name: "greet".into(),
+                description: None,
+                arguments: vec![],
+            }],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+
+        let all = client.into_all_tools();
+        assert_eq!(all.len(), 3);
+        let names: Vec<String> = all.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"mcp_resource_readme".to_string()));
+        assert!(names.contains(&"mcp_prompt_greet".to_string()));
+    }
+
+    #[test]
+    fn supports_resource_subscribe_false_by_default() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+        assert!(!client.supports_resource_subscribe());
+    }
+
+    #[test]
+    fn supports_resource_subscribe_when_advertised() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            capabilities: ServerCapabilities {
+                resources: Some(ResourcesCapability {
+                    subscribe: true,
+                    list_changed: false,
+                }),
+                ..Default::default()
+            },
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+        assert!(client.supports_resource_subscribe());
+    }
+
+    // --- Sampling types ---
+
+    #[test]
+    fn sampling_request_parsing() {
+        let json = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {"type": "text", "text": "What is 2+2?"}
+                }
+            ],
+            "modelPreferences": {
+                "hints": [{"name": "claude-sonnet-4-6-20250610"}]
+            },
+            "systemPrompt": "You are a math helper",
+            "maxTokens": 100
+        });
+        let req: SamplingRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(
+            req.messages[0].content.text.as_deref(),
+            Some("What is 2+2?")
+        );
+        assert_eq!(req.system_prompt.as_deref(), Some("You are a math helper"));
+        assert_eq!(req.max_tokens, Some(100));
+        let hints = &req.model_preferences.unwrap().hints;
+        assert_eq!(hints[0].name.as_deref(), Some("claude-sonnet-4-6-20250610"));
+    }
+
+    #[test]
+    fn sampling_request_minimal() {
+        let json = json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]
+        });
+        let req: SamplingRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.model_preferences.is_none());
+        assert!(req.system_prompt.is_none());
+        assert!(req.max_tokens.is_none());
+    }
+
+    #[test]
+    fn sampling_response_serialization() {
+        let resp = SamplingResponse {
+            role: "assistant".into(),
+            content: SamplingContent {
+                content_type: "text".into(),
+                text: Some("4".into()),
+            },
+            model: "claude-sonnet-4-6-20250610".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"]["type"], "text");
+        assert_eq!(json["content"]["text"], "4");
+        assert_eq!(json["model"], "claude-sonnet-4-6-20250610");
+    }
+
+    #[test]
+    fn sampling_message_serde_roundtrip() {
+        let msg = SamplingMessage {
+            role: "user".into(),
+            content: SamplingContent {
+                content_type: "text".into(),
+                text: Some("hello".into()),
+            },
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        let parsed: SamplingMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.role, "user");
+        assert_eq!(parsed.content.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn with_sampling_sets_handler() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+        assert!(client.sampling_handler.is_none());
+
+        let handler: SamplingHandler =
+            Arc::new(|_req| Box::pin(async move { Ok(("response".into(), "model".into())) }));
+        let client = client.with_sampling(handler);
+        assert!(client.sampling_handler.is_some());
+    }
+
+    // --- Logging ---
+
+    #[test]
+    fn handle_log_notification_info() {
+        // Should not panic; just forwards to tracing
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "info", "logger": "test-server", "data": "Server started"}
+        });
+        handle_log_notification(&value);
+    }
+
+    #[test]
+    fn handle_log_notification_error() {
+        let value = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "error", "data": "Something went wrong"}
+        });
+        handle_log_notification(&value);
+    }
+
+    #[test]
+    fn handle_log_notification_missing_params() {
+        let value = json!({"jsonrpc": "2.0", "method": "notifications/message"});
+        handle_log_notification(&value); // should not panic
+    }
+
+    #[test]
+    fn find_rpc_response_skips_log_notifications() {
+        let events = vec![
+            r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"log"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","result":{"ok":true},"id":1}"#.to_string(),
+        ];
+        let result = find_rpc_response(&events, 1).unwrap();
+        assert!(result.contains("\"id\":1"));
+    }
+
+    // --- Roots ---
+
+    #[test]
+    fn mcp_root_serde_roundtrip() {
+        let root = McpRoot {
+            uri: "file:///workspace/project".into(),
+            name: Some("project".into()),
+        };
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["uri"], "file:///workspace/project");
+        assert_eq!(json["name"], "project");
+        let parsed: McpRoot = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.uri, "file:///workspace/project");
+    }
+
+    #[test]
+    fn mcp_root_minimal() {
+        let json = json!({"uri": "file:///tmp"});
+        let root: McpRoot = serde_json::from_value(json).unwrap();
+        assert_eq!(root.uri, "file:///tmp");
+        assert!(root.name.is_none());
+    }
+
+    #[test]
+    fn mcp_root_name_omitted_when_none() {
+        let root = McpRoot {
+            uri: "file:///x".into(),
+            name: None,
+        };
+        let json = serde_json::to_string(&root).unwrap();
+        assert!(!json.contains("name"));
+    }
+
+    #[test]
+    fn with_roots_sets_roots() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+        let client = McpClient {
+            transport,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+        assert!(client.roots().is_empty());
+
+        let client = client.with_roots(vec![McpRoot {
+            uri: "file:///workspace".into(),
+            name: Some("workspace".into()),
+        }]);
+        assert_eq!(client.roots().len(), 1);
+        assert_eq!(client.roots()[0].uri, "file:///workspace");
+    }
+
+    #[tokio::test]
+    async fn read_stdio_response_forwards_log_notifications() {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(rx);
+
+        tokio::spawn(async move {
+            // Server sends a log notification, then the actual response.
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"test log\"}}\n")
+                .await
+                .unwrap();
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":1}\n")
+                .await
+                .unwrap();
+        });
+
+        let response = read_stdio_response(&mut reader, 1).await.unwrap();
+        assert!(response.contains("\"id\":1"));
+        assert!(response.contains("\"ok\":true"));
     }
 }

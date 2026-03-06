@@ -91,6 +91,15 @@ impl Error {
         }
     }
 
+    /// Wrap this error with the sum of `prior` usage and the error's own partial usage.
+    ///
+    /// Shorthand for `e.with_partial_usage(prior + e.partial_usage())`.
+    pub fn accumulate_usage(self, prior: TokenUsage) -> Self {
+        let mut usage = prior;
+        usage += self.partial_usage();
+        self.with_partial_usage(usage)
+    }
+
     /// Extract partial token usage from this error.
     /// Returns `TokenUsage::default()` for errors that don't carry usage data.
     pub fn partial_usage(&self) -> TokenUsage {
