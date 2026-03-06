@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit"
-version = "2026.306.4"
+version = "2026.306.5"
 dependencies = [
  "a2a-sdk",
  "base64 0.22.1",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-cli"
-version = "2026.306.4"
+version = "2026.306.5"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-macro"
-version = "2026.306.4"
+version = "2026.306.5"
 dependencies = [
  "proc-macro2",
  "quote",
