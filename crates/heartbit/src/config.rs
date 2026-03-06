@@ -445,6 +445,13 @@ pub enum McpServerEntry {
         url: String,
         #[serde(default)]
         auth_header: Option<String>,
+        /// RFC 8707 resource indicator — audience for exchanged tokens.
+        /// Defaults to the `url` value when absent.
+        #[serde(default)]
+        resource: Option<String>,
+        /// OAuth scopes required by this MCP server (e.g., `["gmail.readonly"]`).
+        #[serde(default)]
+        scopes: Option<Vec<String>>,
     },
     /// Stdio transport — spawn a child process communicating via stdin/stdout.
     Stdio {
@@ -478,6 +485,26 @@ impl McpServerEntry {
     /// Whether this entry uses stdio transport.
     pub fn is_stdio(&self) -> bool {
         matches!(self, McpServerEntry::Stdio { .. })
+    }
+
+    /// Get the RFC 8707 resource indicator (audience for token exchange).
+    /// Returns the explicit `resource` if set, otherwise falls back to the URL.
+    pub fn resource(&self) -> Option<&str> {
+        match self {
+            McpServerEntry::Simple(url) => Some(url.as_str()),
+            McpServerEntry::Full { resource, url, .. } => {
+                Some(resource.as_deref().unwrap_or(url.as_str()))
+            }
+            McpServerEntry::Stdio { .. } => None,
+        }
+    }
+
+    /// Get the OAuth scopes configured for this MCP server.
+    pub fn scopes(&self) -> Option<&[String]> {
+        match self {
+            McpServerEntry::Full { scopes, .. } => scopes.as_deref(),
+            _ => None,
+        }
     }
 
     /// Human-readable description for logging.
@@ -3623,10 +3650,57 @@ mcp_servers = [{ url = "" }]
         let full = McpServerEntry::Full {
             url: "http://gateway/mcp".into(),
             auth_header: Some("Bearer tok".into()),
+            resource: None,
+            scopes: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         let parsed: McpServerEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(full, parsed);
+    }
+
+    #[test]
+    fn mcp_server_entry_scopes_resource_roundtrip() {
+        let full = McpServerEntry::Full {
+            url: "http://gmail-mcp.example.com/mcp".into(),
+            auth_header: None,
+            resource: Some("https://gmail.googleapis.com".into()),
+            scopes: Some(vec!["gmail.readonly".into(), "gmail.send".into()]),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let parsed: McpServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(full, parsed);
+
+        // resource() falls back to url when resource is None
+        let no_resource = McpServerEntry::Full {
+            url: "http://mcp.example.com".into(),
+            auth_header: None,
+            resource: None,
+            scopes: None,
+        };
+        assert_eq!(no_resource.resource(), Some("http://mcp.example.com"));
+
+        // resource() returns explicit resource when set
+        assert_eq!(full.resource(), Some("https://gmail.googleapis.com"));
+
+        // scopes() returns the configured scopes
+        assert_eq!(
+            full.scopes(),
+            Some(["gmail.readonly".to_string(), "gmail.send".to_string()].as_slice())
+        );
+
+        // Simple variant has resource = url, no scopes
+        let simple = McpServerEntry::Simple("http://localhost/mcp".into());
+        assert_eq!(simple.resource(), Some("http://localhost/mcp"));
+        assert_eq!(simple.scopes(), None);
+
+        // Stdio variant has no resource, no scopes
+        let stdio = McpServerEntry::Stdio {
+            command: "npx".into(),
+            args: vec![],
+            env: Default::default(),
+        };
+        assert_eq!(stdio.resource(), None);
+        assert_eq!(stdio.scopes(), None);
     }
 
     #[test]
@@ -6553,6 +6627,8 @@ brokers = "localhost:9092"
         let full = McpServerEntry::Full {
             url: "http://gateway/mcp".into(),
             auth_header: Some("Bearer tok".into()),
+            resource: None,
+            scopes: None,
         };
         assert_eq!(full.display_name(), "http://gateway/mcp");
 

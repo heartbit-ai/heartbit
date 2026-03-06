@@ -435,6 +435,31 @@ pub trait AuthProvider: Send + Sync {
         user_id: &'a str,
         tenant_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>>;
+
+    /// Return an Authorization header scoped to a specific resource and OAuth scopes.
+    ///
+    /// RFC 8707 resource indicators allow tokens to be audience-bound to a specific
+    /// MCP server. The default implementation ignores `resource` and `scopes`,
+    /// delegating to `auth_header_for()`.
+    fn auth_header_for_resource<'a>(
+        &'a self,
+        user_id: &'a str,
+        tenant_id: &'a str,
+        _resource: Option<&'a str>,
+        _scopes: Option<&'a [String]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        self.auth_header_for(user_id, tenant_id)
+    }
+
+    /// Check whether credentials exist for the given user/tenant without
+    /// performing an exchange or network call. Used by the daemon to decide
+    /// whether per-user MCP tool stamping is possible before actually
+    /// resolving tokens.
+    ///
+    /// Default: `true` (assume credentials are available).
+    fn has_credentials(&self, _user_id: &str, _tenant_id: &str) -> bool {
+        true
+    }
 }
 
 /// Auth provider that always returns the same static auth header.
@@ -455,6 +480,82 @@ impl AuthProvider for StaticAuthProvider {
         _tenant_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
         Box::pin(async move { Ok(self.header.clone()) })
+    }
+}
+
+// --- Auth resolvers ---
+
+/// Resolves an `Authorization` header at tool-call time.
+///
+/// Unlike `AuthProvider` (which is a shared service), `AuthResolver` is stamped
+/// per-user onto each `McpTool` instance so that a shared transport can carry
+/// different credentials per request.
+pub trait AuthResolver: Send + Sync {
+    /// Resolve the Authorization header value for the current request.
+    fn resolve(&self) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + '_>>;
+}
+
+/// Auth resolver that always returns the same static header.
+pub struct StaticAuthResolver(pub Option<String>);
+
+impl AuthResolver for StaticAuthResolver {
+    fn resolve(&self) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + '_>> {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+/// Auth resolver that calls an `AuthProvider` for a specific user/tenant/resource.
+///
+/// Created per-task by `McpTransportPool::tools_for_user()` and stamped onto each
+/// `McpTool` so that tool execution injects per-user auth at call time.
+pub struct DynamicAuthResolver {
+    provider: Arc<dyn AuthProvider>,
+    user_id: String,
+    tenant_id: String,
+    resource: Option<String>,
+    scopes: Option<Vec<String>>,
+}
+
+impl DynamicAuthResolver {
+    pub fn new(
+        provider: Arc<dyn AuthProvider>,
+        user_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            user_id: user_id.into(),
+            tenant_id: tenant_id.into(),
+            resource: None,
+            scopes: None,
+        }
+    }
+
+    /// Set the RFC 8707 resource indicator for audience-bound tokens.
+    pub fn with_resource(mut self, resource: Option<String>) -> Self {
+        self.resource = resource;
+        self
+    }
+
+    /// Set OAuth scopes for this MCP server.
+    pub fn with_scopes(mut self, scopes: Option<Vec<String>>) -> Self {
+        self.scopes = scopes;
+        self
+    }
+}
+
+impl AuthResolver for DynamicAuthResolver {
+    fn resolve(&self) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + '_>> {
+        Box::pin(async move {
+            self.provider
+                .auth_header_for_resource(
+                    &self.user_id,
+                    &self.tenant_id,
+                    self.resource.as_deref(),
+                    self.scopes.as_deref(),
+                )
+                .await
+        })
     }
 }
 
@@ -705,6 +806,127 @@ impl AuthProvider for TokenExchangeAuthProvider {
             )))
         })
     }
+
+    fn has_credentials(&self, user_id: &str, tenant_id: &str) -> bool {
+        let token_key = format!("{tenant_id}:{user_id}");
+        self.user_tokens
+            .read()
+            .map(|tokens| tokens.contains_key(&token_key))
+            .unwrap_or(false)
+    }
+
+    fn auth_header_for_resource<'a>(
+        &'a self,
+        user_id: &'a str,
+        tenant_id: &'a str,
+        resource: Option<&'a str>,
+        scopes: Option<&'a [String]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            // Build a cache key that includes resource + scopes for per-server isolation
+            let resource_key = resource.unwrap_or("");
+            let scopes_key = scopes
+                .map(|s| {
+                    let mut sorted = s.to_vec();
+                    sorted.sort();
+                    sorted.join(",")
+                })
+                .unwrap_or_default();
+            let cache_key = (
+                tenant_id.to_string(),
+                format!("{user_id}:{resource_key}:{scopes_key}"),
+            );
+
+            // Check cache
+            if let Ok(cache) = self.token_cache.read()
+                && let Some((token, expires_at)) = cache.get(&cache_key)
+                && Instant::now() < *expires_at
+            {
+                return Ok(Some(format!("Bearer {token}")));
+            }
+
+            let token_key = format!("{tenant_id}:{user_id}");
+            let subject_token = {
+                let tokens = self
+                    .user_tokens
+                    .read()
+                    .map_err(|e| Error::Mcp(format!("user_tokens lock poisoned: {e}")))?;
+                tokens.get(&token_key).cloned().ok_or_else(|| {
+                    Error::Mcp(format!(
+                        "No subject token found for user '{user_id}' in tenant '{tenant_id}'"
+                    ))
+                })?
+            };
+
+            let agent_token = self.ensure_valid_agent_token().await?;
+
+            // Build form params — include resource + scope when provided (RFC 8707 / RFC 8693)
+            let mut form_params: Vec<(&str, String)> = vec![
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange".into(),
+                ),
+                ("subject_token", subject_token),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token".into(),
+                ),
+                ("actor_token", agent_token),
+                (
+                    "actor_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token".into(),
+                ),
+                ("client_id", self.client_id.clone()),
+                ("client_secret", self.client_secret.clone()),
+            ];
+            if let Some(r) = resource {
+                form_params.push(("resource", r.to_string()));
+            }
+            if let Some(s) = scopes
+                && !s.is_empty()
+            {
+                form_params.push(("scope", s.join(" ")));
+            }
+
+            let response = self
+                .client
+                .post(&self.exchange_url)
+                .header(TENANT_ID_HEADER, tenant_id)
+                .form(&form_params)
+                .send()
+                .await
+                .map_err(|e| Error::Mcp(format!("Token exchange request failed: {e}")))?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let cut = crate::tool::builtins::floor_char_boundary(&body, 512);
+                return Err(Error::Mcp(format!(
+                    "Token exchange failed (HTTP {status}): {}",
+                    &body[..cut]
+                )));
+            }
+
+            let token_response: TokenExchangeResponse = response
+                .json()
+                .await
+                .map_err(|e| Error::Mcp(format!("Token exchange response parse error: {e}")))?;
+
+            let ttl = token_response.expires_in.unwrap_or(300).min(3600);
+            let now = Instant::now();
+            let expires_at = now + Duration::from_secs(ttl.saturating_sub(30));
+            if let Ok(mut cache) = self.token_cache.write() {
+                cache.retain(|_, (_, exp)| now < *exp);
+                cache.insert(cache_key, (token_response.access_token.clone(), expires_at));
+            }
+
+            let token_type = token_response.token_type.as_deref().unwrap_or("Bearer");
+            Ok(Some(format!(
+                "{token_type} {}",
+                token_response.access_token
+            )))
+        })
+    }
 }
 
 // --- HTTP transport ---
@@ -748,7 +970,12 @@ impl HttpTransport {
         Ok(())
     }
 
-    async fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+    async fn rpc(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        auth_override: Option<&str>,
+    ) -> Result<Value, Error> {
         let id = self.next_id();
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -766,7 +993,9 @@ impl HttpTransport {
         if let Some(sid) = self.read_session_id()? {
             builder = builder.header("Mcp-Session-Id", sid);
         }
-        if let Some(auth) = &self.auth_header {
+        // Per-request auth override takes precedence over static header
+        let effective_auth = auth_override.or(self.auth_header.as_deref());
+        if let Some(auth) = effective_auth {
             builder = builder.header("Authorization", auth);
         }
 
@@ -796,7 +1025,12 @@ impl HttpTransport {
         process_rpc_response(&json_str)
     }
 
-    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
+    async fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        auth_override: Option<&str>,
+    ) -> Result<(), Error> {
         let notification = JsonRpcNotification {
             jsonrpc: "2.0",
             method: method.to_string(),
@@ -812,7 +1046,8 @@ impl HttpTransport {
         if let Some(sid) = self.read_session_id()? {
             builder = builder.header("Mcp-Session-Id", sid);
         }
-        if let Some(auth) = &self.auth_header {
+        let effective_auth = auth_override.or(self.auth_header.as_deref());
+        if let Some(auth) = effective_auth {
             builder = builder.header("Authorization", auth);
         }
 
@@ -937,20 +1172,45 @@ enum Transport {
 
 impl Transport {
     async fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
+        self.rpc_with_auth(method, params, None).await
+    }
+
+    async fn rpc_with_auth(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        auth_override: Option<&str>,
+    ) -> Result<Value, Error> {
         match self {
-            Transport::Http(t) => t.rpc(method, params).await,
+            Transport::Http(t) => t.rpc(method, params, auth_override).await,
+            // Stdio ignores auth_override — no HTTP headers
             Transport::Stdio(t) => t.rpc(method, params).await,
         }
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
+        self.notify_with_auth(method, params, None).await
+    }
+
+    async fn notify_with_auth(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        auth_override: Option<&str>,
+    ) -> Result<(), Error> {
         match self {
-            Transport::Http(t) => t.notify(method, params).await,
+            Transport::Http(t) => t.notify(method, params, auth_override).await,
             Transport::Stdio(t) => t.notify(method, params).await,
         }
     }
 
-    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput, Error> {
+    /// Call a tool, optionally with a per-request auth override.
+    async fn call_tool_with_auth(
+        &self,
+        name: &str,
+        arguments: Value,
+        auth_override: Option<&str>,
+    ) -> Result<ToolOutput, Error> {
         // MCP servers expect arguments to be an object, never null.
         // LLMs sometimes send null/empty for tools with no required params.
         let arguments = if arguments.is_null() {
@@ -963,7 +1223,9 @@ impl Transport {
             "arguments": arguments,
         });
 
-        let result_value = self.rpc("tools/call", Some(params)).await?;
+        let result_value = self
+            .rpc_with_auth("tools/call", Some(params), auth_override)
+            .await?;
         let result: McpCallToolResult = serde_json::from_value(result_value)?;
         Ok(mcp_result_to_tool_output(result))
     }
@@ -974,6 +1236,9 @@ impl Transport {
 struct McpTool {
     transport: Arc<Transport>,
     def: ToolDefinition,
+    /// Per-user auth resolver. When set, resolved at call time and injected
+    /// as an auth override into the shared transport.
+    auth_resolver: Option<Arc<dyn AuthResolver>>,
 }
 
 impl Tool for McpTool {
@@ -986,7 +1251,16 @@ impl Tool for McpTool {
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
-            match self.transport.call_tool(&self.def.name, input).await {
+            let auth = if let Some(resolver) = &self.auth_resolver {
+                resolver.resolve().await?
+            } else {
+                None
+            };
+            match self
+                .transport
+                .call_tool_with_auth(&self.def.name, input, auth.as_deref())
+                .await
+            {
                 Ok(output) => Ok(output),
                 Err(e) => {
                     tracing::warn!(
@@ -1013,6 +1287,7 @@ struct McpResourceTool {
     transport: Arc<Transport>,
     resource: McpResourceDef,
     tool_name: String,
+    auth_resolver: Option<Arc<dyn AuthResolver>>,
 }
 
 impl Tool for McpResourceTool {
@@ -1037,8 +1312,17 @@ impl Tool for McpResourceTool {
         _input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
+            let auth = if let Some(resolver) = &self.auth_resolver {
+                resolver.resolve().await?
+            } else {
+                None
+            };
             let params = serde_json::json!({ "uri": self.resource.uri });
-            match self.transport.rpc("resources/read", Some(params)).await {
+            match self
+                .transport
+                .rpc_with_auth("resources/read", Some(params), auth.as_deref())
+                .await
+            {
                 Ok(value) => {
                     let result: McpResourceReadResult = serde_json::from_value(value)?;
                     let text: String = result
@@ -1076,6 +1360,7 @@ struct McpPromptTool {
     transport: Arc<Transport>,
     prompt: McpPromptDef,
     tool_name: String,
+    auth_resolver: Option<Arc<dyn AuthResolver>>,
 }
 
 impl Tool for McpPromptTool {
@@ -1118,6 +1403,11 @@ impl Tool for McpPromptTool {
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
+            let auth = if let Some(resolver) = &self.auth_resolver {
+                resolver.resolve().await?
+            } else {
+                None
+            };
             let arguments = if input.is_null() || input.as_object().is_some_and(|m| m.is_empty()) {
                 None
             } else {
@@ -1127,7 +1417,11 @@ impl Tool for McpPromptTool {
             if let Some(args) = arguments {
                 params["arguments"] = args;
             }
-            match self.transport.rpc("prompts/get", Some(params)).await {
+            match self
+                .transport
+                .rpc_with_auth("prompts/get", Some(params), auth.as_deref())
+                .await
+            {
                 Ok(value) => {
                     let result: McpPromptGetResult = serde_json::from_value(value)?;
                     let text: String = result
@@ -1546,6 +1840,18 @@ impl McpClient {
 
     /// Convert discovered MCP tools into `Arc<dyn Tool>` instances.
     pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
+        self.stamp_tools(None)
+    }
+
+    /// Convert discovered MCP tools into `Arc<dyn Tool>` instances with a per-user auth resolver.
+    ///
+    /// Each tool will resolve its Authorization header at call time via the resolver,
+    /// allowing a shared transport to carry different credentials per user.
+    pub fn into_tools_with_auth(self, resolver: Arc<dyn AuthResolver>) -> Vec<Arc<dyn Tool>> {
+        self.stamp_tools(Some(resolver))
+    }
+
+    fn stamp_tools(self, resolver: Option<Arc<dyn AuthResolver>>) -> Vec<Arc<dyn Tool>> {
         let transport = self.transport;
         self.tools
             .into_iter()
@@ -1553,6 +1859,7 @@ impl McpClient {
                 let tool: Arc<dyn Tool> = Arc::new(McpTool {
                     transport: Arc::clone(&transport),
                     def: mcp_tool_to_definition(&t),
+                    auth_resolver: resolver.clone(),
                 });
                 tool
             })
@@ -1563,6 +1870,10 @@ impl McpClient {
     ///
     /// Each resource becomes a tool named `mcp_resource_{sanitized_name}`.
     pub fn into_resource_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.stamp_resource_tools(None)
+    }
+
+    fn stamp_resource_tools(&self, resolver: Option<Arc<dyn AuthResolver>>) -> Vec<Arc<dyn Tool>> {
         self.resources
             .iter()
             .map(|r| {
@@ -1571,6 +1882,7 @@ impl McpClient {
                     transport: Arc::clone(&self.transport),
                     resource: r.clone(),
                     tool_name,
+                    auth_resolver: resolver.clone(),
                 });
                 tool
             })
@@ -1581,6 +1893,10 @@ impl McpClient {
     ///
     /// Each prompt becomes a tool named `mcp_prompt_{sanitized_name}`.
     pub fn into_prompt_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.stamp_prompt_tools(None)
+    }
+
+    fn stamp_prompt_tools(&self, resolver: Option<Arc<dyn AuthResolver>>) -> Vec<Arc<dyn Tool>> {
         self.prompts
             .iter()
             .map(|p| {
@@ -1589,6 +1905,7 @@ impl McpClient {
                     transport: Arc::clone(&self.transport),
                     prompt: p.clone(),
                     tool_name,
+                    auth_resolver: resolver.clone(),
                 });
                 tool
             })
@@ -1597,34 +1914,207 @@ impl McpClient {
 
     /// Convert all discovered capabilities (tools + resources + prompts) into `Arc<dyn Tool>`.
     pub fn into_all_tools(self) -> Vec<Arc<dyn Tool>> {
-        let transport = &self.transport;
-        let mut all: Vec<Arc<dyn Tool>> = self
-            .tools
+        Self::stamp_all_tools_inner(
+            &self.transport,
+            &self.tools,
+            &self.resources,
+            &self.prompts,
+            None,
+        )
+    }
+
+    /// Convert all capabilities into tools with a per-user auth resolver.
+    pub fn into_all_tools_with_auth(self, resolver: Arc<dyn AuthResolver>) -> Vec<Arc<dyn Tool>> {
+        Self::stamp_all_tools_inner(
+            &self.transport,
+            &self.tools,
+            &self.resources,
+            &self.prompts,
+            Some(resolver),
+        )
+    }
+
+    fn stamp_all_tools_inner(
+        transport: &Arc<Transport>,
+        tools: &[McpToolDef],
+        resources: &[McpResourceDef],
+        prompts: &[McpPromptDef],
+        resolver: Option<Arc<dyn AuthResolver>>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut all: Vec<Arc<dyn Tool>> = tools
             .iter()
             .map(|t| -> Arc<dyn Tool> {
                 Arc::new(McpTool {
                     transport: Arc::clone(transport),
                     def: mcp_tool_to_definition(t),
+                    auth_resolver: resolver.clone(),
                 })
             })
             .collect();
-        for r in &self.resources {
+        for r in resources {
             let tool_name = format!("mcp_resource_{}", sanitize_tool_name(&r.name));
             all.push(Arc::new(McpResourceTool {
                 transport: Arc::clone(transport),
                 resource: r.clone(),
                 tool_name,
+                auth_resolver: resolver.clone(),
             }));
         }
-        for p in &self.prompts {
+        for p in prompts {
             let tool_name = format!("mcp_prompt_{}", sanitize_tool_name(&p.name));
             all.push(Arc::new(McpPromptTool {
                 transport: Arc::clone(transport),
                 prompt: p.clone(),
                 tool_name,
+                auth_resolver: resolver.clone(),
             }));
         }
         all
+    }
+
+    /// Get the shared transport and discovered capabilities (for pool caching).
+    /// Consumes the client — the transport continues to live via `Arc`.
+    fn into_pool_parts(
+        self,
+    ) -> (
+        Arc<Transport>,
+        Vec<McpToolDef>,
+        Vec<McpResourceDef>,
+        Vec<McpPromptDef>,
+    ) {
+        (self.transport, self.tools, self.resources, self.prompts)
+    }
+}
+
+// --- McpTransportPool ---
+
+/// Cached connection state for a single MCP server.
+struct PoolEntry {
+    transport: Arc<Transport>,
+    tools: Vec<McpToolDef>,
+    resources: Vec<McpResourceDef>,
+    prompts: Vec<McpPromptDef>,
+}
+
+/// Connection pool for MCP transports.
+///
+/// Connects to each MCP server once and caches the transport + discovered tool
+/// definitions. Per-user tools are then "stamped" from the cache with a
+/// `DynamicAuthResolver` — no re-handshake needed.
+pub struct McpTransportPool {
+    pool: RwLock<HashMap<String, PoolEntry>>,
+}
+
+impl McpTransportPool {
+    pub fn new() -> Self {
+        Self {
+            pool: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create a cached connection to an MCP server.
+    ///
+    /// If the server is already connected, returns cached tool definitions.
+    /// Otherwise, connects, performs the MCP handshake, and caches everything.
+    pub async fn get_or_connect(
+        &self,
+        url: &str,
+        static_auth: Option<String>,
+    ) -> Result<Vec<ToolDefinition>, Error> {
+        // Check cache (read lock not held across .await)
+        {
+            let pool = self
+                .pool
+                .read()
+                .map_err(|e| Error::Mcp(format!("transport pool lock poisoned: {e}")))?;
+            if let Some(entry) = pool.get(url) {
+                return Ok(entry.tools.iter().map(mcp_tool_to_definition).collect());
+            }
+        }
+
+        // Connect and cache
+        let client = McpClient::connect_http(url, static_auth).await?;
+        let (transport, tools, resources, prompts) = client.into_pool_parts();
+        let defs: Vec<ToolDefinition> = tools.iter().map(mcp_tool_to_definition).collect();
+
+        let entry = PoolEntry {
+            transport,
+            tools,
+            resources,
+            prompts,
+        };
+
+        let mut pool = self
+            .pool
+            .write()
+            .map_err(|e| Error::Mcp(format!("transport pool lock poisoned: {e}")))?;
+        pool.insert(url.to_string(), entry);
+
+        Ok(defs)
+    }
+
+    /// Stamp tools from a cached connection with a per-user auth resolver.
+    ///
+    /// Returns `None` if the URL has not been connected yet.
+    pub fn tools_for_user(
+        &self,
+        url: &str,
+        resolver: Arc<dyn AuthResolver>,
+    ) -> Result<Option<Vec<Arc<dyn Tool>>>, Error> {
+        let pool = self
+            .pool
+            .read()
+            .map_err(|e| Error::Mcp(format!("transport pool lock poisoned: {e}")))?;
+        let entry = match pool.get(url) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let resolver = Some(resolver);
+        let mut all: Vec<Arc<dyn Tool>> = entry
+            .tools
+            .iter()
+            .map(|t| -> Arc<dyn Tool> {
+                Arc::new(McpTool {
+                    transport: Arc::clone(&entry.transport),
+                    def: mcp_tool_to_definition(t),
+                    auth_resolver: resolver.clone(),
+                })
+            })
+            .collect();
+        for r in &entry.resources {
+            let tool_name = format!("mcp_resource_{}", sanitize_tool_name(&r.name));
+            all.push(Arc::new(McpResourceTool {
+                transport: Arc::clone(&entry.transport),
+                resource: r.clone(),
+                tool_name,
+                auth_resolver: resolver.clone(),
+            }));
+        }
+        for p in &entry.prompts {
+            let tool_name = format!("mcp_prompt_{}", sanitize_tool_name(&p.name));
+            all.push(Arc::new(McpPromptTool {
+                transport: Arc::clone(&entry.transport),
+                prompt: p.clone(),
+                tool_name,
+                auth_resolver: resolver.clone(),
+            }));
+        }
+        Ok(Some(all))
+    }
+
+    /// Check if a URL is already in the pool.
+    pub fn contains(&self, url: &str) -> bool {
+        self.pool
+            .read()
+            .map(|p| p.contains_key(url))
+            .unwrap_or(false)
+    }
+}
+
+impl Default for McpTransportPool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2172,6 +2662,7 @@ mod tests {
         let tool = McpTool {
             transport,
             def: expected_def.clone(),
+            auth_resolver: None,
         };
 
         let def = tool.definition();
@@ -2240,6 +2731,7 @@ mod tests {
                 description: "test".into(),
                 input_schema: json!({"type": "object"}),
             },
+            auth_resolver: None,
         };
 
         // execute() should catch the connection error and return ToolOutput::error,
@@ -2509,6 +3001,7 @@ mod tests {
                 mime_type: None,
             },
             tool_name: "mcp_resource_readme".into(),
+            auth_resolver: None,
         };
 
         let def = tool.definition();
@@ -2539,6 +3032,7 @@ mod tests {
                 mime_type: None,
             },
             tool_name: "mcp_resource_users".into(),
+            auth_resolver: None,
         };
 
         let def = tool.definition();
@@ -2576,6 +3070,7 @@ mod tests {
                 ],
             },
             tool_name: "mcp_prompt_review".into(),
+            auth_resolver: None,
         };
 
         let def = tool.definition();
@@ -2615,6 +3110,7 @@ mod tests {
                 arguments: vec![],
             },
             tool_name: "mcp_prompt_greet".into(),
+            auth_resolver: None,
         };
 
         let def = tool.definition();
@@ -3002,5 +3498,246 @@ mod tests {
         let response = read_stdio_response(&mut reader, 1).await.unwrap();
         assert!(response.contains("\"id\":1"));
         assert!(response.contains("\"ok\":true"));
+    }
+
+    // --- AuthResolver tests ---
+
+    #[tokio::test]
+    async fn static_auth_resolver_returns_header() {
+        let resolver = StaticAuthResolver(Some("Bearer xyz".into()));
+        let result = resolver.resolve().await.unwrap();
+        assert_eq!(result, Some("Bearer xyz".to_string()));
+    }
+
+    #[tokio::test]
+    async fn static_auth_resolver_returns_none() {
+        let resolver = StaticAuthResolver(None);
+        let result = resolver.resolve().await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn dynamic_auth_resolver_calls_provider() {
+        let provider = Arc::new(StaticAuthProvider::new(Some("Bearer dynamic".into())));
+        let resolver = DynamicAuthResolver::new(provider, "user1", "tenant1");
+        let result = resolver.resolve().await.unwrap();
+        assert_eq!(result, Some("Bearer dynamic".to_string()));
+    }
+
+    #[tokio::test]
+    async fn dynamic_auth_resolver_with_resource_and_scopes() {
+        let provider = Arc::new(StaticAuthProvider::new(Some("Bearer scoped".into())));
+        let resolver = DynamicAuthResolver::new(provider, "user1", "tenant1")
+            .with_resource(Some("https://gmail.googleapis.com".into()))
+            .with_scopes(Some(vec!["gmail.readonly".into()]));
+        // StaticAuthProvider ignores resource/scopes — just verify it passes through
+        let result = resolver.resolve().await.unwrap();
+        assert_eq!(result, Some("Bearer scoped".to_string()));
+    }
+
+    #[tokio::test]
+    async fn auth_header_for_resource_default_delegates() {
+        let provider = StaticAuthProvider::new(Some("Bearer base".into()));
+        let result = provider
+            .auth_header_for_resource(
+                "user1",
+                "tenant1",
+                Some("https://resource.example.com"),
+                Some(&["scope1".into()]),
+            )
+            .await
+            .unwrap();
+        // Default impl delegates to auth_header_for, ignoring resource/scopes
+        assert_eq!(result, Some("Bearer base".to_string()));
+    }
+
+    // --- McpTool with auth resolver ---
+
+    #[tokio::test]
+    async fn mcp_tool_with_resolver_injects_auth() {
+        // We can't test the actual HTTP call, but we can verify the tool accepts a resolver
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let resolver: Arc<dyn AuthResolver> =
+            Arc::new(StaticAuthResolver(Some("Bearer user-token".into())));
+        let tool = McpTool {
+            transport,
+            def: ToolDefinition {
+                name: "test_tool".into(),
+                description: "test".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            auth_resolver: Some(resolver),
+        };
+
+        // Execute will fail (nothing listening), but the auth resolver path is exercised
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_without_resolver_uses_transport_default() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: Some("Bearer static".into()),
+        }));
+
+        let tool = McpTool {
+            transport,
+            def: ToolDefinition {
+                name: "test_tool".into(),
+                description: "test".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            auth_resolver: None,
+        };
+
+        // Execute will fail, but the no-resolver path is exercised
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.is_error);
+    }
+
+    // --- McpTransportPool tests ---
+
+    #[test]
+    fn transport_pool_new_is_empty() {
+        let pool = McpTransportPool::new();
+        assert!(!pool.contains("http://example.com/mcp"));
+    }
+
+    #[test]
+    fn transport_pool_tools_for_user_returns_none_for_unknown_url() {
+        let pool = McpTransportPool::new();
+        let resolver: Arc<dyn AuthResolver> = Arc::new(StaticAuthResolver(None));
+        let result = pool
+            .tools_for_user("http://unknown.example.com/mcp", resolver)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transport_pool_default_trait() {
+        let pool = McpTransportPool::default();
+        assert!(!pool.contains("http://example.com/mcp"));
+    }
+
+    // --- into_tools_with_auth ---
+
+    #[test]
+    fn into_tools_with_auth_stamps_resolver() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let client = McpClient {
+            transport,
+            tools: vec![McpToolDef {
+                name: "read_file".into(),
+                description: Some("Read a file".into()),
+                input_schema: Some(json!({"type": "object"})),
+            }],
+            resources: vec![],
+            prompts: vec![],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+
+        let resolver: Arc<dyn AuthResolver> =
+            Arc::new(StaticAuthResolver(Some("Bearer user".into())));
+        let tools = client.into_tools_with_auth(resolver);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].definition().name, "read_file");
+    }
+
+    // --- has_credentials ---
+
+    #[test]
+    fn static_auth_provider_always_has_credentials() {
+        let provider = StaticAuthProvider::new(Some("Bearer x".into()));
+        assert!(provider.has_credentials("u", "t"));
+        let provider = StaticAuthProvider::new(None);
+        assert!(provider.has_credentials("u", "t"));
+    }
+
+    #[test]
+    fn token_exchange_has_credentials_checks_user_tokens() {
+        let user_tokens = Arc::new(std::sync::RwLock::new(HashMap::<String, String>::new()));
+        let provider = TokenExchangeAuthProvider::new(
+            "https://auth.example.com/token",
+            "client_id",
+            "client_secret",
+            "agent_token",
+        )
+        .with_user_tokens(Arc::clone(&user_tokens));
+
+        // No token stashed → false
+        assert!(!provider.has_credentials("alice", "acme"));
+
+        // Stash a token → true
+        user_tokens
+            .write()
+            .unwrap()
+            .insert("acme:alice".to_string(), "jwt-alice".to_string());
+        assert!(provider.has_credentials("alice", "acme"));
+
+        // Wrong user → false
+        assert!(!provider.has_credentials("bob", "acme"));
+    }
+
+    #[test]
+    fn into_all_tools_with_auth_stamps_resolver() {
+        let transport = Arc::new(Transport::Http(HttpTransport {
+            client: reqwest::Client::new(),
+            endpoint: "http://unused".to_string(),
+            session_id: RwLock::new(None),
+            next_id: AtomicU64::new(0),
+            auth_header: None,
+        }));
+
+        let client = McpClient {
+            transport,
+            tools: vec![McpToolDef {
+                name: "tool1".into(),
+                description: None,
+                input_schema: None,
+            }],
+            resources: vec![McpResourceDef {
+                uri: "file:///a.txt".into(),
+                name: "readme".into(),
+                description: None,
+                mime_type: None,
+            }],
+            prompts: vec![McpPromptDef {
+                name: "greet".into(),
+                description: None,
+                arguments: vec![],
+            }],
+            capabilities: ServerCapabilities::default(),
+            sampling_handler: None,
+            roots: Vec::new(),
+        };
+
+        let resolver: Arc<dyn AuthResolver> =
+            Arc::new(StaticAuthResolver(Some("Bearer user".into())));
+        let all = client.into_all_tools_with_auth(resolver);
+        assert_eq!(all.len(), 3);
+        let names: Vec<String> = all.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"tool1".to_string()));
+        assert!(names.contains(&"mcp_resource_readme".to_string()));
+        assert!(names.contains(&"mcp_prompt_greet".to_string()));
     }
 }

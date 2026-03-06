@@ -190,6 +190,93 @@ struct ServiceAuth;
 type PendingApprovals =
     Arc<std::sync::Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<heartbit::ApprovalDecision>>>>;
 
+/// Resolve per-user MCP tools via the transport pool (shared connections, per-user auth).
+///
+/// For each HTTP MCP server, stamps tools from the cached transport with a
+/// `DynamicAuthResolver` carrying the user's identity. Stdio servers and A2A
+/// agents are loaded fresh (they don't support per-request auth headers).
+///
+/// Falls back to `None` when auth is unavailable, letting callers use the
+/// static `tool_cache` instead.
+async fn mcp_tools_for_user(
+    config: &HeartbitConfig,
+    auth_provider: &Arc<dyn heartbit::AuthProvider>,
+    user_id: &str,
+    tenant_id: &str,
+    transport_pool: &heartbit::McpTransportPool,
+) -> Option<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> {
+    if !auth_provider.has_credentials(user_id, tenant_id) {
+        tracing::debug!("no credentials for user, using cached MCP tools");
+        return None;
+    }
+    tracing::debug!(
+        user_id = %user_id,
+        tenant_id = %tenant_id,
+        "resolved per-user auth for MCP tools via transport pool"
+    );
+    let mut cache = HashMap::new();
+    for agent in &config.agents {
+        let mut agent_tools: Vec<Arc<dyn heartbit::tool::Tool>> = Vec::new();
+        for entry in &agent.mcp_servers {
+            if entry.is_stdio() {
+                // Stdio transports don't use auth headers
+                agent_tools
+                    .extend(crate::load_mcp_tools(&agent.name, std::slice::from_ref(entry)).await);
+            } else {
+                // Use pool: stamp cached transport with per-user resolver
+                let resolver: Arc<dyn heartbit::AuthResolver> = Arc::new(
+                    heartbit::DynamicAuthResolver::new(
+                        Arc::clone(auth_provider),
+                        user_id,
+                        tenant_id,
+                    )
+                    .with_resource(entry.resource().map(String::from))
+                    .with_scopes(entry.scopes().map(|s| s.to_vec())),
+                );
+                match transport_pool.tools_for_user(entry.url(), resolver) {
+                    Ok(Some(tools)) => agent_tools.extend(tools),
+                    Ok(None) => {
+                        // Pool miss — server wasn't warmed at startup, connect now
+                        tracing::debug!(
+                            server = %entry.display_name(),
+                            "pool miss, connecting on demand"
+                        );
+                        match heartbit::McpClient::connect_with_auth(
+                            entry.url(),
+                            // Use a fresh per-user token for the handshake
+                            auth_provider
+                                .auth_header_for(user_id, tenant_id)
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default(),
+                        )
+                        .await
+                        {
+                            Ok(client) => agent_tools.extend(client.into_tools()),
+                            Err(e) => tracing::warn!(
+                                agent = %agent.name,
+                                server = %entry.display_name(),
+                                error = %e,
+                                "failed to connect MCP with user auth"
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        agent = %agent.name,
+                        server = %entry.display_name(),
+                        error = %e,
+                        "transport pool error, falling back"
+                    ),
+                }
+            }
+        }
+        // Also load A2A tools (these use their own auth)
+        agent_tools.extend(crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+        cache.insert(agent.name.clone(), agent_tools);
+    }
+    Some(cache)
+}
+
 #[derive(Clone)]
 struct AppState {
     handle: DaemonHandle,
@@ -219,6 +306,8 @@ struct AppState {
     /// Per-user MCP auth provider for RFC 8693 token exchange.
     /// When present, both HTTP and WS tasks receive user-scoped MCP credentials.
     auth_provider: Option<Arc<dyn heartbit::AuthProvider>>,
+    /// Shared MCP transport pool — connects once, stamps per-user auth at call time.
+    transport_pool: Arc<heartbit::McpTransportPool>,
     /// Pending approval senders for REST/SSE tasks (keyed by task_id).
     /// The `on_approval` callback blocks on the receiver; the REST endpoint
     /// sends the decision via the stored sender.
@@ -1378,12 +1467,30 @@ pub async fn run_daemon(
     let daemon_workspace_dir =
         crate::provision_workspace(&crate::workspace_root_from_config(&config));
 
-    // Pre-load MCP + A2A tools once for all agents (daemon reuses across tasks)
+    // Pre-load MCP + A2A tools once for all agents (daemon reuses across tasks).
+    // Also populate the transport pool for per-user auth stamping.
+    let transport_pool = Arc::new(heartbit::McpTransportPool::new());
     let tool_cache: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = {
         let mut cache = HashMap::new();
         for agent in &config.agents {
             let mut agent_tools = crate::load_mcp_tools(&agent.name, &agent.mcp_servers).await;
             agent_tools.extend(crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+            // Warm the transport pool for HTTP MCP servers (enables per-user auth stamping)
+            for entry in &agent.mcp_servers {
+                if !entry.is_stdio()
+                    && !transport_pool.contains(entry.url())
+                    && let Err(e) = transport_pool
+                        .get_or_connect(entry.url(), entry.auth_header().map(String::from))
+                        .await
+                {
+                    tracing::warn!(
+                        agent = %agent.name,
+                        server = %entry.display_name(),
+                        error = %e,
+                        "failed to warm transport pool (tools still loaded via McpClient)"
+                    );
+                }
+            }
             if !agent_tools.is_empty() {
                 tracing::info!(
                     agent = %agent.name,
@@ -1511,6 +1618,7 @@ pub async fn run_daemon(
     let runner_tools = tool_cache.clone();
     let runner_auth_provider = auth_provider;
     let state_auth_provider = runner_auth_provider.clone();
+    let runner_transport_pool = transport_pool.clone();
     let runner_user_tokens = user_tokens.clone();
     // Shared pending approvals map: REST endpoint writes decisions, on_approval callback reads them.
     let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1534,6 +1642,7 @@ pub async fn run_daemon(
         let workspace_dir = runner_workspace.clone();
         let tools = runner_tools.clone();
         let task_auth_provider = runner_auth_provider.clone();
+        let task_transport_pool = runner_transport_pool.clone();
         let task_user_tokens = runner_user_tokens.clone();
         let task_pending_approvals = runner_pending_approvals.clone();
         Box::pin(async move {
@@ -1666,81 +1775,16 @@ pub async fn run_daemon(
                 workspace_dir
             };
 
-            // Phase 1.3: Dynamic MCP auth — load per-user MCP tools when
-            // token_exchange auth_provider is configured and user context is present.
-            // Each task gets its own MCP connections with a user-scoped delegated token.
-            let user_tools: Option<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = if let (
-                Some(ap),
-                Some(uid),
-                Some(tid),
-            ) =
-                (&task_auth_provider, &user_id, &tenant_id)
-            {
-                match ap.auth_header_for(uid, tid).await {
-                    Ok(Some(user_auth)) => {
-                        tracing::debug!(
-                            user_id = %uid,
-                            tenant_id = %tid,
-                            "resolved per-user auth for MCP tools"
-                        );
-                        let mut cache = HashMap::new();
-                        for agent in &config.agents {
-                            let mut agent_tools = Vec::new();
-                            for entry in &agent.mcp_servers {
-                                if entry.is_stdio() {
-                                    // Stdio transports don't use auth headers
-                                    agent_tools.extend(
-                                        crate::load_mcp_tools(
-                                            &agent.name,
-                                            std::slice::from_ref(entry),
-                                        )
-                                        .await,
-                                    );
-                                } else {
-                                    // HTTP MCP: use per-user auth
-                                    match heartbit::McpClient::connect_with_auth(
-                                        entry.url(),
-                                        &user_auth,
-                                    )
-                                    .await
-                                    {
-                                        Ok(client) => {
-                                            agent_tools.extend(client.into_tools());
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                agent = %agent.name,
-                                                server = %entry.display_name(),
-                                                error = %e,
-                                                "failed to connect MCP with user auth, falling back to cached"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            // Also load A2A tools (these use their own auth)
-                            agent_tools.extend(
-                                crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await,
-                            );
-                            cache.insert(agent.name.clone(), agent_tools);
-                        }
-                        Some(cache)
-                    }
-                    Ok(None) => {
-                        tracing::debug!("no auth token for user, using cached MCP tools");
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "token exchange failed, falling back to cached MCP tools"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            // Phase 1.3: Dynamic MCP auth — resolve per-user tools via transport pool
+            // (shared connections, per-user auth headers at call time).
+            let user_tools: Option<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> =
+                if let (Some(ap), Some(uid), Some(tid)) =
+                    (&task_auth_provider, &user_id, &tenant_id)
+                {
+                    mcp_tools_for_user(&config, ap, uid, tid, &task_transport_pool).await
+                } else {
+                    None
+                };
 
             // Clean up subject token after exchange — prevent unbounded growth
             // of the shared user_tokens map across long-lived daemon sessions.
@@ -1934,6 +1978,7 @@ pub async fn run_daemon(
         jwt_validator: jwt_validator.clone(),
         user_tokens: user_tokens.clone(),
         auth_provider: state_auth_provider,
+        transport_pool: transport_pool.clone(),
         pending_approvals,
         mcp_server,
     };
@@ -2825,6 +2870,7 @@ async fn handle_ws_chat_send(
     let ws_auth_provider = state.auth_provider.clone();
     let ws_user_tokens = state.user_tokens.clone();
     let ws_default_tools = state.tool_cache.clone();
+    let ws_transport_pool = state.transport_pool.clone();
 
     // Register WS task in store with tenant context when available
     let register_result = match (&ws_user_id, &ws_tenant_id) {
@@ -2847,68 +2893,18 @@ async fn handle_ws_chat_send(
             t.started_at = Some(chrono::Utc::now());
         });
 
-        // Phase 1.3: resolve per-user MCP tools via token exchange (WS sessions)
-        let ws_tools: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> = if let (
-            Some(ap),
-            Some(uid),
-            Some(tid),
-        ) =
-            (&ws_auth_provider, &ws_user_id, &ws_tenant_id)
-        {
-            match ap.auth_header_for(uid, tid).await {
-                Ok(Some(user_auth)) => {
-                    tracing::debug!(
-                        user_id = %uid,
-                        tenant_id = %tid,
-                        "resolved per-user auth for WS MCP tools"
-                    );
-                    let mut cache = HashMap::new();
-                    for agent in &config.agents {
-                        let mut agent_tools = Vec::new();
-                        for entry in &agent.mcp_servers {
-                            if entry.is_stdio() {
-                                agent_tools.extend(
-                                    crate::load_mcp_tools(&agent.name, std::slice::from_ref(entry))
-                                        .await,
-                                );
-                            } else {
-                                match heartbit::McpClient::connect_with_auth(
-                                    entry.url(),
-                                    &user_auth,
-                                )
-                                .await
-                                {
-                                    Ok(client) => agent_tools.extend(client.into_tools()),
-                                    Err(e) => tracing::warn!(
-                                        agent = %agent.name,
-                                        server = %entry.display_name(),
-                                        error = %e,
-                                        "failed to connect MCP with user auth for WS, falling back to cached"
-                                    ),
-                                }
-                            }
-                        }
-                        agent_tools
-                            .extend(crate::load_a2a_tools(&agent.name, &agent.a2a_agents).await);
-                        cache.insert(agent.name.clone(), agent_tools);
-                    }
-                    Arc::new(cache)
+        // Phase 1.3: resolve per-user MCP tools via transport pool (WS sessions)
+        let ws_tools: Arc<HashMap<String, Vec<Arc<dyn heartbit::tool::Tool>>>> =
+            if let (Some(ap), Some(uid), Some(tid)) =
+                (&ws_auth_provider, &ws_user_id, &ws_tenant_id)
+            {
+                match mcp_tools_for_user(&config, ap, uid, tid, &ws_transport_pool).await {
+                    Some(cache) => Arc::new(cache),
+                    None => ws_default_tools,
                 }
-                Ok(None) => {
-                    tracing::debug!("no auth token for WS user, using cached MCP tools");
-                    ws_default_tools
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "WS token exchange failed, falling back to cached MCP tools"
-                    );
-                    ws_default_tools
-                }
-            }
-        } else {
-            ws_default_tools
-        };
+            } else {
+                ws_default_tools
+            };
         // Clean up subject token — prevent unbounded map growth
         if let (Some(uid), Some(tid)) = (&ws_user_id, &ws_tenant_id) {
             let key = format!("{tid}:{uid}");

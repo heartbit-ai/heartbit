@@ -255,10 +255,11 @@ pub use tool::builtins::{
     QuestionResponse, TodoPriority, TodoStatus, TodoStore, builtin_tools,
 };
 pub use tool::mcp::{
-    AuthProvider, McpClient, McpPromptArgument, McpPromptDef, McpPromptMessage,
-    McpPromptMessageContent, McpResourceContent, McpResourceDef, McpRoot, SamplingContent,
-    SamplingHandler, SamplingMessage, SamplingModelHint, SamplingModelPreferences, SamplingRequest,
-    StaticAuthProvider, TokenExchangeAuthProvider,
+    AuthProvider, AuthResolver, DynamicAuthResolver, McpClient, McpPromptArgument, McpPromptDef,
+    McpPromptMessage, McpPromptMessageContent, McpResourceContent, McpResourceDef, McpRoot,
+    McpTransportPool, SamplingContent, SamplingHandler, SamplingMessage, SamplingModelHint,
+    SamplingModelPreferences, SamplingRequest, StaticAuthProvider, StaticAuthResolver,
+    TokenExchangeAuthProvider,
 };
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
