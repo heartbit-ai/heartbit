@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionResponse, ContentBlock, ToolCall};
 use crate::tool::ToolOutput;
@@ -149,13 +149,11 @@ impl SecretScannerGuardrailBuilder {
     }
 }
 
-impl GuardrailMeta for SecretScannerGuardrail {
+impl Guardrail for SecretScannerGuardrail {
     fn name(&self) -> &str {
         "secret_scanner"
     }
-}
 
-impl Guardrail for SecretScannerGuardrail {
     fn post_llm(
         &self,
         response: &CompletionResponse,
@@ -361,8 +359,8 @@ mod tests {
     }
 
     #[test]
-    fn guardrail_meta_name() {
+    fn guardrail_name() {
         let guard = SecretScannerGuardrail::builder().build();
-        assert_eq!(GuardrailMeta::name(&guard), "secret_scanner");
+        assert_eq!(guard.name(), "secret_scanner");
     }
 }

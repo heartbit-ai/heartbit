@@ -8,7 +8,7 @@ use std::pin::Pin;
 
 use regex::Regex;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionResponse, ContentBlock, ToolCall};
 use crate::tool::ToolOutput;
@@ -126,13 +126,11 @@ impl InjectionClassifierGuardrail {
     }
 }
 
-impl GuardrailMeta for InjectionClassifierGuardrail {
+impl Guardrail for InjectionClassifierGuardrail {
     fn name(&self) -> &str {
         "injection_classifier"
     }
-}
 
-impl Guardrail for InjectionClassifierGuardrail {
     fn post_llm(
         &self,
         response: &CompletionResponse,

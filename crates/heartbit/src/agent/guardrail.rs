@@ -58,17 +58,6 @@ impl GuardAction {
     }
 }
 
-/// Optional metadata for guardrail identification in events and audit records.
-///
-/// All guardrails auto-implement with `"unnamed"` via the blanket default.
-/// Override `name()` to attribute which guardrail fired in logs.
-pub trait GuardrailMeta {
-    /// Human-readable name for this guardrail, used in events and audit.
-    fn name(&self) -> &str {
-        "unnamed"
-    }
-}
-
 /// Interceptor hooks for LLM calls and tool executions.
 ///
 /// All methods have default no-op implementations so guardrails only need to
@@ -78,6 +67,12 @@ pub trait GuardrailMeta {
 /// Multiple guardrails are registered via `Vec<Arc<dyn Guardrail>>` — first
 /// `Deny` wins.
 pub trait Guardrail: Send + Sync {
+    /// Human-readable name for this guardrail, used in events and audit.
+    /// Override to attribute which guardrail fired in logs.
+    fn name(&self) -> &str {
+        "unnamed"
+    }
+
     /// Called before each LLM call. Can mutate the request (e.g., inject safety
     /// instructions, redact content). `Err` aborts the run.
     fn pre_llm(
@@ -171,21 +166,23 @@ mod tests {
     }
 
     #[test]
-    fn guardrail_meta_default_name() {
+    fn guardrail_default_name() {
         struct MyGuardrail;
-        impl GuardrailMeta for MyGuardrail {}
-        assert_eq!(MyGuardrail.name(), "unnamed");
+        impl Guardrail for MyGuardrail {}
+        let g = MyGuardrail;
+        assert_eq!(g.name(), "unnamed");
     }
 
     #[test]
-    fn guardrail_meta_custom_name() {
+    fn guardrail_custom_name() {
         struct NamedGuardrail;
-        impl GuardrailMeta for NamedGuardrail {
+        impl Guardrail for NamedGuardrail {
             fn name(&self) -> &str {
                 "pii_detector"
             }
         }
-        assert_eq!(NamedGuardrail.name(), "pii_detector");
+        let g = NamedGuardrail;
+        assert_eq!(g.name(), "pii_detector");
     }
 
     #[tokio::test]

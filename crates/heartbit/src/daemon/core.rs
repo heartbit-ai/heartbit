@@ -19,23 +19,58 @@ use super::notify::{OnTaskComplete, TaskOutcome};
 use super::store::TaskStore;
 use super::types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 
+/// Error message returned when Kafka-dependent operations are called on an HTTP-only handle.
+///
+/// Used by CLI handlers to map this specific error to HTTP 503.
+pub const KAFKA_REQUIRED: &str = "this operation requires Kafka (daemon is in HTTP-only mode)";
+
 /// Cloneable handle for producing commands and reading state.
 #[derive(Clone)]
 pub struct DaemonHandle {
-    producer: FutureProducer,
-    commands_topic: String,
+    producer: Option<FutureProducer>,
+    commands_topic: Option<String>,
     store: Arc<dyn TaskStore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
 }
 
 impl DaemonHandle {
+    /// Create an HTTP-only handle (no Kafka producer).
+    ///
+    /// Task submission and cancellation via Kafka will return errors.
+    /// Direct task registration (`register_task`) and reads still work.
+    pub fn http_only(store: Arc<dyn TaskStore>) -> Self {
+        Self {
+            producer: None,
+            commands_topic: None,
+            store,
+            event_channels: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns the Kafka producer and commands topic, or an error if not configured.
+    fn require_kafka(&self) -> Result<(&FutureProducer, &str), Error> {
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| Error::Daemon(KAFKA_REQUIRED.into()))?;
+        let topic = self
+            .commands_topic
+            .as_deref()
+            .ok_or_else(|| Error::Daemon(KAFKA_REQUIRED.into()))?;
+        Ok((producer, topic))
+    }
+
     /// Submit a task: create in store as Pending, produce `SubmitTask` to Kafka.
+    ///
+    /// Returns an error when no Kafka producer is configured (HTTP-only mode).
     pub async fn submit_task(
         &self,
         task: impl Into<String>,
         source: impl Into<String>,
         story_id: Option<String>,
     ) -> Result<uuid::Uuid, Error> {
+        let (producer, commands_topic) = self.require_kafka()?;
+
         let id = uuid::Uuid::new_v4();
         let task_str = task.into();
         let source_str = source.into();
@@ -52,13 +87,14 @@ impl DaemonHandle {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
 
-        self.producer
+        producer
             .send(
-                FutureRecord::to(&self.commands_topic)
+                FutureRecord::to(commands_topic)
                     .key(&id.to_string())
                     .payload(&payload),
                 rdkafka::util::Timeout::Never,
@@ -73,6 +109,8 @@ impl DaemonHandle {
     ///
     /// Like `submit_task`, but attaches user/tenant identity to the command
     /// and creates the task record with user context.
+    ///
+    /// Returns an error when no Kafka producer is configured (HTTP-only mode).
     pub async fn submit_task_with_user(
         &self,
         task: impl Into<String>,
@@ -80,6 +118,8 @@ impl DaemonHandle {
         story_id: Option<String>,
         user_context: &super::types::UserContext,
     ) -> Result<uuid::Uuid, Error> {
+        let (producer, commands_topic) = self.require_kafka()?;
+
         let id = uuid::Uuid::new_v4();
         let task_str = task.into();
         let source_str = source.into();
@@ -102,13 +142,14 @@ impl DaemonHandle {
             user_id: Some(user_context.user_id.clone()),
             tenant_id: Some(user_context.tenant_id.clone()),
             roles: user_context.roles.clone(),
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
 
-        self.producer
+        producer
             .send(
-                FutureRecord::to(&self.commands_topic)
+                FutureRecord::to(commands_topic)
                     .key(&id.to_string())
                     .payload(&payload),
                 rdkafka::util::Timeout::Never,
@@ -201,14 +242,18 @@ impl DaemonHandle {
     }
 
     /// Produce a `CancelTask` command.
+    ///
+    /// Returns an error when no Kafka producer is configured (HTTP-only mode).
     pub async fn cancel_task(&self, id: uuid::Uuid) -> Result<(), Error> {
+        let (producer, commands_topic) = self.require_kafka()?;
+
         let cmd = DaemonCommand::CancelTask { id };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
 
-        self.producer
+        producer
             .send(
-                FutureRecord::to(&self.commands_topic)
+                FutureRecord::to(commands_topic)
                     .key(&id.to_string())
                     .payload(&payload),
                 rdkafka::util::Timeout::Never,
@@ -241,17 +286,21 @@ impl DaemonCore {
         store: Arc<dyn TaskStore>,
         cancel: CancellationToken,
     ) -> (Self, DaemonHandle) {
+        let kafka_config = config
+            .kafka
+            .as_ref()
+            .expect("DaemonCore requires [daemon.kafka] config");
         let event_channels = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let handle = DaemonHandle {
-            producer: producer.clone(),
-            commands_topic: config.kafka.commands_topic.clone(),
+            producer: Some(producer.clone()),
+            commands_topic: Some(kafka_config.commands_topic.clone()),
             store: store.clone(),
             event_channels: event_channels.clone(),
         };
         let core = Self {
             consumer,
             producer,
-            events_topic: config.kafka.events_topic.clone(),
+            events_topic: kafka_config.events_topic.clone(),
             store,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
@@ -284,9 +333,10 @@ impl DaemonCore {
                 Option<String>,
                 Option<crate::config::TrustLevel>,
                 Arc<dyn Fn(AgentEvent) + Send + Sync>,
-                Option<String>, // user_id
-                Option<String>, // tenant_id
-                Vec<String>,    // roles
+                Option<String>,                                    // user_id
+                Option<String>,                                    // tenant_id
+                Vec<String>,                                       // roles
+                Option<std::collections::HashMap<String, String>>, // mcp_auth_tokens
             ) -> Fut
             + Send
             + Sync
@@ -331,7 +381,7 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles } => {
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens } => {
                             // Re-insert task if missing (e.g. after restart with message replay)
                             if let Ok(None) = self.store.get(id) {
                                 if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
@@ -399,7 +449,7 @@ impl DaemonCore {
                                     .ok();
 
                                 let start = std::time::Instant::now();
-                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event, user_id, tenant_id, roles);
+                                let runner = build_runner(id, task, source.clone(), story_id, trust_level, on_event, user_id, tenant_id, roles, mcp_auth_tokens);
                                 tokio::select! {
                                     result = runner => {
                                         let duration_secs = start.elapsed().as_secs_f64();
@@ -537,52 +587,43 @@ mod tests {
     use super::*;
     use crate::daemon::store::InMemoryTaskStore;
 
+    fn test_kafka_config() -> crate::config::KafkaConfig {
+        crate::config::KafkaConfig {
+            brokers: "localhost:9092".into(),
+            consumer_group: "test".into(),
+            commands_topic: "test.commands".into(),
+            events_topic: "test.events".into(),
+            dead_letter_topic: "test.dead-letter".into(),
+        }
+    }
+
     fn test_config() -> DaemonConfig {
         crate::config::DaemonConfig {
-            kafka: crate::config::KafkaConfig {
-                brokers: "localhost:9092".into(),
-                consumer_group: "test".into(),
-                commands_topic: "test.commands".into(),
-                events_topic: "test.events".into(),
-                dead_letter_topic: "test.dead-letter".into(),
-            },
+            kafka: Some(test_kafka_config()),
             bind: "127.0.0.1:0".into(),
             max_concurrent_tasks: 4,
-            schedules: vec![],
             metrics: None,
-            sensors: None,
-            ws: None,
-            #[cfg(feature = "telegram")]
-            telegram: None,
             database_url: None,
-            heartbit_pulse: None,
             auth: None,
-            owner_emails: vec![],
             memory: crate::config::DaemonMemoryConfig::default(),
-            mcp_server: None,
         }
     }
 
     fn test_producer() -> FutureProducer {
-        crate::daemon::kafka::create_producer(&test_config().kafka).unwrap()
+        crate::daemon::kafka::create_producer(test_config().kafka.as_ref().unwrap()).unwrap()
     }
 
     fn test_handle() -> DaemonHandle {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
-        let event_channels = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        DaemonHandle {
-            producer: test_producer(),
-            commands_topic: "test.commands".into(),
-            store,
-            event_channels,
-        }
+        DaemonHandle::http_only(store)
     }
 
     #[tokio::test]
     async fn daemon_core_new_returns_handle() {
         let config = test_config();
+        let kafka = config.kafka.as_ref().unwrap();
         let producer = test_producer();
-        let consumer = crate::daemon::kafka::create_commands_consumer(&config.kafka).unwrap();
+        let consumer = crate::daemon::kafka::create_commands_consumer(kafka).unwrap();
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let cancel = CancellationToken::new();
 
@@ -877,8 +918,9 @@ mod tests {
     async fn daemon_core_new_semaphore_matches_config() {
         let mut config = test_config();
         config.max_concurrent_tasks = 2;
+        let kafka = config.kafka.as_ref().unwrap();
         let producer = test_producer();
-        let consumer = crate::daemon::kafka::create_commands_consumer(&config.kafka).unwrap();
+        let consumer = crate::daemon::kafka::create_commands_consumer(kafka).unwrap();
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
         let cancel = CancellationToken::new();
 
@@ -891,5 +933,32 @@ mod tests {
         assert!(p1.is_ok());
         assert!(p2.is_ok());
         assert!(p3.is_err()); // third should fail — only 2 permits
+    }
+
+    #[tokio::test]
+    async fn http_only_handle_submit_returns_error() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let handle = DaemonHandle::http_only(store);
+        let err = handle.submit_task("test", "api", None).await.unwrap_err();
+        assert!(err.to_string().contains(KAFKA_REQUIRED));
+    }
+
+    #[tokio::test]
+    async fn http_only_handle_cancel_returns_error() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let handle = DaemonHandle::http_only(store);
+        let err = handle.cancel_task(uuid::Uuid::new_v4()).await.unwrap_err();
+        assert!(err.to_string().contains(KAFKA_REQUIRED));
+    }
+
+    #[test]
+    fn http_only_handle_register_and_read_works() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let handle = DaemonHandle::http_only(store);
+        let id = uuid::Uuid::new_v4();
+        handle.register_task(id, "test", "execute").unwrap();
+        let task = handle.get_task(id).unwrap().unwrap();
+        assert_eq!(task.task, "test");
+        assert_eq!(task.source, "execute");
     }
 }

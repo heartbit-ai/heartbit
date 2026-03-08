@@ -121,7 +121,7 @@ pub use agent::context::ContextStrategy;
 pub use agent::dag::{DagAgent, DagAgentBuilder};
 pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
-pub use agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+pub use agent::guardrail::{GuardAction, Guardrail};
 #[cfg(feature = "sensor")]
 pub use agent::guardrails::SensorSecurityGuardrail;
 pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
@@ -181,8 +181,11 @@ pub use daemon::PostgresTaskStore;
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
-    OnTaskComplete, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
+    OnTaskComplete, RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeGuardrailConfig,
+    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
+    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeSseEvent, RuntimeSubAgentConfig,
+    TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
+    UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
 };
 
 // --- Error re-exports ---
@@ -262,11 +265,11 @@ pub use tool::builtins::{
     QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, builtin_tools,
 };
 pub use tool::mcp::{
-    AuthProvider, AuthResolver, DynamicAuthResolver, McpClient, McpPromptArgument, McpPromptDef,
-    McpPromptMessage, McpPromptMessageContent, McpResourceContent, McpResourceDef, McpRoot,
-    McpTransportPool, SamplingContent, SamplingHandler, SamplingMessage, SamplingModelHint,
-    SamplingModelPreferences, SamplingRequest, StaticAuthProvider, StaticAuthResolver,
-    TokenExchangeAuthProvider,
+    AuthProvider, AuthResolver, DirectAuthProvider, DynamicAuthResolver, McpClient,
+    McpPromptArgument, McpPromptDef, McpPromptMessage, McpPromptMessageContent, McpResourceContent,
+    McpResourceDef, McpRoot, McpTransportPool, SamplingContent, SamplingHandler, SamplingMessage,
+    SamplingModelHint, SamplingModelPreferences, SamplingRequest, StaticAuthProvider,
+    StaticAuthResolver, TokenExchangeAuthProvider,
 };
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};

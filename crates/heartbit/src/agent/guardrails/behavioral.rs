@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::ToolCall;
 use crate::tool::ToolOutput;
@@ -59,12 +59,6 @@ impl BehavioralMonitorGuardrail {
     /// Returns a new builder with default settings.
     pub fn builder() -> BehavioralMonitorGuardrailBuilder {
         BehavioralMonitorGuardrailBuilder::new()
-    }
-}
-
-impl GuardrailMeta for BehavioralMonitorGuardrail {
-    fn name(&self) -> &str {
-        "behavioral_monitor"
     }
 }
 
@@ -164,6 +158,10 @@ impl BehavioralMonitorGuardrail {
 }
 
 impl Guardrail for BehavioralMonitorGuardrail {
+    fn name(&self) -> &str {
+        "behavioral_monitor"
+    }
+
     fn set_turn(&self, turn: usize) {
         self.current_turn.store(turn, Ordering::Relaxed);
     }

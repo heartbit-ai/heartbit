@@ -378,6 +378,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd).expect("serialize");
 
@@ -489,21 +490,13 @@ mod tests {
         let consumer = create_commands_consumer(&config).expect("create consumer");
 
         let daemon_config = crate::config::DaemonConfig {
-            kafka: config.clone(),
+            kafka: Some(config.clone()),
             bind: "127.0.0.1:0".into(),
             max_concurrent_tasks: 4,
-            schedules: vec![],
             metrics: None,
-            sensors: None,
-            ws: None,
-            #[cfg(feature = "telegram")]
-            telegram: None,
             database_url: None,
-            heartbit_pulse: None,
             auth: None,
-            owner_emails: vec![],
             memory: crate::config::DaemonMemoryConfig::default(),
-            mcp_server: None,
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
@@ -551,30 +544,32 @@ mod tests {
         let (runner_tx, mut runner_rx) = tokio::sync::mpsc::channel::<String>(1);
 
         // Mock build_runner: captures task text, returns a simple AgentOutput
-        let build_runner = move |_id: uuid::Uuid,
-                                 task: String,
-                                 _source: String,
-                                 _story_id: Option<String>,
-                                 _trust_level: Option<crate::config::TrustLevel>,
-                                 _on_event: std::sync::Arc<
-            dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
-        >,
-                                 _user_id: Option<String>,
-                                 _tenant_id: Option<String>,
-                                 _roles: Vec<String>| {
-            let tx = runner_tx.clone();
-            async move {
-                let _ = tx.send(task).await;
-                Ok(crate::agent::AgentOutput {
-                    result: "HEARTBIT_OK".into(),
-                    tool_calls_made: 0,
-                    tokens_used: crate::llm::types::TokenUsage::default(),
-                    structured: None,
-                    estimated_cost_usd: None,
-                    model_name: None,
-                })
-            }
-        };
+        let build_runner =
+            move |_id: uuid::Uuid,
+                  task: String,
+                  _source: String,
+                  _story_id: Option<String>,
+                  _trust_level: Option<crate::config::TrustLevel>,
+                  _on_event: std::sync::Arc<
+                dyn Fn(crate::agent::events::AgentEvent) + Send + Sync,
+            >,
+                  _user_id: Option<String>,
+                  _tenant_id: Option<String>,
+                  _roles: Vec<String>,
+                  _mcp_auth_tokens: Option<std::collections::HashMap<String, String>>| {
+                let tx = runner_tx.clone();
+                async move {
+                    let _ = tx.send(task).await;
+                    Ok(crate::agent::AgentOutput {
+                        result: "HEARTBIT_OK".into(),
+                        tool_calls_made: 0,
+                        tokens_used: crate::llm::types::TokenUsage::default(),
+                        structured: None,
+                        estimated_cost_usd: None,
+                        model_name: None,
+                    })
+                }
+            };
 
         // Spawn daemon core (consumes from Kafka, calls runner)
         let core_handle = tokio::spawn(async move {

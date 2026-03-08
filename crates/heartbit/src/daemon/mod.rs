@@ -9,6 +9,7 @@ pub mod heartbit_pulse;
 pub mod kafka;
 pub mod metrics;
 pub mod notify;
+pub mod runtime_types;
 pub mod store;
 pub mod todo;
 pub mod types;
@@ -19,6 +20,11 @@ pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
+pub use runtime_types::{
+    RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeGuardrailConfig, RuntimeMcpServer,
+    RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType,
+    RuntimeRequest, RuntimeResponse, RuntimeSseEvent, RuntimeSubAgentConfig,
+};
 #[cfg(feature = "postgres")]
 pub use store::PostgresTaskStore;
 pub use store::{InMemoryTaskStore, TaskStore};

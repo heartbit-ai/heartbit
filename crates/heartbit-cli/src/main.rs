@@ -638,30 +638,14 @@ async fn run_from_config(
     let ws_root = workspace_root_from_config(&config);
     let workspace_dir = provision_workspace(&ws_root);
 
-    let mut output = build_orchestrator_from_config(
-        provider,
-        &config,
-        task,
-        on_text,
-        on_approval,
-        on_event,
-        mode,
-        None, // no story_id in CLI run mode
-        None, // CLI uses stdin-based question callback
-        None, // no external memory in CLI run mode
-        workspace_dir,
-        None,   // no daemon todo store in CLI run mode
-        None,   // no pre-loaded tools in CLI run mode
-        None,   // no multimodal content in CLI run mode
-        vec![], // no guardrails in CLI run mode
-        None,   // no memory confidentiality cap in CLI run mode
-        None,   // no memory default confidentiality in CLI run mode
-        None,   // no audit user context in CLI run mode
-        None,   // no audit tenant context in CLI run mode
-        true,   // no role restrictions in CLI run mode
-        true,   // CLI mode: enable dangerous tools (bash) for backward compatibility
-    )
-    .await?;
+    let mut output = RuntimeBuilder::new(provider, &config, task, on_text)
+        .on_approval(on_approval)
+        .on_event(on_event)
+        .observability_mode(mode)
+        .workspace_dir(workspace_dir)
+        .dangerous_tools(true)
+        .run()
+        .await?;
     // Cost estimate is only accurate when all agents use the same model.
     // With per-agent provider overrides, tokens from different models are
     // mixed in total_usage, making a single-model estimate incorrect.
@@ -727,777 +711,933 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
     Ok(kb)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn build_orchestrator_from_config(
+pub(crate) struct RuntimeBuilder<'a> {
     provider: Arc<BoxedProvider>,
-    config: &HeartbitConfig,
-    task: &str,
+    config: &'a HeartbitConfig,
+    task: &'a str,
     on_text: Arc<OnText>,
     on_approval: Option<Arc<OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
     observability_mode: ObservabilityMode,
-    story_id: Option<&str>,
+    story_id: Option<&'a str>,
     on_question: Option<Arc<OnQuestion>>,
     external_memory: Option<Arc<dyn Memory>>,
     workspace_dir: Option<std::path::PathBuf>,
     daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
-    pre_loaded_tools: Option<&HashMap<String, Vec<Arc<dyn Tool>>>>,
+    pre_loaded_tools: Option<&'a HashMap<String, Vec<Arc<dyn Tool>>>>,
     content_blocks: Option<Vec<heartbit::ContentBlock>>,
     guardrails: Vec<Arc<dyn heartbit::Guardrail>>,
     memory_confidentiality_cap: Option<heartbit::Confidentiality>,
     memory_default_confidentiality: Option<heartbit::Confidentiality>,
-    audit_user_id: Option<&str>,
-    audit_tenant_id: Option<&str>,
+    audit_user_id: Option<&'a str>,
+    audit_tenant_id: Option<&'a str>,
     allow_shared_write: bool,
     dangerous_tools: bool,
-) -> Result<AgentOutput> {
-    let on_retry = on_event.as_ref().map(build_on_retry);
+}
 
-    // ── User identity context for system prompt ──
-    // When user context is present, append identity block so the agent knows who it serves.
-    let user_context_suffix = match (audit_user_id, audit_tenant_id) {
-        (Some(uid), Some(tid)) => Some(format!(
-            "\n---\nYou are operating on behalf of **{uid}** in organization **{tid}**.\nKeep this user's information private. Do not share their data with other users."
-        )),
-        _ => None,
-    };
+impl<'a> RuntimeBuilder<'a> {
+    pub(crate) fn new(
+        provider: Arc<BoxedProvider>,
+        config: &'a HeartbitConfig,
+        task: &'a str,
+        on_text: Arc<OnText>,
+    ) -> Self {
+        Self {
+            provider,
+            config,
+            task,
+            on_text,
+            on_approval: None,
+            on_event: None,
+            observability_mode: ObservabilityMode::Production,
+            story_id: None,
+            on_question: None,
+            external_memory: None,
+            workspace_dir: None,
+            daemon_todo_store: None,
+            pre_loaded_tools: None,
+            content_blocks: None,
+            guardrails: vec![],
+            memory_confidentiality_cap: None,
+            memory_default_confidentiality: None,
+            audit_user_id: None,
+            audit_tenant_id: None,
+            allow_shared_write: true,
+            dangerous_tools: false,
+        }
+    }
 
-    // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
-    let builtins = {
-        let btc = BuiltinToolsConfig {
-            on_question: on_question.clone().or_else(|| Some(question_callback())),
-            workspace: workspace_dir.clone(),
-            dangerous_tools,
-            daemon_todo_store,
-            ..Default::default()
+    pub(crate) fn on_approval(mut self, v: Option<Arc<OnApproval>>) -> Self {
+        self.on_approval = v;
+        self
+    }
+
+    pub(crate) fn on_event(mut self, v: Option<Arc<OnEvent>>) -> Self {
+        self.on_event = v;
+        self
+    }
+
+    pub(crate) fn observability_mode(mut self, v: ObservabilityMode) -> Self {
+        self.observability_mode = v;
+        self
+    }
+
+    pub(crate) fn story_id(mut self, v: Option<&'a str>) -> Self {
+        self.story_id = v;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn on_question(mut self, v: Option<Arc<OnQuestion>>) -> Self {
+        self.on_question = v;
+        self
+    }
+
+    pub(crate) fn external_memory(mut self, v: Option<Arc<dyn Memory>>) -> Self {
+        self.external_memory = v;
+        self
+    }
+
+    pub(crate) fn workspace_dir(mut self, v: Option<std::path::PathBuf>) -> Self {
+        self.workspace_dir = v;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn daemon_todo_store(mut self, v: Option<Arc<heartbit::FileTodoStore>>) -> Self {
+        self.daemon_todo_store = v;
+        self
+    }
+
+    pub(crate) fn pre_loaded_tools(
+        mut self,
+        v: Option<&'a HashMap<String, Vec<Arc<dyn Tool>>>>,
+    ) -> Self {
+        self.pre_loaded_tools = v;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn content_blocks(mut self, v: Option<Vec<heartbit::ContentBlock>>) -> Self {
+        self.content_blocks = v;
+        self
+    }
+
+    pub(crate) fn guardrails(mut self, v: Vec<Arc<dyn heartbit::Guardrail>>) -> Self {
+        self.guardrails = v;
+        self
+    }
+
+    pub(crate) fn memory_confidentiality_cap(
+        mut self,
+        v: Option<heartbit::Confidentiality>,
+    ) -> Self {
+        self.memory_confidentiality_cap = v;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn memory_default_confidentiality(
+        mut self,
+        v: Option<heartbit::Confidentiality>,
+    ) -> Self {
+        self.memory_default_confidentiality = v;
+        self
+    }
+
+    pub(crate) fn audit_user_id(mut self, v: Option<&'a str>) -> Self {
+        self.audit_user_id = v;
+        self
+    }
+
+    pub(crate) fn audit_tenant_id(mut self, v: Option<&'a str>) -> Self {
+        self.audit_tenant_id = v;
+        self
+    }
+
+    pub(crate) fn allow_shared_write(mut self, v: bool) -> Self {
+        self.allow_shared_write = v;
+        self
+    }
+
+    pub(crate) fn dangerous_tools(mut self, v: bool) -> Self {
+        self.dangerous_tools = v;
+        self
+    }
+
+    pub(crate) async fn run(self) -> Result<AgentOutput> {
+        let on_retry = self.on_event.as_ref().map(build_on_retry);
+
+        // ── User identity context for system prompt ──
+        // When user context is present, append identity block so the agent knows who it serves.
+        let user_context_suffix = match (self.audit_user_id, self.audit_tenant_id) {
+            (Some(uid), Some(tid)) => Some(format!(
+                "\n---\nYou are operating on behalf of **{uid}** in organization **{tid}**.\nKeep this user's information private. Do not share their data with other users."
+            )),
+            _ => None,
         };
-        builtin_tools(btc)
-    };
 
-    // ── Shared memory + story context pre-loading ──
-    let mut task_text = task.to_string();
-    let base_memory = if let Some(ext) = external_memory {
-        Some(ext)
-    } else if let Some(ref memory_config) = config.memory {
-        Some(create_memory_store(memory_config).await?)
-    } else {
-        None
-    };
-    if let Some(ref base_memory) = base_memory
-        && let Some(sid) = story_id
-    {
-        let prior = base_memory
-            .recall(MemoryQuery {
-                limit: 10,
-                agent_prefix: Some(sid.to_string()),
+        // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
+        let builtins = {
+            let btc = BuiltinToolsConfig {
+                on_question: self
+                    .on_question
+                    .clone()
+                    .or_else(|| Some(question_callback())),
+                workspace: self.workspace_dir.clone(),
+                dangerous_tools: self.dangerous_tools,
+                daemon_todo_store: self.daemon_todo_store,
                 ..Default::default()
-            })
-            .await
-            .unwrap_or_default();
+            };
+            builtin_tools(btc)
+        };
 
-        if !prior.is_empty() {
-            let ctx: String = prior
-                .iter()
-                .map(|e| format!("- [{}] {}", e.category, e.content))
-                .collect::<Vec<_>>()
-                .join("\n");
-            task_text = format!("## Prior story context\n{ctx}\n\n## Current task\n{task_text}");
-            tracing::info!(
-                story_id = sid,
-                prior_memories = prior.len(),
-                "loaded story context into task"
-            );
-        }
-    }
+        // ── Shared memory + story context pre-loading ──
+        let mut task_text = self.task.to_string();
+        let base_memory = if let Some(ext) = self.external_memory {
+            Some(ext)
+        } else if let Some(ref memory_config) = self.config.memory {
+            Some(create_memory_store(memory_config).await?)
+        } else {
+            None
+        };
+        if let Some(ref base_memory) = base_memory
+            && let Some(sid) = self.story_id
+        {
+            let prior = base_memory
+                .recall(MemoryQuery {
+                    limit: 10,
+                    agent_prefix: Some(sid.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_default();
 
-    // When story context was prepended and content_blocks exist, update the
-    // text block so the LLM sees the enriched context alongside images.
-    let mut content_blocks = content_blocks;
-    if task_text != task
-        && let Some(ref mut blocks) = content_blocks
-    {
-        // Replace the first Text block with enriched task_text, or prepend one
-        let updated = blocks.iter_mut().any(|b| {
-            if let heartbit::ContentBlock::Text { text } = b {
-                *text = task_text.clone();
-                true
-            } else {
-                false
-            }
-        });
-        if !updated {
-            blocks.insert(
-                0,
-                heartbit::ContentBlock::Text {
-                    text: task_text.clone(),
-                },
-            );
-        }
-    }
-
-    // ── Routing decision ──
-    // Replace static agent-count check with complexity-based routing.
-    // Three modes: Auto (heuristic + capability match), AlwaysOrchestrate, SingleAgent.
-    let routing_mode = heartbit::resolve_routing_mode(config.orchestrator.routing);
-
-    // Event collector for Tier 3 escalation decisions.
-    // When routing in auto mode with escalation enabled, we need to capture
-    // events from the single-agent run to check for doom loops / compactions.
-    let event_collector: Arc<std::sync::Mutex<Vec<heartbit::AgentEvent>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    let (route_to_single, selected_agent_index) = match routing_mode {
-        heartbit::RoutingMode::AlwaysOrchestrate => (false, None),
-        heartbit::RoutingMode::SingleAgent => (true, Some(0)),
-        heartbit::RoutingMode::Auto => {
-            if config.agents.len() == 1 {
-                // Single agent configured → skip analysis, zero overhead
-                (true, Some(0))
-            } else if config.agents.is_empty() {
-                (false, None)
-            } else {
-                // Build capability list from agent descriptions.
-                // Tool names aren't known until MCP connection, so we rely on
-                // the agent description for domain extraction.
-                let capabilities: Vec<heartbit::AgentCapability> = config
-                    .agents
+            if !prior.is_empty() {
+                let ctx: String = prior
                     .iter()
-                    .map(|a| heartbit::AgentCapability::from_config(&a.name, &a.description, &[]))
-                    .collect();
-                let analyzer = heartbit::TaskComplexityAnalyzer::new(&capabilities);
-                let (decision, signals) = analyzer.analyze(&task_text);
+                    .map(|e| format!("- [{}] {}", e.category, e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                task_text =
+                    format!("## Prior story context\n{ctx}\n\n## Current task\n{task_text}");
+                tracing::info!(
+                    story_id = sid,
+                    prior_memories = prior.len(),
+                    "loaded story context into task"
+                );
+            }
+        }
 
-                // Emit TaskRouted event
-                let (is_single, idx) = match &decision {
-                    heartbit::RoutingDecision::SingleAgent { agent_index, .. } => {
-                        (true, Some(*agent_index))
+        // When story context was prepended and content_blocks exist, update the
+        // text block so the LLM sees the enriched context alongside images.
+        let mut content_blocks = self.content_blocks;
+        if task_text != self.task
+            && let Some(ref mut blocks) = content_blocks
+        {
+            // Replace the first Text block with enriched task_text, or prepend one
+            let updated = blocks.iter_mut().any(|b| {
+                if let heartbit::ContentBlock::Text { text } = b {
+                    *text = task_text.clone();
+                    true
+                } else {
+                    false
+                }
+            });
+            if !updated {
+                blocks.insert(
+                    0,
+                    heartbit::ContentBlock::Text {
+                        text: task_text.clone(),
+                    },
+                );
+            }
+        }
+
+        // ── Routing decision ──
+        // Replace static agent-count check with complexity-based routing.
+        // Three modes: Auto (heuristic + capability match), AlwaysOrchestrate, SingleAgent.
+        let routing_mode = heartbit::resolve_routing_mode(self.config.orchestrator.routing);
+
+        // Event collector for Tier 3 escalation decisions.
+        // When routing in auto mode with escalation enabled, we need to capture
+        // events from the single-agent run to check for doom loops / compactions.
+        let event_collector: Arc<std::sync::Mutex<Vec<heartbit::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (route_to_single, selected_agent_index) = match routing_mode {
+            heartbit::RoutingMode::AlwaysOrchestrate => (false, None),
+            heartbit::RoutingMode::SingleAgent => (true, Some(0)),
+            heartbit::RoutingMode::Auto => {
+                if self.config.agents.len() == 1 {
+                    // Single agent configured → skip analysis, zero overhead
+                    (true, Some(0))
+                } else if self.config.agents.is_empty() {
+                    (false, None)
+                } else {
+                    // Build capability list from agent descriptions.
+                    // Tool names aren't known until MCP connection, so we rely on
+                    // the agent description for domain extraction.
+                    let capabilities: Vec<heartbit::AgentCapability> = self
+                        .config
+                        .agents
+                        .iter()
+                        .map(|a| {
+                            heartbit::AgentCapability::from_config(&a.name, &a.description, &[])
+                        })
+                        .collect();
+                    let analyzer = heartbit::TaskComplexityAnalyzer::new(&capabilities);
+                    let (decision, signals) = analyzer.analyze(&task_text);
+
+                    // Emit TaskRouted event
+                    let (is_single, idx) = match &decision {
+                        heartbit::RoutingDecision::SingleAgent { agent_index, .. } => {
+                            (true, Some(*agent_index))
+                        }
+                        heartbit::RoutingDecision::Orchestrate { .. } => (false, None),
+                    };
+                    if let Some(ref on_ev) = self.on_event {
+                        let selected_name = idx.map(|i| self.config.agents[i].name.clone());
+                        on_ev(heartbit::AgentEvent::TaskRouted {
+                            decision: if is_single {
+                                "single_agent".into()
+                            } else {
+                                "orchestrate".into()
+                            },
+                            reason: match &decision {
+                                heartbit::RoutingDecision::SingleAgent { reason, .. }
+                                | heartbit::RoutingDecision::Orchestrate { reason } => {
+                                    (*reason).to_string()
+                                }
+                            },
+                            selected_agent: selected_name,
+                            complexity_score: signals.complexity_score,
+                            escalated: false,
+                        });
                     }
-                    heartbit::RoutingDecision::Orchestrate { .. } => (false, None),
-                };
-                if let Some(ref on_ev) = on_event {
-                    let selected_name = idx.map(|i| config.agents[i].name.clone());
-                    on_ev(heartbit::AgentEvent::TaskRouted {
-                        decision: if is_single {
-                            "single_agent".into()
-                        } else {
-                            "orchestrate".into()
-                        },
-                        reason: match &decision {
-                            heartbit::RoutingDecision::SingleAgent { reason, .. }
-                            | heartbit::RoutingDecision::Orchestrate { reason } => {
-                                (*reason).to_string()
-                            }
-                        },
-                        selected_agent: selected_name,
-                        complexity_score: signals.complexity_score,
-                        escalated: false,
+                    tracing::info!(
+                        routing = if is_single { "single_agent" } else { "orchestrate" },
+                        score = signals.complexity_score,
+                        domains = ?signals.domain_signals,
+                        "task routing decision"
+                    );
+                    (is_single, idx)
+                }
+            }
+        };
+
+        // Force single-agent routing when multimodal content is present.
+        // The orchestrator only supports text — images would be silently lost.
+        let (route_to_single, selected_agent_index) =
+            if content_blocks.is_some() && !route_to_single {
+                tracing::info!(
+                    "forcing single-agent routing: multimodal content not supported by orchestrator"
+                );
+                (true, Some(0))
+            } else {
+                (route_to_single, selected_agent_index)
+            };
+
+        if route_to_single {
+            let agent_index = selected_agent_index.unwrap_or(0);
+            if agent_index >= self.config.agents.len() {
+                anyhow::bail!(
+                    "routing selected agent index {agent_index} but only {} agents configured",
+                    self.config.agents.len()
+                );
+            }
+            let agent = &self.config.agents[agent_index];
+
+            // Load tools: builtins + (cached or fresh) MCP + A2A
+            let mut tools = builtins.clone();
+            match self.pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
+                Some(cached) => tools.extend(cached.iter().cloned()),
+                None => {
+                    tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
+                    tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+                }
+            }
+
+            // Provider: agent-specific or global
+            let agent_provider: Arc<BoxedProvider> = match &agent.provider {
+                Some(p) => {
+                    build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?
+                }
+                None => Arc::clone(&self.provider),
+            };
+
+            // Settings: agent overrides, falling back to orchestrator defaults
+            let max_turns = agent
+                .max_turns
+                .unwrap_or(self.config.orchestrator.max_turns);
+            let max_tokens = agent
+                .max_tokens
+                .unwrap_or(self.config.orchestrator.max_tokens);
+
+            let agent_provider_for_judge = Arc::clone(&agent_provider);
+            let system_prompt = if let Some(ref suffix) = user_context_suffix {
+                format!("{}{suffix}", agent.system_prompt)
+            } else {
+                agent.system_prompt.clone()
+            };
+            let mut rb = AgentRunner::builder(agent_provider)
+                .name(&agent.name)
+                .system_prompt(&system_prompt)
+                .tools(tools)
+                .max_turns(max_turns)
+                .max_tokens(max_tokens)
+                .on_text(Arc::clone(&self.on_text))
+                .observability_mode(self.observability_mode);
+
+            // Wire audit user context and delegation chain for multi-tenant enrichment
+            if let Some(uid) = self.audit_user_id
+                && let Some(tid) = self.audit_tenant_id
+            {
+                rb = rb
+                    .audit_user_context(uid, tid)
+                    .audit_delegation_chain(vec![agent.name.clone()]);
+            }
+
+            // Context strategy: agent-level, then orchestrator-level fallback
+            match &agent.context_strategy {
+                Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+                    rb = rb.context_strategy(ContextStrategy::SlidingWindow {
+                        max_tokens: *max_tokens,
                     });
                 }
-                tracing::info!(
-                    routing = if is_single { "single_agent" } else { "orchestrate" },
-                    score = signals.complexity_score,
-                    domains = ?signals.domain_signals,
-                    "task routing decision"
-                );
-                (is_single, idx)
-            }
-        }
-    };
-
-    // Force single-agent routing when multimodal content is present.
-    // The orchestrator only supports text — images would be silently lost.
-    let (route_to_single, selected_agent_index) = if content_blocks.is_some() && !route_to_single {
-        tracing::info!(
-            "forcing single-agent routing: multimodal content not supported by orchestrator"
-        );
-        (true, Some(0))
-    } else {
-        (route_to_single, selected_agent_index)
-    };
-
-    if route_to_single {
-        let agent_index = selected_agent_index.unwrap_or(0);
-        if agent_index >= config.agents.len() {
-            anyhow::bail!(
-                "routing selected agent index {agent_index} but only {} agents configured",
-                config.agents.len()
-            );
-        }
-        let agent = &config.agents[agent_index];
-
-        // Load tools: builtins + (cached or fresh) MCP + A2A
-        let mut tools = builtins.clone();
-        match pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
-            Some(cached) => tools.extend(cached.iter().cloned()),
-            None => {
-                tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
-                tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
-            }
-        }
-
-        // Provider: agent-specific or global
-        let agent_provider: Arc<BoxedProvider> = match &agent.provider {
-            Some(p) => build_agent_provider(p, retry_config_from(config), on_retry.clone())?,
-            None => Arc::clone(&provider),
-        };
-
-        // Settings: agent overrides, falling back to orchestrator defaults
-        let max_turns = agent.max_turns.unwrap_or(config.orchestrator.max_turns);
-        let max_tokens = agent.max_tokens.unwrap_or(config.orchestrator.max_tokens);
-
-        let agent_provider_for_judge = Arc::clone(&agent_provider);
-        let system_prompt = if let Some(ref suffix) = user_context_suffix {
-            format!("{}{suffix}", agent.system_prompt)
-        } else {
-            agent.system_prompt.clone()
-        };
-        let mut rb = AgentRunner::builder(agent_provider)
-            .name(&agent.name)
-            .system_prompt(&system_prompt)
-            .tools(tools)
-            .max_turns(max_turns)
-            .max_tokens(max_tokens)
-            .on_text(Arc::clone(&on_text))
-            .observability_mode(observability_mode);
-
-        // Wire audit user context and delegation chain for multi-tenant enrichment
-        if let Some(uid) = audit_user_id
-            && let Some(tid) = audit_tenant_id
-        {
-            rb = rb
-                .audit_user_context(uid, tid)
-                .audit_delegation_chain(vec![agent.name.clone()]);
-        }
-
-        // Context strategy: agent-level, then orchestrator-level fallback
-        match &agent.context_strategy {
-            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
-                rb = rb.context_strategy(ContextStrategy::SlidingWindow {
-                    max_tokens: *max_tokens,
-                });
-            }
-            Some(ContextStrategyConfig::Summarize { threshold }) => {
-                rb = rb.summarize_threshold(*threshold);
-            }
-            Some(ContextStrategyConfig::Unlimited) | None => {
-                if let Some(st) = agent.summarize_threshold {
-                    rb = rb.summarize_threshold(st);
-                } else {
-                    match &config.orchestrator.context_strategy {
-                        Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
-                            rb = rb.context_strategy(ContextStrategy::SlidingWindow {
-                                max_tokens: *max_tokens,
-                            });
-                        }
-                        Some(ContextStrategyConfig::Summarize { threshold }) => {
-                            rb = rb.summarize_threshold(*threshold);
-                        }
-                        _ => {
-                            if let Some(threshold) = config.orchestrator.summarize_threshold {
-                                rb = rb.summarize_threshold(threshold);
+                Some(ContextStrategyConfig::Summarize { threshold }) => {
+                    rb = rb.summarize_threshold(*threshold);
+                }
+                Some(ContextStrategyConfig::Unlimited) | None => {
+                    if let Some(st) = agent.summarize_threshold {
+                        rb = rb.summarize_threshold(st);
+                    } else {
+                        match &self.config.orchestrator.context_strategy {
+                            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+                                rb = rb.context_strategy(ContextStrategy::SlidingWindow {
+                                    max_tokens: *max_tokens,
+                                });
+                            }
+                            Some(ContextStrategyConfig::Summarize { threshold }) => {
+                                rb = rb.summarize_threshold(*threshold);
+                            }
+                            _ => {
+                                if let Some(threshold) =
+                                    self.config.orchestrator.summarize_threshold
+                                {
+                                    rb = rb.summarize_threshold(threshold);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Timeouts: agent-level, then orchestrator-level fallback
-        let tool_timeout = agent
-            .tool_timeout_seconds
-            .or(config.orchestrator.tool_timeout_seconds)
-            .map(std::time::Duration::from_secs);
-        if let Some(t) = tool_timeout {
-            rb = rb.tool_timeout(t);
-        }
-        let max_tool_output = agent
-            .max_tool_output_bytes
-            .or(config.orchestrator.max_tool_output_bytes);
-        if let Some(m) = max_tool_output {
-            rb = rb.max_tool_output_bytes(m);
-        }
-        let run_timeout = agent
-            .run_timeout_seconds
-            .or(config.orchestrator.run_timeout_seconds)
-            .map(std::time::Duration::from_secs);
-        if let Some(t) = run_timeout {
-            rb = rb.run_timeout(t);
-        }
+            // Timeouts: agent-level, then orchestrator-level fallback
+            let tool_timeout = agent
+                .tool_timeout_seconds
+                .or(self.config.orchestrator.tool_timeout_seconds)
+                .map(std::time::Duration::from_secs);
+            if let Some(t) = tool_timeout {
+                rb = rb.tool_timeout(t);
+            }
+            let max_tool_output = agent
+                .max_tool_output_bytes
+                .or(self.config.orchestrator.max_tool_output_bytes);
+            if let Some(m) = max_tool_output {
+                rb = rb.max_tool_output_bytes(m);
+            }
+            let run_timeout = agent
+                .run_timeout_seconds
+                .or(self.config.orchestrator.run_timeout_seconds)
+                .map(std::time::Duration::from_secs);
+            if let Some(t) = run_timeout {
+                rb = rb.run_timeout(t);
+            }
 
-        // Reasoning / reflection / compression: agent-level, then orchestrator-level
-        let reasoning_effort = agent
-            .reasoning_effort
-            .as_deref()
-            .or(config.orchestrator.reasoning_effort.as_deref());
-        if let Some(effort) = reasoning_effort {
-            rb = rb.reasoning_effort(heartbit::config::parse_reasoning_effort(effort)?);
-        }
-        let reflection = agent
-            .enable_reflection
-            .or(config.orchestrator.enable_reflection);
-        if let Some(true) = reflection {
-            rb = rb.enable_reflection(true);
-        }
-        let compression = agent
-            .tool_output_compression_threshold
-            .or(config.orchestrator.tool_output_compression_threshold);
-        if let Some(t) = compression {
-            rb = rb.tool_output_compression_threshold(t);
-        }
-        let max_tools = agent
-            .max_tools_per_turn
-            .or(config.orchestrator.max_tools_per_turn);
-        if let Some(m) = max_tools {
-            rb = rb.max_tools_per_turn(m);
-        }
-        let tool_profile_str = agent
-            .tool_profile
-            .as_deref()
-            .or(config.orchestrator.tool_profile.as_deref());
-        if let Some(p) = tool_profile_str {
-            rb = rb.tool_profile(heartbit::parse_tool_profile(p)?);
-        }
-        let doom_loop = agent
-            .max_identical_tool_calls
-            .or(config.orchestrator.max_identical_tool_calls);
-        if let Some(m) = doom_loop {
-            rb = rb.max_identical_tool_calls(m);
-        }
-        let fuzzy_doom = agent
-            .max_fuzzy_identical_tool_calls
-            .or(config.orchestrator.max_fuzzy_identical_tool_calls);
-        if let Some(m) = fuzzy_doom {
-            rb = rb.max_fuzzy_identical_tool_calls(m);
-        }
-        if let Some(budget) = agent.max_total_tokens {
-            rb = rb.max_total_tokens(budget);
-        }
-        if let Some(size) = agent.response_cache_size {
-            rb = rb.response_cache_size(size);
-        }
-        if let Some(ref am) = agent.audit_mode {
-            let mode = match am.as_str() {
-                "metadata_only" => heartbit::AuditMode::MetadataOnly,
-                _ => heartbit::AuditMode::Full,
-            };
-            rb = rb.audit_mode(mode);
-        }
+            // Reasoning / reflection / compression: agent-level, then orchestrator-level
+            let reasoning_effort = agent.reasoning_effort.as_deref().or(self
+                .config
+                .orchestrator
+                .reasoning_effort
+                .as_deref());
+            if let Some(effort) = reasoning_effort {
+                rb = rb.reasoning_effort(heartbit::config::parse_reasoning_effort(effort)?);
+            }
+            let reflection = agent
+                .enable_reflection
+                .or(self.config.orchestrator.enable_reflection);
+            if let Some(true) = reflection {
+                rb = rb.enable_reflection(true);
+            }
+            let compression = agent
+                .tool_output_compression_threshold
+                .or(self.config.orchestrator.tool_output_compression_threshold);
+            if let Some(t) = compression {
+                rb = rb.tool_output_compression_threshold(t);
+            }
+            let max_tools = agent
+                .max_tools_per_turn
+                .or(self.config.orchestrator.max_tools_per_turn);
+            if let Some(m) = max_tools {
+                rb = rb.max_tools_per_turn(m);
+            }
+            let tool_profile_str = agent.tool_profile.as_deref().or(self
+                .config
+                .orchestrator
+                .tool_profile
+                .as_deref());
+            if let Some(p) = tool_profile_str {
+                rb = rb.tool_profile(heartbit::parse_tool_profile(p)?);
+            }
+            let doom_loop = agent
+                .max_identical_tool_calls
+                .or(self.config.orchestrator.max_identical_tool_calls);
+            if let Some(m) = doom_loop {
+                rb = rb.max_identical_tool_calls(m);
+            }
+            let fuzzy_doom = agent
+                .max_fuzzy_identical_tool_calls
+                .or(self.config.orchestrator.max_fuzzy_identical_tool_calls);
+            if let Some(m) = fuzzy_doom {
+                rb = rb.max_fuzzy_identical_tool_calls(m);
+            }
+            if let Some(budget) = agent.max_total_tokens {
+                rb = rb.max_total_tokens(budget);
+            }
+            if let Some(size) = agent.response_cache_size {
+                rb = rb.response_cache_size(size);
+            }
+            if let Some(ref am) = agent.audit_mode {
+                let mode = match am.as_str() {
+                    "metadata_only" => heartbit::AuditMode::MetadataOnly,
+                    _ => heartbit::AuditMode::Full,
+                };
+                rb = rb.audit_mode(mode);
+            }
 
-        // Session prune config
-        if let Some(ref sp) = agent.session_prune {
-            rb = rb.session_prune_config(heartbit::SessionPruneConfig {
-                keep_recent_n: sp.keep_recent_n,
-                pruned_tool_result_max_bytes: sp.pruned_tool_result_max_bytes,
-                preserve_task: sp.preserve_task,
-            });
-        }
-        if let Some(true) = agent.recursive_summarization {
-            rb = rb.enable_recursive_summarization(true);
-        }
-        if let Some(t) = agent.reflection_threshold {
-            rb = rb.reflection_threshold(t);
-        }
-        if let Some(true) = agent.consolidate_on_exit {
-            rb = rb.consolidate_on_exit(true);
-        }
-
-        // Callbacks
-        if let Some(ref cb) = on_approval {
-            rb = rb.on_approval(Arc::clone(cb));
-        }
-        // Wrap on_event to also collect events for escalation decisions.
-        {
-            let collector = Arc::clone(&event_collector);
-            let inner_cb = on_event.clone();
-            let collecting_cb: Arc<heartbit::OnEvent> =
-                Arc::new(move |event: heartbit::AgentEvent| {
-                    {
-                        let mut events = collector.lock().expect("event collector lock");
-                        events.push(event.clone());
-                    }
-                    if let Some(ref cb) = inner_cb {
-                        cb(event);
-                    }
+            // Session prune config
+            if let Some(ref sp) = agent.session_prune {
+                rb = rb.session_prune_config(heartbit::SessionPruneConfig {
+                    keep_recent_n: sp.keep_recent_n,
+                    pruned_tool_result_max_bytes: sp.pruned_tool_result_max_bytes,
+                    preserve_task: sp.preserve_task,
                 });
-            rb = rb.on_event(collecting_cb);
-        }
-
-        // Permission rules + learned permissions
-        {
-            let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());
-            if let Some(ref learned) = load_learned_permissions() {
-                let guard = learned.lock().expect("learned permissions lock");
-                ruleset.append_rules(guard.rules());
-                rb = rb.learned_permissions(learned.clone());
             }
-            if !ruleset.is_empty() {
-                rb = rb.permission_rules(ruleset);
+            if let Some(true) = agent.recursive_summarization {
+                rb = rb.enable_recursive_summarization(true);
             }
-        }
+            if let Some(t) = agent.reflection_threshold {
+                rb = rb.reflection_threshold(t);
+            }
+            if let Some(true) = agent.consolidate_on_exit {
+                rb = rb.consolidate_on_exit(true);
+            }
 
-        // Instruction text (HEARTBIT.md)
-        if let Some(text) = load_instruction_text() {
-            rb = rb.instruction_text(text);
-        }
+            // Callbacks
+            if let Some(ref cb) = self.on_approval {
+                rb = rb.on_approval(Arc::clone(cb));
+            }
+            // Wrap on_event to also collect events for escalation decisions.
+            {
+                let collector = Arc::clone(&event_collector);
+                let inner_cb = self.on_event.clone();
+                let collecting_cb: Arc<heartbit::OnEvent> =
+                    Arc::new(move |event: heartbit::AgentEvent| {
+                        {
+                            let mut events = collector.lock().expect("event collector lock");
+                            events.push(event.clone());
+                        }
+                        if let Some(ref cb) = inner_cb {
+                            cb(event);
+                        }
+                    });
+                rb = rb.on_event(collecting_cb);
+            }
 
-        // Workspace
-        if let Some(ref ws) = workspace_dir {
-            rb = rb.workspace(ws.clone());
-        }
+            // Permission rules + learned permissions
+            {
+                let mut ruleset = heartbit::PermissionRuleset::new(self.config.permissions.clone());
+                if let Some(ref learned) = load_learned_permissions() {
+                    let guard = learned.lock().expect("learned permissions lock");
+                    ruleset.append_rules(guard.rules());
+                    rb = rb.learned_permissions(learned.clone());
+                }
+                if !ruleset.is_empty() {
+                    rb = rb.permission_rules(ruleset);
+                }
+            }
 
-        // Memory with namespace
-        if let Some(ref base_memory) = base_memory {
-            let agent_ns = match story_id {
-                Some(sid) => format!("{sid}:{}", agent.name),
-                None => agent.name.clone(),
+            // Instruction text (HEARTBIT.md)
+            if let Some(text) = load_instruction_text() {
+                rb = rb.instruction_text(text);
+            }
+
+            // Workspace
+            if let Some(ref ws) = self.workspace_dir {
+                rb = rb.workspace(ws.clone());
+            }
+
+            // Memory with namespace
+            if let Some(ref base_memory) = base_memory {
+                let agent_ns = match self.story_id {
+                    Some(sid) => format!("{sid}:{}", agent.name),
+                    None => agent.name.clone(),
+                };
+                let mut ns = NamespacedMemory::new(Arc::clone(base_memory), agent_ns)
+                    .with_max_confidentiality(self.memory_confidentiality_cap);
+                if let Some(default) = self.memory_default_confidentiality {
+                    ns = ns.with_default_store_confidentiality(default);
+                }
+                let namespaced: Arc<dyn Memory> = Arc::new(ns);
+                rb = rb.memory(namespaced);
+            }
+
+            // Knowledge base
+            if let Some(ref knowledge_config) = self.config.knowledge {
+                let kb = load_knowledge_base(knowledge_config).await?;
+                rb = rb.knowledge(kb);
+            }
+
+            // LSP integration
+            if let Some(ref lsp_config) = self.config.lsp
+                && lsp_config.enabled
+            {
+                let workspace_root = std::env::current_dir().unwrap_or_default();
+                rb = rb.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
+            }
+
+            // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
+            {
+                let mut all_guardrails = self.guardrails.clone();
+                // Per-agent guardrails config overrides top-level
+                let guardrails_config = agent
+                    .guardrails
+                    .as_ref()
+                    .or(self.config.guardrails.as_ref());
+                if let Some(gc) = guardrails_config {
+                    let judge_provider = gc
+                        .llm_judge
+                        .as_ref()
+                        .map(|_| Arc::clone(&agent_provider_for_judge));
+                    all_guardrails.extend(gc.build_with_judge(judge_provider)?);
+                }
+                if !all_guardrails.is_empty() {
+                    rb = rb.guardrails(all_guardrails);
+                }
+            }
+
+            tracing::info!(
+                agent = %agent.name,
+                max_turns,
+                routing = ?routing_mode,
+                "single-agent path: bypassing orchestrator"
+            );
+
+            let runner = rb.build()?;
+            let run_result = if let Some(blocks) = content_blocks {
+                runner.execute_with_content(blocks).await
+            } else {
+                runner.execute(&task_text).await
             };
-            let mut ns = NamespacedMemory::new(Arc::clone(base_memory), agent_ns)
-                .with_max_confidentiality(memory_confidentiality_cap);
-            if let Some(default) = memory_default_confidentiality {
-                ns = ns.with_default_store_confidentiality(default);
+            match run_result {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    // Tier 3: escalation — if enabled and the failure warrants it,
+                    // fall through to orchestrator with partial context.
+                    let collected_events = event_collector
+                        .lock()
+                        .expect("event collector lock")
+                        .clone();
+                    let should_esc = self.config.orchestrator.escalation
+                        && self.config.agents.len() > 1
+                        && heartbit::should_escalate(&err, &collected_events);
+                    if should_esc {
+                        if let Some(ref on_ev) = self.on_event {
+                            on_ev(heartbit::AgentEvent::TaskRouted {
+                                decision: "orchestrate".into(),
+                                reason: format!("escalated after single-agent failure: {err}"),
+                                selected_agent: None,
+                                complexity_score: 0.0,
+                                escalated: true,
+                            });
+                        }
+                        tracing::warn!(
+                            error = %err,
+                            "single-agent failed, escalating to orchestrator"
+                        );
+                        // Fall through to orchestrator path below
+                    } else {
+                        return Err(err.into());
+                    }
+                }
             }
-            let namespaced: Arc<dyn Memory> = Arc::new(ns);
-            rb = rb.memory(namespaced);
         }
 
-        // Knowledge base
-        if let Some(ref knowledge_config) = config.knowledge {
-            let kb = load_knowledge_base(knowledge_config).await?;
-            rb = rb.knowledge(kb);
-        }
+        // ── Multi-agent orchestrator path ──
 
-        // LSP integration
-        if let Some(ref lsp_config) = config.lsp
-            && lsp_config.enabled
+        let provider_for_judge = Arc::clone(&self.provider);
+        let mut builder = Orchestrator::builder(self.provider)
+            .max_turns(self.config.orchestrator.max_turns)
+            .max_tokens(self.config.orchestrator.max_tokens)
+            .on_text(self.on_text)
+            .observability_mode(self.observability_mode)
+            .allow_shared_write(self.allow_shared_write);
+
+        // Wire audit user context and delegation chain for multi-tenant enrichment
+        if let Some(uid) = self.audit_user_id
+            && let Some(tid) = self.audit_tenant_id
         {
-            let workspace_root = std::env::current_dir().unwrap_or_default();
-            rb = rb.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
+            builder = builder
+                .audit_user_context(uid, tid)
+                .audit_delegation_chain(vec!["heartbit-daemon".into()]);
         }
 
         // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
         {
-            let mut all_guardrails = guardrails.clone();
-            // Per-agent guardrails config overrides top-level
-            let guardrails_config = agent.guardrails.as_ref().or(config.guardrails.as_ref());
-            if let Some(gc) = guardrails_config {
+            let mut all_guardrails = self.guardrails.clone();
+            if let Some(gc) = &self.config.guardrails {
                 let judge_provider = gc
                     .llm_judge
                     .as_ref()
-                    .map(|_| Arc::clone(&agent_provider_for_judge));
+                    .map(|_| Arc::clone(&provider_for_judge));
                 all_guardrails.extend(gc.build_with_judge(judge_provider)?);
             }
             if !all_guardrails.is_empty() {
-                rb = rb.guardrails(all_guardrails);
+                builder = builder.guardrails(all_guardrails);
             }
         }
 
-        tracing::info!(
-            agent = %agent.name,
-            max_turns,
-            routing = ?routing_mode,
-            "single-agent path: bypassing orchestrator"
-        );
+        // Wire workspace directory for sub-agents
+        if let Some(ref ws) = self.workspace_dir {
+            builder = builder.workspace(ws.clone());
+        }
 
-        let runner = rb.build()?;
-        let run_result = if let Some(blocks) = content_blocks {
-            runner.execute_with_content(blocks).await
-        } else {
-            runner.execute(&task_text).await
-        };
-        match run_result {
-            Ok(output) => return Ok(output),
-            Err(err) => {
-                // Tier 3: escalation — if enabled and the failure warrants it,
-                // fall through to orchestrator with partial context.
-                let collected_events = event_collector
-                    .lock()
-                    .expect("event collector lock")
-                    .clone();
-                let should_esc = config.orchestrator.escalation
-                    && config.agents.len() > 1
-                    && heartbit::should_escalate(&err, &collected_events);
-                if should_esc {
-                    if let Some(ref on_ev) = on_event {
-                        on_ev(heartbit::AgentEvent::TaskRouted {
-                            decision: "orchestrate".into(),
-                            reason: format!("escalated after single-agent failure: {err}"),
-                            selected_agent: None,
-                            complexity_score: 0.0,
-                            escalated: true,
-                        });
-                    }
-                    tracing::warn!(
-                        error = %err,
-                        "single-agent failed, escalating to orchestrator"
-                    );
-                    // Fall through to orchestrator path below
-                } else {
-                    return Err(err.into());
+        // Wire squad formation opt-out from config
+        if let Some(enable) = self.config.orchestrator.enable_squads {
+            builder = builder.enable_squads(enable);
+        }
+        // Wire dispatch mode from config
+        if let Some(mode) = self.config.orchestrator.dispatch_mode {
+            builder = builder.dispatch_mode(mode);
+        }
+        // Wire multi-agent collaboration prompt from config
+        if let Some(enabled) = self.config.orchestrator.multi_agent_prompt {
+            builder = builder.multi_agent_prompt(enabled);
+        }
+
+        // Wire dynamic agent spawning from config
+        if let Some(spawn_cfg) = self.config.orchestrator.spawn.clone() {
+            builder = builder.spawn_config(spawn_cfg, builtins.clone());
+        }
+
+        // Wire orchestrator-level reasoning effort from config
+        if let Some(ref effort) = self.config.orchestrator.reasoning_effort {
+            builder = builder.reasoning_effort(heartbit::config::parse_reasoning_effort(effort)?);
+        }
+        // Wire orchestrator-level reflection from config
+        if let Some(true) = self.config.orchestrator.enable_reflection {
+            builder = builder.enable_reflection(true);
+        }
+        // Wire orchestrator-level tool output compression threshold from config
+        if let Some(threshold) = self.config.orchestrator.tool_output_compression_threshold {
+            builder = builder.tool_output_compression_threshold(threshold);
+        }
+        // Wire orchestrator-level max tools per turn from config
+        if let Some(max) = self.config.orchestrator.max_tools_per_turn {
+            builder = builder.max_tools_per_turn(max);
+        }
+        // Wire orchestrator-level doom loop detection from config
+        if let Some(max) = self.config.orchestrator.max_identical_tool_calls {
+            builder = builder.max_identical_tool_calls(max);
+        }
+        if let Some(max) = self.config.orchestrator.max_fuzzy_identical_tool_calls {
+            builder = builder.max_fuzzy_identical_tool_calls(max);
+        }
+        // Wire permission rules from config + learned permissions
+        {
+            let mut ruleset = heartbit::PermissionRuleset::new(self.config.permissions.clone());
+            if let Some(ref learned) = load_learned_permissions() {
+                let guard = learned.lock().expect("learned permissions lock");
+                ruleset.append_rules(guard.rules());
+                builder = builder.learned_permissions(learned.clone());
+            }
+            if !ruleset.is_empty() {
+                builder = builder.permission_rules(ruleset);
+            }
+        }
+        // Wire hierarchical instruction files (HEARTBIT.md)
+        if let Some(text) = load_instruction_text() {
+            builder = builder.instruction_text(text);
+        }
+
+        // Wire orchestrator-level context management.
+        match &self.config.orchestrator.context_strategy {
+            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
+                builder = builder.context_strategy(ContextStrategy::SlidingWindow {
+                    max_tokens: *max_tokens,
+                });
+            }
+            Some(ContextStrategyConfig::Summarize { threshold }) => {
+                builder = builder.summarize_threshold(*threshold);
+            }
+            Some(ContextStrategyConfig::Unlimited) | None => {
+                if let Some(threshold) = self.config.orchestrator.summarize_threshold {
+                    builder = builder.summarize_threshold(threshold);
                 }
             }
         }
-    }
-
-    // ── Multi-agent orchestrator path ──
-
-    let provider_for_judge = Arc::clone(&provider);
-    let mut builder = Orchestrator::builder(provider)
-        .max_turns(config.orchestrator.max_turns)
-        .max_tokens(config.orchestrator.max_tokens)
-        .on_text(on_text)
-        .observability_mode(observability_mode)
-        .allow_shared_write(allow_shared_write);
-
-    // Wire audit user context and delegation chain for multi-tenant enrichment
-    if let Some(uid) = audit_user_id
-        && let Some(tid) = audit_tenant_id
-    {
-        builder = builder
-            .audit_user_context(uid, tid)
-            .audit_delegation_chain(vec!["heartbit-daemon".into()]);
-    }
-
-    // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
-    {
-        let mut all_guardrails = guardrails.clone();
-        if let Some(gc) = &config.guardrails {
-            let judge_provider = gc
-                .llm_judge
-                .as_ref()
-                .map(|_| Arc::clone(&provider_for_judge));
-            all_guardrails.extend(gc.build_with_judge(judge_provider)?);
+        if let Some(secs) = self.config.orchestrator.tool_timeout_seconds {
+            builder = builder.tool_timeout(std::time::Duration::from_secs(secs));
         }
-        if !all_guardrails.is_empty() {
-            builder = builder.guardrails(all_guardrails);
+        if let Some(max) = self.config.orchestrator.max_tool_output_bytes {
+            builder = builder.max_tool_output_bytes(max);
         }
-    }
-
-    // Wire workspace directory for sub-agents
-    if let Some(ref ws) = workspace_dir {
-        builder = builder.workspace(ws.clone());
-    }
-
-    // Wire squad formation opt-out from config
-    if let Some(enable) = config.orchestrator.enable_squads {
-        builder = builder.enable_squads(enable);
-    }
-    // Wire dispatch mode from config
-    if let Some(mode) = config.orchestrator.dispatch_mode {
-        builder = builder.dispatch_mode(mode);
-    }
-    // Wire multi-agent collaboration prompt from config
-    if let Some(enabled) = config.orchestrator.multi_agent_prompt {
-        builder = builder.multi_agent_prompt(enabled);
-    }
-
-    // Wire dynamic agent spawning from config
-    if let Some(spawn_cfg) = config.orchestrator.spawn.clone() {
-        builder = builder.spawn_config(spawn_cfg, builtins.clone());
-    }
-
-    // Wire orchestrator-level reasoning effort from config
-    if let Some(ref effort) = config.orchestrator.reasoning_effort {
-        builder = builder.reasoning_effort(heartbit::config::parse_reasoning_effort(effort)?);
-    }
-    // Wire orchestrator-level reflection from config
-    if let Some(true) = config.orchestrator.enable_reflection {
-        builder = builder.enable_reflection(true);
-    }
-    // Wire orchestrator-level tool output compression threshold from config
-    if let Some(threshold) = config.orchestrator.tool_output_compression_threshold {
-        builder = builder.tool_output_compression_threshold(threshold);
-    }
-    // Wire orchestrator-level max tools per turn from config
-    if let Some(max) = config.orchestrator.max_tools_per_turn {
-        builder = builder.max_tools_per_turn(max);
-    }
-    // Wire orchestrator-level doom loop detection from config
-    if let Some(max) = config.orchestrator.max_identical_tool_calls {
-        builder = builder.max_identical_tool_calls(max);
-    }
-    if let Some(max) = config.orchestrator.max_fuzzy_identical_tool_calls {
-        builder = builder.max_fuzzy_identical_tool_calls(max);
-    }
-    // Wire permission rules from config + learned permissions
-    {
-        let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());
-        if let Some(ref learned) = load_learned_permissions() {
-            let guard = learned.lock().expect("learned permissions lock");
-            ruleset.append_rules(guard.rules());
-            builder = builder.learned_permissions(learned.clone());
+        if let Some(secs) = self.config.orchestrator.run_timeout_seconds {
+            builder = builder.run_timeout(std::time::Duration::from_secs(secs));
         }
-        if !ruleset.is_empty() {
-            builder = builder.permission_rules(ruleset);
-        }
-    }
-    // Wire hierarchical instruction files (HEARTBIT.md)
-    if let Some(text) = load_instruction_text() {
-        builder = builder.instruction_text(text);
-    }
 
-    // Wire orchestrator-level context management.
-    match &config.orchestrator.context_strategy {
-        Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => {
-            builder = builder.context_strategy(ContextStrategy::SlidingWindow {
-                max_tokens: *max_tokens,
+        if let Some(cb) = self.on_approval {
+            builder = builder.on_approval(cb);
+        }
+        if let Some(cb) = self.on_event {
+            builder = builder.on_event(cb);
+        }
+
+        for agent in &self.config.agents {
+            let mut tools = builtins.clone();
+            match self.pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
+                Some(cached) => tools.extend(cached.iter().cloned()),
+                None => {
+                    tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
+                    tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
+                }
+            }
+            let (ctx_strategy, summarize_threshold) = match &agent.context_strategy {
+                Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => (
+                    Some(ContextStrategy::SlidingWindow {
+                        max_tokens: *max_tokens,
+                    }),
+                    None,
+                ),
+                Some(ContextStrategyConfig::Summarize { threshold }) => (None, Some(*threshold)),
+                Some(ContextStrategyConfig::Unlimited) | None => (None, agent.summarize_threshold),
+            };
+
+            // Build per-agent provider override if configured.
+            // Per-agent providers inherit the global retry config.
+            let agent_provider = match &agent.provider {
+                Some(p) => Some(build_agent_provider(
+                    p,
+                    retry_config_from(self.config),
+                    on_retry.clone(),
+                )?),
+                None => None,
+            };
+
+            builder = builder.sub_agent_full(SubAgentConfig {
+                name: agent.name.clone(),
+                description: agent.description.clone(),
+                system_prompt: if let Some(ref suffix) = user_context_suffix {
+                    format!("{}{suffix}", agent.system_prompt)
+                } else {
+                    agent.system_prompt.clone()
+                },
+                tools,
+                context_strategy: ctx_strategy,
+                summarize_threshold,
+                tool_timeout: agent
+                    .tool_timeout_seconds
+                    .map(std::time::Duration::from_secs),
+                max_tool_output_bytes: agent.max_tool_output_bytes,
+                max_turns: agent.max_turns,
+                max_tokens: agent.max_tokens,
+                response_schema: agent.response_schema.clone(),
+                run_timeout: agent
+                    .run_timeout_seconds
+                    .map(std::time::Duration::from_secs),
+                guardrails: {
+                    let mut agent_guardrails = self.guardrails.clone();
+                    // Per-agent guardrails config overrides top-level
+                    let gc = agent
+                        .guardrails
+                        .as_ref()
+                        .or(self.config.guardrails.as_ref());
+                    if let Some(gc) = gc {
+                        let judge_provider = gc.llm_judge.as_ref().map(|_| {
+                            agent_provider
+                                .as_ref()
+                                .map_or_else(|| Arc::clone(&provider_for_judge), Arc::clone)
+                        });
+                        agent_guardrails.extend(gc.build_with_judge(judge_provider)?);
+                    }
+                    agent_guardrails
+                },
+                provider: agent_provider,
+                reasoning_effort: agent
+                    .reasoning_effort
+                    .as_deref()
+                    .map(heartbit::config::parse_reasoning_effort)
+                    .transpose()?,
+                enable_reflection: agent.enable_reflection,
+                tool_output_compression_threshold: agent.tool_output_compression_threshold,
+                max_tools_per_turn: agent.max_tools_per_turn,
+                tool_profile: agent
+                    .tool_profile
+                    .as_deref()
+                    .map(heartbit::parse_tool_profile)
+                    .transpose()?,
+                max_identical_tool_calls: agent.max_identical_tool_calls,
+                max_fuzzy_identical_tool_calls: agent.max_fuzzy_identical_tool_calls,
+                session_prune_config: agent.session_prune.as_ref().map(|sp| {
+                    heartbit::SessionPruneConfig {
+                        keep_recent_n: sp.keep_recent_n,
+                        pruned_tool_result_max_bytes: sp.pruned_tool_result_max_bytes,
+                        preserve_task: sp.preserve_task,
+                    }
+                }),
+                enable_recursive_summarization: agent.recursive_summarization,
+                reflection_threshold: agent.reflection_threshold,
+                consolidate_on_exit: agent.consolidate_on_exit,
+                workspace: None,
+                max_total_tokens: agent.max_total_tokens,
+                audit_trail: None,
+                audit_user_id: self.audit_user_id.map(String::from),
+                audit_tenant_id: self.audit_tenant_id.map(String::from),
+                audit_delegation_chain: Vec::new(),
             });
         }
-        Some(ContextStrategyConfig::Summarize { threshold }) => {
-            builder = builder.summarize_threshold(*threshold);
-        }
-        Some(ContextStrategyConfig::Unlimited) | None => {
-            if let Some(threshold) = config.orchestrator.summarize_threshold {
-                builder = builder.summarize_threshold(threshold);
+
+        // Wire shared memory (story context already pre-loaded above)
+        if let Some(base_memory) = base_memory {
+            if let Some(sid) = self.story_id {
+                builder = builder.memory_namespace_prefix(sid);
             }
+            builder = builder.shared_memory(base_memory);
         }
-    }
-    if let Some(secs) = config.orchestrator.tool_timeout_seconds {
-        builder = builder.tool_timeout(std::time::Duration::from_secs(secs));
-    }
-    if let Some(max) = config.orchestrator.max_tool_output_bytes {
-        builder = builder.max_tool_output_bytes(max);
-    }
-    if let Some(secs) = config.orchestrator.run_timeout_seconds {
-        builder = builder.run_timeout(std::time::Duration::from_secs(secs));
-    }
 
-    if let Some(cb) = on_approval {
-        builder = builder.on_approval(cb);
-    }
-    if let Some(cb) = on_event {
-        builder = builder.on_event(cb);
-    }
+        // Always attach an in-memory blackboard for cross-agent coordination
+        let blackboard: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
+        builder = builder.blackboard(blackboard);
 
-    for agent in &config.agents {
-        let mut tools = builtins.clone();
-        match pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
-            Some(cached) => tools.extend(cached.iter().cloned()),
-            None => {
-                tools.extend(load_mcp_tools(&agent.name, &agent.mcp_servers).await);
-                tools.extend(load_a2a_tools(&agent.name, &agent.a2a_agents).await);
-            }
+        // Wire knowledge base if configured
+        if let Some(ref knowledge_config) = self.config.knowledge {
+            let kb = load_knowledge_base(knowledge_config).await?;
+            builder = builder.knowledge(kb);
         }
-        let (ctx_strategy, summarize_threshold) = match &agent.context_strategy {
-            Some(ContextStrategyConfig::SlidingWindow { max_tokens }) => (
-                Some(ContextStrategy::SlidingWindow {
-                    max_tokens: *max_tokens,
-                }),
-                None,
-            ),
-            Some(ContextStrategyConfig::Summarize { threshold }) => (None, Some(*threshold)),
-            Some(ContextStrategyConfig::Unlimited) | None => (None, agent.summarize_threshold),
-        };
 
-        // Build per-agent provider override if configured.
-        // Per-agent providers inherit the global retry config.
-        let agent_provider = match &agent.provider {
-            Some(p) => Some(build_agent_provider(
-                p,
-                retry_config_from(config),
-                on_retry.clone(),
-            )?),
-            None => None,
-        };
-
-        builder = builder.sub_agent_full(SubAgentConfig {
-            name: agent.name.clone(),
-            description: agent.description.clone(),
-            system_prompt: if let Some(ref suffix) = user_context_suffix {
-                format!("{}{suffix}", agent.system_prompt)
-            } else {
-                agent.system_prompt.clone()
-            },
-            tools,
-            context_strategy: ctx_strategy,
-            summarize_threshold,
-            tool_timeout: agent
-                .tool_timeout_seconds
-                .map(std::time::Duration::from_secs),
-            max_tool_output_bytes: agent.max_tool_output_bytes,
-            max_turns: agent.max_turns,
-            max_tokens: agent.max_tokens,
-            response_schema: agent.response_schema.clone(),
-            run_timeout: agent
-                .run_timeout_seconds
-                .map(std::time::Duration::from_secs),
-            guardrails: {
-                let mut agent_guardrails = guardrails.clone();
-                // Per-agent guardrails config overrides top-level
-                let gc = agent.guardrails.as_ref().or(config.guardrails.as_ref());
-                if let Some(gc) = gc {
-                    let judge_provider = gc.llm_judge.as_ref().map(|_| {
-                        agent_provider
-                            .as_ref()
-                            .map_or_else(|| Arc::clone(&provider_for_judge), Arc::clone)
-                    });
-                    agent_guardrails.extend(gc.build_with_judge(judge_provider)?);
-                }
-                agent_guardrails
-            },
-            provider: agent_provider,
-            reasoning_effort: agent
-                .reasoning_effort
-                .as_deref()
-                .map(heartbit::config::parse_reasoning_effort)
-                .transpose()?,
-            enable_reflection: agent.enable_reflection,
-            tool_output_compression_threshold: agent.tool_output_compression_threshold,
-            max_tools_per_turn: agent.max_tools_per_turn,
-            tool_profile: agent
-                .tool_profile
-                .as_deref()
-                .map(heartbit::parse_tool_profile)
-                .transpose()?,
-            max_identical_tool_calls: agent.max_identical_tool_calls,
-            max_fuzzy_identical_tool_calls: agent.max_fuzzy_identical_tool_calls,
-            session_prune_config: agent.session_prune.as_ref().map(|sp| {
-                heartbit::SessionPruneConfig {
-                    keep_recent_n: sp.keep_recent_n,
-                    pruned_tool_result_max_bytes: sp.pruned_tool_result_max_bytes,
-                    preserve_task: sp.preserve_task,
-                }
-            }),
-            enable_recursive_summarization: agent.recursive_summarization,
-            reflection_threshold: agent.reflection_threshold,
-            consolidate_on_exit: agent.consolidate_on_exit,
-            workspace: None,
-            max_total_tokens: agent.max_total_tokens,
-            audit_trail: None,
-            audit_user_id: audit_user_id.map(String::from),
-            audit_tenant_id: audit_tenant_id.map(String::from),
-            audit_delegation_chain: Vec::new(),
-        });
-    }
-
-    // Wire shared memory (story context already pre-loaded above)
-    if let Some(base_memory) = base_memory {
-        if let Some(sid) = story_id {
-            builder = builder.memory_namespace_prefix(sid);
+        // Wire LSP integration if configured
+        if let Some(ref lsp_config) = self.config.lsp
+            && lsp_config.enabled
+        {
+            let workspace_root = std::env::current_dir().unwrap_or_default();
+            builder = builder.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
         }
-        builder = builder.shared_memory(base_memory);
+
+        let mut orchestrator = builder.build()?;
+        let output = orchestrator.run(&task_text).await?;
+        Ok(output)
     }
-
-    // Always attach an in-memory blackboard for cross-agent coordination
-    let blackboard: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
-    builder = builder.blackboard(blackboard);
-
-    // Wire knowledge base if configured
-    if let Some(ref knowledge_config) = config.knowledge {
-        let kb = load_knowledge_base(knowledge_config).await?;
-        builder = builder.knowledge(kb);
-    }
-
-    // Wire LSP integration if configured
-    if let Some(ref lsp_config) = config.lsp
-        && lsp_config.enabled
-    {
-        let workspace_root = std::env::current_dir().unwrap_or_default();
-        builder = builder.lsp_manager(Arc::new(heartbit::LspManager::new(workspace_root)));
-    }
-
-    let mut orchestrator = builder.build()?;
-    let output = orchestrator.run(&task_text).await?;
-    Ok(output)
 }
 
 /// Connect to MCP servers and collect tools. Failures are logged and skipped.

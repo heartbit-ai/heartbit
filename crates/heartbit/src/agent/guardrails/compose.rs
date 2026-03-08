@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, CompletionResponse, ToolCall};
 use crate::tool::ToolOutput;
@@ -39,13 +39,11 @@ impl GuardrailChain {
     }
 }
 
-impl GuardrailMeta for GuardrailChain {
+impl Guardrail for GuardrailChain {
     fn name(&self) -> &str {
         "chain"
     }
-}
 
-impl Guardrail for GuardrailChain {
     fn pre_llm(
         &self,
         request: &mut CompletionRequest,
@@ -183,13 +181,11 @@ impl WarnToDeny {
     }
 }
 
-impl GuardrailMeta for WarnToDeny {
+impl Guardrail for WarnToDeny {
     fn name(&self) -> &str {
         "warn_to_deny"
     }
-}
 
-impl Guardrail for WarnToDeny {
     fn pre_llm(
         &self,
         request: &mut CompletionRequest,
@@ -257,13 +253,11 @@ impl ConditionalGuardrail {
     }
 }
 
-impl GuardrailMeta for ConditionalGuardrail {
+impl Guardrail for ConditionalGuardrail {
     fn name(&self) -> &str {
         "conditional"
     }
-}
 
-impl Guardrail for ConditionalGuardrail {
     fn pre_llm(
         &self,
         request: &mut CompletionRequest,

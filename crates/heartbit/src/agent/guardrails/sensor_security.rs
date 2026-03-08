@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, ToolCall};
 use crate::sensor::triage::context::TrustLevel;
@@ -182,13 +182,11 @@ impl SensorSecurityGuardrail {
     }
 }
 
-impl GuardrailMeta for SensorSecurityGuardrail {
+impl Guardrail for SensorSecurityGuardrail {
     fn name(&self) -> &str {
         "sensor_security"
     }
-}
 
-impl Guardrail for SensorSecurityGuardrail {
     fn pre_llm(
         &self,
         request: &mut CompletionRequest,

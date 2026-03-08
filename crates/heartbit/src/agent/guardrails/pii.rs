@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionResponse, ContentBlock, ToolCall};
 use crate::tool::ToolOutput;
@@ -24,9 +24,11 @@ static CC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}\b").unwrap());
 
 /// What to do when PII is detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PiiAction {
     /// Replace matched PII with `[REDACTED:type]` (recommended default).
+    #[default]
     Redact,
     /// Issue a warning but allow the content through unmodified.
     Warn,
@@ -153,13 +155,11 @@ impl PiiGuardrail {
     }
 }
 
-impl GuardrailMeta for PiiGuardrail {
+impl Guardrail for PiiGuardrail {
     fn name(&self) -> &str {
         "pii"
     }
-}
 
-impl Guardrail for PiiGuardrail {
     fn post_llm(
         &self,
         response: &CompletionResponse,

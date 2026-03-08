@@ -83,7 +83,6 @@ pub(crate) struct SubAgentDef {
     /// Optional tenant ID for multi-tenant audit enrichment.
     pub(crate) audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (propagated from orchestrator).
-    #[allow(dead_code)]
     pub(crate) audit_delegation_chain: Vec<String>,
 }
 
@@ -94,6 +93,88 @@ impl std::fmt::Debug for SubAgentDef {
             .field("description", &self.description)
             .field("tools_count", &self.tools.len())
             .finish()
+    }
+}
+
+impl SubAgentDef {
+    /// Create a new sub-agent definition with required fields. All optional
+    /// fields default to `None`, empty vecs, or false.
+    pub(crate) fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            system_prompt: system_prompt.into(),
+            tools: vec![],
+            context_strategy: None,
+            summarize_threshold: None,
+            tool_timeout: None,
+            max_tool_output_bytes: None,
+            max_turns: None,
+            max_tokens: None,
+            response_schema: None,
+            run_timeout: None,
+            guardrails: vec![],
+            provider_override: None,
+            reasoning_effort: None,
+            enable_reflection: None,
+            tool_output_compression_threshold: None,
+            max_tools_per_turn: None,
+            tool_profile: None,
+            max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
+            session_prune_config: None,
+            enable_recursive_summarization: None,
+            reflection_threshold: None,
+            consolidate_on_exit: None,
+            workspace: None,
+            max_total_tokens: None,
+            audit_trail: None,
+            audit_user_id: None,
+            audit_tenant_id: None,
+            audit_delegation_chain: Vec::new(),
+        }
+    }
+}
+
+impl From<SubAgentConfig> for SubAgentDef {
+    fn from(def: SubAgentConfig) -> Self {
+        Self {
+            name: def.name,
+            description: def.description,
+            system_prompt: def.system_prompt,
+            tools: def.tools,
+            context_strategy: def.context_strategy,
+            summarize_threshold: def.summarize_threshold,
+            tool_timeout: def.tool_timeout,
+            max_tool_output_bytes: def.max_tool_output_bytes,
+            max_turns: def.max_turns,
+            max_tokens: def.max_tokens,
+            response_schema: def.response_schema,
+            run_timeout: def.run_timeout,
+            guardrails: def.guardrails,
+            provider_override: def.provider,
+            reasoning_effort: def.reasoning_effort,
+            enable_reflection: def.enable_reflection,
+            tool_output_compression_threshold: def.tool_output_compression_threshold,
+            max_tools_per_turn: def.max_tools_per_turn,
+            tool_profile: def.tool_profile,
+            max_identical_tool_calls: def.max_identical_tool_calls,
+            max_fuzzy_identical_tool_calls: def.max_fuzzy_identical_tool_calls,
+            session_prune_config: def.session_prune_config,
+            enable_recursive_summarization: def.enable_recursive_summarization,
+            reflection_threshold: def.reflection_threshold,
+            consolidate_on_exit: def.consolidate_on_exit,
+            workspace: def.workspace,
+            max_total_tokens: def.max_total_tokens,
+            audit_trail: def.audit_trail,
+            audit_user_id: def.audit_user_id,
+            audit_tenant_id: def.audit_tenant_id,
+            audit_delegation_chain: def.audit_delegation_chain,
+        }
     }
 }
 
@@ -1645,39 +1726,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         description: impl Into<String>,
         system_prompt: impl Into<String>,
     ) -> Self {
-        self.sub_agents.push(SubAgentDef {
-            name: name.into(),
-            description: description.into(),
-            system_prompt: system_prompt.into(),
-            tools: vec![],
-            context_strategy: None,
-            summarize_threshold: None,
-            tool_timeout: None,
-            max_tool_output_bytes: None,
-            max_turns: None,
-            max_tokens: None,
-            response_schema: None,
-            run_timeout: None,
-            guardrails: vec![],
-            provider_override: None,
-            reasoning_effort: None,
-            enable_reflection: None,
-            tool_output_compression_threshold: None,
-            max_tools_per_turn: None,
-            tool_profile: None,
-            max_identical_tool_calls: None,
-            max_fuzzy_identical_tool_calls: None,
-            session_prune_config: None,
-            enable_recursive_summarization: None,
-            reflection_threshold: None,
-            consolidate_on_exit: None,
-            workspace: self.workspace.clone(),
-            max_total_tokens: None,
-            audit_trail: self.audit_trail.clone(),
-            audit_user_id: self.audit_user_id.clone(),
-            audit_tenant_id: self.audit_tenant_id.clone(),
-            audit_delegation_chain: self.audit_delegation_chain.clone(),
-        });
+        let mut def = SubAgentDef::new(name, description, system_prompt);
+        def.workspace = self.workspace.clone();
+        def.audit_trail = self.audit_trail.clone();
+        def.audit_user_id = self.audit_user_id.clone();
+        def.audit_tenant_id = self.audit_tenant_id.clone();
+        def.audit_delegation_chain = self.audit_delegation_chain.clone();
+        self.sub_agents.push(def);
         self
     }
 
@@ -1688,80 +1743,35 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         system_prompt: impl Into<String>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
-        self.sub_agents.push(SubAgentDef {
-            name: name.into(),
-            description: description.into(),
-            system_prompt: system_prompt.into(),
-            tools,
-            context_strategy: None,
-            summarize_threshold: None,
-            tool_timeout: None,
-            max_tool_output_bytes: None,
-            max_turns: None,
-            max_tokens: None,
-            response_schema: None,
-            run_timeout: None,
-            guardrails: vec![],
-            provider_override: None,
-            reasoning_effort: None,
-            enable_reflection: None,
-            tool_output_compression_threshold: None,
-            max_tools_per_turn: None,
-            tool_profile: None,
-            max_identical_tool_calls: None,
-            max_fuzzy_identical_tool_calls: None,
-            session_prune_config: None,
-            enable_recursive_summarization: None,
-            reflection_threshold: None,
-            consolidate_on_exit: None,
-            workspace: self.workspace.clone(),
-            max_total_tokens: None,
-            audit_trail: self.audit_trail.clone(),
-            audit_user_id: self.audit_user_id.clone(),
-            audit_tenant_id: self.audit_tenant_id.clone(),
-            audit_delegation_chain: self.audit_delegation_chain.clone(),
-        });
+        let mut def = SubAgentDef::new(name, description, system_prompt);
+        def.tools = tools;
+        def.workspace = self.workspace.clone();
+        def.audit_trail = self.audit_trail.clone();
+        def.audit_user_id = self.audit_user_id.clone();
+        def.audit_tenant_id = self.audit_tenant_id.clone();
+        def.audit_delegation_chain = self.audit_delegation_chain.clone();
+        self.sub_agents.push(def);
         self
     }
 
-    pub fn sub_agent_full(mut self, def: SubAgentConfig) -> Self {
-        self.sub_agents.push(SubAgentDef {
-            name: def.name,
-            description: def.description,
-            system_prompt: def.system_prompt,
-            tools: def.tools,
-            context_strategy: def.context_strategy,
-            summarize_threshold: def.summarize_threshold,
-            tool_timeout: def.tool_timeout,
-            max_tool_output_bytes: def.max_tool_output_bytes,
-            max_turns: def.max_turns,
-            max_tokens: def.max_tokens,
-            response_schema: def.response_schema,
-            run_timeout: def.run_timeout,
-            guardrails: def.guardrails,
-            provider_override: def.provider,
-            reasoning_effort: def.reasoning_effort,
-            enable_reflection: def.enable_reflection,
-            tool_output_compression_threshold: def.tool_output_compression_threshold,
-            max_tools_per_turn: def.max_tools_per_turn,
-            tool_profile: def.tool_profile,
-            max_identical_tool_calls: def.max_identical_tool_calls,
-            max_fuzzy_identical_tool_calls: def.max_fuzzy_identical_tool_calls,
-            session_prune_config: def.session_prune_config,
-            enable_recursive_summarization: def.enable_recursive_summarization,
-            reflection_threshold: def.reflection_threshold,
-            consolidate_on_exit: def.consolidate_on_exit,
-            workspace: def.workspace.or_else(|| self.workspace.clone()),
-            max_total_tokens: def.max_total_tokens,
-            audit_trail: def.audit_trail.or_else(|| self.audit_trail.clone()),
-            audit_user_id: def.audit_user_id.or_else(|| self.audit_user_id.clone()),
-            audit_tenant_id: def.audit_tenant_id.or_else(|| self.audit_tenant_id.clone()),
-            audit_delegation_chain: if def.audit_delegation_chain.is_empty() {
-                self.audit_delegation_chain.clone()
-            } else {
-                def.audit_delegation_chain
-            },
-        });
+    pub fn sub_agent_full(mut self, config: SubAgentConfig) -> Self {
+        let mut def = SubAgentDef::from(config);
+        if def.workspace.is_none() {
+            def.workspace = self.workspace.clone();
+        }
+        if def.audit_trail.is_none() {
+            def.audit_trail = self.audit_trail.clone();
+        }
+        if def.audit_user_id.is_none() {
+            def.audit_user_id = self.audit_user_id.clone();
+        }
+        if def.audit_tenant_id.is_none() {
+            def.audit_tenant_id = self.audit_tenant_id.clone();
+        }
+        if def.audit_delegation_chain.is_empty() {
+            def.audit_delegation_chain = self.audit_delegation_chain.clone();
+        }
+        self.sub_agents.push(def);
         self
     }
 

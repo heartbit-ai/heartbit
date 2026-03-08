@@ -1,0 +1,30 @@
+[package]
+name = "heartbit-gateway"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Heartbit ingestion gateway — cron, sensors, and webhooks to Kafka"
+
+[dependencies]
+heartbit = { path = "../heartbit", features = ["daemon", "sensor"] }
+tokio = { workspace = true }
+axum = { workspace = true }
+rdkafka = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::ToolCall;
 
@@ -54,13 +54,11 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-impl GuardrailMeta for ActionBudgetGuardrail {
+impl Guardrail for ActionBudgetGuardrail {
     fn name(&self) -> &str {
         "action_budget"
     }
-}
 
-impl Guardrail for ActionBudgetGuardrail {
     fn pre_tool(
         &self,
         call: &ToolCall,

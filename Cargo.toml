@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro"]
+members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway"]
 
 [workspace.package]
 version = "2026.306.5"
@@ -55,6 +55,7 @@ fastembed = { version = "5" }
 jsonwebtoken = "9"
 petgraph = "0.7"
 landlock = "0.4"
+tower = { version = "0.5", features = ["util"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

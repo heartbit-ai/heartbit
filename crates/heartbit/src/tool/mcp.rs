@@ -483,6 +483,49 @@ impl AuthProvider for StaticAuthProvider {
     }
 }
 
+/// Auth provider backed by a pre-populated map of server URL to bearer token.
+/// Used when the cloud/gateway passes per-request MCP OAuth tokens.
+pub struct DirectAuthProvider {
+    tokens: HashMap<String, String>,
+}
+
+impl DirectAuthProvider {
+    pub fn new(tokens: HashMap<String, String>) -> Self {
+        Self { tokens }
+    }
+}
+
+impl AuthProvider for DirectAuthProvider {
+    fn auth_header_for<'a>(
+        &'a self,
+        _user_id: &'a str,
+        _tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        // DirectAuthProvider doesn't use user/tenant — tokens are per-request.
+        // Return None; callers should use auth_header_for_resource with the server URL.
+        Box::pin(async { Ok(None) })
+    }
+
+    fn auth_header_for_resource<'a>(
+        &'a self,
+        _user_id: &'a str,
+        _tenant_id: &'a str,
+        resource: Option<&'a str>,
+        _scopes: Option<&'a [String]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(
+                resource
+                    .and_then(|url| self.tokens.get(url).map(|token| format!("Bearer {token}"))),
+            )
+        })
+    }
+
+    fn has_credentials(&self, _user_id: &str, _tenant_id: &str) -> bool {
+        !self.tokens.is_empty()
+    }
+}
+
 // --- Auth resolvers ---
 
 /// Resolves an `Authorization` header at tool-call time.
@@ -3696,6 +3739,67 @@ mod tests {
 
         // Wrong user → false
         assert!(!provider.has_credentials("bob", "acme"));
+    }
+
+    // --- DirectAuthProvider tests ---
+
+    #[tokio::test]
+    async fn direct_auth_provider_auth_header_for_returns_none() {
+        let mut tokens = HashMap::new();
+        tokens.insert("http://mcp.example.com".to_string(), "tok_abc".to_string());
+        let provider = DirectAuthProvider::new(tokens);
+        let result = provider.auth_header_for("user1", "tenant1").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_auth_provider_returns_token_for_known_url() {
+        let mut tokens = HashMap::new();
+        tokens.insert("http://mcp.example.com".to_string(), "tok_abc".to_string());
+        let provider = DirectAuthProvider::new(tokens);
+        let result = provider
+            .auth_header_for_resource("u", "t", Some("http://mcp.example.com"), None)
+            .await
+            .unwrap();
+        assert_eq!(result.as_deref(), Some("Bearer tok_abc"));
+    }
+
+    #[tokio::test]
+    async fn direct_auth_provider_returns_none_for_unknown_url() {
+        let mut tokens = HashMap::new();
+        tokens.insert("http://mcp.example.com".to_string(), "tok_abc".to_string());
+        let provider = DirectAuthProvider::new(tokens);
+        let result = provider
+            .auth_header_for_resource("u", "t", Some("http://other.example.com"), None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_auth_provider_returns_none_for_no_resource() {
+        let mut tokens = HashMap::new();
+        tokens.insert("http://mcp.example.com".to_string(), "tok_abc".to_string());
+        let provider = DirectAuthProvider::new(tokens);
+        let result = provider
+            .auth_header_for_resource("u", "t", None, None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn direct_auth_provider_has_credentials_non_empty() {
+        let mut tokens = HashMap::new();
+        tokens.insert("http://mcp.example.com".to_string(), "tok_abc".to_string());
+        let provider = DirectAuthProvider::new(tokens);
+        assert!(provider.has_credentials("u", "t"));
+    }
+
+    #[test]
+    fn direct_auth_provider_has_credentials_empty() {
+        let provider = DirectAuthProvider::new(HashMap::new());
+        assert!(!provider.has_credentials("u", "t"));
     }
 
     #[test]

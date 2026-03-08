@@ -8,7 +8,7 @@ use std::pin::Pin;
 
 use regex::Regex;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::ToolCall;
 
@@ -90,13 +90,11 @@ impl ToolPolicyGuardrail {
     }
 }
 
-impl GuardrailMeta for ToolPolicyGuardrail {
+impl Guardrail for ToolPolicyGuardrail {
     fn name(&self) -> &str {
         "tool_policy"
     }
-}
 
-impl Guardrail for ToolPolicyGuardrail {
     fn pre_tool(
         &self,
         call: &ToolCall,

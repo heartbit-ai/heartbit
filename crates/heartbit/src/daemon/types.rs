@@ -31,6 +31,10 @@ pub enum DaemonCommand {
         /// Absent in old messages → deserialized as empty Vec (backward compatible).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         roles: Vec<String>,
+        /// Per-request MCP OAuth tokens from cloud/gateway.
+        /// Key: MCP server URL, Value: bearer token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_auth_tokens: Option<HashMap<String, String>>,
     },
     CancelTask {
         id: Uuid,
@@ -276,6 +280,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
@@ -321,6 +326,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""type":"submit_task""#));
@@ -344,6 +350,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("story_id"));
@@ -677,6 +684,7 @@ mod tests {
             user_id: Some("alice".into()),
             tenant_id: Some("acme".into()),
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""user_id":"alice""#));
@@ -704,6 +712,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains("user_id"));
@@ -724,6 +733,73 @@ mod tests {
             }
             _ => panic!("expected SubmitTask"),
         }
+    }
+
+    #[test]
+    fn submit_command_backward_compat_no_mcp_auth_tokens() {
+        // Old JSON without mcp_auth_tokens field should deserialize with None
+        let json = r#"{"type":"submit_task","id":"00000000-0000-0000-0000-000000000000","task":"test","source":"api"}"#;
+        let parsed: DaemonCommand = serde_json::from_str(json).unwrap();
+        match parsed {
+            DaemonCommand::SubmitTask {
+                mcp_auth_tokens, ..
+            } => {
+                assert!(mcp_auth_tokens.is_none());
+            }
+            _ => panic!("expected SubmitTask"),
+        }
+    }
+
+    #[test]
+    fn submit_command_mcp_auth_tokens_roundtrip() {
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "http://mcp.example.com".to_string(),
+            "tok_abc123".to_string(),
+        );
+        let cmd = DaemonCommand::SubmitTask {
+            id: Uuid::nil(),
+            task: "test".into(),
+            source: "api".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: None,
+            tenant_id: None,
+            roles: vec![],
+            mcp_auth_tokens: Some(tokens),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("mcp_auth_tokens"));
+        let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonCommand::SubmitTask {
+                mcp_auth_tokens, ..
+            } => {
+                let tokens = mcp_auth_tokens.unwrap();
+                assert_eq!(
+                    tokens.get("http://mcp.example.com").map(String::as_str),
+                    Some("tok_abc123")
+                );
+            }
+            _ => panic!("expected SubmitTask"),
+        }
+    }
+
+    #[test]
+    fn submit_command_mcp_auth_tokens_omitted_when_none() {
+        let cmd = DaemonCommand::SubmitTask {
+            id: Uuid::nil(),
+            task: "test".into(),
+            source: "api".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: None,
+            tenant_id: None,
+            roles: vec![],
+            mcp_auth_tokens: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(!json.contains("mcp_auth_tokens"));
     }
 
     // --- UsageQuery / UsageGroupBy / UsageRow tests ---

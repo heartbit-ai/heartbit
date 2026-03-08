@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+#[cfg(any(feature = "postgres", test))]
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 

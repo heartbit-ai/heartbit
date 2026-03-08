@@ -588,6 +588,7 @@ async fn run_triage_consumer(
                             user_id: None,
                             tenant_id: None,
                             roles: vec![],
+                            mcp_auth_tokens: None,
                         };
 
                         let payload = match serde_json::to_vec(&cmd) {
@@ -1152,6 +1153,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();
@@ -1175,6 +1177,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: crate::daemon::types::DaemonCommand = serde_json::from_slice(&payload).unwrap();

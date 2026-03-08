@@ -1687,6 +1687,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "heartbit-gateway"
+version = "2026.306.5"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "chrono",
+ "clap",
+ "heartbit",
+ "prometheus",
+ "rdkafka",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "heartbit-macro"
 version = "2026.306.5"
 dependencies = [

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock, Message, ToolCall};
 use crate::llm::{BoxedProvider, LlmProvider};
@@ -185,13 +185,11 @@ impl LlmJudgeGuardrail {
     }
 }
 
-impl GuardrailMeta for LlmJudgeGuardrail {
+impl Guardrail for LlmJudgeGuardrail {
     fn name(&self) -> &str {
         "llm_judge"
     }
-}
 
-impl Guardrail for LlmJudgeGuardrail {
     fn post_llm(
         &self,
         response: &CompletionResponse,
