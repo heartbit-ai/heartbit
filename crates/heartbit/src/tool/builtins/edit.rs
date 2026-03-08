@@ -14,13 +14,19 @@ use super::file_tracker::FileTracker;
 pub struct EditTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,
+    protected_paths: Arc<Vec<PathBuf>>,
 }
 
 impl EditTool {
-    pub fn new(file_tracker: Arc<FileTracker>, workspace: Option<PathBuf>) -> Self {
+    pub fn new(
+        file_tracker: Arc<FileTracker>,
+        workspace: Option<PathBuf>,
+        protected_paths: Arc<Vec<PathBuf>>,
+    ) -> Self {
         Self {
             file_tracker,
             workspace,
+            protected_paths,
         }
     }
 }
@@ -73,7 +79,11 @@ impl Tool for EditTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Agent("new_string is required".into()))?;
 
-            let path = match super::resolve_path(file_path, self.workspace.as_deref()) {
+            let path = match super::resolve_path(
+                file_path,
+                self.workspace.as_deref(),
+                &self.protected_paths,
+            ) {
                 Ok(p) => p,
                 Err(msg) => return Ok(ToolOutput::error(msg)),
             };
@@ -178,7 +188,7 @@ mod tests {
     #[test]
     fn definition_has_correct_name() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "edit");
     }
 
@@ -191,7 +201,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "file_path": path.to_str().unwrap(),
@@ -213,7 +223,7 @@ mod tests {
         std::fs::write(&path, "hello").unwrap();
 
         let tracker = Arc::new(FileTracker::new());
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
             .execute(json!({
@@ -236,7 +246,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "file_path": path.to_str().unwrap(),
@@ -258,7 +268,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "file_path": path.to_str().unwrap(),
@@ -280,7 +290,7 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         tracker.record_read(&path).unwrap();
 
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "file_path": path.to_str().unwrap(),
@@ -296,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn edit_nonexistent_file() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = EditTool::new(tracker, None);
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "file_path": "/tmp/nonexistent_heartbit_test_12345.txt",

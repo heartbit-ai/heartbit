@@ -616,6 +616,9 @@ pub struct AgentConfig {
     /// `"none"` — skip resource discovery.
     #[serde(default)]
     pub mcp_resources: McpResourceMode,
+    /// Enable dangerous tools (bash) for this agent. Default: false in daemon mode.
+    #[serde(default)]
+    pub dangerous_tools: bool,
 }
 
 /// How MCP resources are surfaced to agents.
@@ -668,6 +671,19 @@ pub struct WorkspaceConfig {
     /// Defaults to `~/.heartbit/workspaces` if not specified.
     #[serde(default = "default_workspace_root")]
     pub root: String,
+    /// Environment variable allowlist for bash subprocesses.
+    /// Empty = use `DAEMON_ENV_ALLOWLIST` defaults.
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    /// Additional file path patterns to deny (e.g., `*.pem`, `secrets/`).
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+    /// Enable Landlock filesystem sandbox (Linux only, requires `sandbox` feature).
+    #[serde(default)]
+    pub sandbox: bool,
+    /// Additional paths the sandbox should allow reading (beyond system defaults).
+    #[serde(default)]
+    pub sandbox_read_paths: Vec<String>,
 }
 
 fn default_workspace_root() -> String {
@@ -700,6 +716,9 @@ pub struct GuardrailsConfig {
     /// LLM-as-judge safety evaluation.
     #[serde(default)]
     pub llm_judge: Option<LlmJudgeConfig>,
+    /// Secret scanning configuration.
+    #[serde(default)]
+    pub secret_scan: Option<SecretScanConfig>,
 }
 
 /// Configuration for the injection classifier guardrail.
@@ -743,6 +762,30 @@ fn default_pii_detectors() -> Vec<String> {
         "ssn".into(),
         "credit_card".into(),
     ]
+}
+
+/// Configuration for the secret scanning guardrail.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretScanConfig {
+    /// Action: `"redact"` or `"deny"`. Default: `"redact"`.
+    #[serde(default = "default_secret_action")]
+    pub action: String,
+    /// Additional custom patterns as label+regex pairs.
+    #[serde(default)]
+    pub custom_patterns: Vec<SecretPatternConfig>,
+}
+
+/// A custom secret pattern (label + regex).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretPatternConfig {
+    /// Human-readable label for the secret type.
+    pub label: String,
+    /// Regex pattern to match.
+    pub pattern: String,
+}
+
+fn default_secret_action() -> String {
+    "redact".into()
 }
 
 /// Configuration for the LLM-as-judge guardrail.
@@ -816,6 +859,7 @@ impl GuardrailsConfig {
             && self.pii.is_none()
             && self.tool_policy.is_none()
             && self.llm_judge.is_none()
+            && self.secret_scan.is_none()
     }
 
     /// Build runtime guardrail instances from this configuration.
@@ -954,6 +998,32 @@ impl GuardrailsConfig {
                      LLM judge guardrail will NOT be active. Use build_with_judge(Some(provider))."
                 );
             }
+        }
+
+        // 5. Secret scanner
+        if let Some(cfg) = &self.secret_scan {
+            use crate::agent::guardrails::secret_scanner::{SecretAction, SecretScannerGuardrail};
+
+            let action = match cfg.action.as_str() {
+                "redact" => SecretAction::Redact,
+                "deny" => SecretAction::Deny,
+                other => {
+                    return Err(Error::Config(format!(
+                        "invalid secret_scan action: `{other}` (expected \"redact\" or \"deny\")"
+                    )));
+                }
+            };
+            let mut builder = SecretScannerGuardrail::builder().action(action);
+            for cp in &cfg.custom_patterns {
+                let re = regex::Regex::new(&cp.pattern).map_err(|e| {
+                    Error::Config(format!(
+                        "invalid secret_scan custom pattern `{}`: {e}",
+                        cp.label
+                    ))
+                })?;
+                builder = builder.custom_pattern(&cp.label, re);
+            }
+            guardrails.push(Arc::new(builder.build()));
         }
 
         Ok(guardrails)
@@ -7049,6 +7119,7 @@ action = "redact"
                 rules: vec![],
             }),
             llm_judge: None,
+            secret_scan: None,
         };
         assert!(!config.is_empty());
         let guardrails = config.build().unwrap();

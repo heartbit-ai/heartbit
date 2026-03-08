@@ -46,6 +46,7 @@ hex = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
+landlock = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 heartbit-macro = { path = "../heartbit-macro", optional = true }
@@ -61,6 +62,7 @@ postgres = ["dep:sqlx", "dep:pgvector"]
 a2a = ["dep:a2a-sdk"]
 telegram = ["dep:teloxide"]
 local-embedding = ["dep:fastembed"]
+sandbox = ["dep:landlock"]
 macro = ["dep:heartbit-macro"]
 full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram"]
 

@@ -78,6 +78,9 @@ pub mod tool;
 pub(crate) mod util;
 pub mod workspace;
 
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+pub mod sandbox;
+
 pub mod lsp;
 
 // --- Feature-gated modules ---
@@ -125,7 +128,8 @@ pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
 pub use agent::guardrails::{
     ConditionalGuardrail, ContentFenceGuardrail, GuardrailChain, GuardrailMode,
     InjectionClassifierGuardrail, LlmJudgeGuardrail, LlmJudgeGuardrailBuilder, PiiAction,
-    PiiDetector, PiiGuardrail, ToolPolicyGuardrail, WarnToDeny,
+    PiiDetector, PiiGuardrail, SecretAction, SecretScannerGuardrail, SecretScannerGuardrailBuilder,
+    ToolPolicyGuardrail, WarnToDeny,
 };
 pub use agent::instructions::{
     discover_instruction_files, load_instructions, prepend_instructions,
@@ -158,9 +162,10 @@ pub use config::{
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KafkaConfig, KnowledgeConfig,
     KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry, MemoryConfig, MetricsConfig,
     OrchestratorConfig, PiiConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry,
-    SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml,
-    SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
-    ToolPolicyRuleConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
+    SecretPatternConfig, SecretScanConfig, SensorConfig, SensorModality, SensorRoutingConfig,
+    SensorSourceConfig, SessionPruneConfigToml, SpawnConfig, StoryCorrelationConfig,
+    TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig,
+    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
 };
 
 // --- Auth re-exports (feature-gated) ---
@@ -252,7 +257,7 @@ pub use sensor::{Sensor, SensorEvent};
 pub use tool::a2a::A2aClient;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
-    QuestionResponse, TodoPriority, TodoStatus, TodoStore, builtin_tools,
+    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, builtin_tools,
 };
 pub use tool::mcp::{
     AuthProvider, AuthResolver, DynamicAuthResolver, McpClient, McpPromptArgument, McpPromptDef,
@@ -275,4 +280,6 @@ pub use store::PostgresStore;
 pub use store::postgres::PostgresAuditTrail;
 
 // --- Workspace re-exports ---
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+pub use sandbox::SandboxPolicy;
 pub use workspace::Workspace;

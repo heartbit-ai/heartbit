@@ -19,6 +19,11 @@ pub struct BashTool {
     cwd: Mutex<PathBuf>,
     /// Optional workspace root. When set, cwd is jailed to this directory.
     workspace: Option<PathBuf>,
+    /// Controls which environment variables are visible to bash subprocesses.
+    env_policy: crate::workspace::EnvPolicy,
+    /// Landlock filesystem sandbox policy (Linux only, feature-gated).
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
 }
 
 impl BashTool {
@@ -27,15 +32,28 @@ impl BashTool {
         Self {
             cwd: Mutex::new(cwd),
             workspace: None,
+            env_policy: crate::workspace::EnvPolicy::Inherit,
+            #[cfg(all(target_os = "linux", feature = "sandbox"))]
+            sandbox_policy: None,
         }
     }
 
-    /// Create a BashTool with the working directory set to a workspace path.
-    pub fn with_workspace(workspace: PathBuf) -> Self {
+    /// Create a BashTool with workspace jailing and optional env variable filtering.
+    pub fn with_sandbox(workspace: PathBuf, env_policy: crate::workspace::EnvPolicy) -> Self {
         Self {
             cwd: Mutex::new(workspace.clone()),
             workspace: Some(workspace),
+            env_policy,
+            #[cfg(all(target_os = "linux", feature = "sandbox"))]
+            sandbox_policy: None,
         }
+    }
+
+    /// Set a Landlock filesystem sandbox policy (Linux only).
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    pub fn with_sandbox_policy(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox_policy = Some(policy);
+        self
     }
 }
 
@@ -98,12 +116,41 @@ impl Tool for BashTool {
                 wrapped
             );
 
-            let child = tokio::process::Command::new("bash")
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.arg("-c")
                 .arg(&full_command)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
+                .kill_on_drop(true);
+
+            match &self.env_policy {
+                crate::workspace::EnvPolicy::Inherit => {}
+                crate::workspace::EnvPolicy::Allowlist(allowed) => {
+                    cmd.env_clear();
+                    for key in allowed {
+                        if let Ok(val) = std::env::var(key) {
+                            cmd.env(key, &val);
+                        }
+                    }
+                }
+            }
+
+            // Apply Landlock sandbox if configured (Linux only).
+            #[cfg(all(target_os = "linux", feature = "sandbox"))]
+            if let Some(ref policy) = self.sandbox_policy {
+                use std::os::unix::process::CommandExt as _;
+                let pre_exec_fn = policy
+                    .clone()
+                    .into_pre_exec()
+                    .map_err(|e| Error::Agent(format!("Sandbox setup failed: {e}")))?;
+                // SAFETY: pre_exec runs between fork() and exec() in the child.
+                // The closure only calls Landlock syscalls — no allocations.
+                unsafe {
+                    cmd.as_std_mut().pre_exec(pre_exec_fn);
+                }
+            }
+
+            let child = cmd
                 .spawn()
                 .map_err(|e| Error::Agent(format!("Failed to spawn bash: {e}")))?;
 
@@ -358,7 +405,7 @@ mod tests {
     async fn bash_workspace_cd_outside_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().canonicalize().unwrap();
-        let tool = BashTool::with_workspace(ws.clone());
+        let tool = BashTool::with_sandbox(ws.clone(), crate::workspace::EnvPolicy::Inherit);
 
         // Try to cd outside workspace
         tool.execute(json!({"command": "cd /tmp"})).await.unwrap();
@@ -379,7 +426,7 @@ mod tests {
         let sub = ws.join("subdir");
         std::fs::create_dir(&sub).unwrap();
 
-        let tool = BashTool::with_workspace(ws);
+        let tool = BashTool::with_sandbox(ws, crate::workspace::EnvPolicy::Inherit);
 
         tool.execute(json!({"command": "cd subdir"})).await.unwrap();
 
@@ -419,5 +466,42 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("after"));
+    }
+
+    #[tokio::test]
+    async fn bash_with_sandbox_env_filtering() {
+        use crate::workspace::EnvPolicy;
+
+        // SAFETY: set_var is unsafe in multi-threaded contexts but acceptable in tests
+        unsafe { std::env::set_var("__HEARTBIT_TEST_SECRET", "super_secret_123") };
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::with_sandbox(
+            dir.path().canonicalize().unwrap(),
+            EnvPolicy::Allowlist(vec!["PATH".into(), "HOME".into()]),
+        );
+        let result = tool
+            .execute(json!({"command": "echo $__HEARTBIT_TEST_SECRET"}))
+            .await
+            .unwrap();
+        // Should NOT contain the secret since it's not in the allowlist
+        assert!(
+            !result.content.contains("super_secret_123"),
+            "env var should be filtered: {}",
+            result.content
+        );
+        unsafe { std::env::remove_var("__HEARTBIT_TEST_SECRET") };
+    }
+
+    #[tokio::test]
+    async fn bash_inherit_env_passes_vars() {
+        // SAFETY: set_var is unsafe in multi-threaded contexts but acceptable in tests
+        unsafe { std::env::set_var("__HEARTBIT_TEST_VAR", "visible_value") };
+        let tool = BashTool::new();
+        let result = tool
+            .execute(json!({"command": "echo $__HEARTBIT_TEST_VAR"}))
+            .await
+            .unwrap();
+        assert!(result.content.contains("visible_value"));
+        unsafe { std::env::remove_var("__HEARTBIT_TEST_VAR") };
     }
 }

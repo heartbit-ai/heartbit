@@ -2,6 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde_json::json;
 
@@ -13,11 +14,15 @@ const MAX_MATCHES: usize = 100;
 
 pub struct GrepTool {
     workspace: Option<PathBuf>,
+    protected_paths: Arc<Vec<PathBuf>>,
 }
 
 impl GrepTool {
-    pub fn new(workspace: Option<PathBuf>) -> Self {
-        Self { workspace }
+    pub fn new(workspace: Option<PathBuf>, protected_paths: Arc<Vec<PathBuf>>) -> Self {
+        Self {
+            workspace,
+            protected_paths,
+        }
     }
 }
 
@@ -73,10 +78,12 @@ impl Tool for GrepTool {
                 .unwrap_or(false);
 
             let search_path = match path_str {
-                Some(p) => match super::resolve_path(p, self.workspace.as_deref()) {
-                    Ok(p) => p,
-                    Err(msg) => return Ok(ToolOutput::error(msg)),
-                },
+                Some(p) => {
+                    match super::resolve_path(p, self.workspace.as_deref(), &self.protected_paths) {
+                        Ok(p) => p,
+                        Err(msg) => return Ok(ToolOutput::error(msg)),
+                    }
+                }
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
             let path = search_path.display().to_string();
@@ -281,7 +288,7 @@ mod tests {
 
     #[test]
     fn definition_has_correct_name() {
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "grep");
     }
 
@@ -291,7 +298,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world\nfoo bar\nhello again\n").unwrap();
 
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "pattern": "hello",
@@ -310,7 +317,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world\n").unwrap();
 
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "pattern": "xyz_not_here",
@@ -328,7 +335,7 @@ mod tests {
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "price is $5.00\nnot a regex\n").unwrap();
 
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "pattern": "$5.00",
@@ -343,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_nonexistent_path() {
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "pattern": "test",
@@ -361,7 +368,7 @@ mod tests {
         std::fs::write(dir.path().join("match.rs"), "fn hello() {}\n").unwrap();
         std::fs::write(dir.path().join("skip.txt"), "fn hello() {}\n").unwrap();
 
-        let tool = GrepTool::new(None);
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({
                 "pattern": "hello",

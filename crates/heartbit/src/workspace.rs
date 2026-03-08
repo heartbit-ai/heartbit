@@ -96,6 +96,21 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+/// Controls which environment variables are visible to bash subprocesses.
+#[derive(Debug, Clone, Default)]
+pub enum EnvPolicy {
+    /// Inherit all env vars from parent process (CLI default).
+    #[default]
+    Inherit,
+    /// Only pass explicitly allowlisted env vars.
+    Allowlist(Vec<String>),
+}
+
+/// Safe default allowlist for daemon mode — no secrets, just system vars.
+pub const DAEMON_ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "SHELL", "TMPDIR",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +202,15 @@ mod tests {
         let normalized = normalize_path(path);
         // Should not go above root: /a/../../b -> /b
         assert!(normalized.starts_with("/"));
+    }
+
+    #[test]
+    fn env_policy_default_is_inherit() {
+        assert!(matches!(EnvPolicy::default(), EnvPolicy::Inherit));
+    }
+
+    #[test]
+    fn daemon_env_allowlist_contains_path() {
+        assert!(DAEMON_ENV_ALLOWLIST.contains(&"PATH"));
     }
 }

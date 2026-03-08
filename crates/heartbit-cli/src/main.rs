@@ -659,6 +659,7 @@ async fn run_from_config(
         None,   // no audit user context in CLI run mode
         None,   // no audit tenant context in CLI run mode
         true,   // no role restrictions in CLI run mode
+        true,   // CLI mode: enable dangerous tools (bash) for backward compatibility
     )
     .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -748,6 +749,7 @@ pub(crate) async fn build_orchestrator_from_config(
     audit_user_id: Option<&str>,
     audit_tenant_id: Option<&str>,
     allow_shared_write: bool,
+    dangerous_tools: bool,
 ) -> Result<AgentOutput> {
     let on_retry = on_event.as_ref().map(build_on_retry);
 
@@ -765,6 +767,7 @@ pub(crate) async fn build_orchestrator_from_config(
         let btc = BuiltinToolsConfig {
             on_question: on_question.clone().or_else(|| Some(question_callback())),
             workspace: workspace_dir.clone(),
+            dangerous_tools,
             daemon_todo_store,
             ..Default::default()
         };
@@ -1748,6 +1751,7 @@ async fn run_default_agent(
         let btc = BuiltinToolsConfig {
             on_question: Some(question_callback()),
             workspace: workspace_dir.clone(),
+            dangerous_tools: true, // CLI mode: enable bash for backward compat
             ..Default::default()
         };
         builtin_tools(btc)
@@ -1964,6 +1968,7 @@ async fn run_chat_from_config(
         let btc = BuiltinToolsConfig {
             on_question: Some(question_callback()),
             workspace: workspace_dir.clone(),
+            dangerous_tools: true, // CLI mode: enable bash for backward compat
             ..Default::default()
         };
         builtin_tools(btc)
@@ -2159,6 +2164,7 @@ async fn run_chat_from_env(
         let btc = BuiltinToolsConfig {
             on_question: Some(question_callback()),
             workspace: workspace_dir.clone(),
+            dangerous_tools: true, // CLI mode: enable bash for backward compat
             ..Default::default()
         };
         builtin_tools(btc)

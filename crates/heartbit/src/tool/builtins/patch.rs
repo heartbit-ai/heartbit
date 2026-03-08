@@ -14,13 +14,19 @@ use super::file_tracker::FileTracker;
 pub struct PatchTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,
+    protected_paths: Arc<Vec<PathBuf>>,
 }
 
 impl PatchTool {
-    pub fn new(file_tracker: Arc<FileTracker>, workspace: Option<PathBuf>) -> Self {
+    pub fn new(
+        file_tracker: Arc<FileTracker>,
+        workspace: Option<PathBuf>,
+        protected_paths: Arc<Vec<PathBuf>>,
+    ) -> Self {
         Self {
             file_tracker,
             workspace,
+            protected_paths,
         }
     }
 }
@@ -67,7 +73,11 @@ impl Tool for PatchTool {
             // Resolve all paths once and pre-check: modified files must have been read
             let mut resolved_paths = Vec::with_capacity(file_patches.len());
             for fp in &file_patches {
-                let resolved = match super::resolve_path(&fp.path, self.workspace.as_deref()) {
+                let resolved = match super::resolve_path(
+                    &fp.path,
+                    self.workspace.as_deref(),
+                    &self.protected_paths,
+                ) {
                     Ok(p) => p,
                     Err(msg) => return Ok(ToolOutput::error(msg)),
                 };
@@ -441,7 +451,7 @@ mod tests {
     #[test]
     fn definition_has_correct_name() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "patch");
     }
 
@@ -459,7 +469,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));
@@ -483,7 +493,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("has not been read yet"));
@@ -492,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn patch_empty_diff() {
         let tracker = Arc::new(FileTracker::new());
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
             .execute(json!({"patch_text": "no diff here\n"}))
             .await
@@ -531,7 +541,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
@@ -557,7 +567,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
@@ -583,7 +593,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(
             result.is_error,
@@ -612,7 +622,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(
             result.is_error,
@@ -640,7 +650,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(!path.exists());
@@ -704,7 +714,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("2 addition"));
@@ -735,7 +745,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
@@ -762,7 +772,7 @@ mod tests {
             p2.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("2 file(s) changed"));
@@ -798,7 +808,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(
             result.is_error,
@@ -827,7 +837,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(
             result.is_error,
@@ -858,7 +868,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(
             result.is_error,
@@ -956,7 +966,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));
@@ -982,7 +992,7 @@ mod tests {
             path.display()
         );
 
-        let tool = PatchTool::new(tracker, None);
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));

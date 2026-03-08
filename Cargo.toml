@@ -54,6 +54,7 @@ dotenvy = "0.15"
 fastembed = { version = "5" }
 jsonwebtoken = "9"
 petgraph = "0.7"
+landlock = "0.4"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

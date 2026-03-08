@@ -1808,6 +1808,9 @@ pub async fn run_daemon(
                     roles.is_empty() || user_roles.iter().any(|r| roles.contains(r))
                 });
 
+            // Check if any agent has dangerous_tools enabled.
+            let dangerous_tools = config.agents.iter().any(|a| a.dangerous_tools);
+
             let result = crate::build_orchestrator_from_config(
                 provider,
                 &config,
@@ -1829,6 +1832,7 @@ pub async fn run_daemon(
                 user_id.as_deref(),
                 tenant_id.as_deref(),
                 allow_shared_write,
+                dangerous_tools,
             )
             .await
             .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -2163,6 +2167,7 @@ pub async fn run_daemon(
                 };
 
                 let start = Instant::now();
+                let dangerous_tools = config.agents.iter().any(|a| a.dangerous_tools);
                 let result = crate::build_orchestrator_from_config(
                     provider,
                     &config,
@@ -2184,6 +2189,7 @@ pub async fn run_daemon(
                     None, // no JWT user context for Telegram (uses Telegram user ID)
                     None, // no JWT tenant context for Telegram
                     true, // Telegram users authenticate via Telegram, not JWT — no RBAC roles available
+                    dangerous_tools,
                 )
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));
@@ -3236,6 +3242,7 @@ async fn run_interactive_task(
                 .is_none_or(|roles| {
                     roles.is_empty() || user_roles.iter().any(|r| roles.contains(r))
                 }),
+            config.agents.iter().any(|a| a.dangerous_tools),
         ) => {
             res.map_err(|e| HeartbitError::Daemon(e.to_string()))
         }
