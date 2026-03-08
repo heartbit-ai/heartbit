@@ -172,6 +172,25 @@ pub enum AgentEvent {
         tool_names: Vec<String>,
     },
 
+    /// Fuzzy doom loop detected: the agent repeated the same tools with different inputs.
+    FuzzyDoomLoopDetected {
+        agent: String,
+        turn: usize,
+        /// Number of consecutive fuzzy-identical turns.
+        consecutive_count: u32,
+        /// Tool names in the repeated batch.
+        #[serde(default)]
+        tool_names: Vec<String>,
+    },
+
+    /// Kill switch activated: a guardrail triggered an immediate agent termination.
+    KillSwitchActivated {
+        agent: String,
+        reason: String,
+        #[serde(default)]
+        guardrail_name: String,
+    },
+
     /// Session pruning truncated old tool results before an LLM call.
     SessionPruned {
         agent: String,
@@ -477,6 +496,17 @@ mod tests {
                 turn: 4,
                 consecutive_count: 3,
                 tool_names: vec!["web_search".into()],
+            },
+            AgentEvent::FuzzyDoomLoopDetected {
+                agent: "a".into(),
+                turn: 5,
+                consecutive_count: 4,
+                tool_names: vec!["web_search".into()],
+            },
+            AgentEvent::KillSwitchActivated {
+                agent: "a".into(),
+                reason: "critical detection".into(),
+                guardrail_name: "content_fence".into(),
             },
             AgentEvent::AutoCompactionTriggered {
                 agent: "a".into(),

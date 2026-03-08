@@ -113,7 +113,7 @@ pub use channel::telegram::{
 };
 
 // --- Agent re-exports ---
-pub use agent::audit::{AuditRecord, AuditTrail, InMemoryAuditTrail};
+pub use agent::audit::{AuditMode, AuditRecord, AuditTrail, InMemoryAuditTrail};
 pub use agent::batch::{BatchConfig, BatchExecutor, BatchExecutorBuilder, BatchResult};
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::cache::ResponseCache;
@@ -126,10 +126,11 @@ pub use agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
 pub use agent::guardrails::SensorSecurityGuardrail;
 pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
 pub use agent::guardrails::{
-    ConditionalGuardrail, ContentFenceGuardrail, GuardrailChain, GuardrailMode,
-    InjectionClassifierGuardrail, LlmJudgeGuardrail, LlmJudgeGuardrailBuilder, PiiAction,
-    PiiDetector, PiiGuardrail, SecretAction, SecretScannerGuardrail, SecretScannerGuardrailBuilder,
-    ToolPolicyGuardrail, WarnToDeny,
+    ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BehaviorRule, BehavioralMonitorGuardrail,
+    BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, ContentFenceGuardrail,
+    GuardrailChain, GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail,
+    LlmJudgeGuardrailBuilder, PiiAction, PiiDetector, PiiGuardrail, SecretAction,
+    SecretScannerGuardrail, SecretScannerGuardrailBuilder, ToolPolicyGuardrail, WarnToDeny,
 };
 pub use agent::instructions::{
     discover_instruction_files, load_instructions, prepend_instructions,
@@ -156,7 +157,8 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
 // --- Config re-exports (always available — just data structs) ---
 pub use config::{
-    ActiveHoursConfig, AgentConfig, AgentProviderConfig, AuthConfig, CascadeConfig,
+    ActionBudgetConfig, ActionBudgetRuleConfig, ActiveHoursConfig, AgentConfig,
+    AgentProviderConfig, AuthConfig, BehavioralConfig, BehavioralRuleConfig, CascadeConfig,
     CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig,
     DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KafkaConfig, KnowledgeConfig,

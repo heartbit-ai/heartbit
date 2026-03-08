@@ -313,6 +313,9 @@ pub struct OrchestratorConfig {
     /// Maximum consecutive identical tool-call turns before doom loop detection
     /// triggers. When reached, tool calls get error results instead of executing.
     pub max_identical_tool_calls: Option<u32>,
+    /// Maximum consecutive fuzzy-identical tool-call turns before doom loop detection.
+    /// Fuzzy matching compares sorted tool names (ignoring inputs).
+    pub max_fuzzy_identical_tool_calls: Option<u32>,
     /// Dispatch mode for orchestrator delegation. When `Sequential`, the
     /// delegate_task schema constrains `maxItems: 1` so the LLM dispatches
     /// one agent at a time. Defaults to `Parallel` when absent.
@@ -407,6 +410,7 @@ impl Default for OrchestratorConfig {
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
             dispatch_mode: None,
             routing: RoutingMode::default(),
             escalation: true,
@@ -586,6 +590,9 @@ pub struct AgentConfig {
     /// Maximum consecutive identical tool-call turns before doom loop detection.
     /// Overrides the orchestrator default.
     pub max_identical_tool_calls: Option<u32>,
+    /// Maximum consecutive fuzzy-identical tool-call turns before doom loop detection.
+    /// Fuzzy matching compares sorted tool names (ignoring inputs). Overrides orchestrator default.
+    pub max_fuzzy_identical_tool_calls: Option<u32>,
     /// Session pruning: truncate old tool results to save tokens.
     /// When set, enables session-level pruning before each LLM call.
     pub session_prune: Option<SessionPruneConfigToml>,
@@ -619,6 +626,10 @@ pub struct AgentConfig {
     /// Enable dangerous tools (bash) for this agent. Default: false in daemon mode.
     #[serde(default)]
     pub dangerous_tools: bool,
+    /// Audit mode: "full" (default) or "metadata_only".
+    /// MetadataOnly strips user content from audit records.
+    #[serde(default)]
+    pub audit_mode: Option<String>,
 }
 
 /// How MCP resources are surfaced to agents.
@@ -719,6 +730,12 @@ pub struct GuardrailsConfig {
     /// Secret scanning configuration.
     #[serde(default)]
     pub secret_scan: Option<SecretScanConfig>,
+    /// Behavioral monitoring configuration.
+    #[serde(default)]
+    pub behavioral: Option<BehavioralConfig>,
+    /// Action budget guardrail configuration.
+    #[serde(default)]
+    pub action_budget: Option<ActionBudgetConfig>,
 }
 
 /// Configuration for the injection classifier guardrail.
@@ -786,6 +803,77 @@ pub struct SecretPatternConfig {
 
 fn default_secret_action() -> String {
     "redact".into()
+}
+
+/// A single behavioral rule in TOML format.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct BehavioralRuleConfig {
+    /// Rule type: `"frequency_limit"`, `"suspicious_sequence"`, or `"denial_spike"`.
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    /// Tool name pattern (for `frequency_limit`).
+    #[serde(default)]
+    pub tool_pattern: Option<String>,
+    /// Maximum count threshold (for `frequency_limit`).
+    #[serde(default)]
+    pub max_count: Option<usize>,
+    /// Time window in seconds (for `frequency_limit` and `denial_spike`).
+    #[serde(default)]
+    pub window_seconds: Option<u64>,
+    /// First tool pattern in a suspicious sequence.
+    #[serde(default)]
+    pub first: Option<String>,
+    /// Second tool pattern in a suspicious sequence.
+    #[serde(default)]
+    pub then: Option<String>,
+    /// Turn window for suspicious sequences.
+    #[serde(default)]
+    pub within_turns: Option<usize>,
+    /// Maximum denied calls before spike triggers (for `denial_spike`).
+    #[serde(default)]
+    pub max_denied: Option<usize>,
+}
+
+/// Behavioral monitoring guardrail configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct BehavioralConfig {
+    /// Maximum entries in the sliding window. Default: 200.
+    #[serde(default = "default_behavioral_window_size")]
+    pub window_size: usize,
+    /// Time-to-live for window entries in seconds. Default: 1800 (30 min).
+    #[serde(default = "default_behavioral_window_ttl")]
+    pub window_ttl_seconds: u64,
+    /// Behavioral rules to enforce.
+    #[serde(default)]
+    pub rules: Vec<BehavioralRuleConfig>,
+}
+
+fn default_behavioral_window_size() -> usize {
+    200
+}
+
+fn default_behavioral_window_ttl() -> u64 {
+    1800
+}
+
+/// A single action budget rule in TOML format.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ActionBudgetRuleConfig {
+    /// Tool name pattern (exact or glob with `*`).
+    pub tool_pattern: String,
+    /// Maximum number of calls allowed.
+    pub max_calls: usize,
+}
+
+/// Action budget guardrail configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct ActionBudgetConfig {
+    /// Default budget for tools not matching any rule.
+    #[serde(default)]
+    pub default_budget: Option<usize>,
+    /// Per-tool budget rules.
+    #[serde(default)]
+    pub rules: Vec<ActionBudgetRuleConfig>,
 }
 
 /// Configuration for the LLM-as-judge guardrail.
@@ -860,6 +948,8 @@ impl GuardrailsConfig {
             && self.tool_policy.is_none()
             && self.llm_judge.is_none()
             && self.secret_scan.is_none()
+            && self.behavioral.is_none()
+            && self.action_budget.is_none()
     }
 
     /// Build runtime guardrail instances from this configuration.
@@ -1022,6 +1112,60 @@ impl GuardrailsConfig {
                     ))
                 })?;
                 builder = builder.custom_pattern(&cp.label, re);
+            }
+            guardrails.push(Arc::new(builder.build()));
+        }
+
+        // 6. Behavioral monitor
+        if let Some(cfg) = &self.behavioral {
+            use crate::agent::guardrails::behavioral::{BehaviorRule, BehavioralMonitorGuardrail};
+
+            let mut builder = BehavioralMonitorGuardrail::builder()
+                .window_size(cfg.window_size)
+                .window_ttl(std::time::Duration::from_secs(cfg.window_ttl_seconds));
+
+            for rule_cfg in &cfg.rules {
+                let rule = match rule_cfg.rule_type.as_str() {
+                    "frequency_limit" => BehaviorRule::FrequencyLimit {
+                        tool_pattern: rule_cfg.tool_pattern.clone().unwrap_or_else(|| "*".into()),
+                        max_count: rule_cfg.max_count.unwrap_or(10),
+                        window: std::time::Duration::from_secs(
+                            rule_cfg.window_seconds.unwrap_or(60),
+                        ),
+                    },
+                    "suspicious_sequence" => BehaviorRule::SuspiciousSequence {
+                        first: rule_cfg.first.clone().unwrap_or_default(),
+                        then: rule_cfg.then.clone().unwrap_or_default(),
+                        within_turns: rule_cfg.within_turns.unwrap_or(3),
+                    },
+                    "denial_spike" => BehaviorRule::DenialSpike {
+                        max_denied: rule_cfg.max_denied.unwrap_or(5),
+                        window: std::time::Duration::from_secs(
+                            rule_cfg.window_seconds.unwrap_or(60),
+                        ),
+                    },
+                    other => {
+                        return Err(Error::Config(format!(
+                            "unknown behavioral rule type: `{other}` \
+                             (expected \"frequency_limit\", \"suspicious_sequence\", or \"denial_spike\")"
+                        )));
+                    }
+                };
+                builder = builder.rule(rule);
+            }
+            guardrails.push(Arc::new(builder.build()));
+        }
+
+        // 7. Action budget
+        if let Some(cfg) = &self.action_budget {
+            use crate::agent::guardrails::action_budget::ActionBudgetGuardrail;
+
+            let mut builder = ActionBudgetGuardrail::builder();
+            if let Some(default) = cfg.default_budget {
+                builder = builder.default_budget(default);
+            }
+            for rule in &cfg.rules {
+                builder = builder.rule(&rule.tool_pattern, rule.max_calls);
             }
             guardrails.push(Arc::new(builder.build()));
         }
@@ -1876,6 +2020,11 @@ impl HeartbitConfig {
                 "orchestrator.max_identical_tool_calls must be at least 1".into(),
             ));
         }
+        if self.orchestrator.max_fuzzy_identical_tool_calls == Some(0) {
+            return Err(Error::Config(
+                "orchestrator.max_fuzzy_identical_tool_calls must be at least 1".into(),
+            ));
+        }
 
         // Validate spawn config
         if let Some(ref spawn) = self.orchestrator.spawn {
@@ -2070,6 +2219,12 @@ impl HeartbitConfig {
             if agent.max_identical_tool_calls == Some(0) {
                 return Err(Error::Config(format!(
                     "agent '{}': max_identical_tool_calls must be at least 1",
+                    agent.name
+                )));
+            }
+            if agent.max_fuzzy_identical_tool_calls == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': max_fuzzy_identical_tool_calls must be at least 1",
                     agent.name
                 )));
             }
@@ -7120,6 +7275,8 @@ action = "redact"
             }),
             llm_judge: None,
             secret_scan: None,
+            behavioral: None,
+            action_budget: None,
         };
         assert!(!config.is_empty());
         let guardrails = config.build().unwrap();

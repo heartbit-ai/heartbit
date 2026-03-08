@@ -18,6 +18,11 @@ pub enum GuardAction {
     /// `AgentEvent::GuardrailWarned` and an audit record. This enables
     /// monitoring mode (shadow enforcement) without blocking production.
     Warn { reason: String },
+    /// Immediately terminate the agent run. Used for critical detections
+    /// (e.g., CSAM, active exploitation) where the agent loop must stop
+    /// without further processing. The agent emits `KillSwitchActivated`
+    /// and returns `Error::KillSwitch`.
+    Kill { reason: String },
 }
 
 impl GuardAction {
@@ -35,9 +40,21 @@ impl GuardAction {
         }
     }
 
-    /// Returns `true` if this action blocks the operation (`Deny`).
+    /// Create a `Kill` action with the given reason.
+    pub fn kill(reason: impl Into<String>) -> Self {
+        GuardAction::Kill {
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns `true` if this action blocks the operation (`Deny` or `Kill`).
     pub fn is_denied(&self) -> bool {
-        matches!(self, GuardAction::Deny { .. })
+        matches!(self, GuardAction::Deny { .. } | GuardAction::Kill { .. })
+    }
+
+    /// Returns `true` if this action terminates the agent run (`Kill`).
+    pub fn is_killed(&self) -> bool {
+        matches!(self, GuardAction::Kill { .. })
     }
 }
 
@@ -99,6 +116,11 @@ pub trait Guardrail: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Called by the agent loop before each guardrail evaluation to provide
+    /// the current turn number. Stateful guardrails (e.g., `BehavioralMonitorGuardrail`)
+    /// can override this to track turn context.
+    fn set_turn(&self, _turn: usize) {}
 }
 
 #[cfg(test)]
@@ -126,8 +148,26 @@ mod tests {
     #[test]
     fn guard_action_is_denied() {
         assert!(GuardAction::deny("blocked").is_denied());
+        assert!(GuardAction::kill("critical").is_denied());
         assert!(!GuardAction::Allow.is_denied());
         assert!(!GuardAction::warn("suspicious").is_denied());
+    }
+
+    #[test]
+    fn guard_action_kill_constructor() {
+        let action = GuardAction::kill("CSAM detected");
+        match action {
+            GuardAction::Kill { reason } => assert_eq!(reason, "CSAM detected"),
+            _ => panic!("expected Kill"),
+        }
+    }
+
+    #[test]
+    fn guard_action_is_killed() {
+        assert!(GuardAction::kill("critical").is_killed());
+        assert!(!GuardAction::deny("blocked").is_killed());
+        assert!(!GuardAction::Allow.is_killed());
+        assert!(!GuardAction::warn("suspicious").is_killed());
     }
 
     #[test]

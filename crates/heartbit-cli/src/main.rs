@@ -1063,11 +1063,24 @@ pub(crate) async fn build_orchestrator_from_config(
         if let Some(m) = doom_loop {
             rb = rb.max_identical_tool_calls(m);
         }
+        let fuzzy_doom = agent
+            .max_fuzzy_identical_tool_calls
+            .or(config.orchestrator.max_fuzzy_identical_tool_calls);
+        if let Some(m) = fuzzy_doom {
+            rb = rb.max_fuzzy_identical_tool_calls(m);
+        }
         if let Some(budget) = agent.max_total_tokens {
             rb = rb.max_total_tokens(budget);
         }
         if let Some(size) = agent.response_cache_size {
             rb = rb.response_cache_size(size);
+        }
+        if let Some(ref am) = agent.audit_mode {
+            let mode = match am.as_str() {
+                "metadata_only" => heartbit::AuditMode::MetadataOnly,
+                _ => heartbit::AuditMode::Full,
+            };
+            rb = rb.audit_mode(mode);
         }
 
         // Session prune config
@@ -1302,6 +1315,9 @@ pub(crate) async fn build_orchestrator_from_config(
     if let Some(max) = config.orchestrator.max_identical_tool_calls {
         builder = builder.max_identical_tool_calls(max);
     }
+    if let Some(max) = config.orchestrator.max_fuzzy_identical_tool_calls {
+        builder = builder.max_fuzzy_identical_tool_calls(max);
+    }
     // Wire permission rules from config + learned permissions
     {
         let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());
@@ -1433,6 +1449,7 @@ pub(crate) async fn build_orchestrator_from_config(
                 .map(heartbit::parse_tool_profile)
                 .transpose()?,
             max_identical_tool_calls: agent.max_identical_tool_calls,
+            max_fuzzy_identical_tool_calls: agent.max_fuzzy_identical_tool_calls,
             session_prune_config: agent.session_prune.as_ref().map(|sp| {
                 heartbit::SessionPruneConfig {
                     keep_recent_n: sp.keep_recent_n,
@@ -2054,6 +2071,9 @@ async fn run_chat_from_config(
     }
     if let Some(max) = config.orchestrator.max_identical_tool_calls {
         builder = builder.max_identical_tool_calls(max);
+    }
+    if let Some(max) = config.orchestrator.max_fuzzy_identical_tool_calls {
+        builder = builder.max_fuzzy_identical_tool_calls(max);
     }
     {
         let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());

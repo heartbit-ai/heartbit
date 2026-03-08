@@ -62,6 +62,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) tool_profile: Option<super::tool_filter::ToolProfile>,
     /// Maximum consecutive identical tool-call turns for doom loop detection.
     pub(crate) max_identical_tool_calls: Option<u32>,
+    /// Maximum consecutive fuzzy-identical tool-call turns for doom loop detection.
+    pub(crate) max_fuzzy_identical_tool_calls: Option<u32>,
     /// Session pruning configuration.
     pub(crate) session_prune_config: Option<crate::agent::pruner::SessionPruneConfig>,
     /// Enable recursive summarization.
@@ -153,6 +155,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
             max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
             permission_rules: super::permission::PermissionRuleset::default(),
             instruction_text: None,
             learned_permissions: None,
@@ -356,6 +359,9 @@ impl DelegateTaskTool {
                 }
                 if let Some(max) = agent_def.max_identical_tool_calls {
                     builder = builder.max_identical_tool_calls(max);
+                }
+                if let Some(max) = agent_def.max_fuzzy_identical_tool_calls {
+                    builder = builder.max_fuzzy_identical_tool_calls(max);
                 }
                 if let Some(ref config) = agent_def.session_prune_config {
                     builder = builder.session_prune_config(config.clone());
@@ -757,6 +763,9 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(max) = agent_def.max_identical_tool_calls {
                         builder = builder.max_identical_tool_calls(max);
+                    }
+                    if let Some(max) = agent_def.max_fuzzy_identical_tool_calls {
+                        builder = builder.max_fuzzy_identical_tool_calls(max);
                     }
                     if let Some(ref config) = agent_def.session_prune_config {
                         builder = builder.session_prune_config(config.clone());
@@ -1548,6 +1557,8 @@ pub struct SubAgentConfig {
     pub tool_profile: Option<super::tool_filter::ToolProfile>,
     /// Maximum consecutive identical tool-call turns for doom loop detection.
     pub max_identical_tool_calls: Option<u32>,
+    /// Maximum consecutive fuzzy-identical tool-call turns for doom loop detection.
+    pub max_fuzzy_identical_tool_calls: Option<u32>,
     /// Session pruning configuration for this sub-agent.
     pub session_prune_config: Option<crate::agent::pruner::SessionPruneConfig>,
     /// Enable recursive summarization for this sub-agent.
@@ -1596,6 +1607,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     tool_output_compression_threshold: Option<usize>,
     max_tools_per_turn: Option<usize>,
     max_identical_tool_calls: Option<u32>,
+    max_fuzzy_identical_tool_calls: Option<u32>,
     permission_rules: super::permission::PermissionRuleset,
     instruction_text: Option<String>,
     learned_permissions: Option<Arc<std::sync::Mutex<super::permission::LearnedPermissions>>>,
@@ -1654,6 +1666,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
             session_prune_config: None,
             enable_recursive_summarization: None,
             reflection_threshold: None,
@@ -1696,6 +1709,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
             session_prune_config: None,
             enable_recursive_summarization: None,
             reflection_threshold: None,
@@ -1732,6 +1746,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             max_tools_per_turn: def.max_tools_per_turn,
             tool_profile: def.tool_profile,
             max_identical_tool_calls: def.max_identical_tool_calls,
+            max_fuzzy_identical_tool_calls: def.max_fuzzy_identical_tool_calls,
             session_prune_config: def.session_prune_config,
             enable_recursive_summarization: def.enable_recursive_summarization,
             reflection_threshold: def.reflection_threshold,
@@ -1952,6 +1967,11 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
 
     pub fn max_identical_tool_calls(mut self, max: u32) -> Self {
         self.max_identical_tool_calls = Some(max);
+        self
+    }
+
+    pub fn max_fuzzy_identical_tool_calls(mut self, max: u32) -> Self {
+        self.max_fuzzy_identical_tool_calls = Some(max);
         self
     }
 
@@ -2294,6 +2314,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if let Some(max) = self.max_identical_tool_calls {
             runner_builder = runner_builder.max_identical_tool_calls(max);
         }
+        if let Some(max) = self.max_fuzzy_identical_tool_calls {
+            runner_builder = runner_builder.max_fuzzy_identical_tool_calls(max);
+        }
         if !self.permission_rules.is_empty() {
             runner_builder = runner_builder.permission_rules(self.permission_rules);
         }
@@ -2605,6 +2628,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3531,6 +3555,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3593,6 +3618,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3640,6 +3666,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3755,6 +3782,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3834,6 +3862,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -4350,6 +4379,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -4852,11 +4882,13 @@ mod tests {
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
+                | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
                 | AgentEvent::ModelEscalated { agent, .. }
                 | AgentEvent::BudgetExceeded { agent, .. }
-                | AgentEvent::AgentSpawned { agent, .. } => agent,
+                | AgentEvent::AgentSpawned { agent, .. }
+                | AgentEvent::KillSwitchActivated { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5225,6 +5257,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -5419,6 +5452,7 @@ mod tests {
                 max_tools_per_turn: None,
                 tool_profile: None,
                 max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -5527,11 +5561,13 @@ mod tests {
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
+                | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
                 | AgentEvent::AutoCompactionTriggered { agent, .. }
                 | AgentEvent::SessionPruned { agent, .. }
                 | AgentEvent::ModelEscalated { agent, .. }
                 | AgentEvent::BudgetExceeded { agent, .. }
-                | AgentEvent::AgentSpawned { agent, .. } => agent,
+                | AgentEvent::AgentSpawned { agent, .. }
+                | AgentEvent::KillSwitchActivated { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5556,6 +5592,7 @@ mod tests {
                 AgentEvent::GuardrailWarned { .. } => "GuardrailWarned",
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",
+                AgentEvent::FuzzyDoomLoopDetected { .. } => "FuzzyDoomLoopDetected",
                 AgentEvent::AutoCompactionTriggered { .. } => "AutoCompactionTriggered",
                 AgentEvent::SessionPruned { .. } => "SessionPruned",
                 AgentEvent::SensorEventProcessed { .. } => "SensorEventProcessed",
@@ -5564,6 +5601,7 @@ mod tests {
                 AgentEvent::ModelEscalated { .. } => "ModelEscalated",
                 AgentEvent::BudgetExceeded { .. } => "BudgetExceeded",
                 AgentEvent::AgentSpawned { .. } => "AgentSpawned",
+                AgentEvent::KillSwitchActivated { .. } => "KillSwitchActivated",
             }
         }
 

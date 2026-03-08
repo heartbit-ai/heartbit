@@ -79,6 +79,9 @@ struct DoomLoopTracker {
     /// Hash of the previous turn's tool calls, and its consecutive count.
     last_hash: Option<u64>,
     count: u32,
+    /// Tracks fuzzy matches (same tool names, different inputs).
+    last_names_hash: Option<u64>,
+    fuzzy_count: u32,
 }
 
 impl DoomLoopTracker {
@@ -86,6 +89,8 @@ impl DoomLoopTracker {
         Self {
             last_hash: None,
             count: 0,
+            last_names_hash: None,
+            fuzzy_count: 0,
         }
     }
 
@@ -105,9 +110,26 @@ impl DoomLoopTracker {
         hasher.finish()
     }
 
-    /// Record the current turn's tool calls hash. Returns `true` if a doom loop
-    /// is detected (count >= threshold).
-    fn record(&mut self, calls: &[ToolCall], threshold: u32) -> bool {
+    /// Hash only the tool names (sorted) for fuzzy matching.
+    fn hash_tool_names(calls: &[ToolCall]) -> u64 {
+        let mut names: Vec<&str> = calls.iter().map(|tc| tc.name.as_str()).collect();
+        names.sort();
+        let mut hasher = DefaultHasher::new();
+        for name in &names {
+            name.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Record the current turn's tool calls. Returns `(exact_match, fuzzy_match)`.
+    /// `exact_match` is true if exact same calls repeated >= threshold times.
+    /// `fuzzy_match` is true if same tool names (different inputs) repeated >= fuzzy_threshold times.
+    fn record(
+        &mut self,
+        calls: &[ToolCall],
+        threshold: u32,
+        fuzzy_threshold: Option<u32>,
+    ) -> (bool, bool) {
         let hash = Self::hash_tool_calls(calls);
         match self.last_hash {
             Some(prev) if prev == hash => {
@@ -118,7 +140,28 @@ impl DoomLoopTracker {
                 self.count = 1;
             }
         }
-        self.count >= threshold
+
+        // Fuzzy tracking: same tool names, possibly different inputs
+        if let Some(_ft) = fuzzy_threshold {
+            let names_hash = Self::hash_tool_names(calls);
+            match self.last_names_hash {
+                Some(prev) if prev == names_hash => {
+                    // Only count fuzzy if NOT an exact match (avoid double-counting)
+                    if self.count < threshold {
+                        self.fuzzy_count += 1;
+                    }
+                }
+                _ => {
+                    self.last_names_hash = Some(names_hash);
+                    self.fuzzy_count = 1;
+                }
+            }
+        }
+
+        let exact = self.count >= threshold;
+        // Fuzzy only fires when exact does not (avoid double-counting)
+        let fuzzy = !exact && fuzzy_threshold.is_some_and(|ft| self.fuzzy_count >= ft);
+        (exact, fuzzy)
     }
 }
 
@@ -210,6 +253,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// agent receives an error result instead of executing the tools. `None`
     /// disables doom loop detection.
     max_identical_tool_calls: Option<u32>,
+    /// Maximum number of consecutive fuzzy-identical tool-call turns before
+    /// doom loop detection triggers. Fuzzy matching compares sorted tool names
+    /// (ignoring inputs). `None` disables fuzzy detection.
+    max_fuzzy_identical_tool_calls: Option<u32>,
     /// Declarative permission rules evaluated per tool call before the
     /// `on_approval` callback. `Allow` → execute, `Deny` → error result,
     /// `Ask` → fall through to `on_approval`.
@@ -237,6 +284,8 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Hard limit on cumulative tokens (input + output) across all turns.
     /// When exceeded, the agent returns `Error::BudgetExceeded`.
     max_total_tokens: Option<u64>,
+    /// Controls whether audit records include full content or metadata only.
+    audit_mode: audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
     audit_trail: Option<Arc<dyn AuditTrail>>,
     /// Optional user context for multi-tenant audit enrichment.
@@ -278,6 +327,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
+            max_fuzzy_identical_tool_calls: None,
             permission_rules: permission::PermissionRuleset::default(),
             instruction_text: None,
             learned_permissions: None,
@@ -289,6 +339,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             observability_mode: None,
             workspace: None,
             max_total_tokens: None,
+            audit_mode: audit::AuditMode::Full,
             audit_trail: None,
             audit_user_id: None,
             audit_tenant_id: None,
@@ -330,11 +381,14 @@ impl<P: LlmProvider> AgentRunner<P> {
     }
 
     /// Record an audit entry (best-effort). Failures are logged, never abort the agent.
-    async fn audit(&self, record: AuditRecord) {
-        if let Some(ref trail) = self.audit_trail
-            && let Err(e) = trail.record(record).await
-        {
-            tracing::warn!(error = %e, "audit record failed");
+    async fn audit(&self, mut record: AuditRecord) {
+        if let Some(ref trail) = self.audit_trail {
+            if self.audit_mode == audit::AuditMode::MetadataOnly {
+                record.payload = audit::strip_content(&record.payload);
+            }
+            if let Err(e) = trail.record(record).await {
+                tracing::warn!(error = %e, "audit record failed");
+            }
         }
     }
 
@@ -563,6 +617,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     turn: ctx.current_turn(),
                     max_turns: ctx.max_turns(),
                 });
+
+                // Provide turn context to stateful guardrails
+                for g in &self.guardrails {
+                    g.set_turn(ctx.current_turn());
+                }
 
                 // Session pruning: create a pruned view of messages for this LLM call
                 let mut request = if let Some(ref prune_config) = self.session_prune_config {
@@ -953,6 +1012,32 @@ impl<P: LlmProvider> AgentRunner<P> {
                             post_llm_denied = true;
                             break;
                         }
+                        GuardAction::Kill { reason } => {
+                            self.emit(AgentEvent::KillSwitchActivated {
+                                agent: self.name.clone(),
+                                reason: reason.clone(),
+                                guardrail_name: String::new(),
+                            });
+                            self.audit(AuditRecord {
+                                agent: self.name.clone(),
+                                turn: ctx.current_turn(),
+                                event_type: "guardrail_killed".into(),
+                                payload: serde_json::json!({
+                                    "hook": "post_llm",
+                                    "reason": reason,
+                                }),
+                                usage: TokenUsage::default(),
+                                timestamp: chrono::Utc::now(),
+                                user_id: self.audit_user_id.clone(),
+                                tenant_id: self.audit_tenant_id.clone(),
+                                delegation_chain: self.audit_delegation_chain.clone(),
+                            })
+                            .await;
+                            return Err((
+                                Error::KillSwitch(reason),
+                                total_usage,
+                            ));
+                        }
                     }
                 }
                 if post_llm_denied {
@@ -1245,36 +1330,76 @@ impl<P: LlmProvider> AgentRunner<P> {
 
                 // Doom loop detection: if the same set of tool calls is repeated
                 // for N consecutive turns, return error results instead of executing.
-                if let Some(threshold) = self.max_identical_tool_calls
-                    && doom_tracker.record(&tool_calls, threshold)
-                {
-                    debug!(
-                        agent = %self.name,
-                        count = doom_tracker.count,
-                        "doom loop detected, returning error results"
+                if let Some(threshold) = self.max_identical_tool_calls {
+                    let (exact, fuzzy) = doom_tracker.record(
+                        &tool_calls,
+                        threshold,
+                        self.max_fuzzy_identical_tool_calls,
                     );
-                    self.emit(AgentEvent::DoomLoopDetected {
-                        agent: self.name.clone(),
-                        turn: ctx.current_turn(),
-                        consecutive_count: doom_tracker.count,
-                        tool_names: tool_calls.iter().map(|tc| tc.name.clone()).collect(),
-                    });
-                    let results: Vec<ToolResult> = tool_calls
-                        .iter()
-                        .map(|tc| {
-                            ToolResult::error(
-                                tc.id.clone(),
-                                format!(
-                                    "Doom loop detected: identical tool calls repeated {} times \
-                                 consecutively. Try a different approach.",
-                                    doom_tracker.count
-                                ),
-                            )
-                        })
-                        .collect();
-                    total_tool_calls += tool_calls.len();
-                    ctx.add_tool_results(results);
-                    continue;
+                    if exact {
+                        debug!(
+                            agent = %self.name,
+                            count = doom_tracker.count,
+                            "doom loop detected, returning error results"
+                        );
+                        self.emit(AgentEvent::DoomLoopDetected {
+                            agent: self.name.clone(),
+                            turn: ctx.current_turn(),
+                            consecutive_count: doom_tracker.count,
+                            tool_names: tool_calls
+                                .iter()
+                                .map(|tc| tc.name.clone())
+                                .collect(),
+                        });
+                        let results: Vec<ToolResult> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                ToolResult::error(
+                                    tc.id.clone(),
+                                    format!(
+                                        "Doom loop detected: identical tool calls repeated {} \
+                                         times consecutively. Try a different approach.",
+                                        doom_tracker.count
+                                    ),
+                                )
+                            })
+                            .collect();
+                        total_tool_calls += tool_calls.len();
+                        ctx.add_tool_results(results);
+                        continue;
+                    } else if fuzzy {
+                        debug!(
+                            agent = %self.name,
+                            count = doom_tracker.fuzzy_count,
+                            "fuzzy doom loop detected, returning error results"
+                        );
+                        self.emit(AgentEvent::FuzzyDoomLoopDetected {
+                            agent: self.name.clone(),
+                            turn: ctx.current_turn(),
+                            consecutive_count: doom_tracker.fuzzy_count,
+                            tool_names: tool_calls
+                                .iter()
+                                .map(|tc| tc.name.clone())
+                                .collect(),
+                        });
+                        let results: Vec<ToolResult> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                ToolResult::error(
+                                    tc.id.clone(),
+                                    format!(
+                                        "Fuzzy doom loop detected: same tools with different \
+                                         inputs repeated {} times consecutively. Try a \
+                                         completely different approach.",
+                                        doom_tracker.fuzzy_count
+                                    ),
+                                )
+                            })
+                            .collect();
+                        total_tool_calls += tool_calls.len();
+                        ctx.add_tool_results(results);
+                        continue;
+                    }
                 }
 
                 // pre_tool guardrail: per-call fine-grained filter
@@ -1343,6 +1468,33 @@ impl<P: LlmProvider> AgentRunner<P> {
                                     ));
                                     call_denied = true;
                                     break;
+                                }
+                                GuardAction::Kill { reason } => {
+                                    self.emit(AgentEvent::KillSwitchActivated {
+                                        agent: self.name.clone(),
+                                        reason: reason.clone(),
+                                        guardrail_name: String::new(),
+                                    });
+                                    self.audit(AuditRecord {
+                                        agent: self.name.clone(),
+                                        turn: ctx.current_turn(),
+                                        event_type: "guardrail_killed".into(),
+                                        payload: serde_json::json!({
+                                            "hook": "pre_tool",
+                                            "reason": reason,
+                                            "tool_name": call.name,
+                                        }),
+                                        usage: TokenUsage::default(),
+                                        timestamp: chrono::Utc::now(),
+                                        user_id: self.audit_user_id.clone(),
+                                        tenant_id: self.audit_tenant_id.clone(),
+                                        delegation_chain: self.audit_delegation_chain.clone(),
+                                    })
+                                    .await;
+                                    return Err((
+                                        Error::KillSwitch(reason),
+                                        total_usage,
+                                    ));
                                 }
                             }
                         }
@@ -2077,6 +2229,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     max_tools_per_turn: Option<usize>,
     tool_profile: Option<tool_filter::ToolProfile>,
     max_identical_tool_calls: Option<u32>,
+    max_fuzzy_identical_tool_calls: Option<u32>,
     permission_rules: permission::PermissionRuleset,
     /// Instruction file contents to prepend to the system prompt.
     instruction_text: Option<String>,
@@ -2091,6 +2244,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     workspace: Option<std::path::PathBuf>,
     /// Hard limit on cumulative tokens (input + output) across all turns.
     max_total_tokens: Option<u64>,
+    /// Controls whether audit records include full content or metadata only.
+    audit_mode: audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
     audit_trail: Option<Arc<dyn AuditTrail>>,
     /// Optional user context for multi-tenant audit enrichment.
@@ -2307,6 +2462,17 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the maximum number of consecutive fuzzy-identical tool-call turns
+    /// before the agent receives an error result. Fuzzy matching compares sorted
+    /// tool names (ignoring inputs), catching loops where the agent retries the
+    /// same tools with different arguments.
+    ///
+    /// Default: `None` (no fuzzy detection).
+    pub fn max_fuzzy_identical_tool_calls(mut self, max: u32) -> Self {
+        self.max_fuzzy_identical_tool_calls = Some(max);
+        self
+    }
+
     /// Set declarative permission rules for tool calls.
     ///
     /// Rules are evaluated per tool call before the `on_approval` callback.
@@ -2406,6 +2572,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the audit mode controlling what data is stored in audit records.
+    ///
+    /// - `Full` (default): all content is recorded.
+    /// - `MetadataOnly`: user content fields are replaced with `[stripped]`.
+    pub fn audit_mode(mut self, mode: audit::AuditMode) -> Self {
+        self.audit_mode = mode;
+        self
+    }
+
     /// Attach an audit trail for recording untruncated agent decisions.
     ///
     /// When set, every LLM response, tool call, tool result, run completion,
@@ -2491,6 +2666,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         if self.max_identical_tool_calls == Some(0) {
             return Err(Error::Config(
                 "max_identical_tool_calls must be at least 1".into(),
+            ));
+        }
+        if self.max_fuzzy_identical_tool_calls == Some(0) {
+            return Err(Error::Config(
+                "max_fuzzy_identical_tool_calls must be at least 1".into(),
             ));
         }
         if self.max_total_tokens == Some(0) {
@@ -2604,6 +2784,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_tools_per_turn: self.max_tools_per_turn,
             tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,
+            max_fuzzy_identical_tool_calls: self.max_fuzzy_identical_tool_calls,
             permission_rules: std::sync::RwLock::new(self.permission_rules),
             learned_permissions: self.learned_permissions,
             lsp_manager: self.lsp_manager,
@@ -2617,6 +2798,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 self.observability_mode,
             ),
             max_total_tokens: self.max_total_tokens,
+            audit_mode: self.audit_mode,
             audit_trail: self.audit_trail,
             audit_user_id: self.audit_user_id,
             audit_tenant_id: self.audit_tenant_id,
@@ -6607,9 +6789,9 @@ mod tests {
             name: "search".into(),
             input: json!({"query": "rust"}),
         }];
-        assert!(!tracker.record(&calls, 3));
-        assert!(!tracker.record(&calls, 3));
-        assert!(tracker.record(&calls, 3)); // 3rd time triggers
+        assert!(!tracker.record(&calls, 3, None).0);
+        assert!(!tracker.record(&calls, 3, None).0);
+        assert!(tracker.record(&calls, 3, None).0); // 3rd time triggers
     }
 
     #[test]
@@ -6625,12 +6807,12 @@ mod tests {
             name: "search".into(),
             input: json!({"query": "python"}),
         }];
-        assert!(!tracker.record(&calls_a, 3));
-        assert!(!tracker.record(&calls_a, 3));
+        assert!(!tracker.record(&calls_a, 3, None).0);
+        assert!(!tracker.record(&calls_a, 3, None).0);
         // Different input resets
-        assert!(!tracker.record(&calls_b, 3));
-        assert!(!tracker.record(&calls_b, 3));
-        assert!(tracker.record(&calls_b, 3)); // 3rd consecutive of calls_b
+        assert!(!tracker.record(&calls_b, 3, None).0);
+        assert!(!tracker.record(&calls_b, 3, None).0);
+        assert!(tracker.record(&calls_b, 3, None).0); // 3rd consecutive of calls_b
     }
 
     #[test]
@@ -6647,8 +6829,8 @@ mod tests {
             name: "read".into(),
             input: json!({"file": "foo.txt"}),
         }];
-        assert!(!tracker.record(&calls_1, 2));
-        assert!(tracker.record(&calls_2, 2)); // Same name+input, different ID
+        assert!(!tracker.record(&calls_1, 2, None).0);
+        assert!(tracker.record(&calls_2, 2, None).0); // Same name+input, different ID
     }
 
     #[test]
@@ -6666,8 +6848,150 @@ mod tests {
                 input: json!({"file": "y"}),
             },
         ];
-        assert!(!tracker.record(&calls, 2));
-        assert!(tracker.record(&calls, 2));
+        assert!(!tracker.record(&calls, 2, None).0);
+        assert!(tracker.record(&calls, 2, None).0);
+    }
+
+    #[test]
+    fn fuzzy_doom_loop_same_tools_different_inputs() {
+        let mut tracker = DoomLoopTracker::new();
+        let calls_a = vec![ToolCall {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({"query": "rust"}),
+        }];
+        let calls_b = vec![ToolCall {
+            id: "c2".into(),
+            name: "search".into(),
+            input: json!({"query": "python"}),
+        }];
+        let calls_c = vec![ToolCall {
+            id: "c3".into(),
+            name: "search".into(),
+            input: json!({"query": "go"}),
+        }];
+        // All have same tool name "search" but different inputs
+        let (exact, fuzzy) = tracker.record(&calls_a, 5, Some(3));
+        assert!(!exact && !fuzzy, "first call: no detection");
+        let (exact, fuzzy) = tracker.record(&calls_b, 5, Some(3));
+        assert!(!exact && !fuzzy, "second call: no detection yet");
+        let (exact, fuzzy) = tracker.record(&calls_c, 5, Some(3));
+        assert!(!exact && fuzzy, "third call: fuzzy triggered");
+    }
+
+    #[test]
+    fn fuzzy_doom_loop_different_tools_no_trigger() {
+        let mut tracker = DoomLoopTracker::new();
+        let calls_a = vec![ToolCall {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({"query": "rust"}),
+        }];
+        let calls_b = vec![ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            input: json!({"file": "foo.txt"}),
+        }];
+        let calls_c = vec![ToolCall {
+            id: "c3".into(),
+            name: "write".into(),
+            input: json!({"file": "bar.txt"}),
+        }];
+        // Different tool names each turn
+        let (_, fuzzy) = tracker.record(&calls_a, 5, Some(3));
+        assert!(!fuzzy);
+        let (_, fuzzy) = tracker.record(&calls_b, 5, Some(3));
+        assert!(!fuzzy);
+        let (_, fuzzy) = tracker.record(&calls_c, 5, Some(3));
+        assert!(!fuzzy);
+    }
+
+    #[test]
+    fn fuzzy_doom_loop_disabled_by_default() {
+        let mut tracker = DoomLoopTracker::new();
+        let calls_a = vec![ToolCall {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({"query": "rust"}),
+        }];
+        let calls_b = vec![ToolCall {
+            id: "c2".into(),
+            name: "search".into(),
+            input: json!({"query": "python"}),
+        }];
+        // fuzzy_threshold is None — no fuzzy detection
+        let (_, fuzzy) = tracker.record(&calls_a, 5, None);
+        assert!(!fuzzy);
+        let (_, fuzzy) = tracker.record(&calls_b, 5, None);
+        assert!(!fuzzy);
+    }
+
+    #[test]
+    fn exact_match_does_not_double_trigger_fuzzy() {
+        let mut tracker = DoomLoopTracker::new();
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({"query": "rust"}),
+        }];
+        // Exact same calls 3 times with both thresholds set to 3
+        let (exact, fuzzy) = tracker.record(&calls, 3, Some(3));
+        assert!(!exact && !fuzzy);
+        let (exact, fuzzy) = tracker.record(&calls, 3, Some(3));
+        assert!(!exact && !fuzzy);
+        // Third time: exact triggers, fuzzy should NOT
+        let (exact, fuzzy) = tracker.record(&calls, 3, Some(3));
+        assert!(exact, "exact should trigger");
+        assert!(!fuzzy, "fuzzy should not trigger when exact fires");
+    }
+
+    #[test]
+    fn exact_match_resets_fuzzy_count() {
+        let mut tracker = DoomLoopTracker::new();
+        // Two different-input calls build fuzzy count
+        let calls_a = vec![ToolCall {
+            id: "c1".into(),
+            name: "search".into(),
+            input: json!({"query": "a"}),
+        }];
+        let calls_b = vec![ToolCall {
+            id: "c2".into(),
+            name: "search".into(),
+            input: json!({"query": "b"}),
+        }];
+        let calls_c = vec![ToolCall {
+            id: "c3".into(),
+            name: "read".into(),
+            input: json!({"file": "x"}),
+        }];
+        tracker.record(&calls_a, 5, Some(3));
+        tracker.record(&calls_b, 5, Some(3));
+        // Different tool resets fuzzy count
+        tracker.record(&calls_c, 5, Some(3));
+        assert_eq!(
+            tracker.fuzzy_count, 1,
+            "fuzzy count reset on different tools"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_max_fuzzy_identical_tool_calls() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .max_fuzzy_identical_tool_calls(0)
+            .build();
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("max_fuzzy_identical_tool_calls must be at least 1"),
+                    "error: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for max_fuzzy_identical_tool_calls(0)"),
+        }
     }
 
     #[tokio::test]

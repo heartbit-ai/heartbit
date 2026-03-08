@@ -570,7 +570,7 @@ impl DaemonMetrics {
             AgentEvent::RetryAttempt { .. } => {
                 self.retry_attempts_total.inc();
             }
-            AgentEvent::DoomLoopDetected { .. } => {
+            AgentEvent::DoomLoopDetected { .. } | AgentEvent::FuzzyDoomLoopDetected { .. } => {
                 self.doom_loops_detected_total.inc();
             }
             AgentEvent::SessionPruned { bytes_saved, .. } => {
@@ -626,8 +626,8 @@ impl DaemonMetrics {
                     .with_label_values(&[hook])
                     .inc();
             }
-            AgentEvent::AgentSpawned { .. } => {
-                // Spawn events are informational — no metric needed yet.
+            AgentEvent::AgentSpawned { .. } | AgentEvent::KillSwitchActivated { .. } => {
+                // Spawn/kill events are informational — no metric needed yet.
             }
         }
     }
@@ -1505,6 +1505,12 @@ mod tests {
                 agent: "a".into(),
                 turn: 4,
                 consecutive_count: 3,
+                tool_names: vec!["bash".into()],
+            },
+            AgentEvent::FuzzyDoomLoopDetected {
+                agent: "a".into(),
+                turn: 5,
+                consecutive_count: 4,
                 tool_names: vec!["bash".into()],
             },
             AgentEvent::SessionPruned {

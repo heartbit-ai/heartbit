@@ -74,6 +74,9 @@ impl Guardrail for GuardrailChain {
             let mut worst = GuardAction::Allow;
             for fut in futs {
                 let action = fut.await?;
+                if action.is_killed() {
+                    return Ok(action);
+                }
                 if action.is_denied() {
                     return Ok(action);
                 }
@@ -97,6 +100,9 @@ impl Guardrail for GuardrailChain {
             let mut worst = GuardAction::Allow;
             for fut in futs {
                 let action = fut.await?;
+                if action.is_killed() {
+                    return Ok(action);
+                }
                 if action.is_denied() {
                     return Ok(action);
                 }
@@ -167,11 +173,9 @@ impl WarnToDeny {
                     action
                 }
             }
-            GuardAction::Allow => {
-                self.consecutive_warns.store(0, Ordering::Relaxed);
-                action
-            }
-            GuardAction::Deny { .. } => {
+            // Allow/Deny reset warn counter; Kill passes through unchanged
+            GuardAction::Kill { .. } => action,
+            _ => {
                 self.consecutive_warns.store(0, Ordering::Relaxed);
                 action
             }

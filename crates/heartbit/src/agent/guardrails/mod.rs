@@ -1,3 +1,5 @@
+pub mod action_budget;
+pub mod behavioral;
 pub mod compose;
 pub mod content_fence;
 pub mod injection;
@@ -8,6 +10,8 @@ pub mod secret_scanner;
 pub mod sensor_security;
 pub mod tool_policy;
 
+pub use action_budget::{ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BudgetRule};
+pub use behavioral::{BehaviorRule, BehavioralMonitorGuardrail, BehavioralMonitorGuardrailBuilder};
 pub use compose::{ConditionalGuardrail, GuardrailChain, WarnToDeny};
 pub use content_fence::ContentFenceGuardrail;
 pub use injection::{GuardrailMode, InjectionClassifierGuardrail};
