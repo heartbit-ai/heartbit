@@ -83,17 +83,7 @@ async fn main() -> Result<()> {
     tracing::info!(topic = gateway_producer.topic(), "gateway producer ready");
 
     // Signal handler
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => tracing::info!("SIGINT received"),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-        }
-        signal_cancel.cancel();
-    });
+    heartbit::signal::spawn_shutdown_handler(cancel.clone());
 
     // Start HTTP server
     let state = server::GatewayState {

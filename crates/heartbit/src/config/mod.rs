@@ -144,6 +144,24 @@ impl std::fmt::Display for TrustLevel {
     }
 }
 
+/// Parse a workflow type string into the enum.
+pub fn parse_workflow_type(s: &str) -> Result<crate::agent::workflow::WorkflowType, Error> {
+    use crate::agent::workflow::WorkflowType;
+    match s.to_lowercase().as_str() {
+        "dag" => Ok(WorkflowType::Dag),
+        "sequential" => Ok(WorkflowType::Sequential),
+        "parallel" => Ok(WorkflowType::Parallel),
+        "loop" => Ok(WorkflowType::Loop),
+        "debate" => Ok(WorkflowType::Debate),
+        "voting" => Ok(WorkflowType::Voting),
+        "mixture" => Ok(WorkflowType::Mixture),
+        _ => Err(Error::Config(format!(
+            "invalid workflow_type '{}': must be dag, sequential, parallel, loop, debate, voting, or mixture",
+            s
+        ))),
+    }
+}
+
 /// Parse a tool profile string into the enum.
 pub fn parse_tool_profile(s: &str) -> Result<ToolProfile, Error> {
     match s.to_lowercase().as_str() {
@@ -179,6 +197,7 @@ fn default_true() -> bool {
 /// Top-level configuration loaded from `heartbit.toml`.
 #[derive(Debug, Deserialize)]
 pub struct HeartbitConfig {
+    #[serde(default)]
     pub provider: ProviderConfig,
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
@@ -219,12 +238,16 @@ impl HeartbitConfig {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        // Validate top-level provider
-        if self.provider.name.is_empty() {
-            return Err(Error::Config("provider.name must not be empty".into()));
-        }
-        if self.provider.model.is_empty() {
-            return Err(Error::Config("provider.model must not be empty".into()));
+        // Validate top-level provider (skip when running as cloud-delegated runtime
+        // where per-request provider keys are used instead of a global config).
+        let daemon_only = self.daemon.is_some() && self.agents.is_empty();
+        if !daemon_only {
+            if self.provider.name.is_empty() {
+                return Err(Error::Config("provider.name must not be empty".into()));
+            }
+            if self.provider.model.is_empty() {
+                return Err(Error::Config("provider.model must not be empty".into()));
+            }
         }
         if self.orchestrator.max_turns == 0 {
             return Err(Error::Config(
@@ -4653,4 +4676,33 @@ mcp_resources = "none"
     }
 
     // daemon_mcp_server tests removed — mcp_server field moved to gateway crate.
+
+    #[test]
+    fn parse_workflow_type_valid() {
+        use crate::agent::workflow::WorkflowType;
+        assert_eq!(parse_workflow_type("dag").unwrap(), WorkflowType::Dag);
+        assert_eq!(parse_workflow_type("DAG").unwrap(), WorkflowType::Dag);
+        assert_eq!(
+            parse_workflow_type("sequential").unwrap(),
+            WorkflowType::Sequential
+        );
+        assert_eq!(
+            parse_workflow_type("parallel").unwrap(),
+            WorkflowType::Parallel
+        );
+        assert_eq!(parse_workflow_type("loop").unwrap(), WorkflowType::Loop);
+        assert_eq!(parse_workflow_type("debate").unwrap(), WorkflowType::Debate);
+        assert_eq!(parse_workflow_type("voting").unwrap(), WorkflowType::Voting);
+        assert_eq!(
+            parse_workflow_type("mixture").unwrap(),
+            WorkflowType::Mixture
+        );
+    }
+
+    #[test]
+    fn parse_workflow_type_invalid() {
+        assert!(parse_workflow_type("").is_err());
+        assert!(parse_workflow_type("unknown").is_err());
+        assert!(parse_workflow_type("rm -rf /").is_err());
+    }
 }

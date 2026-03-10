@@ -307,38 +307,34 @@ mod postgres_session {
 
         /// Run the session tables migration. Safe to call multiple times.
         pub async fn run_migration(&self) -> Result<(), Error> {
-            sqlx::query(
-                r#"
-            CREATE TABLE IF NOT EXISTS sessions (
-                id          UUID PRIMARY KEY,
-                title       TEXT,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                user_id     TEXT,
-                tenant_id   TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS session_messages (
-                id          BIGSERIAL PRIMARY KEY,
-                session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                role        TEXT NOT NULL,
-                content     TEXT NOT NULL,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            CREATE INDEX IF NOT EXISTS idx_session_messages_session_id
-                ON session_messages(session_id);
-
-            -- Add user/tenant columns if upgrading from older schema.
-            DO $$ BEGIN
-                ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_id TEXT;
-                ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT;
-            EXCEPTION WHEN duplicate_column THEN NULL;
-            END $$;
-            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);
-            "#,
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(|e| Error::Channel(format!("session migration failed: {e}")))?;
+            // Split into separate statements — sqlx doesn't support multiple
+            // commands in a single prepared statement.
+            let statements = [
+                r#"CREATE TABLE IF NOT EXISTS sessions (
+                    id          UUID PRIMARY KEY,
+                    title       TEXT,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    user_id     TEXT,
+                    tenant_id   TEXT
+                )"#,
+                r#"CREATE TABLE IF NOT EXISTS session_messages (
+                    id          BIGSERIAL PRIMARY KEY,
+                    session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    role        TEXT NOT NULL,
+                    content     TEXT NOT NULL,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                )"#,
+                "CREATE INDEX IF NOT EXISTS idx_session_messages_session_id ON session_messages(session_id)",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_id TEXT",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT",
+                "CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id)",
+            ];
+            for stmt in statements {
+                sqlx::query(stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Error::Channel(format!("session migration failed: {e}")))?;
+            }
             Ok(())
         }
     }

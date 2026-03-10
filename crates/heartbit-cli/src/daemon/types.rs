@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use heartbit::{
     DaemonHandle, DaemonMetrics, HeartbitConfig, JwtValidator, Memory, ObservabilityMode,
 };
+use sqlx::PgPool;
 
 // --- Request / Response types ---
 
@@ -172,4 +173,5 @@ pub(crate) struct AppState {
     pub auth_provider: Option<Arc<dyn heartbit::AuthProvider>>,
     pub transport_pool: Arc<heartbit::McpTransportPool>,
     pub pending_approvals: PendingApprovals,
+    pub db_pool: Option<PgPool>,
 }

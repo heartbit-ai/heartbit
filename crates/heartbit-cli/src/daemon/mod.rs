@@ -1,4 +1,5 @@
 mod auth;
+mod eval;
 mod execute;
 mod handlers;
 mod memory;
@@ -65,11 +66,20 @@ pub async fn run_daemon(
         None
     };
 
-    // Build task store: PostgreSQL if configured, in-memory otherwise
-    let store: Arc<dyn heartbit::TaskStore> = if let Some(ref db_url) = daemon_config.database_url {
-        let pg_store = heartbit::PostgresTaskStore::connect(db_url)
+    // Create a shared PgPool when a database URL is configured.
+    // Reused by both the task store and the execute handler (for persistent memory).
+    let db_pool: Option<sqlx::PgPool> = if let Some(ref db_url) = daemon_config.database_url {
+        let pool = sqlx::PgPool::connect(db_url)
             .await
-            .context("failed to connect to task database")?;
+            .context("failed to connect to database")?;
+        Some(pool)
+    } else {
+        None
+    };
+
+    // Build task store: PostgreSQL if configured, in-memory otherwise
+    let store: Arc<dyn heartbit::TaskStore> = if let Some(ref pool) = db_pool {
+        let pg_store = heartbit::PostgresTaskStore::new(pool.clone());
         pg_store
             .run_migration()
             .await
@@ -80,6 +90,18 @@ pub async fn run_daemon(
         tracing::info!("task store: in-memory (tasks lost on restart)");
         Arc::new(InMemoryTaskStore::new())
     };
+
+    // Run memory table migration when database is available.
+    // This is done once at startup so the execute handler can create
+    // PostgresMemoryStore instances without per-request migration overhead.
+    if let Some(ref pool) = db_pool {
+        let mut pg_mem = heartbit::PostgresMemoryStore::new(pool.clone());
+        pg_mem
+            .run_migration()
+            .await
+            .context("failed to run memory migration")?;
+        tracing::info!("memory store: PostgreSQL migration complete");
+    }
 
     // Create cancellation token
     let cancel = CancellationToken::new();
@@ -163,17 +185,7 @@ pub async fn run_daemon(
     };
 
     // Signal handler
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = sigint.recv() => tracing::info!("SIGINT received"),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-        }
-        signal_cancel.cancel();
-    });
+    heartbit::signal::spawn_shutdown_handler(cancel.clone());
 
     // Resolve observability mode
     let config_obs = config
@@ -503,6 +515,7 @@ pub async fn run_daemon(
         auth_provider: state_auth_provider,
         transport_pool: transport_pool.clone(),
         pending_approvals,
+        db_pool,
     };
 
     // Public routes -- health, readiness, metrics -- never require auth
@@ -520,6 +533,7 @@ pub async fn run_daemon(
         .route("/v1/tasks/{id}/stream", get(handle_stream))
         .route("/v1/tasks/{id}/approve", post(handle_approval))
         .route("/v1/tasks/execute", post(execute::handle_execute))
+        .route("/v1/tasks/eval", post(eval::handle_eval))
         .route("/v1/stats", get(handle_stats))
         .route("/v1/usage", get(handle_usage));
 

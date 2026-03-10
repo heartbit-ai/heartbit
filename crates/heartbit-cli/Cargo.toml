@@ -39,6 +39,8 @@ rdkafka = { workspace = true }
 teloxide = { workspace = true }
 dotenvy = { workspace = true }
 base64 = { workspace = true }
+sqlx = { workspace = true }
+regex = { workspace = true }
 
 [features]
 local-embedding = ["heartbit/local-embedding"]

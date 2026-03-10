@@ -53,9 +53,10 @@ impl PostgresStore {
 
     /// Run the initial schema migration.
     pub async fn run_migration(&self) -> Result<(), Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS tasks (
+        // Split into separate statements — sqlx doesn't support multiple
+        // commands in a single prepared statement.
+        let statements = [
+            r#"CREATE TABLE IF NOT EXISTS tasks (
                 id            UUID PRIMARY KEY,
                 status        TEXT NOT NULL DEFAULT 'pending',
                 task_input    TEXT NOT NULL,
@@ -65,8 +66,8 @@ impl PostgresStore {
                 token_usage   JSONB,
                 created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
                 completed_at  TIMESTAMPTZ
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
+            )"#,
+            r#"CREATE TABLE IF NOT EXISTS audit_log (
                 id          BIGSERIAL PRIMARY KEY,
                 task_id     UUID REFERENCES tasks(id),
                 agent_name  TEXT NOT NULL,
@@ -75,14 +76,17 @@ impl PostgresStore {
                 tokens_in   INT,
                 tokens_out  INT,
                 created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| Error::Store(format!("migration failed: {e}")))?;
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_audit_task ON audit_log(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ];
+        for stmt in statements {
+            sqlx::query(stmt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Error::Store(format!("migration failed: {e}")))?;
+        }
+
         Ok(())
     }
 

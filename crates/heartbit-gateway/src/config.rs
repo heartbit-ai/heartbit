@@ -8,8 +8,6 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub schedules: Vec<heartbit::ScheduleEntry>,
     pub sensors: Option<heartbit::SensorConfig>,
-    #[allow(dead_code)] // Scaffolded for webhook auth in next phase
-    pub auth: Option<AuthConfig>,
 }
 
 /// HTTP server settings.
@@ -21,15 +19,6 @@ pub struct ServerConfig {
 
 fn default_listen_addr() -> String {
     "0.0.0.0:8080".into()
-}
-
-/// JWT authentication configuration for webhook endpoints.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Scaffolded for webhook auth in next phase
-pub struct AuthConfig {
-    pub jwks_url: String,
-    pub issuer: Option<String>,
-    pub audience: Option<String>,
 }
 
 impl GatewayConfig {
@@ -58,7 +47,6 @@ brokers = "localhost:9092"
         assert_eq!(config.kafka.brokers, "localhost:9092");
         assert!(config.schedules.is_empty());
         assert!(config.sensors.is_none());
-        assert!(config.auth.is_none());
     }
 
     #[test]
@@ -79,29 +67,6 @@ enabled = true
         assert_eq!(config.server.listen_addr, "0.0.0.0:8080");
         assert_eq!(config.schedules.len(), 1);
         assert_eq!(config.schedules[0].name, "daily-report");
-    }
-
-    #[test]
-    fn deserialize_with_auth() {
-        let toml = r#"
-[server]
-
-[kafka]
-brokers = "localhost:9092"
-
-[auth]
-jwks_url = "https://idp.example.com/.well-known/jwks.json"
-issuer = "https://idp.example.com"
-audience = "heartbit-gateway"
-"#;
-        let config: GatewayConfig = toml::from_str(toml).unwrap();
-        let auth = config.auth.unwrap();
-        assert_eq!(
-            auth.jwks_url,
-            "https://idp.example.com/.well-known/jwks.json"
-        );
-        assert_eq!(auth.issuer.as_deref(), Some("https://idp.example.com"));
-        assert_eq!(auth.audience.as_deref(), Some("heartbit-gateway"));
     }
 
     #[test]

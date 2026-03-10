@@ -387,6 +387,8 @@ mod postgres_store {
 
         /// Run the daemon_tasks migration. Safe to call multiple times.
         pub async fn run_migration(&self) -> Result<(), Error> {
+            // Split into separate statements — sqlx doesn't support multiple
+            // commands in a single prepared statement.
             sqlx::query(
                 r#"
             CREATE TABLE IF NOT EXISTS daemon_tasks (
@@ -410,26 +412,28 @@ mod postgres_store {
                 user_id                     TEXT,
                 tenant_id                   TEXT,
                 model_name                  TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at
-                ON daemon_tasks(created_at);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_state
-                ON daemon_tasks(state);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_tenant_id
-                ON daemon_tasks(tenant_id);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_model_name
-                ON daemon_tasks(model_name);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_agent_name
-                ON daemon_tasks(agent_name);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_user_id
-                ON daemon_tasks(user_id);
-            CREATE INDEX IF NOT EXISTS idx_daemon_tasks_source
-                ON daemon_tasks(source);
+            )
             "#,
             )
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::Daemon(format!("task migration failed: {e}")))?;
+            .map_err(|e| Error::Daemon(format!("task table migration failed: {e}")))?;
+
+            // Create indexes individually
+            for index_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at ON daemon_tasks(created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_state ON daemon_tasks(state)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_tenant_id ON daemon_tasks(tenant_id)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_model_name ON daemon_tasks(model_name)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_agent_name ON daemon_tasks(agent_name)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_user_id ON daemon_tasks(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_source ON daemon_tasks(source)",
+            ] {
+                sqlx::query(index_sql)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("index migration failed: {e}")))?;
+            }
 
             // Add columns if not already present (for existing tables).
             for col in ["agent_name", "user_id", "tenant_id", "model_name"] {

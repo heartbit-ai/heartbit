@@ -21,9 +21,12 @@ pub use kafka::KafkaCommandProducer;
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
 pub use runtime_types::{
-    RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeGuardrailConfig, RuntimeMcpServer,
-    RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType,
-    RuntimeRequest, RuntimeResponse, RuntimeSseEvent, RuntimeSubAgentConfig,
+    EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, RuntimeAdvancedConfig,
+    RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent,
+    RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig,
+    RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest, RuntimeResponse,
+    RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent, RuntimeSubAgentConfig,
+    RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
 };
 #[cfg(feature = "postgres")]
 pub use store::PostgresTaskStore;

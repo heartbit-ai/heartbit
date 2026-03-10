@@ -277,6 +277,43 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// Returns the serde tag name for this event variant (e.g. `"run_started"`).
+    ///
+    /// Matches the `#[serde(tag = "type", rename_all = "snake_case")]` tags
+    /// without requiring JSON serialization.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::RunStarted { .. } => "run_started",
+            Self::TurnStarted { .. } => "turn_started",
+            Self::LlmResponse { .. } => "llm_response",
+            Self::ToolCallStarted { .. } => "tool_call_started",
+            Self::ToolCallCompleted { .. } => "tool_call_completed",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalDecision { .. } => "approval_decision",
+            Self::SubAgentsDispatched { .. } => "sub_agents_dispatched",
+            Self::SubAgentCompleted { .. } => "sub_agent_completed",
+            Self::ContextSummarized { .. } => "context_summarized",
+            Self::RunCompleted { .. } => "run_completed",
+            Self::GuardrailDenied { .. } => "guardrail_denied",
+            Self::GuardrailWarned { .. } => "guardrail_warned",
+            Self::RunFailed { .. } => "run_failed",
+            Self::RetryAttempt { .. } => "retry_attempt",
+            Self::DoomLoopDetected { .. } => "doom_loop_detected",
+            Self::FuzzyDoomLoopDetected { .. } => "fuzzy_doom_loop_detected",
+            Self::KillSwitchActivated { .. } => "kill_switch_activated",
+            Self::SessionPruned { .. } => "session_pruned",
+            Self::AutoCompactionTriggered { .. } => "auto_compaction_triggered",
+            Self::SensorEventProcessed { .. } => "sensor_event_processed",
+            Self::StoryUpdated { .. } => "story_updated",
+            Self::ModelEscalated { .. } => "model_escalated",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
+            Self::AgentSpawned { .. } => "agent_spawned",
+            Self::TaskRouted { .. } => "task_routed",
+        }
+    }
+}
+
 /// Callback type for receiving structured agent events.
 pub type OnEvent = dyn Fn(AgentEvent) + Send + Sync;
 
@@ -562,6 +599,60 @@ mod tests {
         for event in events {
             let json = serde_json::to_string(&event).unwrap();
             let _back: AgentEvent = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn type_name_matches_serde_tag() {
+        // Verify type_name() matches the serialized "type" field for a few key variants
+        let cases = vec![
+            (
+                AgentEvent::RunStarted {
+                    agent: "a".into(),
+                    task: "t".into(),
+                },
+                "run_started",
+            ),
+            (
+                AgentEvent::LlmResponse {
+                    agent: "a".into(),
+                    turn: 1,
+                    usage: TokenUsage::default(),
+                    stop_reason: StopReason::EndTurn,
+                    tool_call_count: 0,
+                    text: String::new(),
+                    latency_ms: 0,
+                    model: None,
+                    time_to_first_token_ms: 0,
+                },
+                "llm_response",
+            ),
+            (
+                AgentEvent::SubAgentsDispatched {
+                    agent: "a".into(),
+                    agents: vec![],
+                },
+                "sub_agents_dispatched",
+            ),
+            (
+                AgentEvent::KillSwitchActivated {
+                    agent: "a".into(),
+                    reason: "r".into(),
+                    guardrail_name: "g".into(),
+                },
+                "kill_switch_activated",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(event.type_name(), expected);
+            let json = serde_json::to_value(&event).unwrap();
+            let serde_type = json.get("type").unwrap().as_str().unwrap();
+            assert_eq!(
+                event.type_name(),
+                serde_type,
+                "type_name() diverges from serde tag for {:?}",
+                expected
+            );
         }
     }
 

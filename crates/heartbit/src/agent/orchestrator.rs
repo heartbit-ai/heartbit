@@ -2273,6 +2273,21 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             runner_builder = runner_builder.tool(spawn_tool);
         }
 
+        // Give the orchestrator itself memory tools so it can recall/store memories
+        // directly, without needing to delegate to a sub-agent.
+        if let Some(ref memory) = self.shared_memory {
+            let orch_ns = self
+                .memory_namespace_prefix
+                .as_deref()
+                .unwrap_or("orchestrator");
+            let mem_tools = crate::memory::shared_tools::shared_memory_tools(
+                memory.clone(),
+                orch_ns,
+                self.allow_shared_write,
+            );
+            runner_builder = runner_builder.tools(mem_tools);
+        }
+
         if let Some(strategy) = self.context_strategy {
             runner_builder = runner_builder.context_strategy(strategy);
         }

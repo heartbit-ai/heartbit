@@ -1,9 +1,14 @@
 use serde::Deserialize;
 
 /// LLM provider configuration.
-#[derive(Debug, Deserialize)]
+///
+/// When running as a cloud-delegated runtime (daemon mode with no agents),
+/// the provider section can be omitted — per-request provider keys are used instead.
+#[derive(Debug, Default, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub model: String,
     /// Retry configuration for transient LLM API failures.
     pub retry: Option<RetryProviderConfig>,

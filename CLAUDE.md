@@ -49,6 +49,12 @@ All three must pass. No warnings allowed.
 - Optional OpenTelemetry tracing via OTLP exporter.
 - Workspace dependencies in root Cargo.toml.
 
+### Process Safety
+- **NEVER `pkill` or kill running server processes** (heartbit-cloud, heartbit daemon, dashboard dev server, etc.). You will kill the service you need for testing.
+- To restart a service: ask the user to restart it, or use a separate terminal.
+- If a port is already in use, that means the service is already running — use it, don't kill it.
+- Before running `cargo run` for a server: check if it's already running with `curl` to its healthz endpoint first.
+
 ### Subagent Strategy
 - Use subagents liberally to keep main context window clean.
 - Offload research, exploration, and parallel analysis to subagents.

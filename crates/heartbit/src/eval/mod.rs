@@ -27,9 +27,20 @@
 //! println!("{summary}");
 //! ```
 
+/// All known scorer names supported by the eval framework.
+pub const KNOWN_SCORERS: &[&str] = &[
+    "trajectory",
+    "keyword",
+    "similarity",
+    "cost",
+    "latency",
+    "tool_call_count",
+    "safety",
+];
+
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::events::AgentEvent;
 use crate::error::Error;
@@ -40,33 +51,37 @@ use crate::llm::pricing::estimate_cost;
 // ---------------------------------------------------------------------------
 
 /// A single evaluation test case.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalCase {
     /// Human-readable name for the test case.
     pub name: String,
     /// The task input to send to the agent.
     pub input: String,
     /// Expected tool calls in order (if `Some`). Empty vec means "expect no tools."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_tools: Option<Vec<ExpectedToolCall>>,
     /// Strings that should appear in the agent's output.
+    #[serde(default)]
     pub output_contains: Vec<String>,
     /// Strings that must NOT appear in the agent's output.
+    #[serde(default)]
     pub output_not_contains: Vec<String>,
     /// Optional reference output for similarity scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_output: Option<String>,
     /// Maximum acceptable cost in USD for this case.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
     /// Maximum acceptable total LLM latency in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_latency_ms: Option<u64>,
     /// Maximum acceptable number of tool calls.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_calls: Option<usize>,
 }
 
 /// An expected tool call in a trajectory.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedToolCall {
     /// Tool name (exact match).
     pub name: String,
@@ -157,7 +172,7 @@ impl EvalCase {
 }
 
 /// Result of evaluating a single test case.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalResult {
     /// Name of the test case.
     pub case_name: String,
@@ -174,7 +189,7 @@ pub struct EvalResult {
 }
 
 /// Result from a single scorer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScorerResult {
     /// Scorer name.
     pub scorer: String,
@@ -187,7 +202,7 @@ pub struct ScorerResult {
 }
 
 /// Aggregate summary of multiple eval results.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalSummary {
     /// Total cases evaluated.
     pub total: usize,
@@ -903,14 +918,14 @@ impl EvalScorer for SafetyScorer {
 const REGRESSION_TOLERANCE: f64 = 0.001;
 
 /// Comparison of two eval runs for A/B testing and regression detection.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalComparison {
     /// Per-case comparison results.
     pub cases: Vec<CaseComparison>,
 }
 
 /// Comparison of a single case between baseline and candidate runs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseComparison {
     /// Test case name.
     pub case_name: String,
@@ -2413,5 +2428,112 @@ mod tests {
         let cmp = EvalComparison::compare(&baseline, &candidate);
         assert!(cmp.has_regressions());
         assert_eq!(cmp.regressions(), vec!["a"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Serde round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn eval_case_serde_round_trip() {
+        let case = EvalCase::new("greeting", "Say hello")
+            .expect_tool("bash")
+            .expect_tool_at("read_file", 1)
+            .expect_output_contains("hello")
+            .expect_output_not_contains("goodbye")
+            .reference_output("Hello there!")
+            .expect_max_cost_usd(0.05)
+            .expect_max_latency_ms(5000)
+            .expect_max_tool_calls(10);
+
+        let json = serde_json::to_string(&case).expect("serialize EvalCase");
+        let parsed: EvalCase = serde_json::from_str(&json).expect("deserialize EvalCase");
+
+        assert_eq!(parsed.name, "greeting");
+        assert_eq!(parsed.input, "Say hello");
+        assert_eq!(parsed.expected_tools.as_ref().unwrap().len(), 2);
+        assert_eq!(parsed.expected_tools.as_ref().unwrap()[0].name, "bash");
+        assert!(parsed.expected_tools.as_ref().unwrap()[0].order.is_none());
+        assert_eq!(parsed.expected_tools.as_ref().unwrap()[1].order, Some(1));
+        assert_eq!(parsed.output_contains, vec!["hello"]);
+        assert_eq!(parsed.output_not_contains, vec!["goodbye"]);
+        assert_eq!(parsed.reference_output.as_deref(), Some("Hello there!"));
+        assert_eq!(parsed.max_cost_usd, Some(0.05));
+        assert_eq!(parsed.max_latency_ms, Some(5000));
+        assert_eq!(parsed.max_tool_calls, Some(10));
+    }
+
+    #[test]
+    fn eval_case_deserialize_minimal() {
+        let json = r#"{"name":"simple","input":"do it"}"#;
+        let case: EvalCase = serde_json::from_str(json).expect("deserialize minimal");
+        assert_eq!(case.name, "simple");
+        assert_eq!(case.input, "do it");
+        assert!(case.expected_tools.is_none());
+        assert!(case.output_contains.is_empty());
+    }
+
+    #[test]
+    fn eval_result_serde_round_trip() {
+        let result = EvalResult {
+            case_name: "test-case".into(),
+            passed: true,
+            scores: vec![ScorerResult {
+                scorer: "keyword".into(),
+                score: 0.85,
+                passed: true,
+                details: vec!["OK: found hello".into()],
+            }],
+            actual_tools: vec!["bash".into(), "read".into()],
+            actual_output: "Hello world".into(),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&result).expect("serialize EvalResult");
+        let parsed: EvalResult = serde_json::from_str(&json).expect("deserialize EvalResult");
+
+        assert_eq!(parsed.case_name, "test-case");
+        assert!(parsed.passed);
+        assert_eq!(parsed.scores.len(), 1);
+        assert_eq!(parsed.scores[0].scorer, "keyword");
+        assert!((parsed.scores[0].score - 0.85).abs() < f64::EPSILON);
+        assert_eq!(parsed.actual_tools, vec!["bash", "read"]);
+        assert_eq!(parsed.actual_output, "Hello world");
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn eval_summary_serde_round_trip() {
+        let summary = EvalSummary {
+            total: 10,
+            passed: 8,
+            failed: 1,
+            errors: 1,
+            avg_score: 0.9,
+            scorer_averages: vec![("keyword".into(), 0.95), ("trajectory".into(), 0.85)],
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let parsed: EvalSummary = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.total, 10);
+        assert_eq!(parsed.passed, 8);
+        assert_eq!(parsed.scorer_averages.len(), 2);
+    }
+
+    #[test]
+    fn eval_comparison_serde_round_trip() {
+        let cmp = EvalComparison {
+            cases: vec![CaseComparison {
+                case_name: "test".into(),
+                baseline_avg_score: 0.8,
+                candidate_avg_score: 0.9,
+                delta: 0.1,
+                regressed: false,
+            }],
+        };
+        let json = serde_json::to_string(&cmp).expect("serialize");
+        let parsed: EvalComparison = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.cases.len(), 1);
+        assert!(!parsed.cases[0].regressed);
+        assert!((parsed.cases[0].delta - 0.1).abs() < f64::EPSILON);
     }
 }

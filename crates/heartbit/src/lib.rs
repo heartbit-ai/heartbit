@@ -73,6 +73,7 @@ pub mod eval;
 pub mod knowledge;
 pub mod llm;
 pub mod memory;
+pub mod signal;
 pub mod store;
 pub mod tool;
 pub(crate) mod util;
@@ -167,7 +168,7 @@ pub use config::{
     SecretPatternConfig, SecretScanConfig, SensorConfig, SensorModality, SensorRoutingConfig,
     SensorSourceConfig, SessionPruneConfigToml, SpawnConfig, StoryCorrelationConfig,
     TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig,
-    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
+    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile, parse_workflow_type,
 };
 
 // --- Auth re-exports (feature-gated) ---
@@ -180,10 +181,13 @@ pub use daemon::PostgresTaskStore;
 #[cfg(feature = "daemon")]
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
-    DaemonTask, FileTodoStore, HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer,
-    OnTaskComplete, RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeGuardrailConfig,
-    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
-    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeSseEvent, RuntimeSubAgentConfig,
+    DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, FileTodoStore,
+    HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer, OnTaskComplete,
+    RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse,
+    RuntimeEvalSseEvent, RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig,
+    RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest,
+    RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent,
+    RuntimeSubAgentConfig, RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
     TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
     UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
 };
