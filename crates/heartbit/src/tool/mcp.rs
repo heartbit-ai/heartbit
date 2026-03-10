@@ -654,6 +654,9 @@ impl TokenExchangeAuthProvider {
         Self {
             client: reqwest::Client::builder()
                 .timeout(TOKEN_EXCHANGE_TIMEOUT)
+                // Disable redirects — the exchange_url is user-supplied; a redirect to
+                // a private IP would bypass any SSRF blocklist applied at registration.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             exchange_url: exchange_url.into(),
@@ -1708,6 +1711,10 @@ impl McpClient {
     async fn connect_http(endpoint: &str, auth_header: Option<String>) -> Result<Self, Error> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            // Disable redirect following — the MCP server URL is validated before
+            // connection (SSRF blocklist), but a redirect to a private IP would bypass
+            // that check. Refusing all redirects closes that bypass entirely.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let transport = Arc::new(Transport::Http(HttpTransport {
