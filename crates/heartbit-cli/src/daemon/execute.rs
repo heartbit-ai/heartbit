@@ -16,7 +16,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use regex::{Regex, RegexBuilder};
+use regex::RegexBuilder;
 
 use heartbit::{
     AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, BuiltinToolsConfig, DagAgent,
@@ -96,6 +96,24 @@ pub(crate) async fn handle_execute(
     }
 }
 
+/// Run an agent with either a text prompt or pre-built content blocks.
+/// Choosing between the two paths at a single site avoids repeating the
+/// if/else dispatch in every handler that builds a standalone runner.
+async fn run_agent(
+    runner: AgentRunner<BoxedProvider>,
+    prompt: &str,
+    initial_content: Vec<heartbit::llm::types::ContentBlock>,
+) -> Result<heartbit::AgentOutput, String> {
+    if initial_content.is_empty() {
+        runner.execute(prompt).await.map_err(|e| e.to_string())
+    } else {
+        runner
+            .execute_with_content(initial_content)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 async fn handle_execute_sync(state: AppState, req: RuntimeRequest) -> impl IntoResponse {
     // Collect events during execution
     let events = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -135,7 +153,7 @@ async fn handle_execute_sync(state: AppState, req: RuntimeRequest) -> impl IntoR
         )
         .await
         {
-            Ok(runner) => runner.execute(&req.prompt).await.map_err(|e| e.to_string()),
+            Ok(runner) => run_agent(runner, &req.prompt, req.initial_content).await,
             Err(e) => Err(e),
         }
     };
@@ -215,7 +233,7 @@ async fn handle_execute_stream(state: AppState, req: RuntimeRequest) -> impl Int
             )
             .await
             {
-                Ok(runner) => runner.execute(&prompt).await.map_err(|e| e.to_string()),
+                Ok(runner) => run_agent(runner, &prompt, req.initial_content).await,
                 Err(e) => Err(e),
             }
         };
@@ -552,9 +570,15 @@ async fn execute_orchestrator_inner(
 // ---------------------------------------------------------------------------
 
 /// Maximum number of nodes allowed in a workflow definition.
-const MAX_WORKFLOW_NODES: usize = 50;
+/// Must match heartbit-cloud routes/workflows.rs MAX_WORKFLOW_NODES so that
+/// a workflow created via the cloud API (validated at 100) never fails at runtime.
+const MAX_WORKFLOW_NODES: usize = 100;
 /// Maximum number of edges allowed in a workflow definition.
-const MAX_WORKFLOW_EDGES: usize = 100;
+/// Must match heartbit-cloud routes/workflows.rs MAX_WORKFLOW_EDGES.
+const MAX_WORKFLOW_EDGES: usize = 500;
+/// Maximum byte length for workflow node names and sub-agent names.
+/// Must match heartbit-cloud routes/workflows.rs MAX_NODE_NAME_BYTES.
+const MAX_NAME_BYTES: usize = 100;
 
 /// Shared workflow execution logic for both sync and stream paths.
 async fn execute_workflow_inner(
@@ -586,14 +610,23 @@ async fn execute_workflow_inner(
         ));
     }
 
+    // Validate node names and agent names before building the agent map.
+    // heartbit-cloud validates full format; the daemon adds a lighter guard for
+    // the case where it is called directly (bypassing the cloud API).
+    for node in &wf.nodes {
+        contains_unsafe_chars(&node.name).map_err(|e| format!("workflow node name: {e}"))?;
+        contains_unsafe_chars(&node.agent_name)
+            .map_err(|e| format!("workflow node '{}' agent_name: {e}", node.name))?;
+    }
     let provider = build_provider(&req.provider);
 
-    // Build a map of agent_name → RuntimeSubAgentConfig
-    let agent_map: std::collections::HashMap<&str, &heartbit::RuntimeSubAgentConfig> = req
-        .sub_agents
-        .iter()
-        .map(|sa| (sa.name.as_str(), sa))
-        .collect();
+    // Validate sub-agent names and build the lookup map in a single pass.
+    let mut agent_map: std::collections::HashMap<&str, &heartbit::RuntimeSubAgentConfig> =
+        std::collections::HashMap::with_capacity(req.sub_agents.len());
+    for sa in &req.sub_agents {
+        contains_unsafe_chars(&sa.name).map_err(|e| format!("sub-agent name: {e}"))?;
+        agent_map.insert(sa.name.as_str(), sa);
+    }
 
     let ws = workspace.as_deref();
     match wf.workflow_type {
@@ -620,6 +653,51 @@ async fn execute_workflow_inner(
 type AgentMap<'a> = std::collections::HashMap<&'a str, &'a heartbit::RuntimeSubAgentConfig>;
 type EdgeConditionFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
 type EdgeTransformFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// Build all per-node AgentRunners concurrently, returning them in node order.
+///
+/// Resolving nodes is synchronous (HashMap lookup); the async work is tool setup
+/// (MCP server connections, builtin tool wiring).  Running all builds in parallel
+/// reduces startup latency from O(N × max_build_time) to O(max_build_time).
+async fn build_all_agents(
+    nodes: &[heartbit::RuntimeWorkflowNode],
+    agent_map: &AgentMap<'_>,
+    provider: Arc<BoxedProvider>,
+    on_text: Option<Arc<heartbit::OnText>>,
+    on_event: Option<Arc<heartbit::OnEvent>>,
+    workspace: Option<&std::path::Path>,
+) -> Result<Vec<(String, AgentRunner<BoxedProvider>)>, String> {
+    // Resolve all nodes synchronously first (cheap HashMap lookups).
+    // Clone each sub-agent config so the async closures can own their data.
+    let resolved: Vec<(
+        String,
+        heartbit::RuntimeSubAgentConfig,
+        Option<Arc<heartbit::OnEvent>>,
+    )> = nodes
+        .iter()
+        .map(|node| {
+            let sub = resolve_node(node, agent_map)?.clone();
+            let node_event = wrap_node_event(node.name.clone(), on_event.clone());
+            Ok((node.name.clone(), sub, node_event))
+        })
+        .collect::<Result<_, String>>()?;
+
+    // Build the workspace path once as an owned `PathBuf` so async closures can use it.
+    let ws_buf = workspace.map(|p| p.to_path_buf());
+
+    let futs = resolved.into_iter().map(|(name, sub, node_event)| {
+        let provider = provider.clone();
+        let on_text = on_text.clone();
+        let ws = ws_buf.clone();
+        async move {
+            let runner =
+                build_workflow_agent(&sub, provider, on_text, node_event, ws.as_deref()).await?;
+            Ok::<_, String>((name, runner))
+        }
+    });
+
+    futures::future::try_join_all(futs).await
+}
 
 /// Build a single AgentRunner from a sub-agent config.
 async fn build_workflow_agent(
@@ -650,6 +728,68 @@ async fn build_workflow_agent(
     builder.build().map_err(|e| e.to_string())
 }
 
+/// Wrap an `on_event` callback to emit WorkflowNodeStarted/Completed events
+/// when the underlying agent's RunStarted/RunCompleted events fire.
+fn wrap_node_event(
+    node_name: String,
+    on_event: Option<Arc<heartbit::OnEvent>>,
+) -> Option<Arc<heartbit::OnEvent>> {
+    on_event.map(|cb| {
+        Arc::new(move |event: heartbit::AgentEvent| {
+            match &event {
+                heartbit::AgentEvent::RunStarted { .. } => {
+                    cb(heartbit::AgentEvent::WorkflowNodeStarted {
+                        node: node_name.clone(),
+                    });
+                }
+                heartbit::AgentEvent::RunCompleted { .. } => {
+                    cb(heartbit::AgentEvent::WorkflowNodeCompleted {
+                        node: node_name.clone(),
+                    });
+                }
+                heartbit::AgentEvent::RunFailed { .. } => {
+                    cb(heartbit::AgentEvent::WorkflowNodeFailed {
+                        node: node_name.clone(),
+                    });
+                }
+                _ => {}
+            }
+            cb(event);
+        }) as Arc<heartbit::OnEvent>
+    })
+}
+
+/// Return an error if `s` contains ASCII control characters or Unicode format
+/// characters (e.g. zero-width spaces, bidirectional overrides) that could be
+/// used for log injection or terminal escape attacks.
+///
+/// Length is checked first (O(1)) so oversized inputs are rejected before the
+/// O(n) Unicode scan.  The limit matches heartbit-cloud's `MAX_NODE_NAME_BYTES`.
+fn contains_unsafe_chars(s: &str) -> Result<(), String> {
+    if s.len() > MAX_NAME_BYTES {
+        return Err(format!(
+            "name too long ({} bytes, max {MAX_NAME_BYTES})",
+            s.len()
+        ));
+    }
+    if s.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                // Zero-width and joining characters
+                '\u{200B}'..='\u{200F}' |
+                // Bidirectional override and embedding
+                '\u{202A}'..='\u{202E}' |
+                // Additional directional/invisible formatting
+                '\u{2060}'..='\u{2069}' |
+                // Byte order mark
+                '\u{FEFF}'
+            )
+    }) {
+        return Err("contains control or unsafe Unicode format characters".into());
+    }
+    Ok(())
+}
+
 /// Resolve a workflow node to its sub-agent config.
 fn resolve_node<'a>(
     node: &heartbit::RuntimeWorkflowNode,
@@ -666,6 +806,14 @@ fn resolve_node<'a>(
         })
 }
 
+/// Build a `Regex` with bounded NFA/DFA sizes to prevent regex-based DoS.
+fn build_bounded_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    RegexBuilder::new(pattern)
+        .size_limit(1_000_000)
+        .dfa_size_limit(10_000_000)
+        .build()
+}
+
 /// Build an edge condition closure from a spec.
 fn build_edge_condition(spec: &heartbit::EdgeConditionSpec) -> Result<EdgeConditionFn, String> {
     use heartbit::EdgeConditionPattern;
@@ -675,9 +823,7 @@ fn build_edge_condition(spec: &heartbit::EdgeConditionSpec) -> Result<EdgeCondit
         EdgeConditionPattern::NotContains => Ok(Box::new(move |s: &str| !s.contains(&value))),
         EdgeConditionPattern::StartsWith => Ok(Box::new(move |s: &str| s.starts_with(&value))),
         EdgeConditionPattern::Regex => {
-            let re = RegexBuilder::new(&value)
-                .size_limit(1_000_000)
-                .build()
+            let re = build_bounded_regex(&value)
                 .map_err(|e| format!("invalid regex '{}': {}", value, e))?;
             Ok(Box::new(move |s: &str| re.is_match(s)))
         }
@@ -717,17 +863,10 @@ async fn execute_dag(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = DagAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
-        builder = builder.node(&node.name, runner);
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    for (name, runner) in agents {
+        builder = builder.node(&name, runner);
     }
 
     for edge in &wf.edges {
@@ -757,16 +896,10 @@ async fn execute_sequential(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = SequentialAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
+    // Build agents in parallel (setup cost), then add in node order (execution is sequential).
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    for (_, runner) in agents {
         builder = builder.agent(runner);
     }
 
@@ -785,16 +918,9 @@ async fn execute_parallel(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = ParallelAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    for (_, runner) in agents {
         builder = builder.agent(runner);
     }
 
@@ -812,7 +938,8 @@ async fn execute_loop(
 ) -> Result<heartbit::AgentOutput, String> {
     let wf = req.workflow.as_ref().unwrap();
     let sub = resolve_node(&wf.nodes[0], agent_map)?;
-    let runner = build_workflow_agent(sub, provider, on_text, on_event, workspace).await?;
+    let node_event = wrap_node_event(wf.nodes[0].name.clone(), on_event);
+    let runner = build_workflow_agent(sub, provider, on_text, node_event, workspace).await?;
 
     let mut builder = LoopAgent::builder().agent(runner);
 
@@ -824,7 +951,7 @@ async fn execute_loop(
     }
 
     if let Some(ref pattern) = wf.stop_pattern {
-        let re = Regex::new(pattern)
+        let re = build_bounded_regex(pattern)
             .map_err(|e| format!("invalid stop_pattern regex '{}': {}", pattern, e))?;
         builder = builder.should_stop(move |text: &str| re.is_match(text));
     } else {
@@ -847,16 +974,10 @@ async fn execute_debate(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = DebateAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    // Zip agents back with nodes to recover role assignments (try_join_all preserves order).
+    for ((_, runner), node) in agents.into_iter().zip(&wf.nodes) {
         let role = node.role.as_deref().unwrap_or("debater");
         match role {
             "judge" => builder = builder.judge(runner),
@@ -864,7 +985,6 @@ async fn execute_debate(
         }
     }
 
-    // DebateAgent requires max_rounds
     let rounds = wf.rounds.unwrap_or(2) as usize;
     builder = builder.max_rounds(rounds);
 
@@ -883,16 +1003,9 @@ async fn execute_voting(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = VotingAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    for (_, runner) in agents {
         builder = builder.voter(runner);
     }
 
@@ -918,16 +1031,9 @@ async fn execute_mixture(
     let wf = req.workflow.as_ref().unwrap();
     let mut builder = MixtureOfAgentsAgent::<BoxedProvider>::builder();
 
-    for node in &wf.nodes {
-        let sub = resolve_node(node, agent_map)?;
-        let runner = build_workflow_agent(
-            sub,
-            provider.clone(),
-            on_text.clone(),
-            on_event.clone(),
-            workspace,
-        )
-        .await?;
+    let agents =
+        build_all_agents(&wf.nodes, agent_map, provider, on_text, on_event, workspace).await?;
+    for ((_, runner), node) in agents.into_iter().zip(&wf.nodes) {
         let role = node.role.as_deref().unwrap_or("proposer");
         match role {
             "synthesizer" => builder = builder.synthesizer(runner),
@@ -980,6 +1086,7 @@ mod tests {
             sub_agents: vec![],
             orchestrator: None,
             workflow: None,
+            initial_content: vec![],
         }
     }
 
@@ -1219,6 +1326,59 @@ mod tests {
         let result = super::execute_workflow_inner(req, None, None, None).await;
         let err = result.unwrap_err();
         assert!(err.contains("exceeding maximum"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn workflow_node_name_with_control_char_rejected() {
+        let mut req = make_test_request();
+        req.workflow = Some(heartbit::RuntimeWorkflowConfig {
+            workflow_type: heartbit::WorkflowType::Sequential,
+            nodes: vec![heartbit::RuntimeWorkflowNode {
+                name: "bad\x0aname".into(), // newline — log injection
+                agent_name: "valid-agent".into(),
+                role: None,
+            }],
+            edges: vec![],
+            max_iterations: None,
+            stop_pattern: None,
+            rounds: None,
+            layers: None,
+        });
+        let err = super::execute_workflow_inner(req, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("control or unsafe Unicode"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn workflow_sub_agent_name_with_control_char_rejected() {
+        let mut req = make_test_request();
+        req.sub_agents = vec![heartbit::RuntimeSubAgentConfig {
+            name: "bad\x1bname".into(), // ESC — ANSI injection
+            description: String::new(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            max_tokens: 1024,
+            builtin_tools: vec![],
+            mcp_servers: vec![],
+        }];
+        req.workflow = Some(heartbit::RuntimeWorkflowConfig {
+            workflow_type: heartbit::WorkflowType::Sequential,
+            nodes: vec![heartbit::RuntimeWorkflowNode {
+                name: "n1".into(),
+                agent_name: "bad\x1bname".into(),
+                role: None,
+            }],
+            edges: vec![],
+            max_iterations: None,
+            stop_pattern: None,
+            rounds: None,
+            layers: None,
+        });
+        let err = super::execute_workflow_inner(req, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("control or unsafe Unicode"), "got: {err}");
     }
 
     #[tokio::test]

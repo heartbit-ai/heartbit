@@ -275,6 +275,15 @@ pub enum AgentEvent {
         #[serde(default)]
         escalated: bool,
     },
+
+    /// A workflow node agent has started executing (emitted by the workflow executor).
+    WorkflowNodeStarted { node: String },
+
+    /// A workflow node agent has completed executing (emitted by the workflow executor).
+    WorkflowNodeCompleted { node: String },
+
+    /// A workflow node agent has failed (emitted by the workflow executor).
+    WorkflowNodeFailed { node: String },
 }
 
 impl AgentEvent {
@@ -310,6 +319,9 @@ impl AgentEvent {
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::AgentSpawned { .. } => "agent_spawned",
             Self::TaskRouted { .. } => "task_routed",
+            Self::WorkflowNodeStarted { .. } => "workflow_node_started",
+            Self::WorkflowNodeCompleted { .. } => "workflow_node_completed",
+            Self::WorkflowNodeFailed { .. } => "workflow_node_failed",
         }
     }
 }

@@ -629,6 +629,11 @@ impl DaemonMetrics {
             AgentEvent::AgentSpawned { .. } | AgentEvent::KillSwitchActivated { .. } => {
                 // Spawn/kill events are informational — no metric needed yet.
             }
+            AgentEvent::WorkflowNodeStarted { .. }
+            | AgentEvent::WorkflowNodeCompleted { .. }
+            | AgentEvent::WorkflowNodeFailed { .. } => {
+                // Workflow node lifecycle events are informational — no metric needed yet.
+            }
         }
     }
 

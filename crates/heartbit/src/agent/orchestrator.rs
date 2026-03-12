@@ -4917,6 +4917,9 @@ mod tests {
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
+                AgentEvent::WorkflowNodeStarted { node, .. }
+                | AgentEvent::WorkflowNodeCompleted { node, .. }
+                | AgentEvent::WorkflowNodeFailed { node, .. } => node,
             }
         }
 
@@ -5596,6 +5599,9 @@ mod tests {
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
+                AgentEvent::WorkflowNodeStarted { node, .. }
+                | AgentEvent::WorkflowNodeCompleted { node, .. }
+                | AgentEvent::WorkflowNodeFailed { node, .. } => node,
             }
         }
 
@@ -5627,6 +5633,9 @@ mod tests {
                 AgentEvent::BudgetExceeded { .. } => "BudgetExceeded",
                 AgentEvent::AgentSpawned { .. } => "AgentSpawned",
                 AgentEvent::KillSwitchActivated { .. } => "KillSwitchActivated",
+                AgentEvent::WorkflowNodeStarted { .. } => "WorkflowNodeStarted",
+                AgentEvent::WorkflowNodeCompleted { .. } => "WorkflowNodeCompleted",
+                AgentEvent::WorkflowNodeFailed { .. } => "WorkflowNodeFailed",
             }
         }
 

@@ -269,6 +269,7 @@ mod tests {
             sub_agents: vec![],
             orchestrator: None,
             workflow: None,
+            initial_content: vec![],
         }
     }
 

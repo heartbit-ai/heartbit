@@ -252,6 +252,11 @@ pub struct RuntimeRequest {
     /// a single AgentRunner or Orchestrator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<RuntimeWorkflowConfig>,
+    /// Multimodal content blocks for the initial user message (e.g. image + text).
+    /// When non-empty, the execute endpoint calls `execute_with_content` instead of
+    /// `execute(&prompt)`. The `prompt` field is ignored in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_content: Vec<crate::llm::types::ContentBlock>,
 }
 
 /// Workflow execution configuration for the runtime execute endpoint.
@@ -462,6 +467,7 @@ mod tests {
             sub_agents: vec![],
             orchestrator: None,
             workflow: None,
+            initial_content: vec![],
         };
 
         let json = serde_json::to_string(&request).expect("serialize");
@@ -778,6 +784,7 @@ mod tests {
                 sub_agents: vec![],
                 orchestrator: None,
                 workflow: None,
+                initial_content: vec![],
             },
             cases: vec![crate::eval::EvalCase::new("greet", "Say hi").expect_output_contains("hi")],
             scoring: RuntimeScorerConfig {
