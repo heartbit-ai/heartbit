@@ -1,0 +1,7 @@
+{
+    "name": "GitHub",
+    "description": "GitHub API integration — repos, issues, PRs, code search",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+}

@@ -45,6 +45,7 @@ prometheus = { version = "0.14", default-features = false }
 quick-xml = "0.37"
 pgvector = { version = "0.4", features = ["sqlx"] }
 hmac = "0.12"
+sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
@@ -55,6 +56,10 @@ fastembed = { version = "5" }
 jsonwebtoken = "9"
 petgraph = "0.7"
 landlock = "0.4"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
 tower = { version = "0.5", features = ["util"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

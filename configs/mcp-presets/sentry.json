@@ -1,0 +1,7 @@
+{
+    "name": "Sentry",
+    "description": "Sentry error tracking — issues, events, releases",
+    "command": "npx",
+    "args": ["-y", "@sentry/mcp-server"],
+    "env_keys": ["SENTRY_AUTH_TOKEN"]
+}

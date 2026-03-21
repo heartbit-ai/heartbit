@@ -280,6 +280,32 @@ pub(super) fn build_provider(config: &heartbit::RuntimeProviderConfig) -> Arc<Bo
         RuntimeProviderType::Openrouter => {
             BoxedProvider::new(OpenRouterProvider::new(&config.api_key, &config.model))
         }
+        RuntimeProviderType::Gemini => {
+            let p = match config.base_url.as_deref() {
+                Some(url) => {
+                    heartbit::GeminiProvider::with_base_url(&config.api_key, &config.model, url)
+                }
+                None => heartbit::GeminiProvider::new(&config.api_key, &config.model),
+            };
+            BoxedProvider::new(p)
+        }
+        RuntimeProviderType::OpenAiCompat => {
+            let url = config
+                .base_url
+                .as_deref()
+                .unwrap_or("http://localhost:8000/v1");
+            let auth_style = if config.api_key.is_empty() {
+                heartbit::AuthStyle::None
+            } else {
+                heartbit::AuthStyle::Bearer
+            };
+            BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
+                &config.api_key,
+                &config.model,
+                url,
+                auth_style,
+            ))
+        }
     };
     Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(base)))
 }
@@ -377,7 +403,22 @@ pub(super) async fn build_runner_from_request(
     }
 
     // Collect tools (MCP + builtins) with workspace isolation
-    let tools = collect_tools(&req.mcp_servers, &req.builtin_tools, workspace.as_deref()).await;
+    let twitter_creds = req
+        .twitter_credentials
+        .as_ref()
+        .map(|c| heartbit::TwitterCredentials {
+            consumer_key: c.consumer_key.clone(),
+            consumer_secret: c.consumer_secret.clone(),
+            access_token: c.access_token.clone(),
+            access_token_secret: c.access_token_secret.clone(),
+        });
+    let tools = collect_tools(
+        &req.mcp_servers,
+        &req.builtin_tools,
+        workspace.as_deref(),
+        twitter_creds,
+    )
+    .await;
     if !tools.is_empty() {
         builder = builder.tools(tools);
     }
@@ -406,27 +447,44 @@ pub(super) async fn collect_tools(
     mcp_servers: &[heartbit::RuntimeMcpServer],
     builtin_tool_names: &[String],
     workspace: Option<&std::path::Path>,
+    twitter_credentials: Option<heartbit::TwitterCredentials>,
 ) -> Vec<Arc<dyn heartbit::tool::Tool>> {
     let mut tools: Vec<Arc<dyn heartbit::tool::Tool>> = Vec::new();
 
     // Connect to MCP servers concurrently
     let mut join_set = tokio::task::JoinSet::new();
     for server in mcp_servers {
-        let url = server.url.clone();
-        let auth = server.auth_header.clone();
+        let server = server.clone();
         join_set.spawn(async move {
-            let result = match auth.as_deref() {
-                Some(a) => McpClient::connect_with_auth(&url, a).await,
-                None => McpClient::connect(&url).await,
+            let label = server
+                .command
+                .as_deref()
+                .or(server.url.as_deref())
+                .unwrap_or("<unknown>")
+                .to_string();
+            let result = if let Some(cmd) = &server.command {
+                McpClient::connect_stdio(cmd, &server.args, &server.env).await
+            } else if let Some(url) = &server.url {
+                match server.auth_header.as_deref() {
+                    Some(a) => McpClient::connect_with_auth(url, a).await,
+                    None => McpClient::connect(url).await,
+                }
+            } else {
+                return (
+                    label,
+                    Err(heartbit::Error::Mcp(
+                        "RuntimeMcpServer has neither url nor command".into(),
+                    )),
+                );
             };
-            (url, result)
+            (label, result)
         });
     }
-    while let Some(Ok((url, result))) = join_set.join_next().await {
+    while let Some(Ok((label, result))) = join_set.join_next().await {
         match result {
             Ok(client) => tools.extend(client.into_tools()),
             Err(e) => {
-                tracing::warn!(url = %url, error = %e, "failed to connect MCP server");
+                tracing::warn!(server = %label, error = %e, "failed to connect MCP server");
             }
         }
     }
@@ -448,6 +506,7 @@ pub(super) async fn collect_tools(
             dangerous_tools: builtin_tool_names.iter().any(|t| t == "bash"),
             workspace: workspace.map(|p| p.to_path_buf()),
             env_policy,
+            twitter_credentials,
             ..Default::default()
         };
         let all_builtins = heartbit::builtin_tools(bt_config);
@@ -542,7 +601,13 @@ async fn execute_orchestrator_inner(
 
     // Register sub-agents (with workspace isolation matching the parent)
     for sub in &req.sub_agents {
-        let tools = collect_tools(&sub.mcp_servers, &sub.builtin_tools, workspace.as_deref()).await;
+        let tools = collect_tools(
+            &sub.mcp_servers,
+            &sub.builtin_tools,
+            workspace.as_deref(),
+            None,
+        )
+        .await;
 
         let config = SubAgentConfig {
             name: sub.name.clone(),
@@ -707,7 +772,7 @@ async fn build_workflow_agent(
     on_event: Option<Arc<heartbit::OnEvent>>,
     workspace: Option<&std::path::Path>,
 ) -> Result<AgentRunner<BoxedProvider>, String> {
-    let tools = collect_tools(&sub.mcp_servers, &sub.builtin_tools, workspace).await;
+    let tools = collect_tools(&sub.mcp_servers, &sub.builtin_tools, workspace, None).await;
 
     let mut builder = AgentRunner::builder(provider)
         .name(&sub.name)

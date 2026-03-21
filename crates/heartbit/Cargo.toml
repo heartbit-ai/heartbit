@@ -31,6 +31,10 @@ regex = { workspace = true }
 tokio-util = { workspace = true }
 petgraph = { workspace = true }
 
+# --- OAuth / HMAC signing (used by twitter_post builtin + sensor) ---
+hmac = { workspace = true }
+sha1 = { workspace = true }
+
 # --- Optional (feature-gated) ---
 rdkafka = { workspace = true, optional = true }
 restate-sdk = { workspace = true, optional = true }
@@ -40,7 +44,6 @@ a2a-sdk = { workspace = true, optional = true }
 cron = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true }
-hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
@@ -48,23 +51,30 @@ teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
 landlock = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+base64 = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 heartbit-macro = { path = "../heartbit-macro", optional = true }
 
 [features]
 default = ["core"]
 core = []
 kafka = ["dep:rdkafka"]
-daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken", "dep:base64"]
-sensor = ["daemon", "dep:quick-xml", "dep:hmac", "dep:sha2", "dep:hex", "dep:subtle"]
+daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken"]
+sensor = ["daemon", "dep:quick-xml", "dep:sha2", "dep:hex", "dep:subtle"]
 restate = ["dep:restate-sdk"]
 postgres = ["dep:sqlx", "dep:pgvector"]
 a2a = ["dep:a2a-sdk"]
 telegram = ["dep:teloxide"]
+discord = ["dep:tokio-tungstenite"]
+slack = ["dep:tokio-tungstenite"]
 local-embedding = ["dep:fastembed"]
 sandbox = ["dep:landlock"]
 macro = ["dep:heartbit-macro"]
-full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram"]
+vault = ["dep:aes-gcm", "dep:argon2", "dep:rand"]
+full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram", "discord", "slack", "vault"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -9,6 +9,7 @@ pub mod heartbit_pulse;
 pub mod kafka;
 pub mod metrics;
 pub mod notify;
+pub mod openai_compat;
 pub mod runtime_types;
 pub mod store;
 pub mod todo;
@@ -20,13 +21,18 @@ pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
+pub use openai_compat::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ModelListResponse,
+    build_done_chunk, build_model_list, build_response, build_role_chunk, build_text_chunk,
+    extract_system_prompt, extract_task,
+};
 pub use runtime_types::{
     EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, RuntimeAdvancedConfig,
     RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent,
     RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig,
     RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest, RuntimeResponse,
     RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent, RuntimeSubAgentConfig,
-    RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
+    RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
 };
 #[cfg(feature = "postgres")]
 pub use store::PostgresTaskStore;

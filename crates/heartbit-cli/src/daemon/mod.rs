@@ -41,8 +41,23 @@ pub async fn run_daemon(
     verbose: bool,
     observability_flag: Option<&str>,
 ) -> Result<()> {
-    let config = HeartbitConfig::from_file(config_path)
+    let mut config = HeartbitConfig::from_file(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+
+    // Resolve agent templates, skills, and variables.
+    let variables = config.variables.clone();
+    for i in 0..config.agents.len() {
+        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+            let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve template for agent '{}'",
+                        config.agents[i].name
+                    )
+                })?;
+            config.agents[i] = resolved;
+        }
+    }
 
     init_tracing_from_config(&config)?;
 

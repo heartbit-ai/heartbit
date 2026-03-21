@@ -1,0 +1,7 @@
+{
+    "name": "PostgreSQL",
+    "description": "PostgreSQL database — query, schema inspection",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-postgres"],
+    "env_keys": ["POSTGRES_CONNECTION_STRING"]
+}

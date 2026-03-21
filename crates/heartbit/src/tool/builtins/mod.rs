@@ -3,12 +3,15 @@ mod edit;
 mod file_tracker;
 mod glob;
 mod grep;
+mod image_generate;
 mod list;
 mod patch;
 mod question;
 mod read;
 mod skill;
 mod todo;
+mod tts;
+pub(crate) mod twitter_post;
 mod webfetch;
 mod websearch;
 mod write;
@@ -95,6 +98,7 @@ pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
 pub use todo::{TodoPriority, TodoStatus, TodoStore};
+pub use twitter_post::TwitterCredentials;
 
 /// Risk classification for builtin tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +126,8 @@ pub struct BuiltinToolsConfig {
     pub sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
     #[cfg(feature = "daemon")]
     pub daemon_todo_store: Option<Arc<crate::daemon::todo::FileTodoStore>>,
+    /// X/Twitter credentials for the `twitter_post` builtin tool (per-tenant).
+    pub twitter_credentials: Option<TwitterCredentials>,
 }
 
 impl Default for BuiltinToolsConfig {
@@ -138,6 +144,7 @@ impl Default for BuiltinToolsConfig {
             sandbox_policy: None,
             #[cfg(feature = "daemon")]
             daemon_todo_store: None,
+            twitter_credentials: None,
         }
     }
 }
@@ -191,6 +198,8 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         )),
         Arc::new(webfetch::WebFetchTool::new()),
         Arc::new(websearch::WebSearchTool::new()),
+        Arc::new(image_generate::ImageGenerateTool::new()),
+        Arc::new(tts::TtsTool::new()),
         Arc::new(skill::SkillTool::new()),
     ]);
 
@@ -206,6 +215,10 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         tools.push(Arc::new(crate::daemon::todo::TodoManageTool::new(
             daemon_store,
         )));
+    }
+
+    if let Some(creds) = config.twitter_credentials {
+        tools.push(Arc::new(twitter_post::TwitterPostTool::new(creds)));
     }
 
     tools
@@ -334,7 +347,7 @@ mod tests {
     fn builtin_tools_excludes_bash_by_default() {
         let tools = builtin_tools(BuiltinToolsConfig::default());
         assert!(!tools.iter().any(|t| t.definition().name == "bash"));
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -345,7 +358,7 @@ mod tests {
         };
         let tools = builtin_tools(config);
         assert!(tools.iter().any(|t| t.definition().name == "bash"));
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 15);
     }
 
     #[test]
@@ -358,7 +371,7 @@ mod tests {
             ..Default::default()
         };
         let tools = builtin_tools(config);
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 16);
     }
 
     #[cfg(feature = "daemon")]
@@ -372,7 +385,29 @@ mod tests {
             ..Default::default()
         };
         let tools = builtin_tools(config);
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 16);
         assert!(tools.iter().any(|t| t.definition().name == "todo_manage"));
+    }
+
+    #[test]
+    fn builtin_tools_includes_twitter_when_credentials_present() {
+        let config = BuiltinToolsConfig {
+            twitter_credentials: Some(TwitterCredentials {
+                consumer_key: "ck".into(),
+                consumer_secret: "cs".into(),
+                access_token: "at".into(),
+                access_token_secret: "ats".into(),
+            }),
+            ..Default::default()
+        };
+        let tools = builtin_tools(config);
+        assert_eq!(tools.len(), 15); // 14 base + twitter_post
+        assert!(tools.iter().any(|t| t.definition().name == "twitter_post"));
+    }
+
+    #[test]
+    fn builtin_tools_excludes_twitter_when_no_credentials() {
+        let tools = builtin_tools(BuiltinToolsConfig::default());
+        assert!(!tools.iter().any(|t| t.definition().name == "twitter_post"));
     }
 }

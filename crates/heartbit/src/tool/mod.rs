@@ -2,6 +2,7 @@
 pub mod a2a;
 pub mod builtins;
 pub mod mcp;
+pub mod mcp_presets;
 pub mod mcp_server;
 
 use std::future::Future;

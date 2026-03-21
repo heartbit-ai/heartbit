@@ -47,9 +47,12 @@ const BUILTIN_TOOLS: &[&str] = &[
     "list",
     "webfetch",
     "websearch",
+    "image_generate",
+    "tts",
     "skill",
     "todowrite",
     "todoread",
+    "twitter_post",
     // Memory tools are also builtins
     "memory_recall",
     "memory_store",

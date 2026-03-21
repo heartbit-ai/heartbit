@@ -1,0 +1,7 @@
+{
+    "name": "GitLab",
+    "description": "GitLab API integration — projects, merge requests, issues",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-gitlab"],
+    "env_keys": ["GITLAB_PERSONAL_ACCESS_TOKEN", "GITLAB_API_URL"]
+}

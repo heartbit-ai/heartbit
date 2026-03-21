@@ -1,5 +1,9 @@
 pub mod bridge;
+#[cfg(feature = "discord")]
+pub mod discord;
 pub mod session;
+#[cfg(feature = "slack")]
+pub mod slack;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 pub mod types;
@@ -57,6 +61,45 @@ pub type RunTask = dyn Fn(RunTaskInput) -> Pin<Box<dyn Future<Output = Result<St
 /// Callback type for memory consolidation on idle sessions.
 pub type ConsolidateSession =
     dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> + Send + Sync;
+
+/// Split a message into chunks that fit a platform's message-length limit.
+///
+/// Tries to split at newlines for readability; falls back to char boundaries.
+/// Shared by Discord, Slack, and other channel adapters.
+pub fn chunk_message(text: &str, max_len: usize) -> Vec<&str> {
+    if text.len() <= max_len {
+        return vec![text];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining);
+            break;
+        }
+        // Try to split at a newline
+        let split_at = remaining[..max_len].rfind('\n').unwrap_or_else(|| {
+            // Fall back to char boundary
+            let mut pos = max_len;
+            while pos > 0 && !remaining.is_char_boundary(pos) {
+                pos -= 1;
+            }
+            pos
+        });
+        let split_at = if split_at == 0 {
+            max_len.min(remaining.len())
+        } else {
+            split_at
+        };
+        chunks.push(&remaining[..split_at]);
+        remaining = &remaining[split_at..];
+        // Skip leading newline after split
+        if remaining.starts_with('\n') {
+            remaining = &remaining[1..];
+        }
+    }
+    chunks
+}
 
 #[cfg(test)]
 mod tests {

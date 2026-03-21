@@ -1,0 +1,7 @@
+{
+    "name": "Slack",
+    "description": "Slack workspace integration — messages, channels, users",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-slack"],
+    "env_keys": ["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"]
+}

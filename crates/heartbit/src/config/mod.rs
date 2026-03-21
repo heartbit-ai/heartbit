@@ -203,6 +203,10 @@ pub struct HeartbitConfig {
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
+    /// Custom variables for template prompt substitution.
+    /// Available as `{var_name}` in system_prompt, template prompts, and skill content.
+    #[serde(default)]
+    pub variables: std::collections::HashMap<String, String>,
     pub restate: Option<RestateConfig>,
     pub telemetry: Option<TelemetryConfig>,
     pub memory: Option<MemoryConfig>,

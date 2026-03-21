@@ -1,0 +1,7 @@
+{
+    "name": "Jira",
+    "description": "Atlassian Jira integration — issues, projects, boards",
+    "command": "npx",
+    "args": ["-y", "@aashari/mcp-server-atlassian-jira"],
+    "env_keys": ["JIRA_API_TOKEN", "JIRA_USER_EMAIL", "JIRA_INSTANCE_URL"]
+}

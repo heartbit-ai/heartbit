@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,14 +13,61 @@ use crate::config::DispatchMode;
 pub enum RuntimeProviderType {
     Anthropic,
     Openrouter,
+    Gemini,
+    /// Generic OpenAI-compatible endpoint (requires `base_url` on `RuntimeProviderConfig`).
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
 }
 
 /// MCP server configuration for runtime execution.
+///
+/// Supports two transports:
+/// - **HTTP**: set `url` (and optionally `auth_header`)
+/// - **Stdio**: set `command` (and optionally `args` / `env`)
+///
+/// When `command` is present the stdio transport is used; `url` is ignored.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RuntimeMcpServer {
-    pub url: String,
+    /// HTTP MCP server URL (used when `command` is `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
+    /// Stdio MCP server command (when set, `url` is ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+}
+
+impl RuntimeMcpServer {
+    /// Create an HTTP MCP server configuration.
+    pub fn http(url: impl Into<String>, auth_header: Option<String>) -> Self {
+        Self {
+            url: Some(url.into()),
+            auth_header,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+        }
+    }
+
+    /// Create a stdio MCP server configuration.
+    pub fn stdio(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            url: None,
+            auth_header: None,
+            command: Some(command.into()),
+            args,
+            env,
+        }
+    }
 }
 
 impl std::fmt::Debug for RuntimeMcpServer {
@@ -28,6 +77,16 @@ impl std::fmt::Debug for RuntimeMcpServer {
             .field(
                 "auth_header",
                 &self.auth_header.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self
+                    .env
+                    .keys()
+                    .map(|k| format!("{k}=[REDACTED]"))
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -41,6 +100,9 @@ pub struct RuntimeProviderConfig {
     pub model: String,
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Custom base URL for OpenAI-compatible or Gemini providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 impl std::fmt::Debug for RuntimeProviderConfig {
@@ -50,6 +112,7 @@ impl std::fmt::Debug for RuntimeProviderConfig {
             .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
             .field("prompt_caching", &self.prompt_caching)
+            .field("base_url", &self.base_url)
             .finish()
     }
 }
@@ -257,6 +320,42 @@ pub struct RuntimeRequest {
     /// `execute(&prompt)`. The `prompt` field is ignored in that case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_content: Vec<crate::llm::types::ContentBlock>,
+    /// Per-tenant X/Twitter credentials for the `twitter_post` builtin tool.
+    /// When present, the runtime creates a `TwitterPostTool` with these credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twitter_credentials: Option<RuntimeTwitterCredentials>,
+}
+
+/// X/Twitter OAuth 1.0a credentials for the `twitter_post` builtin tool.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RuntimeTwitterCredentials {
+    pub consumer_key: String,
+    pub consumer_secret: String,
+    pub access_token: String,
+    pub access_token_secret: String,
+}
+
+impl std::fmt::Debug for RuntimeTwitterCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeTwitterCredentials")
+            .field("consumer_key", &"[REDACTED]")
+            .field("consumer_secret", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .field("access_token_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RuntimeTwitterCredentials {
+    /// Convert to the builtin tool's `TwitterCredentials` type.
+    pub fn into_tool_credentials(self) -> crate::tool::builtins::TwitterCredentials {
+        crate::tool::builtins::TwitterCredentials {
+            consumer_key: self.consumer_key,
+            consumer_secret: self.consumer_secret,
+            access_token: self.access_token,
+            access_token_secret: self.access_token_secret,
+        }
+    }
 }
 
 /// Workflow execution configuration for the runtime execute endpoint.
@@ -450,11 +549,12 @@ mod tests {
                 api_key: "sk-test".to_string(),
                 model: "claude-sonnet-4-20250514".to_string(),
                 prompt_caching: true,
+                base_url: None,
             },
-            mcp_servers: vec![RuntimeMcpServer {
-                url: "https://mcp.example.com".to_string(),
-                auth_header: Some("Bearer token".to_string()),
-            }],
+            mcp_servers: vec![RuntimeMcpServer::http(
+                "https://mcp.example.com",
+                Some("Bearer token".to_string()),
+            )],
             builtin_tools: vec!["bash".to_string(), "read".to_string()],
             guardrails: Some(RuntimeGuardrailConfig {
                 injection: true,
@@ -468,6 +568,7 @@ mod tests {
             orchestrator: None,
             workflow: None,
             initial_content: vec![],
+            twitter_credentials: None,
         };
 
         let json = serde_json::to_string(&request).expect("serialize");
@@ -568,6 +669,57 @@ mod tests {
         // Should serialize to empty object (all None fields skipped)
         let json = serde_json::to_string(&config).expect("serialize");
         assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn runtime_twitter_credentials_round_trip() {
+        let creds = RuntimeTwitterCredentials {
+            consumer_key: "ck".into(),
+            consumer_secret: "cs".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+        };
+        let json = serde_json::to_string(&creds).expect("serialize");
+        let parsed: RuntimeTwitterCredentials = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.consumer_key, "ck");
+        assert_eq!(parsed.access_token, "at");
+
+        // Debug redacts secrets
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("ck"));
+    }
+
+    #[test]
+    fn runtime_twitter_credentials_converts_to_tool_credentials() {
+        let creds = RuntimeTwitterCredentials {
+            consumer_key: "ck".into(),
+            consumer_secret: "cs".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+        };
+        let tool_creds = creds.into_tool_credentials();
+        assert_eq!(tool_creds.consumer_key, "ck");
+        assert_eq!(tool_creds.consumer_secret, "cs");
+        assert_eq!(tool_creds.access_token, "at");
+        assert_eq!(tool_creds.access_token_secret, "ats");
+    }
+
+    #[test]
+    fn runtime_request_twitter_credentials_optional() {
+        // twitter_credentials defaults to None when omitted from JSON
+        let json = r#"{
+            "task_id": "00000000-0000-0000-0000-000000000001",
+            "prompt": "test",
+            "agent": { "name": "test" },
+            "provider": {
+                "provider_type": "anthropic",
+                "api_key": "sk-test",
+                "model": "claude-sonnet-4-20250514"
+            }
+        }"#;
+        let request: RuntimeRequest = serde_json::from_str(json).expect("deserialize");
+        assert!(request.twitter_credentials.is_none());
     }
 
     #[test]
@@ -702,10 +854,7 @@ mod tests {
             max_turns: 10,
             max_tokens: 2048,
             builtin_tools: vec!["read".to_string()],
-            mcp_servers: vec![RuntimeMcpServer {
-                url: "http://localhost:9000/mcp".to_string(),
-                auth_header: None,
-            }],
+            mcp_servers: vec![RuntimeMcpServer::http("http://localhost:9000/mcp", None)],
         };
 
         let json = serde_json::to_string(&config).expect("serialize");
@@ -775,6 +924,7 @@ mod tests {
                     api_key: "sk-test".into(),
                     model: "claude-sonnet-4-20250514".into(),
                     prompt_caching: false,
+                    base_url: None,
                 },
                 mcp_servers: vec![],
                 builtin_tools: vec![],
@@ -785,6 +935,7 @@ mod tests {
                 orchestrator: None,
                 workflow: None,
                 initial_content: vec![],
+                twitter_credentials: None,
             },
             cases: vec![crate::eval::EvalCase::new("greet", "Say hi").expect_output_contains("hi")],
             scoring: RuntimeScorerConfig {
@@ -1048,6 +1199,77 @@ mod tests {
         assert_eq!(edge.to, "b");
         assert!(edge.condition.is_none());
         assert!(edge.transform.is_none());
+    }
+
+    #[test]
+    fn runtime_mcp_server_http_serde() {
+        let server = RuntimeMcpServer::http("https://mcp.example.com", Some("Bearer tok".into()));
+        let json = serde_json::to_string(&server).expect("serialize");
+        let parsed: RuntimeMcpServer = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.url.as_deref(), Some("https://mcp.example.com"));
+        assert_eq!(parsed.auth_header.as_deref(), Some("Bearer tok"));
+        assert!(parsed.command.is_none());
+        assert!(parsed.args.is_empty());
+        assert!(parsed.env.is_empty());
+    }
+
+    #[test]
+    fn runtime_mcp_server_stdio_serde() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("API_KEY".to_string(), "secret".to_string());
+        let server = RuntimeMcpServer::stdio("x-mcp-server", vec!["--port".into()], env);
+        let json = serde_json::to_string(&server).expect("serialize");
+        let parsed: RuntimeMcpServer = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.url.is_none());
+        assert!(parsed.auth_header.is_none());
+        assert_eq!(parsed.command.as_deref(), Some("x-mcp-server"));
+        assert_eq!(parsed.args, vec!["--port"]);
+        assert_eq!(parsed.env.get("API_KEY").unwrap(), "secret");
+    }
+
+    #[test]
+    fn runtime_mcp_server_debug_redacts_env() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("SECRET_KEY".to_string(), "super-secret-value".to_string());
+        let server = RuntimeMcpServer::stdio("cmd", vec![], env);
+        let debug = format!("{:?}", server);
+        assert!(
+            !debug.contains("super-secret-value"),
+            "env value leaked in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("SECRET_KEY=[REDACTED]"),
+            "env key should be shown: {debug}"
+        );
+    }
+
+    #[test]
+    fn runtime_mcp_server_backward_compat_url_string() {
+        // Old JSON with url as a plain string should still deserialize
+        let json = r#"{"url":"https://mcp.example.com"}"#;
+        let parsed: RuntimeMcpServer = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(parsed.url.as_deref(), Some("https://mcp.example.com"));
+        assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn runtime_mcp_server_http_helper() {
+        let s = RuntimeMcpServer::http("https://x.com", None);
+        assert_eq!(s.url.as_deref(), Some("https://x.com"));
+        assert!(s.auth_header.is_none());
+        assert!(s.command.is_none());
+    }
+
+    #[test]
+    fn runtime_mcp_server_stdio_helper() {
+        let s = RuntimeMcpServer::stdio(
+            "node",
+            vec!["app.js".into()],
+            std::collections::HashMap::new(),
+        );
+        assert!(s.url.is_none());
+        assert_eq!(s.command.as_deref(), Some("node"));
+        assert_eq!(s.args, vec!["app.js"]);
     }
 
     #[test]

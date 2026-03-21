@@ -75,6 +75,7 @@ pub mod llm;
 pub mod memory;
 pub mod signal;
 pub mod store;
+pub mod template;
 pub mod tool;
 pub(crate) mod util;
 pub mod workspace;
@@ -85,7 +86,7 @@ pub mod sandbox;
 pub mod lsp;
 
 // --- Feature-gated modules ---
-#[cfg(feature = "daemon")]
+#[cfg(any(feature = "daemon", feature = "vault"))]
 pub mod auth;
 #[cfg(feature = "daemon")]
 pub mod daemon;
@@ -104,6 +105,19 @@ pub use channel::session::{
 };
 pub use channel::types::WsFrame;
 pub use channel::{ChannelBridge, ConsolidateSession, MediaAttachment, RunTask, RunTaskInput};
+
+#[cfg(feature = "discord")]
+pub use channel::discord::{
+    DiscordBridge, DiscordConfig, chunk_message as discord_chunk_message, get_gateway_url,
+    send_typing as discord_send_typing, strip_mention as discord_strip_mention,
+};
+
+#[cfg(feature = "slack")]
+pub use channel::slack::{
+    SlackBridge, SlackConfig, SlackEnvelope, SlackEvent, SocketModeAck,
+    chunk_message as slack_chunk_message, get_socket_url, strip_mention as slack_strip_mention,
+    validate_bot_token,
+};
 
 #[cfg(feature = "telegram")]
 pub use channel::telegram::{
@@ -172,12 +186,16 @@ pub use config::{
 };
 
 // --- Auth re-exports (feature-gated) ---
+#[cfg(feature = "vault")]
+pub use auth::vault::{CredentialResolver, CredentialVault};
 #[cfg(feature = "daemon")]
 pub use auth::{JwksClient, JwtValidator};
 
 // --- Daemon re-exports (feature-gated) ---
 #[cfg(all(feature = "daemon", feature = "postgres"))]
 pub use daemon::PostgresTaskStore;
+#[cfg(feature = "daemon")]
+pub use daemon::openai_compat;
 #[cfg(feature = "daemon")]
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
@@ -187,9 +205,9 @@ pub use daemon::{
     RuntimeEvalSseEvent, RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig,
     RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest,
     RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent,
-    RuntimeSubAgentConfig, RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
-    TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
-    UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
+    RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge,
+    RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
+    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
 };
 
 // --- Error re-exports ---
@@ -215,8 +233,14 @@ pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
 pub use llm::error_class::{ErrorClass, classify as classify_error};
+pub use llm::gemini::GeminiProvider;
+pub use llm::openai_compat::{AuthStyle, OpenAiCompatProvider};
 pub use llm::openrouter::OpenRouterProvider;
 pub use llm::pricing::estimate_cost;
+pub use llm::registry::{
+    ProviderInfo, detect_available_provider, get_provider, known_providers as known_llm_providers,
+    resolve_api_key,
+};
 pub use llm::retry::{OnRetry, RetryConfig, RetryingProvider};
 pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, ReasoningEffort, Role,
@@ -262,11 +286,15 @@ pub use sensor::triage::{ActionCategory, Priority, TriageDecision, TriageProcess
 pub use sensor::{Sensor, SensorEvent};
 
 // --- Tool re-exports ---
+pub use template::registry::{known_templates, resolve_template};
+pub use template::skills::{SkillContent, known_skills, load_skill, load_skills};
+pub use template::{AgentTemplate, PartialAgentConfig, TemplateMeta, resolve_agent_config};
 #[cfg(feature = "a2a")]
 pub use tool::a2a::A2aClient;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
-    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, builtin_tools,
+    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, TwitterCredentials,
+    builtin_tools,
 };
 pub use tool::mcp::{
     AuthProvider, AuthResolver, DirectAuthProvider, DynamicAuthResolver, McpClient,
@@ -275,6 +303,7 @@ pub use tool::mcp::{
     SamplingModelHint, SamplingModelPreferences, SamplingRequest, StaticAuthProvider,
     StaticAuthResolver, TokenExchangeAuthProvider,
 };
+pub use tool::mcp_presets::{McpPreset, check_preset_env, known_presets, resolve_preset};
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
 

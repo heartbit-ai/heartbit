@@ -1,0 +1,7 @@
+{
+    "name": "Google Calendar",
+    "description": "Google Calendar integration — events, scheduling",
+    "command": "npx",
+    "args": ["-y", "gcal-mcp-server"],
+    "env_keys": ["GOOGLE_CALENDAR_CREDENTIALS"]
+}

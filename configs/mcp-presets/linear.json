@@ -1,0 +1,7 @@
+{
+    "name": "Linear",
+    "description": "Linear project management — issues, projects, teams",
+    "command": "npx",
+    "args": ["-y", "mcp-linear"],
+    "env_keys": ["LINEAR_API_KEY"]
+}

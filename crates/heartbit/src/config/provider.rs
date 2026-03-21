@@ -10,6 +10,14 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(default)]
     pub model: String,
+    /// Custom API endpoint URL (overrides the default for the provider).
+    /// Useful for self-hosted models, Azure, or proxies.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Direct API key (alternative to environment variable).
+    /// Prefer env vars in production; this is for testing/local dev.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Retry configuration for transient LLM API failures.
     pub retry: Option<RetryProviderConfig>,
     /// Enable Anthropic prompt caching (system prompt + tool definitions).
@@ -26,7 +34,7 @@ pub struct ProviderConfig {
 /// When enabled, the provider tries cheaper model tiers first and only
 /// escalates to the main (most expensive) model when the confidence gate
 /// rejects the cheaper response or the tier errors.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CascadeConfig {
     /// Enable model cascading. Default: false.
     #[serde(default)]
@@ -41,13 +49,13 @@ pub struct CascadeConfig {
 }
 
 /// A single tier in the model cascade.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CascadeTierConfig {
     pub model: String,
 }
 
 /// Confidence gate configuration for model cascading.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CascadeGateConfig {
     /// Heuristic gate: zero-cost checks on response length, refusal patterns, etc.

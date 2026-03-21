@@ -51,21 +51,8 @@ impl LlmProvider for OpenRouterProvider {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            // Sanitize body for auth failures to avoid leaking API key fragments in logs
-            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
-                format!("authentication failed (HTTP {})", status.as_u16())
-            } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
-            };
-            return Err(Error::Api {
-                status: status.as_u16(),
-                message,
-            });
+        if !response.status().is_success() {
+            return Err(super::api_error_from_response(response).await);
         }
 
         let api_response: OpenAiResponse = response.json().await?;
@@ -90,20 +77,8 @@ impl LlmProvider for OpenRouterProvider {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
-                format!("authentication failed (HTTP {})", status.as_u16())
-            } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
-            };
-            return Err(Error::Api {
-                status: status.as_u16(),
-                message,
-            });
+        if !response.status().is_success() {
+            return Err(super::api_error_from_response(response).await);
         }
 
         parse_openai_stream(response.bytes_stream(), on_text).await
@@ -112,7 +87,7 @@ impl LlmProvider for OpenRouterProvider {
 
 // --- Request building: our types → OpenAI format ---
 
-fn build_openai_request(
+pub(crate) fn build_openai_request(
     model: &str,
     request: &CompletionRequest,
 ) -> Result<serde_json::Value, Error> {
@@ -322,7 +297,7 @@ fn tool_to_openai(tool: &ToolDefinition) -> serde_json::Value {
 // --- Response parsing: OpenAI format → our types ---
 
 #[derive(Deserialize)]
-struct OpenAiResponse {
+pub(crate) struct OpenAiResponse {
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -366,7 +341,7 @@ struct OpenAiUsage {
     reasoning_tokens: u32,
 }
 
-fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
+pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
     let choice = api.choices.into_iter().next().ok_or_else(|| Error::Api {
         status: 502,
         message: "empty choices array in response".into(),

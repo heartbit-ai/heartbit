@@ -17,9 +17,9 @@ use heartbit::{
     ContextStrategyConfig, HeartbitConfig, HeuristicGate, InMemoryBlackboard,
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
     McpServerEntry, Memory, MemoryConfig, MemoryQuery, NamespacedMemory, ObservabilityMode,
-    OnApproval, OnEvent, OnQuestion, OnRetry, OnText, OpenRouterProvider, Orchestrator,
-    PostgresMemoryStore, QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider,
-    SubAgentConfig, ToolCall, Workspace, builtin_tools,
+    OnApproval, OnEvent, OnQuestion, OnRetry, OnText, Orchestrator, PostgresMemoryStore,
+    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
+    Workspace, builtin_tools,
 };
 
 #[derive(Parser)]
@@ -120,6 +120,46 @@ enum Commands {
         /// Print structured agent events to stderr as one-line JSON
         #[arg(long, short)]
         verbose: bool,
+    },
+    /// Manage agent templates
+    Templates {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+    /// Manage agent skills
+    Skills {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+    /// Generate a starter config from a template
+    Init {
+        /// Template name to use as base
+        template: String,
+        /// Output file path (prints to stdout if not set)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// List all available templates
+    List,
+    /// Show details for a specific template
+    Show {
+        /// Template name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// List all available skills
+    List,
+    /// Show content of a specific skill
+    Show {
+        /// Skill name
+        name: String,
     },
 }
 
@@ -367,6 +407,9 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Templates { action }) => run_template_command(action),
+        Some(Commands::Skills { action }) => run_skill_command(action),
+        Some(Commands::Init { template, output }) => run_init_command(&template, output.as_deref()),
         None => {
             // Backward-compatible: bare task args without subcommand
             let task_str = cli.task.join(" ");
@@ -428,26 +471,84 @@ fn build_base_provider(
     provider_name: &str,
     model: &str,
     prompt_caching: bool,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
 ) -> Result<BoxedProvider> {
-    match provider_name {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let base = if prompt_caching {
-                AnthropicProvider::with_prompt_caching(api_key, model)
-            } else {
-                AnthropicProvider::new(api_key, model)
-            };
-            Ok(BoxedProvider::new(base))
-        }
-        "openrouter" => {
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let base = OpenRouterProvider::new(api_key, model);
-            Ok(BoxedProvider::new(base))
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    // Special case: Anthropic has a native driver
+    if provider_name == "anthropic" {
+        let key = match api_key {
+            Some(k) => k.to_string(),
+            None => std::env::var("ANTHROPIC_API_KEY")
+                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?,
+        };
+        let base = if prompt_caching {
+            AnthropicProvider::with_prompt_caching(key, model)
+        } else {
+            AnthropicProvider::new(key, model)
+        };
+        return Ok(BoxedProvider::new(base));
     }
+
+    // Special case: Gemini has a native driver
+    if provider_name == "gemini" {
+        let key = match api_key {
+            Some(k) => k.to_string(),
+            None => std::env::var("GEMINI_API_KEY")
+                .context("GEMINI_API_KEY env var required for gemini provider")?,
+        };
+        let base = match base_url {
+            Some(url) => heartbit::GeminiProvider::with_base_url(key, model, url),
+            None => heartbit::GeminiProvider::new(key, model),
+        };
+        return Ok(BoxedProvider::new(base));
+    }
+
+    // Registry-based: look up provider info
+    if let Some(info) = heartbit::get_provider(provider_name) {
+        let url = base_url
+            .map(|s| s.to_string())
+            .or_else(|| info.base_url.map(|s| s.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{provider_name}' requires a base_url (native driver not available)"
+                )
+            })?;
+
+        let key = match api_key {
+            Some(k) => k.to_string(),
+            None => heartbit::resolve_api_key(provider_name, info)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        };
+
+        let auth_style = if info.auth_required() {
+            heartbit::AuthStyle::Bearer
+        } else {
+            heartbit::AuthStyle::None
+        };
+
+        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
+            key, model, url, auth_style,
+        )));
+    }
+
+    // Unknown provider: if base_url is provided, try OpenAI-compatible
+    if let Some(url) = base_url {
+        let key = api_key.unwrap_or("").to_string();
+        let auth_style = if key.is_empty() {
+            heartbit::AuthStyle::None
+        } else {
+            heartbit::AuthStyle::Bearer
+        };
+        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
+            key, model, url, auth_style,
+        )));
+    }
+
+    bail!(
+        "Unknown provider: '{provider_name}'. Known providers: {}. \
+         Or provide a base_url for custom OpenAI-compatible endpoints.",
+        heartbit::known_llm_providers().join(", ")
+    );
 }
 
 /// Build a `HeuristicGate` from cascade gate configuration.
@@ -488,6 +589,7 @@ fn wrap_with_retry(
 ///
 /// Builds a `CascadingProvider` with the configured tiers (cheapest first)
 /// and the main provider as the final (most expensive) tier.
+#[allow(clippy::too_many_arguments)]
 fn wrap_with_cascade(
     main_provider: BoxedProvider,
     main_model: &str,
@@ -496,11 +598,19 @@ fn wrap_with_cascade(
     cascade: &CascadeConfig,
     retry: Option<RetryConfig>,
     on_retry: Option<&Arc<OnRetry>>,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
 ) -> Result<BoxedProvider> {
     let mut builder = CascadingProvider::builder();
 
     for tier_cfg in &cascade.tiers {
-        let tier_base = build_base_provider(provider_name, &tier_cfg.model, prompt_caching)?;
+        let tier_base = build_base_provider(
+            provider_name,
+            &tier_cfg.model,
+            prompt_caching,
+            base_url,
+            api_key,
+        )?;
         let tier_provider = wrap_with_retry(tier_base, retry.clone(), on_retry.cloned());
         builder = builder.add_tier(&tier_cfg.model, tier_provider);
     }
@@ -538,6 +648,8 @@ pub(crate) fn build_provider_from_config(
         &config.provider.name,
         &config.provider.model,
         config.provider.prompt_caching,
+        config.provider.base_url.as_deref(),
+        config.provider.api_key.as_deref(),
     )?;
 
     // Cascade wrapping (tiers get their own retry; main provider is the final tier)
@@ -554,6 +666,8 @@ pub(crate) fn build_provider_from_config(
             cascade,
             retry,
             on_retry.as_ref(),
+            config.provider.base_url.as_deref(),
+            config.provider.api_key.as_deref(),
         )?;
         return Ok(Arc::new(cascaded));
     }
@@ -580,7 +694,13 @@ fn build_agent_provider(
             );
         });
     }
-    let base = build_base_provider(&config.name, &config.model, config.prompt_caching)?;
+    let base = build_base_provider(
+        &config.name,
+        &config.model,
+        config.prompt_caching,
+        config.base_url.as_deref(),
+        config.api_key.as_deref(),
+    )?;
 
     // Cascade wrapping for per-agent provider
     if let Some(ref cascade) = config.cascade
@@ -596,6 +716,8 @@ fn build_agent_provider(
             cascade,
             retry,
             on_retry.as_ref(),
+            config.base_url.as_deref(),
+            config.api_key.as_deref(),
         )?;
         return Ok(Arc::new(cascaded));
     }
@@ -610,8 +732,23 @@ async fn run_from_config(
     verbose: bool,
     observability_flag: Option<&str>,
 ) -> Result<()> {
-    let config = HeartbitConfig::from_file(path)
+    let mut config = HeartbitConfig::from_file(path)
         .with_context(|| format!("failed to load config from {}", path.display()))?;
+
+    // Resolve agent templates, skills, and variables before building agents.
+    let variables = config.variables.clone();
+    for i in 0..config.agents.len() {
+        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+            let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve template for agent '{}'",
+                        config.agents[i].name
+                    )
+                })?;
+            config.agents[i] = resolved;
+        }
+    }
 
     init_tracing_from_config(&config)?;
 
@@ -1719,53 +1856,47 @@ pub(crate) async fn load_a2a_tools(
 /// `HEARTBIT_MODEL`, and `HEARTBIT_PROMPT_CACHING`. Always wraps with retry.
 fn build_provider_from_env(on_retry: Option<Arc<OnRetry>>) -> Result<Arc<BoxedProvider>> {
     let provider_name = std::env::var("HEARTBIT_PROVIDER").unwrap_or_else(|_| {
-        if std::env::var("OPENROUTER_API_KEY").is_ok() {
-            "openrouter".into()
+        // Auto-detect from available API keys
+        if let Some((name, _)) = heartbit::detect_available_provider() {
+            name.to_string()
         } else {
-            "anthropic".into()
+            "anthropic".into() // default fallback
         }
     });
 
-    match provider_name.as_str() {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY env var required for anthropic provider")?;
-            let model = std::env::var("HEARTBIT_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
-            let prompt_caching = std::env::var("HEARTBIT_PROMPT_CACHING")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let base = if prompt_caching {
-                AnthropicProvider::with_prompt_caching(api_key, model)
-            } else {
-                AnthropicProvider::new(api_key, model)
-            };
-            let mut retrying = RetryingProvider::with_defaults(base);
-            if let Some(cb) = on_retry {
-                retrying = retrying.with_on_retry(cb);
-            }
-            Ok(Arc::new(BoxedProvider::new(retrying)))
-        }
-        "openrouter" => {
-            if std::env::var("HEARTBIT_PROMPT_CACHING").is_ok() {
-                tracing::warn!(
-                    "HEARTBIT_PROMPT_CACHING is only effective with the 'anthropic' provider; \
-                     ignored for 'openrouter'"
-                );
-            }
-            let api_key = std::env::var("OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY env var required for openrouter provider")?;
-            let model = std::env::var("HEARTBIT_MODEL")
-                .unwrap_or_else(|_| "anthropic/claude-sonnet-4".into());
-            let mut retrying =
-                RetryingProvider::with_defaults(OpenRouterProvider::new(api_key, model));
-            if let Some(cb) = on_retry {
-                retrying = retrying.with_on_retry(cb);
-            }
-            Ok(Arc::new(BoxedProvider::new(retrying)))
-        }
-        other => bail!("Unknown provider: {other}. Use 'anthropic' or 'openrouter'."),
+    let model = std::env::var("HEARTBIT_MODEL").unwrap_or_else(|_| {
+        heartbit::get_provider(&provider_name)
+            .map(|info| info.default_model.to_string())
+            .unwrap_or_else(|| "claude-sonnet-4-20250514".into())
+    });
+
+    let prompt_caching = std::env::var("HEARTBIT_PROMPT_CACHING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if prompt_caching && provider_name != "anthropic" {
+        tracing::warn!(
+            "HEARTBIT_PROMPT_CACHING is only effective with the 'anthropic' provider; \
+             ignored for '{provider_name}'"
+        );
     }
+
+    let base_url = std::env::var("HEARTBIT_BASE_URL").ok();
+    let api_key = std::env::var("HEARTBIT_API_KEY").ok();
+
+    let base = build_base_provider(
+        &provider_name,
+        &model,
+        prompt_caching,
+        base_url.as_deref(),
+        api_key.as_deref(),
+    )?;
+
+    let mut retrying = RetryingProvider::with_defaults(base);
+    if let Some(cb) = on_retry {
+        retrying = retrying.with_on_retry(cb);
+    }
+    Ok(Arc::new(BoxedProvider::new(retrying)))
 }
 
 /// Create a memory store from config.
@@ -2093,8 +2224,23 @@ async fn run_chat_from_config(
     verbose: bool,
     observability_flag: Option<&str>,
 ) -> Result<()> {
-    let config = HeartbitConfig::from_file(path)
+    let mut config = HeartbitConfig::from_file(path)
         .with_context(|| format!("failed to load config from {}", path.display()))?;
+
+    // Resolve agent templates, skills, and variables.
+    let variables = config.variables.clone();
+    for i in 0..config.agents.len() {
+        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+            let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve template for agent '{}'",
+                        config.agents[i].name
+                    )
+                })?;
+            config.agents[i] = resolved;
+        }
+    }
 
     init_tracing_from_config(&config)?;
 
@@ -2757,6 +2903,119 @@ fn print_streaming_stats(output: &AgentOutput) {
     if let Some(cost) = output.estimated_cost_usd {
         eprintln!("Estimated cost: ${cost:.4}");
     }
+}
+
+// ── Template / Skill / Init CLI commands ──
+
+fn run_template_command(action: TemplateAction) -> Result<()> {
+    match action {
+        TemplateAction::List => {
+            let templates = heartbit::known_templates();
+            println!("Available templates ({}):\n", templates.len());
+            for name in templates {
+                match heartbit::resolve_template(name) {
+                    Ok(t) => println!("  {:<20} {}", name, t.meta.description),
+                    Err(_) => println!("  {:<20} (failed to load)", name),
+                }
+            }
+            Ok(())
+        }
+        TemplateAction::Show { name } => {
+            let template = heartbit::resolve_template(&name)
+                .with_context(|| format!("failed to resolve template '{name}'"))?;
+            println!("Template: {name}");
+            println!("Description: {}", template.meta.description);
+            println!("Version: {}", template.meta.version);
+            if !template.meta.tags.is_empty() {
+                println!("Tags: {}", template.meta.tags.join(", "));
+            }
+            if let Some(ref parent) = template.meta.extends {
+                println!("Extends: {parent}");
+            }
+            println!("\n--- Agent Defaults ---");
+            if let Some(mt) = template.agent.max_tokens {
+                println!("max_tokens: {mt}");
+            }
+            if let Some(mt) = template.agent.max_turns {
+                println!("max_turns: {mt}");
+            }
+            if let Some(ref tp) = template.agent.tool_profile {
+                println!("tool_profile: {tp}");
+            }
+            if let Some(dt) = template.agent.dangerous_tools {
+                println!("dangerous_tools: {dt}");
+            }
+            if let Some(ref prompt) = template.agent.system_prompt {
+                println!("\n--- System Prompt ---\n{prompt}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_skill_command(action: SkillAction) -> Result<()> {
+    match action {
+        SkillAction::List => {
+            let skills = heartbit::known_skills();
+            println!("Available skills ({}):\n", skills.len());
+            for name in skills {
+                match heartbit::load_skill(name) {
+                    Ok(s) => {
+                        let desc = s.description.as_deref().unwrap_or("(no description)");
+                        println!("  {:<20} {}", name, desc);
+                    }
+                    Err(_) => println!("  {:<20} (failed to load)", name),
+                }
+            }
+            Ok(())
+        }
+        SkillAction::Show { name } => {
+            let skill = heartbit::load_skill(&name)
+                .with_context(|| format!("failed to load skill '{name}'"))?;
+            println!("Skill: {}", skill.name);
+            if let Some(ref desc) = skill.description {
+                println!("Description: {desc}");
+            }
+            if let Some(max) = skill.max_inject_tokens {
+                println!("Max inject tokens: {max}");
+            }
+            println!("\n--- Content ---\n{}", skill.content);
+            Ok(())
+        }
+    }
+}
+
+fn run_init_command(template_name: &str, output: Option<&std::path::Path>) -> Result<()> {
+    let template = heartbit::resolve_template(template_name)
+        .with_context(|| format!("failed to resolve template '{template_name}'"))?;
+
+    let config_toml = format!(
+        r#"[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+template = "{template_name}"
+name = "{template_name}"
+description = "{description}"
+skills = []
+# system_prompt appended to template prompt:
+# system_prompt = "Additional context here"
+"#,
+        description = template.meta.description
+    );
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &config_toml)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Config written to {}", path.display());
+        }
+        None => {
+            print!("{config_toml}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -28,10 +28,18 @@ pub enum ContextStrategyConfig {
 
 /// Per-agent provider override. When set on an agent, overrides the
 /// orchestrator's default provider for that agent only.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentProviderConfig {
     pub name: String,
     pub model: String,
+    /// Custom API endpoint URL (overrides the default for the provider).
+    /// Useful for self-hosted models, Azure, or proxies.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Direct API key (alternative to environment variable).
+    /// Prefer env vars in production; this is for testing/local dev.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Enable Anthropic prompt caching for this agent.
     #[serde(default)]
     pub prompt_caching: bool,
@@ -295,7 +303,17 @@ pub enum McpResourceMode {
 pub struct AgentConfig {
     pub name: String,
     pub description: String,
+    #[serde(default)]
     pub system_prompt: String,
+    /// Agent template to use as a base. The template provides default values
+    /// for system_prompt, max_tokens, max_turns, and other settings.
+    /// User-specified values override template defaults.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Skills to auto-inject into the system prompt at config resolution time.
+    /// Each skill name maps to a bundled or filesystem SKILL.md file.
+    #[serde(default)]
+    pub skills: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerEntry>,
     /// A2A agent endpoints to discover and register as tools.
@@ -383,7 +401,7 @@ pub struct AgentConfig {
 }
 
 /// TOML representation of session pruning configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionPruneConfigToml {
     /// Number of recent message pairs to keep at full fidelity. Default: 2.
     #[serde(default = "default_keep_recent_n")]
@@ -406,4 +424,63 @@ fn default_pruned_max_bytes() -> usize {
 
 fn default_preserve_task() -> bool {
     true
+}
+
+impl AgentConfig {
+    /// Clone all fields of this config into a new `AgentConfig`.
+    ///
+    /// `AgentConfig` intentionally does not derive `Clone` (to keep the derive
+    /// list short and avoid accidental copies in hot paths). Use this method
+    /// when an explicit copy is needed (e.g., template resolution).
+    pub fn clone_config(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            system_prompt: self.system_prompt.clone(),
+            template: self.template.clone(),
+            skills: self.skills.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            a2a_agents: self.a2a_agents.clone(),
+            context_strategy: self.context_strategy.clone(),
+            summarize_threshold: self.summarize_threshold,
+            tool_timeout_seconds: self.tool_timeout_seconds,
+            max_tool_output_bytes: self.max_tool_output_bytes,
+            max_turns: self.max_turns,
+            max_tokens: self.max_tokens,
+            response_schema: self.response_schema.clone(),
+            run_timeout_seconds: self.run_timeout_seconds,
+            provider: self.provider.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            enable_reflection: self.enable_reflection,
+            tool_output_compression_threshold: self.tool_output_compression_threshold,
+            max_tools_per_turn: self.max_tools_per_turn,
+            tool_profile: self.tool_profile.clone(),
+            max_identical_tool_calls: self.max_identical_tool_calls,
+            max_fuzzy_identical_tool_calls: self.max_fuzzy_identical_tool_calls,
+            session_prune: self.session_prune.clone(),
+            recursive_summarization: self.recursive_summarization,
+            reflection_threshold: self.reflection_threshold,
+            consolidate_on_exit: self.consolidate_on_exit,
+            max_total_tokens: self.max_total_tokens,
+            guardrails: self.guardrails.clone(),
+            response_cache_size: self.response_cache_size,
+            mcp_resources: self.mcp_resources,
+            dangerous_tools: self.dangerous_tools,
+            audit_mode: self.audit_mode.clone(),
+        }
+    }
+}
+
+impl AgentProviderConfig {
+    /// Clone via Option::as_ref → clone pattern for non-Clone containers.
+    pub fn take_ref(opt: &Option<Self>) -> Option<Self> {
+        opt.clone()
+    }
+}
+
+impl SessionPruneConfigToml {
+    /// Clone via Option::as_ref → clone pattern for non-Clone containers.
+    pub fn take_ref(opt: &Option<Self>) -> Option<Self> {
+        opt.clone()
+    }
 }

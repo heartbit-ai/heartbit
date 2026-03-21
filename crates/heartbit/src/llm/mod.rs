@@ -1,8 +1,28 @@
 pub mod anthropic;
+
+/// Build an `Error::Api` from a failed HTTP response, sanitizing auth errors.
+///
+/// For 401/403 responses, the body is NOT read to avoid leaking API key
+/// fragments in logs. For all other statuses the response body is included.
+pub(crate) async fn api_error_from_response(response: reqwest::Response) -> Error {
+    let status = response.status().as_u16();
+    let message = if status == 401 || status == 403 {
+        format!("authentication failed (HTTP {status})")
+    } else {
+        response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read error: {e}>"))
+    };
+    Error::Api { status, message }
+}
 pub mod cascade;
 pub mod error_class;
+pub mod gemini;
+pub mod openai_compat;
 pub mod openrouter;
 pub mod pricing;
+pub mod registry;
 pub mod retry;
 pub mod types;
 
