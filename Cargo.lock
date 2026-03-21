@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit"
-version = "2026.306.5"
+version = "2026.306.6"
 dependencies = [
  "a2a-sdk",
  "aes-gcm",
@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-cli"
-version = "2026.306.5"
+version = "2026.306.6"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-gateway"
-version = "2026.306.5"
+version = "2026.306.6"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-macro"
-version = "2026.306.5"
+version = "2026.306.6"
 dependencies = [
  "proc-macro2",
  "quote",
