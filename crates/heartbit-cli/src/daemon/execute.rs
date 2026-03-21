@@ -489,7 +489,7 @@ pub(super) async fn collect_tools(
         }
     }
 
-    // Add builtin tools (filtered to requested names)
+    // Add builtin tools (filtered to requested names via allowlist)
     if !builtin_tool_names.is_empty() {
         let env_policy = if workspace.is_some() {
             // Use restrictive allowlist in runtime mode to prevent env var leaks
@@ -507,16 +507,10 @@ pub(super) async fn collect_tools(
             workspace: workspace.map(|p| p.to_path_buf()),
             env_policy,
             twitter_credentials,
+            allowlist: Some(builtin_tool_names.to_vec()),
             ..Default::default()
         };
-        let all_builtins = heartbit::builtin_tools(bt_config);
-        let requested: std::collections::HashSet<&str> =
-            builtin_tool_names.iter().map(|s| s.as_str()).collect();
-        for tool in all_builtins {
-            if requested.contains(tool.definition().name.as_str()) {
-                tools.push(tool);
-            }
-        }
+        tools.extend(heartbit::builtin_tools(bt_config));
     }
 
     tools

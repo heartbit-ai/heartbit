@@ -138,6 +138,7 @@ mod tests {
             mcp_resources: Default::default(),
             dangerous_tools: false,
             audit_mode: None,
+            builtin_tools: None,
             template: None,
             skills: vec![],
         }

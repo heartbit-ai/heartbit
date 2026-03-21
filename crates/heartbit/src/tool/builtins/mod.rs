@@ -128,6 +128,10 @@ pub struct BuiltinToolsConfig {
     pub daemon_todo_store: Option<Arc<crate::daemon::todo::FileTodoStore>>,
     /// X/Twitter credentials for the `twitter_post` builtin tool (per-tenant).
     pub twitter_credentials: Option<TwitterCredentials>,
+    /// Optional allowlist of builtin tool names. When `Some`, only tools whose
+    /// name appears in this list are returned. When `None`, all builtins are
+    /// returned (backward compatible).
+    pub allowlist: Option<Vec<String>>,
 }
 
 impl Default for BuiltinToolsConfig {
@@ -145,6 +149,7 @@ impl Default for BuiltinToolsConfig {
             #[cfg(feature = "daemon")]
             daemon_todo_store: None,
             twitter_credentials: None,
+            allowlist: None,
         }
     }
 }
@@ -219,6 +224,11 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
 
     if let Some(creds) = config.twitter_credentials {
         tools.push(Arc::new(twitter_post::TwitterPostTool::new(creds)));
+    }
+
+    if let Some(ref allowed) = config.allowlist {
+        let set: std::collections::HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+        tools.retain(|t| set.contains(t.definition().name.as_str()));
     }
 
     tools
@@ -409,5 +419,50 @@ mod tests {
     fn builtin_tools_excludes_twitter_when_no_credentials() {
         let tools = builtin_tools(BuiltinToolsConfig::default());
         assert!(!tools.iter().any(|t| t.definition().name == "twitter_post"));
+    }
+
+    #[test]
+    fn builtin_tools_with_allowlist() {
+        let config = BuiltinToolsConfig {
+            allowlist: Some(vec!["websearch".into(), "webfetch".into()]),
+            ..Default::default()
+        };
+        let tools = builtin_tools(config);
+        assert_eq!(tools.len(), 2);
+        let names: Vec<String> = tools.iter().map(|t| t.definition().name.clone()).collect();
+        assert!(names.contains(&"websearch".to_string()));
+        assert!(names.contains(&"webfetch".to_string()));
+    }
+
+    #[test]
+    fn builtin_tools_empty_allowlist() {
+        let config = BuiltinToolsConfig {
+            allowlist: Some(vec![]),
+            ..Default::default()
+        };
+        let tools = builtin_tools(config);
+        assert_eq!(tools.len(), 0);
+    }
+
+    #[test]
+    fn builtin_tools_allowlist_none_returns_all() {
+        let config = BuiltinToolsConfig {
+            allowlist: None,
+            ..Default::default()
+        };
+        let tools = builtin_tools(config);
+        assert_eq!(tools.len(), 14);
+    }
+
+    #[test]
+    fn builtin_tools_allowlist_bash_gated() {
+        // Even if allowlist includes bash, dangerous_tools=false prevents it
+        let config = BuiltinToolsConfig {
+            dangerous_tools: false,
+            allowlist: Some(vec!["bash".into()]),
+            ..Default::default()
+        };
+        let tools = builtin_tools(config);
+        assert_eq!(tools.len(), 0);
     }
 }

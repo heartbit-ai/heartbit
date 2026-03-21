@@ -1185,8 +1185,8 @@ impl<'a> RuntimeBuilder<'a> {
             }
             let agent = &self.config.agents[agent_index];
 
-            // Load tools: builtins + (cached or fresh) MCP + A2A
-            let mut tools = builtins.clone();
+            // Load tools: builtins (filtered per-agent) + (cached or fresh) MCP + A2A
+            let mut tools = filter_builtins_for_agent(&builtins, agent.builtin_tools.as_deref());
             match self.pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
                 Some(cached) => tools.extend(cached.iter().cloned()),
                 None => {
@@ -1642,7 +1642,7 @@ impl<'a> RuntimeBuilder<'a> {
         }
 
         for agent in &self.config.agents {
-            let mut tools = builtins.clone();
+            let mut tools = filter_builtins_for_agent(&builtins, agent.builtin_tools.as_deref());
             match self.pre_loaded_tools.and_then(|c| c.get(&agent.name)) {
                 Some(cached) => tools.extend(cached.iter().cloned()),
                 None => {
@@ -1774,6 +1774,27 @@ impl<'a> RuntimeBuilder<'a> {
         let mut orchestrator = builder.build()?;
         let output = orchestrator.run(&task_text).await?;
         Ok(output)
+    }
+}
+
+/// Filter builtins per-agent based on an optional allowlist.
+/// When `None`, all builtins are returned (backward compatible).
+/// When `Some(list)`, only named tools are included. Empty list → no builtins.
+fn filter_builtins_for_agent(
+    builtins: &[Arc<dyn Tool>],
+    allowlist: Option<&[String]>,
+) -> Vec<Arc<dyn Tool>> {
+    match allowlist {
+        Some([]) => Vec::new(),
+        Some(allowed) => {
+            let set: std::collections::HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+            builtins
+                .iter()
+                .filter(|t| set.contains(t.definition().name.as_str()))
+                .cloned()
+                .collect()
+        }
+        None => builtins.to_vec(),
     }
 }
 

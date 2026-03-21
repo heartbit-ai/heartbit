@@ -40,6 +40,28 @@ use crate::agent::permission::PermissionRule;
 use crate::agent::tool_filter::ToolProfile;
 use crate::llm::types::ReasoningEffort;
 
+/// Known builtin tool names for validation of `builtin_tools` allowlists.
+pub const KNOWN_BUILTINS: &[&str] = &[
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "glob",
+    "list",
+    "patch",
+    "webfetch",
+    "websearch",
+    "image_generate",
+    "tts",
+    "skill",
+    "todoread",
+    "todowrite",
+    "question",
+    "twitter_post",
+    "todo_manage",
+];
+
 /// Sensory modality — the type of information a sensor captures.
 ///
 /// Defined in config so it's always available for TOML deserialization
@@ -551,6 +573,18 @@ impl HeartbitConfig {
                         agent.name, profile
                     ))
                 })?;
+            }
+            if let Some(ref bt) = agent.builtin_tools {
+                for name in bt {
+                    if !KNOWN_BUILTINS.contains(&name.as_str()) {
+                        return Err(Error::Config(format!(
+                            "agent '{}': unknown builtin tool '{}'; known builtins: {}",
+                            agent.name,
+                            name,
+                            KNOWN_BUILTINS.join(", ")
+                        )));
+                    }
+                }
             }
         }
 
@@ -4708,5 +4742,65 @@ mcp_resources = "none"
         assert!(parse_workflow_type("").is_err());
         assert!(parse_workflow_type("unknown").is_err());
         assert!(parse_workflow_type("rm -rf /").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_builtin() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "researcher"
+description = "Research specialist"
+builtin_tools = ["websearch", "nonexistent"]
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown builtin tool 'nonexistent'"),
+            "expected unknown builtin error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn agent_config_builtin_tools_deserialization() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "researcher"
+description = "Research specialist"
+builtin_tools = ["websearch", "webfetch"]
+
+[[agents]]
+name = "publisher"
+description = "Publisher"
+builtin_tools = []
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            config.agents[0].builtin_tools,
+            Some(vec!["websearch".into(), "webfetch".into()])
+        );
+        assert_eq!(config.agents[1].builtin_tools, Some(vec![]));
+    }
+
+    #[test]
+    fn agent_config_builtin_tools_absent_is_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "researcher"
+description = "Research specialist"
+"#;
+        let config = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(config.agents[0].builtin_tools, None);
     }
 }

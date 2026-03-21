@@ -398,6 +398,11 @@ pub struct AgentConfig {
     /// MetadataOnly strips user content from audit records.
     #[serde(default)]
     pub audit_mode: Option<String>,
+    /// Optional allowlist of builtin tool names for this agent.
+    /// When set, only listed builtins are included. When absent, all builtins load.
+    /// Empty list `[]` disables all builtins (MCP-only agent).
+    #[serde(default)]
+    pub builtin_tools: Option<Vec<String>>,
 }
 
 /// TOML representation of session pruning configuration.
@@ -467,6 +472,7 @@ impl AgentConfig {
             mcp_resources: self.mcp_resources,
             dangerous_tools: self.dangerous_tools,
             audit_mode: self.audit_mode.clone(),
+            builtin_tools: self.builtin_tools.clone(),
         }
     }
 }

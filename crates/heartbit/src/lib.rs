@@ -176,13 +176,14 @@ pub use config::{
     AgentProviderConfig, AuthConfig, BehavioralConfig, BehavioralRuleConfig, CascadeConfig,
     CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig,
     DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
-    HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KafkaConfig, KnowledgeConfig,
-    KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry, MemoryConfig, MetricsConfig,
-    OrchestratorConfig, PiiConfig, RetryProviderConfig, SalienceConfig, ScheduleEntry,
-    SecretPatternConfig, SecretScanConfig, SensorConfig, SensorModality, SensorRoutingConfig,
-    SensorSourceConfig, SessionPruneConfigToml, SpawnConfig, StoryCorrelationConfig,
-    TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig,
-    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile, parse_workflow_type,
+    HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KNOWN_BUILTINS, KafkaConfig,
+    KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry,
+    MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig, RetryProviderConfig,
+    SalienceConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig, SensorConfig,
+    SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, SpawnConfig,
+    StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
+    ToolPolicyRuleConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
+    parse_workflow_type,
 };
 
 // --- Auth re-exports (feature-gated) ---

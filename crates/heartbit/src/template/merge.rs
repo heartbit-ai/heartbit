@@ -166,6 +166,7 @@ pub(super) fn apply_template(config: &AgentConfig, template: &AgentTemplate) -> 
             template.agent.dangerous_tools.unwrap_or(false)
         },
         audit_mode: config.audit_mode.clone(),
+        builtin_tools: config.builtin_tools.clone(),
         // Template-only fields: pass through
         template: None,     // Already resolved
         skills: Vec::new(), // Already injected
@@ -209,6 +210,7 @@ mod tests {
             mcp_resources: Default::default(),
             dangerous_tools: false,
             audit_mode: None,
+            builtin_tools: None,
             template: None,
             skills: vec![],
         }
