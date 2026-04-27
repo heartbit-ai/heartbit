@@ -59,7 +59,7 @@ pub(crate) fn validate_bearer_token(
     match auth_header {
         Some(value) if value.starts_with("Bearer ") => {
             let token = &value[7..];
-            if token.is_empty() || !tokens.contains(token) {
+            if token.is_empty() || !heartbit::auth::ct::contains(tokens, token) {
                 Err((StatusCode::UNAUTHORIZED, "invalid bearer token"))
             } else {
                 Ok(())
@@ -263,5 +263,22 @@ mod auth_tests {
         let result = resolve_auth_tokens(&["shared-key".into()], Some("shared-key".into()));
         let tokens = result.unwrap();
         assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn validate_bearer_rejects_equal_length_different_token() {
+        let mut tokens = HashSet::new();
+        tokens.insert("aaaaaaaa".to_string());
+        // Same length, different content — must reject.
+        let res = validate_bearer_token(Some("Bearer bbbbbbbb"), &tokens);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn validate_bearer_accepts_known_token() {
+        let mut tokens = HashSet::new();
+        tokens.insert("hunter2".to_string());
+        let res = validate_bearer_token(Some("Bearer hunter2"), &tokens);
+        assert!(res.is_ok());
     }
 }
