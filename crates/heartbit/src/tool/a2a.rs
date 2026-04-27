@@ -430,13 +430,17 @@ impl A2aClient {
     }
 
     async fn connect_internal(base_url: &str, auth_header: Option<String>) -> Result<Self, Error> {
-        let client = reqwest::Client::builder()
+        let client = crate::http::safe_client_builder()
             .timeout(REQUEST_TIMEOUT)
             .build()?;
 
         let card_url = format!("{}{}", base_url.trim_end_matches('/'), AGENT_CARD_PATH);
 
-        let mut builder = client.get(&card_url);
+        let safe = crate::http::SafeUrl::parse(&card_url, crate::http::IpPolicy::default())
+            .await
+            .map_err(|e| Error::A2a(format!("peer URL refused: {e}")))?;
+
+        let mut builder = client.get(safe.as_str());
         if let Some(ref auth) = auth_header {
             builder = builder.header("Authorization", auth);
         }

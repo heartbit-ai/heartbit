@@ -46,7 +46,7 @@ impl Sensor for RssSensor {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
+            let client = crate::http::safe_client_builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("heartbit-sensor/0.1")
                 .build()
@@ -132,8 +132,11 @@ struct FeedItem {
 
 /// Fetch and parse an RSS or Atom feed, returning extracted items.
 async fn fetch_and_parse_feed(client: &reqwest::Client, url: &str) -> Result<Vec<FeedItem>, Error> {
+    let safe = crate::http::SafeUrl::parse(url, crate::http::IpPolicy::default())
+        .await
+        .map_err(|e| Error::Sensor(format!("rejecting feed URL {url}: {e}")))?;
     let response = client
-        .get(url)
+        .get(safe.as_str())
         .send()
         .await
         .map_err(|e| Error::Sensor(format!("HTTP request failed for {url}: {e}")))?;

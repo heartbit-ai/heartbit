@@ -50,7 +50,7 @@ impl TwitterPostTool {
     pub fn new(credentials: TwitterCredentials) -> Self {
         Self {
             credentials,
-            client: reqwest::Client::builder()
+            client: crate::http::vendor_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build reqwest client"),

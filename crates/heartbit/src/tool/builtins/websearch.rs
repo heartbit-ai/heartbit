@@ -31,7 +31,7 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::http::vendor_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build reqwest client"),
@@ -44,7 +44,7 @@ impl WebSearchTool {
     #[allow(dead_code)] // Public API — not yet re-exported from lib.rs
     pub fn with_provider(provider: SearchProvider) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::http::vendor_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build reqwest client"),

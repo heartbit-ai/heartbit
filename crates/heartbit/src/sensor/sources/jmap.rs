@@ -211,7 +211,7 @@ impl Sensor for JmapEmailSensor {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
+            let client = crate::http::vendor_client_builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("heartbit-sensor/0.1")
                 .build()
