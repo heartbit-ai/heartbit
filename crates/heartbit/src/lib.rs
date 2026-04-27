@@ -86,7 +86,9 @@ pub mod sandbox;
 pub mod lsp;
 
 // --- Feature-gated modules ---
-#[cfg(any(feature = "daemon", feature = "vault"))]
+// `auth` is unconditional: `auth::ct` is a foundational constant-time helper
+// that all builds need access to. `auth::jwt` and `auth::vault` remain gated
+// inside `auth/mod.rs`.
 pub mod auth;
 #[cfg(feature = "daemon")]
 pub mod daemon;
