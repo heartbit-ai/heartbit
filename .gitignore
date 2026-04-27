@@ -24,6 +24,9 @@ gateway/config.yaml
 # Model cache (fastembed ONNX models)
 .fastembed_cache/
 
+# Git worktrees (used by superpowers workflow)
+.worktrees/
+
 # Scratch / test artifacts
 orchestrated.txt
 probe.txt
