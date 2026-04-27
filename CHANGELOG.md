@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- `WebFetchTool` now refuses requests to private/loopback/link-local IPs by
+  default (loopback, link-local incl. cloud IMDS at `169.254.169.254`,
+  RFC1918, CGNAT, ULA, multicast, unspecified, broadcast). HTTP redirects
+  are no longer followed (a 302 to a private IP is surfaced as a 302
+  response, not silently followed). Set `HEARTBIT_ALLOW_PRIVATE_IPS=1` or
+  pass `IpPolicy::AllowPrivate` via `WebFetchTool::with_ip_policy` for
+  single-tenant deployments that legitimately need internal-network access.
+
 ## [2026.228.3] - 2026-02-28
 
 ### Fixed

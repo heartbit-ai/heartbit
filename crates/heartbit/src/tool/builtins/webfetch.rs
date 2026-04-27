@@ -14,16 +14,35 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 
 pub struct WebFetchTool {
     client: reqwest::Client,
+    ip_policy: crate::http::IpPolicy,
 }
 
 impl WebFetchTool {
+    /// Construct with `IpPolicy::default()` — `Strict` unless
+    /// `HEARTBIT_ALLOW_PRIVATE_IPS=1` is set in the environment.
     pub fn new() -> Self {
+        Self::with_ip_policy(crate::http::IpPolicy::default())
+    }
+
+    /// Construct with an explicit IP policy.
+    ///
+    /// Use `IpPolicy::AllowPrivate` only for single-tenant / dev
+    /// deployments where the agent legitimately needs to access internal
+    /// services.
+    pub fn with_ip_policy(ip_policy: crate::http::IpPolicy) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::http::safe_client_builder()
                 .user_agent("heartbit/0.1")
                 .build()
                 .expect("failed to build reqwest client"),
+            ip_policy,
         }
+    }
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -77,17 +96,15 @@ impl Tool for WebFetchTool {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .min(MAX_TIMEOUT_SECS);
 
-            // Validate URL scheme to prevent file:// and other non-HTTP access
-            let url_lower = url.to_ascii_lowercase();
-            if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
-                return Ok(ToolOutput::error(
-                    "Only http:// and https:// URLs are supported.",
-                ));
-            }
+            // Validate scheme + private-IP blocklist via crate::http::SafeUrl.
+            let safe_url = match crate::http::SafeUrl::parse(url, self.ip_policy).await {
+                Ok(u) => u,
+                Err(e) => return Ok(ToolOutput::error(e.to_string())),
+            };
 
             let response = self
                 .client
-                .get(url)
+                .get(safe_url.as_str())
                 .timeout(std::time::Duration::from_secs(timeout_secs))
                 .send()
                 .await
@@ -318,7 +335,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("http://"));
+        assert!(
+            result.content.contains("scheme") || result.content.contains("invalid URL"),
+            "got: {}",
+            result.content,
+        );
     }
 
     #[tokio::test]
@@ -329,7 +350,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("http://"));
+        assert!(
+            result.content.contains("scheme") || result.content.contains("invalid URL"),
+            "got: {}",
+            result.content,
+        );
     }
 
     #[test]
@@ -348,6 +373,81 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("http://"));
+        assert!(
+            result.content.contains("scheme") || result.content.contains("invalid URL"),
+            "got: {}",
+            result.content,
+        );
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_loopback() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": "http://127.0.0.1/"}))
+            .await
+            .unwrap();
+        assert!(result.is_error, "loopback must be rejected by default");
+        assert!(
+            result.content.contains("private/loopback"),
+            "rejection message should explain why; got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_imds() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": "http://169.254.169.254/latest/meta-data/"}))
+            .await
+            .unwrap();
+        assert!(result.is_error, "AWS/GCE IMDS must be rejected");
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_rfc1918() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": "http://10.0.0.1/"}))
+            .await
+            .unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_localhost_dns() {
+        let tool = WebFetchTool::new();
+        let result = tool
+            .execute(json!({"url": "http://localhost/"}))
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "localhost (resolves to 127.0.0.1/::1) must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn webfetch_with_allow_private_ips_does_not_reject_loopback() {
+        // Use with_ip_policy directly; do NOT mutate global env in tests.
+        let tool = WebFetchTool::with_ip_policy(crate::http::IpPolicy::AllowPrivate);
+        // The address won't resolve to anything reachable, so the request
+        // itself fails — but it should NOT fail with the SSRF rejection.
+        // The request-level failure may surface as either
+        // `Ok(ToolOutput::error(..))` or `Err(Error::Agent(..))`; either way
+        // the message must NOT contain the private-IP rejection text.
+        let outcome = tool.execute(json!({"url": "http://127.0.0.1:1/"})).await;
+        let message = match outcome {
+            Ok(out) => {
+                assert!(out.is_error, "request to closed port should error");
+                out.content
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !message.contains("private/loopback"),
+            "AllowPrivate should bypass the SSRF rejection; got: {message}",
+        );
     }
 }
