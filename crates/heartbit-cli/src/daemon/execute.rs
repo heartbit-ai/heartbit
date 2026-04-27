@@ -1136,6 +1136,7 @@ mod tests {
                 api_key: "sk-test".into(),
                 model: "claude-sonnet-4-20250514".into(),
                 prompt_caching: false,
+                base_url: None,
             },
             mcp_servers: vec![],
             builtin_tools: vec![],
@@ -1146,6 +1147,7 @@ mod tests {
             orchestrator: None,
             workflow: None,
             initial_content: vec![],
+            twitter_credentials: None,
         }
     }
 
@@ -1485,6 +1487,7 @@ mod tests {
             api_key: "sk-test".into(),
             model: "claude-sonnet-4-20250514".into(),
             prompt_caching: false,
+            base_url: None,
         });
         let result = super::build_workflow_agent(&sub, provider, None, None, None).await;
         assert!(result.is_ok());
