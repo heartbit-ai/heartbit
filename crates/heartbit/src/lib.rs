@@ -70,6 +70,7 @@ pub mod channel;
 pub mod config;
 pub mod error;
 pub mod eval;
+pub mod http;
 pub mod knowledge;
 pub mod llm;
 pub mod memory;
