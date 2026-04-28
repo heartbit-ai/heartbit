@@ -28,7 +28,10 @@ jobs:
         run: cargo fmt -- --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo test (compile only)
+        run: cargo test --workspace --no-run
+
+      - name: cargo test (lib)
+        run: cargo test --workspace --lib
