@@ -600,13 +600,13 @@ mod tests {
         let mut completed_task = None;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Ok((tasks, _)) = store.list(10, 0) {
-                if let Some(t) = tasks.iter().find(|t| {
+            if let Ok((tasks, _)) = store.list(10, 0)
+                && let Some(t) = tasks.iter().find(|t| {
                     t.source == "heartbit" && t.state == super::super::types::TaskState::Completed
-                }) {
-                    completed_task = Some(t.clone());
-                    break;
-                }
+                })
+            {
+                completed_task = Some(t.clone());
+                break;
             }
         }
 

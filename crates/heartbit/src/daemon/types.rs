@@ -537,16 +537,18 @@ mod tests {
 
     #[test]
     fn task_stats_serde_roundtrip() {
-        let mut stats = TaskStats::default();
-        stats.total_tasks = 10;
+        let mut stats = TaskStats {
+            total_tasks: 10,
+            active_tasks: 3,
+            total_input_tokens: 5000,
+            total_output_tokens: 2000,
+            total_estimated_cost_usd: 1.23,
+            ..TaskStats::default()
+        };
         stats
             .tasks_by_state
             .insert(TaskState::Running.as_str().into(), 3);
         stats.tasks_by_source.insert("api".into(), 7);
-        stats.active_tasks = 3;
-        stats.total_input_tokens = 5000;
-        stats.total_output_tokens = 2000;
-        stats.total_estimated_cost_usd = 1.23;
 
         let json = serde_json::to_string(&stats).unwrap();
         let parsed: TaskStats = serde_json::from_str(&json).unwrap();

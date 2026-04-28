@@ -312,10 +312,12 @@ mod tests {
     use super::super::ChannelCommandProducer;
     use super::*;
 
-    fn mock_producer() -> (
+    type MockProducerHandle = (
         Arc<dyn CommandProducer>,
         tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
-    ) {
+    );
+
+    fn mock_producer() -> MockProducerHandle {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (Arc::new(ChannelCommandProducer { tx }), rx)
     }

@@ -4740,10 +4740,10 @@ async fn kafka_source_rss_sensor_produces_events() {
     // Consume events from the sensor's Kafka topic, filtering by our sensor name
     let mut events = Vec::new();
     while let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await {
-        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-            if event.sensor_name == "test_rss_source" {
-                events.push(event);
-            }
+        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == "test_rss_source"
+        {
+            events.push(event);
         }
     }
 
@@ -4917,10 +4917,10 @@ async fn kafka_source_webhook_sensor_build_and_produce() {
     // Consume and verify
     let mut events = Vec::new();
     for _ in 0..3 {
-        if let Some(payload) = consume_one(&consumer, Duration::from_secs(5)).await {
-            if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-                events.push(event);
-            }
+        if let Some(payload) = consume_one(&consumer, Duration::from_secs(5)).await
+            && let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+        {
+            events.push(event);
         }
     }
 
@@ -5041,54 +5041,53 @@ async fn kafka_full_pipeline_rss_source_to_commands() {
     let mut decision = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        if let Some(payload) = consume_one(&triage_consumer, Duration::from_secs(3)).await {
-            if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-                if event.sensor_name == "fullpipe_rss" {
-                    let d = processor.process(&event).await.ok();
-                    if let Some(TriageDecision::Promote {
-                        ref summary,
-                        ref priority,
-                        ref extracted_entities,
-                        estimated_tokens: _,
-                        ..
-                    }) = d
-                    {
-                        let entities: HashSet<String> =
-                            extracted_entities.iter().cloned().collect();
-                        let mut corr = correlator.lock().unwrap_or_else(|e| e.into_inner());
-                        let story_id = corr.correlate_with_links(
-                            &event.id,
-                            &event.sensor_name,
-                            summary,
-                            &entities,
-                            *priority,
-                            &event.related_ids,
-                        );
-                        drop(corr);
+        if let Some(payload) = consume_one(&triage_consumer, Duration::from_secs(3)).await
+            && let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == "fullpipe_rss"
+        {
+            let d = processor.process(&event).await.ok();
+            if let Some(TriageDecision::Promote {
+                ref summary,
+                ref priority,
+                ref extracted_entities,
+                estimated_tokens: _,
+                ..
+            }) = d
+            {
+                let entities: HashSet<String> = extracted_entities.iter().cloned().collect();
+                let story_id = {
+                    let mut corr = correlator.lock().unwrap_or_else(|e| e.into_inner());
+                    corr.correlate_with_links(
+                        &event.id,
+                        &event.sensor_name,
+                        summary,
+                        &entities,
+                        *priority,
+                        &event.related_ids,
+                    )
+                };
 
-                        let cmd = serde_json::json!({
-                            "task": summary,
-                            "source": format!("sensor:{}", event.sensor_name),
-                            "priority": priority,
-                            "story_id": story_id,
-                            "sensor_event_id": event.id,
-                        });
-                        let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
-                        let record = rdkafka::producer::FutureRecord::to(&commands_topic)
-                            .payload(&cmd_bytes)
-                            .key(&event.id);
-                        triage_producer
-                            .send(
-                                record,
-                                rdkafka::util::Timeout::After(Duration::from_secs(5)),
-                            )
-                            .await
-                            .expect("produce command");
-                    }
-                    decision = d;
-                    break;
-                }
+                let cmd = serde_json::json!({
+                    "task": summary,
+                    "source": format!("sensor:{}", event.sensor_name),
+                    "priority": priority,
+                    "story_id": story_id,
+                    "sensor_event_id": event.id,
+                });
+                let cmd_bytes = serde_json::to_vec(&cmd).unwrap();
+                let record = rdkafka::producer::FutureRecord::to(&commands_topic)
+                    .payload(&cmd_bytes)
+                    .key(&event.id);
+                triage_producer
+                    .send(
+                        record,
+                        rdkafka::util::Timeout::After(Duration::from_secs(5)),
+                    )
+                    .await
+                    .expect("produce command");
             }
+            decision = d;
+            break;
         }
     }
 
@@ -5252,10 +5251,10 @@ async fn kafka_source_jmap_sensor_produces_events() {
     // Consume events from the email topic, filtering by our sensor name
     let mut events = Vec::new();
     while let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await {
-        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-            if event.sensor_name == "e2e_jmap_test" {
-                events.push(event);
-            }
+        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == "e2e_jmap_test"
+        {
+            events.push(event);
         }
     }
 
@@ -5348,18 +5347,17 @@ async fn kafka_source_weather_sensor_produces_events() {
     let mut found = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await {
-            if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-                if event.sensor_name == sensor_name {
-                    let decision = triage.process(&event).await.expect("triage");
-                    assert!(
-                        decision.is_promote(),
-                        "severe weather should be promoted: {decision:?}"
-                    );
-                    found = true;
-                    break;
-                }
-            }
+        if let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await
+            && let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == sensor_name
+        {
+            let decision = triage.process(&event).await.expect("triage");
+            assert!(
+                decision.is_promote(),
+                "severe weather should be promoted: {decision:?}"
+            );
+            found = true;
+            break;
         }
     }
 
@@ -5430,17 +5428,16 @@ async fn kafka_source_weather_alert_only_drops_normal() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await {
-            if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-                if event.sensor_name == sensor_name {
-                    let decision = triage.process(&event).await.expect("triage");
-                    assert!(
-                        decision.is_drop(),
-                        "normal weather should be dropped: {decision:?}"
-                    );
-                    return;
-                }
-            }
+        if let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await
+            && let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == sensor_name
+        {
+            let decision = triage.process(&event).await.expect("triage");
+            assert!(
+                decision.is_drop(),
+                "normal weather should be dropped: {decision:?}"
+            );
+            return;
         }
     }
     panic!("weather event not found in topic");
@@ -5503,10 +5500,10 @@ async fn kafka_source_audio_sensor_produces_events() {
     // Consume events, filtering by our sensor name
     let mut events = Vec::new();
     while let Some(payload) = consume_one(&consumer, Duration::from_secs(3)).await {
-        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload) {
-            if event.sensor_name == "audio_e2e_test" {
-                events.push(event);
-            }
+        if let Ok(event) = serde_json::from_slice::<SensorEvent>(&payload)
+            && event.sensor_name == "audio_e2e_test"
+        {
+            events.push(event);
         }
     }
 

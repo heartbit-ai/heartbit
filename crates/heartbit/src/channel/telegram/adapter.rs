@@ -805,10 +805,10 @@ mod tests {
         // Simulate bridge1's task completing — it should NOT remove bridge2
         {
             let mut bridges = adapter.active_bridges.write().unwrap();
-            if let Some(current) = bridges.get(&chat_id) {
-                if Arc::ptr_eq(current, &bridge1) {
-                    bridges.remove(&chat_id);
-                }
+            if let Some(current) = bridges.get(&chat_id)
+                && Arc::ptr_eq(current, &bridge1)
+            {
+                bridges.remove(&chat_id);
             }
         }
 
