@@ -97,8 +97,18 @@ impl SafeUrl {
             .ok_or_else(|| Error::Agent("URL has no host".into()))?;
         let port = url.port_or_known_default().unwrap_or(80);
 
+        // `Url::host_str` returns IPv6 hosts surrounded by brackets
+        // (`[::1]`, not `::1`). `IpAddr::from_str` rejects the bracketed
+        // form, so we strip a single matched pair before the literal-IP
+        // check. Without this, every IPv6 URL falls through to the DNS
+        // path and the v6 blocklist is effectively dead code.
+        let bare_host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+
         // Literal IP fast-path.
-        if let Ok(ip) = IpAddr::from_str(host) {
+        if let Ok(ip) = IpAddr::from_str(bare_host) {
             if is_blocked(&ip) {
                 return Err(reject(host));
             }
@@ -106,7 +116,9 @@ impl SafeUrl {
         }
 
         // DNS path: resolve and check every returned address.
-        let addrs = tokio::net::lookup_host((host, port))
+        // Use the bracket-stripped host name for the resolver — `tokio::net::lookup_host`
+        // expects a bare hostname, not the URL host_str format.
+        let addrs = tokio::net::lookup_host((bare_host, port))
             .await
             .map_err(|e| Error::Agent(format!("DNS lookup failed for {host}: {e}")))?;
         let mut any = false;
@@ -158,6 +170,15 @@ fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
 }
 
 fn is_blocked_v6(ip: &Ipv6Addr) -> bool {
+    // IPv4-mapped IPv6 addresses (`::ffff:0:0/96`) embed a v4 address in the
+    // low 32 bits. A literal URL such as `http://[::ffff:127.0.0.1]/` would
+    // otherwise bypass the v4 blocklist via the v6 path. Reduce to v4.
+    //
+    // (The deprecated IPv4-compatible form `::0:0/96`, e.g. `::127.0.0.1`,
+    // is RFC 4291 §2.5.5.1-deprecated and not handled here.)
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_blocked_v4(&v4);
+    }
     ip.is_loopback()
         || ip.is_multicast()
         || ip.is_unspecified()
@@ -390,6 +411,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(safe.as_str(), "http://8.8.8.8/");
+    }
+
+    // ---- SafeUrl::parse — IPv4-mapped IPv6 (`::ffff:0:0/96`) ----
+
+    #[tokio::test]
+    async fn safe_url_rejects_ipv4_mapped_loopback() {
+        // ::ffff:127.0.0.1 must be rejected via the v4 blocklist.
+        assert!(
+            SafeUrl::parse("http://[::ffff:127.0.0.1]/", IpPolicy::Strict)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_url_rejects_ipv4_mapped_imds() {
+        assert!(
+            SafeUrl::parse("http://[::ffff:169.254.169.254]/", IpPolicy::Strict)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_url_rejects_ipv4_mapped_rfc1918() {
+        assert!(
+            SafeUrl::parse("http://[::ffff:10.0.0.1]/", IpPolicy::Strict)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_url_accepts_ipv4_mapped_public() {
+        // ::ffff:8.8.8.8 should be accepted (mapped to a public v4).
+        // Note: the URL parser normalizes the v6 form to the compact
+        // representation (`::ffff:808:808`); we just assert success.
+        let safe = SafeUrl::parse("http://[::ffff:8.8.8.8]/", IpPolicy::Strict)
+            .await
+            .unwrap();
+        assert!(safe.as_str().starts_with("http://[::ffff:"));
     }
 
     // ---- SafeUrl::parse — DNS resolution ----
