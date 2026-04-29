@@ -173,7 +173,7 @@ impl SessionStore for InMemorySessionStore {
             .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
         let mut list: Vec<Session> = sessions.values().cloned().collect();
         // Most recent first
-        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        list.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         Ok(list)
     }
 

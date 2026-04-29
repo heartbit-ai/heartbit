@@ -158,10 +158,8 @@ fn apply_text_to_field(
 ) {
     match current_tag {
         "title" => *title = text.to_string(),
-        "link" => {
-            if link.is_empty() {
-                *link = text.to_string();
-            }
+        "link" if link.is_empty() => {
+            *link = text.to_string();
         }
         "description" | "summary" | "content" | "content:encoded" => {
             *description = text.to_string();
