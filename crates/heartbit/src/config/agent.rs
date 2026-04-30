@@ -4,15 +4,7 @@ use crate::agent::routing::RoutingMode;
 
 use super::guardrails::GuardrailsConfig;
 
-/// Dispatch mode for orchestrator delegation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchMode {
-    /// All delegated tasks run in parallel via JoinSet (default).
-    Parallel,
-    /// One task at a time. Schema constrains `maxItems: 1` on delegate_task.
-    Sequential,
-}
+pub use heartbit_core::types::DispatchMode;
 
 /// Context window management strategy.
 #[derive(Debug, Clone, Deserialize, PartialEq)]

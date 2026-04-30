@@ -1,5 +1,92 @@
 use serde::{Deserialize, Serialize};
 
+/// Dispatch mode for orchestrator delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchMode {
+    /// All delegated tasks run in parallel via JoinSet (default).
+    Parallel,
+    /// One task at a time. Schema constrains `maxItems: 1` on delegate_task.
+    Sequential,
+}
+
+/// Trust classification for the sender of an external message.
+///
+/// Resolved deterministically from config lists — never LLM-based.
+/// Ordered from least to most trusted; `PartialOrd`/`Ord` follow declaration order.
+///
+/// Defined in core types so it's always available for TOML/JSON deserialization
+/// even when the `sensor` feature is disabled. Re-exported from
+/// `heartbit::config` and `heartbit::sensor::triage::context`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    /// Explicitly blocked sender. Zero action permitted.
+    Quarantined,
+    /// No prior relationship. Read-only access.
+    #[default]
+    Unknown,
+    /// Recognized but not privileged.
+    Known,
+    /// In the priority senders list. May trigger replies (with approval).
+    Verified,
+    /// The system owner. Full access.
+    Owner,
+}
+
+impl TrustLevel {
+    /// Resolve trust level from sender email against config lists.
+    ///
+    /// Priority: Owner > Blocked(Quarantined) > Priority(Verified) > Unknown.
+    /// Matching is case-insensitive.
+    pub fn resolve(
+        sender: Option<&str>,
+        owner_emails: &[String],
+        priority_senders: &[String],
+        blocked_senders: &[String],
+    ) -> Self {
+        let sender = match sender {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return TrustLevel::Unknown,
+        };
+        let lower = sender.to_lowercase();
+
+        if owner_emails
+            .iter()
+            .any(|e| e.trim().to_lowercase() == lower)
+        {
+            return TrustLevel::Owner;
+        }
+        if blocked_senders
+            .iter()
+            .any(|e| e.trim().to_lowercase() == lower)
+        {
+            return TrustLevel::Quarantined;
+        }
+        if priority_senders
+            .iter()
+            .any(|e| e.trim().to_lowercase() == lower)
+        {
+            return TrustLevel::Verified;
+        }
+        TrustLevel::Unknown
+    }
+}
+
+impl std::fmt::Display for TrustLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrustLevel::Quarantined => write!(f, "quarantined"),
+            TrustLevel::Unknown => write!(f, "unknown"),
+            TrustLevel::Known => write!(f, "known"),
+            TrustLevel::Verified => write!(f, "verified"),
+            TrustLevel::Owner => write!(f, "owner"),
+        }
+    }
+}
+
 /// Token usage statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
