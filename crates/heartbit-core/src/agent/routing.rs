@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::events::AgentEvent;
-use crate::Error;
+use crate::error::Error;
 
 /// Pluggable routing strategy for deciding single-agent vs orchestrator dispatch.
 ///

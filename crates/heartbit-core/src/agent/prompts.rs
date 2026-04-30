@@ -32,7 +32,7 @@ You are agent `{name}` with role: {description}.
 ";
 
 /// Replace `{name}` and `{description}` placeholders in the collaboration prompt.
-pub(crate) fn render_collab_prompt(name: &str, description: &str) -> String {
+pub fn render_collab_prompt(name: &str, description: &str) -> String {
     MULTI_AGENT_COLLAB_PROMPT
         .replace("{name}", name)
         .replace("{description}", description)

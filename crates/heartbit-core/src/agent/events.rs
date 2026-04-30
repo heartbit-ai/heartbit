@@ -5,13 +5,13 @@ use crate::tool::builtins::floor_char_boundary;
 
 /// Maximum byte size for event payload strings (LLM text, tool I/O).
 /// Payloads exceeding this are truncated with a `[truncated: N bytes omitted]` suffix.
-pub(crate) const EVENT_MAX_PAYLOAD_BYTES: usize = 65536;
+pub const EVENT_MAX_PAYLOAD_BYTES: usize = 65536;
 
 /// Truncate a string for event payloads. Short strings (≤ `max_bytes`) pass
 /// through unchanged. Long strings are cut at a UTF-8 char boundary with a
 /// `[truncated: N bytes omitted]` suffix appended (the suffix itself is not
 /// counted against `max_bytes`).
-pub(crate) fn truncate_for_event(text: &str, max_bytes: usize) -> String {
+pub fn truncate_for_event(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }

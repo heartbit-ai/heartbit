@@ -8,6 +8,7 @@
 #![allow(unexpected_cfgs)]
 
 // Modules are added one at a time as subsequent tasks move them in.
+pub mod agent;
 pub mod auth;
 pub mod error;
 pub mod http;
