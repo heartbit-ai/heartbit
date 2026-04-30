@@ -75,7 +75,7 @@ pub use heartbit_core::llm;
 pub mod memory;
 pub mod store;
 pub mod template;
-pub mod tool;
+pub use heartbit_core::tool;
 pub(crate) mod util;
 pub use heartbit_core::workspace;
 

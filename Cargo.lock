@@ -1703,7 +1703,6 @@ dependencies = [
 name = "heartbit"
 version = "2026.306.6"
 dependencies = [
- "a2a-sdk",
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
@@ -1784,11 +1783,18 @@ dependencies = [
 name = "heartbit-core"
 version = "2026.306.6"
 dependencies = [
+ "a2a-sdk",
+ "base64 0.22.1",
  "bytes",
  "futures",
+ "glob",
+ "hmac",
+ "jsonschema",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
@@ -1796,6 +1802,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

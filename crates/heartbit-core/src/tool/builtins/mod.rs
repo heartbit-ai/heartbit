@@ -85,7 +85,7 @@ pub(crate) fn resolve_path(
     }
 }
 
-pub(crate) fn floor_char_boundary(text: &str, target: usize) -> usize {
+pub fn floor_char_boundary(text: &str, target: usize) -> usize {
     let mut pos = target.min(text.len());
     while pos > 0 && !text.is_char_boundary(pos) {
         pos -= 1;

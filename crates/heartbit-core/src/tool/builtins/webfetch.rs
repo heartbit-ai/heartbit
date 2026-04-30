@@ -147,7 +147,7 @@ impl Tool for WebFetchTool {
 
             let output = match format {
                 "html" => body,
-                "text" => crate::knowledge::loader::strip_html_tags(&body),
+                "text" => crate::util::strip_html_tags(&body),
                 _ => html_to_markdown(&body),
             };
 

@@ -41,7 +41,6 @@ rdkafka = { workspace = true, optional = true }
 restate-sdk = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 pgvector = { workspace = true, optional = true }
-a2a-sdk = { workspace = true, optional = true }
 cron = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true }
@@ -67,13 +66,13 @@ daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken"]
 sensor = ["daemon", "dep:quick-xml", "dep:sha2", "dep:hex"]
 restate = ["dep:restate-sdk"]
 postgres = ["dep:sqlx", "dep:pgvector"]
-a2a = ["dep:a2a-sdk"]
+a2a = ["heartbit-core/a2a"]
 telegram = ["dep:teloxide"]
 discord = ["dep:tokio-tungstenite"]
 slack = ["dep:tokio-tungstenite"]
 local-embedding = ["dep:fastembed"]
-sandbox = ["dep:landlock"]
-macro = ["dep:heartbit-macro"]
+sandbox = ["dep:landlock", "heartbit-core/sandbox"]
+macro = ["dep:heartbit-macro", "heartbit-core/macro"]
 vault = ["dep:aes-gcm", "dep:argon2", "dep:rand"]
 full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram", "discord", "slack", "vault"]
 

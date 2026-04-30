@@ -26,9 +26,21 @@ tokio-util = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+base64 = { workspace = true }
+glob = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+jsonschema = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+a2a-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = []
+a2a = ["dep:a2a-sdk"]
+# Features inherited from tool/ (gated conditionals in code)
+sandbox = []
+macro = []
