@@ -1784,6 +1784,8 @@ dependencies = [
 name = "heartbit-core"
 version = "2026.306.6"
 dependencies = [
+ "bytes",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -1793,6 +1795,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

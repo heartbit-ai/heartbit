@@ -23,6 +23,9 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 subtle = { workspace = true }
 tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

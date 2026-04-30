@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::time::Duration;
 
 /// LLM provider configuration.
 ///
@@ -110,4 +111,14 @@ fn default_base_delay_ms() -> u64 {
 
 fn default_max_delay_ms() -> u64 {
     30_000
+}
+
+impl From<&RetryProviderConfig> for crate::llm::retry::RetryConfig {
+    fn from(r: &RetryProviderConfig) -> Self {
+        Self {
+            max_retries: r.max_retries,
+            base_delay: Duration::from_millis(r.base_delay_ms),
+            max_delay: Duration::from_millis(r.max_delay_ms),
+        }
+    }
 }

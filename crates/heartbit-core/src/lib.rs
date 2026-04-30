@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod error;
 pub mod http;
+pub mod llm;
 pub mod signal;
 pub mod types;
 pub mod workspace;

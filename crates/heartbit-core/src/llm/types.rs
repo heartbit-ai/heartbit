@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-// Re-export TokenUsage from heartbit-core for backward compatibility
-pub use heartbit_core::types::TokenUsage;
+// Re-export TokenUsage from sibling module for backward compatibility
+pub use crate::types::TokenUsage;
 
 /// Name of the synthetic tool used for structured output.
-pub(crate) const RESPOND_TOOL_NAME: &str = "__respond__";
+pub const RESPOND_TOOL_NAME: &str = "__respond__";
 
 /// Description for the synthetic `__respond__` tool.
-pub(crate) const RESPOND_TOOL_DESCRIPTION: &str = "Produce your final structured response. Call this tool when you \
+pub const RESPOND_TOOL_DESCRIPTION: &str = "Produce your final structured response. Call this tool when you \
      have gathered all necessary information and are ready to return \
      your answer in the required format.";
 

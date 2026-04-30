@@ -27,16 +27,6 @@ impl Default for RetryConfig {
     }
 }
 
-impl From<&crate::config::RetryProviderConfig> for RetryConfig {
-    fn from(r: &crate::config::RetryProviderConfig) -> Self {
-        Self {
-            max_retries: r.max_retries,
-            base_delay: Duration::from_millis(r.base_delay_ms),
-            max_delay: Duration::from_millis(r.max_delay_ms),
-        }
-    }
-}
-
 /// Callback invoked before each retry attempt.
 ///
 /// Parameters: `(attempt: u32, max_retries: u32, delay_ms: u64, error_class: &str)`
@@ -549,19 +539,6 @@ mod tests {
         // Very large attempt number should not panic
         let delay = compute_delay(&config, 50);
         assert_eq!(delay, Duration::from_secs(60)); // capped at max
-    }
-
-    #[test]
-    fn retry_config_from_provider_config() {
-        let provider_config = crate::config::RetryProviderConfig {
-            max_retries: 5,
-            base_delay_ms: 1000,
-            max_delay_ms: 60000,
-        };
-        let config = RetryConfig::from(&provider_config);
-        assert_eq!(config.max_retries, 5);
-        assert_eq!(config.base_delay, Duration::from_millis(1000));
-        assert_eq!(config.max_delay, Duration::from_millis(60000));
     }
 
     #[tokio::test]
