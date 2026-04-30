@@ -255,9 +255,9 @@ pub use lsp::{Diagnostic as LspDiagnostic, LspManager};
 
 // --- Memory re-exports ---
 pub use memory::Confidentiality;
-pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
 #[cfg(feature = "local-embedding")]
-pub use memory::embedding::LocalEmbeddingProvider;
+pub use memory::LocalEmbeddingProvider;
+pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
 pub use memory::embedding::{EmbeddingMemory, EmbeddingProvider, NoopEmbedding, OpenAiEmbedding};
 pub use memory::hybrid::{cosine_similarity, rrf_fuse};
 pub use memory::in_memory::InMemoryStore;

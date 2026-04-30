@@ -4,13 +4,11 @@ pub mod embedding;
 pub mod hybrid;
 pub mod in_memory;
 pub mod namespaced;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod pruning;
 pub mod reflection;
 pub mod scoring;
-pub(crate) mod shared_tools;
-pub(crate) mod tools;
+pub mod shared_tools;
+pub mod tools;
 
 use std::future::Future;
 use std::pin::Pin;

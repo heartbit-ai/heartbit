@@ -33,6 +33,7 @@ walkdir = { workspace = true }
 jsonschema = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }
+chrono = { workspace = true }
 a2a-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]

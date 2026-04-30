@@ -12,6 +12,7 @@ pub mod auth;
 pub mod error;
 pub mod http;
 pub mod llm;
+pub mod memory;
 pub mod signal;
 pub mod tool;
 pub mod types;
