@@ -4,7 +4,7 @@ use crate::agent::routing::RoutingMode;
 
 use super::guardrails::GuardrailsConfig;
 
-pub use heartbit_core::types::DispatchMode;
+pub use heartbit_core::types::{DispatchMode, SpawnConfig};
 
 /// Context window management strategy.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -104,47 +104,6 @@ pub struct OrchestratorConfig {
     /// Dynamic agent spawning configuration. When present, enables the `spawn_agent`
     /// tool on the orchestrator, allowing the LLM to create specialist agents at runtime.
     pub spawn: Option<SpawnConfig>,
-}
-
-/// Configuration for dynamic agent spawning via `spawn_agent`.
-///
-/// Controls security boundaries: which tools spawned agents may use,
-/// how many can be created, and their token budgets.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpawnConfig {
-    /// Maximum number of agents that can be spawned per orchestrator run.
-    #[serde(default = "default_max_spawned_agents")]
-    pub max_spawned_agents: u32,
-    /// Allowlist of tool names that spawned agents may use.
-    /// Only builtin tools from this list are available; unknown names
-    /// are rejected at build time.
-    #[serde(default)]
-    pub tool_allowlist: Vec<String>,
-    /// Maximum turns per spawned agent.
-    #[serde(default = "default_spawn_max_turns")]
-    pub max_turns: usize,
-    /// Maximum tokens per LLM call for spawned agents.
-    #[serde(default = "default_spawn_max_tokens")]
-    pub max_tokens: u32,
-    /// Cumulative token budget across ALL spawned agents in a single run.
-    #[serde(default = "default_max_total_tokens")]
-    pub max_total_tokens: u64,
-}
-
-fn default_max_spawned_agents() -> u32 {
-    3
-}
-
-fn default_spawn_max_turns() -> usize {
-    15
-}
-
-fn default_spawn_max_tokens() -> u32 {
-    4096
-}
-
-fn default_max_total_tokens() -> u64 {
-    50_000
 }
 
 pub(super) fn default_max_turns() -> usize {

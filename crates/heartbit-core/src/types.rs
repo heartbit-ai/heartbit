@@ -120,6 +120,51 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
+/// Configuration for dynamic agent spawning via `spawn_agent`.
+///
+/// Controls security boundaries: which tools spawned agents may use,
+/// how many can be created, and their token budgets.
+///
+/// Defined in core types so the agent core can reference it without
+/// pulling in the umbrella's full config module. Re-exported from
+/// `heartbit::config`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpawnConfig {
+    /// Maximum number of agents that can be spawned per orchestrator run.
+    #[serde(default = "default_max_spawned_agents")]
+    pub max_spawned_agents: u32,
+    /// Allowlist of tool names that spawned agents may use.
+    /// Only builtin tools from this list are available; unknown names
+    /// are rejected at build time.
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
+    /// Maximum turns per spawned agent.
+    #[serde(default = "default_spawn_max_turns")]
+    pub max_turns: usize,
+    /// Maximum tokens per LLM call for spawned agents.
+    #[serde(default = "default_spawn_max_tokens")]
+    pub max_tokens: u32,
+    /// Cumulative token budget across ALL spawned agents in a single run.
+    #[serde(default = "default_max_total_tokens")]
+    pub max_total_tokens: u64,
+}
+
+fn default_max_spawned_agents() -> u32 {
+    3
+}
+
+fn default_spawn_max_turns() -> usize {
+    15
+}
+
+fn default_spawn_max_tokens() -> u32 {
+    4096
+}
+
+fn default_max_total_tokens() -> u64 {
+    50_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
