@@ -14,6 +14,7 @@ pub mod http;
 pub mod llm;
 pub mod memory;
 pub mod signal;
+pub mod store;
 pub mod tool;
 pub mod types;
 pub mod util;

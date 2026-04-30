@@ -1,35 +1,38 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::Error;
+use crate::store::{AuditEntry, TaskRecord};
 
-/// Task record stored in PostgreSQL.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct TaskRecord {
-    pub id: Uuid,
-    pub status: String,
-    pub task_input: String,
-    pub config_name: Option<String>,
-    pub result: Option<String>,
-    pub error: Option<String>,
-    pub token_usage: Option<serde_json::Value>,
-    pub created_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+/// Internal PostgreSQL-specific TaskRecord row with FromRow derive.
+#[derive(Debug, Clone, FromRow)]
+struct PgTaskRecord {
+    id: Uuid,
+    status: String,
+    task_input: String,
+    config_name: Option<String>,
+    result: Option<String>,
+    error: Option<String>,
+    token_usage: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
 }
 
-/// Audit log entry stored in PostgreSQL.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct AuditEntry {
-    pub id: i64,
-    pub task_id: Uuid,
-    pub agent_name: String,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-    pub tokens_in: Option<i32>,
-    pub tokens_out: Option<i32>,
-    pub created_at: DateTime<Utc>,
+impl From<PgTaskRecord> for TaskRecord {
+    fn from(record: PgTaskRecord) -> Self {
+        TaskRecord {
+            id: record.id,
+            status: record.status,
+            task_input: record.task_input,
+            config_name: record.config_name,
+            result: record.result,
+            error: record.error,
+            token_usage: record.token_usage,
+            created_at: record.created_at,
+            completed_at: record.completed_at,
+        }
+    }
 }
 
 /// PostgreSQL store for task tracking and audit logging.
@@ -97,7 +100,7 @@ impl PostgresStore {
         task_input: &str,
         config_name: Option<&str>,
     ) -> Result<TaskRecord, Error> {
-        let record: TaskRecord = sqlx::query_as(
+        let record: PgTaskRecord = sqlx::query_as(
             r#"
             INSERT INTO tasks (id, task_input, config_name)
             VALUES ($1, $2, $3)
@@ -112,7 +115,7 @@ impl PostgresStore {
         .await
         .map_err(|e| Error::Store(format!("failed to create task: {e}")))?;
 
-        Ok(record)
+        Ok(record.into())
     }
 
     /// Update task status and optionally set result/error.
@@ -150,7 +153,7 @@ impl PostgresStore {
 
     /// Get a task by ID.
     pub async fn get_task(&self, id: Uuid) -> Result<Option<TaskRecord>, Error> {
-        let record: Option<TaskRecord> = sqlx::query_as(
+        let record: Option<PgTaskRecord> = sqlx::query_as(
             r#"
             SELECT id, status, task_input, config_name, result, error,
                    token_usage, created_at, completed_at
@@ -162,7 +165,7 @@ impl PostgresStore {
         .await
         .map_err(|e| Error::Store(format!("failed to fetch task: {e}")))?;
 
-        Ok(record)
+        Ok(record.map(|r| r.into()))
     }
 
     /// Write an audit log entry.
