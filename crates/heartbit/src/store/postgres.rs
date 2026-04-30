@@ -35,6 +35,34 @@ impl From<PgTaskRecord> for TaskRecord {
     }
 }
 
+/// Internal PostgreSQL-specific AuditEntry row with FromRow derive.
+#[derive(Debug, Clone, FromRow)]
+struct PgAuditEntry {
+    id: i64,
+    task_id: Uuid,
+    agent_name: String,
+    event_type: String,
+    payload: serde_json::Value,
+    tokens_in: Option<i32>,
+    tokens_out: Option<i32>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<PgAuditEntry> for AuditEntry {
+    fn from(entry: PgAuditEntry) -> Self {
+        AuditEntry {
+            id: entry.id,
+            task_id: entry.task_id,
+            agent_name: entry.agent_name,
+            event_type: entry.event_type,
+            payload: entry.payload,
+            tokens_in: entry.tokens_in,
+            tokens_out: entry.tokens_out,
+            created_at: entry.created_at,
+        }
+    }
+}
+
 /// PostgreSQL store for task tracking and audit logging.
 pub struct PostgresStore {
     pool: PgPool,
@@ -199,7 +227,7 @@ impl PostgresStore {
 
     /// Get audit log entries for a task.
     pub async fn get_audit_log(&self, task_id: Uuid) -> Result<Vec<AuditEntry>, Error> {
-        let entries: Vec<AuditEntry> = sqlx::query_as(
+        let entries: Vec<PgAuditEntry> = sqlx::query_as(
             r#"
             SELECT id, task_id, agent_name, event_type, payload,
                    tokens_in, tokens_out, created_at
@@ -212,7 +240,7 @@ impl PostgresStore {
         .await
         .map_err(|e| Error::Store(format!("failed to fetch audit log: {e}")))?;
 
-        Ok(entries)
+        Ok(entries.into_iter().map(|e| e.into()).collect())
     }
 }
 

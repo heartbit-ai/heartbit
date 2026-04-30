@@ -10,4 +10,4 @@ pub use heartbit_core::store::*;
 pub mod postgres;
 
 #[cfg(feature = "postgres")]
-pub use postgres::{PostgresStore, PostgresAuditTrail};
+pub use postgres::{PostgresAuditTrail, PostgresStore};
