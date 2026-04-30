@@ -6,3 +6,6 @@
 //! is rendered above this on docs.rs.
 
 // Modules are added one at a time as subsequent tasks move them in.
+pub mod error;
+pub mod signal;
+pub mod types;

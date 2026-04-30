@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::llm::types::TokenUsage;
+use crate::types::TokenUsage;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

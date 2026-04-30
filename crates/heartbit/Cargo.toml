@@ -13,6 +13,7 @@ categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 # --- Core (always available) ---
+heartbit-core = { path = "../heartbit-core" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
