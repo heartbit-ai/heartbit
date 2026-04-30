@@ -408,10 +408,10 @@ mod tests {
         let result = loop {
             {
                 let c = cache.lock().await;
-                if let Some(entry) = c.get("file:///test.rs") {
-                    if entry.version > 1 {
-                        break Some(entry.params.clone());
-                    }
+                if let Some(entry) = c.get("file:///test.rs")
+                    && entry.version > 1
+                {
+                    break Some(entry.params.clone());
                 }
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

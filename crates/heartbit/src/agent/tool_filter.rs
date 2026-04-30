@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn classify_conversational_greetings() {
         let names = all_tool_names();
-        let names_ref: Vec<&str> = names.iter().copied().collect();
+        let names_ref: Vec<&str> = names.to_vec();
         assert_eq!(
             classify_query("hello", &names_ref),
             ToolProfile::Conversational
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn classify_standard_file_operations() {
         let names = all_tool_names();
-        let names_ref: Vec<&str> = names.iter().copied().collect();
+        let names_ref: Vec<&str> = names.to_vec();
         assert_eq!(
             classify_query("read the file", &names_ref),
             ToolProfile::Standard
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn classify_full_mcp_tool_mention() {
         let names = all_tool_names();
-        let names_ref: Vec<&str> = names.iter().copied().collect();
+        let names_ref: Vec<&str> = names.to_vec();
         // Mentioning a non-builtin tool name → Full
         assert_eq!(
             classify_query("use slack_send to notify the team", &names_ref),
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn classify_full_multiple_keywords() {
         let names = all_tool_names();
-        let names_ref: Vec<&str> = names.iter().copied().collect();
+        let names_ref: Vec<&str> = names.to_vec();
         // Two or more full keywords → Full
         assert_eq!(
             classify_query("send an email via the integration", &names_ref),
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn classify_standard_long_query() {
         let names = all_tool_names();
-        let names_ref: Vec<&str> = names.iter().copied().collect();
+        let names_ref: Vec<&str> = names.to_vec();
         // Long query without specific keywords → Standard (complexity heuristic)
         let long_query = "I need you to help me understand the architecture of this project and explain how the different components interact with each other. Also explain the data flow between modules and the error handling strategy used throughout the codebase.";
         assert_eq!(

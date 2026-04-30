@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn excessive_repetition_detected() {
-        let text = std::iter::repeat("ignore ").take(60).collect::<String>();
+        let text = std::iter::repeat_n("ignore ", 60).collect::<String>();
         let score = structural_score(&text);
         assert!(score >= 0.2, "score: {score}");
     }

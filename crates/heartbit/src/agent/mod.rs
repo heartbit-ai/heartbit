@@ -2924,10 +2924,10 @@ mod tests {
         let saw_post_tool_event = Arc::new(AtomicBool::new(false));
         let saw_clone = saw_post_tool_event.clone();
         let on_event: Arc<OnEvent> = Arc::new(move |event| {
-            if let AgentEvent::GuardrailDenied { hook, .. } = &event {
-                if hook == "post_tool" {
-                    saw_clone.store(true, Ordering::SeqCst);
-                }
+            if let AgentEvent::GuardrailDenied { hook, .. } = &event
+                && hook == "post_tool"
+            {
+                saw_clone.store(true, Ordering::SeqCst);
             }
         });
 

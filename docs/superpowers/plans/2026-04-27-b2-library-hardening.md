@@ -1574,7 +1574,7 @@ If any is missing, the corresponding task is incomplete.
 These are NOT part of this plan and should NOT be addressed in this round:
 
 - DNS-rebind defense (parse-time only).
-- Triage / un-ignoring of the 78 `#[ignore]`d sensor-E2E tests.
+- Triage / un-ignoring of the 82 `#[ignore]`d sensor-E2E tests.
 - `heartbit-core` sub-crate extraction.
 - Rotation of credentials in the on-disk `.env`.
 - Documentation reorganization (CLAUDE.md / AGENTS.md relocation, getting-started docs).

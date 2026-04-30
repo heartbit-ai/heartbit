@@ -87,7 +87,7 @@ fn scan_and_redact(text: &str, patterns: &[SecretPattern]) -> (String, Vec<Strin
         }
     }
     // Sort by position descending to replace from end.
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.sort_by_key(|m| std::cmp::Reverse(m.0));
     matches.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
     let mut result = text.to_string();

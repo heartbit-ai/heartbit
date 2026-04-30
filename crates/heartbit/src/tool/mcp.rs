@@ -656,6 +656,8 @@ impl TokenExchangeAuthProvider {
                 .timeout(TOKEN_EXCHANGE_TIMEOUT)
                 // Disable redirects — the exchange_url is user-supplied; a redirect to
                 // a private IP would bypass any SSRF blocklist applied at registration.
+                // (See also crate::http::safe_client_builder; this site predates that
+                //  module and is intentionally inline pending consolidation.)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
@@ -1714,6 +1716,8 @@ impl McpClient {
             // Disable redirect following — the MCP server URL is validated before
             // connection (SSRF blocklist), but a redirect to a private IP would bypass
             // that check. Refusing all redirects closes that bypass entirely.
+            // (See also crate::http::safe_client_builder; this site predates that
+            //  module and is intentionally inline pending consolidation.)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 

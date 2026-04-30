@@ -30,7 +30,7 @@ A separate audit item — DNS-rebind defense — was explicitly de-scoped from t
 ## Non-Goals
 
 - DNS-rebind defense. The IP blocklist is parse-time only. An attacker who controls a DNS name can return a public IP at parse time and a private IP at connect time and bypass this design. Documented limitation; deferred.
-- Triage of the 78 `#[ignore]`d tests in `tests/sensor_pipeline_e2e.rs`. They will be made clippy-clean as a side-effect but their `#[ignore]` status is unchanged.
+- Triage of the 82 `#[ignore]`d tests in `tests/sensor_pipeline_e2e.rs`. They will be made clippy-clean as a side-effect but their `#[ignore]` status is unchanged.
 - Extraction of `heartbit-core` sub-crate. Reviewed item 8; deferred.
 - Rotation of credentials in the on-disk `.env` and migration to the vault module. Operator-side action.
 - Documentation reorganization (CLAUDE.md / AGENTS.md relocation, CHANGELOG refresh, getting-started docs). Separate round.
@@ -253,7 +253,7 @@ Modify `.github/workflows/ci.yml` `cargo clippy` and `cargo test` steps to:
 ```
 
 Rationale for `--lib` instead of full `--workspace`:
-- 78 `#[ignore]`d sensor-E2E tests are already skipped by default; not the issue.
+- 82 `#[ignore]`d sensor-E2E tests are already skipped by default; not the issue.
 - Integration tests in the workspace may rely on infrastructure (Postgres, Kafka, live LLM keys) that the CI runner does not have. We don't want the gate to fail for environment reasons.
 - `--no-run` already proves the integration tests *compile*. That's the regression we actually had.
 - Lib tests run completely in-process and are the fast, reliable signal.
@@ -319,12 +319,12 @@ Total: ~5 engineer-hours.
 - **DNS-rebind unaddressed.** Documented in `crate::http` rustdoc with a pointer to the future hardening (B3 round). If a high-value tenant requires this, it can be backfilled by adding a custom `reqwest::dns::Resolve` implementation that filters at connect time.
 - **Sensor sources to `safe_client_builder`.** RSS feeds may be operator-config but are treated as agent-controllable for blast-radius reasons. Operators with legitimate need for internal feeds use `HEARTBIT_ALLOW_PRIVATE_IPS=1`. Documented.
 - **`subtle` becoming a non-optional dep.** Minor SemVer impact; we are pre-1.0 (versioned `2026.x.x`). Not a real concern.
-- **Auto-fix on `tests/sensor_pipeline_e2e.rs`.** That file has 78 `#[ignore]`d tests; auto-fix touches parked code. Acceptable: we are not changing logic, only making it lint-clean. The MutexGuard refactor is a real correctness fix and is worth doing even in parked tests.
+- **Auto-fix on `tests/sensor_pipeline_e2e.rs`.** That file has 82 `#[ignore]`d tests; auto-fix touches parked code. Acceptable: we are not changing logic, only making it lint-clean. The MutexGuard refactor is a real correctness fix and is worth doing even in parked tests.
 
 ## Out-of-Scope
 
 - DNS-rebind defense (deferred to a future B3).
-- Triage of the 78 `#[ignore]`d sensor-E2E tests.
+- Triage of the 82 `#[ignore]`d sensor-E2E tests.
 - `heartbit-core` sub-crate extraction.
 - `.env` rotation and vault adoption (operator-side action).
 - Documentation reorganization (CLAUDE.md / AGENTS.md relocation, CHANGELOG refresh, getting-started docs).

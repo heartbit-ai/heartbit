@@ -1777,7 +1777,7 @@ impl<P: LlmProvider> AgentRunner<P> {
         }
 
         // Sort candidates by score descending
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
         // Fill remaining slots (cap total at max_tools)
         let remaining = max_tools.saturating_sub(selected.len());

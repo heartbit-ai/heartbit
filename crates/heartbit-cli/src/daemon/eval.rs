@@ -260,6 +260,7 @@ mod tests {
                 api_key: "sk-test".into(),
                 model: "claude-sonnet-4-20250514".into(),
                 prompt_caching: false,
+                base_url: None,
             },
             mcp_servers: vec![],
             builtin_tools: vec![],
@@ -270,6 +271,7 @@ mod tests {
             orchestrator: None,
             workflow: None,
             initial_content: vec![],
+            twitter_credentials: None,
         }
     }
 

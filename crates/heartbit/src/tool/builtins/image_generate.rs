@@ -17,7 +17,7 @@ pub struct ImageGenerateTool {
 impl ImageGenerateTool {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::http::vendor_client_builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("failed to build reqwest client"),
