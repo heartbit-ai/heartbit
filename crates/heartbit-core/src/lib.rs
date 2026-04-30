@@ -14,6 +14,7 @@ pub mod error;
 pub mod http;
 pub mod knowledge;
 pub mod llm;
+pub mod lsp;
 pub mod memory;
 pub mod signal;
 pub mod store;

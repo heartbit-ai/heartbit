@@ -82,7 +82,7 @@ pub use heartbit_core::workspace;
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod sandbox;
 
-pub mod lsp;
+pub use heartbit_core::lsp;
 
 // --- Feature-gated modules ---
 // `auth` is unconditional: `auth::ct` is a foundational constant-time helper
