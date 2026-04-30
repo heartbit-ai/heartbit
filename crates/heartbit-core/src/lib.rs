@@ -11,3 +11,4 @@ pub mod error;
 pub mod http;
 pub mod signal;
 pub mod types;
+pub mod workspace;

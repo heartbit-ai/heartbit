@@ -77,7 +77,7 @@ pub mod store;
 pub mod template;
 pub mod tool;
 pub(crate) mod util;
-pub mod workspace;
+pub use heartbit_core::workspace;
 
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod sandbox;

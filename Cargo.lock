@@ -1713,6 +1713,7 @@ dependencies = [
  "fastembed",
  "futures",
  "glob",
+ "heartbit-core",
  "heartbit-macro",
  "hex",
  "hmac",
@@ -1777,6 +1778,21 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "heartbit-core"
+version = "2026.306.6"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

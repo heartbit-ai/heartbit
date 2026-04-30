@@ -24,5 +24,8 @@ reqwest = { workspace = true }
 subtle = { workspace = true }
 tokio-util = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []

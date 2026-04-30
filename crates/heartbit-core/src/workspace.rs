@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::Error;
+use crate::error::Error;
 
 /// An agent's home directory — a persistent location for notes, artifacts,
 /// and intermediate results that survive context window limits.
@@ -73,7 +73,7 @@ impl Workspace {
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. This is needed because `canonicalize()` requires the
 /// path to exist, but we want to resolve paths that don't exist yet.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
         match component {
