@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+subtle = { workspace = true }
 tokio-util = { workspace = true }
 
 [features]
