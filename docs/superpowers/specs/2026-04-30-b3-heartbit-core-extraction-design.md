@@ -256,15 +256,21 @@ pub use memory::embedding::LocalEmbeddingProvider;
 #[cfg(feature = "slack")]    pub use channel::slack::*;
 ```
 
-The current ~75 explicit `pub use agent::audit::{AuditMode, ...}` style lines in the umbrella's `lib.rs` all get deleted — they're maintenance debt that the glob covers wholesale. Any item that should be public in core but *not* re-exported by the umbrella gets demoted (`pub` → `pub(crate)`) in core itself.
+The current ~75 explicit `pub use agent::audit::{AuditMode, ...}` style lines in the umbrella's `lib.rs` **move into `crates/heartbit-core/src/lib.rs`** as part of step 9 (the `agent` move) — they don't get deleted. Specifically: the lines that today read `pub use agent::audit::{AuditMode, ...};` (with `agent` resolving to a sibling module of `lib.rs` inside the same crate) are translated to the equivalent `pub use crate::agent::audit::{AuditMode, ...};` and pasted into `heartbit-core/src/lib.rs`, where `crate` now means `heartbit_core`. The umbrella's glob (`pub use heartbit_core::*;`) then re-exports them, preserving every `heartbit::AgentRunner` / `heartbit::Tool` / etc. flat shortcut that downstream consumers rely on. Any item that is `pub` in core but should *not* be re-exported by the umbrella gets demoted (`pub` → `pub(crate)`) in core itself.
 
 ### Migration Mechanics & Sequencing
 
 **Constraint:** `cargo test --workspace` must pass at the end of every commit on the branch. The B2 work made this gate strictly enforced; B3 must respect it for review hygiene and bisectability.
 
-**Strategy:** ~12 small commits, each green, ordered by dependency depth (leaves first):
+**Per-step forwarding pattern.** Modules in the umbrella that have been moved to core, but whose still-in-umbrella callers reference them via `crate::module::*`, would break compilation between steps. To keep every intermediate commit green without rewriting a fan of import paths in each commit, the umbrella adds a temporary `pub use heartbit_core::module;` line at the top of `crates/heartbit/src/lib.rs` for each module as it moves. Concretely: when step 6 moves `tool/` to core, the umbrella's lib.rs gains `pub use heartbit_core::tool;` so that still-inline `agent/orchestrator.rs` can keep saying `use crate::tool::Tool;` (which now resolves through the umbrella's re-export to `heartbit_core::tool::Tool`). Each move-step adds its own temporary forwarding. At step 10, the umbrella switches to the final `pub use heartbit_core::*;` glob, which subsumes all the explicit per-module forwardings; the explicit lines get deleted in the same step. This pattern adds a few lines per step and removes them all at step 10 — far less churn than rewriting `crate::tool::*` → `heartbit_core::tool::*` in dozens of files per step.
 
-1. **Scaffold `heartbit-core` crate.** Add `crates/heartbit-core/{Cargo.toml, src/lib.rs, README.md}` with placeholder contents (`pub mod placeholder { }` so it compiles). Add to workspace `members`. Verify gate green.
+**Step 9 sub-sequence.** Step 9 (move `agent/` + `channel/{bridge, session, types}`) is by far the largest by diffstat. Bisectability and reviewability suffer if it's monolithic. Sub-divide as: 9a — move `agent` submodules with no inter-agent dependencies (e.g., `agent::audit`, `agent::events`, `agent::permission`, `agent::observability`); 9b — move the orchestration core (`agent::orchestrator`, `agent::runner`, `agent::workflow`, `agent::guardrail`, `agent::guardrails/*`); 9c — move `channel/{bridge, session, types}`. Each sub-step uses the forwarding pattern.
+
+**`git mv` discipline.** A commit that performs `git mv path/foo path/bar` should not also edit `bar`'s contents in the same commit — git's rename detection degrades when an "edit similarity" threshold is crossed, and `git blame` loses the line history. Each move-step is therefore *two* commits when content edits are required: commit-A is `git mv` only (zero content diff); commit-B is the import-path edits in callers and any other content adjustments. This applies particularly to steps 9a–9c.
+
+**Strategy:** ~12 conceptual steps, each green, ordered by dependency depth (leaves first):
+
+1. **Scaffold `heartbit-core` crate.** Add `crates/heartbit-core/{Cargo.toml, src/lib.rs, README.md}` with placeholder contents (`pub mod placeholder { }` so it compiles). Add to workspace `members`. Initial `Cargo.toml` declares only `tokio`, `serde`, `thiserror`, `tracing` workspace deps; **let subsequent move-steps surface dep additions empirically** — when step N's `cargo check -p heartbit-core` fails with "unresolved import", add the missing workspace dep, repeat. This avoids guessing the full dep list ahead of time. Verify gate green.
 
 2. **Move `error.rs` and `signal.rs`.** `git mv` both files; fix umbrella's `pub mod` lines to `pub use heartbit_core::{error, signal};`. Leaf modules — easiest first. Verify gate green.
 
@@ -280,7 +286,7 @@ The current ~75 explicit `pub use agent::audit::{AuditMode, ...}` style lines in
 
 8. **Move `store/` (excluding `postgres.rs`).** Same shape — trait + InMem only. Verify gate.
 
-9. **Move `agent/` and `channel/{bridge, session, types}`.** Largest commit by diffstat. The cross-references inside agent (orchestrator → guardrail → memory → tool) all need rewiring; most of the rewires are mechanical because everything sits inside `heartbit-core::` after this commit, so internal `use crate::tool::Tool` literally still works (just resolved within `heartbit_core` instead of `heartbit`). Verify gate.
+9. **Move `agent/` and `channel/{bridge, session, types}`** — sub-divided as 9a/9b/9c per the *Step 9 sub-sequence* note above. After 9b lands, `crates/heartbit-core/src/lib.rs` also receives the ~75 flat re-export lines (`pub use crate::agent::{AgentRunner, ...};`, `pub use crate::tool::Tool;`, etc.) that today live in the umbrella's `lib.rs`. The umbrella's lib.rs still has its temporary per-module forwardings; the glob switch happens at step 10. Verify gate after each of 9a/9b/9c.
 
 10. **Convert umbrella to thin re-export.** `crates/heartbit/src/lib.rs` becomes ~30 lines (glob + platform-gated mods). Delete the now-redundant ~75 explicit `pub use` lines. Verify gate.
 
