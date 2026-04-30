@@ -1,0 +1,24 @@
+[package]
+name = "heartbit-core"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/heartbit-core"
+description = "The Rust agentic framework — agents, tools, LLM providers, memory, evaluation."
+readme = "README.md"
+keywords = ["agent", "llm", "mcp", "ai", "framework"]
+categories = ["development-tools", "asynchronous"]
+
+[dependencies]
+# Empirical-deps pattern: add a dep here only when a subsequent move-task's
+# `cargo check -p heartbit-core` fails with "unresolved import". Start minimal.
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
