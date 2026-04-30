@@ -70,7 +70,7 @@ pub mod channel;
 pub mod config;
 pub use heartbit_core::{error, http, signal};
 pub mod eval;
-pub mod knowledge;
+pub use heartbit_core::knowledge;
 pub use heartbit_core::llm;
 pub mod memory;
 pub mod store;
