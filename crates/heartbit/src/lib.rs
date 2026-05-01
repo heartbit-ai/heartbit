@@ -67,7 +67,7 @@ extern crate self as heartbit;
 // --- Core modules (always available) ---
 pub use heartbit_core::agent;
 pub mod channel;
-pub mod config;
+pub use heartbit_core::config;
 pub use heartbit_core::{error, http, signal};
 pub mod eval;
 pub use heartbit_core::knowledge;

@@ -4,7 +4,7 @@ use crate::agent::routing::RoutingMode;
 
 use super::guardrails::GuardrailsConfig;
 
-pub use heartbit_core::types::{DispatchMode, SpawnConfig};
+pub use crate::types::{DispatchMode, SpawnConfig};
 
 /// Context window management strategy.
 #[derive(Debug, Clone, Deserialize, PartialEq)]

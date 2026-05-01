@@ -6683,11 +6683,6 @@ mod tests {
         assert!(result.content.contains("System prompt too long"));
     }
 
-    // TODO(b3): re-enable after config moves to core (Task 9d).
-    // `crate::config::HeartbitConfig` does not yet exist in heartbit-core,
-    // so these four tests are gated out of compilation via `#[cfg(any())]`
-    // (always-false cfg). Replace with `#[test]` once config has moved.
-    #[cfg(any())]
     #[test]
     fn spawn_config_validation_rejects_zero_agents() {
         let toml_str = r#"
@@ -6706,7 +6701,6 @@ max_spawned_agents = 0
         );
     }
 
-    #[cfg(any())]
     #[test]
     fn spawn_config_validation_rejects_zero_turns() {
         let toml_str = r#"
@@ -6724,7 +6718,6 @@ max_turns = 0
         );
     }
 
-    #[cfg(any())]
     #[test]
     fn spawn_config_from_toml() {
         let toml_str = r#"
@@ -6748,7 +6741,6 @@ max_total_tokens = 100000
         assert_eq!(spawn.max_total_tokens, 100_000);
     }
 
-    #[cfg(any())]
     #[test]
     fn spawn_disabled_by_default() {
         let toml_str = r#"

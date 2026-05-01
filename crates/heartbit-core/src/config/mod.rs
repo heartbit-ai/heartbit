@@ -90,7 +90,7 @@ impl std::fmt::Display for SensorModality {
     }
 }
 
-pub use heartbit_core::types::TrustLevel;
+pub use crate::types::TrustLevel;
 
 /// Parse a workflow type string into the enum.
 pub fn parse_workflow_type(s: &str) -> Result<crate::agent::workflow::WorkflowType, Error> {
