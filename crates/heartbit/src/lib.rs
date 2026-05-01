@@ -97,9 +97,9 @@ pub mod sensor;
 pub mod workflow;
 
 // --- Channel re-exports (always available — lightweight traits) ---
-pub use channel::bridge::{InteractionBridge, OutboundMessage};
 #[cfg(feature = "postgres")]
-pub use channel::session::PostgresSessionStore;
+pub use channel::PostgresSessionStore;
+pub use channel::bridge::{InteractionBridge, OutboundMessage};
 pub use channel::session::{
     InMemorySessionStore, Session, SessionMessage, SessionRole, SessionStore,
     format_session_context,
