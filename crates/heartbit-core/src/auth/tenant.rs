@@ -54,6 +54,23 @@ impl TenantScope {
     pub fn is_single_tenant(&self) -> bool {
         self.tenant_id.is_empty()
     }
+
+    /// Build a scope from optional audit identity fields. Used by code paths
+    /// that have already extracted `(tenant_id, user_id)` into separate
+    /// `Option<String>` fields (e.g., `AgentRunner.audit_tenant_id` /
+    /// `audit_user_id`). Missing tenant collapses to `single_tenant()`.
+    pub fn from_audit_fields(tenant_id: Option<&str>, user_id: Option<&str>) -> Self {
+        match tenant_id {
+            Some(t) => {
+                let mut scope = Self::new(t);
+                if let Some(u) = user_id {
+                    scope = scope.with_user(u);
+                }
+                scope
+            }
+            None => Self::default(),
+        }
+    }
 }
 
 impl Default for TenantScope {
@@ -99,6 +116,28 @@ mod tests {
         let a = TenantScope::new("acme").with_user("u1");
         let b = TenantScope::new("acme").with_user("u1");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn from_audit_fields_some_tenant_some_user() {
+        let scope = TenantScope::from_audit_fields(Some("acme"), Some("u1"));
+        assert_eq!(scope.tenant_id, "acme");
+        assert_eq!(scope.user_id.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn from_audit_fields_no_tenant_returns_default() {
+        let scope = TenantScope::from_audit_fields(None, Some("u1"));
+        assert!(scope.is_single_tenant());
+        // user_id discarded when there's no tenant — single-tenant default
+        assert!(scope.user_id.is_none());
+    }
+
+    #[test]
+    fn from_audit_fields_some_tenant_no_user() {
+        let scope = TenantScope::from_audit_fields(Some("acme"), None);
+        assert_eq!(scope.tenant_id, "acme");
+        assert!(scope.user_id.is_none());
     }
 
     #[test]

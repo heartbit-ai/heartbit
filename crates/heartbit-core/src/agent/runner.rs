@@ -1636,12 +1636,10 @@ impl<P: LlmProvider> AgentRunner<P> {
     ///
     /// Falls back to single-tenant (empty `tenant_id`) when no audit context is set.
     fn memory_scope(&self) -> crate::auth::TenantScope {
-        let mut scope =
-            crate::auth::TenantScope::new(self.audit_tenant_id.clone().unwrap_or_default());
-        if let Some(ref uid) = self.audit_user_id {
-            scope = scope.with_user(uid.clone());
-        }
-        scope
+        crate::auth::TenantScope::from_audit_fields(
+            self.audit_tenant_id.as_deref(),
+            self.audit_user_id.as_deref(),
+        )
     }
 
     /// Flush key tool results to memory before compaction.

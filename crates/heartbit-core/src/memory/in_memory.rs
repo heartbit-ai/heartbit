@@ -431,9 +431,9 @@ impl Memory for InMemoryStore {
                 }
                 Some(_) => {
                     // Entry exists but belongs to a different tenant — treat as not found.
-                    Err(Error::Memory(format!("memory entry not found: {id}")))
+                    Err(Error::Memory(format!("memory not found: {id}")))
                 }
-                None => Err(Error::Memory(format!("memory entry not found: {id}"))),
+                None => Err(Error::Memory(format!("memory not found: {id}"))),
             }
         })
     }
@@ -2136,6 +2136,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(acme_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_does_not_modify_other_tenant() {
+        let store = InMemoryStore::new();
+        let acme = TenantScope::new("acme");
+        let globex = TenantScope::new("globex");
+
+        store
+            .store(&acme, make_entry("a1", "agent", "original", "fact"))
+            .await
+            .unwrap();
+
+        // Cross-tenant update should fail (entry exists, but in a different tenant).
+        let err = store
+            .update(&globex, "a1", "tampered".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("memory not found"), "got: {err}");
+
+        // Original content survived.
+        let results = store
+            .recall(
+                &acme,
+                MemoryQuery {
+                    agent: Some("agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "original");
     }
 
     #[tokio::test]

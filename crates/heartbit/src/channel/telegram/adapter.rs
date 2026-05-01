@@ -1049,7 +1049,7 @@ mod tests {
             author_tenant_id: None,
         };
         other_ns
-            .store(&TenantScope::default(), entry)
+            .store(&TenantScope::new("tg:456"), entry)
             .await
             .unwrap();
 
