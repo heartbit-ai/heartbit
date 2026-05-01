@@ -167,6 +167,16 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
     let path_policy = config.path_policy;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
+    macro_rules! maybe_policy {
+        ($tool:expr) => {
+            if let Some(ref pp) = path_policy {
+                $tool.with_path_policy(Arc::clone(pp))
+            } else {
+                $tool
+            }
+        };
+    }
+
     if config.dangerous_tools {
         let bash_tool: Arc<dyn Tool> = match &ws {
             Some(path) => {
@@ -177,34 +187,11 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
                 } else {
                     tool
                 };
-                let tool = if let Some(ref pp) = path_policy {
-                    tool.with_path_policy(Arc::clone(pp))
-                } else {
-                    tool
-                };
-                Arc::new(tool)
+                Arc::new(maybe_policy!(tool))
             }
-            None => {
-                let tool = bash::BashTool::new();
-                let tool = if let Some(ref pp) = path_policy {
-                    tool.with_path_policy(Arc::clone(pp))
-                } else {
-                    tool
-                };
-                Arc::new(tool)
-            }
+            None => Arc::new(maybe_policy!(bash::BashTool::new())),
         };
         tools.push(bash_tool);
-    }
-
-    macro_rules! maybe_policy {
-        ($tool:expr) => {
-            if let Some(ref pp) = path_policy {
-                $tool.with_path_policy(Arc::clone(pp))
-            } else {
-                $tool
-            }
-        };
     }
 
     tools.extend([
