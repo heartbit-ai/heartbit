@@ -148,6 +148,28 @@ pub struct MemoryQuery {
 /// Trait for persistent memory stores.
 ///
 /// Uses `Pin<Box<dyn Future>>` for dyn-compatibility, matching the `Tool` trait pattern.
+///
+/// # Example
+///
+/// Recalling memory entries with the in-memory backend:
+///
+/// ```rust,no_run
+/// use heartbit_core::{InMemoryStore, Memory, MemoryQuery};
+///
+/// # async fn run() -> Result<(), heartbit_core::Error> {
+/// let store = InMemoryStore::new();
+/// let hits = store
+///     .recall(MemoryQuery {
+///         agent: Some("assistant".into()),
+///         text: Some("preferences".into()),
+///         ..MemoryQuery::default()
+///     })
+///     .await?;
+/// for entry in hits {
+///     println!("{}: {}", entry.id, entry.content);
+/// }
+/// # Ok(()) }
+/// ```
 pub trait Memory: Send + Sync {
     fn store(
         &self,

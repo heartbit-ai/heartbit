@@ -49,6 +49,39 @@ pub struct SequentialAgentBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> SequentialAgent<P> {
+    /// Create a new [`SequentialAgentBuilder`].
+    ///
+    /// Add agents with `.agent(...)` in execution order; each agent receives
+    /// the previous agent's text output as its task input.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use heartbit_core::{
+    ///     AgentRunner, AnthropicProvider, BoxedProvider, SequentialAgent,
+    /// };
+    ///
+    /// # async fn run() -> Result<(), heartbit_core::Error> {
+    /// let provider = Arc::new(BoxedProvider::new(AnthropicProvider::new(
+    ///     "sk-...",
+    ///     "claude-sonnet-4-20250514",
+    /// )));
+    /// let researcher = AgentRunner::builder(provider.clone())
+    ///     .system_prompt("Summarize the topic in 3 bullet points.")
+    ///     .build()?;
+    /// let writer = AgentRunner::builder(provider)
+    ///     .system_prompt("Rewrite as a single engaging paragraph.")
+    ///     .build()?;
+    ///
+    /// let pipeline = SequentialAgent::builder()
+    ///     .agent(researcher)
+    ///     .agent(writer)
+    ///     .build()?;
+    /// let output = pipeline.execute("History of Rust").await?;
+    /// println!("{}", output.result);
+    /// # Ok(()) }
+    /// ```
     pub fn builder() -> SequentialAgentBuilder<P> {
         SequentialAgentBuilder { agents: Vec::new() }
     }

@@ -63,6 +63,43 @@ impl ToolOutput {
 ///
 /// Uses `Pin<Box<dyn Future>>` return type for dyn-compatibility,
 /// allowing tools to be stored as `Arc<dyn Tool>`.
+///
+/// # Example
+///
+/// Implementing a simple synchronous tool that echoes its input:
+///
+/// ```rust
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use heartbit_core::{Tool, ToolOutput};
+/// use heartbit_core::llm::types::ToolDefinition;
+///
+/// struct EchoTool;
+///
+/// impl Tool for EchoTool {
+///     fn definition(&self) -> ToolDefinition {
+///         ToolDefinition {
+///             name: "echo".into(),
+///             description: "Echo back the input string.".into(),
+///             input_schema: serde_json::json!({
+///                 "type": "object",
+///                 "properties": { "text": { "type": "string" } },
+///                 "required": ["text"]
+///             }),
+///         }
+///     }
+///
+///     fn execute(
+///         &self,
+///         input: serde_json::Value,
+///     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, heartbit_core::Error>> + Send + '_>> {
+///         Box::pin(async move {
+///             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("");
+///             Ok(ToolOutput::success(text.to_string()))
+///         })
+///     }
+/// }
+/// ```
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 

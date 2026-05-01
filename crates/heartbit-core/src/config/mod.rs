@@ -175,7 +175,34 @@ pub struct HeartbitConfig {
 }
 
 impl HeartbitConfig {
-    /// Parse a TOML string into a `HeartbitConfig`.
+    /// Parse a TOML string into a `HeartbitConfig` and validate it.
+    ///
+    /// Returns `Err(Error::Config)` when the TOML is malformed or when a
+    /// field violates an invariant (e.g. zero `max_turns`, missing provider
+    /// when not running in cloud-delegated daemon mode, duplicate agent names).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use heartbit_core::config::HeartbitConfig;
+    ///
+    /// let toml_text = r#"
+    /// [provider]
+    /// name = "anthropic"
+    /// model = "claude-sonnet-4-20250514"
+    ///
+    /// [[agents]]
+    /// name = "assistant"
+    /// description = "A helpful general-purpose assistant."
+    /// system_prompt = "You are a helpful assistant."
+    /// max_turns = 10
+    /// max_tokens = 4096
+    /// "#;
+    ///
+    /// let config = HeartbitConfig::from_toml(toml_text).expect("valid config");
+    /// assert_eq!(config.agents.len(), 1);
+    /// assert_eq!(config.agents[0].name, "assistant");
+    /// ```
     pub fn from_toml(content: &str) -> Result<Self, Error> {
         let config: Self = toml::from_str(content).map_err(|e| Error::Config(e.to_string()))?;
         config.validate()?;
