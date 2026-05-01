@@ -900,7 +900,7 @@ mod tests {
             roles: vec![],
             raw_token: None,
         };
-        let scope: heartbit_core::auth::TenantScope = (&ctx).into();
+        let scope: TenantScope = (&ctx).into();
         assert_eq!(scope.tenant_id, "acme");
         assert_eq!(scope.user_id.as_deref(), Some("u1"));
     }

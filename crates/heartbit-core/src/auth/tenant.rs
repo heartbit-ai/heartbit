@@ -16,18 +16,29 @@ pub struct TenantScope {
 
 impl TenantScope {
     /// Multi-tenant scope from an externally-supplied tenant id (typically
-    /// JWT `tid` claim). Empty strings collapse to `single_tenant()` so a
+    /// JWT `tid` claim). Empty strings delegate to `single_tenant()` so a
     /// dropped scope can never silently widen to all tenants.
     pub fn new(tenant_id: impl Into<String>) -> Self {
+        let tenant_id = tenant_id.into();
+        if tenant_id.is_empty() {
+            return Self::single_tenant();
+        }
         Self {
-            tenant_id: tenant_id.into(),
+            tenant_id,
             user_id: None,
         }
     }
 
-    /// Add a user identity (typically `sub` claim from JWT).
+    /// Add a user identity (typically `sub` claim from JWT). An empty string
+    /// normalizes to `None` so callers can rely on `Some(_)` meaning a
+    /// non-empty identity is present.
     pub fn with_user(mut self, user_id: impl Into<String>) -> Self {
-        self.user_id = Some(user_id.into());
+        let user_id = user_id.into();
+        self.user_id = if user_id.is_empty() {
+            None
+        } else {
+            Some(user_id)
+        };
         self
     }
 
@@ -39,6 +50,7 @@ impl TenantScope {
         }
     }
 
+    /// Returns true if this scope represents single-tenant mode (`tenant_id == ""`).
     pub fn is_single_tenant(&self) -> bool {
         self.tenant_id.is_empty()
     }
@@ -87,5 +99,24 @@ mod tests {
         let a = TenantScope::new("acme").with_user("u1");
         let b = TenantScope::new("acme").with_user("u1");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn new_with_empty_string_produces_canonical_single_tenant() {
+        // After normalization, new("") and single_tenant() should be equal,
+        // not just equivalent under is_single_tenant().
+        assert_eq!(TenantScope::new(""), TenantScope::single_tenant());
+    }
+
+    #[test]
+    fn with_user_empty_string_normalizes_to_none() {
+        let scope = TenantScope::new("acme").with_user("");
+        assert!(scope.user_id.is_none());
+    }
+
+    #[test]
+    fn with_user_overwrites_previous_user_with_none_when_given_empty() {
+        let scope = TenantScope::new("acme").with_user("u1").with_user("");
+        assert!(scope.user_id.is_none());
     }
 }
