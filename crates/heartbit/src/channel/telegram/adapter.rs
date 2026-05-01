@@ -9,6 +9,7 @@ use crate::channel::session::{SessionMessage, SessionRole, SessionStore, format_
 use crate::channel::{ChannelBridge, ConsolidateSession, MediaAttachment, RunTask, RunTaskInput};
 use crate::error::Error;
 use crate::memory::{Memory, MemoryQuery};
+use heartbit_core::auth::TenantScope;
 
 use super::access::AccessControl;
 use super::bridge::TelegramBridge;
@@ -124,9 +125,11 @@ impl TelegramAdapter {
             ..Default::default()
         };
 
+        let user_scope = TenantScope::new(format!("tg:{user_id}"));
+        let inst_scope = TenantScope::default();
         let (user_result, inst_result) = tokio::join!(
-            memory.recall(user_query),
-            memory.recall(institutional_query)
+            memory.recall(&user_scope, user_query),
+            memory.recall(&inst_scope, institutional_query)
         );
 
         let user_entries = user_result.unwrap_or_default();
@@ -638,7 +641,7 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        ns.store(entry).await.unwrap();
+        ns.store(&TenantScope::new("tg:123"), entry).await.unwrap();
 
         // preload_memories uses agent_prefix="tg:123" which matches "tg:123:assistant"
         let adapter = make_adapter(Some(store));
@@ -847,7 +850,7 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        ns.store(entry).await.unwrap();
+        ns.store(&TenantScope::new("tg:123"), entry).await.unwrap();
 
         let config = TelegramConfig {
             dm_policy: super::super::config::DmPolicy::Open,
@@ -903,7 +906,7 @@ mod tests {
                 author_user_id: None,
                 author_tenant_id: None,
             };
-            ns.store(entry).await.unwrap();
+            ns.store(&TenantScope::default(), entry).await.unwrap();
         }
 
         // With limit=3, should return at most 3 entries
@@ -957,7 +960,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        user_ns.store(user_entry).await.unwrap();
+        user_ns
+            .store(&TenantScope::new("tg:123"), user_entry)
+            .await
+            .unwrap();
 
         // Store an institutional memory about a Rust release
         let inst_ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "institutional");
@@ -982,7 +988,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        inst_ns.store(inst_entry).await.unwrap();
+        inst_ns
+            .store(&TenantScope::default(), inst_entry)
+            .await
+            .unwrap();
 
         let adapter = make_adapter(Some(store));
         let ctx = adapter
@@ -1039,7 +1048,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        other_ns.store(entry).await.unwrap();
+        other_ns
+            .store(&TenantScope::default(), entry)
+            .await
+            .unwrap();
 
         // User 123 should NOT see user 456's memories
         let adapter = make_adapter(Some(store));

@@ -1632,6 +1632,18 @@ impl<P: LlmProvider> AgentRunner<P> {
         Ok((final_summary, total_usage))
     }
 
+    /// Build a `TenantScope` from the agent's audit identity fields.
+    ///
+    /// Falls back to single-tenant (empty `tenant_id`) when no audit context is set.
+    fn memory_scope(&self) -> crate::auth::TenantScope {
+        let mut scope =
+            crate::auth::TenantScope::new(self.audit_tenant_id.clone().unwrap_or_default());
+        if let Some(ref uid) = self.audit_user_id {
+            scope = scope.with_user(uid.clone());
+        }
+        scope
+    }
+
     /// Flush key tool results to memory before compaction.
     ///
     /// Extracts non-error tool results exceeding a minimum length from messages
@@ -1688,7 +1700,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                         author_user_id: None,
                         author_tenant_id: None,
                     };
-                    if let Err(e) = memory.store(entry).await {
+                    let scope = self.memory_scope();
+                    if let Err(e) = memory.store(&scope, entry).await {
                         tracing::warn!(
                             agent = %self.name,
                             error = %e,
@@ -1708,8 +1721,10 @@ impl<P: LlmProvider> AgentRunner<P> {
         let Some(ref memory) = self.memory else {
             return;
         };
+        let scope = self.memory_scope();
         match crate::memory::pruning::prune_weak_entries(
             memory,
+            &scope,
             crate::memory::pruning::DEFAULT_MIN_STRENGTH,
             crate::memory::pruning::default_min_age(),
         )
@@ -1741,7 +1756,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             self.provider.clone(),
             &self.name,
         );
-        match pipeline.run().await {
+        let scope = self.memory_scope();
+        match pipeline.run(&scope).await {
             Ok((0, _, usage)) => usage,
             Ok((clusters, entries, usage)) => {
                 tracing::debug!(

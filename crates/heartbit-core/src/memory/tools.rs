@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
@@ -14,13 +15,17 @@ use crate::tool::{Tool, ToolOutput};
 use super::reflection::ReflectionTracker;
 use super::{Memory, MemoryEntry, MemoryQuery};
 
-/// Create the 5 memory tools bound to a specific memory store and agent name.
+/// Create the 5 memory tools bound to a specific memory store, agent name, and tenant scope.
+///
+/// The `scope` is baked into every tool so calls route to the correct tenant
+/// without requiring callers to thread a scope through each individual operation.
 ///
 /// If `reflection_threshold` is set, the store tool will include a reflection
 /// hint when cumulative importance exceeds the threshold.
 pub fn memory_tools_with_reflection(
     memory: Arc<dyn Memory>,
     agent_name: &str,
+    scope: TenantScope,
     reflection_threshold: Option<u32>,
 ) -> Vec<Arc<dyn Tool>> {
     let tracker = reflection_threshold.map(|t| Arc::new(ReflectionTracker::new(t)));
@@ -28,20 +33,25 @@ pub fn memory_tools_with_reflection(
         Arc::new(MemoryStoreTool {
             memory: memory.clone(),
             agent_name: agent_name.into(),
+            scope: scope.clone(),
             reflection_tracker: tracker,
         }),
         Arc::new(MemoryRecallTool {
             memory: memory.clone(),
+            scope: scope.clone(),
         }),
         Arc::new(MemoryUpdateTool {
             memory: memory.clone(),
+            scope: scope.clone(),
         }),
         Arc::new(MemoryForgetTool {
             memory: memory.clone(),
+            scope: scope.clone(),
         }),
         Arc::new(MemoryConsolidateTool {
             memory,
             agent_name: agent_name.into(),
+            scope,
         }),
     ]
 }
@@ -51,6 +61,7 @@ pub fn memory_tools_with_reflection(
 struct MemoryStoreTool {
     memory: Arc<dyn Memory>,
     agent_name: String,
+    scope: TenantScope,
     reflection_tracker: Option<Arc<ReflectionTracker>>,
 }
 
@@ -155,16 +166,19 @@ impl Tool for MemoryStoreTool {
 
             let importance = entry.importance;
             let keywords = entry.keywords.clone();
-            self.memory.store(entry).await?;
+            self.memory.store(&self.scope, entry).await?;
 
             // Link evolution: find related entries by keyword overlap
             if !keywords.is_empty()
                 && let Ok(existing) = self
                     .memory
-                    .recall(MemoryQuery {
-                        limit: 20,
-                        ..Default::default()
-                    })
+                    .recall(
+                        &self.scope,
+                        MemoryQuery {
+                            limit: 20,
+                            ..Default::default()
+                        },
+                    )
                     .await
             {
                 for e in &existing {
@@ -173,7 +187,7 @@ impl Tool for MemoryStoreTool {
                     }
                     let jaccard = super::consolidation::jaccard_similarity(&keywords, &e.keywords);
                     if jaccard >= 0.2 {
-                        let _ = self.memory.add_link(&id, &e.id).await;
+                        let _ = self.memory.add_link(&self.scope, &id, &e.id).await;
                     }
                 }
             }
@@ -193,6 +207,7 @@ impl Tool for MemoryStoreTool {
 
 struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -250,17 +265,20 @@ impl Tool for MemoryRecallTool {
 
             let results = self
                 .memory
-                .recall(MemoryQuery {
-                    text: input.query,
-                    category: input.category,
-                    tags: input.tags,
-                    // agent: None lets NamespacedMemory default to the correct
-                    // compound namespace (e.g. "tg:123:assistant"). Passing the
-                    // plain agent_name would bypass NamespacedMemory's scoping.
-                    agent: None,
-                    limit: input.limit,
-                    ..Default::default()
-                })
+                .recall(
+                    &self.scope,
+                    MemoryQuery {
+                        text: input.query,
+                        category: input.category,
+                        tags: input.tags,
+                        // agent: None lets NamespacedMemory default to the correct
+                        // compound namespace (e.g. "tg:123:assistant"). Passing the
+                        // plain agent_name would bypass NamespacedMemory's scoping.
+                        agent: None,
+                        limit: input.limit,
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
             if results.is_empty() {
@@ -318,6 +336,7 @@ impl Tool for MemoryRecallTool {
 
 struct MemoryUpdateTool {
     memory: Arc<dyn Memory>,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -356,7 +375,9 @@ impl Tool for MemoryUpdateTool {
             let input: UpdateInput =
                 serde_json::from_value(input).map_err(|e| Error::Memory(e.to_string()))?;
 
-            self.memory.update(&input.id, input.content).await?;
+            self.memory
+                .update(&self.scope, &input.id, input.content)
+                .await?;
             Ok(ToolOutput::success(format!("Updated memory: {}", input.id)))
         })
     }
@@ -366,6 +387,7 @@ impl Tool for MemoryUpdateTool {
 
 struct MemoryForgetTool {
     memory: Arc<dyn Memory>,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -399,7 +421,7 @@ impl Tool for MemoryForgetTool {
             let input: ForgetInput =
                 serde_json::from_value(input).map_err(|e| Error::Memory(e.to_string()))?;
 
-            let removed = self.memory.forget(&input.id).await?;
+            let removed = self.memory.forget(&self.scope, &input.id).await?;
             if removed {
                 Ok(ToolOutput::success(format!("Deleted memory: {}", input.id)))
             } else {
@@ -414,6 +436,7 @@ impl Tool for MemoryForgetTool {
 struct MemoryConsolidateTool {
     memory: Arc<dyn Memory>,
     agent_name: String,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -489,10 +512,13 @@ impl Tool for MemoryConsolidateTool {
             // Use a generous limit — consolidation is not a hot path.
             let sources = self
                 .memory
-                .recall(MemoryQuery {
-                    limit: 1000,
-                    ..Default::default()
-                })
+                .recall(
+                    &self.scope,
+                    MemoryQuery {
+                        limit: 1000,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap_or_default();
 
@@ -546,14 +572,14 @@ impl Tool for MemoryConsolidateTool {
                 author_tenant_id: None,
             };
 
-            self.memory.store(entry).await?;
+            self.memory.store(&self.scope, entry).await?;
 
             // Delete source memories, track which were found
             let total = input.source_ids.len();
             let mut deleted = 0;
             let mut not_found = Vec::new();
             for id in &input.source_ids {
-                match self.memory.forget(id).await? {
+                match self.memory.forget(&self.scope, id).await? {
                     true => deleted += 1,
                     false => not_found.push(id.clone()),
                 }
@@ -561,7 +587,7 @@ impl Tool for MemoryConsolidateTool {
 
             if deleted == 0 {
                 // Clean up the orphaned consolidated entry (best-effort)
-                if let Err(e) = self.memory.forget(&new_id).await {
+                if let Err(e) = self.memory.forget(&self.scope, &new_id).await {
                     tracing::warn!(id = %new_id, error = %e, "failed to clean up orphaned consolidation entry");
                 }
                 return Ok(ToolOutput::error(
@@ -586,12 +612,17 @@ impl Tool for MemoryConsolidateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TenantScope;
     use crate::memory::Confidentiality;
     use crate::memory::in_memory::InMemoryStore;
 
+    fn test_scope() -> TenantScope {
+        TenantScope::default()
+    }
+
     fn setup() -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = memory_tools_with_reflection(store.clone(), "test-agent", None);
+        let tools = memory_tools_with_reflection(store.clone(), "test-agent", test_scope(), None);
         (store, tools)
     }
 
@@ -634,10 +665,13 @@ mod tests {
 
         // Verify it's in the store
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -695,10 +729,13 @@ mod tests {
 
         // Get the ID
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let id = &entries[0].id;
@@ -710,10 +747,13 @@ mod tests {
         assert!(!result.is_error);
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].content, "updated");
@@ -731,10 +771,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let id = &entries[0].id;
@@ -744,10 +787,13 @@ mod tests {
         assert!(result.content.contains("Deleted"));
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(entries.is_empty());
@@ -776,10 +822,13 @@ mod tests {
         tool.execute(json!({"content": "test"})).await.unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 5);
@@ -795,10 +844,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 9);
@@ -815,10 +867,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 10);
@@ -918,10 +973,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 2);
@@ -941,10 +999,13 @@ mod tests {
 
         // Should now have 1 entry
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -979,10 +1040,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let real_id = entries[0].id.clone();
@@ -1021,10 +1085,13 @@ mod tests {
 
         // Verify the orphaned consolidated entry was cleaned up
         let all = store
-            .recall(MemoryQuery {
-                limit: 100,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(all.is_empty(), "orphaned entry should have been cleaned up");
@@ -1046,10 +1113,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let id_a = entries[0].id.clone();
@@ -1065,10 +1135,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 9);
@@ -1084,10 +1157,13 @@ mod tests {
         store_tool.execute(json!({"content": "y"})).await.unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let id_x = entries[0].id.clone();
@@ -1102,10 +1178,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].importance, 5); // default
@@ -1135,10 +1214,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
@@ -1153,10 +1235,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -1189,10 +1274,13 @@ mod tests {
         .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1214,10 +1302,13 @@ mod tests {
         .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1278,7 +1369,12 @@ mod tests {
 
     fn setup_with_reflection(threshold: u32) -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = memory_tools_with_reflection(store.clone(), "test-agent", Some(threshold));
+        let tools = memory_tools_with_reflection(
+            store.clone(),
+            "test-agent",
+            test_scope(),
+            Some(threshold),
+        );
         (store, tools)
     }
 
@@ -1362,10 +1458,13 @@ mod tests {
 
         // Check that entries are linked
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1386,10 +1485,13 @@ mod tests {
         tool.execute(json!({"content": "test"})).await.unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1412,10 +1514,13 @@ mod tests {
         .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].confidentiality, Confidentiality::Confidential);
@@ -1435,21 +1540,27 @@ mod tests {
 
         // With no cap, should be found
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries[0].confidentiality, Confidentiality::Restricted);
 
         // With Public cap, should be filtered out
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                max_confidentiality: Some(Confidentiality::Public),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    max_confidentiality: Some(Confidentiality::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -1475,10 +1586,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
@@ -1492,10 +1606,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 1,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -1521,10 +1638,13 @@ mod tests {
             .unwrap();
 
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 

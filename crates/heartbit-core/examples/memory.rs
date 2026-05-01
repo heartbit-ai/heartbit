@@ -6,12 +6,14 @@
 
 use chrono::{Duration, Utc};
 
+use heartbit_core::auth::TenantScope;
 use heartbit_core::memory::Confidentiality;
 use heartbit_core::{InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 #[tokio::main]
 async fn main() -> Result<(), heartbit_core::Error> {
     let store = InMemoryStore::new();
+    let scope = TenantScope::default();
 
     // 1. Store an episodic entry.
     let entry = MemoryEntry {
@@ -35,30 +37,33 @@ async fn main() -> Result<(), heartbit_core::Error> {
         author_user_id: None,
         author_tenant_id: None,
     };
-    store.store(entry).await?;
+    store.store(&scope, entry).await?;
 
     // 2. Recall by keyword. Composite scoring orders the result set by
     //    recency + importance + relevance + strength.
     let hits = store
-        .recall(MemoryQuery {
-            agent: Some("assistant".into()),
-            text: Some("preference".into()),
-            limit: 5,
-            ..MemoryQuery::default()
-        })
+        .recall(
+            &scope,
+            MemoryQuery {
+                agent: Some("assistant".into()),
+                text: Some("preference".into()),
+                limit: 5,
+                ..MemoryQuery::default()
+            },
+        )
         .await?;
     println!("recalled {} entry/entries", hits.len());
 
     // 3. Update the content in place. The entry id is preserved.
     store
-        .update("m1", "User prefers terse, formal responses.".into())
+        .update(&scope, "m1", "User prefers terse, formal responses.".into())
         .await?;
 
     // 4. Prune anything older than 1 hour with strength below 0.1. The
     //    fresh entry above is far above that threshold, so this is a
     //    no-op here — but it's the call you'd schedule periodically in a
     //    long-running deployment.
-    let pruned = store.prune(0.1, Duration::hours(1), None).await?;
+    let pruned = store.prune(&scope, 0.1, Duration::hours(1), None).await?;
     println!("pruned {pruned} weak entries");
 
     Ok(())

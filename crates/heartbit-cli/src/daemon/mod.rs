@@ -631,8 +631,10 @@ pub async fn run_daemon(
                     outcome.user_id.as_deref(),
                     outcome.tenant_id.as_deref(),
                 );
+                let scope =
+                    heartbit::TenantScope::new(outcome.tenant_id.clone().unwrap_or_default());
                 tokio::spawn(async move {
-                    if let Err(e) = memory.store(entry).await {
+                    if let Err(e) = memory.store(&scope, entry).await {
                         tracing::warn!(
                             error = %e,
                             "failed to persist institutional memory"

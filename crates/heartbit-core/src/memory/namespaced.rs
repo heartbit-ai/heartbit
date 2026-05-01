@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::{Confidentiality, Memory, MemoryEntry, MemoryQuery};
@@ -61,6 +62,7 @@ impl NamespacedMemory {
 impl Memory for NamespacedMemory {
     fn store(
         &self,
+        scope: &TenantScope,
         mut entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         entry.id = self.prefix_id(&entry.id);
@@ -72,11 +74,14 @@ impl Memory for NamespacedMemory {
         if entry.confidentiality < self.default_store_confidentiality {
             entry.confidentiality = self.default_store_confidentiality;
         }
-        Box::pin(async move { self.inner.store(entry).await })
+        // Clone scope for the async block.
+        let scope = scope.clone();
+        Box::pin(async move { self.inner.store(&scope, entry).await })
     }
 
     fn recall(
         &self,
+        scope: &TenantScope,
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
         // Always force recall to this agent's namespace. Ignoring caller-supplied
@@ -93,8 +98,9 @@ impl Memory for NamespacedMemory {
             });
         }
         let prefix = format!("{}:", self.agent_name);
+        let scope = scope.clone();
         Box::pin(async move {
-            let mut entries = self.inner.recall(query).await?;
+            let mut entries = self.inner.recall(&scope, query).await?;
             // Strip namespace prefix from IDs so consumers see unprefixed IDs.
             // This ensures update/forget (which re-add the prefix) work correctly.
             for entry in &mut entries {
@@ -108,38 +114,57 @@ impl Memory for NamespacedMemory {
 
     fn update(
         &self,
+        scope: &TenantScope,
         id: &str,
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let prefixed = self.prefix_id(id);
-        Box::pin(async move { self.inner.update(&prefixed, content).await })
+        let scope = scope.clone();
+        Box::pin(async move { self.inner.update(&scope, &prefixed, content).await })
     }
 
-    fn forget(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+    fn forget(
+        &self,
+        scope: &TenantScope,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
         let prefixed = self.prefix_id(id);
-        Box::pin(async move { self.inner.forget(&prefixed).await })
+        let scope = scope.clone();
+        Box::pin(async move { self.inner.forget(&scope, &prefixed).await })
     }
 
     fn add_link(
         &self,
+        scope: &TenantScope,
         id: &str,
         related_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let prefixed_id = self.prefix_id(id);
         let prefixed_related = self.prefix_id(related_id);
-        Box::pin(async move { self.inner.add_link(&prefixed_id, &prefixed_related).await })
+        let scope = scope.clone();
+        Box::pin(async move {
+            self.inner
+                .add_link(&scope, &prefixed_id, &prefixed_related)
+                .await
+        })
     }
 
     fn prune(
         &self,
+        scope: &TenantScope,
         min_strength: f64,
         min_age: chrono::Duration,
         _agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         // Always scope to this namespace — ignore caller-supplied prefix.
         // This ensures a NamespacedMemory for user A never prunes user B's entries.
-        self.inner
-            .prune(min_strength, min_age, Some(&self.agent_name))
+        let scope = scope.clone();
+        let agent_name = self.agent_name.clone();
+        Box::pin(async move {
+            self.inner
+                .prune(&scope, min_strength, min_age, Some(&agent_name))
+                .await
+        })
     }
 }
 
@@ -150,6 +175,10 @@ mod tests {
     use chrono::Utc;
 
     use super::super::{Confidentiality, MemoryType};
+
+    fn test_scope() -> TenantScope {
+        TenantScope::default()
+    }
 
     fn make_entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -180,14 +209,19 @@ mod tests {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(inner.clone(), "researcher");
 
-        ns.store(make_entry("m1", "test data")).await.unwrap();
+        ns.store(&test_scope(), make_entry("m1", "test data"))
+            .await
+            .unwrap();
 
         // Raw store should have prefixed entry
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 1);
@@ -196,10 +230,13 @@ mod tests {
 
         // Namespaced recall should return unprefixed IDs
         let ns_results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(ns_results[0].id, "m1"); // prefix stripped
@@ -211,15 +248,22 @@ mod tests {
         let ns_a = NamespacedMemory::new(inner.clone(), "agent_a");
         let ns_b = NamespacedMemory::new(inner.clone(), "agent_b");
 
-        ns_a.store(make_entry("m1", "data from A")).await.unwrap();
-        ns_b.store(make_entry("m2", "data from B")).await.unwrap();
+        ns_a.store(&test_scope(), make_entry("m1", "data from A"))
+            .await
+            .unwrap();
+        ns_b.store(&test_scope(), make_entry("m2", "data from B"))
+            .await
+            .unwrap();
 
         // Agent A should only see its own memories
         let results = ns_a
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -227,10 +271,13 @@ mod tests {
 
         // Agent B should only see its own memories
         let results = ns_b
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -246,16 +293,23 @@ mod tests {
         let ns_a = NamespacedMemory::new(inner.clone(), "agent_a");
         let ns_b = NamespacedMemory::new(inner.clone(), "agent_b");
 
-        ns_a.store(make_entry("m1", "from A")).await.unwrap();
-        ns_b.store(make_entry("m2", "from B")).await.unwrap();
+        ns_a.store(&test_scope(), make_entry("m1", "from A"))
+            .await
+            .unwrap();
+        ns_b.store(&test_scope(), make_entry("m2", "from B"))
+            .await
+            .unwrap();
 
         // Even with explicit empty agent, namespace forces own agent
         let results = ns_a
-            .recall(MemoryQuery {
-                agent: Some(String::new()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    agent: Some(String::new()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // Returns agent_a's entries (not empty — the override is ignored)
@@ -264,10 +318,13 @@ mod tests {
 
         // Cross-agent access requires the raw inner store
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
@@ -280,29 +337,41 @@ mod tests {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(inner.clone(), "agent_a");
 
-        ns.store(make_entry("m1", "original")).await.unwrap();
+        ns.store(&test_scope(), make_entry("m1", "original"))
+            .await
+            .unwrap();
 
         // Recall gives us unprefixed ID
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results[0].id, "m1");
 
         // Update using the unprefixed ID from recall
-        ns.update(&results[0].id, "updated via recall ID".into())
-            .await
-            .unwrap();
+        ns.update(
+            &test_scope(),
+            &results[0].id,
+            "updated via recall ID".into(),
+        )
+        .await
+        .unwrap();
 
         // Verify the update worked
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results[0].content, "updated via recall ID");
@@ -313,14 +382,21 @@ mod tests {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(inner.clone(), "agent_a");
 
-        ns.store(make_entry("m1", "original")).await.unwrap();
-        ns.update("m1", "updated".into()).await.unwrap();
+        ns.store(&test_scope(), make_entry("m1", "original"))
+            .await
+            .unwrap();
+        ns.update(&test_scope(), "m1", "updated".into())
+            .await
+            .unwrap();
 
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results[0].content, "updated");
@@ -331,14 +407,19 @@ mod tests {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(inner.clone(), "agent_a");
 
-        ns.store(make_entry("m1", "to delete")).await.unwrap();
-        assert!(ns.forget("m1").await.unwrap());
+        ns.store(&test_scope(), make_entry("m1", "to delete"))
+            .await
+            .unwrap();
+        assert!(ns.forget(&test_scope(), "m1").await.unwrap());
 
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -349,18 +430,25 @@ mod tests {
         let inner: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
         let ns = NamespacedMemory::new(inner.clone(), "agent_a");
 
-        ns.store(make_entry("m1", "first")).await.unwrap();
-        ns.store(make_entry("m2", "second")).await.unwrap();
+        ns.store(&test_scope(), make_entry("m1", "first"))
+            .await
+            .unwrap();
+        ns.store(&test_scope(), make_entry("m2", "second"))
+            .await
+            .unwrap();
 
         // Link via namespaced (unprefixed IDs)
-        ns.add_link("m1", "m2").await.unwrap();
+        ns.add_link(&test_scope(), "m1", "m2").await.unwrap();
 
         // Verify in raw store that prefixed IDs are linked
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let m1 = all.iter().find(|e| e.id == "agent_a:m1").unwrap();
@@ -378,21 +466,27 @@ mod tests {
         // Store entries at different confidentiality levels
         let mut public_entry = make_entry("m1", "public data");
         public_entry.confidentiality = Confidentiality::Public;
-        ns.store(public_entry).await.unwrap();
+        ns.store(&test_scope(), public_entry).await.unwrap();
 
         let mut confidential_entry = make_entry("m2", "confidential data");
         confidential_entry.confidentiality = Confidentiality::Confidential;
         // Store via inner directly to bypass namespace (then prefix manually)
         confidential_entry.id = "agent_a:m2".into();
         confidential_entry.agent = "agent_a".into();
-        inner.store(confidential_entry).await.unwrap();
+        inner
+            .store(&test_scope(), confidential_entry)
+            .await
+            .unwrap();
 
         // Recall should only return the public entry
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -406,17 +500,20 @@ mod tests {
 
         let mut public_entry = make_entry("m1", "public data");
         public_entry.confidentiality = Confidentiality::Public;
-        ns.store(public_entry).await.unwrap();
+        ns.store(&test_scope(), public_entry).await.unwrap();
 
         let mut confidential_entry = make_entry("m2", "confidential data");
         confidential_entry.confidentiality = Confidentiality::Confidential;
-        ns.store(confidential_entry).await.unwrap();
+        ns.store(&test_scope(), confidential_entry).await.unwrap();
 
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -431,37 +528,46 @@ mod tests {
 
         let mut public_entry = make_entry("m1", "public data");
         public_entry.confidentiality = Confidentiality::Public;
-        ns.store(public_entry).await.unwrap();
+        ns.store(&test_scope(), public_entry).await.unwrap();
 
         let mut internal_entry = make_entry("m2", "internal data");
         internal_entry.confidentiality = Confidentiality::Internal;
-        ns.store(internal_entry).await.unwrap();
+        ns.store(&test_scope(), internal_entry).await.unwrap();
 
         let mut confidential_entry = make_entry("m3", "confidential data");
         confidential_entry.confidentiality = Confidentiality::Confidential;
         // Store via inner directly (bypassing namespace)
         confidential_entry.id = "agent_a:m3".into();
         confidential_entry.agent = "agent_a".into();
-        inner.store(confidential_entry).await.unwrap();
+        inner
+            .store(&test_scope(), confidential_entry)
+            .await
+            .unwrap();
 
         // Even with query requesting Confidential cap, namespace cap (Internal) wins
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                max_confidentiality: Some(Confidentiality::Confidential),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    max_confidentiality: Some(Confidentiality::Confidential),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2); // Public + Internal, not Confidential
 
         // With query requesting Public (stricter than namespace Internal), query wins
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                max_confidentiality: Some(Confidentiality::Public),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    max_confidentiality: Some(Confidentiality::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1); // Only Public
@@ -475,14 +581,17 @@ mod tests {
 
         // Store with default (Public) → should be upgraded to Confidential
         let entry = make_entry("m1", "private chat data");
-        ns.store(entry).await.unwrap();
+        ns.store(&test_scope(), entry).await.unwrap();
 
         // Check raw store: entry should be stored as Confidential
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 1);
@@ -498,13 +607,16 @@ mod tests {
         // Store with Internal (below Confidential floor) → should be upgraded
         let mut entry = make_entry("m1", "internal data");
         entry.confidentiality = Confidentiality::Internal;
-        ns.store(entry).await.unwrap();
+        ns.store(&test_scope(), entry).await.unwrap();
 
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 1);
@@ -520,13 +632,16 @@ mod tests {
         // Store with Restricted (above Confidential floor) → should NOT be changed
         let mut entry = make_entry("m1", "secret data");
         entry.confidentiality = Confidentiality::Restricted;
-        ns.store(entry).await.unwrap();
+        ns.store(&test_scope(), entry).await.unwrap();
 
         let all = inner
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 1);
@@ -542,20 +657,23 @@ mod tests {
         entry.strength = 0.01;
         entry.created_at = Utc::now() - chrono::Duration::hours(48);
         entry.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        ns.store(entry).await.unwrap();
+        ns.store(&test_scope(), entry).await.unwrap();
 
         let pruned = ns
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1);
 
         // Verify entry is gone
         let results = ns
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -572,37 +690,43 @@ mod tests {
         weak_a.strength = 0.01;
         weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        ns_a.store(weak_a).await.unwrap();
+        ns_a.store(&test_scope(), weak_a).await.unwrap();
 
         let mut weak_b = make_entry("m1", "weak from B");
         weak_b.strength = 0.01;
         weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        ns_b.store(weak_b).await.unwrap();
+        ns_b.store(&test_scope(), weak_b).await.unwrap();
 
         // Prune via namespace A only removes A's weak entries, not B's
         let pruned = ns_a
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1, "should only prune agent_a's entry");
 
         // A's entry is gone
         let a_results = ns_a
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(a_results.is_empty());
 
         // B's entry is still there
         let b_results = ns_b
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -625,25 +749,25 @@ mod tests {
         weak_alice.strength = 0.01;
         weak_alice.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_alice.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        alice.store(weak_alice).await.unwrap();
+        alice.store(&test_scope(), weak_alice).await.unwrap();
 
         let mut strong_alice = make_entry("m2", "alice strong");
         strong_alice.strength = 0.9;
-        alice.store(strong_alice).await.unwrap();
+        alice.store(&test_scope(), strong_alice).await.unwrap();
 
         let mut weak_bob = make_entry("m1", "bob weak");
         weak_bob.strength = 0.01;
         weak_bob.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_bob.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        bob.store(weak_bob).await.unwrap();
+        bob.store(&test_scope(), weak_bob).await.unwrap();
 
         let mut strong_bob = make_entry("m2", "bob strong");
         strong_bob.strength = 0.9;
-        bob.store(strong_bob).await.unwrap();
+        bob.store(&test_scope(), strong_bob).await.unwrap();
 
         // Alice prunes — should only remove alice's weak entry
         let pruned = alice
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1, "should only prune alice's weak entry");
@@ -651,27 +775,33 @@ mod tests {
         // Bob prunes — should remove bob's weak entry. The fact that this returns 1
         // (not 0) proves the entry survived Alice's prune.
         let pruned = bob
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1, "bob's weak entry must survive alice's prune");
 
         // Verify final state: each user has only their strong entry
         let alice_results = alice
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(alice_results.len(), 1);
         assert_eq!(alice_results[0].content, "alice strong");
 
         let bob_results = bob
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(bob_results.len(), 1);
@@ -689,11 +819,16 @@ mod tests {
         weak_bob.strength = 0.01;
         weak_bob.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_bob.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        bob.store(weak_bob).await.unwrap();
+        bob.store(&test_scope(), weak_bob).await.unwrap();
 
         // Alice tries to prune with bob's prefix — should still only affect alice's namespace
         let pruned = alice
-            .prune(0.1, chrono::Duration::hours(1), Some("user:bob"))
+            .prune(
+                &test_scope(),
+                0.1,
+                chrono::Duration::hours(1),
+                Some("user:bob"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -702,10 +837,13 @@ mod tests {
         );
 
         let bob_results = bob
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(bob_results.len(), 1, "bob's entry must survive");
@@ -718,17 +856,24 @@ mod tests {
         let ns_a = NamespacedMemory::new(inner.clone(), "user:alice");
         let ns_b = NamespacedMemory::new(inner.clone(), "user:bob");
 
-        ns_a.store(make_entry("m1", "alice data")).await.unwrap();
-        ns_b.store(make_entry("m1", "bob data")).await.unwrap();
+        ns_a.store(&test_scope(), make_entry("m1", "alice data"))
+            .await
+            .unwrap();
+        ns_b.store(&test_scope(), make_entry("m1", "bob data"))
+            .await
+            .unwrap();
 
         // Even if we explicitly request bob's namespace, alice's NamespacedMemory
         // should still return only alice's entries (prevents prompt injection).
         let results = ns_a
-            .recall(MemoryQuery {
-                agent: Some("user:bob".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    agent: Some("user:bob".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -744,19 +889,22 @@ mod tests {
         let bob = NamespacedMemory::new(shared.clone(), "user:bob");
 
         alice
-            .store(make_entry("m1", "Alice's deal notes"))
+            .store(&test_scope(), make_entry("m1", "Alice's deal notes"))
             .await
             .unwrap();
-        bob.store(make_entry("m1", "Bob's pipeline review"))
+        bob.store(&test_scope(), make_entry("m1", "Bob's pipeline review"))
             .await
             .unwrap();
 
         // Alice only sees her own memory
         let alice_results = alice
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(alice_results.len(), 1);
@@ -765,10 +913,13 @@ mod tests {
 
         // Bob only sees his own memory
         let bob_results = bob
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(bob_results.len(), 1);
@@ -776,10 +927,13 @@ mod tests {
 
         // Raw store has both, namespaced
         let all = shared
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
@@ -798,18 +952,24 @@ mod tests {
         let mut institutional = make_entry("shared:playbook", "Always follow up within 24h");
         institutional.agent = "shared".into();
         institutional.id = "shared:playbook".into();
-        shared.store(institutional).await.unwrap();
+        shared.store(&test_scope(), institutional).await.unwrap();
 
         // Per-user memory via namespace
         let alice = NamespacedMemory::new(shared.clone(), "user:alice");
-        alice.store(make_entry("m1", "Alice's note")).await.unwrap();
+        alice
+            .store(&test_scope(), make_entry("m1", "Alice's note"))
+            .await
+            .unwrap();
 
         // Alice sees only her own memories through namespace
         let alice_results = alice
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(alice_results.len(), 1);
@@ -817,10 +977,13 @@ mod tests {
 
         // Raw store has both: institutional + Alice's namespaced entry
         let all = shared
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 2);

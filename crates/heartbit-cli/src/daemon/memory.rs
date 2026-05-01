@@ -243,7 +243,8 @@ mod institutional_memory_tests {
             None,
         );
 
-        memory.store(entry).await.unwrap();
+        let scope = heartbit::TenantScope::default();
+        memory.store(&scope, entry).await.unwrap();
 
         // Recall from institutional namespace
         let query = heartbit::MemoryQuery {
@@ -252,7 +253,7 @@ mod institutional_memory_tests {
             limit: 5,
             ..Default::default()
         };
-        let results = memory.recall(query).await.unwrap();
+        let results = memory.recall(&scope, query).await.unwrap();
         assert!(!results.is_empty(), "should find institutional memory");
         assert!(results[0].content.contains("Claude 4.6"));
         assert_eq!(results[0].agent, "institutional");

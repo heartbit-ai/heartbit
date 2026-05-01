@@ -530,11 +530,20 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
 
         // Collect all tools, including memory and knowledge tools
         let mut all_tools = self.tools;
+        let memory_scope = {
+            let mut s =
+                crate::auth::TenantScope::new(self.audit_tenant_id.clone().unwrap_or_default());
+            if let Some(ref uid) = self.audit_user_id {
+                s = s.with_user(uid.clone());
+            }
+            s
+        };
         let memory_ref = self.memory.clone();
         if let Some(memory) = self.memory {
             all_tools.extend(crate::memory::tools::memory_tools_with_reflection(
                 memory,
                 &self.name,
+                memory_scope,
                 self.reflection_threshold,
             ));
         }

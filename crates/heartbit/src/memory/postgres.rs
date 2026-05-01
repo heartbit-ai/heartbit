@@ -4,6 +4,8 @@ use std::pin::Pin;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool, Row};
 
+use heartbit_core::auth::TenantScope;
+
 use crate::error::Error;
 
 use super::bm25;
@@ -32,6 +34,13 @@ struct MemoryRow {
     related_ids: Vec<String>,
     source_ids: Vec<String>,
     confidentiality: String,
+    /// Added in Task 4 (schema migration in Task 8). `#[sqlx(default)]` so
+    /// queries against old schemas still compile; value will be None until
+    /// the column is added.
+    #[sqlx(default)]
+    author_tenant_id: Option<String>,
+    #[sqlx(default)]
+    author_user_id: Option<String>,
 }
 
 fn memory_type_from_str(s: &str) -> MemoryType {
@@ -88,8 +97,8 @@ impl From<MemoryRow> for MemoryEntry {
             source_ids: row.source_ids,
             embedding: None, // loaded separately when pgvector is available
             confidentiality: confidentiality_from_str(&row.confidentiality),
-            author_user_id: None,
-            author_tenant_id: None,
+            author_tenant_id: row.author_tenant_id,
+            author_user_id: row.author_user_id,
         }
     }
 }
@@ -202,6 +211,10 @@ impl PostgresMemoryStore {
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS related_ids TEXT[] NOT NULL DEFAULT '{}'",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ids TEXT[] NOT NULL DEFAULT '{}'",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidentiality TEXT NOT NULL DEFAULT 'public'",
+            // Task 4: tenant/user identity columns. Empty string = single-tenant sentinel.
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_tenant_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_user_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_memories_author_tenant ON memories(author_tenant_id)",
         ];
 
         for stmt in statements {
@@ -235,8 +248,12 @@ impl PostgresMemoryStore {
 impl Memory for PostgresMemoryStore {
     fn store(
         &self,
-        entry: MemoryEntry,
+        scope: &TenantScope,
+        mut entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        // Stamp the entry with the calling scope's tenant/user identity.
+        entry.author_tenant_id = Some(scope.tenant_id.clone());
+        entry.author_user_id = scope.user_id.clone();
         Box::pin(async move {
             if self.has_pgvector {
                 let embedding = entry
@@ -246,8 +263,9 @@ impl Memory for PostgresMemoryStore {
                 sqlx::query(
                     r#"
                     INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
-                        memory_type, keywords, summary, strength, related_ids, source_ids, embedding, confidentiality)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                        memory_type, keywords, summary, strength, related_ids, source_ids, embedding, confidentiality,
+                        author_tenant_id, author_user_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                     ON CONFLICT (id) DO UPDATE SET
                         content = EXCLUDED.content,
                         category = EXCLUDED.category,
@@ -260,7 +278,9 @@ impl Memory for PostgresMemoryStore {
                         related_ids = EXCLUDED.related_ids,
                         source_ids = EXCLUDED.source_ids,
                         embedding = EXCLUDED.embedding,
-                        confidentiality = EXCLUDED.confidentiality
+                        confidentiality = EXCLUDED.confidentiality,
+                        author_tenant_id = EXCLUDED.author_tenant_id,
+                        author_user_id = EXCLUDED.author_user_id
                     "#,
                 )
                 .bind(&entry.id)
@@ -280,6 +300,8 @@ impl Memory for PostgresMemoryStore {
                 .bind(&entry.source_ids)
                 .bind(&embedding)
                 .bind(confidentiality_to_str(entry.confidentiality))
+                .bind(entry.author_tenant_id.as_deref().unwrap_or(""))
+                .bind(entry.author_user_id.as_deref())
                 .execute(&self.pool)
                 .await
                 .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
@@ -288,8 +310,9 @@ impl Memory for PostgresMemoryStore {
                 sqlx::query(
                     r#"
                     INSERT INTO memories (id, agent, content, category, tags, created_at, last_accessed, access_count, importance,
-                        memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                        memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality,
+                        author_tenant_id, author_user_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                     ON CONFLICT (id) DO UPDATE SET
                         content = EXCLUDED.content,
                         category = EXCLUDED.category,
@@ -301,7 +324,9 @@ impl Memory for PostgresMemoryStore {
                         strength = EXCLUDED.strength,
                         related_ids = EXCLUDED.related_ids,
                         source_ids = EXCLUDED.source_ids,
-                        confidentiality = EXCLUDED.confidentiality
+                        confidentiality = EXCLUDED.confidentiality,
+                        author_tenant_id = EXCLUDED.author_tenant_id,
+                        author_user_id = EXCLUDED.author_user_id
                     "#,
                 )
                 .bind(&entry.id)
@@ -320,6 +345,8 @@ impl Memory for PostgresMemoryStore {
                 .bind(&entry.related_ids)
                 .bind(&entry.source_ids)
                 .bind(confidentiality_to_str(entry.confidentiality))
+                .bind(entry.author_tenant_id.as_deref().unwrap_or(""))
+                .bind(entry.author_user_id.as_deref())
                 .execute(&self.pool)
                 .await
                 .map_err(|e| Error::Memory(format!("failed to store memory: {e}")))?;
@@ -330,14 +357,18 @@ impl Memory for PostgresMemoryStore {
 
     fn recall(
         &self,
+        scope: &TenantScope,
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             // Build dynamic query with filters
+            // author_tenant_id is always filtered — this is the primary tenant isolation boundary.
             let mut sql = String::from(
-                "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality FROM memories WHERE true",
+                "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality, author_tenant_id, author_user_id FROM memories WHERE author_tenant_id = $1",
             );
-            let mut param_idx = 1u32;
+            // $1 is reserved for author_tenant_id (always bound first).
+            let mut param_idx = 2u32;
 
             // We'll collect bind values as we build the query
             let mut text_filter: Option<Vec<String>> = None;
@@ -423,7 +454,8 @@ impl Memory for PostgresMemoryStore {
             sql.push_str(" ORDER BY created_at DESC");
 
             // Build and bind
-            let mut q = sqlx::query(&sql);
+            // $1 = author_tenant_id (always). Subsequent params from dynamic filters.
+            let mut q = sqlx::query(&sql).bind(&tenant_id);
 
             if let Some(ref tokens) = text_filter {
                 for token in tokens {
@@ -471,6 +503,8 @@ impl Memory for PostgresMemoryStore {
                         related_ids: row.get("related_ids"),
                         source_ids: row.get("source_ids"),
                         confidentiality: row.get("confidentiality"),
+                        author_tenant_id: row.try_get("author_tenant_id").ok(),
+                        author_user_id: row.try_get("author_user_id").ok().flatten(),
                     };
                     MemoryEntry::from(r)
                 })
@@ -616,9 +650,10 @@ impl Memory for PostgresMemoryStore {
 
             if !related_to_fetch.is_empty() {
                 let expanded_rows = sqlx::query(
-                    "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality FROM memories WHERE id = ANY($1)",
+                    "SELECT id, agent, content, category, tags, created_at, last_accessed, access_count, importance, memory_type, keywords, summary, strength, related_ids, source_ids, confidentiality, author_tenant_id, author_user_id FROM memories WHERE id = ANY($1) AND author_tenant_id = $2",
                 )
                 .bind(&related_to_fetch)
+                .bind(&tenant_id)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| Error::Memory(format!("failed to fetch related entries: {e}")))?;
@@ -643,6 +678,8 @@ impl Memory for PostgresMemoryStore {
                         related_ids: row.get("related_ids"),
                         source_ids: row.get("source_ids"),
                         confidentiality: row.get("confidentiality"),
+                        author_tenant_id: row.try_get("author_tenant_id").ok(),
+                        author_user_id: row.try_get("author_user_id").ok().flatten(),
                     };
                     let related_entry = MemoryEntry::from(r);
                     // Respect confidentiality cap for expanded entries too
@@ -763,16 +800,19 @@ impl Memory for PostgresMemoryStore {
 
     fn update(
         &self,
+        scope: &TenantScope,
         id: &str,
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let id = id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let result = sqlx::query(
-                "UPDATE memories SET content = $2, last_accessed = now() WHERE id = $1",
+                "UPDATE memories SET content = $2, last_accessed = now() WHERE id = $1 AND author_tenant_id = $3",
             )
             .bind(&id)
             .bind(&content)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Memory(format!("failed to update memory: {e}")))?;
@@ -784,14 +824,21 @@ impl Memory for PostgresMemoryStore {
         })
     }
 
-    fn forget(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+    fn forget(
+        &self,
+        scope: &TenantScope,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
         let id = id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            let result = sqlx::query("DELETE FROM memories WHERE id = $1")
-                .bind(&id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| Error::Memory(format!("failed to delete memory: {e}")))?;
+            let result =
+                sqlx::query("DELETE FROM memories WHERE id = $1 AND author_tenant_id = $2")
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Error::Memory(format!("failed to delete memory: {e}")))?;
 
             Ok(result.rows_affected() > 0)
         })
@@ -799,28 +846,32 @@ impl Memory for PostgresMemoryStore {
 
     fn add_link(
         &self,
+        scope: &TenantScope,
         id: &str,
         related_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let id = id.to_string();
         let related_id = related_id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            // Add related_id to id's related_ids (if not already present)
+            // Add related_id to id's related_ids (if not already present, scoped to tenant)
             sqlx::query(
-                "UPDATE memories SET related_ids = array_append(related_ids, $2) WHERE id = $1 AND NOT ($2 = ANY(related_ids))",
+                "UPDATE memories SET related_ids = array_append(related_ids, $2) WHERE id = $1 AND author_tenant_id = $3 AND NOT ($2 = ANY(related_ids))",
             )
             .bind(&id)
             .bind(&related_id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Memory(format!("failed to add link {id} -> {related_id}: {e}")))?;
 
-            // Add id to related_id's related_ids (bidirectional)
+            // Add id to related_id's related_ids (bidirectional, scoped to tenant)
             sqlx::query(
-                "UPDATE memories SET related_ids = array_append(related_ids, $2) WHERE id = $1 AND NOT ($2 = ANY(related_ids))",
+                "UPDATE memories SET related_ids = array_append(related_ids, $2) WHERE id = $1 AND author_tenant_id = $3 AND NOT ($2 = ANY(related_ids))",
             )
             .bind(&related_id)
             .bind(&id)
+            .bind(&tenant_id)
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Memory(format!("failed to add link {related_id} -> {id}: {e}")))?;
@@ -831,35 +882,41 @@ impl Memory for PostgresMemoryStore {
 
     fn prune(
         &self,
+        scope: &TenantScope,
         min_strength: f64,
         min_age: chrono::Duration,
         agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         let owned_prefix = agent_prefix.map(String::from);
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             // Fetch candidates: entries with raw strength below threshold and old enough.
             // Then filter in Rust using effective_strength (Ebbinghaus decay).
             // When agent_prefix is set, push the filter to SQL for efficiency.
+            // author_tenant_id is always filtered — never prune another tenant's entries.
             let min_age_secs = min_age.num_seconds().max(0);
             let rows = if let Some(ref prefix) = owned_prefix {
                 let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
                 sqlx::query(
                     "SELECT id, strength, last_accessed, created_at FROM memories \
                      WHERE strength < $1 AND created_at < now() - make_interval(secs => $2) \
-                     AND agent LIKE $3",
+                     AND author_tenant_id = $3 AND agent LIKE $4",
                 )
                 .bind(min_strength)
                 .bind(min_age_secs as f64)
+                .bind(&tenant_id)
                 .bind(&pattern)
                 .fetch_all(&self.pool)
                 .await
             } else {
                 sqlx::query(
                     "SELECT id, strength, last_accessed, created_at FROM memories \
-                     WHERE strength < $1 AND created_at < now() - make_interval(secs => $2)",
+                     WHERE strength < $1 AND created_at < now() - make_interval(secs => $2) \
+                     AND author_tenant_id = $3",
                 )
                 .bind(min_strength)
                 .bind(min_age_secs as f64)
+                .bind(&tenant_id)
                 .fetch_all(&self.pool)
                 .await
             }
@@ -914,6 +971,8 @@ mod tests {
             related_ids: vec![],
             source_ids: vec![],
             confidentiality: "public".into(),
+            author_tenant_id: None,
+            author_user_id: None,
         }
     }
 

@@ -508,9 +508,19 @@ impl DelegateTaskTool {
                         &agent_ns,
                     ));
                     builder = builder.memory(ns);
+                    let mem_scope = {
+                        let mut s = crate::auth::TenantScope::new(
+                            agent_def.audit_tenant_id.clone().unwrap_or_default(),
+                        );
+                        if let Some(ref uid) = agent_def.audit_user_id {
+                            s = s.with_user(uid.clone());
+                        }
+                        s
+                    };
                     builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                         memory.clone(),
                         &agent_ns,
+                        mem_scope,
                         allow_shared_write,
                     ));
                 }
@@ -912,9 +922,19 @@ impl Tool for FormSquadTool {
                             &agent_ns,
                         ));
                         builder = builder.memory(ns);
+                        let mem_scope = {
+                            let mut s = crate::auth::TenantScope::new(
+                                agent_def.audit_tenant_id.clone().unwrap_or_default(),
+                            );
+                            if let Some(ref uid) = agent_def.audit_user_id {
+                                s = s.with_user(uid.clone());
+                            }
+                            s
+                        };
                         builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                             memory.clone(),
                             &agent_ns,
+                            mem_scope,
                             allow_shared_write,
                         ));
                     }
@@ -1286,9 +1306,18 @@ impl SpawnAgentTool {
                 &agent_ns,
             ));
             builder = builder.memory(ns);
+            let mem_scope = {
+                let mut s =
+                    crate::auth::TenantScope::new(self.audit_tenant_id.clone().unwrap_or_default());
+                if let Some(ref uid) = self.audit_user_id {
+                    s = s.with_user(uid.clone());
+                }
+                s
+            };
             builder = builder.tools(crate::memory::shared_tools::shared_memory_tools(
                 memory.clone(),
                 &agent_ns,
+                mem_scope,
                 false, // read-only: spawned agents cannot write to shared memory
             ));
         }
@@ -2280,9 +2309,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 .memory_namespace_prefix
                 .as_deref()
                 .unwrap_or("orchestrator");
+            let mem_scope = {
+                let mut s =
+                    crate::auth::TenantScope::new(self.audit_tenant_id.clone().unwrap_or_default());
+                if let Some(ref uid) = self.audit_user_id {
+                    s = s.with_user(uid.clone());
+                }
+                s
+            };
             let mem_tools = crate::memory::shared_tools::shared_memory_tools(
                 memory.clone(),
                 orch_ns,
+                mem_scope,
                 self.allow_shared_write,
             );
             runner_builder = runner_builder.tools(mem_tools);

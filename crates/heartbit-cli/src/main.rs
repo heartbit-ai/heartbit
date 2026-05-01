@@ -18,8 +18,8 @@ use heartbit::{
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
     McpServerEntry, Memory, MemoryConfig, MemoryQuery, NamespacedMemory, ObservabilityMode,
     OnApproval, OnEvent, OnQuestion, OnRetry, OnText, Orchestrator, PostgresMemoryStore,
-    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, ToolCall,
-    Workspace, builtin_tools,
+    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, TenantScope,
+    ToolCall, Workspace, builtin_tools,
 };
 
 #[derive(Parser)]
@@ -1056,11 +1056,14 @@ impl<'a> RuntimeBuilder<'a> {
             && let Some(sid) = self.story_id
         {
             let prior = base_memory
-                .recall(MemoryQuery {
-                    limit: 10,
-                    agent_prefix: Some(sid.to_string()),
-                    ..Default::default()
-                })
+                .recall(
+                    &TenantScope::default(),
+                    MemoryQuery {
+                        limit: 10,
+                        agent_prefix: Some(sid.to_string()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap_or_default();
 

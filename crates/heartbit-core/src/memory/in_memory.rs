@@ -5,6 +5,7 @@ use std::sync::RwLock;
 
 use chrono::Utc;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::bm25;
@@ -44,8 +45,12 @@ impl Default for InMemoryStore {
 impl Memory for InMemoryStore {
     fn store(
         &self,
-        entry: MemoryEntry,
+        scope: &TenantScope,
+        mut entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        // Stamp the entry with the calling scope's tenant/user identity.
+        entry.author_tenant_id = Some(scope.tenant_id.clone());
+        entry.author_user_id = scope.user_id.clone();
         Box::pin(async move {
             let mut entries = self
                 .entries
@@ -58,8 +63,10 @@ impl Memory for InMemoryStore {
 
     fn recall(
         &self,
+        scope: &TenantScope,
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             // Single write lock for the entire operation. Recall updates
             // access_count as a side effect, so we need write access anyway.
@@ -73,6 +80,10 @@ impl Memory for InMemoryStore {
             let mut results: Vec<MemoryEntry> = entries
                 .values()
                 .filter(|e| {
+                    // Tenant isolation: only return entries for this scope's tenant.
+                    if e.author_tenant_id.as_deref().unwrap_or("") != tenant_id.as_str() {
+                        return false;
+                    }
                     if let Some(ref text) = query.text {
                         let lower_content = e.content.to_lowercase();
                         let lower_keywords: Vec<String> =
@@ -399,58 +410,94 @@ impl Memory for InMemoryStore {
 
     fn update(
         &self,
+        scope: &TenantScope,
         id: &str,
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let id = id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self
                 .entries
                 .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
             match entries.get_mut(&id) {
-                Some(entry) => {
+                Some(entry)
+                    if entry.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str() =>
+                {
                     entry.content = content;
                     entry.last_accessed = Utc::now();
                     Ok(())
+                }
+                Some(_) => {
+                    // Entry exists but belongs to a different tenant — treat as not found.
+                    Err(Error::Memory(format!("memory entry not found: {id}")))
                 }
                 None => Err(Error::Memory(format!("memory entry not found: {id}"))),
             }
         })
     }
 
-    fn forget(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+    fn forget(
+        &self,
+        scope: &TenantScope,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
         let id = id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self
                 .entries
                 .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
-            Ok(entries.remove(&id).is_some())
+            // Only remove if the entry belongs to this tenant.
+            // Return false for both "not found" and "wrong tenant" to avoid
+            // revealing cross-tenant id existence.
+            let belongs = entries
+                .get(&id)
+                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .unwrap_or(false);
+            if belongs {
+                Ok(entries.remove(&id).is_some())
+            } else {
+                Ok(false)
+            }
         })
     }
 
     fn add_link(
         &self,
+        scope: &TenantScope,
         id: &str,
         related_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         let id = id.to_string();
         let related_id = related_id.to_string();
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self
                 .entries
                 .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
 
-            // Add related_id to id's related_ids (if not already present)
-            if let Some(entry) = entries.get_mut(&id)
+            // Only link entries that belong to the same tenant.
+            let id_ok = entries
+                .get(&id)
+                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .unwrap_or(false);
+            let rel_ok = entries
+                .get(&related_id)
+                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .unwrap_or(false);
+
+            if id_ok
+                && let Some(entry) = entries.get_mut(&id)
                 && !entry.related_ids.contains(&related_id)
             {
                 entry.related_ids.push(related_id.clone());
             }
-            // Add id to related_id's related_ids (bidirectional)
-            if let Some(entry) = entries.get_mut(&related_id)
+            if rel_ok
+                && let Some(entry) = entries.get_mut(&related_id)
                 && !entry.related_ids.contains(&id)
             {
                 entry.related_ids.push(id);
@@ -461,11 +508,13 @@ impl Memory for InMemoryStore {
 
     fn prune(
         &self,
+        scope: &TenantScope,
         min_strength: f64,
         min_age: chrono::Duration,
         agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         let owned_prefix = agent_prefix.map(String::from);
+        let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self
                 .entries
@@ -476,6 +525,10 @@ impl Memory for InMemoryStore {
             let to_remove: Vec<String> = entries
                 .values()
                 .filter(|e| {
+                    // Tenant isolation: only prune entries belonging to this scope.
+                    if e.author_tenant_id.as_deref().unwrap_or("") != tenant_id.as_str() {
+                        return false;
+                    }
                     // If agent_prefix is set, only consider entries whose agent starts with it
                     if let Some(ref prefix) = owned_prefix
                         && !e.agent.starts_with(prefix.as_str())
@@ -504,6 +557,10 @@ mod tests {
     use chrono::Utc;
 
     use super::super::{Confidentiality, MemoryType};
+
+    fn test_scope() -> TenantScope {
+        TenantScope::default()
+    }
 
     fn make_entry(id: &str, agent: &str, content: &str, category: &str) -> MemoryEntry {
         MemoryEntry {
@@ -563,13 +620,16 @@ mod tests {
     async fn store_and_recall() {
         let store = InMemoryStore::new();
         let entry = make_entry("m1", "agent1", "Rust is fast", "fact");
-        store.store(entry).await.unwrap();
+        store.store(&test_scope(), entry).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -580,20 +640,26 @@ mod tests {
     async fn recall_by_text() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "Rust is fast", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "Rust is fast", "fact"))
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "a", "Python is slow", "fact"))
+            .store(
+                &test_scope(),
+                make_entry("m2", "a", "Python is slow", "fact"),
+            )
             .await
             .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -604,20 +670,29 @@ mod tests {
     async fn recall_by_category() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "remember this", "fact"))
+            .store(
+                &test_scope(),
+                make_entry("m1", "a", "remember this", "fact"),
+            )
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "a", "I saw something", "observation"))
+            .store(
+                &test_scope(),
+                make_entry("m2", "a", "I saw something", "observation"),
+            )
             .await
             .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                category: Some("observation".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    category: Some("observation".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -628,32 +703,41 @@ mod tests {
     async fn recall_by_tags() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry_with_tags(
-                "m1",
-                "a",
-                "Rust memory safety",
-                "fact",
-                vec!["rust".into(), "safety".into()],
-            ))
+            .store(
+                &test_scope(),
+                make_entry_with_tags(
+                    "m1",
+                    "a",
+                    "Rust memory safety",
+                    "fact",
+                    vec!["rust".into(), "safety".into()],
+                ),
+            )
             .await
             .unwrap();
         store
-            .store(make_entry_with_tags(
-                "m2",
-                "a",
-                "Go is garbage collected",
-                "fact",
-                vec!["go".into()],
-            ))
+            .store(
+                &test_scope(),
+                make_entry_with_tags(
+                    "m2",
+                    "a",
+                    "Go is garbage collected",
+                    "fact",
+                    vec!["go".into()],
+                ),
+            )
             .await
             .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                tags: vec!["rust".into()],
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    tags: vec!["rust".into()],
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -664,20 +748,29 @@ mod tests {
     async fn recall_by_agent() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "researcher", "data point", "fact"))
+            .store(
+                &test_scope(),
+                make_entry("m1", "researcher", "data point", "fact"),
+            )
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "coder", "code snippet", "procedure"))
+            .store(
+                &test_scope(),
+                make_entry("m2", "coder", "code snippet", "procedure"),
+            )
             .await
             .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                agent: Some("researcher".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    agent: Some("researcher".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -689,21 +782,22 @@ mod tests {
         let store = InMemoryStore::new();
         for i in 0..10 {
             store
-                .store(make_entry(
-                    &format!("m{i}"),
-                    "a",
-                    &format!("entry {i}"),
-                    "fact",
-                ))
+                .store(
+                    &test_scope(),
+                    make_entry(&format!("m{i}"), "a", &format!("entry {i}"), "fact"),
+                )
                 .await
                 .unwrap();
         }
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 3,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 3,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -713,17 +807,23 @@ mod tests {
     async fn update_existing() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "original", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "original", "fact"))
             .await
             .unwrap();
 
-        store.update("m1", "updated content".into()).await.unwrap();
+        store
+            .update(&test_scope(), "m1", "updated content".into())
+            .await
+            .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results[0].content, "updated content");
@@ -732,7 +832,10 @@ mod tests {
     #[tokio::test]
     async fn update_nonexistent() {
         let store = InMemoryStore::new();
-        let err = store.update("missing", "content".into()).await.unwrap_err();
+        let err = store
+            .update(&test_scope(), "missing", "content".into())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -740,17 +843,20 @@ mod tests {
     async fn forget_existing() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "to delete", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "to delete", "fact"))
             .await
             .unwrap();
 
-        assert!(store.forget("m1").await.unwrap());
+        assert!(store.forget(&test_scope(), "m1").await.unwrap());
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(results.is_empty());
@@ -759,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn forget_nonexistent() {
         let store = InMemoryStore::new();
-        assert!(!store.forget("missing").await.unwrap());
+        assert!(!store.forget(&test_scope(), "missing").await.unwrap());
     }
 
     #[test]
@@ -776,19 +882,22 @@ mod tests {
         let mut high_imp = make_entry("m1", "a", "high importance", "fact");
         high_imp.importance = 10;
         high_imp.created_at = Utc::now() - chrono::Duration::hours(48);
-        store.store(high_imp).await.unwrap();
+        store.store(&test_scope(), high_imp).await.unwrap();
 
         // Recent entry with low importance (now, importance=1)
         let mut low_imp = make_entry("m2", "a", "low importance", "fact");
         low_imp.importance = 1;
         low_imp.created_at = Utc::now();
-        store.store(low_imp).await.unwrap();
+        store.store(&test_scope(), low_imp).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -809,19 +918,22 @@ mod tests {
         let mut old_low = make_entry("m1", "a", "old low", "fact");
         old_low.importance = 1;
         old_low.created_at = Utc::now() - chrono::Duration::hours(1000);
-        store.store(old_low).await.unwrap();
+        store.store(&test_scope(), old_low).await.unwrap();
 
         // Recent, high importance — should definitely be first
         let mut recent_high = make_entry("m2", "a", "recent high", "fact");
         recent_high.importance = 10;
         recent_high.created_at = Utc::now();
-        store.store(recent_high).await.unwrap();
+        store.store(&test_scope(), recent_high).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -842,18 +954,21 @@ mod tests {
         let mut low = make_entry("m1", "a", "recent but low", "fact");
         low.importance = 1;
         low.created_at = Utc::now();
-        store.store(low).await.unwrap();
+        store.store(&test_scope(), low).await.unwrap();
 
         let mut high = make_entry("m2", "a", "old but high", "fact");
         high.importance = 10;
         high.created_at = Utc::now() - chrono::Duration::hours(1000);
-        store.store(high).await.unwrap();
+        store.store(&test_scope(), high).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -874,15 +989,18 @@ mod tests {
 
         let mut e1 = make_entry("m1", "a", "Rust is fast", "fact");
         e1.importance = 5;
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         // Text query means relevance=1.0 for matched entries
         let results = store
-            .recall(MemoryQuery {
-                text: Some("Rust".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("Rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -895,22 +1013,23 @@ mod tests {
         let store = InMemoryStore::new();
         for i in 0..5 {
             store
-                .store(make_entry(
-                    &format!("m{i}"),
-                    "a",
-                    &format!("entry {i}"),
-                    "fact",
-                ))
+                .store(
+                    &test_scope(),
+                    make_entry(&format!("m{i}"), "a", &format!("entry {i}"), "fact"),
+                )
                 .await
                 .unwrap();
         }
 
         // limit=0 means "no limit" — should return all entries
         let results = store
-            .recall(MemoryQuery {
-                limit: 0,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 0,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 5);
@@ -929,21 +1048,27 @@ mod tests {
         });
 
         store
-            .store(make_entry("m1", "a", "Rust is fast", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "Rust is fast", "fact"))
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "a", "Python is slow", "fact"))
+            .store(
+                &test_scope(),
+                make_entry("m2", "a", "Python is slow", "fact"),
+            )
             .await
             .unwrap();
 
         // Query with duplicated token
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust rust rust".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust rust rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -968,15 +1093,18 @@ mod tests {
         entry_full.importance = 5;
 
         // Store partial-match first so it would naturally sort first by insertion order
-        store.store(entry_partial).await.unwrap();
-        store.store(entry_full).await.unwrap();
+        store.store(&test_scope(), entry_partial).await.unwrap();
+        store.store(&test_scope(), entry_full).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("Rust fast".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("Rust fast".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -997,23 +1125,26 @@ mod tests {
 
         let mut episodic = make_entry("m1", "a", "episodic fact", "fact");
         episodic.memory_type = MemoryType::Episodic;
-        store.store(episodic).await.unwrap();
+        store.store(&test_scope(), episodic).await.unwrap();
 
         let mut semantic = make_entry("m2", "a", "semantic knowledge", "fact");
         semantic.memory_type = MemoryType::Semantic;
-        store.store(semantic).await.unwrap();
+        store.store(&test_scope(), semantic).await.unwrap();
 
         let mut reflection = make_entry("m3", "a", "reflection insight", "fact");
         reflection.memory_type = MemoryType::Reflection;
-        store.store(reflection).await.unwrap();
+        store.store(&test_scope(), reflection).await.unwrap();
 
         // Filter by Semantic only
         let results = store
-            .recall(MemoryQuery {
-                memory_type: Some(MemoryType::Semantic),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    memory_type: Some(MemoryType::Semantic),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1021,11 +1152,14 @@ mod tests {
 
         // Filter by Reflection
         let results = store
-            .recall(MemoryQuery {
-                memory_type: Some(MemoryType::Reflection),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    memory_type: Some(MemoryType::Reflection),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1033,10 +1167,13 @@ mod tests {
 
         // No filter returns all
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -1048,19 +1185,22 @@ mod tests {
 
         let mut strong = make_entry("m1", "a", "strong memory", "fact");
         strong.strength = 0.9;
-        store.store(strong).await.unwrap();
+        store.store(&test_scope(), strong).await.unwrap();
 
         let mut weak = make_entry("m2", "a", "weak memory", "fact");
         weak.strength = 0.05;
-        store.store(weak).await.unwrap();
+        store.store(&test_scope(), weak).await.unwrap();
 
         // Only strong entries
         let results = store
-            .recall(MemoryQuery {
-                min_strength: Some(0.5),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    min_strength: Some(0.5),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1073,24 +1213,30 @@ mod tests {
 
         let mut entry = make_entry("m1", "a", "test", "fact");
         entry.strength = 0.5;
-        store.store(entry).await.unwrap();
+        store.store(&test_scope(), entry).await.unwrap();
 
         // Recall reinforces strength by +0.2
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!((results[0].strength - 0.7).abs() < f64::EPSILON);
 
         // Second access: 0.7 + 0.2 = 0.9
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!((results[0].strength - 0.9).abs() < f64::EPSILON);
@@ -1102,14 +1248,17 @@ mod tests {
 
         let mut entry = make_entry("m1", "a", "test", "fact");
         entry.strength = 0.95;
-        store.store(entry).await.unwrap();
+        store.store(&test_scope(), entry).await.unwrap();
 
         // 0.95 + 0.2 should cap at 1.0
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!((results[0].strength - 1.0).abs() < f64::EPSILON);
@@ -1122,14 +1271,17 @@ mod tests {
         // Entry with "performance" only in keywords, not content
         let mut entry = make_entry("m1", "a", "Rust is great", "fact");
         entry.keywords = vec!["performance".into(), "speed".into()];
-        store.store(entry).await.unwrap();
+        store.store(&test_scope(), entry).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("performance".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("performance".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1140,21 +1292,24 @@ mod tests {
     async fn add_link_bidirectional() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "first", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "first", "fact"))
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "a", "second", "fact"))
+            .store(&test_scope(), make_entry("m2", "a", "second", "fact"))
             .await
             .unwrap();
 
-        store.add_link("m1", "m2").await.unwrap();
+        store.add_link(&test_scope(), "m1", "m2").await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let m1 = results.iter().find(|e| e.id == "m1").unwrap();
@@ -1168,23 +1323,26 @@ mod tests {
     async fn add_link_idempotent() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry("m1", "a", "first", "fact"))
+            .store(&test_scope(), make_entry("m1", "a", "first", "fact"))
             .await
             .unwrap();
         store
-            .store(make_entry("m2", "a", "second", "fact"))
+            .store(&test_scope(), make_entry("m2", "a", "second", "fact"))
             .await
             .unwrap();
 
         // Link twice — should not duplicate
-        store.add_link("m1", "m2").await.unwrap();
-        store.add_link("m1", "m2").await.unwrap();
+        store.add_link(&test_scope(), "m1", "m2").await.unwrap();
+        store.add_link(&test_scope(), "m1", "m2").await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let m1 = results.iter().find(|e| e.id == "m1").unwrap();
@@ -1202,24 +1360,27 @@ mod tests {
         let mut strong = make_entry("m1", "a", "strong", "fact");
         strong.strength = 0.8;
         strong.created_at = Utc::now() - chrono::Duration::hours(48);
-        store.store(strong).await.unwrap();
+        store.store(&test_scope(), strong).await.unwrap();
 
         let mut weak = make_entry("m2", "a", "weak", "fact");
         weak.strength = 0.05;
         weak.created_at = Utc::now() - chrono::Duration::hours(48);
-        store.store(weak).await.unwrap();
+        store.store(&test_scope(), weak).await.unwrap();
 
         let pruned = store
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1);
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1234,10 +1395,10 @@ mod tests {
         let mut weak_recent = make_entry("m1", "a", "weak recent", "fact");
         weak_recent.strength = 0.01;
         weak_recent.created_at = Utc::now(); // just created
-        store.store(weak_recent).await.unwrap();
+        store.store(&test_scope(), weak_recent).await.unwrap();
 
         let pruned = store
-            .prune(0.1, chrono::Duration::hours(24), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(24), None)
             .await
             .unwrap();
         assert_eq!(pruned, 0, "recent entry should not be pruned");
@@ -1253,29 +1414,32 @@ mod tests {
         old_accessed.strength = 0.5;
         old_accessed.created_at = Utc::now() - chrono::Duration::hours(30 * 24);
         old_accessed.last_accessed = Utc::now() - chrono::Duration::hours(30 * 24);
-        store.store(old_accessed).await.unwrap();
+        store.store(&test_scope(), old_accessed).await.unwrap();
 
         // Same stored strength but recently accessed — effective ≈ 0.5
         let mut recently_accessed = make_entry("m2", "a", "recently accessed", "fact");
         recently_accessed.strength = 0.5;
         recently_accessed.created_at = Utc::now() - chrono::Duration::hours(30 * 24);
         recently_accessed.last_accessed = Utc::now();
-        store.store(recently_accessed).await.unwrap();
+        store.store(&test_scope(), recently_accessed).await.unwrap();
 
         // Prune with min_strength=0.1, min_age=24h
         // m1: effective ≈ 0.014 < 0.1, age 30d > 24h → pruned
         // m2: effective ≈ 0.5 > 0.1 → kept
         let pruned = store
-            .prune(0.1, chrono::Duration::hours(24), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(24), None)
             .await
             .unwrap();
         assert_eq!(pruned, 1, "old unaccessed entry should be pruned");
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1291,26 +1455,34 @@ mod tests {
         weak_a.strength = 0.01;
         weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        store.store(weak_a).await.unwrap();
+        store.store(&test_scope(), weak_a).await.unwrap();
 
         let mut weak_b = make_entry("m2", "agent_b", "weak from B", "fact");
         weak_b.strength = 0.01;
         weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        store.store(weak_b).await.unwrap();
+        store.store(&test_scope(), weak_b).await.unwrap();
 
         // Prune with agent_prefix = "agent_a" — should only remove agent_a's entry
         let pruned = store
-            .prune(0.1, chrono::Duration::hours(1), Some("agent_a"))
+            .prune(
+                &test_scope(),
+                0.1,
+                chrono::Duration::hours(1),
+                Some("agent_a"),
+            )
             .await
             .unwrap();
         assert_eq!(pruned, 1, "should only prune agent_a's entry");
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1326,17 +1498,17 @@ mod tests {
         weak_a.strength = 0.01;
         weak_a.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_a.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        store.store(weak_a).await.unwrap();
+        store.store(&test_scope(), weak_a).await.unwrap();
 
         let mut weak_b = make_entry("m2", "agent_b", "weak from B", "fact");
         weak_b.strength = 0.01;
         weak_b.created_at = Utc::now() - chrono::Duration::hours(48);
         weak_b.last_accessed = Utc::now() - chrono::Duration::hours(48);
-        store.store(weak_b).await.unwrap();
+        store.store(&test_scope(), weak_b).await.unwrap();
 
         // Prune with None prefix — removes all weak entries
         let pruned = store
-            .prune(0.1, chrono::Duration::hours(1), None)
+            .prune(&test_scope(), 0.1, chrono::Duration::hours(1), None)
             .await
             .unwrap();
         assert_eq!(pruned, 2, "should prune all weak entries");
@@ -1356,7 +1528,7 @@ mod tests {
 
         // Entry with only one query term match
         let e1 = make_entry("m1", "a", "Rust is a programming language", "fact");
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         // Entry matching both query terms
         let e2 = make_entry(
@@ -1365,14 +1537,17 @@ mod tests {
             "Rust has excellent performance and speed",
             "fact",
         );
-        store.store(e2).await.unwrap();
+        store.store(&test_scope(), e2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("Rust performance".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("Rust performance".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1396,19 +1571,22 @@ mod tests {
 
         // Match in content only
         let e1 = make_entry("m1", "a", "optimization techniques for databases", "fact");
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         // Match in both content and keywords (keyword boost)
         let mut e2 = make_entry("m2", "a", "optimization techniques for systems", "fact");
         e2.keywords = vec!["optimization".into(), "databases".into()];
-        store.store(e2).await.unwrap();
+        store.store(&test_scope(), e2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("optimization databases".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("optimization databases".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1432,17 +1610,20 @@ mod tests {
 
         let mut weak = make_entry("m1", "a", "weak entry", "fact");
         weak.strength = 0.2;
-        store.store(weak).await.unwrap();
+        store.store(&test_scope(), weak).await.unwrap();
 
         let mut strong = make_entry("m2", "a", "strong entry", "fact");
         strong.strength = 0.9;
-        store.store(strong).await.unwrap();
+        store.store(&test_scope(), strong).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1467,7 +1648,7 @@ mod tests {
 
         // e1: keyword match for "rust" but no embedding
         let e1 = make_entry("m1", "a", "Rust is fast", "fact");
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         // e2: no keyword match for "rust" but has embedding very similar to query
         let mut e2 = make_entry(
@@ -1477,16 +1658,19 @@ mod tests {
             "fact",
         );
         e2.embedding = Some(vec![0.9, 0.1, 0.0]);
-        store.store(e2).await.unwrap();
+        store.store(&test_scope(), e2).await.unwrap();
 
         // Query: "rust" with embedding close to e2's embedding
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust".into()),
-                query_embedding: Some(vec![0.9, 0.1, 0.0]),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    query_embedding: Some(vec![0.9, 0.1, 0.0]),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1513,28 +1697,31 @@ mod tests {
         // e1 matches "rust" and "fast" (2 terms) — strong BM25
         let mut e1 = make_entry("m1", "a", "Rust is fast and fast", "fact");
         e1.embedding = Some(vec![0.0, 0.0, 1.0]); // orthogonal to query embedding
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         // e2 matches only "rust" (1 term) — weaker BM25
         let mut e2 = make_entry("m2", "a", "Rust has zero-cost abstractions", "fact");
         e2.embedding = Some(vec![0.95, 0.05, 0.0]); // very similar to query embedding
-        store.store(e2).await.unwrap();
+        store.store(&test_scope(), e2).await.unwrap();
 
         // e3 matches only "rust" — weakest BM25, moderate vector
         let mut e3 = make_entry("m3", "a", "Rust is a programming language", "fact");
         e3.embedding = Some(vec![0.5, 0.5, 0.0]); // moderate similarity
-        store.store(e3).await.unwrap();
+        store.store(&test_scope(), e3).await.unwrap();
 
         // Without hybrid: BM25 ranks m1 first (matches "rust"+"fast").
         // With hybrid: vector strongly boosts m2 (0.95 similarity vs m1's 0.0).
         // RRF fuses both signals — m2 should come out on top.
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust fast".into()),
-                query_embedding: Some(vec![0.95, 0.05, 0.0]),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust fast".into()),
+                    query_embedding: Some(vec![0.95, 0.05, 0.0]),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1562,18 +1749,21 @@ mod tests {
         });
 
         let e1 = make_entry("m1", "a", "Rust programming language", "fact");
-        store.store(e1).await.unwrap();
+        store.store(&test_scope(), e1).await.unwrap();
 
         let e2 = make_entry("m2", "a", "Rust performance and speed", "fact");
-        store.store(e2).await.unwrap();
+        store.store(&test_scope(), e2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("Rust performance".into()),
-                query_embedding: Some(vec![0.5, 0.5, 0.0]),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("Rust performance".into()),
+                    query_embedding: Some(vec![0.5, 0.5, 0.0]),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1590,18 +1780,21 @@ mod tests {
 
         let mut m1 = make_entry("m1", "a", "Rust is fast", "fact");
         m1.related_ids = vec!["m2".into()];
-        store.store(m1).await.unwrap();
+        store.store(&test_scope(), m1).await.unwrap();
 
         let mut m2 = make_entry("m2", "a", "Memory safety guarantees", "fact");
         m2.related_ids = vec!["m1".into()];
-        store.store(m2).await.unwrap();
+        store.store(&test_scope(), m2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1621,22 +1814,25 @@ mod tests {
 
         let mut m1 = make_entry("m1", "a", "Rust is fast", "fact");
         m1.related_ids = vec!["m2".into()];
-        store.store(m1).await.unwrap();
+        store.store(&test_scope(), m1).await.unwrap();
 
         // m2 has very low strength — should be excluded by min_strength
         let mut m2 = make_entry("m2", "a", "Weak linked memory", "fact");
         m2.related_ids = vec!["m1".into()];
         m2.strength = 0.01;
         m2.last_accessed = Utc::now() - chrono::Duration::hours(720); // very old
-        store.store(m2).await.unwrap();
+        store.store(&test_scope(), m2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust".into()),
-                min_strength: Some(0.1),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    min_strength: Some(0.1),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1652,18 +1848,21 @@ mod tests {
         // Both m1 and m2 match "rust" directly AND are linked
         let mut m1 = make_entry("m1", "a", "Rust is fast", "fact");
         m1.related_ids = vec!["m2".into()];
-        store.store(m1).await.unwrap();
+        store.store(&test_scope(), m1).await.unwrap();
 
         let mut m2 = make_entry("m2", "a", "Rust is safe", "fact");
         m2.related_ids = vec!["m1".into()];
-        store.store(m2).await.unwrap();
+        store.store(&test_scope(), m2).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                text: Some("rust".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1687,35 +1886,37 @@ mod tests {
         let store = InMemoryStore::new();
         // Sub-agent memories with compound namespace
         store
-            .store(make_entry("m1", "tg:123:assistant", "likes Rust", "fact"))
+            .store(
+                &test_scope(),
+                make_entry("m1", "tg:123:assistant", "likes Rust", "fact"),
+            )
             .await
             .unwrap();
         store
-            .store(make_entry(
-                "m2",
-                "tg:123:researcher",
-                "loves coffee",
-                "fact",
-            ))
+            .store(
+                &test_scope(),
+                make_entry("m2", "tg:123:researcher", "loves coffee", "fact"),
+            )
             .await
             .unwrap();
         // Different user — should NOT match
         store
-            .store(make_entry(
-                "m3",
-                "tg:456:assistant",
-                "prefers Python",
-                "fact",
-            ))
+            .store(
+                &test_scope(),
+                make_entry("m3", "tg:456:assistant", "prefers Python", "fact"),
+            )
             .await
             .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                agent_prefix: Some("tg:123".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    agent_prefix: Some("tg:123".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1729,32 +1930,31 @@ mod tests {
     async fn recall_agent_exact_takes_precedence_over_prefix() {
         let store = InMemoryStore::new();
         store
-            .store(make_entry(
-                "m1",
-                "tg:123:assistant",
-                "from assistant",
-                "fact",
-            ))
+            .store(
+                &test_scope(),
+                make_entry("m1", "tg:123:assistant", "from assistant", "fact"),
+            )
             .await
             .unwrap();
         store
-            .store(make_entry(
-                "m2",
-                "tg:123:researcher",
-                "from researcher",
-                "fact",
-            ))
+            .store(
+                &test_scope(),
+                make_entry("m2", "tg:123:researcher", "from researcher", "fact"),
+            )
             .await
             .unwrap();
 
         // Exact agent filter should only return the exact match
         let results = store
-            .recall(MemoryQuery {
-                agent: Some("tg:123:assistant".into()),
-                agent_prefix: Some("tg:123".into()), // ignored
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    agent: Some("tg:123:assistant".into()),
+                    agent_prefix: Some("tg:123".into()), // ignored
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1769,26 +1969,29 @@ mod tests {
 
         let mut public = make_entry("m1", "a", "public fact", "fact");
         public.confidentiality = Confidentiality::Public;
-        store.store(public).await.unwrap();
+        store.store(&test_scope(), public).await.unwrap();
 
         let mut internal = make_entry("m2", "a", "internal note", "fact");
         internal.confidentiality = Confidentiality::Internal;
-        store.store(internal).await.unwrap();
+        store.store(&test_scope(), internal).await.unwrap();
 
         let mut confidential = make_entry("m3", "a", "private expense", "fact");
         confidential.confidentiality = Confidentiality::Confidential;
-        store.store(confidential).await.unwrap();
+        store.store(&test_scope(), confidential).await.unwrap();
 
         let mut restricted = make_entry("m4", "a", "api key", "fact");
         restricted.confidentiality = Confidentiality::Restricted;
-        store.store(restricted).await.unwrap();
+        store.store(&test_scope(), restricted).await.unwrap();
 
         // Cap at Public — only public entries returned
         let results = store
-            .recall(MemoryQuery {
-                max_confidentiality: Some(Confidentiality::Public),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    max_confidentiality: Some(Confidentiality::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1796,20 +1999,26 @@ mod tests {
 
         // No cap — all entries returned
         let results = store
-            .recall(MemoryQuery {
-                max_confidentiality: None,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    max_confidentiality: None,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 4);
 
         // Cap at Confidential — excludes Restricted
         let results = store
-            .recall(MemoryQuery {
-                max_confidentiality: Some(Confidentiality::Confidential),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    max_confidentiality: Some(Confidentiality::Confidential),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
@@ -1826,20 +2035,23 @@ mod tests {
         public.confidentiality = Confidentiality::Public;
         public.related_ids = vec!["m2".into()];
         public.keywords = vec!["project".into()];
-        store.store(public).await.unwrap();
+        store.store(&test_scope(), public).await.unwrap();
 
         let mut confidential = make_entry("m2", "a", "private expense data", "fact");
         confidential.confidentiality = Confidentiality::Confidential;
         confidential.keywords = vec!["expense".into()];
-        store.store(confidential).await.unwrap();
+        store.store(&test_scope(), confidential).await.unwrap();
 
         // Query with Public cap and keyword that matches m1 — should NOT expand to m2
         let results = store
-            .recall(MemoryQuery {
-                text: Some("project".into()),
-                max_confidentiality: Some(Confidentiality::Public),
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("project".into()),
+                    max_confidentiality: Some(Confidentiality::Public),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -1848,5 +2060,105 @@ mod tests {
             "graph expansion should not include Confidential entries when capped at Public"
         );
         assert!(results.iter().any(|e| e.id == "m1"));
+    }
+
+    // --- Tenant-scope isolation (B4): scope filter is independent of agent_prefix ---
+
+    #[tokio::test]
+    async fn recall_does_not_leak_across_tenants() {
+        let store = InMemoryStore::new();
+        let acme = TenantScope::new("acme");
+        let globex = TenantScope::new("globex");
+
+        store
+            .store(&acme, make_entry("a1", "agent", "acme-secret", "fact"))
+            .await
+            .unwrap();
+        store
+            .store(&globex, make_entry("g1", "agent", "globex-secret", "fact"))
+            .await
+            .unwrap();
+
+        let acme_results = store
+            .recall(
+                &acme,
+                MemoryQuery {
+                    agent: Some("agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(acme_results.len(), 1);
+        assert_eq!(acme_results[0].id, "a1");
+
+        let globex_results = store
+            .recall(
+                &globex,
+                MemoryQuery {
+                    agent: Some("agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(globex_results.len(), 1);
+        assert_eq!(globex_results[0].id, "g1");
+    }
+
+    #[tokio::test]
+    async fn forget_does_not_delete_other_tenant() {
+        let store = InMemoryStore::new();
+        let acme = TenantScope::new("acme");
+        let globex = TenantScope::new("globex");
+
+        store
+            .store(&acme, make_entry("a1", "agent", "x", "fact"))
+            .await
+            .unwrap();
+        store
+            .store(&globex, make_entry("g1", "agent", "y", "fact"))
+            .await
+            .unwrap();
+
+        // Try to forget acme's id under globex's scope — should not delete acme's entry.
+        let removed = store.forget(&globex, "a1").await.unwrap();
+        assert!(!removed);
+
+        let acme_results = store
+            .recall(
+                &acme,
+                MemoryQuery {
+                    agent: Some("agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(acme_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_under_scope_populates_author_tenant_id() {
+        let store = InMemoryStore::new();
+        let scope = TenantScope::new("acme").with_user("u-42");
+        store
+            .store(&scope, make_entry("s1", "agent", "x", "fact"))
+            .await
+            .unwrap();
+
+        let results = store
+            .recall(
+                &scope,
+                MemoryQuery {
+                    agent: Some("agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].author_tenant_id.as_deref(), Some("acme"));
+        assert_eq!(results[0].author_user_id.as_deref(), Some("u-42"));
     }
 }
