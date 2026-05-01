@@ -5386,4 +5386,111 @@ mod tests {
             "GuardrailWarned event should have fired"
         );
     }
+
+    #[tokio::test]
+    async fn max_tool_calls_per_turn_caps_excess_dispatch() {
+        // Canned response with 3 tool_use blocks; cap is 2.
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "a".into(),
+                    input: json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "b".into(),
+                    input: json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c3".into(),
+                    name: "c".into(),
+                    input: json!({}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+            model: None,
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("a", "x")))
+            .tool(Arc::new(MockTool::new("b", "y")))
+            .tool(Arc::new(MockTool::new("c", "z")))
+            .max_tool_calls_per_turn(2)
+            .build()
+            .unwrap();
+
+        let err = runner.execute("go").await.unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("tool-call cap exceeded"), "got: {s}");
+        // The error should carry partial usage (Error::WithPartialUsage shape)
+        assert!(
+            matches!(err, Error::WithPartialUsage { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn max_tool_calls_per_turn_zero_is_rejected_at_build() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let result = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("p")
+            .max_tool_calls_per_turn(0)
+            .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("max_tool_calls_per_turn must be > 0"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tool_calls_per_turn_at_cap_is_allowed() {
+        // Exactly at the cap (2 calls, cap=2) should NOT error — only > cap errors.
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "a".into(),
+                        input: json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c2".into(),
+                        name: "b".into(),
+                        input: json!({}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("a", "x")))
+            .tool(Arc::new(MockTool::new("b", "y")))
+            .max_tool_calls_per_turn(2)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("go").await.unwrap();
+        assert_eq!(output.tool_calls_made, 2);
+    }
 }

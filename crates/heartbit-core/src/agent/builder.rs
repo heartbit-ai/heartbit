@@ -50,6 +50,10 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) tool_profile: Option<tool_filter::ToolProfile>,
     pub(super) max_identical_tool_calls: Option<u32>,
     pub(super) max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Hard cap on the number of tool invocations the LLM may emit per turn.
+    /// Distinct from `max_tools_per_turn` (which limits tool *definitions* offered
+    /// to the LLM). `None` = unlimited. Zero is rejected at build time.
+    pub(super) max_tool_calls_per_turn: Option<u32>,
     pub(super) permission_rules: permission::PermissionRuleset,
     /// Instruction file contents to prepend to the system prompt.
     pub(super) instruction_text: Option<String>,
@@ -293,6 +297,23 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Cap the number of tool *invocations* the LLM may emit per turn.
+    /// When the LLM returns more tool_use blocks than `cap`, the run
+    /// returns `Error::Agent` (wrapped in `Error::WithPartialUsage`) and
+    /// no tools are dispatched.
+    ///
+    /// **Distinct from `max_tools_per_turn`**: that one limits the *tool
+    /// definitions* offered to the LLM before it responds (pre-filter).
+    /// This one caps the *invocations* in the LLM's actual response
+    /// (post-response). Both can be set independently.
+    ///
+    /// Default: `None` (unlimited). Recommended for production: 8.
+    /// Zero is rejected at build time.
+    pub fn max_tool_calls_per_turn(mut self, cap: u32) -> Self {
+        self.max_tool_calls_per_turn = Some(cap);
+        self
+    }
+
     /// Set declarative permission rules for tool calls.
     ///
     /// Rules are evaluated per tool call before the `on_approval` callback.
@@ -493,6 +514,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 "max_fuzzy_identical_tool_calls must be at least 1".into(),
             ));
         }
+        if self.max_tool_calls_per_turn == Some(0) {
+            return Err(Error::Config(
+                "max_tool_calls_per_turn must be > 0 if set".into(),
+            ));
+        }
         if self.max_total_tokens == Some(0) {
             return Err(Error::Config("max_total_tokens must be at least 1".into()));
         }
@@ -605,6 +631,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,
             max_fuzzy_identical_tool_calls: self.max_fuzzy_identical_tool_calls,
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn,
             permission_rules: std::sync::RwLock::new(self.permission_rules),
             learned_permissions: self.learned_permissions,
             lsp_manager: self.lsp_manager,

@@ -138,6 +138,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// doom loop detection triggers. Fuzzy matching compares sorted tool names
     /// (ignoring inputs). `None` disables fuzzy detection.
     pub(super) max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Hard cap on the number of tool invocations per LLM turn. When the LLM
+    /// emits more tool_use blocks than this limit, the run fails with
+    /// `Error::Agent` (wrapped in `Error::WithPartialUsage`). `None` = unlimited.
+    pub(super) max_tool_calls_per_turn: Option<u32>,
     /// Declarative permission rules evaluated per tool call before the
     /// `on_approval` callback. `Allow` → execute, `Deny` → error result,
     /// `Ask` → fall through to `on_approval`.
@@ -231,6 +235,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             tool_profile: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             permission_rules: permission::PermissionRuleset::default(),
             instruction_text: None,
             learned_permissions: None,
@@ -810,6 +815,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 let tool_calls = response.tool_calls();
+
+                // Tool-call cap: reject turns that exceed max_tool_calls_per_turn.
+                // Checked before dispatch so no tools are executed on a capped turn.
+                if let Some(cap) = self.max_tool_calls_per_turn
+                    && tool_calls.len() as u32 > cap
+                {
+                    let err = Error::Agent(format!(
+                        "tool-call cap exceeded: turn produced {} calls, max is {cap}",
+                        tool_calls.len()
+                    ));
+                    self.emit(AgentEvent::RunFailed {
+                        agent: self.name.clone(),
+                        error: err.to_string(),
+                        partial_usage: total_usage,
+                    });
+                    return Err((err, total_usage));
+                }
 
                 self.emit(AgentEvent::LlmResponse {
                     agent: self.name.clone(),
