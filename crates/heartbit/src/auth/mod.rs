@@ -7,4 +7,4 @@ pub use jwt::{JwksClient, JwtValidator};
 #[cfg(feature = "vault")]
 pub mod vault;
 
-pub mod ct;
+pub use heartbit_core::auth::ct;

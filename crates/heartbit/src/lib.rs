@@ -64,33 +64,25 @@
 
 extern crate self as heartbit;
 
-// --- Core modules (always available) ---
-pub mod agent;
-pub mod channel;
-pub mod config;
-pub mod error;
-pub mod eval;
-pub mod http;
-pub mod knowledge;
-pub mod llm;
-pub mod memory;
-pub mod signal;
-pub mod store;
-pub mod template;
-pub mod tool;
-pub(crate) mod util;
-pub mod workspace;
+// All core modules and flat re-exports flow through this glob. Local module
+// declarations below (channel, memory, store, auth, daemon, sensor, workflow,
+// sandbox) shadow the glob-imported names — that's the point: the umbrella's
+// versions add platform-specific extensions on top of core.
+pub use heartbit_core::*;
 
-#[cfg(all(target_os = "linux", feature = "sandbox"))]
-pub mod sandbox;
-
-pub mod lsp;
-
-// --- Feature-gated modules ---
+// --- Umbrella-side platform modules ---
 // `auth` is unconditional: `auth::ct` is a foundational constant-time helper
 // that all builds need access to. `auth::jwt` and `auth::vault` remain gated
 // inside `auth/mod.rs`.
 pub mod auth;
+pub mod channel;
+pub mod memory;
+pub mod store;
+pub(crate) mod util;
+
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+pub mod sandbox;
+
 #[cfg(feature = "daemon")]
 pub mod daemon;
 #[cfg(feature = "sensor")]
@@ -99,9 +91,9 @@ pub mod sensor;
 pub mod workflow;
 
 // --- Channel re-exports (always available — lightweight traits) ---
-pub use channel::bridge::{InteractionBridge, OutboundMessage};
 #[cfg(feature = "postgres")]
-pub use channel::session::PostgresSessionStore;
+pub use channel::PostgresSessionStore;
+pub use channel::bridge::{InteractionBridge, OutboundMessage};
 pub use channel::session::{
     InMemorySessionStore, Session, SessionMessage, SessionRole, SessionStore,
     format_session_context,
@@ -130,49 +122,6 @@ pub use channel::telegram::{
     parse_callback_data, question_buttons,
 };
 
-// --- Agent re-exports ---
-pub use agent::audit::{AuditMode, AuditRecord, AuditTrail, InMemoryAuditTrail};
-pub use agent::batch::{BatchConfig, BatchExecutor, BatchExecutorBuilder, BatchResult};
-pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
-pub use agent::cache::ResponseCache;
-pub use agent::context::ContextStrategy;
-pub use agent::dag::{DagAgent, DagAgentBuilder};
-pub use agent::debate::{DebateAgent, DebateAgentBuilder};
-pub use agent::events::{AgentEvent, OnEvent};
-pub use agent::guardrail::{GuardAction, Guardrail};
-#[cfg(feature = "sensor")]
-pub use agent::guardrails::SensorSecurityGuardrail;
-pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
-pub use agent::guardrails::{
-    ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BehaviorRule, BehavioralMonitorGuardrail,
-    BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, ContentFenceGuardrail,
-    GuardrailChain, GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail,
-    LlmJudgeGuardrailBuilder, PiiAction, PiiDetector, PiiGuardrail, SecretAction,
-    SecretScannerGuardrail, SecretScannerGuardrailBuilder, ToolPolicyGuardrail, WarnToDeny,
-};
-pub use agent::instructions::{
-    discover_instruction_files, load_instructions, prepend_instructions,
-};
-pub use agent::mixture::{MixtureOfAgentsAgent, MixtureOfAgentsAgentBuilder};
-pub use agent::observability::ObservabilityMode;
-pub use agent::orchestrator::{Orchestrator, OrchestratorBuilder, SubAgentConfig};
-pub use agent::permission::{
-    LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
-};
-pub use agent::prompts::MULTI_AGENT_COLLAB_PROMPT;
-pub use agent::pruner::SessionPruneConfig;
-pub use agent::routing::{
-    AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,
-    RoutingStrategy, TaskComplexityAnalyzer, resolve_routing_mode, should_escalate,
-};
-pub use agent::tool_filter::ToolProfile;
-pub use agent::voting::{VoteResult, VotingAgent, VotingAgentBuilder};
-pub use agent::workflow::{
-    LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
-    SequentialAgentBuilder, WorkflowRouter, WorkflowType,
-};
-pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
-
 // --- Config re-exports (always available — just data structs) ---
 pub use config::{
     ActionBudgetConfig, ActionBudgetRuleConfig, ActiveHoursConfig, AgentConfig,
@@ -185,8 +134,8 @@ pub use config::{
     SalienceConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig, SensorConfig,
     SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, SpawnConfig,
     StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
-    ToolPolicyRuleConfig, WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile,
-    parse_workflow_type,
+    ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig, WsConfig, parse_reasoning_effort,
+    parse_tool_profile, parse_workflow_type,
 };
 
 // --- Auth re-exports (feature-gated) ---
@@ -214,9 +163,6 @@ pub use daemon::{
     TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
 };
 
-// --- Error re-exports ---
-pub use error::Error;
-
 // --- Eval re-exports ---
 pub use eval::{
     CaseComparison, CostScorer, EvalCase, EvalComparison, EvalResult, EvalRunner, EvalScorer,
@@ -225,51 +171,11 @@ pub use eval::{
     clear_events,
 };
 
-// --- Knowledge re-exports ---
-pub use knowledge::in_memory::InMemoryKnowledgeBase;
-pub use knowledge::{Chunk, DocumentSource, KnowledgeBase, KnowledgeQuery, SearchResult};
-
-// --- LLM re-exports ---
-pub use llm::ApprovalDecision;
-pub use llm::LlmProvider;
-pub use llm::OnApproval;
-pub use llm::OnText;
-pub use llm::anthropic::AnthropicProvider;
-pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
-pub use llm::error_class::{ErrorClass, classify as classify_error};
-pub use llm::gemini::GeminiProvider;
-pub use llm::openai_compat::{AuthStyle, OpenAiCompatProvider};
-pub use llm::openrouter::OpenRouterProvider;
-pub use llm::pricing::estimate_cost;
-pub use llm::registry::{
-    ProviderInfo, detect_available_provider, get_provider, known_providers as known_llm_providers,
-    resolve_api_key,
-};
-pub use llm::retry::{OnRetry, RetryConfig, RetryingProvider};
-pub use llm::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, Message, ReasoningEffort, Role,
-    StopReason, TokenUsage, ToolCall, ToolChoice, ToolDefinition, ToolResult,
-};
-pub use llm::{BoxedProvider, DynLlmProvider};
-
-// --- LSP re-exports ---
-pub use lsp::{Diagnostic as LspDiagnostic, LspManager};
-
-// --- Memory re-exports ---
-pub use memory::Confidentiality;
-pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
+// --- Memory re-exports (feature-gated platform impls only — core impls flow through glob) ---
 #[cfg(feature = "local-embedding")]
-pub use memory::embedding::LocalEmbeddingProvider;
-pub use memory::embedding::{EmbeddingMemory, EmbeddingProvider, NoopEmbedding, OpenAiEmbedding};
-pub use memory::hybrid::{cosine_similarity, rrf_fuse};
-pub use memory::in_memory::InMemoryStore;
-pub use memory::namespaced::NamespacedMemory;
+pub use memory::LocalEmbeddingProvider;
 #[cfg(feature = "postgres")]
 pub use memory::postgres::PostgresMemoryStore;
-pub use memory::pruning::{DEFAULT_MIN_STRENGTH, default_min_age, prune_weak_entries};
-pub use memory::reflection::ReflectionTracker;
-pub use memory::scoring::ScoringWeights;
-pub use memory::{Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 // --- Sensor re-exports (feature-gated) ---
 #[cfg(feature = "sensor")]
@@ -282,46 +188,26 @@ pub use sensor::routing::{ModelRouter, ModelTier};
 pub use sensor::stories::{Story, StoryCorrelator, StoryStatus, SubjectType};
 #[cfg(feature = "sensor")]
 pub use sensor::triage::context::TaskContext;
-// TrustLevel is always available (defined in config.rs).
-pub use config::TrustLevel;
 #[cfg(feature = "sensor")]
 pub use sensor::triage::{ActionCategory, Priority, TriageDecision, TriageProcessor};
 #[cfg(feature = "sensor")]
 pub use sensor::{Sensor, SensorEvent};
 
-// --- Tool re-exports ---
+// --- Template re-exports ---
 pub use template::registry::{known_templates, resolve_template};
 pub use template::skills::{SkillContent, known_skills, load_skill, load_skills};
 pub use template::{AgentTemplate, PartialAgentConfig, TemplateMeta, resolve_agent_config};
-#[cfg(feature = "a2a")]
-pub use tool::a2a::A2aClient;
-pub use tool::builtins::{
-    BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
-    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, TwitterCredentials,
-    builtin_tools,
-};
-pub use tool::mcp::{
-    AuthProvider, AuthResolver, DirectAuthProvider, DynamicAuthResolver, McpClient,
-    McpPromptArgument, McpPromptDef, McpPromptMessage, McpPromptMessageContent, McpResourceContent,
-    McpResourceDef, McpRoot, McpTransportPool, SamplingContent, SamplingHandler, SamplingMessage,
-    SamplingModelHint, SamplingModelPreferences, SamplingRequest, StaticAuthProvider,
-    StaticAuthResolver, TokenExchangeAuthProvider,
-};
-pub use tool::mcp_presets::{McpPreset, check_preset_env, known_presets, resolve_preset};
-pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
-pub use tool::{Tool, ToolOutput, validate_tool_input};
 
 // --- Macro re-exports (feature-gated) ---
 #[cfg(feature = "macro")]
 pub use heartbit_macro::heartbit_tool;
 
-// --- Store re-exports ---
+// --- Store re-exports (feature-gated platform impls only) ---
 #[cfg(feature = "postgres")]
 pub use store::PostgresStore;
 #[cfg(feature = "postgres")]
 pub use store::postgres::PostgresAuditTrail;
 
-// --- Workspace re-exports ---
+// --- Sandbox re-exports (feature-gated) ---
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub use sandbox::SandboxPolicy;
-pub use workspace::Workspace;

@@ -1016,6 +1016,21 @@ impl<'a> RuntimeBuilder<'a> {
 
         // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
         let builtins = {
+            #[cfg(feature = "daemon")]
+            let mut btc = {
+                let mut btc = BuiltinToolsConfig {
+                    on_question: self
+                        .on_question
+                        .clone()
+                        .or_else(|| Some(question_callback())),
+                    workspace: self.workspace_dir.clone(),
+                    dangerous_tools: self.dangerous_tools,
+                    ..Default::default()
+                };
+                btc.daemon_todo_store = self.daemon_todo_store;
+                btc
+            };
+            #[cfg(not(feature = "daemon"))]
             let btc = BuiltinToolsConfig {
                 on_question: self
                     .on_question
@@ -1023,7 +1038,6 @@ impl<'a> RuntimeBuilder<'a> {
                     .or_else(|| Some(question_callback())),
                 workspace: self.workspace_dir.clone(),
                 dangerous_tools: self.dangerous_tools,
-                daemon_todo_store: self.daemon_todo_store,
                 ..Default::default()
             };
             builtin_tools(btc)

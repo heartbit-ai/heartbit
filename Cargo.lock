@@ -1703,7 +1703,6 @@ dependencies = [
 name = "heartbit"
 version = "2026.306.6"
 dependencies = [
- "a2a-sdk",
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
@@ -1713,6 +1712,7 @@ dependencies = [
  "fastembed",
  "futures",
  "glob",
+ "heartbit-core",
  "heartbit-macro",
  "hex",
  "hmac",
@@ -1777,6 +1777,35 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "heartbit-core"
+version = "2026.306.6"
+dependencies = [
+ "a2a-sdk",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures",
+ "glob",
+ "hmac",
+ "jsonschema",
+ "petgraph",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

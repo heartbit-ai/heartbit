@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway"]
+members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core"]
 
 [workspace.package]
 version = "2026.306.6"
