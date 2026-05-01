@@ -497,25 +497,45 @@ prune_interval_minutes = 60  # how often the background task runs
 
 A new background task spawned in `DaemonCore::run_*` calls `audit.prune(retain)` on the configured interval. The audit trait itself stays in `heartbit-core`; the retention background task is in `heartbit/daemon/` because it's daemon-mode-specific.
 
-### Component 6: Postgres tenant constraints
+### Component 6: Postgres tenant columns
 
-The existing schema stores tenant ids as `TEXT` (matching `UserContext.tenant_id: String` and `MemoryEntry.author_tenant_id: Option<String>` types — see Component 1 rationale). The migrations enforce non-null + index, they do **not** retype to `uuid`. Two new SQLx migrations under `crates/heartbit/migrations/postgres/` (numbering follows whatever the next free slot is when the round lands):
+**Current state.** I checked the live schemas (`crates/heartbit/src/memory/postgres.rs:176` and `crates/heartbit/src/store/postgres.rs:101`). The `memories` table has no `author_tenant_id` column at all; the `audit_log` table has no `tenant_id` column at all. The Rust structs carry these fields, but they're **dropped on persistence** — `PostgresMemoryStore::recall` always returns `author_tenant_id: None`, and `write_audit` never persists tenant. Tenant scoping in Postgres is currently non-functional.
 
-- `NNNN_audit_tenant_not_null.sql` — backfills `NULL` rows in `audit.tenant_id` to the empty-string sentinel (`''`), adds `NOT NULL DEFAULT ''` to the column, and adds a composite `(tenant_id, created_at DESC)` index for efficient `entries(&scope, limit)` queries.
-- `NNNN+1_memory_tenant_not_null.sql` — same treatment for `memory.author_tenant_id`. Composite index on `(author_tenant_id, agent, created_at DESC)` for the recall query shape.
+This makes Component 6 larger than originally drafted: we're adding columns, writing them on insert, and filtering them in queries — not just adding `NOT NULL` to existing columns. The migrations use idempotent `ADD COLUMN IF NOT EXISTS` (matching the existing migration pattern in `memory/postgres.rs:198`) so re-running is safe.
 
-The empty-string sentinel matches `TenantScope::single_tenant()` so single-tenant deployments don't see a behavior change: existing rows with `tenant_id = NULL` become `tenant_id = ''`, and queries scoped by `TenantScope::default()` (also `''`) still match them.
+**Migrations** are added inline in the existing `run_migration` methods (the codebase already does idempotent migrations this way; no separate `migrations/` directory is in use today, and adding one would be a separate refactor):
 
-Migrations are gated behind the `postgres` feature; library-only consumers see no schema change. There's no separate "drop legacy column" migration: the legacy state was *nullable text*, not a separate column, so backfill-then-NOT-NULL is single-step.
+- In `memory/postgres.rs::run_migration` — append:
+  ```sql
+  ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_tenant_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_user_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_memories_tenant ON memories(author_tenant_id, agent);
+  ```
+- In `store/postgres.rs::run_migration` — append:
+  ```sql
+  ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS user_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id, created_at DESC);
+  ```
 
-A pre-migration helper query is documented in the upgrade notes for operators to audit current state:
+**Default `''`** matches `TenantScope::single_tenant()`. Existing rows get `''`; new rows under a real tenant get the actual tenant id. Single-tenant deployments are unaffected. The empty-string default is what makes `TenantScope::default()` queries match historical rows transparently.
+
+**Code changes:**
+
+- `PostgresMemoryStore::store` — bind `entry.author_tenant_id.unwrap_or_default()` and `entry.author_user_id`.
+- `PostgresMemoryStore::recall` — `WHERE author_tenant_id = $N` filter; populate `author_tenant_id` and `author_user_id` on the returned `MemoryEntry`.
+- `PostgresAuditTrail` (today: implicit via `AuditStore::write_audit`) — bind `record.tenant_id.as_deref().unwrap_or("")` and `record.user_id`. Add `audit_log.tenant_id` filter to scoped reads.
+
+Migrations are gated behind the `postgres` feature; library-only consumers see no schema change. No `task_outcomes` table exists (the spec's earlier draft mentioned it; that was a stale reference — there is `tasks` but tenant scoping for tasks is out of scope and follows in B5).
+
+**Pre-migration audit query** for operators (documented in upgrade notes), useful only on installations that ran a downstream patch adding the columns earlier:
 
 ```sql
-SELECT count(*) AS null_tenants FROM audit WHERE tenant_id IS NULL;
-SELECT count(*) AS null_tenants FROM memory WHERE author_tenant_id IS NULL;
+SELECT count(*) FROM memories WHERE author_tenant_id IS NULL;
+SELECT count(*) FROM audit_log WHERE tenant_id IS NULL;
 ```
 
-If either count is non-zero on a multi-tenant deployment, that indicates a pre-existing bug (rows were written without a scope). Operators should investigate before running the migration; the migration will collapse those rows into single-tenant data.
+On a stock installation both queries return `0` because the columns don't exist yet — `ADD COLUMN IF NOT EXISTS ... NOT NULL DEFAULT ''` creates them already filled.
 
 ### CLI / config surface
 
