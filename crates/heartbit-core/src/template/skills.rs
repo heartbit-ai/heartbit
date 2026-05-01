@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::error::Error;
+use crate::tool::builtins::floor_char_boundary;
 
 /// Parsed skill content from a SKILL.md file.
 #[derive(Debug, Clone)]
@@ -194,18 +195,6 @@ fn collect_skill_search_dirs() -> Vec<PathBuf> {
     }
 
     dirs
-}
-
-/// Find the largest valid UTF-8 char boundary at or before `max`.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
-    }
-    let mut i = max;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 #[cfg(test)]

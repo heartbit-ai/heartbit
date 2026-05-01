@@ -13,11 +13,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-exports `heartbit-core` (`pub use heartbit_core::*;`) and adds platform
   integrations (Postgres, Telegram/Discord/Slack adapters, Restate
   workflows, fastembed local embeddings, vault, JWT validator, daemon
-  mode). **No public API changes** — every existing import
+  mode). **No breaking public API changes** — every existing import
   (`use heartbit::AgentRunner;` etc.) continues to compile via the
-  umbrella's glob re-export. Library users should target `heartbit-core`
-  directly; runtime/platform users keep using `heartbit`. Documentation
-  rewritten: top-level `README.md` now leads with the framework
+  umbrella's glob re-export. A handful of items previously `pub(crate)`
+  in the umbrella are now `pub` in `heartbit-core` (transitional surface
+  to keep umbrella-side code that consumes them compiling); these may
+  return to `pub(crate)` in a future cleanup round. Library users should
+  target `heartbit-core` directly; runtime/platform users keep using
+  `heartbit`. `heartbit-cli` gains a small `daemon` feature that
+  forwards to `heartbit/daemon` so the CLI can be built without daemon
+  mode (the default `heartbit-cli` ships with `features = ["full"]`, so
+  this is a no-op for default builds). Documentation rewritten:
+  top-level `README.md` now leads with the framework
   (`cargo add heartbit-core` + quickstart), platform content moves to
   `crates/heartbit-cli/README.md` and `docs/platform.md`, and
   `crates/heartbit-core/README.md` is the docs.rs landing page.
