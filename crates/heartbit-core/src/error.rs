@@ -68,6 +68,9 @@ pub enum Error {
     #[error("Kill switch activated: {0}")]
     KillSwitch(String),
 
+    #[error("sandbox violation: {0}")]
+    Sandbox(String),
+
     /// Wraps another error with partial token usage accumulated before failure.
     /// Used by `AgentRunner::execute` to surface tokens consumed before an error.
     #[error("{source}")]

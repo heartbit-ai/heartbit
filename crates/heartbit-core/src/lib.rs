@@ -19,6 +19,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod lsp;
 pub mod memory;
+pub mod sandbox;
 pub mod signal;
 pub mod store;
 pub mod template;
@@ -72,6 +73,9 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
 // --- Error re-exports ---
 pub use error::Error;
+
+// --- Sandbox re-exports ---
+pub use sandbox::{CorePathPolicy, CorePathPolicyBuilder};
 
 // --- Knowledge re-exports ---
 pub use knowledge::in_memory::InMemoryKnowledgeBase;
