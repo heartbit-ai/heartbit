@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use heartbit::daemon::kafka;
 use heartbit::{
     AgentEvent, AgentOutput, DaemonCore, DaemonMetrics, Error as HeartbitError, HeartbitConfig,
-    InMemoryTaskStore, JwtValidator, Memory,
+    InMemoryTaskStore, JwtValidator, Memory, PostgresStore,
 };
 
 use crate::{build_on_retry, build_provider_from_config, init_tracing_from_config};
@@ -135,6 +135,12 @@ pub async fn run_daemon(
 
         let (core, handle) =
             DaemonCore::new(&daemon_config, consumer, producer, store, cancel.clone());
+        // Attach Postgres store for audit retention (used by HEARTBIT_AUDIT_RETAIN_DAYS).
+        let core = if let Some(ref pool) = db_pool {
+            core.with_postgres_store(std::sync::Arc::new(PostgresStore::new(pool.clone())))
+        } else {
+            core
+        };
         tracing::info!("Kafka consumer/producer initialized");
         (Some(core), handle)
     } else {

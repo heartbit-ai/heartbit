@@ -242,6 +242,17 @@ impl PostgresStore {
 
         Ok(entries.into_iter().map(|e| e.into()).collect())
     }
+
+    /// Delete audit_log rows older than `now - retain`. Returns the number of rows deleted.
+    pub async fn prune_audit(&self, retain: chrono::Duration) -> Result<usize, Error> {
+        let cutoff = chrono::Utc::now() - retain;
+        let result = sqlx::query("DELETE FROM audit_log WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Store(format!("prune_audit: {e}")))?;
+        Ok(result.rows_affected() as usize)
+    }
 }
 
 /// Audit trail backed by PostgreSQL, bridging to the existing `audit_log` table.
@@ -393,14 +404,11 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
 
     fn prune(
         &self,
-        _retain: chrono::Duration,
+        retain: chrono::Duration,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Error>> + Send + '_>>
     {
-        // The audit_log table has no tenant_id column in the current schema.
-        // A global DELETE by created_at would require a new PostgresStore method.
-        // TODO Task 9: add PostgresStore::prune_audit(retain: Duration) -> usize
-        // and wire it here once the schema migration adds tenant_id + index on created_at.
-        Box::pin(async move { Ok(0) })
+        let store = self.store.clone();
+        Box::pin(async move { store.prune_audit(retain).await })
     }
 }
 
@@ -462,5 +470,73 @@ mod tests {
         let parsed: TaskRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, "completed");
         assert!(parsed.token_usage.is_some());
+    }
+
+    /// Integration test: prune_audit deletes rows older than the retain window.
+    ///
+    /// Requires a live PostgreSQL instance (DATABASE_URL env var). Ignored in CI.
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (live PostgreSQL)"]
+    async fn prune_audit_deletes_old_rows() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        store.run_migration().await.expect("migration");
+
+        let task_id = Uuid::new_v4();
+        // Insert a task so the FK constraint on audit_log is satisfied
+        sqlx::query(
+            "INSERT INTO tasks (id, status, task_input) VALUES ($1, 'completed', 'prune test')",
+        )
+        .bind(task_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert task");
+
+        // Insert a row with a created_at in the far past (30 days ago)
+        let old_ts = chrono::Utc::now() - chrono::Duration::days(30);
+        sqlx::query(
+            "INSERT INTO audit_log (task_id, agent_name, event_type, payload, created_at) \
+             VALUES ($1, 'test-agent', 'test', '{}', $2)",
+        )
+        .bind(task_id)
+        .bind(old_ts)
+        .execute(&store.pool)
+        .await
+        .expect("insert old audit row");
+
+        // Insert a fresh row (should NOT be pruned)
+        store
+            .write_audit(
+                task_id,
+                "test-agent",
+                "test",
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .await
+            .expect("insert fresh audit row");
+
+        // Prune rows older than 7 days — only the 30-day-old row should be removed
+        let removed = store
+            .prune_audit(chrono::Duration::days(7))
+            .await
+            .expect("prune_audit");
+        assert!(
+            removed >= 1,
+            "expected at least 1 deleted row, got {removed}"
+        );
+
+        // Cleanup
+        sqlx::query("DELETE FROM audit_log WHERE task_id = $1")
+            .bind(task_id)
+            .execute(&store.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .execute(&store.pool)
+            .await
+            .ok();
     }
 }
