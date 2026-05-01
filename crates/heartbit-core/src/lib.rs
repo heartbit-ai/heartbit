@@ -23,8 +23,8 @@ pub mod signal;
 pub mod store;
 pub mod template;
 pub mod tool;
-pub mod types;
-pub mod util;
+pub(crate) mod types;
+pub(crate) mod util;
 pub mod workspace;
 
 // --- Agent re-exports ---
