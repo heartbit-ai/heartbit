@@ -63,6 +63,20 @@ Every public function must have at least one test. `cargo test` must pass before
 - `pub(crate)` for internal APIs. Keep modules focused.
 - No premature abstraction -- three similar lines is better than one unused helper.
 
+## Documentation
+
+If you change a public API in `heartbit-core`, update the relevant
+chapter in `book/src/`. The book is published at
+[docs.heartbit.ai](https://docs.heartbit.ai) and is the canonical
+narrative reference for library users. The CI workflow at
+`.github/workflows/book.yml` builds the book on every PR; broken
+`{{#include}}` paths or build errors fail the check.
+
+Examples in `crates/heartbit-core/examples/` are sourced into the book
+via `{{#include}}` directives. If you change an example, the book chapter
+that includes it stays in sync automatically — but the surrounding prose
+may need an update.
+
 ## Submitting a pull request
 
 1. Fork the repository and create a feature branch from `main`.

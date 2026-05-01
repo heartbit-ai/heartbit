@@ -67,6 +67,48 @@ pub struct DagAgentBuilder<P: LlmProvider + 'static> {
 }
 
 impl<P: LlmProvider + 'static> DagAgent<P> {
+    /// Create a new [`DagAgentBuilder`].
+    ///
+    /// Add nodes with `.node("name", agent)` and edges with
+    /// `.edge("from", "to")`. The builder validates the graph is acyclic
+    /// and that all edge endpoints reference declared nodes.
+    ///
+    /// # Example
+    ///
+    /// A diamond DAG: planner fans out to two workers that converge into a synthesizer.
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use heartbit_core::{
+    ///     AgentRunner, AnthropicProvider, BoxedProvider, DagAgent,
+    /// };
+    ///
+    /// # async fn run() -> Result<(), heartbit_core::Error> {
+    /// let provider = Arc::new(BoxedProvider::new(AnthropicProvider::new(
+    ///     "sk-...",
+    ///     "claude-sonnet-4-20250514",
+    /// )));
+    /// let make = |prompt: &str| {
+    ///     AgentRunner::builder(provider.clone())
+    ///         .system_prompt(prompt)
+    ///         .build()
+    ///         .expect("agent build")
+    /// };
+    ///
+    /// let dag = DagAgent::builder()
+    ///     .node("plan", make("Outline the question."))
+    ///     .node("research", make("Answer the question."))
+    ///     .node("critique", make("Critique the proposed answer."))
+    ///     .node("synth", make("Combine research and critique."))
+    ///     .edge("plan", "research")
+    ///     .edge("plan", "critique")
+    ///     .edge("research", "synth")
+    ///     .edge("critique", "synth")
+    ///     .build()?;
+    /// let output = dag.execute("Should we use Rust?").await?;
+    /// println!("{}", output.result);
+    /// # Ok(()) }
+    /// ```
     pub fn builder() -> DagAgentBuilder<P> {
         DagAgentBuilder {
             nodes: Vec::new(),

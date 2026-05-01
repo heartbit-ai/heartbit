@@ -539,6 +539,22 @@ impl Default for EvalRunner {
 
 impl EvalRunner {
     /// Create a new eval runner with no scorers.
+    ///
+    /// Add scorers with [`scorer`](Self::scorer); each runs against every
+    /// case's actual output to produce a [`ScorerResult`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use heartbit_core::eval::{EvalCase, EvalRunner, KeywordScorer};
+    ///
+    /// let runner = EvalRunner::new().scorer(KeywordScorer);
+    /// let case = EvalCase::new("capital", "What is the capital of France?")
+    ///     .expect_output_contains("Paris");
+    /// // No real LLM call here — score the "actual output" directly.
+    /// let result = runner.score_result(&case, "The capital of France is Paris.", &[], None);
+    /// assert!(result.passed);
+    /// ```
     pub fn new() -> Self {
         Self {
             scorers: Vec::new(),

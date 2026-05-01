@@ -1,0 +1,43 @@
+name: Book
+
+on:
+  push:
+    branches: [main]
+    paths: ['book/**', 'crates/heartbit-core/examples/**', '.github/workflows/book.yml']
+  pull_request:
+    paths: ['book/**', 'crates/heartbit-core/examples/**', '.github/workflows/book.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: 'latest'
+
+      - name: Cache cargo install
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-mdbook-plugins-v1
+
+      - name: Install mdBook plugins
+        run: |
+          if ! command -v mdbook-mermaid >/dev/null; then cargo install mdbook-mermaid; fi
+
+      - name: Build
+        run: cd book && mdbook build
+
+      - name: Deploy to gh-pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./book/book
+          cname: docs.heartbit.ai

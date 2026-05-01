@@ -66,6 +66,42 @@ impl GuardAction {
 ///
 /// Multiple guardrails are registered via `Vec<Arc<dyn Guardrail>>` — first
 /// `Deny` wins.
+///
+/// # Example
+///
+/// A trivial guardrail that denies any LLM response containing a forbidden
+/// substring:
+///
+/// ```rust
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use heartbit_core::{GuardAction, Guardrail};
+/// use heartbit_core::llm::types::CompletionResponse;
+///
+/// struct NoSecrets;
+///
+/// impl Guardrail for NoSecrets {
+///     fn name(&self) -> &str { "no-secrets" }
+///
+///     fn post_llm(
+///         &self,
+///         response: &CompletionResponse,
+///     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, heartbit_core::Error>> + Send + '_>> {
+///         let leaked = response
+///             .content
+///             .iter()
+///             .any(|block| matches!(block, heartbit_core::llm::types::ContentBlock::Text { text }
+///                 if text.contains("sk-")));
+///         Box::pin(async move {
+///             Ok(if leaked {
+///                 GuardAction::deny("response contained an API key prefix")
+///             } else {
+///                 GuardAction::Allow
+///             })
+///         })
+///     }
+/// }
+/// ```
 pub trait Guardrail: Send + Sync {
     /// Human-readable name for this guardrail, used in events and audit.
     /// Override to attribute which guardrail fired in logs.

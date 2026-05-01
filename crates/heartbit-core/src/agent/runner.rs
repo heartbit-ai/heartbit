@@ -180,6 +180,28 @@ pub struct AgentRunner<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
+    /// Create a new [`AgentRunnerBuilder`] for an agent backed by `provider`.
+    ///
+    /// The builder uses sensible defaults (10 turns, 4096 tokens) so the
+    /// minimum required configuration is just a system prompt.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use heartbit_core::{AgentRunner, AnthropicProvider, BoxedProvider};
+    ///
+    /// # async fn run() -> Result<(), heartbit_core::Error> {
+    /// let provider = Arc::new(BoxedProvider::new(AnthropicProvider::new(
+    ///     "sk-...",
+    ///     "claude-sonnet-4-20250514",
+    /// )));
+    /// let agent = AgentRunner::builder(provider)
+    ///     .system_prompt("You are a helpful assistant.")
+    ///     .build()?;
+    /// # let _ = agent;
+    /// # Ok(()) }
+    /// ```
     pub fn builder(provider: Arc<P>) -> AgentRunnerBuilder<P> {
         AgentRunnerBuilder {
             provider,
