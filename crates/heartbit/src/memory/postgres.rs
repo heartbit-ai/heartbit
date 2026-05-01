@@ -180,6 +180,20 @@ impl PostgresMemoryStore {
     ///
     /// Each statement runs separately because `sqlx` prepared statements
     /// do not support multi-command batches.
+    ///
+    /// **B4 multi-tenant upgrade notes:** before upgrading from a pre-B4
+    /// deployment, audit existing data:
+    ///
+    /// ```sql
+    /// SELECT count(*) FROM memories WHERE author_tenant_id IS NULL;
+    /// ```
+    ///
+    /// Non-zero on a multi-tenant installation indicates rows that were
+    /// written without a tenant scope (pre-B4). The migration adds the
+    /// `author_tenant_id` column as NOT NULL DEFAULT '' so existing rows
+    /// (which had no value) collapse into the single-tenant sentinel — they
+    /// remain visible to `TenantScope::default()`-scoped queries but are
+    /// invisible to multi-tenant ones.
     pub async fn run_migration(&mut self) -> Result<(), Error> {
         let statements = [
             r#"CREATE TABLE IF NOT EXISTS memories (

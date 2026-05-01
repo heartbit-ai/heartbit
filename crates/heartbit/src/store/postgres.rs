@@ -86,7 +86,19 @@ impl PostgresStore {
         Ok(Self { pool })
     }
 
-    /// Run the initial schema migration.
+    /// Run the initial schema migration. Idempotent — safe to re-run.
+    ///
+    /// **B4 multi-tenant upgrade notes:** before upgrading from a pre-B4
+    /// deployment, audit existing data:
+    ///
+    /// ```sql
+    /// SELECT count(*) FROM audit_log WHERE tenant_id IS NULL;
+    /// ```
+    ///
+    /// Non-zero on a multi-tenant installation indicates rows that were
+    /// written without a tenant scope (a pre-B4 bug). The migration backfills
+    /// these rows with the empty-string sentinel (single-tenant), matching
+    /// `TenantScope::default()`. After backfill, the column becomes NOT NULL.
     pub async fn run_migration(&self) -> Result<(), Error> {
         // Split into separate statements — sqlx doesn't support multiple
         // commands in a single prepared statement.
@@ -116,6 +128,14 @@ impl PostgresStore {
             "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
             "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS tenant_id TEXT",
             "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS user_id TEXT",
+            // B4 (Task 8): tighten tenant_id to NOT NULL DEFAULT '' for symmetry with
+            // memories.author_tenant_id and to make tenant scoping a guaranteed
+            // post-write invariant. Existing rows with NULL are backfilled to ''
+            // (single-tenant sentinel) — matches TenantScope::default() so default-
+            // scoped queries remain transparent against historical data.
+            "UPDATE audit_log SET tenant_id = '' WHERE tenant_id IS NULL",
+            "ALTER TABLE audit_log ALTER COLUMN tenant_id SET DEFAULT ''",
+            "ALTER TABLE audit_log ALTER COLUMN tenant_id SET NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id)",
             // idx_audit_created_at is required by prune_audit's DELETE to avoid full table scans.
             "CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_log(created_at)",
@@ -230,7 +250,9 @@ impl PostgresStore {
         .bind(payload)
         .bind(tokens_in)
         .bind(tokens_out)
-        .bind(tenant_id)
+        // tenant_id is NOT NULL DEFAULT '' on the column; bind "" when caller
+        // supplies None so single-tenant audits land in the sentinel namespace.
+        .bind(tenant_id.unwrap_or(""))
         .bind(user_id)
         .execute(&self.pool)
         .await
