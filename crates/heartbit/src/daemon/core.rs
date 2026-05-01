@@ -368,17 +368,25 @@ impl DaemonCore {
             if let Some(pg) = self.postgres_store.as_ref() {
                 let pg = pg.clone();
                 let retain = chrono::Duration::days(days);
+                let cancel = self.cancel.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
                     tick.tick().await; // consume the immediate first tick
                     loop {
-                        tick.tick().await;
-                        match pg.prune_audit(retain).await {
-                            Ok(n) => {
-                                tracing::info!(removed = n, "audit retention prune completed")
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                tracing::info!("audit prune task: cancellation received, exiting");
+                                break;
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "audit retention prune failed")
+                            _ = tick.tick() => {
+                                match pg.prune_audit(retain).await {
+                                    Ok(n) => {
+                                        tracing::info!(removed = n, "audit retention prune completed")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "audit retention prune failed")
+                                    }
+                                }
                             }
                         }
                     }
@@ -390,7 +398,7 @@ impl DaemonCore {
             } else {
                 tracing::debug!(
                     "HEARTBIT_AUDIT_RETAIN_DAYS set but no Postgres store attached; \
-                     audit pruning is a no-op (in-memory deployments rely on Vec capacity)"
+                     audit retention requires a Postgres store — in-memory trails grow without bound until prune is called explicitly"
                 );
             }
         }
