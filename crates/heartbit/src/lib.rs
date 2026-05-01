@@ -138,7 +138,8 @@ pub use config::{
     parse_tool_profile, parse_workflow_type,
 };
 
-// --- Auth re-exports (feature-gated) ---
+// --- Auth re-exports ---
+pub use auth::TenantScope;
 #[cfg(feature = "vault")]
 pub use auth::vault::{CredentialResolver, CredentialVault};
 #[cfg(feature = "daemon")]
