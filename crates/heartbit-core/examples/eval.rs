@@ -12,7 +12,7 @@ use heartbit_core::eval::{
 };
 
 fn main() {
-    let cases = vec![
+    let cases = [
         EvalCase::new("greeting", "Say hello in one word.")
             .expect_output_contains("hello")
             .expect_no_tools(),
