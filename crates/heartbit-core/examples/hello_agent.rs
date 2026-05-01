@@ -8,8 +8,8 @@ use heartbit_core::{AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvi
 
 #[tokio::main]
 async fn main() -> Result<(), heartbit_core::Error> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("set ANTHROPIC_API_KEY environment variable");
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
 
     let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
         AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),

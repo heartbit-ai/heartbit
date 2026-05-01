@@ -7,9 +7,7 @@
 use chrono::{Duration, Utc};
 
 use heartbit_core::memory::Confidentiality;
-use heartbit_core::{
-    InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType,
-};
+use heartbit_core::{InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 #[tokio::main]
 async fn main() -> Result<(), heartbit_core::Error> {

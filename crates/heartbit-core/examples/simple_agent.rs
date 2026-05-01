@@ -8,14 +8,12 @@
 use std::sync::Arc;
 
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
-use heartbit_core::{
-    AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider,
-};
+use heartbit_core::{AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider};
 
 #[tokio::main]
 async fn main() -> Result<(), heartbit_core::Error> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .expect("set ANTHROPIC_API_KEY environment variable");
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
 
     let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
         AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
@@ -46,7 +44,9 @@ async fn main() -> Result<(), heartbit_core::Error> {
         .build()?;
 
     let output = agent
-        .execute("List the files in the current directory and summarise what kind of project this is.")
+        .execute(
+            "List the files in the current directory and summarise what kind of project this is.",
+        )
         .await?;
 
     println!("{}", output.result);
