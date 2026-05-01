@@ -74,7 +74,7 @@ pub use heartbit_core::llm;
 pub use heartbit_core::{error, http, signal};
 pub mod memory;
 pub mod store;
-pub mod template;
+pub use heartbit_core::template;
 pub use heartbit_core::tool;
 pub(crate) mod util;
 pub use heartbit_core::workspace;

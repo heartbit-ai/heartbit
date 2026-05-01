@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod memory;
 pub mod signal;
 pub mod store;
+pub mod template;
 pub mod tool;
 pub mod types;
 pub mod util;
