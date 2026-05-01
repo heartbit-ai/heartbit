@@ -3,7 +3,7 @@ use crate::llm::types::{ContentBlock, Message};
 /// Estimate token count for a text string using 4 chars/token heuristic.
 ///
 /// This is a fast, dependency-free approximation. No external tokenizer needed.
-pub(crate) fn estimate_tokens(text: &str) -> u32 {
+pub fn estimate_tokens(text: &str) -> u32 {
     // 4 chars per token is a reasonable average for English + code
     (text.len() as u32).div_ceil(4)
 }
@@ -11,7 +11,7 @@ pub(crate) fn estimate_tokens(text: &str) -> u32 {
 /// Estimate token count for a single message, including all content blocks.
 ///
 /// Adds a small overhead per message for role/structure tokens.
-pub(crate) fn estimate_message_tokens(message: &Message) -> u32 {
+pub fn estimate_message_tokens(message: &Message) -> u32 {
     const MESSAGE_OVERHEAD: u32 = 4; // role, separators
 
     let content_tokens: u32 = message

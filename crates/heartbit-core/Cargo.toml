@@ -35,6 +35,7 @@ hmac = { workspace = true }
 sha1 = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
+petgraph = { workspace = true }
 a2a-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -46,3 +47,6 @@ a2a = ["dep:a2a-sdk"]
 # Features inherited from tool/ (gated conditionals in code)
 sandbox = []
 macro = []
+# Mirror umbrella's `sensor` feature so cfg-gated items
+# (`agent::guardrails::sensor_security`) compile when the umbrella enables it.
+sensor = []

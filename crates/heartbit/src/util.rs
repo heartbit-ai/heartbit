@@ -15,6 +15,7 @@ pub(crate) fn fnv1a_hash(data: &[u8]) -> u64 {
 /// Compute the Levenshtein (edit) distance between two strings.
 ///
 /// Uses `chars().count()` for correct unicode handling (not byte length).
+#[allow(dead_code)] // also lives in heartbit-core; kept here behind a future-use guard
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();

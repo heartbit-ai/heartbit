@@ -245,7 +245,7 @@ impl AgentContext {
 /// Adjusts the tail start to ensure User/Assistant alternation is preserved.
 ///
 /// Shared between standalone (`AgentContext`) and durable (`AgentWorkflow`) paths.
-pub(crate) fn inject_summary_into_messages(
+pub fn inject_summary_into_messages(
     messages: &mut Vec<Message>,
     original_task: &str,
     summary: &str,
@@ -284,7 +284,7 @@ pub(crate) fn inject_summary_into_messages(
 /// Render a message list as a plain text transcript for summarization.
 ///
 /// Shared between standalone (`AgentContext`) and durable (`AgentWorkflow`) paths.
-pub(crate) fn messages_to_text(messages: &[Message]) -> String {
+pub fn messages_to_text(messages: &[Message]) -> String {
     let mut parts = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = match msg.role {
@@ -322,7 +322,7 @@ pub(crate) fn messages_to_text(messages: &[Message]) -> String {
 /// Tool use/result pairs are kept together to avoid orphaned tool references.
 ///
 /// Shared between standalone (`AgentContext`) and durable (`AgentWorkflow`) paths.
-pub(crate) fn apply_sliding_window(messages: &[Message], max_tokens: u32) -> Vec<Message> {
+pub fn apply_sliding_window(messages: &[Message], max_tokens: u32) -> Vec<Message> {
     if messages.len() <= 1 {
         return messages.to_vec();
     }

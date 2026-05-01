@@ -4,8 +4,8 @@ use std::pin::Pin;
 use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, ToolCall};
-use crate::sensor::triage::context::TrustLevel;
 use crate::tool::ToolOutput;
+use crate::types::TrustLevel;
 
 /// Email MCP tool suffixes whose output should be fenced as untrusted.
 const EMAIL_TOOL_SUFFIXES: &[&str] = &["get_message", "search_messages", "list_messages"];
