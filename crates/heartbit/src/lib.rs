@@ -80,7 +80,6 @@ pub mod memory;
 pub mod store;
 pub(crate) mod util;
 
-#[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod sandbox;
 
 #[cfg(feature = "daemon")]
@@ -209,6 +208,9 @@ pub use store::PostgresStore;
 #[cfg(feature = "postgres")]
 pub use store::postgres::PostgresAuditTrail;
 
-// --- Sandbox re-exports (feature-gated) ---
+// --- Sandbox re-exports ---
+// CorePathPolicy/Builder are always available (pure Rust, no Linux/sandbox gate).
+pub use sandbox::{CorePathPolicy, CorePathPolicyBuilder};
+// SandboxPolicy (Landlock kernel enforcement) is Linux + sandbox-feature only.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub use sandbox::SandboxPolicy;

@@ -153,13 +153,16 @@ mod landlock_sandbox {
                     builder = builder.allow_dir(p);
                 }
             }
-            // build() can't fail here since we filtered to existing dirs and
-            // there are no globs, but we degrade gracefully if it does.
-            let path_policy = Arc::new(
-                builder
-                    .build()
-                    .unwrap_or_else(|_| CorePathPolicy::builder().build().expect("empty policy")),
-            );
+            let path_policy = Arc::new(builder.build().unwrap_or_else(|e| {
+                // workspace_only registers only existing directories and zero deny globs,
+                // so CorePathPolicyBuilder::build() cannot fail here in practice. If it
+                // does, panic loudly rather than silently substituting an empty policy
+                // (which would leave the Landlock layer permissive but the path-policy
+                // layer denying everything — a split-brain).
+                unreachable!(
+                    "CorePathPolicy build failed in workspace_only despite filtered inputs: {e}"
+                )
+            }));
             Self {
                 path_policy,
                 read_paths,
@@ -169,10 +172,15 @@ mod landlock_sandbox {
 
         /// Build a SandboxPolicy from an externally-constructed `CorePathPolicy`.
         ///
-        /// Used when one path policy is shared across multiple tools (bash +
-        /// write + edit + ...). The Landlock layer is initialized empty
-        /// (caller must populate `read_paths` / `write_paths` separately if
-        /// they want kernel-level enforcement on top of the path policy).
+        /// Used when one path policy is shared across multiple tools (bash + write +
+        /// edit + ...). The Landlock layer (`read_paths` / `write_paths`) is
+        /// initialized **empty**: this is intentional, but means callers that want
+        /// kernel-level enforcement on top of the path policy MUST populate
+        /// `read_paths` / `write_paths` before calling `into_pre_exec`. Otherwise
+        /// the Landlock ruleset locks the subprocess out of all filesystem access.
+        ///
+        /// For the common "workspace" case, prefer `SandboxPolicy::workspace_only`
+        /// which derives both layers from a single `&Path`.
         pub fn from_path_policy(path_policy: Arc<CorePathPolicy>) -> Self {
             Self {
                 path_policy,
@@ -189,6 +197,14 @@ mod landlock_sandbox {
 
         /// Create a `pre_exec` closure that applies Landlock rules.
         pub fn into_pre_exec(self) -> Result<impl FnMut() -> io::Result<()>, Error> {
+            debug_assert!(
+                !self.read_paths.is_empty() || !self.write_paths.is_empty(),
+                "SandboxPolicy::into_pre_exec called with empty read_paths AND write_paths; \
+                 the resulting Landlock ruleset would lock the subprocess out of all \
+                 filesystem access. Use workspace_only() or populate read_paths/write_paths \
+                 before calling into_pre_exec on a from_path_policy()-built sandbox."
+            );
+
             let abi = ABI::V5;
 
             let read_access = AccessFs::from_read(abi);
@@ -237,6 +253,23 @@ mod landlock_sandbox {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn workspace_only_includes_system_dirs() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SandboxPolicy::workspace_only(dir.path());
+            assert!(policy.read_paths.contains(&PathBuf::from("/usr")));
+            assert!(policy.read_paths.contains(&PathBuf::from("/bin")));
+            assert!(policy.read_paths.contains(&PathBuf::from("/etc")));
+        }
+
+        #[test]
+        fn into_pre_exec_succeeds_on_workspace() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SandboxPolicy::workspace_only(dir.path());
+            let result = policy.into_pre_exec();
+            assert!(result.is_ok());
+        }
 
         #[test]
         fn workspace_only_includes_workspace_in_read_and_write() {
