@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use heartbit_core::auth::TenantScope;
+
 use crate::config::TrustLevel;
 use crate::llm::types::TokenUsage;
 
@@ -190,6 +192,12 @@ pub struct UserContext {
     /// RFC 8693 token exchange for per-user MCP auth delegation.
     #[serde(skip)]
     pub raw_token: Option<String>,
+}
+
+impl From<&UserContext> for TenantScope {
+    fn from(ctx: &UserContext) -> Self {
+        TenantScope::new(&ctx.tenant_id).with_user(&ctx.user_id)
+    }
 }
 
 /// Aggregated statistics across all daemon tasks.
@@ -882,5 +890,18 @@ mod tests {
         assert_eq!(parsed.completed_count, 8);
         assert_eq!(parsed.estimated_cost_usd, 1.23);
         assert_eq!(parsed.avg_duration_secs, Some(4.5));
+    }
+
+    #[test]
+    fn user_context_to_tenant_scope() {
+        let ctx = UserContext {
+            user_id: "u1".into(),
+            tenant_id: "acme".into(),
+            roles: vec![],
+            raw_token: None,
+        };
+        let scope: heartbit_core::auth::TenantScope = (&ctx).into();
+        assert_eq!(scope.tenant_id, "acme");
+        assert_eq!(scope.user_id.as_deref(), Some("u1"));
     }
 }
