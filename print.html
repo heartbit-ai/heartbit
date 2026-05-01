@@ -1,0 +1,2387 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The Heartbit Book</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="User guide for heartbit-core, the Rust agentic framework">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-cfb2c6bc.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-053f7758.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Heartbit Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/heartbit-ai/heartbit" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<h2 id="what-is-heartbit-core"><a class="header" href="#what-is-heartbit-core">What is heartbit-core</a></h2>
+<p><code>heartbit-core</code> is a Rust framework for building agentic LLM applications.
+You give an agent a system prompt, a list of tools, and a user task; the
+agent runs a <a href="https://arxiv.org/abs/2210.03629">ReAct</a> loop — alternating
+LLM calls and tool executions — until it returns a final answer or hits
+one of your configured limits.</p>
+<p>The framework is built around four trait abstractions: <code>LlmProvider</code> for
+swappable model backends, <code>Tool</code> for capabilities you grant the agent,
+<code>Memory</code> for cross-turn and cross-session state, and <code>Guardrail</code> for
+safety and policy hooks. Tool calls within a single turn run in parallel
+on a <code>tokio::JoinSet</code>. The whole stack is async-native, type-safe, and
+runtime-agnostic — it works equally well embedded in a web service, a
+CLI, or a long-running daemon.</p>
+<p>This is a production framework, not a research demo. The crate ships
+with retry, prompt caching, model cascading, sandboxing, MCP client,
+session pruning, auto-compaction on context overflow, and
+<a href="https://docs.rs/heartbit-core">29 streaming <code>AgentEvent</code> variants</a> for
+observability. Reach for it when you want type-checked tool I/O and a
+single binary, not when you want to copy-paste a notebook.</p>
+<h2 id="what-you-can-build-with-it"><a class="header" href="#what-you-can-build-with-it">What you can build with it</a></h2>
+<ul>
+<li><strong>Chat agents</strong> that hold a conversation, search the web, and remember
+what you told them last week — see <a href="recipes/README.html">Recipes</a>.</li>
+<li><strong>Code-aware agents</strong> that read, edit, patch, and run shell commands
+inside a sandboxed workspace — see the
+<a href="tools/README.html">Tools chapter</a>.</li>
+<li><strong>Multi-agent research workflows</strong> with an orchestrator delegating to
+parallel specialists via a shared blackboard — see
+<a href="orchestration/README.html">Multi-Agent Orchestration</a>.</li>
+<li><strong>Eval-driven prompt iteration</strong> with trajectory, similarity, cost,
+and safety scorers and A/B regression comparison — see the
+<a href="eval/README.html">Eval Framework</a>.</li>
+<li><strong>MCP server integrations</strong> that expose any
+<a href="https://modelcontextprotocol.io">Model Context Protocol</a> server’s
+tools to your agent with a single call — see the
+<a href="tools/README.html">Tools chapter</a>.</li>
+</ul>
+<h2 id="how-this-book-is-organized"><a class="header" href="#how-this-book-is-organized">How this book is organized</a></h2>
+<p>The book has twelve chapters. Read the first five in order — each
+builds on the one before it:</p>
+<ol>
+<li><strong>Introduction</strong> (this chapter).</li>
+<li><strong><a href="getting-started/README.html">Getting Started</a></strong> — install, run a
+hello-world agent, pick a provider, set up API keys.</li>
+<li><strong><a href="agents/README.html">Agents</a></strong> — the ReAct loop, builder API,
+token budgets, streaming, events.</li>
+<li><strong><a href="tools/README.html">Tools</a></strong> — built-ins, writing your own,
+approval hooks, MCP.</li>
+<li><strong><a href="memory/README.html">Memory</a></strong> — episodic, semantic, and
+reflection memory; recall scoring; consolidation.</li>
+</ol>
+<p>The remaining chapters can be read by need:
+<strong><a href="guardrails/README.html">Guardrails</a></strong>,
+<strong><a href="workflow-agents/README.html">Workflow Agents</a></strong>,
+<strong><a href="orchestration/README.html">Multi-Agent Orchestration</a></strong>,
+<strong><a href="configuration/README.html">Configuration</a></strong>,
+<strong><a href="eval/README.html">Eval Framework</a></strong>,
+<strong><a href="recipes/README.html">Recipes</a></strong>, and
+<strong><a href="production/README.html">Production Considerations</a></strong>.</p>
+<h2 id="why-rust"><a class="header" href="#why-rust">Why Rust</a></h2>
+<p>Tool inputs and outputs are JSON values, but everything around them is
+strongly typed: tool definitions, agent configuration, provider
+responses, event streams. Bugs that would be runtime crashes in a
+dynamic language are compile errors here.</p>
+<p>The Tokio runtime scales an agent server to thousands of concurrent
+agents on a single machine without per-agent threads, and the binary
+ships as a single statically-linked file with no GC pauses to worry
+about. When latency or throughput matter — production chat, real-time
+trading workflows, large-scale evaluations — the runtime cost
+disappears.</p>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<ul>
+<li><strong>Rust 1.85 or later</strong> (edition 2024).</li>
+<li><strong>An LLM API key</strong> for at least one of: Anthropic, OpenRouter,
+Google Gemini, or any OpenAI-compatible endpoint (vLLM, Ollama,
+local servers).</li>
+<li><strong>Basic familiarity with async Rust</strong> — <code>async fn</code>, <code>.await</code>,
+<code>Arc</code>, <code>tokio::main</code>. The book does not teach the language.</li>
+</ul>
+<p>If you are comfortable reading the Rust standard library docs, you are
+ready for this book.</p>
+<h2 id="where-to-go-from-here"><a class="header" href="#where-to-go-from-here">Where to go from here</a></h2>
+<ul>
+<li>API reference: <a href="https://docs.rs/heartbit-core">heartbit-core on docs.rs</a>.</li>
+<li>Source code, examples, issue tracker:
+<a href="https://github.com/heartbit-ai/heartbit">heartbit on GitHub</a>.</li>
+<li>The next chapter: <a href="getting-started/README.html">Getting Started</a>.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>This chapter takes you from <code>cargo new</code> to a working agent that calls
+Claude. By the end you will have:</p>
+<ul>
+<li>a project that depends on <code>heartbit-core</code>;</li>
+<li>a 30-line <code>hello_agent</code> example that you can run;</li>
+<li>a working understanding of which LLM provider to pick;</li>
+<li>API keys configured for local development.</li>
+</ul>
+<p>The chapter has four sub-pages:</p>
+<ul>
+<li><strong><a href="#installation">Installation</a></strong> — adding the crate, Rust
+version, optional features.</li>
+<li><strong><a href="#hello-agent">Hello agent</a></strong> — a minimal agent with a
+walk-through.</li>
+<li><strong><a href="#choosing-an-llm-provider">Choosing an LLM provider</a></strong> — comparison and
+swap-in snippet.</li>
+<li><strong><a href="#api-keys-and-environment">API keys and environment</a></strong> — where to put secrets
+in dev and in production.</li>
+</ul>
+<p>If you already know what provider you want to use and just need the
+incantation, jump straight to <a href="#hello-agent">Hello agent</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<h2 id="add-heartbit-core"><a class="header" href="#add-heartbit-core">Add heartbit-core</a></h2>
+<pre><code class="language-bash">cargo add heartbit-core
+</code></pre>
+<p>This is the framework only — agents, tools, providers, memory,
+guardrails, workflow agents, eval. For Postgres-backed memory, the
+Telegram / Discord / Slack chat adapters, fastembed local embeddings,
+the secrets vault, multi-tenant daemon mode, and Restate-durable
+execution, depend on the umbrella crate instead:</p>
+<pre><code class="language-bash">cargo add heartbit --features postgres,telegram,vault
+</code></pre>
+<p>The umbrella re-exports everything in <code>heartbit_core::*</code>, so library
+code remains import-compatible regardless of which crate you depend on.</p>
+<h2 id="rust-version"><a class="header" href="#rust-version">Rust version</a></h2>
+<p><code>heartbit-core</code> is on edition 2024 and requires <strong>Rust 1.85 or later</strong>.
+A current stable toolchain installed via <a href="https://rustup.rs">rustup</a>
+will work.</p>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="https://crates.io/crates/heartbit-core">crates.io/crates/heartbit-core</a></li>
+<li><a href="https://docs.rs/heartbit-core">docs.rs/heartbit-core</a></li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="hello-agent"><a class="header" href="#hello-agent">Hello agent</a></h1>
+<p>The smallest useful agent in <code>heartbit-core</code> is about thirty lines:
+you build a provider, give it to <code>AgentRunner::builder</code>, set a system
+prompt, and call <code>.execute(...).await</code>. Here is the whole file:</p>
+<pre class="playground"><code class="language-rust no_run">//! Minimal "hello world" agent.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example hello_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You are a helpful assistant. Answer in one short paragraph.")
+        .build()?;
+
+    let output = agent.execute("What is Rust?").await?;
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
+<pre><code class="language-bash">ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example hello_agent
+</code></pre>
+<p>You should see a paragraph about Rust printed to stdout.</p>
+<h2 id="whats-happening"><a class="header" href="#whats-happening">What’s happening</a></h2>
+<p><code>AnthropicProvider::new(...)</code> constructs a typed client for Anthropic’s
+Messages API. <code>RetryingProvider::with_defaults(...)</code> wraps it with
+exponential backoff on 429 / 5xx / network errors so a transient blip
+doesn’t kill your run. <code>BoxedProvider</code> then erases the concrete type
+behind a <code>dyn</code>-compatible facade so you can swap providers in
+<a href="configuration/README.html">Configuration</a> without changing call
+sites. The whole stack is wrapped in <code>Arc</code> because the agent shares it
+across parallel tool invocations.</p>
+<p><code>AgentRunner::builder(provider).system_prompt(...).build()?</code> produces
+an <code>AgentRunner</code> ready to run. The builder is where you’ll later add
+tools, memory, guardrails, turn caps, and event listeners — the
+<a href="agents/README.html">Agents chapter</a> walks through every option.</p>
+<p><code>agent.execute("What is Rust?").await?</code> runs the
+<a href="agents/README.html#the-react-loop">ReAct loop</a> until the model
+returns a final text response. The returned
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.AgentOutput.html"><code>AgentOutput</code></a>
+contains the text in <code>.result</code>, plus <code>tokens_used</code>, <code>tool_calls_made</code>,
+and an estimated <code>cost_usd</code>. This minimal agent has no tools, so it
+runs exactly one turn.</p>
+<p>From here, the next page picks an LLM provider that fits your needs;
+after that you’ll set up an API key.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="choosing-an-llm-provider"><a class="header" href="#choosing-an-llm-provider">Choosing an LLM provider</a></h1>
+<p><code>heartbit-core</code> ships with four LLM providers. Pick one based on what
+you’re optimizing for:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Strengths</th><th>Caveats</th></tr>
+</thead>
+<tbody>
+<tr><td>Anthropic</td><td>Native prompt caching; mature tool use; strong reasoning</td><td>Higher per-token latency than some</td></tr>
+<tr><td>OpenRouter</td><td>One API key for 100+ models; cheap A/B testing</td><td>Quality varies by underlying model</td></tr>
+<tr><td>Gemini</td><td>Strong on long-context tasks; competitive pricing</td><td>Tool-call format quirks</td></tr>
+<tr><td>OpenAI-compatible</td><td>Works with vLLM, Ollama, LM Studio, local LLMs</td><td>YMMV on tool-use reliability</td></tr>
+</tbody>
+</table>
+</div>
+<p>If you don’t know yet, start with Anthropic — every example in this
+book uses it.</p>
+<h2 id="swapping-providers"><a class="header" href="#swapping-providers">Swapping providers</a></h2>
+<p>Each provider implements the same <code>LlmProvider</code> trait, so swapping is
+a one-line change. To run <a href="#hello-agent">Hello agent</a> against
+OpenRouter instead of Anthropic:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::{BoxedProvider, OpenRouterProvider, RetryingProvider};
+
+let api_key = std::env::var("OPENROUTER_API_KEY").unwrap();
+let provider = std::sync::Arc::new(BoxedProvider::new(
+    RetryingProvider::with_defaults(
+        OpenRouterProvider::new(api_key, "anthropic/claude-sonnet-4"),
+    ),
+));
+<span class="boring">}</span></code></pre>
+<p>Replace <code>OpenRouterProvider</code> with <code>GeminiProvider</code> or
+<code>OpenAiCompatProvider</code> for the other two.</p>
+<h2 id="going-deeper"><a class="header" href="#going-deeper">Going deeper</a></h2>
+<p>See <a href="https://docs.rs/heartbit-core/latest/heartbit_core/llm/index.html"><code>heartbit_core::llm</code></a>
+for the full provider API, including <code>RetryConfig</code>, the cascading
+provider, and Anthropic prompt caching.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="api-keys-and-environment"><a class="header" href="#api-keys-and-environment">API keys and environment</a></h1>
+<h2 id="setting-an-api-key"><a class="header" href="#setting-an-api-key">Setting an API key</a></h2>
+<p>Each provider reads its API key from a conventional environment
+variable. Pick the one that matches the provider you chose in
+<a href="#choosing-an-llm-provider">Choosing an LLM provider</a>:</p>
+<pre><code class="language-bash">export ANTHROPIC_API_KEY=sk-ant-...
+export OPENROUTER_API_KEY=sk-or-...
+export GEMINI_API_KEY=AIza...
+export OPENAI_API_KEY=sk-...
+</code></pre>
+<p>The <code>OPENAI_API_KEY</code> value is also what <code>OpenAiCompatProvider</code> reads
+when you point it at a local vLLM or Ollama server.</p>
+<h2 id="local-development"><a class="header" href="#local-development">Local development</a></h2>
+<p>For day-to-day development, drop secrets into a <code>.env</code> file at the
+project root and load them with
+<a href="https://crates.io/crates/dotenvy"><code>dotenvy</code></a>:</p>
+<pre class="playground"><code class="language-rust no_run">fn main() {
+    dotenvy::dotenv().ok();
+    // ... rest of main
+}</code></pre>
+<p>Add <code>.env</code> to <code>.gitignore</code>. Never commit a key to a repository.</p>
+<h2 id="production"><a class="header" href="#production">Production</a></h2>
+<p>For production, store API keys in the
+<a href="tools/README.html">vault module</a> (provided by the <code>heartbit</code>
+umbrella crate’s <code>vault</code> feature) rather than plain environment
+variables. The vault gives you per-tenant key isolation, audit logs,
+and rotation hooks that bare env vars can’t.</p>
+<h2 id="ssrf-protection"><a class="header" href="#ssrf-protection">SSRF protection</a></h2>
+<p>The <code>web_fetch</code> built-in tool refuses requests to private and loopback
+IP ranges by default. This blocks server-side request forgery (SSRF)
+attacks where an LLM is tricked into fetching internal endpoints. To
+allow internal-network access in development, set:</p>
+<pre><code class="language-bash">HEARTBIT_ALLOW_PRIVATE_IPS=1
+</code></pre>
+<p>See the <a href="tools/README.html">Tools chapter</a> for the full SSRF policy
+and how to scope it down per-agent in production.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="agents"><a class="header" href="#agents">Agents</a></h1>
+<p>An agent in <code>heartbit-core</code> is an <code>AgentRunner</code> — a configured LLM, a
+system prompt, an optional tool set, optional memory, optional
+guardrails, and a set of safety limits. You build one with
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.AgentRunnerBuilder.html"><code>AgentRunnerBuilder</code></a>
+and run it by calling <code>.execute(task).await</code>. The rest of this chapter
+explains what happens between those two calls and how to control it.</p>
+<h2 id="the-react-loop"><a class="header" href="#the-react-loop">The ReAct loop</a></h2>
+<p>Every call to <code>.execute(...)</code> runs a <a href="https://arxiv.org/abs/2210.03629">ReAct loop</a>.
+Each iteration is one <strong>turn</strong>. On every turn the runner sends the
+current message history to the LLM, parses the response, and dispatches
+any tool calls the model requested. Tool results become new messages
+in the history, and the loop runs again.</p>
+<p>When the LLM returns a <code>tool_use</code> content block, the runner spawns one
+task per tool call on a <code>tokio::JoinSet</code> and awaits all of them
+together. Independent tools — read three files, fetch two URLs —
+therefore execute in parallel, not serially. Tool errors do not crash
+the loop: they are converted to <code>ToolOutput::error</code> and sent back to
+the model, which can self-correct on the next turn.</p>
+<p>The loop exits in one of four ways: the model returns a turn with no
+tool calls (final answer), <code>max_turns</code> is reached, a token limit is
+exceeded, or an error bubbles up from a provider or guardrail. The
+returned <code>AgentOutput</code> carries the result text plus accumulated token
+usage and cost.</p>
+<h2 id="building-an-agent"><a class="header" href="#building-an-agent">Building an agent</a></h2>
+<p>A typical agent declares the parts you’ll see throughout the rest of
+this book — provider, system prompt, tools, turn cap, an event hook:</p>
+<pre class="playground"><code class="language-rust no_run">//! A small agent with file-reading tools, a turn cap, and an event listener.
+//!
+//! Demonstrates the parts of `AgentRunnerBuilder` covered in the Agents
+//! chapter: `system_prompt`, `tools`, `max_turns`, and `on_event`.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example simple_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
+use heartbit_core::{AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    // The default builtin set excludes dangerous tools (bash). It includes
+    // read/write/edit/patch/list/glob/grep, plus web_fetch/web_search.
+    let tools = builtin_tools(BuiltinToolsConfig::default());
+
+    // Print a one-line trace for each lifecycle event.
+    let on_event = Arc::new(|event: AgentEvent| match event {
+        AgentEvent::TurnStarted { turn, .. } =&gt; eprintln!("[turn {turn}]"),
+        AgentEvent::ToolCallStarted { tool_name, .. } =&gt; eprintln!("  -&gt; {tool_name}"),
+        AgentEvent::RunCompleted { total_usage, .. } =&gt; {
+            eprintln!(
+                "[done] {} in / {} out",
+                total_usage.input_tokens, total_usage.output_tokens,
+            );
+        }
+        _ =&gt; {}
+    });
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You are a helpful coding assistant.")
+        .tools(tools)
+        .max_turns(8)
+        .on_event(on_event)
+        .build()?;
+
+    let output = agent
+        .execute(
+            "List the files in the current directory and summarise what kind of project this is.",
+        )
+        .await?;
+
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>Two things to notice. First, every method on the builder is optional
+except the provider — you only configure what you need, defaults are
+sensible. Second, <code>Arc</code> is everywhere because the runner internally
+shares these values across parallel tool tasks; the type signatures
+make this explicit rather than hiding it behind clones.</p>
+<h2 id="system-prompts"><a class="header" href="#system-prompts">System prompts</a></h2>
+<p>The system prompt sets the agent’s role and ground rules. Keep it
+focused: the model is good at staying in character but bad at
+following long bullet lists of “always do this, never do that”. Two
+or three sentences plus any domain conventions usually beats a
+five-paragraph essay.</p>
+<p>If you need a starting point, the framework ships with 15 reusable
+agent archetypes — researcher, coder, reviewer, planner, and so on —
+covered in the <a href="configuration/README.html#templates">templates section</a>
+of the Configuration chapter.</p>
+<h2 id="token-budgets-and-turn-limits"><a class="header" href="#token-budgets-and-turn-limits">Token budgets and turn limits</a></h2>
+<p>Three independent caps protect you from runaway agents:</p>
+<ul>
+<li><strong><code>max_turns</code></strong> (default 10) — how many ReAct iterations the loop
+will perform before giving up.</li>
+<li><strong><code>max_tokens</code></strong> — the per-call cap sent to the LLM provider
+(controls response length, not history size).</li>
+<li><strong><code>max_total_tokens</code></strong> — a lifetime cap on the sum of input plus
+output tokens across the whole run.</li>
+</ul>
+<p>Hitting any of these returns
+<code>Error::WithPartialUsage</code>, which wraps the underlying error and
+preserves the token counter accumulated up to that point — so your
+billing telemetry stays accurate even on a mid-run abort. The
+<a href="#errors-and-partial-usage">Errors and partial usage</a> section below
+covers the variants.</p>
+<h2 id="streaming-output"><a class="header" href="#streaming-output">Streaming output</a></h2>
+<p>Agents that talk to a user benefit from streaming tokens to the screen
+as the LLM generates them. Set an <code>on_text</code> callback, and the runner
+will invoke it for each delta:</p>
+<pre class="playground"><code class="language-rust no_run"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use std::io::Write;
+use std::sync::Arc;
+
+let on_text = Arc::new(|delta: &amp;str| {
+    print!("{delta}");
+    std::io::stdout().flush().ok();
+});
+let agent = AgentRunner::builder(provider)
+    .on_text(on_text)
+    .build()?;
+<span class="boring">}</span></code></pre>
+<p>See <a href="https://docs.rs/heartbit-core/latest/heartbit_core/llm/type.OnText.html"><code>OnText</code></a>
+for the full signature.</p>
+<h2 id="events-and-observability"><a class="header" href="#events-and-observability">Events and observability</a></h2>
+<p><code>on_text</code> shows you the model’s prose; <code>on_event</code> shows you everything
+else. Set an
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/enum.AgentEvent.html"><code>AgentEvent</code></a>
+listener and the runner emits 29 lifecycle variants — <code>RunStarted</code>,
+<code>TurnStarted</code>, <code>LlmResponse</code>, <code>ToolCallStarted</code>, <code>ToolCallCompleted</code>,
+<code>GuardrailDenied</code>, <code>RunCompleted</code>, and many more.</p>
+<p>In dev, log them to stderr as JSON. In production, fan them out to
+OpenTelemetry spans, Prometheus counters, or your audit trail; see
+<a href="production/README.html">Production Considerations</a> for the
+recommended OTel wiring.</p>
+<h2 id="errors-and-partial-usage"><a class="header" href="#errors-and-partial-usage">Errors and partial usage</a></h2>
+<p><code>heartbit_core::Error</code> distinguishes the failure modes that matter:
+provider errors (<code>Anthropic</code>, <code>OpenRouter</code>, <code>Gemini</code>, <code>OpenAiCompat</code>),
+tool errors, guardrail denials, max-turns / max-tokens caps, context
+overflow, and configuration errors. The
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/llm/error_class/index.html">error classifier</a>
+sorts provider errors into <code>RateLimited</code>, <code>ServerError</code>,
+<code>ContextOverflow</code>, and friends so retry policy can react.</p>
+<p>The wrapper variant <code>Error::WithPartialUsage { source, usage }</code>
+preserves the <code>TokenUsage</code> accumulated before the failure. Always
+check for it at the outer match arm so your dashboards don’t lose the
+tokens a failed run already spent.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="tools"><a class="header" href="#tools">Tools</a></h1>
+<p>Tools are how an agent affects the outside world: reading files,
+running shell commands, fetching URLs, querying APIs, calling other
+agents. The framework ships a curated built-in suite, gives you a
+clean trait for your own, and integrates with any
+<a href="https://modelcontextprotocol.io">Model Context Protocol</a> server out
+of the box.</p>
+<h2 id="the-tool-trait"><a class="header" href="#the-tool-trait">The Tool trait</a></h2>
+<p>Every tool is a value that implements two methods:</p>
+<ul>
+<li><code>definition() -&gt; ToolDefinition</code> — the name, human-readable
+description, and a JSON Schema for the input.</li>
+<li><code>execute(input: serde_json::Value) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;ToolOutput, Error&gt;&gt; + Send + '_&gt;&gt;</code> — the async body.</li>
+</ul>
+<p><code>ToolOutput::success(text)</code> and <code>ToolOutput::error(text)</code> build the
+two terminal cases. The error variant is <strong>not</strong> a panic or a runtime
+abort: the runner feeds the error string back into the conversation as
+a tool result, and the model decides whether to retry, give up, or
+ask the user. Tools that <em>do</em> panic are caught by the runner and
+converted to <code>ToolOutput::error</code> for the same reason — a misbehaving
+tool must never take down the agent loop.</p>
+<h2 id="built-in-tools"><a class="header" href="#built-in-tools">Built-in tools</a></h2>
+<p><code>heartbit-core</code> includes a focused built-in set covering the cases an
+agent needs most:</p>
+<ul>
+<li><code>read</code> — read a file, with mtime tracking for safe edits.</li>
+<li><code>write</code> — write a file, blocked unless a recent <code>read</code> exists.</li>
+<li><code>edit</code> — find-and-replace within a file.</li>
+<li><code>patch</code> — apply a unified-diff hunk.</li>
+<li><code>bash</code> — run a shell command, sandboxable via Linux landlock
+(see <a href="production/README.html">Production Considerations</a>).</li>
+<li><code>list</code>, <code>glob</code>, <code>grep</code> — directory traversal and search.</li>
+<li><code>todo</code> — track multi-step task progress across turns.</li>
+<li><code>web_fetch</code> — HTTP GET with default-deny on private IPs.</li>
+<li><code>web_search</code> — query a search backend.</li>
+<li><code>image_generate</code> — call image-generation APIs.</li>
+<li><code>tts</code> — text-to-speech.</li>
+<li><code>twitter_post</code> — post to X/Twitter (per-tenant credentials).</li>
+<li><code>skill</code> — load a named skill from a skill registry.</li>
+<li><code>question</code> — ask the user a structured question
+(interactive sessions).</li>
+</ul>
+<p>Build the suite with <code>builtin_tools(BuiltinToolsConfig::default())</code>.
+Dangerous tools like <code>bash</code> are gated behind <code>dangerous_tools = true</code>.
+For the full list and signatures see
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/tool/builtins/index.html"><code>heartbit_core::tool::builtins</code></a>.</p>
+<h2 id="writing-your-own-tool"><a class="header" href="#writing-your-own-tool">Writing your own tool</a></h2>
+<p>When the built-ins don’t cover your domain — pull a record from your
+database, hit an internal microservice, render a chart — implement the
+trait yourself. The pattern is short:</p>
+<pre class="playground"><code class="language-rust no_run">//! Implementing the `Tool` trait by hand.
+//!
+//! Defines a `WordCount` tool, attaches it to an agent, and lets the LLM
+//! decide when to call it.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example custom_tool`
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use heartbit_core::llm::types::ToolDefinition;
+use heartbit_core::{
+    AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider, Tool, ToolOutput,
+};
+
+/// A tool that counts the words in a string.
+struct WordCount;
+
+impl Tool for WordCount {
+    fn definition(&amp;self) -&gt; ToolDefinition {
+        ToolDefinition {
+            name: "word_count".into(),
+            description: "Count the number of whitespace-separated words in a string.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to count words in.",
+                    }
+                },
+                "required": ["text"],
+            }),
+        }
+    }
+
+    fn execute(
+        &amp;self,
+        input: serde_json::Value,
+    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;ToolOutput, heartbit_core::Error&gt;&gt; + Send + '_&gt;&gt; {
+        Box::pin(async move {
+            let text = match input.get("text").and_then(|v| v.as_str()) {
+                Some(t) =&gt; t,
+                None =&gt; return Ok(ToolOutput::error("missing required field `text`")),
+            };
+            let count = text.split_whitespace().count();
+            Ok(ToolOutput::success(count.to_string()))
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let tools: Vec&lt;Arc&lt;dyn Tool&gt;&gt; = vec![Arc::new(WordCount)];
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("Use the word_count tool to answer questions about word counts.")
+        .tools(tools)
+        .build()?;
+
+    let output = agent
+        .execute("How many words are in: 'The quick brown fox jumps over the lazy dog'?")
+        .await?;
+
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>The <code>definition()</code> returns a <code>ToolDefinition</code> whose <code>input_schema</code> is
+a JSON Schema object. The agent’s LLM uses the description and schema
+to decide when and how to call the tool, so write both for the model:
+say what the tool <em>does</em>, list each field, and give an example value
+where it helps. The <code>execute</code> body parses the validated input, does
+the work, and returns either <code>ToolOutput::success</code> or
+<code>ToolOutput::error</code>.</p>
+<h2 id="the-heartbit_tool-macro"><a class="header" href="#the-heartbit_tool-macro">The heartbit_tool macro</a></h2>
+<p>The <code>heartbit_tool</code> proc-macro in the
+<a href="https://docs.rs/heartbit-macro"><code>heartbit-macro</code></a> crate generates the
+trait impl and JSON Schema from the function signature, so simple
+tools collapse to a single annotated <code>async fn</code>:</p>
+<pre><code class="language-rust ignore">use heartbit_macro::heartbit_tool;
+
+#[heartbit_tool(description = "Count whitespace-separated words.")]
+async fn word_count(text: String) -&gt; Result&lt;ToolOutput, Error&gt; {
+    Ok(ToolOutput::success(text.split_whitespace().count().to_string()))
+}</code></pre>
+<p>Reach for the macro when the schema is mechanical. Drop down to the
+trait impl when you need custom validation, dynamic schemas, or
+request-scoped state.</p>
+<h2 id="tool-input-validation"><a class="header" href="#tool-input-validation">Tool input validation</a></h2>
+<p>Before dispatching a tool call, the runner validates the LLM-supplied
+input against the declared <code>input_schema</code> using
+<code>validate_tool_input</code>. A schema mismatch becomes a tool-result error
+the model sees on the next turn — so it self-corrects rather than
+crashing the run. This is one of the main payoffs of writing
+JSON Schemas: the LLM gets early, structured feedback when it
+hallucinates a field name.</p>
+<h2 id="tool-approval-human-in-the-loop"><a class="header" href="#tool-approval-human-in-the-loop">Tool approval (human-in-the-loop)</a></h2>
+<p>For high-stakes tools — anything that writes outside a sandbox, calls
+a paid API, or posts to a channel — set an <code>on_approval</code> callback.
+The runner pauses before each tool call, hands you the list of pending
+calls, and waits for an <code>ApprovalDecision</code>:</p>
+<ul>
+<li><code>Allow</code> — run this call once.</li>
+<li><code>Deny</code> — refuse and tell the model why.</li>
+<li><code>AlwaysAllow</code> — auto-approve this exact call shape for the rest of
+the run.</li>
+<li><code>AlwaysDeny</code> — auto-refuse this shape.</li>
+</ul>
+<p>The CLI’s <code>--approve</code> flag wires this to an interactive prompt. In a
+web app you would route the request to a UI and resume on response.</p>
+<h2 id="mcp-integration"><a class="header" href="#mcp-integration">MCP integration</a></h2>
+<p>For tools you don’t want to write — Slack, Atlassian, GitHub, or any
+of the growing
+<a href="https://modelcontextprotocol.io">MCP server ecosystem</a> — connect an
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.McpClient.html"><code>McpClient</code></a>
+and the server’s tools become first-class <code>Tool</code> instances you pass
+to <code>AgentRunnerBuilder::tools(...)</code> alongside the built-ins. The
+client speaks MCP Streamable HTTP, handles auth, sampling, and
+resource roots, and reuses connection pools across agents. See
+<a href="#mcp-server-integration">the MCP recipe</a> for an end-to-end
+walk-through.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="memory"><a class="header" href="#memory">Memory</a></h1>
+<p>An agent without memory rebuilds its world from scratch on every run.
+Wiring memory into an <code>AgentRunner</code> gives it durable knowledge it can
+reach across runs — what the user prefers, what worked last time, what
+the current project is about. The framework treats memory as a small,
+explicit interface so you can plug in whatever backing store fits your
+deployment, from a <code>HashMap</code> in tests to PostgreSQL in production.</p>
+<h2 id="the-memory-trait"><a class="header" href="#the-memory-trait">The Memory trait</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/memory/trait.Memory.html"><code>Memory</code></a>
+is six async methods — <code>store</code>, <code>recall</code>, <code>update</code>, <code>forget</code>,
+<code>add_link</code>, <code>prune</code>. Each returns a
+<code>Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;…, Error&gt;&gt; + Send + '_&gt;&gt;</code>, the same
+shape used elsewhere in the framework, so the trait is dyn-compatible
+and an agent can hold it as <code>Arc&lt;dyn Memory&gt;</code>.</p>
+<p><code>store</code> and <code>update</code> mutate, <code>recall</code> reads, <code>forget</code> deletes, and
+<code>add_link</code> connects two entries bidirectionally. <code>prune</code> removes
+entries whose strength has decayed below a threshold and that are
+older than a minimum age — strength decay is covered below. Default
+implementations of <code>add_link</code> and <code>prune</code> are no-ops, so simple stores
+only need to implement four methods.</p>
+<h2 id="inmemorystore-and-namespacedmemory"><a class="header" href="#inmemorystore-and-namespacedmemory">InMemoryStore and NamespacedMemory</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/memory/struct.InMemoryStore.html"><code>heartbit_core::memory::InMemoryStore</code></a>
+is a thread-safe <code>HashMap</code>-backed implementation suitable for tests
+and single-process deployments. Construct it with <code>InMemoryStore::new()</code>,
+hand it to your agent as <code>Arc::new(store)</code>, and you’re done. It
+implements the full trait, including BM25 recall ranking and pruning.</p>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/memory/struct.NamespacedMemory.html"><code>heartbit_core::memory::NamespacedMemory</code></a>
+wraps any <code>Memory</code> implementation and prefixes every entry’s <code>agent</code>
+field with a tenant or user namespace, so a single shared backing
+store can serve many isolated agents safely. This is how the
+multi-tenant deployments in the daemon mode keep one user’s memories
+out of another user’s recall results — and <code>prune</code> is namespace-scoped
+by the same prefix so cleanup never reaches across tenants.</p>
+<h2 id="memory-entries"><a class="header" href="#memory-entries">Memory entries</a></h2>
+<p>A <code>MemoryEntry</code> carries <code>id</code>, <code>agent</code>, <code>content</code>, <code>category</code>, and
+<code>tags</code> for the basics; <code>created_at</code>, <code>last_accessed</code>, and <code>access_count</code>
+for usage tracking; and a richer set of fields for ranking and
+governance: <code>importance</code> (1–10, set by the agent at store time),
+<code>memory_type</code> (<code>Episodic</code>, <code>Semantic</code>, or <code>Reflection</code>), <code>keywords</code>,
+<code>summary</code>, <code>strength</code>, <code>related_ids</code>, <code>source_ids</code>, an optional
+vector <code>embedding</code>, <code>confidentiality</code>, and <code>author_user_id</code> /
+<code>author_tenant_id</code> for multi-tenant authorship.</p>
+<p>The <code>strength</code> field is the centerpiece of the framework’s
+forgetting-curve model. It starts at 1.0, decays exponentially over
+time (Ebbinghaus, with a default rate of <code>0.005</code> per hour — roughly a
+six-day half-life), and is reinforced by <code>+0.2</code> (capped at 1.0) on
+every successful recall. The pruner uses <em>effective</em> strength —
+current value minus elapsed decay — so unused entries fade and useful
+ones stay sharp.</p>
+<h2 id="the-5-memory-tools"><a class="header" href="#the-5-memory-tools">The 5 memory tools</a></h2>
+<p>When you wire a <code>Memory</code> into an agent via
+<code>AgentRunnerBuilder::memory(...)</code>, five tools become available
+automatically — implementing the <a href="https://arxiv.org/abs/2310.08560">MemGPT</a>
+pattern of letting the LLM manage its own knowledge:</p>
+<ul>
+<li><code>memory_store</code> — write a new entry with content, category, tags,
+importance, and keywords.</li>
+<li><code>memory_recall</code> — retrieve entries by text query, category, or tags;
+ranked and limited.</li>
+<li><code>memory_update</code> — edit the content of an existing entry by id.</li>
+<li><code>memory_forget</code> — delete an entry by id.</li>
+<li><code>memory_consolidate</code> — cluster recent episodic entries by keyword
+overlap and merge them into a <code>Semantic</code> entry, citing source ids.</li>
+</ul>
+<p>The agent decides when to call each: it stores facts as it learns
+them, recalls before answering, and consolidates when the episodic
+log grows too long.</p>
+<h2 id="recall-and-ranking"><a class="header" href="#recall-and-ranking">Recall and ranking</a></h2>
+<p>Recall uses BM25 keyword scoring — with a 2× boost for matches against
+the entry’s <code>keywords</code> field — fused with a composite score that
+blends recency, <code>importance</code>, relevance, and effective <code>strength</code>.
+The result is that newer, more important, more frequently-recalled
+entries rise to the top, while stale low-confidence entries sink even
+if their literal match score is high.</p>
+<h2 id="embeddings-and-hybrid-search"><a class="header" href="#embeddings-and-hybrid-search">Embeddings and hybrid search</a></h2>
+<p><code>Memory</code> is a trait, so vector search is layered on rather than baked
+in. The
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/memory/embedding/struct.EmbeddingMemory.html"><code>EmbeddingMemory</code></a>
+wrapper takes any <code>Memory</code> plus an <code>EmbeddingProvider</code> and computes
+embeddings on <code>store</code>, populates <code>query_embedding</code> on <code>recall</code>, and
+fuses BM25 with cosine similarity via Reciprocal Rank Fusion.</p>
+<p>For embeddings without an external API call, enable the
+<code>local-embedding</code> feature on the <a href="https://crates.io/crates/heartbit">heartbit</a>
+umbrella crate. It bundles a fastembed (ONNX Runtime) backend with
+the <code>AllMiniLML6V2</code> model by default, which is small enough to run on
+CPU and gives you private, offline semantic search.</p>
+<h2 id="memory-lifecycle"><a class="header" href="#memory-lifecycle">Memory lifecycle</a></h2>
+<p>The end-to-end shape is short — store, recall, update, prune:</p>
+<pre class="playground"><code class="language-rust no_run">//! Memory lifecycle: store, recall, update, prune.
+//!
+//! Drives the [`InMemoryStore`] directly — no LLM call, no API key needed.
+//!
+//! `cargo run -p heartbit-core --example memory`
+
+use chrono::{Duration, Utc};
+
+use heartbit_core::memory::Confidentiality;
+use heartbit_core::{InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let store = InMemoryStore::new();
+
+    // 1. Store an episodic entry.
+    let entry = MemoryEntry {
+        id: "m1".into(),
+        agent: "assistant".into(),
+        content: "The user prefers terse responses without preamble.".into(),
+        category: "preference".into(),
+        tags: vec!["style".into()],
+        created_at: Utc::now(),
+        last_accessed: Utc::now(),
+        access_count: 0,
+        importance: 7,
+        memory_type: MemoryType::Episodic,
+        keywords: vec!["terse".into(), "preference".into()],
+        summary: Some("User wants short answers.".into()),
+        strength: 1.0,
+        related_ids: vec![],
+        source_ids: vec![],
+        embedding: None,
+        confidentiality: Confidentiality::Internal,
+        author_user_id: None,
+        author_tenant_id: None,
+    };
+    store.store(entry).await?;
+
+    // 2. Recall by keyword. Composite scoring orders the result set by
+    //    recency + importance + relevance + strength.
+    let hits = store
+        .recall(MemoryQuery {
+            agent: Some("assistant".into()),
+            text: Some("preference".into()),
+            limit: 5,
+            ..MemoryQuery::default()
+        })
+        .await?;
+    println!("recalled {} entry/entries", hits.len());
+
+    // 3. Update the content in place. The entry id is preserved.
+    store
+        .update("m1", "User prefers terse, formal responses.".into())
+        .await?;
+
+    // 4. Prune anything older than 1 hour with strength below 0.1. The
+    //    fresh entry above is far above that threshold, so this is a
+    //    no-op here — but it's the call you'd schedule periodically in a
+    //    long-running deployment.
+    let pruned = store.prune(0.1, Duration::hours(1), None).await?;
+    println!("pruned {pruned} weak entries");
+
+    Ok(())
+}</code></pre>
+<p>In a real agent, the LLM drives this loop through the five memory
+tools — you just hand the runner an <code>Arc&lt;dyn Memory&gt;</code> and it does
+the orchestration.</p>
+<h2 id="postgres-backed-memory"><a class="header" href="#postgres-backed-memory">Postgres-backed memory</a></h2>
+<p>For multi-process deployments and durability across restarts, the
+<a href="https://crates.io/crates/heartbit">heartbit</a> umbrella crate exposes a
+PostgreSQL-backed memory store behind the <code>postgres</code> feature. The
+schema auto-migrates on first connect, so you point at an empty
+database and the store creates the tables it needs. The
+<a href="production/README.html">Production Considerations</a> chapter covers
+the connection pool, indexing strategy, and the additional knobs
+relevant to running a fleet of agents against a shared store.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="guardrails"><a class="header" href="#guardrails">Guardrails</a></h1>
+<p>Guardrails sit between the agent loop and the outside world, watching
+LLM input and output and every tool call as it happens. They are how
+you stop secrets from leaking into responses, redact PII before it
+hits a log, refuse prompt-injection attempts, cap the number of
+expensive tool calls, enforce policy on which tools may run with which
+arguments, and let an LLM judge a sibling LLM’s output before it
+reaches the user. They run on the standalone path — the same code
+that powers the durable and daemon execution paths — and a denial
+turns into structured feedback the model sees on the next turn rather
+than a panic.</p>
+<h2 id="the-guardrail-trait"><a class="header" href="#the-guardrail-trait">The Guardrail trait</a></h2>
+<p>Every guardrail implements
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/agent/guardrails/index.html"><code>heartbit_core::agent::guardrails</code></a>
+through the four hooks of the <code>Guardrail</code> trait: <code>pre_llm</code> to inspect
+or mutate the request before it leaves, <code>post_llm</code> to inspect the
+response that came back, <code>pre_tool</code> to gate a specific tool call, and
+<code>post_tool</code> to inspect or rewrite the tool’s output. Each method has
+a default no-op, so you only override what you need.</p>
+<p>Hooks return a <code>GuardAction</code>: <code>Allow</code> lets the operation through,
+<code>Warn { reason }</code> allows it but emits an event for monitoring,
+<code>Deny { reason }</code> blocks it, and <code>Kill { reason }</code> terminates the run
+immediately. The runner walks the guardrail list in order on each
+hook and the first <code>Deny</code> wins — <code>Warn</code>s never short-circuit. All
+hooks are async; they return <code>Pin&lt;Box&lt;dyn Future&gt;&gt;</code> for
+dyn-compatibility, so the runner can hold them as
+<code>Vec&lt;Arc&lt;dyn Guardrail&gt;&gt;</code>.</p>
+<h2 id="built-in-guardrails"><a class="header" href="#built-in-guardrails">Built-in guardrails</a></h2>
+<p>The framework ships nine production-ready guardrails covering the
+common safety surfaces.</p>
+<h3 id="llm-judge"><a class="header" href="#llm-judge">LLM judge</a></h3>
+<p><code>LlmJudgeGuardrail</code> runs a second, typically cheaper LLM against the
+main agent’s response (or, optionally, its tool inputs) and asks it
+to vote <code>SAFE</code> / <code>UNSAFE</code> / <code>WARN</code> against a list of criteria. Fail-
+open on timeout or judge error keeps the agent loop running through
+transient judge issues.</p>
+<h3 id="secret-scanner"><a class="header" href="#secret-scanner">Secret scanner</a></h3>
+<p><code>SecretScannerGuardrail</code> matches AWS keys, generic API keys, bearer
+tokens, JWTs, private keys, and database connection strings against
+LLM responses and tool outputs. The default action is <code>Redact</code>; the
+alternative is <code>Deny</code>.</p>
+<h3 id="pii-guardrail"><a class="header" href="#pii-guardrail">PII guardrail</a></h3>
+<p><code>PiiGuardrail::all_builtin(PiiAction::Redact)</code> covers email addresses,
+phone numbers, SSNs, and credit card numbers (Luhn-validated) out of
+the box. Add custom regex detectors for tenant-specific identifiers.</p>
+<h3 id="content-fence"><a class="header" href="#content-fence">Content fence</a></h3>
+<p><code>ContentFenceGuardrail</code> enforces fenced-code formatting on assistant
+output, useful when the agent feeds another tool that expects a code
+block in a known shape.</p>
+<h3 id="action-budget"><a class="header" href="#action-budget">Action budget</a></h3>
+<p><code>ActionBudgetGuardrail</code> caps how many times a tool — or all tools
+matching a pattern — can be called per run. Set per-pattern budgets
+via <code>.rule("web_fetch", 5)</code> and a default budget for everything
+else.</p>
+<h3 id="behavioral-monitor"><a class="header" href="#behavioral-monitor">Behavioral monitor</a></h3>
+<p><code>BehavioralMonitorGuardrail</code> flags suspicious tool-use sequences:
+repeated identical calls, write-after-no-read, or any pattern you
+encode as a <code>BehaviorRule</code>. Bounded windows with a TTL keep memory
+flat.</p>
+<h3 id="tool-policy"><a class="header" href="#tool-policy">Tool policy</a></h3>
+<p><code>ToolPolicyGuardrail</code> evaluates a list of <code>ToolRule</code>s — each is a
+tool name, an <code>InputConstraint</code> (regex, JSON path equals, allowlist),
+and an action. Use it to forbid <code>bash</code> from running <code>rm -rf</code>, or to
+restrict <code>web_fetch</code> to your own domains.</p>
+<h3 id="injection-classifier"><a class="header" href="#injection-classifier">Injection classifier</a></h3>
+<p><code>InjectionClassifierGuardrail</code> scores incoming text against known
+prompt-injection patterns (“ignore previous instructions”, “you are
+now…”) and acts when the score crosses a threshold.</p>
+<h3 id="sensor-security"><a class="header" href="#sensor-security">Sensor security</a></h3>
+<p>The <code>SensorSecurityGuardrail</code>, gated behind the <code>sensor</code> feature on
+the umbrella <a href="https://crates.io/crates/heartbit">heartbit</a> crate,
+validates sensor-pipeline payloads (Telegram, webhook, etc.) before
+they reach the agent — replay protection, signature checks, and
+per-tenant trust levels.</p>
+<h2 id="composing-multiple-guardrails"><a class="header" href="#composing-multiple-guardrails">Composing multiple guardrails</a></h2>
+<p>You attach guardrails by handing the agent a <code>Vec&lt;Arc&lt;dyn Guardrail&gt;&gt;</code>.
+The order matters because <code>Deny</code> short-circuits, so put the cheapest
+checks first:</p>
+<pre><code class="language-rust ignore">let guardrails: Vec&lt;Arc&lt;dyn Guardrail&gt;&gt; = vec![
+    Arc::new(SecretScannerGuardrail::builder().build()),
+    Arc::new(PiiGuardrail::all_builtin(PiiAction::Redact)),
+    Arc::new(LlmJudgeGuardrail::builder(judge).criterion("...").build()?),
+];
+let agent = AgentRunner::builder(provider).guardrails(guardrails).build()?;</code></pre>
+<h2 id="example-full-guardrail-stack"><a class="header" href="#example-full-guardrail-stack">Example: full guardrail stack</a></h2>
+<p>The example below wires three guardrails — secret scanner, PII
+redactor, LLM judge — onto a single agent and logs any denial through
+an <code>on_event</code> listener:</p>
+<pre class="playground"><code class="language-rust no_run">//! Composing several guardrails on a single agent.
+//!
+//! Wires a secret scanner, a PII redactor, and an LLM judge in front
+//! of an `AgentRunner`. First `Deny` wins; `Warn` is logged via the
+//! event listener but does not block.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example guardrails`
+
+use std::sync::Arc;
+
+use heartbit_core::{
+    AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, Guardrail, LlmJudgeGuardrail,
+    PiiAction, PiiGuardrail, RetryingProvider, SecretAction, SecretScannerGuardrail,
+};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    // A judge model can be cheaper than the main agent — wire a separate
+    // provider in production. Here we reuse the same one for brevity.
+    let judge_provider = provider.clone();
+
+    let secret_scanner = SecretScannerGuardrail::builder()
+        .action(SecretAction::Redact)
+        .build();
+
+    let pii = PiiGuardrail::all_builtin(PiiAction::Redact);
+
+    let llm_judge = LlmJudgeGuardrail::builder(judge_provider)
+        .criterion("response must not give legal advice")
+        .criterion("response must stay on the technical topic")
+        .build()?;
+
+    let guardrails: Vec&lt;Arc&lt;dyn Guardrail&gt;&gt; =
+        vec![Arc::new(secret_scanner), Arc::new(pii), Arc::new(llm_judge)];
+
+    let on_event = Arc::new(|event: AgentEvent| {
+        if let AgentEvent::GuardrailDenied { reason, .. } = event {
+            eprintln!("[guardrail-denied] {reason}");
+        }
+    });
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You are a helpful technical assistant.")
+        .guardrails(guardrails)
+        .on_event(on_event)
+        .build()?;
+
+    let output = agent
+        .execute("Summarise the difference between TCP and UDP in two sentences.")
+        .await?;
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>In production, point the judge guardrail at a smaller, cheaper model
+than the main agent’s; the cost difference compounds quickly when you
+evaluate every response.</p>
+<h2 id="when-to-write-your-own"><a class="header" href="#when-to-write-your-own">When to write your own</a></h2>
+<p>Implement <code>Guardrail</code> directly when none of the built-ins capture your
+domain rule — say, “deny any response that mentions a competitor’s
+product” or “redact internal project codenames”. The pattern mirrors
+the <a href="tools/README.html#writing-your-own-tool">custom-tool walkthrough in the Tools chapter</a>:
+pick the hook(s) you care about, return <code>Pin&lt;Box&lt;dyn Future&lt;…&gt; + Send&gt;&gt;</code>
+from each, and decide between <code>Allow</code>, <code>Warn</code>, <code>Deny</code>, and <code>Kill</code>
+based on the input or response. Override <code>name()</code> so audit records
+attribute denials back to your guardrail. Mutating <code>pre_llm</code> or
+<code>post_tool</code> is the same shape — the request and tool output are
+passed mutably so you can redact in place rather than denying outright.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="workflow-agents"><a class="header" href="#workflow-agents">Workflow Agents</a></h1>
+<h2 id="when-to-use-a-workflow-vs-a-single-agent"><a class="header" href="#when-to-use-a-workflow-vs-a-single-agent">When to use a workflow vs a single agent</a></h2>
+<p>A single <a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.AgentRunner.html"><code>AgentRunner</code></a>
+is the right tool when one ReAct loop can finish the task — the LLM
+decides what to do, calls tools, and returns. A workflow agent is the
+right tool when the structure of the work is known in advance and you
+want it executed deterministically, with no LLM cost paid at the
+dispatcher level. The dispatcher is plain Rust code; only the leaves
+call the model.</p>
+<p>Workflow agents compose other <code>AgentRunner</code>s (or other workflow
+agents) into pipelines, fan-outs, refinement loops, conditional DAGs,
+and consensus structures. They share the same <code>AgentOutput</code> shape —
+result text plus accumulated <code>TokenUsage</code> — so they slot into any
+caller that accepts an agent. The trade-off versus a single LLM-driven
+agent is predictability and cost (no dispatcher tokens) against
+flexibility (the structure is fixed before the run starts). Reach for
+the <a href="orchestration/README.html">Multi-Agent Orchestration</a> chapter
+when the dispatch itself needs to be LLM-driven instead.</p>
+<h2 id="sequential"><a class="header" href="#sequential">Sequential</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.SequentialAgent.html"><code>SequentialAgent</code></a>
+chains agents in declared order, piping each step’s output as the
+next step’s input and accumulating token usage across the whole run.
+Use it for pipelines where stage <code>n+1</code> literally consumes stage <code>n</code>’s
+text — research → write, draft → critique → revise. Fail-fast: any
+sub-agent error aborts the pipeline and the partial usage so far is
+preserved on the returned error.</p>
+<pre class="playground"><code class="language-rust no_run">//! Sequential workflow: a researcher agent feeds into a writer agent.
+//!
+//! `cargo run -p heartbit-core --example sequential_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{
+    AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider, SequentialAgent,
+};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let researcher = AgentRunner::builder(provider.clone())
+        .system_prompt(
+            "Research the topic and produce a concise factual summary (3 bullet points).",
+        )
+        .build()?;
+
+    let writer = AgentRunner::builder(provider)
+        .system_prompt("Rewrite the input as a single engaging paragraph for a general audience.")
+        .build()?;
+
+    let workflow = SequentialAgent::builder()
+        .agent(researcher)
+        .agent(writer)
+        .build()?;
+
+    let output = workflow
+        .execute("The history of the Rust programming language")
+        .await?;
+    println!("{}", output.result);
+    println!(
+        "Total tokens used: {} in / {} out",
+        output.tokens_used.input_tokens, output.tokens_used.output_tokens,
+    );
+    Ok(())
+}</code></pre>
+<h2 id="parallel"><a class="header" href="#parallel">Parallel</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.ParallelAgent.html"><code>ParallelAgent</code></a>
+runs every agent concurrently on a <code>tokio::JoinSet</code> and merges the
+results in declared order. Token usage is summed; the first error
+fails the whole run. Use it when sub-tasks are independent — three
+search backends, four file-summarisers — and total wall time matters.</p>
+<pre><code class="language-rust ignore">let workflow = ParallelAgent::builder()
+    .agent(searcher_a)
+    .agent(searcher_b)
+    .agent(searcher_c)
+    .build()?;
+let output = workflow.execute("query").await?;</code></pre>
+<h2 id="loop"><a class="header" href="#loop">Loop</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.LoopAgent.html"><code>LoopAgent</code></a>
+re-runs a single sub-agent on its own output until either
+<code>should_stop(text)</code> returns <code>true</code> or <code>max_iterations</code> is reached.
+Useful for refinement and self-correction passes — keep critiquing a
+draft until a separate quality check signals “good enough”.
+<code>should_stop</code> is plain Rust (<code>Fn(&amp;str) -&gt; bool</code>), so the termination
+predicate runs at zero LLM cost.</p>
+<pre><code class="language-rust ignore">let refiner = LoopAgent::builder()
+    .agent(reviewer)
+    .max_iterations(3)
+    .should_stop(|text: &amp;str| text.contains("APPROVED"))
+    .build()?;</code></pre>
+<h2 id="dag"><a class="header" href="#dag">DAG</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.DagAgent.html"><code>DagAgent</code></a>
+generalises the patterns above into an arbitrary directed acyclic
+graph. Declare nodes with <code>.node(name, agent)</code> and edges with
+<code>.edge(from, to)</code>; the builder rejects cycles at build time.</p>
+<pre class="playground"><code class="language-rust no_run">//! DAG workflow: a planner feeds two parallel workers (research + critique),
+//! then a synthesizer combines their outputs.
+//!
+//! `cargo run -p heartbit-core --example dag_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{AgentRunner, AnthropicProvider, BoxedProvider, DagAgent, RetryingProvider};
+
+fn make_agent(
+    provider: Arc&lt;BoxedProvider&gt;,
+    prompt: &amp;str,
+) -&gt; Result&lt;AgentRunner&lt;BoxedProvider&gt;, heartbit_core::Error&gt; {
+    AgentRunner::builder(provider).system_prompt(prompt).build()
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let dag = DagAgent::builder()
+        .node(
+            "planner",
+            make_agent(
+                provider.clone(),
+                "Outline the question into 2 parallel research questions.",
+            )?,
+        )
+        .node(
+            "research",
+            make_agent(provider.clone(), "Answer the research question concisely.")?,
+        )
+        .node(
+            "critique",
+            make_agent(
+                provider.clone(),
+                "Identify weaknesses in the proposed answer.",
+            )?,
+        )
+        .node(
+            "synthesizer",
+            make_agent(
+                provider,
+                "Combine research and critique into a final answer.",
+            )?,
+        )
+        .edge("planner", "research")
+        .edge("planner", "critique")
+        .edge("research", "synthesizer")
+        .edge("critique", "synthesizer")
+        .build()?;
+
+    let output = dag
+        .execute("Should we use Rust for our agent runtime?")
+        .await?;
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>Execution is petgraph-backed BFS. Topological order is respected,
+nodes within the same tier run in parallel, and a node receives the
+concatenated outputs of its incoming edges as input. The result of
+the DAG is the output of the unique terminal node — the builder
+errors if there is more than one. This is the right shape when work
+has true branching structure rather than fitting into pure pipeline,
+fan-out, or refinement.</p>
+<h2 id="voting--debate--mixture-of-agents"><a class="header" href="#voting--debate--mixture-of-agents">Voting / Debate / Mixture-of-agents</a></h2>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.VotingAgent.html"><code>VotingAgent</code></a>
+runs <code>n</code> agents in parallel and selects the majority answer (or applies
+a custom vote aggregator). Use it for self-consistency: the same
+question, multiple temperatures or seeds, take the consensus.</p>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.DebateAgent.html"><code>DebateAgent</code></a>
+runs multiple agents — typically with opposing system prompts — across
+several rounds, feeding each agent the others’ previous arguments. Use
+it when an adversarial back-and-forth surfaces failure modes a single
+agent would miss.</p>
+<p><a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.MixtureOfAgentsAgent.html"><code>MixtureOfAgentsAgent</code></a>
+runs several “proposer” agents in parallel, then feeds their proposals
+to a single “synthesizer” agent that produces the final answer. It’s
+the workflow shape from the
+<a href="https://arxiv.org/abs/2406.04692">Mixture-of-Agents paper</a> and is
+useful when proposers are diverse — different models, different
+prompts — and a synthesizer benefits from seeing all of them at once
+rather than picking a single winner.</p>
+<h2 id="choosing-the-right-pattern"><a class="header" href="#choosing-the-right-pattern">Choosing the right pattern</a></h2>
+<p>A short decision tree:</p>
+<ul>
+<li>Need stage <code>n+1</code> to consume stage <code>n</code>’s output deterministically?
+<code>SequentialAgent</code>.</li>
+<li>Independent fan-out where wall time matters? <code>ParallelAgent</code>.</li>
+<li>Refinement until a quality threshold is met? <code>LoopAgent</code>.</li>
+<li>Graph-structured work with multiple inputs and conditional joins?
+<code>DagAgent</code>.</li>
+<li>Self-consistency over <code>n</code> samples? <code>VotingAgent</code>.</li>
+<li>Adversarial cross-examination? <code>DebateAgent</code>.</li>
+<li>Multiple proposers, single synthesizer? <code>MixtureOfAgentsAgent</code>.</li>
+<li>Dispatch decision should itself be LLM-driven, with tools picked at
+runtime? Drop down to the <a href="orchestration/README.html">Orchestrator</a>.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-agent-orchestration"><a class="header" href="#multi-agent-orchestration">Multi-Agent Orchestration</a></h1>
+<h2 id="when-to-use-the-orchestrator"><a class="header" href="#when-to-use-the-orchestrator">When to use the Orchestrator</a></h2>
+<p>The <a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.Orchestrator.html"><code>Orchestrator</code></a>
+is the right tool when sub-agent dispatch needs to be LLM-driven —
+that is, when the <em>which</em> sub-agent to call is itself a question the
+model should answer at runtime, based on the user’s request. The
+orchestrator runs its own ReAct loop with a <code>delegate_task</code> tool
+exposing each registered sub-agent by name and description, plus
+optional <code>form_squad</code> and <code>spawn_agent</code> tools for dynamic team
+assembly. The model picks, the runner dispatches.</p>
+<p>The trade-off versus the deterministic
+<a href="workflow-agents/README.html">Workflow Agents</a> is the usual one:
+flexibility against predictability and cost. The orchestrator pays
+LLM tokens at the dispatcher level on top of every sub-agent run. Use
+it when the structure isn’t knowable in advance, or when you genuinely
+want the model to reason about routing. If a <code>SequentialAgent</code> or
+<code>DagAgent</code> already encodes your dispatch graph, prefer that.</p>
+<h2 id="the-orchestrator-and-orchestratorbuilder"><a class="header" href="#the-orchestrator-and-orchestratorbuilder">The Orchestrator and OrchestratorBuilder</a></h2>
+<p>You build an orchestrator through
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.OrchestratorBuilder.html"><code>OrchestratorBuilder</code></a>.
+The two most common shapes are <code>.sub_agent(name, description, prompt)</code>
+for the simple case and <code>.sub_agent_full(SubAgentConfig { … })</code> when
+you need per-agent tools, turn caps, or memory namespaces. Sub-agents
+must have unique non-empty names; <code>build()</code> errors otherwise.</p>
+<p>When <code>agents.len() == 1</code> the orchestrator detects a single-agent fast
+path and bypasses the dispatch loop, calling the lone sub-agent
+directly with the input task. This means you can wire a config that
+<em>could</em> grow into a multi-agent setup without paying dispatch cost
+until you actually register a second agent.</p>
+<h2 id="sub-agent-dispatch-tools"><a class="header" href="#sub-agent-dispatch-tools">Sub-agent dispatch tools</a></h2>
+<p>The orchestrator’s LLM has up to three dispatch tools available, all
+auto-wired by the builder.</p>
+<h3 id="delegatetasktool"><a class="header" href="#delegatetasktool">DelegateTaskTool</a></h3>
+<p><code>delegate_task</code> is the default. The LLM picks a sub-agent by name,
+hands it a task string, and the orchestrator runs that sub-agent’s
+<code>AgentRunner</code> to completion. The sub-agent’s token usage flows back
+into the orchestrator’s accumulated <code>AgentOutput</code>. Use it for the
+common “pick the right specialist” pattern.</p>
+<h3 id="formsquadtool"><a class="header" href="#formsquadtool">FormSquadTool</a></h3>
+<p><code>form_squad</code> is auto-enabled when at least two sub-agents are
+registered (toggle via <code>.enable_squads(bool)</code>). The LLM names a
+subset of sub-agents and a single task; the orchestrator runs them in
+parallel on a private in-memory blackboard so squad members can share
+notes for that one assignment, then aggregates their outputs into a
+single result. Use it when independent specialists should collaborate
+on the same question — research + critique + risk assessment, run at
+once.</p>
+<h3 id="spawnagenttool"><a class="header" href="#spawnagenttool">SpawnAgentTool</a></h3>
+<p><code>spawn_agent</code> is opt-in via <code>.spawn_config(...)</code>. It lets the
+orchestrator’s LLM define <em>new</em> sub-agents at runtime with a custom
+system prompt and a subset of an allowlisted tool pool. A spawn-count
+cap, name uniqueness within a run, and a shared token budget keep
+runaway recursion from happening. Reach for it when the right
+specialist isn’t predictable in advance and you’d rather have the
+model describe the agent it needs than enumerate every possibility
+upfront.</p>
+<h2 id="example"><a class="header" href="#example">Example</a></h2>
+<p>A three-sub-agent orchestrator — researcher, coder, reviewer — wired
+through <code>OrchestratorBuilder</code> and run on a single task:</p>
+<pre class="playground"><code class="language-rust no_run">//! Building an Orchestrator with multiple sub-agents.
+//!
+//! Wires three named sub-agents — researcher, coder, reviewer — and
+//! lets the orchestrator's LLM pick which one to dispatch via the
+//! `delegate_task` tool.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example multi_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{AnthropicProvider, BoxedProvider, Orchestrator, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let mut orchestrator = Orchestrator::builder(provider)
+        .sub_agent(
+            "researcher",
+            "Investigates a topic and returns a factual summary.",
+            "You are a research assistant. Produce a concise factual summary \
+             of the requested topic, with no opinions.",
+        )
+        .sub_agent(
+            "coder",
+            "Writes or modifies Rust code given clear requirements.",
+            "You are a senior Rust engineer. Produce idiomatic, well-tested \
+             code that compiles cleanly with `cargo clippy -- -D warnings`.",
+        )
+        .sub_agent(
+            "reviewer",
+            "Reviews code or text for issues and suggests improvements.",
+            "You are a code reviewer. Identify bugs, style issues, and \
+             missing test cases. Be specific and concrete.",
+        )
+        .max_turns(10)
+        .build()?;
+
+    let output = orchestrator
+        .run("Summarise the trade-offs of using Rust for an LLM agent runtime.")
+        .await?;
+
+    println!("{}", output.result);
+    println!(
+        "Total tokens: {} in / {} out",
+        output.tokens_used.input_tokens, output.tokens_used.output_tokens,
+    );
+    Ok(())
+}</code></pre>
+<p>The orchestrator’s LLM sees three sub-agents in <code>delegate_task</code>’s
+schema and routes the task to whichever one best fits — or chains
+several in sequence within its own loop.</p>
+<h2 id="blackboard-for-shared-state"><a class="header" href="#blackboard-for-shared-state">Blackboard for shared state</a></h2>
+<p>Sub-agents are otherwise isolated: each one runs its own
+<code>AgentRunner</code> with its own message history. When they need to share
+intermediate state — a research finding the reviewer should also see,
+a plan the coder produced — wire a <code>Blackboard</code> via
+<code>OrchestratorBuilder::blackboard(Arc&lt;dyn Blackboard&gt;)</code> and the runner
+exposes three tools to every sub-agent: <code>blackboard_read</code>,
+<code>blackboard_write</code>, and <code>blackboard_list</code>. The default
+<code>InMemoryBlackboard</code> is a <code>RwLock&lt;HashMap&lt;String, String&gt;&gt;</code>. Each
+sub-agent’s <code>AgentOutput</code> is also written automatically under
+<code>agent:{name}</code> so downstream agents can pick it up by key. The
+<code>form_squad</code> flow uses the same blackboard pattern internally — but
+on a private instance so squad scratch work doesn’t leak to the
+outer run.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
+<p><code>heartbit-core</code> can be driven entirely from a TOML file via
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/config/struct.HeartbitConfig.html"><code>HeartbitConfig</code></a>.
+This is the path you want when the agent topology should be operable
+without recompiling — for example, when running <code>heartbit-cli</code>’s
+<code>daemon</code> subcommand, or when a single binary needs to host several
+distinct agent setups loaded at startup.</p>
+<h2 id="heartbitconfig-from-toml"><a class="header" href="#heartbitconfig-from-toml">HeartbitConfig from TOML</a></h2>
+<p><code>HeartbitConfig::from_toml</code> parses and validates in one step. It
+rejects zero values for <code>max_turns</code>/<code>max_tokens</code>, enforces unique
+agent names, and wires the provider, orchestrator defaults, agents,
+and (optionally) Restate, telemetry, daemon, and memory sections into
+a typed root struct.</p>
+<pre class="playground"><code class="language-rust no_run">//! Loading agent configuration from a TOML file.
+//!
+//! `cargo run -p heartbit-core --example from_toml`
+
+use heartbit_core::config::HeartbitConfig;
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let toml_text = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "assistant"
+description = "A helpful general-purpose assistant."
+system_prompt = "You are a helpful assistant."
+max_turns = 10
+max_tokens = 4096
+"#;
+
+    // `from_toml` parses and validates the config in one step.
+    let config = HeartbitConfig::from_toml(toml_text)?;
+
+    println!(
+        "Loaded provider {} ({}); {} agent(s)",
+        config.provider.name,
+        config.provider.model,
+        config.agents.len()
+    );
+    for agent in &amp;config.agents {
+        println!(
+            "  - {} (max_turns={:?}, max_tokens={:?})",
+            agent.name, agent.max_turns, agent.max_tokens
+        );
+    }
+    Ok(())
+}</code></pre>
+<p>The TOML root has four primary tables: <code>[provider]</code> (LLM defaults),
+<code>[orchestrator]</code> (top-level run defaults), one or more <code>[[agents]]</code>
+entries (each becomes a sub-agent), and optional <code>[telemetry]</code>,
+<code>[memory]</code>, <code>[daemon]</code>, and <code>[restate]</code> sections wired in by the
+respective code paths.</p>
+<h2 id="provider-configuration"><a class="header" href="#provider-configuration">Provider configuration</a></h2>
+<p>The <code>[provider]</code> table tells the runtime which LLM to call by
+default. Required fields are <code>name</code> (e.g. <code>"anthropic"</code>,
+<code>"openrouter"</code>, <code>"openai_compat"</code>, <code>"gemini"</code>) and <code>model</code>. Optional
+fields include <code>base_url</code> (override the default endpoint — useful for
+Azure, self-hosted, or proxy setups), <code>api_key</code> (prefer environment
+variables in production), and <code>prompt_caching = true</code> to enable
+Anthropic prompt caching on the system prompt and tool definitions.
+Two sub-tables — <code>[provider.cascade]</code> and <code>[provider.retry]</code> — control
+cost and reliability.</p>
+<h2 id="cascade-and-retry"><a class="header" href="#cascade-and-retry">Cascade and retry</a></h2>
+<p><code>[provider.cascade]</code> configures
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.CascadingProvider.html">model cascading</a>:
+the runtime tries cheap-tier models first and only escalates to the
+main <code>[provider].model</code> when the confidence gate rejects the cheap
+response. Tiers are listed cheapest-first under <code>[[provider.cascade.tiers]]</code>.
+<code>[provider.retry]</code> configures <code>RetryProviderConfig</code> — exponential
+backoff for transient failures (HTTP 429, 500, 502, 503, 529, network
+errors). Defaults are 3 retries, 500 ms base delay, 30 s cap.</p>
+<h2 id="per-agent-overrides"><a class="header" href="#per-agent-overrides">Per-agent overrides</a></h2>
+<p>Each <code>[[agents]]</code> entry can override the global provider, the
+guardrails block, memory namespace, turn/token caps, and the tool
+profile. A typical per-agent provider override looks like:</p>
+<pre><code class="language-toml">[[agents]]
+name = "fast-router"
+description = "Lightweight intent classifier."
+system_prompt = "Classify the user request into one of: search, code, chat."
+
+[agents.provider]
+name = "openrouter"
+model = "google/gemini-2.5-flash"
+prompt_caching = false
+</code></pre>
+<p>The agent inherits everything else from the top-level <code>[provider]</code>
+and <code>[orchestrator]</code> blocks. Per-agent <code>guardrails</code>, <code>cascade</code>, and
+<code>response_schema</code> fields work the same way.</p>
+<h2 id="templates"><a class="header" href="#templates">Templates</a></h2>
+<p>Heartbit ships 15 built-in agent templates in
+<a href="https://github.com/heartbit-ai/heartbit/tree/main/crates/heartbit-core/templates">crates/heartbit-core/templates/</a>.
+Reference one by name on an agent — <code>template = "researcher"</code> — and
+the template’s <code>system_prompt</code>, <code>max_tokens</code>, <code>max_turns</code>, and other
+defaults are merged in; user-specified fields on the same agent
+override the template. The bundled templates are: <code>analyst</code>,
+<code>architect</code>, <code>coder</code>, <code>customer-support</code>, <code>data-scientist</code>,
+<code>debugger</code>, <code>ops</code>, <code>orchestrator</code>, <code>planner</code>, <code>researcher</code>,
+<code>reviewer</code>, <code>security-auditor</code>, <code>test-engineer</code>, <code>translator</code>,
+<code>writer</code>.</p>
+<h2 id="skills"><a class="header" href="#skills">Skills</a></h2>
+<p>Skills are reusable system-prompt fragments — domain expertise
+bundles that get injected into an agent’s prompt at config
+resolution. Heartbit ships 10 built-in skill packs in
+<a href="https://github.com/heartbit-ai/heartbit/tree/main/crates/heartbit-core/skills">crates/heartbit-core/skills/</a>:
+<code>api-design</code>, <code>docker</code>, <code>git-expert</code>, <code>kubernetes</code>, <code>python-expert</code>,
+<code>rust-expert</code>, <code>security</code>, <code>sql-expert</code>, <code>testing</code>,
+<code>typescript-expert</code>. Reference them via <code>skills = ["rust-expert", "testing"]</code>
+on an <code>[[agents]]</code> entry; the runtime auto-injects each skill’s
+<code>SKILL.md</code> at build time. Custom skills can live anywhere on the
+filesystem — the bundled names are just resolved first.</p>
+<h2 id="mcp-server-presets"><a class="header" href="#mcp-server-presets">MCP server presets</a></h2>
+<p>Connecting to a popular MCP server usually means typing the same URL,
+auth headers, and tool allowlist into every config. Heartbit ships 10
+named presets in
+<a href="https://github.com/heartbit-ai/heartbit/tree/main/crates/heartbit-core/mcp-presets">crates/heartbit-core/mcp-presets/</a>:
+<code>brave-search</code>, <code>github</code>, <code>gitlab</code>, <code>google-calendar</code>, <code>jira</code>,
+<code>linear</code>, <code>notion</code>, <code>postgresql</code>, <code>sentry</code>, <code>slack</code>. Reference one in
+an agent’s <code>mcp_servers</code> list — the preset name resolves to the full
+config, and you only need to supply the secrets it requires (typically
+through environment variable substitution). When you outgrow a
+preset, copy its JSON file into your project and edit freely; preset
+resolution falls back to literal config when the name doesn’t match.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="eval-framework"><a class="header" href="#eval-framework">Eval Framework</a></h1>
+<h2 id="why-eval"><a class="header" href="#why-eval">Why eval</a></h2>
+<p>Agents are LLM apps; LLMs drift. A prompt that produced the right
+trajectory yesterday can return a different answer tomorrow against
+the same model — let alone after a model upgrade or a tool change.
+The eval framework lets you codify “this prompt + this tool stack
+should do X for these inputs” and catch regressions in CI before they
+ship.</p>
+<h2 id="evalrunner-and-evalcase"><a class="header" href="#evalrunner-and-evalcase">EvalRunner and EvalCase</a></h2>
+<p>An <a href="https://docs.rs/heartbit-core/latest/heartbit_core/eval/struct.EvalCase.html"><code>EvalCase</code></a>
+captures the input task plus the expectations: required keywords,
+forbidden keywords, expected tool trajectory, optional reference
+output, and budget caps. An
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/eval/struct.EvalRunner.html"><code>EvalRunner</code></a>
+holds a list of scorers and produces an <code>EvalResult</code> per case — either
+by running the agent and capturing its output, or by scoring a
+pre-collected output via <code>score_result</code>. The example below uses the
+latter shape, so it runs without any API key:</p>
+<pre class="playground"><code class="language-rust no_run">//! Score agent outputs against eval cases without an LLM call.
+//!
+//! Builds an `EvalRunner` with three pure-function scorers, runs three
+//! cases against pre-recorded "actual outputs" via `score_result`, and
+//! prints the aggregate `EvalSummary`. No API key required.
+//!
+//! `cargo run -p heartbit-core --example eval`
+
+use heartbit_core::eval::{
+    EvalCase, EvalResult, EvalRunner, EvalSummary, KeywordScorer, SimilarityScorer,
+    TrajectoryScorer,
+};
+
+fn main() {
+    let cases = [
+        EvalCase::new("greeting", "Say hello in one word.")
+            .expect_output_contains("hello")
+            .expect_no_tools(),
+        EvalCase::new("capital", "What is the capital of France?")
+            .expect_output_contains("Paris")
+            .reference_output("The capital of France is Paris."),
+        EvalCase::new("file-read", "Read /tmp/notes.txt and summarise it.")
+            .expect_tool("read_file")
+            .expect_output_contains("summary"),
+    ];
+
+    // Stand in for real agent runs. In a real eval you'd execute the
+    // agent and feed `output.result` + collected tool calls instead.
+    let actuals: Vec&lt;(&amp;str, Vec&lt;String&gt;)&gt; = vec![
+        ("hello", vec![]),
+        ("The capital of France is Paris.", vec![]),
+        (
+            "Here is a summary of the file contents.",
+            vec!["read_file".into()],
+        ),
+    ];
+
+    let runner = EvalRunner::new()
+        .scorer(TrajectoryScorer)
+        .scorer(KeywordScorer)
+        .scorer(SimilarityScorer);
+
+    let results: Vec&lt;EvalResult&gt; = cases
+        .iter()
+        .zip(actuals)
+        .map(|(case, (output, tools))| runner.score_result(case, output, &amp;tools, None))
+        .collect();
+
+    let summary = EvalSummary::from_results(&amp;results);
+    println!("{summary}");
+}</code></pre>
+<h2 id="built-in-scorers"><a class="header" href="#built-in-scorers">Built-in scorers</a></h2>
+<p>Heartbit ships seven scorers covering trajectory, output content,
+similarity, and operational budgets:</p>
+<ul>
+<li><code>TrajectoryScorer</code>: matches the actual sequence of tool calls
+against <code>expect_tool</code> / <code>expect_tool_at</code> / <code>expect_no_tools</code>
+expectations on the case.</li>
+<li><code>KeywordScorer</code>: counts required <code>output_contains</code> and forbidden
+<code>output_not_contains</code> keywords in the final response, case-insensitive.</li>
+<li><code>SimilarityScorer</code>: Rouge-1 unigram F1 between the output and the
+case’s <code>reference_output</code>; default pass threshold is <code>0.3</code>.</li>
+<li><code>CostScorer</code>: aggregates <code>LlmResponse</code> events from a shared
+collector and asserts total estimated cost stays within
+<code>expect_max_cost_usd</code> (or the runner default).</li>
+<li><code>LatencyScorer</code>: asserts cumulative LLM wall-clock latency stays
+under <code>expect_max_latency_ms</code>.</li>
+<li><code>ToolCallCountScorer</code>: bounds the number of tool invocations per
+case via <code>expect_max_tool_calls</code>.</li>
+<li><code>SafetyScorer</code>: pass rate of guardrail evaluations observed during
+the run via <code>GuardrailDenied</code> events.</li>
+</ul>
+<h2 id="writing-custom-scorers"><a class="header" href="#writing-custom-scorers">Writing custom scorers</a></h2>
+<p>Scorers implement the <a href="https://docs.rs/heartbit-core/latest/heartbit_core/eval/trait.EvalScorer.html"><code>EvalScorer</code></a>
+trait — three methods, no async, no allocation contract beyond
+returning the per-scorer details vec:</p>
+<pre><code class="language-rust ignore">use heartbit_core::eval::{EvalCase, EvalScorer};
+
+struct LengthScorer { max_chars: usize }
+
+impl EvalScorer for LengthScorer {
+    fn name(&amp;self) -&gt; &amp;str { "length" }
+    fn score(&amp;self, _case: &amp;EvalCase, output: &amp;str, _tools: &amp;[String]) -&gt; (f64, Vec&lt;String&gt;) {
+        let ok = output.chars().count() &lt;= self.max_chars;
+        (if ok { 1.0 } else { 0.0 }, vec![format!("len={}", output.chars().count())])
+    }
+}</code></pre>
+<p>Hand it to the runner via <code>.scorer(LengthScorer { max_chars: 280 })</code>
+alongside the built-ins; first failing scorer fails the case.</p>
+<h2 id="running-evals-in-ci"><a class="header" href="#running-evals-in-ci">Running evals in CI</a></h2>
+<p>The cleanest pattern is a small eval binary in your project that
+loads cases from disk (TOML or JSON), runs them through an
+<code>EvalRunner</code> against your real agent, prints the human-readable
+<code>EvalSummary</code>, and emits a machine-readable JSON report alongside.
+Gate the CI step on <code>EvalSummary::pass_rate &gt;= threshold</code> (or on a
+zero-regression <code>EvalComparison</code> against a stored baseline). For the
+end-to-end iteration loop — write a failing case, fix the prompt,
+re-run, commit the new baseline — see the
+<a href="#eval-driven-prompt-iteration">Eval-driven prompt iteration</a> recipe.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="recipes"><a class="header" href="#recipes">Recipes</a></h1>
+<p>Practical, task-focused walkthroughs. Each recipe shows how to build one
+thing, end to end, with code that compiles.</p>
+<h2 id="recipes-in-this-cookbook"><a class="header" href="#recipes-in-this-cookbook">Recipes in this cookbook</a></h2>
+<ul>
+<li><a href="#chat-agent-with-web-search">Chat agent with web search</a> — a conversational
+agent that browses the web and answers questions with sources.</li>
+<li><a href="#code-aware-agent">Code-aware agent</a> — wire the file tools and the LSP
+client so the agent can navigate, read, and edit a real codebase.</li>
+<li><a href="#multi-agent-research-workflow">Multi-agent research workflow</a> — orchestrate
+a researcher and a writer that hand off work.</li>
+<li><a href="#long-running-agent-with-persistent-memory">Long-running agent with persistent memory</a> —
+use the heartbit umbrella crate’s Postgres-backed memory so context
+survives across runs.</li>
+<li><a href="#eval-driven-prompt-iteration">Eval-driven prompt iteration</a> — write a fixed test
+set, iterate the system prompt against it, gate CI on the score.</li>
+<li><a href="#mcp-server-integration">MCP server integration</a> — connect to an MCP
+server (GitHub, Slack, Postgres, …) and expose its tools to the agent.</li>
+</ul>
+<p>If you’re new to heartbit, read <a href="getting-started/README.html">Getting Started</a>
+first. Recipes assume you’ve read chapters 3 (<a href="agents/README.html">Agents</a>)
+and 4 (<a href="tools/README.html">Tools</a>).</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="chat-agent-with-web-search"><a class="header" href="#chat-agent-with-web-search">Chat agent with web search</a></h1>
+<h2 id="goal"><a class="header" href="#goal">Goal</a></h2>
+<p>A conversational agent that browses the web to answer questions and
+returns sources.</p>
+<h2 id="solution"><a class="header" href="#solution">Solution</a></h2>
+<p>Build an <code>AgentRunner</code> with the default built-in tools. The default set
+already includes <code>web_search</code> and <code>web_fetch</code> alongside the file tools,
+so a single call to <code>builtin_tools(BuiltinToolsConfig::default())</code> is
+enough. Wrap your <code>LlmProvider</code> in <code>RetryingProvider</code> to absorb 429s,
+and attach an <code>on_event</code> callback if you want a streaming-style trace
+to stderr while the agent works.</p>
+<p>For citation-friendly answers, instruct the system prompt to quote the
+URLs returned by <code>web_fetch</code>. The agent will plan its own
+search-then-fetch loop; you do not need to script it. The example below
+is a working starting point — change the <code>system_prompt</code> to taste, and
+extend the user message into a chat loop by feeding follow-up turns
+through <code>agent.execute(...)</code>.</p>
+<pre class="playground"><code class="language-rust no_run">//! A small agent with file-reading tools, a turn cap, and an event listener.
+//!
+//! Demonstrates the parts of `AgentRunnerBuilder` covered in the Agents
+//! chapter: `system_prompt`, `tools`, `max_turns`, and `on_event`.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example simple_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
+use heartbit_core::{AgentEvent, AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    // The default builtin set excludes dangerous tools (bash). It includes
+    // read/write/edit/patch/list/glob/grep, plus web_fetch/web_search.
+    let tools = builtin_tools(BuiltinToolsConfig::default());
+
+    // Print a one-line trace for each lifecycle event.
+    let on_event = Arc::new(|event: AgentEvent| match event {
+        AgentEvent::TurnStarted { turn, .. } =&gt; eprintln!("[turn {turn}]"),
+        AgentEvent::ToolCallStarted { tool_name, .. } =&gt; eprintln!("  -&gt; {tool_name}"),
+        AgentEvent::RunCompleted { total_usage, .. } =&gt; {
+            eprintln!(
+                "[done] {} in / {} out",
+                total_usage.input_tokens, total_usage.output_tokens,
+            );
+        }
+        _ =&gt; {}
+    });
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You are a helpful coding assistant.")
+        .tools(tools)
+        .max_turns(8)
+        .on_event(on_event)
+        .build()?;
+
+    let output = agent
+        .execute(
+            "List the files in the current directory and summarise what kind of project this is.",
+        )
+        .await?;
+
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>The example ships with the default tool set, which already exposes
+<code>web_search</code> and <code>web_fetch</code>. If you build a custom <code>BuiltinToolsConfig</code>
+later, double-check those two flags are on.</p>
+<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<ul>
+<li>The <code>web_fetch</code> tool refuses private IPs (loopback, RFC1918,
+link-local) unless <code>HEARTBIT_ALLOW_PRIVATE_IPS=1</code> is set. See
+<a href="#api-keys-and-environment">API keys and environment</a> for the opt-out
+and the <a href="tools/README.html">Tools chapter</a> for the full SSRF policy.</li>
+<li>For results citation, instruct the system prompt to include source
+URLs in the response.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="code-aware-agent"><a class="header" href="#code-aware-agent">Code-aware agent</a></h1>
+<h2 id="goal-1"><a class="header" href="#goal-1">Goal</a></h2>
+<p>An agent that reads, navigates, and edits a real codebase using file
+tools and a language-server-protocol client.</p>
+<h2 id="solution-1"><a class="header" href="#solution-1">Solution</a></h2>
+<p>The default <code>builtin_tools(BuiltinToolsConfig::default())</code> set already
+includes the file tools an editor agent needs: <code>read</code>, <code>write</code>, <code>edit</code>,
+<code>patch</code>, <code>glob</code>, and <code>grep</code>. They share a <code>FileTracker</code> that records
+mtimes, so the agent cannot silently overwrite a file that changed under
+it.</p>
+<p>For richer code intelligence — go-to-definition, find-references, and
+diagnostics — attach an <code>LspManager</code> from the heartbit umbrella crate’s
+<a href="https://docs.rs/heartbit/latest/heartbit/lsp/index.html"><code>lsp</code> module</a>.
+The manager spawns a language server per project and exposes its
+capabilities to the agent as additional tools. The example below
+illustrates the same composition pattern by attaching a small custom
+tool to an <code>AgentRunner</code>; swap in the file builtins (or LSP tools) the
+same way.</p>
+<pre class="playground"><code class="language-rust no_run">//! Implementing the `Tool` trait by hand.
+//!
+//! Defines a `WordCount` tool, attaches it to an agent, and lets the LLM
+//! decide when to call it.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example custom_tool`
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use heartbit_core::llm::types::ToolDefinition;
+use heartbit_core::{
+    AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider, Tool, ToolOutput,
+};
+
+/// A tool that counts the words in a string.
+struct WordCount;
+
+impl Tool for WordCount {
+    fn definition(&amp;self) -&gt; ToolDefinition {
+        ToolDefinition {
+            name: "word_count".into(),
+            description: "Count the number of whitespace-separated words in a string.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to count words in.",
+                    }
+                },
+                "required": ["text"],
+            }),
+        }
+    }
+
+    fn execute(
+        &amp;self,
+        input: serde_json::Value,
+    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;ToolOutput, heartbit_core::Error&gt;&gt; + Send + '_&gt;&gt; {
+        Box::pin(async move {
+            let text = match input.get("text").and_then(|v| v.as_str()) {
+                Some(t) =&gt; t,
+                None =&gt; return Ok(ToolOutput::error("missing required field `text`")),
+            };
+            let count = text.split_whitespace().count();
+            Ok(ToolOutput::success(count.to_string()))
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let tools: Vec&lt;Arc&lt;dyn Tool&gt;&gt; = vec![Arc::new(WordCount)];
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("Use the word_count tool to answer questions about word counts.")
+        .tools(tools)
+        .build()?;
+
+    let output = agent
+        .execute("How many words are in: 'The quick brown fox jumps over the lazy dog'?")
+        .await?;
+
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>The included example shows a custom price-lookup tool; the same
+<code>AgentRunner::builder(...).tools(...)</code> pattern composes cleanly with
+the file builtins. For LSP, see the umbrella’s
+<a href="https://docs.rs/heartbit/latest/heartbit/lsp/index.html">lsp module</a>.</p>
+<h2 id="notes-1"><a class="header" href="#notes-1">Notes</a></h2>
+<ul>
+<li>The <code>bash</code> tool can be sandboxed via Linux landlock (umbrella’s
+<code>sandbox</code> feature); see
+<a href="production/README.html">Production Considerations</a>.</li>
+<li>The <code>read</code>/<code>write</code>/<code>edit</code> tools track file mtimes via <code>FileTracker</code>
+to prevent stale-write races.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-agent-research-workflow"><a class="header" href="#multi-agent-research-workflow">Multi-agent research workflow</a></h1>
+<h2 id="goal-2"><a class="header" href="#goal-2">Goal</a></h2>
+<p>A workflow where a researcher gathers facts and a writer turns them
+into prose. You can wire it as a deterministic
+<a href="workflow-agents/README.html#sequential">SequentialAgent</a> or, if the
+work order isn’t fixed, dispatch through a dynamic
+<a href="orchestration/README.html">Orchestrator</a>.</p>
+<h2 id="solution-deterministic-pipeline"><a class="header" href="#solution-deterministic-pipeline">Solution: deterministic pipeline</a></h2>
+<p>When the order is known — research first, write second — a
+<code>SequentialAgent</code> keeps the wiring boring and free of LLM-driven
+routing. The output of agent <em>N</em> becomes the input of agent <em>N+1</em>; the
+final <code>AgentOutput</code> accumulates token usage from every step.</p>
+<pre class="playground"><code class="language-rust no_run">//! Sequential workflow: a researcher agent feeds into a writer agent.
+//!
+//! `cargo run -p heartbit-core --example sequential_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{
+    AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider, SequentialAgent,
+};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let researcher = AgentRunner::builder(provider.clone())
+        .system_prompt(
+            "Research the topic and produce a concise factual summary (3 bullet points).",
+        )
+        .build()?;
+
+    let writer = AgentRunner::builder(provider)
+        .system_prompt("Rewrite the input as a single engaging paragraph for a general audience.")
+        .build()?;
+
+    let workflow = SequentialAgent::builder()
+        .agent(researcher)
+        .agent(writer)
+        .build()?;
+
+    let output = workflow
+        .execute("The history of the Rust programming language")
+        .await?;
+    println!("{}", output.result);
+    println!(
+        "Total tokens used: {} in / {} out",
+        output.tokens_used.input_tokens, output.tokens_used.output_tokens,
+    );
+    Ok(())
+}</code></pre>
+<p>Two <code>AgentRunner</code>s share the same provider, both built with focused
+system prompts. <code>SequentialAgent::builder().agent(...).agent(...).build()?</code>
+chains them; <code>.execute("topic")</code> runs the pipeline end to end and
+returns one combined output.</p>
+<h2 id="solution-dynamic-orchestrator"><a class="header" href="#solution-dynamic-orchestrator">Solution: dynamic orchestrator</a></h2>
+<p>When the right next sub-agent depends on what the user asked,
+hand off to an <code>Orchestrator</code>. Each sub-agent is registered with a
+name, a one-line description, and its own system prompt. The
+orchestrator’s LLM sees those descriptions and picks who to delegate
+to via the built-in <code>delegate_task</code> tool.</p>
+<pre class="playground"><code class="language-rust no_run">//! Building an Orchestrator with multiple sub-agents.
+//!
+//! Wires three named sub-agents — researcher, coder, reviewer — and
+//! lets the orchestrator's LLM pick which one to dispatch via the
+//! `delegate_task` tool.
+//!
+//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example multi_agent`
+
+use std::sync::Arc;
+
+use heartbit_core::{AnthropicProvider, BoxedProvider, Orchestrator, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let mut orchestrator = Orchestrator::builder(provider)
+        .sub_agent(
+            "researcher",
+            "Investigates a topic and returns a factual summary.",
+            "You are a research assistant. Produce a concise factual summary \
+             of the requested topic, with no opinions.",
+        )
+        .sub_agent(
+            "coder",
+            "Writes or modifies Rust code given clear requirements.",
+            "You are a senior Rust engineer. Produce idiomatic, well-tested \
+             code that compiles cleanly with `cargo clippy -- -D warnings`.",
+        )
+        .sub_agent(
+            "reviewer",
+            "Reviews code or text for issues and suggests improvements.",
+            "You are a code reviewer. Identify bugs, style issues, and \
+             missing test cases. Be specific and concrete.",
+        )
+        .max_turns(10)
+        .build()?;
+
+    let output = orchestrator
+        .run("Summarise the trade-offs of using Rust for an LLM agent runtime.")
+        .await?;
+
+    println!("{}", output.result);
+    println!(
+        "Total tokens: {} in / {} out",
+        output.tokens_used.input_tokens, output.tokens_used.output_tokens,
+    );
+    Ok(())
+}</code></pre>
+<h2 id="choosing-between-them"><a class="header" href="#choosing-between-them">Choosing between them</a></h2>
+<p>Pick the deterministic pipeline when the order is known; pick the
+orchestrator when sub-agent selection depends on the task at runtime.
+See <a href="workflow-agents/README.html">Workflow Agents</a> and
+<a href="orchestration/README.html">Orchestration</a> for the full menu.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="long-running-agent-with-persistent-memory"><a class="header" href="#long-running-agent-with-persistent-memory">Long-running agent with persistent memory</a></h1>
+<h2 id="goal-3"><a class="header" href="#goal-3">Goal</a></h2>
+<p>An agent whose memory survives process restarts. Use the heartbit
+umbrella crate’s
+<a href="https://docs.rs/heartbit/latest/heartbit/struct.PostgresMemoryStore.html"><code>PostgresMemoryStore</code></a>
+(behind the <code>postgres</code> feature).</p>
+<h2 id="solution-2"><a class="header" href="#solution-2">Solution</a></h2>
+<p>Provision a Postgres instance, build a <code>sqlx::PgPool</code>, and hand the
+pool to <code>PostgresMemoryStore::new</code>. The schema auto-migrates on first
+run, so you don’t have to ship migrations alongside your code. Wrap
+the store in a <code>NamespacedMemory</code> keyed by the agent name (or a tenant
+id, for multi-tenant deployments) so different scopes can’t read each
+other’s entries.</p>
+<p>Pass the namespaced memory into <code>AgentRunnerBuilder::with_memory</code>. The
+runner will then expose the five memory tools (<code>memory_store</code>,
+<code>memory_recall</code>, <code>memory_update</code>, <code>memory_forget</code>, <code>memory_consolidate</code>)
+and persist every entry to Postgres automatically.</p>
+<pre><code class="language-bash">cargo add heartbit --features postgres
+</code></pre>
+<pre class="playground"><code class="language-rust no_run">use std::sync::Arc;
+
+use heartbit::{
+    AgentRunner, AnthropicProvider, BoxedProvider, NamespacedMemory,
+    PostgresMemoryStore, RetryingProvider,
+};
+use sqlx::postgres::PgPoolOptions;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")?;
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&amp;std::env::var("DATABASE_URL")?)
+        .await?;
+
+    let store = PostgresMemoryStore::new(pool, "heartbit").await?;
+    let memory = Arc::new(NamespacedMemory::new(Arc::new(store), "support-agent"));
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You remember the user across sessions.")
+        .with_memory(memory)
+        .build()?;
+
+    let output = agent.execute("Hi, I'm Alice. Save that.").await?;
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<h2 id="notes-2"><a class="header" href="#notes-2">Notes</a></h2>
+<ul>
+<li>For multi-tenant deployments, namespace memory per tenant via
+<a href="https://docs.rs/heartbit-core/latest/heartbit_core/memory/struct.NamespacedMemory.html"><code>NamespacedMemory</code></a>.</li>
+<li>See the <a href="memory/README.html">Memory chapter</a> for the trait surface
+and the five memory tools.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="eval-driven-prompt-iteration"><a class="header" href="#eval-driven-prompt-iteration">Eval-driven prompt iteration</a></h1>
+<h2 id="goal-4"><a class="header" href="#goal-4">Goal</a></h2>
+<p>Catch prompt regressions automatically. Codify “this prompt + tool
+stack should do X for these inputs” as eval cases, run them in CI, and
+fail the build if the score drops.</p>
+<h2 id="solution-3"><a class="header" href="#solution-3">Solution</a></h2>
+<p>Write 5–10 <code>EvalCase</code>s that cover your core scenarios plus a few edge
+cases. Each case pairs an input prompt with expectations:
+<code>expect_output_contains</code>, <code>expect_tool</code>, <code>expect_no_tools</code>,
+<code>reference_output</code>, and so on. Run them through an <code>EvalRunner</code>
+configured with the scorers that match your expectations:
+<code>KeywordScorer</code>, <code>SimilarityScorer</code>, <code>TrajectoryScorer</code>,
+<code>CostScorer</code>, <code>SafetyScorer</code>.</p>
+<p>The runner produces an <code>EvalSummary</code> you can serialize to JSON and
+gate CI on. For deterministic runs (fast and rate-limit-free), feed
+the runner pre-recorded actuals via <code>score_result</code> instead of letting
+it call the live LLM. The example below does exactly that — no API
+key required.</p>
+<pre class="playground"><code class="language-rust no_run">//! Score agent outputs against eval cases without an LLM call.
+//!
+//! Builds an `EvalRunner` with three pure-function scorers, runs three
+//! cases against pre-recorded "actual outputs" via `score_result`, and
+//! prints the aggregate `EvalSummary`. No API key required.
+//!
+//! `cargo run -p heartbit-core --example eval`
+
+use heartbit_core::eval::{
+    EvalCase, EvalResult, EvalRunner, EvalSummary, KeywordScorer, SimilarityScorer,
+    TrajectoryScorer,
+};
+
+fn main() {
+    let cases = [
+        EvalCase::new("greeting", "Say hello in one word.")
+            .expect_output_contains("hello")
+            .expect_no_tools(),
+        EvalCase::new("capital", "What is the capital of France?")
+            .expect_output_contains("Paris")
+            .reference_output("The capital of France is Paris."),
+        EvalCase::new("file-read", "Read /tmp/notes.txt and summarise it.")
+            .expect_tool("read_file")
+            .expect_output_contains("summary"),
+    ];
+
+    // Stand in for real agent runs. In a real eval you'd execute the
+    // agent and feed `output.result` + collected tool calls instead.
+    let actuals: Vec&lt;(&amp;str, Vec&lt;String&gt;)&gt; = vec![
+        ("hello", vec![]),
+        ("The capital of France is Paris.", vec![]),
+        (
+            "Here is a summary of the file contents.",
+            vec!["read_file".into()],
+        ),
+    ];
+
+    let runner = EvalRunner::new()
+        .scorer(TrajectoryScorer)
+        .scorer(KeywordScorer)
+        .scorer(SimilarityScorer);
+
+    let results: Vec&lt;EvalResult&gt; = cases
+        .iter()
+        .zip(actuals)
+        .map(|(case, (output, tools))| runner.score_result(case, output, &amp;tools, None))
+        .collect();
+
+    let summary = EvalSummary::from_results(&amp;results);
+    println!("{summary}");
+}</code></pre>
+<p>Iterate the system prompt until every case passes, then commit the
+case set alongside the prompt. From that point on, any prompt change
+that drops a score is caught by CI before merge.</p>
+<h2 id="ci-integration"><a class="header" href="#ci-integration">CI integration</a></h2>
+<p>A minimal GitHub Actions workflow that fails the build if the eval
+binary exits non-zero:</p>
+<pre><code class="language-yaml"># .github/workflows/eval.yml
+name: eval
+on: [pull_request]
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p heartbit-core --example eval
+</code></pre>
+<p>Have the example print a JSON summary to stdout and <code>std::process::exit(1)</code>
+when any aggregate score drops below your threshold. The Action’s
+default behaviour — fail on non-zero exit — does the gating for you.</p>
+<h2 id="notes-3"><a class="header" href="#notes-3">Notes</a></h2>
+<ul>
+<li>See the <a href="eval/README.html">Eval Framework chapter</a> for the full
+list of built-in scorers.</li>
+<li>For deterministic eval runs, use a stub provider that returns
+recorded responses; this keeps CI fast and free of rate limits.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="mcp-server-integration"><a class="header" href="#mcp-server-integration">MCP server integration</a></h1>
+<h2 id="goal-5"><a class="header" href="#goal-5">Goal</a></h2>
+<p>Connect an MCP (Model Context Protocol) server and expose its tools
+alongside the built-ins.</p>
+<h2 id="solution-4"><a class="header" href="#solution-4">Solution</a></h2>
+<p><code>McpClient::connect_stdio</code> spawns the server as a subprocess and
+speaks MCP over its stdin/stdout. Once connected, <code>client.into_tools()</code>
+returns a <code>Vec&lt;Arc&lt;dyn Tool&gt;&gt;</code> you can extend onto the built-in set
+and pass straight to <code>AgentRunnerBuilder::tools</code>. Run with the MCP
+command after <code>--</code>, for example:
+<code>cargo run -p heartbit-core --example mcp_agent -- npx -y @anthropic-ai/mcp-server-filesystem /tmp</code>.</p>
+<pre class="playground"><code class="language-rust no_run">//! Connecting to an MCP (Model Context Protocol) server.
+//!
+//! Spawns an MCP server over stdio, discovers its tools, and hands them
+//! to an agent alongside the built-in tool set. If no MCP command is
+//! supplied — or the connection fails — the agent falls back to the
+//! built-ins only, so the example always compiles and runs.
+//!
+//! ```bash
+//! ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example mcp_agent -- \
+//!     npx -y @anthropic-ai/mcp-server-filesystem /tmp
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
+use heartbit_core::{AgentRunner, AnthropicProvider, BoxedProvider, McpClient, RetryingProvider};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
+
+    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
+        AnthropicProvider::new(&amp;api_key, "claude-sonnet-4-20250514"),
+    )));
+
+    let mut tools = builtin_tools(BuiltinToolsConfig::default());
+
+    // Anything after `--` is treated as the MCP server command.
+    let mcp_args: Vec&lt;String&gt; = std::env::args().skip(1).collect();
+    if !mcp_args.is_empty() {
+        eprintln!("[connecting to MCP server: {}]", mcp_args.join(" "));
+        match McpClient::connect_stdio(&amp;mcp_args[0], &amp;mcp_args[1..], &amp;HashMap::new()).await {
+            Ok(client) =&gt; {
+                let mcp_tools = client.into_tools();
+                eprintln!("[discovered {} MCP tools]", mcp_tools.len());
+                tools.extend(mcp_tools);
+            }
+            Err(e) =&gt; {
+                eprintln!("[MCP connection failed: {e}; falling back to built-ins]");
+            }
+        }
+    }
+
+    let agent = AgentRunner::builder(provider)
+        .system_prompt("You are a helpful assistant. Prefer MCP tools when available.")
+        .tools(tools)
+        .max_turns(10)
+        .build()?;
+
+    let task = if mcp_args.is_empty() {
+        "List the names of the built-in tools you have access to."
+    } else {
+        "List the tools you have access to from the connected MCP server."
+    };
+
+    let output = agent.execute(task).await?;
+    println!("{}", output.result);
+    Ok(())
+}</code></pre>
+<p>The example fails soft: if no command is supplied — or the connection
+errors — the agent runs with the built-in tools only, so the binary
+always compiles and runs end to end.</p>
+<h2 id="built-in-mcp-presets"><a class="header" href="#built-in-mcp-presets">Built-in MCP presets</a></h2>
+<p>Ten ready-to-use server presets ship with <code>heartbit-core</code> (GitHub,
+Slack, Postgres, …). Reference them by name in your agent config and
+heartbit will resolve the URL, env vars, and auth pattern for you. See
+<a href="configuration/README.html#mcp-server-presets">Configuration</a> for the
+full list and the per-preset env-var requirements.</p>
+<h2 id="notes-4"><a class="header" href="#notes-4">Notes</a></h2>
+<ul>
+<li>MCP server URLs are validated through the same SSRF defense as
+<code>web_fetch</code> (private IPs refused by default; opt out via
+<code>HEARTBIT_ALLOW_PRIVATE_IPS=1</code>).</li>
+<li>See <a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.McpClient.html"><code>McpClient</code></a>
+for the full API, including <code>connect_with_auth</code> for OAuth token
+exchange and <code>connect</code> for already-running HTTP servers.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="production-considerations"><a class="header" href="#production-considerations">Production Considerations</a></h1>
+<p><code>heartbit-core</code> is the framework — agents, tools, providers, memory,
+eval. For multi-tenant SaaS deployments, where you want a Kafka-backed
+daemon, a dashboard, JWT-scoped tenants, sandboxed bash workspaces,
+and a Postgres task store, you compose <code>heartbit-core</code> with the
+<a href="https://crates.io/crates/heartbit">heartbit umbrella crate</a> and
+deploy through <code>heartbit-cli</code>’s <code>daemon</code> subcommand. This chapter
+points you at the right docs for each axis.</p>
+<h2 id="sandboxing"><a class="header" href="#sandboxing">Sandboxing</a></h2>
+<p>Bash execution is the highest-risk tool surface. The umbrella crate’s
+<code>sandbox</code> feature wires Linux landlock so a bash process can only
+read and write inside an allowlisted workspace, with environment
+variables filtered to a pre-declared set. Apply it via
+<code>BashTool::with_sandbox_policy(policy)</code> or the workspace-aware
+constructor <code>BashTool::with_sandbox(workspace, env_policy)</code>.</p>
+<p>On non-Linux hosts the sandbox layer is a graceful no-op — the same
+code compiles and runs, and policy is enforced by the umbrella where
+the kernel supports it. See
+<a href="https://github.com/heartbit-ai/heartbit/blob/main/crates/heartbit-cli/README.md">crates/heartbit-cli/README.md</a>
+for the daemon-side wiring of sandbox policies per agent.</p>
+<h2 id="resource-limits"><a class="header" href="#resource-limits">Resource limits</a></h2>
+<p>Every production agent needs at least four caps configured: <code>max_turns</code>
+(stops runaway ReAct loops), <code>max_tokens</code> (per-call output cap),
+<code>max_total_tokens</code> (cumulative input + output budget across all turns;
+returns <code>Error::WithPartialUsage</code> when exceeded), and <code>run_timeout_seconds</code>
+(wall-clock deadline for the entire run). Add <code>max_identical_tool_calls</code>
+to engage doom-loop detection — when an agent repeats the same tool
+call N times in a row, subsequent calls get error results instead of
+executing. Sensible defaults per agent in production: 25 turns,
+8 192 output tokens, a few hundred thousand total tokens, a 5-minute
+run deadline, and <code>max_identical_tool_calls = 3</code>.</p>
+<h2 id="observability"><a class="header" href="#observability">Observability</a></h2>
+<p>Three layers, in increasing weight. First, <code>OnEvent</code> callbacks fire
+synchronously from the runner — wire one to forward <code>AgentEvent</code>
+variants (<code>RunStarted</code>, <code>LlmResponse</code>, <code>ToolCallStarted</code>, <code>RunFailed</code>,
+<code>GuardrailDenied</code>, <code>ModelEscalated</code>, etc.) into your logging or
+metrics system. Second, OpenTelemetry: configure <code>[telemetry]</code> in
+your <code>HeartbitConfig</code> and the <code>heartbit-cli</code> binary’s
+<code>setup_telemetry</code> wires an OTLP exporter spanning the agent ReAct
+loop. Third, in daemon mode the umbrella exposes Prometheus metrics
+and SSE event streams over the Axum HTTP API. See
+<a href="https://github.com/heartbit-ai/heartbit/blob/main/docs/platform.md">docs/platform.md</a>
+for the full setup.</p>
+<h2 id="multi-tenancy"><a class="header" href="#multi-tenancy">Multi-tenancy</a></h2>
+<p><code>NamespacedMemory</code> wraps any <code>Memory</code> implementation with a tenant
+scope so per-tenant agents read and write only their own entries
+without changing the underlying store. The umbrella crate’s
+<code>auth/jwt</code> module validates inbound JWTs against your IdP and binds
+the resolved user/tenant to every command and audit record produced
+by the daemon. Tenant identity also flows into the agent’s system
+prompt and into <code>MemoryEntry::author_tenant_id</code> for cross-context
+attribution. The full multi-tenant deployment guide lives in
+<a href="https://github.com/heartbit-ai/heartbit/blob/main/docs/platform.md">docs/platform.md</a>.</p>
+<h2 id="going-beyond-library-mode"><a class="header" href="#going-beyond-library-mode">Going beyond library mode</a></h2>
+<p>The umbrella’s <code>daemon</code> feature gives you a Kafka-backed runtime
+(commands in, audit + SSE out), a Postgres task store, the
+multi-tenant dashboard, the cron scheduler, and the heartbeat pulse
+service — everything you need to operate agents as a long-running
+service rather than as a library inside another binary. Start with
+<a href="https://github.com/heartbit-ai/heartbit/blob/main/crates/heartbit-cli/README.md">crates/heartbit-cli/README.md</a>
+for the binary, then
+<a href="https://github.com/heartbit-ai/heartbit/blob/main/docs/platform.md">docs/platform.md</a>
+for the multi-tenant deployment topology.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
