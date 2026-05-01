@@ -15,43 +15,34 @@ pub struct SkillContent {
 static BUNDLED_SKILLS: &[(&str, &str)] = &[
     (
         "rust-expert",
-        include_str!("../../../../configs/skills/rust-expert/SKILL.md"),
+        include_str!("../../skills/rust-expert/SKILL.md"),
     ),
     (
         "python-expert",
-        include_str!("../../../../configs/skills/python-expert/SKILL.md"),
+        include_str!("../../skills/python-expert/SKILL.md"),
     ),
     (
         "typescript-expert",
-        include_str!("../../../../configs/skills/typescript-expert/SKILL.md"),
+        include_str!("../../skills/typescript-expert/SKILL.md"),
     ),
-    (
-        "docker",
-        include_str!("../../../../configs/skills/docker/SKILL.md"),
-    ),
+    ("docker", include_str!("../../skills/docker/SKILL.md")),
     (
         "kubernetes",
-        include_str!("../../../../configs/skills/kubernetes/SKILL.md"),
+        include_str!("../../skills/kubernetes/SKILL.md"),
     ),
-    (
-        "security",
-        include_str!("../../../../configs/skills/security/SKILL.md"),
-    ),
+    ("security", include_str!("../../skills/security/SKILL.md")),
     (
         "sql-expert",
-        include_str!("../../../../configs/skills/sql-expert/SKILL.md"),
+        include_str!("../../skills/sql-expert/SKILL.md"),
     ),
     (
         "api-design",
-        include_str!("../../../../configs/skills/api-design/SKILL.md"),
+        include_str!("../../skills/api-design/SKILL.md"),
     ),
-    (
-        "testing",
-        include_str!("../../../../configs/skills/testing/SKILL.md"),
-    ),
+    ("testing", include_str!("../../skills/testing/SKILL.md")),
     (
         "git-expert",
-        include_str!("../../../../configs/skills/git-expert/SKILL.md"),
+        include_str!("../../skills/git-expert/SKILL.md"),
     ),
 ];
 

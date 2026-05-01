@@ -25,46 +25,25 @@ pub struct McpPreset {
 
 /// Embedded preset data (compile-time).
 static PRESETS: &[(&str, &str)] = &[
-    (
-        "github",
-        include_str!("../../../../configs/mcp-presets/github.json"),
-    ),
-    (
-        "gitlab",
-        include_str!("../../../../configs/mcp-presets/gitlab.json"),
-    ),
-    (
-        "slack",
-        include_str!("../../../../configs/mcp-presets/slack.json"),
-    ),
-    (
-        "notion",
-        include_str!("../../../../configs/mcp-presets/notion.json"),
-    ),
+    ("github", include_str!("../../mcp-presets/github.json")),
+    ("gitlab", include_str!("../../mcp-presets/gitlab.json")),
+    ("slack", include_str!("../../mcp-presets/slack.json")),
+    ("notion", include_str!("../../mcp-presets/notion.json")),
     (
         "postgresql",
-        include_str!("../../../../configs/mcp-presets/postgresql.json"),
+        include_str!("../../mcp-presets/postgresql.json"),
     ),
     (
         "brave-search",
-        include_str!("../../../../configs/mcp-presets/brave-search.json"),
+        include_str!("../../mcp-presets/brave-search.json"),
     ),
-    (
-        "sentry",
-        include_str!("../../../../configs/mcp-presets/sentry.json"),
-    ),
-    (
-        "linear",
-        include_str!("../../../../configs/mcp-presets/linear.json"),
-    ),
+    ("sentry", include_str!("../../mcp-presets/sentry.json")),
+    ("linear", include_str!("../../mcp-presets/linear.json")),
     (
         "google-calendar",
-        include_str!("../../../../configs/mcp-presets/google-calendar.json"),
+        include_str!("../../mcp-presets/google-calendar.json"),
     ),
-    (
-        "jira",
-        include_str!("../../../../configs/mcp-presets/jira.json"),
-    ),
+    ("jira", include_str!("../../mcp-presets/jira.json")),
 ];
 
 /// Resolve a preset name to its MCP server configuration.

@@ -4,65 +4,41 @@ use super::AgentTemplate;
 
 /// Embedded template data (compile-time).
 static TEMPLATES: &[(&str, &str)] = &[
-    (
-        "coder",
-        include_str!("../../../../configs/templates/coder.toml"),
-    ),
+    ("coder", include_str!("../../templates/coder.toml")),
     (
         "researcher",
-        include_str!("../../../../configs/templates/researcher.toml"),
+        include_str!("../../templates/researcher.toml"),
     ),
-    (
-        "planner",
-        include_str!("../../../../configs/templates/planner.toml"),
-    ),
-    (
-        "reviewer",
-        include_str!("../../../../configs/templates/reviewer.toml"),
-    ),
-    (
-        "debugger",
-        include_str!("../../../../configs/templates/debugger.toml"),
-    ),
-    (
-        "writer",
-        include_str!("../../../../configs/templates/writer.toml"),
-    ),
-    (
-        "ops",
-        include_str!("../../../../configs/templates/ops.toml"),
-    ),
+    ("planner", include_str!("../../templates/planner.toml")),
+    ("reviewer", include_str!("../../templates/reviewer.toml")),
+    ("debugger", include_str!("../../templates/debugger.toml")),
+    ("writer", include_str!("../../templates/writer.toml")),
+    ("ops", include_str!("../../templates/ops.toml")),
     (
         "orchestrator",
-        include_str!("../../../../configs/templates/orchestrator.toml"),
+        include_str!("../../templates/orchestrator.toml"),
     ),
     (
         "security-auditor",
-        include_str!("../../../../configs/templates/security-auditor.toml"),
+        include_str!("../../templates/security-auditor.toml"),
     ),
     (
         "test-engineer",
-        include_str!("../../../../configs/templates/test-engineer.toml"),
+        include_str!("../../templates/test-engineer.toml"),
     ),
-    (
-        "architect",
-        include_str!("../../../../configs/templates/architect.toml"),
-    ),
+    ("architect", include_str!("../../templates/architect.toml")),
     (
         "data-scientist",
-        include_str!("../../../../configs/templates/data-scientist.toml"),
+        include_str!("../../templates/data-scientist.toml"),
     ),
-    (
-        "analyst",
-        include_str!("../../../../configs/templates/analyst.toml"),
-    ),
+    ("analyst", include_str!("../../templates/analyst.toml")),
     (
         "customer-support",
-        include_str!("../../../../configs/templates/customer-support.toml"),
+        include_str!("../../templates/customer-support.toml"),
     ),
     (
         "translator",
-        include_str!("../../../../configs/templates/translator.toml"),
+        include_str!("../../templates/translator.toml"),
     ),
 ];
 
