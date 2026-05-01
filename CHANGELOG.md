@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Refactor
+
+- Workspace restructured: `heartbit-core` extracted as the official Rust
+  agentic framework. The `heartbit` crate becomes a thin umbrella that
+  re-exports `heartbit-core` (`pub use heartbit_core::*;`) and adds platform
+  integrations (Postgres, Telegram/Discord/Slack adapters, Restate
+  workflows, fastembed local embeddings, vault, JWT validator, daemon
+  mode). **No public API changes** — every existing import
+  (`use heartbit::AgentRunner;` etc.) continues to compile via the
+  umbrella's glob re-export. Library users should target `heartbit-core`
+  directly; runtime/platform users keep using `heartbit`. Documentation
+  rewritten: top-level `README.md` now leads with the framework
+  (`cargo add heartbit-core` + quickstart), platform content moves to
+  `crates/heartbit-cli/README.md` and `docs/platform.md`, and
+  `crates/heartbit-core/README.md` is the docs.rs landing page.
+
 ### Security
 
 - `WebFetchTool` now refuses requests to private/loopback/link-local IPs by
