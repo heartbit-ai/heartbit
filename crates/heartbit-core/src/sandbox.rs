@@ -103,6 +103,176 @@ impl CorePathPolicyBuilder {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+pub use landlock_sandbox::SandboxPolicy;
+
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
+mod landlock_sandbox {
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use landlock::{
+        ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    };
+
+    use super::CorePathPolicy;
+    use crate::error::Error;
+
+    /// Filesystem sandbox policy applied to bash subprocess via `pre_exec`.
+    ///
+    /// Composes a `CorePathPolicy` (path allowlist + glob denylist, shared with
+    /// non-bash filesystem tools) plus the kernel-level Landlock enforcement.
+    #[derive(Debug, Clone)]
+    pub struct SandboxPolicy {
+        /// Application-level path policy. Shared with read/write/edit/patch tools.
+        path_policy: Arc<CorePathPolicy>,
+        /// Paths with read-only access (Landlock layer).
+        pub read_paths: Vec<PathBuf>,
+        /// Paths with read-write access (Landlock layer).
+        pub write_paths: Vec<PathBuf>,
+    }
+
+    impl SandboxPolicy {
+        /// Default policy: R/W on workspace, read-only on system dirs.
+        pub fn workspace_only(workspace: &std::path::Path) -> Self {
+            let read_paths = vec![
+                PathBuf::from("/usr"),
+                PathBuf::from("/lib"),
+                PathBuf::from("/lib64"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/tmp"),
+                workspace.to_path_buf(),
+            ];
+            let write_paths = vec![workspace.to_path_buf(), PathBuf::from("/tmp")];
+            // Build a corresponding CorePathPolicy (best-effort: skip missing dirs).
+            let mut builder = CorePathPolicy::builder();
+            for p in read_paths.iter().chain(write_paths.iter()) {
+                if p.exists() {
+                    builder = builder.allow_dir(p);
+                }
+            }
+            // build() can't fail here since we filtered to existing dirs and
+            // there are no globs, but we degrade gracefully if it does.
+            let path_policy = Arc::new(
+                builder
+                    .build()
+                    .unwrap_or_else(|_| CorePathPolicy::builder().build().expect("empty policy")),
+            );
+            Self {
+                path_policy,
+                read_paths,
+                write_paths,
+            }
+        }
+
+        /// Build a SandboxPolicy from an externally-constructed `CorePathPolicy`.
+        ///
+        /// Used when one path policy is shared across multiple tools (bash +
+        /// write + edit + ...). The Landlock layer is initialized empty
+        /// (caller must populate `read_paths` / `write_paths` separately if
+        /// they want kernel-level enforcement on top of the path policy).
+        pub fn from_path_policy(path_policy: Arc<CorePathPolicy>) -> Self {
+            Self {
+                path_policy,
+                read_paths: Vec::new(),
+                write_paths: Vec::new(),
+            }
+        }
+
+        /// Expose the inner `CorePathPolicy` so callers can pass it to non-bash
+        /// filesystem tools that take `Arc<CorePathPolicy>`.
+        pub fn path_policy(&self) -> Arc<CorePathPolicy> {
+            self.path_policy.clone()
+        }
+
+        /// Create a `pre_exec` closure that applies Landlock rules.
+        pub fn into_pre_exec(self) -> Result<impl FnMut() -> io::Result<()>, Error> {
+            let abi = ABI::V5;
+
+            let read_access = AccessFs::from_read(abi);
+            let write_access = AccessFs::from_all(abi);
+
+            let read_fds: Vec<_> = self
+                .read_paths
+                .iter()
+                .filter_map(|p| PathFd::new(p).ok())
+                .collect();
+
+            let write_fds: Vec<_> = self
+                .write_paths
+                .iter()
+                .filter_map(|p| PathFd::new(p).ok())
+                .collect();
+
+            Ok(move || {
+                let mut ruleset = Ruleset::default()
+                    .handle_access(write_access)
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .create()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+
+                for fd in &read_fds {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(fd, read_access))
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+
+                for fd in &write_fds {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(fd, write_access))
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+
+                ruleset
+                    .restrict_self()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn workspace_only_includes_workspace_in_read_and_write() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SandboxPolicy::workspace_only(dir.path());
+            assert!(policy.read_paths.contains(&dir.path().to_path_buf()));
+            assert!(policy.write_paths.contains(&dir.path().to_path_buf()));
+        }
+
+        #[test]
+        fn from_path_policy_exposes_inner_policy() {
+            let path_policy = Arc::new(
+                CorePathPolicy::builder()
+                    .allow_dir(std::env::temp_dir())
+                    .build()
+                    .unwrap(),
+            );
+            let sandbox = SandboxPolicy::from_path_policy(path_policy.clone());
+            assert!(Arc::ptr_eq(&path_policy, &sandbox.path_policy()));
+            assert!(sandbox.read_paths.is_empty());
+            assert!(sandbox.write_paths.is_empty());
+        }
+
+        #[test]
+        fn workspace_only_populates_path_policy() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SandboxPolicy::workspace_only(dir.path());
+            // The inner CorePathPolicy should accept paths under dir
+            let inner = policy.path_policy();
+            let file = dir.path().join("ok.txt");
+            std::fs::write(&file, b"x").unwrap();
+            assert!(inner.check_path(&file).is_ok());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

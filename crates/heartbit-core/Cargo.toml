@@ -38,6 +38,9 @@ toml = { workspace = true }
 petgraph = { workspace = true }
 a2a-sdk = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -45,7 +48,7 @@ tempfile = "3"
 default = []
 a2a = ["dep:a2a-sdk"]
 # Features inherited from tool/ (gated conditionals in code)
-sandbox = []
+sandbox = ["dep:landlock"]
 macro = []
 # Mirror umbrella's `sensor` feature so cfg-gated items
 # (`agent::guardrails::sensor_security`) compile when the umbrella enables it.

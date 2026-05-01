@@ -49,7 +49,6 @@ hex = { workspace = true, optional = true }
 subtle = { workspace = true }
 teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
-landlock = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
@@ -71,7 +70,7 @@ telegram = ["dep:teloxide"]
 discord = ["dep:tokio-tungstenite"]
 slack = ["dep:tokio-tungstenite"]
 local-embedding = ["dep:fastembed"]
-sandbox = ["dep:landlock", "heartbit-core/sandbox"]
+sandbox = ["heartbit-core/sandbox"]
 macro = ["dep:heartbit-macro", "heartbit-core/macro"]
 vault = ["dep:aes-gcm", "dep:argon2", "dep:rand"]
 full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram", "discord", "slack", "vault"]
