@@ -8,9 +8,9 @@ use crate::error::Error;
 ///
 /// Lives in heartbit-core (not in the umbrella) so all filesystem
 /// builtins (bash, patch, edit, write, read) can share enforcement.
-/// The umbrella's `SandboxPolicy` (landlock-backed on Linux) composes
-/// a `CorePathPolicy` for the path-allowlist piece and adds kernel-
-/// level enforcement.
+/// The umbrella's `SandboxPolicy` (landlock-backed on Linux) will
+/// compose a `CorePathPolicy` for the path-allowlist piece. Until
+/// Task 5 lands, the two are independent.
 #[derive(Debug, Clone)]
 pub struct CorePathPolicy {
     allowed_dirs: Vec<PathBuf>,
@@ -62,12 +62,12 @@ pub struct CorePathPolicyBuilder {
 }
 
 impl CorePathPolicyBuilder {
-    /// Allow filesystem operations under `dir`. The directory is canonicalized
-    /// at build time so symlink-following is consistent with `check_path`.
+    /// Allow filesystem operations under `dir`. The directory is
+    /// canonicalized at `build()` time; passing a path that doesn't
+    /// exist or that the process can't resolve causes `build()` to
+    /// return `Err(Error::Sandbox(...))`.
     pub fn allow_dir(mut self, dir: impl AsRef<Path>) -> Self {
-        let p = dir.as_ref();
-        let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        self.allowed_dirs.push(canon);
+        self.allowed_dirs.push(dir.as_ref().to_path_buf());
         self
     }
 
@@ -78,6 +78,15 @@ impl CorePathPolicyBuilder {
     }
 
     pub fn build(self) -> Result<CorePathPolicy, Error> {
+        let allowed_dirs = self
+            .allowed_dirs
+            .into_iter()
+            .map(|p| {
+                p.canonicalize()
+                    .map_err(|e| Error::Sandbox(format!("allow_dir {}: {e}", p.display())))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let deny_globs = self
             .deny_globs
             .into_iter()
@@ -86,8 +95,9 @@ impl CorePathPolicyBuilder {
                     .map_err(|e| Error::Sandbox(format!("invalid deny glob {p}: {e}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         Ok(CorePathPolicy {
-            allowed_dirs: self.allowed_dirs,
+            allowed_dirs,
             deny_globs,
         })
     }
@@ -98,29 +108,31 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("heartbit-sandbox-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn allows_path_under_allowed_dir() {
         let root = tmp();
-        let file = root.join("ok.txt");
+        let file = root.path().join("ok.txt");
         fs::write(&file, b"x").unwrap();
-        let policy = CorePathPolicy::builder().allow_dir(&root).build().unwrap();
+        let policy = CorePathPolicy::builder()
+            .allow_dir(root.path())
+            .build()
+            .unwrap();
         assert!(policy.check_path(&file).is_ok());
     }
 
     #[test]
     fn denies_path_outside_allowed_dirs() {
         let root = tmp();
-        let policy = CorePathPolicy::builder().allow_dir(&root).build().unwrap();
-        let bad_dir =
-            std::env::temp_dir().join(format!("heartbit-sandbox-out-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&bad_dir).unwrap();
-        let bad = bad_dir.join("x.txt");
+        let policy = CorePathPolicy::builder()
+            .allow_dir(root.path())
+            .build()
+            .unwrap();
+        let bad_dir = tmp();
+        let bad = bad_dir.path().join("x.txt");
         fs::write(&bad, b"x").unwrap();
         let err = policy.check_path(&bad).unwrap_err();
         assert!(matches!(err, Error::Sandbox(_)));
@@ -129,10 +141,10 @@ mod tests {
     #[test]
     fn denies_glob_match_inside_allowed_dir() {
         let root = tmp();
-        let dotenv = root.join(".env");
+        let dotenv = root.path().join(".env");
         fs::write(&dotenv, b"x").unwrap();
         let policy = CorePathPolicy::builder()
-            .allow_dir(&root)
+            .allow_dir(root.path())
             .deny_glob("**/.env")
             .build()
             .unwrap();
@@ -152,5 +164,33 @@ mod tests {
     fn invalid_glob_pattern_returns_error() {
         let result = CorePathPolicy::builder().deny_glob("[unclosed").build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn allow_dir_with_nonexistent_path_fails_at_build() {
+        let bogus = std::env::temp_dir().join(format!("does-not-exist-{}", uuid::Uuid::new_v4()));
+        let result = CorePathPolicy::builder().allow_dir(&bogus).build();
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denies_symlink_pointing_outside_allowed_dir() {
+        use std::os::unix::fs::symlink;
+        let allowed = tmp();
+        let outside = tmp();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"secret").unwrap();
+
+        // Create a symlink inside the allowed dir that points OUTSIDE.
+        let link = allowed.path().join("link.txt");
+        symlink(&outside_file, &link).unwrap();
+
+        let policy = CorePathPolicy::builder()
+            .allow_dir(allowed.path())
+            .build()
+            .unwrap();
+        let err = policy.check_path(&link).unwrap_err();
+        assert!(matches!(err, Error::Sandbox(_)));
     }
 }
