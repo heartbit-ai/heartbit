@@ -343,6 +343,11 @@ impl DaemonCore {
             + 'static,
         Fut: Future<Output = Result<AgentOutput, Error>> + Send + 'static,
     {
+        // TODO Task 9: spawn audit prune task once DaemonCore holds an Arc<dyn AuditTrail>
+        // or a PostgresStore handle for retention. Activate via DaemonAuditConfig.retain_days.
+        // For now, the HEARTBIT_AUDIT_RETAIN_DAYS env var provides an escape hatch for
+        // InMemory trails; a proper [daemon.audit] config section will replace this in Task 9.
+
         use futures::StreamExt;
 
         let build_runner = Arc::new(build_runner);

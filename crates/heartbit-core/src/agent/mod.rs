@@ -5131,7 +5131,7 @@ mod tests {
         let output = runner.execute("hello").await.unwrap();
         assert_eq!(output.result, "Done!");
 
-        let entries = trail.entries().await.unwrap();
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
         let event_types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
         assert!(
             event_types.contains(&"llm_response"),
@@ -5189,7 +5189,7 @@ mod tests {
 
         runner.execute("greet the world").await.unwrap();
 
-        let entries = trail.entries().await.unwrap();
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
         let event_types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
         assert!(
             event_types.contains(&"tool_call"),

@@ -279,6 +279,8 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
 
     fn entries(
         &self,
+        scope: &crate::auth::TenantScope,
+        limit: usize,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Vec<crate::agent::audit::AuditRecord>, Error>>
@@ -286,9 +288,10 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
                 + '_,
         >,
     > {
+        let tid = scope.tenant_id.clone();
         Box::pin(async move {
             let rows = self.store.get_audit_log(self.task_id).await?;
-            Ok(rows
+            let matched: Vec<_> = rows
                 .into_iter()
                 .map(|row| crate::agent::audit::AuditRecord {
                     agent: row.agent_name,
@@ -305,13 +308,16 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
                     tenant_id: None,
                     delegation_chain: Vec::new(),
                 })
-                .collect())
+                .filter(|r| r.tenant_id.as_deref().unwrap_or("") == tid.as_str())
+                .collect();
+            let start = matched.len().saturating_sub(limit);
+            Ok(matched[start..].to_vec())
         })
     }
 
-    fn entries_for_tenant(
+    fn entries_unscoped(
         &self,
-        tenant_id: Option<&str>,
+        limit: usize,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Vec<crate::agent::audit::AuditRecord>, Error>>
@@ -319,17 +325,82 @@ impl crate::agent::audit::AuditTrail for PostgresAuditTrail {
                 + '_,
         >,
     > {
-        let tenant_id = tenant_id.map(String::from);
         Box::pin(async move {
-            let all = self.entries().await?;
-            match tenant_id {
-                None => Ok(all),
-                Some(ref tid) => Ok(all
-                    .into_iter()
-                    .filter(|r| r.tenant_id.as_deref() == Some(tid.as_str()))
-                    .collect()),
-            }
+            let rows = self.store.get_audit_log(self.task_id).await?;
+            let all: Vec<_> = rows
+                .into_iter()
+                .map(|row| crate::agent::audit::AuditRecord {
+                    agent: row.agent_name,
+                    turn: 0,
+                    event_type: row.event_type,
+                    payload: row.payload,
+                    usage: crate::llm::types::TokenUsage {
+                        input_tokens: row.tokens_in.unwrap_or(0) as u32,
+                        output_tokens: row.tokens_out.unwrap_or(0) as u32,
+                        ..Default::default()
+                    },
+                    timestamp: row.created_at,
+                    user_id: None,
+                    tenant_id: None,
+                    delegation_chain: Vec::new(),
+                })
+                .collect();
+            let start = all.len().saturating_sub(limit);
+            Ok(all[start..].to_vec())
         })
+    }
+
+    fn entries_since(
+        &self,
+        scope: &crate::auth::TenantScope,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<crate::agent::audit::AuditRecord>, Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        let tid = scope.tenant_id.clone();
+        Box::pin(async move {
+            let rows = self.store.get_audit_log(self.task_id).await?;
+            let matched: Vec<_> = rows
+                .into_iter()
+                .map(|row| crate::agent::audit::AuditRecord {
+                    agent: row.agent_name,
+                    turn: 0,
+                    event_type: row.event_type,
+                    payload: row.payload,
+                    usage: crate::llm::types::TokenUsage {
+                        input_tokens: row.tokens_in.unwrap_or(0) as u32,
+                        output_tokens: row.tokens_out.unwrap_or(0) as u32,
+                        ..Default::default()
+                    },
+                    timestamp: row.created_at,
+                    user_id: None,
+                    tenant_id: None,
+                    delegation_chain: Vec::new(),
+                })
+                .filter(|r| {
+                    r.tenant_id.as_deref().unwrap_or("") == tid.as_str() && r.timestamp >= since
+                })
+                .collect();
+            let start = matched.len().saturating_sub(limit);
+            Ok(matched[start..].to_vec())
+        })
+    }
+
+    fn prune(
+        &self,
+        _retain: chrono::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Error>> + Send + '_>>
+    {
+        // The audit_log table has no tenant_id column in the current schema.
+        // A global DELETE by created_at would require a new PostgresStore method.
+        // TODO Task 9: add PostgresStore::prune_audit(retain: Duration) -> usize
+        // and wire it here once the schema migration adds tenant_id + index on created_at.
+        Box::pin(async move { Ok(0) })
     }
 }
 
