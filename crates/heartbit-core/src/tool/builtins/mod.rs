@@ -132,6 +132,11 @@ pub struct BuiltinToolsConfig {
     /// name appears in this list are returned. When `None`, all builtins are
     /// returned (backward compatible).
     pub allowlist: Option<Vec<String>>,
+    /// Application-layer path policy applied to all filesystem builtins
+    /// (bash, read, write, edit, patch). When set, `check_path` is called
+    /// before any I/O, complementing the existing workspace + protected_paths
+    /// mechanism and the Linux-only Landlock sandbox.
+    pub path_policy: Option<Arc<crate::sandbox::CorePathPolicy>>,
 }
 
 impl Default for BuiltinToolsConfig {
@@ -150,6 +155,7 @@ impl Default for BuiltinToolsConfig {
             daemon_todo_store: None,
             twitter_credentials: None,
             allowlist: None,
+            path_policy: None,
         }
     }
 }
@@ -158,6 +164,7 @@ impl Default for BuiltinToolsConfig {
 pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
     let ws = config.workspace.map(|w| w.canonicalize().unwrap_or(w));
     let pp = Arc::new(config.protected_paths);
+    let path_policy = config.path_policy;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     if config.dangerous_tools {
@@ -170,37 +177,60 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
                 } else {
                     tool
                 };
+                let tool = if let Some(ref pp) = path_policy {
+                    tool.with_path_policy(Arc::clone(pp))
+                } else {
+                    tool
+                };
                 Arc::new(tool)
             }
-            None => Arc::new(bash::BashTool::new()),
+            None => {
+                let tool = bash::BashTool::new();
+                let tool = if let Some(ref pp) = path_policy {
+                    tool.with_path_policy(Arc::clone(pp))
+                } else {
+                    tool
+                };
+                Arc::new(tool)
+            }
         };
         tools.push(bash_tool);
     }
 
+    macro_rules! maybe_policy {
+        ($tool:expr) => {
+            if let Some(ref pp) = path_policy {
+                $tool.with_path_policy(Arc::clone(pp))
+            } else {
+                $tool
+            }
+        };
+    }
+
     tools.extend([
-        Arc::new(read::ReadTool::new(
+        Arc::new(maybe_policy!(read::ReadTool::new(
             config.file_tracker.clone(),
             ws.clone(),
             Arc::clone(&pp),
-        )) as Arc<dyn Tool>,
-        Arc::new(write::WriteTool::new(
+        ))) as Arc<dyn Tool>,
+        Arc::new(maybe_policy!(write::WriteTool::new(
             config.file_tracker.clone(),
             ws.clone(),
             Arc::clone(&pp),
-        )),
-        Arc::new(edit::EditTool::new(
+        ))),
+        Arc::new(maybe_policy!(edit::EditTool::new(
             config.file_tracker.clone(),
             ws.clone(),
             Arc::clone(&pp),
-        )),
+        ))),
         Arc::new(grep::GrepTool::new(ws.clone(), Arc::clone(&pp))),
         Arc::new(glob::GlobTool::new(ws.clone(), Arc::clone(&pp))),
         Arc::new(list::ListTool::new(ws.clone(), Arc::clone(&pp))),
-        Arc::new(patch::PatchTool::new(
+        Arc::new(maybe_policy!(patch::PatchTool::new(
             config.file_tracker.clone(),
             ws,
             Arc::clone(&pp),
-        )),
+        ))),
         Arc::new(webfetch::WebFetchTool::new()),
         Arc::new(websearch::WebSearchTool::new()),
         Arc::new(image_generate::ImageGenerateTool::new()),

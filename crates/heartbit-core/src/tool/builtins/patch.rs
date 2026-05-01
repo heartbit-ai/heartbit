@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
@@ -15,6 +16,7 @@ pub struct PatchTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl PatchTool {
@@ -27,7 +29,16 @@ impl PatchTool {
             file_tracker,
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that restricts file paths beyond what the
+    /// workspace + protected_paths combination already enforces. The policy's
+    /// `check_path` is called before any I/O.
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -81,6 +92,22 @@ impl Tool for PatchTool {
                     Ok(p) => p,
                     Err(msg) => return Ok(ToolOutput::error(msg)),
                 };
+
+                if let Some(policy) = &self.path_policy {
+                    // Walk up to the first existing ancestor for canonicalization
+                    // (new files from the patch may not exist yet).
+                    let mut probe = resolved.clone();
+                    while !probe.exists() {
+                        match probe.parent() {
+                            Some(p) if p != probe => probe = p.to_path_buf(),
+                            _ => break,
+                        }
+                    }
+                    if let Err(e) = policy.check_path(&probe) {
+                        return Ok(ToolOutput::error(format!("path policy: {e}")));
+                    }
+                }
+
                 if fp.is_new {
                     if resolved.exists() {
                         return Ok(ToolOutput::error(format!(
@@ -453,6 +480,81 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "patch");
+    }
+
+    #[tokio::test]
+    async fn patch_tool_rejects_path_outside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        // Target a file outside the policy — path policy fires before I/O
+        let target = outside.path().join("evil.txt");
+        std::fs::write(&target, "content\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&target).unwrap();
+
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1 +1 @@\n-content\n+changed\n",
+            target.display()
+        );
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
+
+        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        assert!(
+            result.is_error,
+            "expected sandbox violation, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("path policy"),
+            "expected path policy error, got: {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_tool_allows_path_inside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        let target = allowed.path().join("ok.txt");
+        std::fs::write(&target, "content\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&target).unwrap();
+
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1 +1 @@\n-content\n+changed\n",
+            target.display()
+        );
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tool = PatchTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
+
+        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        assert!(
+            !result.is_error,
+            "expected success, got: {:?}",
+            result.content
+        );
     }
 
     #[tokio::test]
