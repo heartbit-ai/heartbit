@@ -1,6 +1,7 @@
 [![CI](https://github.com/heartbit-ai/heartbit/actions/workflows/ci.yml/badge.svg)](https://github.com/heartbit-ai/heartbit/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/heartbit-core)](https://crates.io/crates/heartbit-core)
 [![docs.rs](https://img.shields.io/docsrs/heartbit-core)](https://docs.rs/heartbit-core)
+[![Book](https://img.shields.io/badge/book-docs.heartbit.ai-blue)](https://docs.heartbit.ai)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-heartbitagent-blue?logo=telegram)](https://t.me/heartbitagent)
 
