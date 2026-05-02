@@ -325,6 +325,7 @@ mod postgres_store {
         pub(crate) agent_name: Option<String>,
         pub(crate) user_id: Option<String>,
         pub(crate) tenant_id: Option<String>,
+        pub(crate) idempotency_key: Option<String>,
         pub(crate) model_name: Option<String>,
     }
 
@@ -358,6 +359,7 @@ mod postgres_store {
                 agent_name: row.agent_name,
                 user_id: row.user_id,
                 tenant_id: row.tenant_id,
+                idempotency_key: row.idempotency_key,
                 model_name: row.model_name,
             }
         }
@@ -445,6 +447,27 @@ mod postgres_store {
                 .map_err(|e| Error::Daemon(format!("{col} migration failed: {e}")))?;
             }
 
+            // B5b: tighten tenant_id to NOT NULL DEFAULT '' for symmetry with
+            // audit_log (B4) and so the partial unique idempotency index has a
+            // guaranteed-present column to scope on.
+            for stmt in [
+                "UPDATE daemon_tasks SET tenant_id = '' WHERE tenant_id IS NULL",
+                "ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET DEFAULT ''",
+                "ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET NOT NULL",
+                "ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_daemon_tasks_idem \
+                   ON daemon_tasks (tenant_id, idempotency_key) \
+                   WHERE idempotency_key IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at_for_sweep \
+                   ON daemon_tasks (created_at) \
+                   WHERE idempotency_key IS NOT NULL",
+            ] {
+                sqlx::query(stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("idempotency migration failed: {e}")))?;
+            }
+
             Ok(())
         }
     }
@@ -454,39 +477,42 @@ mod postgres_store {
             let pool = self.pool.clone();
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
-                sqlx::query(
-                    r#"INSERT INTO daemon_tasks
+                    sqlx::query(
+                        r#"INSERT INTO daemon_tasks
                         (id, task, state, created_at, started_at, completed_at, result, error,
                          input_tokens, output_tokens, cache_creation_input_tokens,
                          cache_read_input_tokens, reasoning_tokens, tool_calls_made,
-                         estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"#,
-                )
-                .bind(task.id)
-                .bind(&task.task)
-                .bind(task.state.as_str())
-                .bind(task.created_at)
-                .bind(task.started_at)
-                .bind(task.completed_at)
-                .bind(&task.result)
-                .bind(&task.error)
-                .bind(task.tokens_used.input_tokens as i32)
-                .bind(task.tokens_used.output_tokens as i32)
-                .bind(task.tokens_used.cache_creation_input_tokens as i32)
-                .bind(task.tokens_used.cache_read_input_tokens as i32)
-                .bind(task.tokens_used.reasoning_tokens as i32)
-                .bind(task.tool_calls_made as i32)
-                .bind(task.estimated_cost_usd)
-                .bind(&task.source)
-                .bind(&task.agent_name)
-                .bind(&task.user_id)
-                .bind(&task.tenant_id)
-                .bind(&task.model_name)
-                .execute(&pool)
-                .await
-                .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
-                Ok(())
-            })
+                         estimated_cost_usd, source, agent_name, user_id, tenant_id,
+                         idempotency_key, model_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                            $16, $17, $18, $19, $20, $21)"#,
+                    )
+                    .bind(task.id)
+                    .bind(&task.task)
+                    .bind(task.state.as_str())
+                    .bind(task.created_at)
+                    .bind(task.started_at)
+                    .bind(task.completed_at)
+                    .bind(&task.result)
+                    .bind(&task.error)
+                    .bind(task.tokens_used.input_tokens as i32)
+                    .bind(task.tokens_used.output_tokens as i32)
+                    .bind(task.tokens_used.cache_creation_input_tokens as i32)
+                    .bind(task.tokens_used.cache_read_input_tokens as i32)
+                    .bind(task.tokens_used.reasoning_tokens as i32)
+                    .bind(task.tool_calls_made as i32)
+                    .bind(task.estimated_cost_usd)
+                    .bind(&task.source)
+                    .bind(&task.agent_name)
+                    .bind(&task.user_id)
+                    .bind(&task.tenant_id)
+                    .bind(&task.idempotency_key)
+                    .bind(&task.model_name)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
+                    Ok(())
+                })
             })
         }
 
@@ -498,7 +524,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -522,7 +549,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit as i64)
@@ -545,7 +573,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -566,7 +595,7 @@ mod postgres_store {
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
                         estimated_cost_usd = $14, source = $15, agent_name = $16,
-                        user_id = $17, tenant_id = $18, model_name = $19
+                        user_id = $17, tenant_id = $18, idempotency_key = $19, model_name = $20
                     WHERE id = $1"#,
                     )
                     .bind(task.id)
@@ -587,6 +616,7 @@ mod postgres_store {
                     .bind(&task.agent_name)
                     .bind(&task.user_id)
                     .bind(&task.tenant_id)
+                    .bind(&task.idempotency_key)
                     .bind(&task.model_name)
                     .execute(&pool)
                     .await
@@ -655,7 +685,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks {where_clause} ORDER BY created_at DESC \
                      LIMIT ${param_idx} OFFSET ${}",
                     param_idx + 1
@@ -1128,6 +1159,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1167,6 +1199,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1206,6 +1239,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1240,6 +1274,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1271,6 +1306,7 @@ mod tests {
             agent_name: Some("security-bot".into()),
             user_id: Some("user-42".into()),
             tenant_id: Some("tenant-a".into()),
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);

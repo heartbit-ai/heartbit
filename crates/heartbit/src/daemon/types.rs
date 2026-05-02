@@ -130,6 +130,12 @@ pub struct DaemonTask {
     /// Tenant ID for multi-tenant isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Idempotency key supplied by the client to dedup retries
+    /// (e.g., Kafka redelivery, HTTP retry-on-timeout). Scoped to
+    /// `(tenant_id, idempotency_key)` via a partial unique index.
+    /// Cleared by the TTL sweep after `idempotency.ttl_hours`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// The LLM model used for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
@@ -154,6 +160,7 @@ impl DaemonTask {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         }
     }
@@ -903,5 +910,43 @@ mod tests {
         let scope: TenantScope = (&ctx).into();
         assert_eq!(scope.tenant_id, "acme");
         assert_eq!(scope.user_id.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn daemon_task_default_idempotency_key_is_none() {
+        let task = DaemonTask::new(Uuid::nil(), "hello", "test");
+        assert!(task.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn daemon_task_idempotency_key_round_trips_through_serde() {
+        let mut task = DaemonTask::new(Uuid::nil(), "hello", "test");
+        task.idempotency_key = Some("idem-abc-123".to_string());
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("idempotency_key"));
+        let back: DaemonTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.idempotency_key.as_deref(), Some("idem-abc-123"));
+    }
+
+    #[test]
+    fn daemon_task_missing_idempotency_key_field_deserializes_as_none() {
+        // Backward compat: payloads from before B5b have no `idempotency_key` field.
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "task": "x",
+            "state": "pending",
+            "created_at": "2026-05-02T00:00:00Z",
+            "tokens_used": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "reasoning_tokens": 0
+            },
+            "tool_calls_made": 0,
+            "source": "test"
+        }"#;
+        let task: DaemonTask = serde_json::from_str(legacy).unwrap();
+        assert!(task.idempotency_key.is_none());
     }
 }
