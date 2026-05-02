@@ -18,6 +18,10 @@ thing, end to end, with code that compiles.
   set, iterate the system prompt against it, gate CI on the score.
 - [MCP server integration](./mcp-integration.md) — connect to an MCP
   server (GitHub, Slack, Postgres, …) and expose its tools to the agent.
+- [Multi-tenant hardening](./multi-tenant.md) — `TenantScope`, path policy,
+  and per-turn tool-call caps for multi-tenant deployments.
+- [Failure-mode hardening](./failure-modes.md) — idempotency keys,
+  per-tenant token caps, and per-provider circuit breakers.
 
 If you're new to heartbit, read [Getting Started](../getting-started/README.md)
 first. Recipes assume you've read chapters 3 ([Agents](../agents/README.md))

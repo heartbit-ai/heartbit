@@ -28,6 +28,7 @@
   - [Eval-driven prompt iteration](./recipes/eval-driven.md)
   - [MCP server integration](./recipes/mcp-integration.md)
   - [Multi-tenant hardening](./recipes/multi-tenant.md)
+  - [Failure-mode hardening](./recipes/failure-modes.md)
 
 # Operations
 

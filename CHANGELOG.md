@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — B5b Failure-Mode Hardening
+
+- **Idempotency keys.** `DaemonCommand::SubmitTask` and `POST /v1/tasks`
+  accept an `idempotency_key` (`Option<String>` field / `Idempotency-Key`
+  HTTP header). Scoped to `(tenant_id, idempotency_key)` via a partial
+  unique index on `daemon_tasks`. 24 h TTL with a background sweep task
+  configurable via `[daemon.idempotency]` (`ttl_hours`,
+  `sweep_interval_minutes`). Duplicate requests return the existing task id
+  without re-executing.
+- **Per-tenant token cap.** `TenantTokenTracker` with `Arc`-owning RAII
+  reservation tracks in-flight tokens per tenant. Configurable cap via
+  `orchestrator.max_tokens_in_flight_per_tenant`. Submissions estimated to
+  exceed the cap return `Error::TenantOverloaded` (HTTP 503 +
+  `Retry-After: 5`). The in-flight counter is reconciled per turn using
+  actual token usage; on task completion the runner releases its cumulative
+  actual tokens back to the tenant's budget.
+- **Per-(tenant, provider) circuit breaker.** `CircuitBreakerProvider`
+  wraps any `LlmProvider`. Composes outside `RetryingProvider`
+  (`CircuitBreaker<Retrying<Provider>>`). State machine: Closed → Open
+  (after N consecutive retry-exhausted failures) → HalfOpen → Closed/Open.
+  Open circuits fail fast with `Error::CircuitOpen`; no retries fire while
+  open. Each `(tenant, provider)` pair has its own independent circuit.
+  Configurable via `[provider.circuit]` (`failure_threshold`,
+  `initial_open_duration_seconds`, `max_open_duration_seconds`,
+  `backoff_multiplier`). The failure classifier trips on `ServerError`,
+  `RateLimited`, and `Network` errors; `AuthError`, `InvalidRequest`, and
+  `ContextOverflow` do not trip the circuit.
+- Failure-mode hardening recipe in the user docs
+  (`book/src/recipes/failure-modes.md`).
+
+### Changed — B5b Failure-Mode Hardening
+
+- `daemon_tasks.tenant_id` tightened to `NOT NULL DEFAULT ''` (matches the
+  B4 `audit_log` pattern). Existing rows are backfilled to the
+  empty-string single-tenant sentinel on migration. The migration is
+  idempotent (`ADD COLUMN IF NOT EXISTS` / `UPDATE … WHERE … IS NULL`).
+
 ### Added — B4 Multi-Tenant Hardening
 
 - `heartbit_core::auth::TenantScope` — owned `(tenant_id: String, user_id: Option<String>)`
