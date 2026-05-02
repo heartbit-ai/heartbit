@@ -7,7 +7,7 @@ use teloxide::types::{ChatId, ParseMode};
 
 use heartbit::{
     ChannelBridge, ConsolidateSession, Error, MediaAttachment, Memory, MemoryQuery, RunTask,
-    RunTaskInput, SessionMessage, SessionRole, SessionStore, format_session_context,
+    RunTaskInput, SessionMessage, SessionRole, SessionStore, TenantScope, format_session_context,
 };
 
 use super::access::AccessControl;
@@ -124,9 +124,10 @@ impl TelegramAdapter {
             ..Default::default()
         };
 
+        let scope = TenantScope::single_tenant();
         let (user_result, inst_result) = tokio::join!(
-            memory.recall(user_query),
-            memory.recall(institutional_query)
+            memory.recall(&scope, user_query),
+            memory.recall(&scope, institutional_query)
         );
 
         let user_entries = user_result.unwrap_or_default();
@@ -635,7 +636,9 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        ns.store(entry).await.unwrap();
+        ns.store(&TenantScope::single_tenant(), entry)
+            .await
+            .unwrap();
 
         // preload_memories uses agent_prefix="tg:123" which matches "tg:123:assistant"
         let adapter = make_adapter(Some(store));
@@ -802,10 +805,10 @@ mod tests {
         // Simulate bridge1's task completing — it should NOT remove bridge2
         {
             let mut bridges = adapter.active_bridges.write().unwrap();
-            if let Some(current) = bridges.get(&chat_id) {
-                if Arc::ptr_eq(current, &bridge1) {
-                    bridges.remove(&chat_id);
-                }
+            if let Some(current) = bridges.get(&chat_id)
+                && Arc::ptr_eq(current, &bridge1)
+            {
+                bridges.remove(&chat_id);
             }
         }
 
@@ -842,7 +845,9 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        ns.store(entry).await.unwrap();
+        ns.store(&TenantScope::single_tenant(), entry)
+            .await
+            .unwrap();
 
         let config = TelegramConfig {
             dm_policy: super::super::config::DmPolicy::Open,
@@ -896,7 +901,9 @@ mod tests {
                 author_user_id: None,
                 author_tenant_id: None,
             };
-            ns.store(entry).await.unwrap();
+            ns.store(&TenantScope::single_tenant(), entry)
+                .await
+                .unwrap();
         }
 
         // With limit=3, should return at most 3 entries
@@ -948,7 +955,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        user_ns.store(user_entry).await.unwrap();
+        user_ns
+            .store(&TenantScope::single_tenant(), user_entry)
+            .await
+            .unwrap();
 
         // Store an institutional memory about a Rust release
         let inst_ns = NamespacedMemory::new(Arc::clone(&store) as Arc<dyn Memory>, "institutional");
@@ -973,7 +983,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        inst_ns.store(inst_entry).await.unwrap();
+        inst_ns
+            .store(&TenantScope::single_tenant(), inst_entry)
+            .await
+            .unwrap();
 
         let adapter = make_adapter(Some(store));
         let ctx = adapter
@@ -1028,7 +1041,10 @@ mod tests {
             author_user_id: None,
             author_tenant_id: None,
         };
-        other_ns.store(entry).await.unwrap();
+        other_ns
+            .store(&TenantScope::single_tenant(), entry)
+            .await
+            .unwrap();
 
         // User 123 should NOT see user 456's memories
         let adapter = make_adapter(Some(store));

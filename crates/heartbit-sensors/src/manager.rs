@@ -585,10 +585,11 @@ async fn run_triage_consumer(
                             task: context.to_task_prompt(),
                             source: format!("sensor:{}", event.sensor_name),
                             story_id: Some(story_id.clone()),
-                            trust_level: Some(context.trust_level.to_string()),
+                            trust_level: Some(context.trust_level),
                             user_id: None,
                             tenant_id: None,
                             roles: vec![],
+                            mcp_auth_tokens: None,
                         };
 
                         let payload = match serde_json::to_vec(&cmd) {
@@ -1132,6 +1133,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: heartbit::daemon::types::DaemonCommand =
@@ -1156,6 +1158,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
             roles: vec![],
+            mcp_auth_tokens: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: heartbit::daemon::types::DaemonCommand =

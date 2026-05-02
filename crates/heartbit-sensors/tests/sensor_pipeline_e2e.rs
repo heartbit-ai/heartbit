@@ -1,7 +1,7 @@
-#![cfg(feature = "sensor")]
 //! Sensor pipeline end-to-end tests.
 //!
 //! These tests exercise the full sensor pipeline through real Kafka:
+#![allow(clippy::collapsible_if, clippy::await_holding_lock)]
 //!   SensorEvent → Kafka topic → triage consumer → story correlator → commands topic
 //!
 //! Requirements:

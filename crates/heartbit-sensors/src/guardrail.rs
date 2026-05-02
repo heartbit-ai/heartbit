@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use heartbit::Error;
-use heartbit::agent::guardrail::{GuardAction, Guardrail, GuardrailMeta};
+use heartbit::agent::guardrail::{GuardAction, Guardrail};
 use heartbit::llm::types::{CompletionRequest, ToolCall};
 use heartbit::tool::ToolOutput;
 
@@ -183,13 +183,11 @@ impl SensorSecurityGuardrail {
     }
 }
 
-impl GuardrailMeta for SensorSecurityGuardrail {
+impl Guardrail for SensorSecurityGuardrail {
     fn name(&self) -> &str {
         "sensor_security"
     }
-}
 
-impl Guardrail for SensorSecurityGuardrail {
     fn pre_llm(
         &self,
         request: &mut CompletionRequest,

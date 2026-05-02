@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn processor_default_trait() {
-        let processor = StructuredTriageProcessor::default();
+        let processor = StructuredTriageProcessor;
         assert_eq!(processor.modality(), SensorModality::Structured);
     }
 
