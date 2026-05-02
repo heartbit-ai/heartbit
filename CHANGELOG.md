@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.306.7] - 2026-05-02
+
 ### Added — B5b Failure-Mode Hardening
 
 - **Idempotency keys.** `DaemonCommand::SubmitTask` and `POST /v1/tasks`
