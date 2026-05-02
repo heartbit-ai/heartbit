@@ -64,6 +64,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) max_identical_tool_calls: Option<u32>,
     /// Maximum consecutive fuzzy-identical tool-call turns for doom loop detection.
     pub(crate) max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Maximum number of tool calls allowed in a single LLM turn (per-turn cap).
+    pub(crate) max_tool_calls_per_turn: Option<u32>,
     /// Session pruning configuration.
     pub(crate) session_prune_config: Option<crate::agent::pruner::SessionPruneConfig>,
     /// Enable recursive summarization.
@@ -126,6 +128,7 @@ impl SubAgentDef {
             tool_profile: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             session_prune_config: None,
             enable_recursive_summarization: None,
             reflection_threshold: None,
@@ -164,6 +167,7 @@ impl From<SubAgentConfig> for SubAgentDef {
             tool_profile: def.tool_profile,
             max_identical_tool_calls: def.max_identical_tool_calls,
             max_fuzzy_identical_tool_calls: def.max_fuzzy_identical_tool_calls,
+            max_tool_calls_per_turn: def.max_tool_calls_per_turn,
             session_prune_config: def.session_prune_config,
             enable_recursive_summarization: def.enable_recursive_summarization,
             reflection_threshold: def.reflection_threshold,
@@ -237,6 +241,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             max_tools_per_turn: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             permission_rules: super::permission::PermissionRuleset::default(),
             instruction_text: None,
             learned_permissions: None,
@@ -443,6 +448,9 @@ impl DelegateTaskTool {
                 }
                 if let Some(max) = agent_def.max_fuzzy_identical_tool_calls {
                     builder = builder.max_fuzzy_identical_tool_calls(max);
+                }
+                if let Some(cap) = agent_def.max_tool_calls_per_turn {
+                    builder = builder.max_tool_calls_per_turn(cap);
                 }
                 if let Some(ref config) = agent_def.session_prune_config {
                     builder = builder.session_prune_config(config.clone());
@@ -852,6 +860,9 @@ impl Tool for FormSquadTool {
                     }
                     if let Some(max) = agent_def.max_fuzzy_identical_tool_calls {
                         builder = builder.max_fuzzy_identical_tool_calls(max);
+                    }
+                    if let Some(cap) = agent_def.max_tool_calls_per_turn {
+                        builder = builder.max_tool_calls_per_turn(cap);
                     }
                     if let Some(ref config) = agent_def.session_prune_config {
                         builder = builder.session_prune_config(config.clone());
@@ -1655,6 +1666,8 @@ pub struct SubAgentConfig {
     pub max_identical_tool_calls: Option<u32>,
     /// Maximum consecutive fuzzy-identical tool-call turns for doom loop detection.
     pub max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Maximum number of tool calls allowed in a single LLM turn (per-turn cap).
+    pub max_tool_calls_per_turn: Option<u32>,
     /// Session pruning configuration for this sub-agent.
     pub session_prune_config: Option<crate::agent::pruner::SessionPruneConfig>,
     /// Enable recursive summarization for this sub-agent.
@@ -1704,6 +1717,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     max_tools_per_turn: Option<usize>,
     max_identical_tool_calls: Option<u32>,
     max_fuzzy_identical_tool_calls: Option<u32>,
+    max_tool_calls_per_turn: Option<u32>,
     permission_rules: super::permission::PermissionRuleset,
     instruction_text: Option<String>,
     learned_permissions: Option<Arc<std::sync::Mutex<super::permission::LearnedPermissions>>>,
@@ -1997,6 +2011,11 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
 
     pub fn max_fuzzy_identical_tool_calls(mut self, max: u32) -> Self {
         self.max_fuzzy_identical_tool_calls = Some(max);
+        self
+    }
+
+    pub fn max_tool_calls_per_turn(mut self, cap: u32) -> Self {
+        self.max_tool_calls_per_turn = Some(cap);
         self
     }
 
@@ -2362,6 +2381,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if let Some(max) = self.max_fuzzy_identical_tool_calls {
             runner_builder = runner_builder.max_fuzzy_identical_tool_calls(max);
         }
+        if let Some(cap) = self.max_tool_calls_per_turn {
+            runner_builder = runner_builder.max_tool_calls_per_turn(cap);
+        }
         if !self.permission_rules.is_empty() {
             runner_builder = runner_builder.permission_rules(self.permission_rules);
         }
@@ -2674,6 +2696,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3601,6 +3624,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3664,6 +3688,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3712,6 +3737,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3828,6 +3854,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -3908,6 +3935,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -4425,6 +4453,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -5306,6 +5335,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,
@@ -5501,6 +5531,7 @@ mod tests {
                 tool_profile: None,
                 max_identical_tool_calls: None,
                 max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
                 session_prune_config: None,
                 enable_recursive_summarization: None,
                 reflection_threshold: None,

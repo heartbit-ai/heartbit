@@ -125,14 +125,14 @@ pub use channel::telegram::{
 pub use config::{
     ActionBudgetConfig, ActionBudgetRuleConfig, ActiveHoursConfig, AgentConfig,
     AgentProviderConfig, AuthConfig, BehavioralConfig, BehavioralRuleConfig, CascadeConfig,
-    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig,
+    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonAuditConfig, DaemonConfig,
     DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KNOWN_BUILTINS, KafkaConfig,
     KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry,
     MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig, RetryProviderConfig,
-    SalienceConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig, SensorConfig,
-    SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, SpawnConfig,
-    StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
+    SalienceConfig, SandboxConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig,
+    SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml,
+    SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
     ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig, WsConfig, parse_reasoning_effort,
     parse_tool_profile, parse_workflow_type,
 };

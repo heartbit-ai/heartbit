@@ -45,3 +45,4 @@ regex = { workspace = true }
 [features]
 local-embedding = ["heartbit/local-embedding"]
 daemon = ["heartbit/daemon"]
+sandbox = ["heartbit/sandbox"]

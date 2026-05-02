@@ -33,6 +33,9 @@ pub struct DaemonConfig {
     /// Memory access control configuration.
     #[serde(default)]
     pub memory: DaemonMemoryConfig,
+    /// Audit log retention configuration.
+    #[serde(default)]
+    pub audit: DaemonAuditConfig,
 }
 
 /// MCP server configuration for the daemon.
@@ -57,6 +60,22 @@ pub struct DaemonMcpServerConfig {
 
 fn default_mcp_server_name() -> String {
     "heartbit".into()
+}
+
+/// Audit log retention configuration for the daemon.
+///
+/// Controls automatic pruning of old audit log entries.
+/// When `retain_days` is set and a Postgres store is attached, the daemon
+/// spawns a background task that deletes entries older than `retain_days`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DaemonAuditConfig {
+    /// Number of days to retain audit log entries. Entries older than this
+    /// are deleted by the background prune task. `None` disables pruning.
+    #[serde(default)]
+    pub retain_days: Option<u32>,
+    /// Interval in minutes between prune runs. Defaults to 60 (hourly).
+    #[serde(default)]
+    pub prune_interval_minutes: Option<u64>,
 }
 
 /// Memory access control configuration for the daemon.

@@ -82,6 +82,10 @@ pub struct OrchestratorConfig {
     /// Maximum consecutive fuzzy-identical tool-call turns before doom loop detection.
     /// Fuzzy matching compares sorted tool names (ignoring inputs).
     pub max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Maximum number of tool calls allowed in a single LLM turn. When a turn
+    /// contains more tool calls than this limit, the excess calls are rejected
+    /// with an error result (per-turn cap, not cumulative).
+    pub max_tool_calls_per_turn: Option<u32>,
     /// Dispatch mode for orchestrator delegation. When `Sequential`, the
     /// delegate_task schema constrains `maxItems: 1` so the LLM dispatches
     /// one agent at a time. Defaults to `Parallel` when absent.
@@ -132,6 +136,7 @@ impl Default for OrchestratorConfig {
             tool_profile: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             dispatch_mode: None,
             routing: RoutingMode::default(),
             escalation: true,
@@ -312,6 +317,8 @@ pub struct AgentConfig {
     /// Maximum consecutive fuzzy-identical tool-call turns before doom loop detection.
     /// Fuzzy matching compares sorted tool names (ignoring inputs). Overrides orchestrator default.
     pub max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Maximum number of tool calls allowed in a single LLM turn. Overrides the orchestrator default.
+    pub max_tool_calls_per_turn: Option<u32>,
     /// Session pruning: truncate old tool results to save tokens.
     /// When set, enables session-level pruning before each LLM call.
     pub session_prune: Option<SessionPruneConfigToml>,
@@ -413,6 +420,7 @@ impl AgentConfig {
             tool_profile: self.tool_profile.clone(),
             max_identical_tool_calls: self.max_identical_tool_calls,
             max_fuzzy_identical_tool_calls: self.max_fuzzy_identical_tool_calls,
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn,
             session_prune: self.session_prune.clone(),
             recursive_summarization: self.recursive_summarization,
             reflection_threshold: self.reflection_threshold,

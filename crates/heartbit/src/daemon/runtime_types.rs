@@ -133,6 +133,8 @@ pub struct RuntimeAdvancedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_identical_tool_calls: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summarize_threshold: Option<u32>,
@@ -656,6 +658,7 @@ mod tests {
         assert!(config.run_timeout_seconds.is_none());
         assert!(config.tool_timeout_seconds.is_none());
         assert!(config.max_identical_tool_calls.is_none());
+        assert!(config.max_tool_calls_per_turn.is_none());
         assert!(config.context_strategy.is_none());
         assert!(config.summarize_threshold.is_none());
         assert!(config.enable_reflection.is_none());

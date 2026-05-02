@@ -567,6 +567,29 @@ fn build_gate_from_config(gate_config: &CascadeGateConfig) -> HeuristicGate {
     }
 }
 
+/// Build a `CorePathPolicy` from an optional `[sandbox]` config section.
+///
+/// Returns `Ok(None)` when `sandbox` is absent (no restriction applied).
+/// Returns `Ok(Some(Arc<CorePathPolicy>))` when the sandbox config is present.
+fn build_path_policy(
+    sandbox: Option<&heartbit::SandboxConfig>,
+) -> Result<Option<Arc<heartbit::CorePathPolicy>>> {
+    let Some(sb) = sandbox else {
+        return Ok(None);
+    };
+    let mut b = heartbit::CorePathPolicy::builder();
+    for d in &sb.allowed_dirs {
+        b = b.allow_dir(d);
+    }
+    for g in &sb.deny_globs {
+        b = b.deny_glob(g);
+    }
+    let policy = b
+        .build()
+        .with_context(|| "failed to build CorePathPolicy from [sandbox] config")?;
+    Ok(Some(Arc::new(policy)))
+}
+
 /// Wrap a provider with retry if configured, applying the `on_retry` callback.
 fn wrap_with_retry(
     provider: BoxedProvider,
@@ -1014,32 +1037,31 @@ impl<'a> RuntimeBuilder<'a> {
             _ => None,
         };
 
+        // Build path policy from [sandbox] config if present.
+        let path_policy = build_path_policy(self.config.sandbox.as_ref())?;
+
         // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
         let builtins = {
-            #[cfg(feature = "daemon")]
-            let mut btc = {
-                let mut btc = BuiltinToolsConfig {
-                    on_question: self
-                        .on_question
-                        .clone()
-                        .or_else(|| Some(question_callback())),
-                    workspace: self.workspace_dir.clone(),
-                    dangerous_tools: self.dangerous_tools,
-                    ..Default::default()
-                };
-                btc.daemon_todo_store = self.daemon_todo_store;
-                btc
-            };
-            #[cfg(not(feature = "daemon"))]
-            let btc = BuiltinToolsConfig {
+            #[allow(unused_mut)]
+            let mut btc = BuiltinToolsConfig {
                 on_question: self
                     .on_question
                     .clone()
                     .or_else(|| Some(question_callback())),
                 workspace: self.workspace_dir.clone(),
                 dangerous_tools: self.dangerous_tools,
+                path_policy: path_policy.clone(),
                 ..Default::default()
             };
+            #[cfg(feature = "daemon")]
+            {
+                btc.daemon_todo_store = self.daemon_todo_store;
+            }
+            #[cfg(all(target_os = "linux", feature = "sandbox"))]
+            if let Some(ref pp) = path_policy {
+                btc.sandbox_policy =
+                    Some(heartbit::SandboxPolicy::from_path_policy(Arc::clone(pp)));
+            }
             builtin_tools(btc)
         };
 
@@ -1356,6 +1378,12 @@ impl<'a> RuntimeBuilder<'a> {
             if let Some(m) = fuzzy_doom {
                 rb = rb.max_fuzzy_identical_tool_calls(m);
             }
+            let tool_call_cap = agent
+                .max_tool_calls_per_turn
+                .or(self.config.orchestrator.max_tool_calls_per_turn);
+            if let Some(cap) = tool_call_cap {
+                rb = rb.max_tool_calls_per_turn(cap);
+            }
             if let Some(budget) = agent.max_total_tokens {
                 rb = rb.max_total_tokens(budget);
             }
@@ -1608,6 +1636,9 @@ impl<'a> RuntimeBuilder<'a> {
         if let Some(max) = self.config.orchestrator.max_fuzzy_identical_tool_calls {
             builder = builder.max_fuzzy_identical_tool_calls(max);
         }
+        if let Some(cap) = self.config.orchestrator.max_tool_calls_per_turn {
+            builder = builder.max_tool_calls_per_turn(cap);
+        }
         // Wire permission rules from config + learned permissions
         {
             let mut ruleset = heartbit::PermissionRuleset::new(self.config.permissions.clone());
@@ -1743,6 +1774,9 @@ impl<'a> RuntimeBuilder<'a> {
                     .transpose()?,
                 max_identical_tool_calls: agent.max_identical_tool_calls,
                 max_fuzzy_identical_tool_calls: agent.max_fuzzy_identical_tool_calls,
+                max_tool_calls_per_turn: agent
+                    .max_tool_calls_per_turn
+                    .or(self.config.orchestrator.max_tool_calls_per_turn),
                 session_prune_config: agent.session_prune.as_ref().map(|sp| {
                     heartbit::SessionPruneConfig {
                         keep_recent_n: sp.keep_recent_n,
@@ -2173,6 +2207,11 @@ async fn run_default_agent(
     {
         builder = builder.max_identical_tool_calls(n);
     }
+    if let Ok(max) = std::env::var("HEARTBIT_MAX_TOOL_CALLS_PER_TURN")
+        && let Ok(n) = max.parse::<u32>()
+    {
+        builder = builder.max_tool_calls_per_turn(n);
+    }
     if let Ok(size) = std::env::var("HEARTBIT_RESPONSE_CACHE_SIZE")
         && let Ok(n) = size.parse::<usize>()
     {
@@ -2304,14 +2343,23 @@ async fn run_chat_from_config(
     let ws_root = workspace_root_from_config(&config);
     let workspace_dir = provision_workspace(&ws_root);
 
+    // Build path policy from [sandbox] config if present.
+    let path_policy = build_path_policy(config.sandbox.as_ref())?;
+
     // Load MCP + A2A tools from all configured agents
     let mut tools = {
-        let btc = BuiltinToolsConfig {
+        #[allow(unused_mut)]
+        let mut btc = BuiltinToolsConfig {
             on_question: Some(question_callback()),
             workspace: workspace_dir.clone(),
             dangerous_tools: true, // CLI mode: enable bash for backward compat
+            path_policy: path_policy.clone(),
             ..Default::default()
         };
+        #[cfg(all(target_os = "linux", feature = "sandbox"))]
+        if let Some(ref pp) = path_policy {
+            btc.sandbox_policy = Some(heartbit::SandboxPolicy::from_path_policy(Arc::clone(pp)));
+        }
         builtin_tools(btc)
     };
     for agent in &config.agents {
@@ -2398,6 +2446,9 @@ async fn run_chat_from_config(
     }
     if let Some(max) = config.orchestrator.max_fuzzy_identical_tool_calls {
         builder = builder.max_fuzzy_identical_tool_calls(max);
+    }
+    if let Some(cap) = config.orchestrator.max_tool_calls_per_turn {
+        builder = builder.max_tool_calls_per_turn(cap);
     }
     {
         let mut ruleset = heartbit::PermissionRuleset::new(config.permissions.clone());
@@ -2607,6 +2658,11 @@ async fn run_chat_from_env(
         && let Ok(n) = max.parse::<u32>()
     {
         builder = builder.max_identical_tool_calls(n);
+    }
+    if let Ok(max) = std::env::var("HEARTBIT_MAX_TOOL_CALLS_PER_TURN")
+        && let Ok(n) = max.parse::<u32>()
+    {
+        builder = builder.max_tool_calls_per_turn(n);
     }
     if let Ok(size) = std::env::var("HEARTBIT_RESPONSE_CACHE_SIZE")
         && let Ok(n) = size.parse::<usize>()

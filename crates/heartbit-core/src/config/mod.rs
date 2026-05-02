@@ -11,8 +11,9 @@ pub use agent::{
     McpServerEntry, OrchestratorConfig, SessionPruneConfigToml, SpawnConfig,
 };
 pub use daemon::{
-    ActiveHoursConfig, AuthConfig, DaemonConfig, DaemonMcpServerConfig, DaemonMemoryConfig,
-    HeartbitPulseConfig, KafkaConfig, MetricsConfig, ScheduleEntry, TokenExchangeConfig, WsConfig,
+    ActiveHoursConfig, AuthConfig, DaemonAuditConfig, DaemonConfig, DaemonMcpServerConfig,
+    DaemonMemoryConfig, HeartbitPulseConfig, KafkaConfig, MetricsConfig, ScheduleEntry,
+    TokenExchangeConfig, WsConfig,
 };
 pub use guardrails::{
     ActionBudgetConfig, ActionBudgetRuleConfig, BehavioralConfig, BehavioralRuleConfig,
@@ -142,6 +143,24 @@ fn default_true() -> bool {
     true
 }
 
+/// Application-layer filesystem sandbox configuration.
+///
+/// When present, a `CorePathPolicy` is built from `allowed_dirs` and
+/// `deny_globs` and applied to all filesystem builtins (read, write, edit,
+/// patch). On Linux with the `sandbox` feature, bash also gets a wrapped
+/// `SandboxPolicy` for Landlock kernel enforcement.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SandboxConfig {
+    /// Directories the agent is allowed to access. When empty, the policy
+    /// denies all directory-level access (files may still pass glob checks).
+    #[serde(default)]
+    pub allowed_dirs: Vec<std::path::PathBuf>,
+    /// Glob patterns for paths to deny regardless of `allowed_dirs`.
+    /// Example: `["**/.env", "**/secrets/**"]`.
+    #[serde(default)]
+    pub deny_globs: Vec<String>,
+}
+
 /// Top-level configuration loaded from `heartbit.toml`.
 #[derive(Debug, Deserialize)]
 pub struct HeartbitConfig {
@@ -172,6 +191,11 @@ pub struct HeartbitConfig {
     /// Guardrails configuration for injection detection, PII, and tool policies.
     #[serde(default)]
     pub guardrails: Option<GuardrailsConfig>,
+    /// Application-layer filesystem sandbox. When set, restricts file access
+    /// to `allowed_dirs` and blocks `deny_globs`. On Linux + sandbox feature,
+    /// bash subprocess also gets Landlock enforcement.
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 impl HeartbitConfig {
@@ -308,6 +332,11 @@ impl HeartbitConfig {
         if self.orchestrator.max_fuzzy_identical_tool_calls == Some(0) {
             return Err(Error::Config(
                 "orchestrator.max_fuzzy_identical_tool_calls must be at least 1".into(),
+            ));
+        }
+        if self.orchestrator.max_tool_calls_per_turn == Some(0) {
+            return Err(Error::Config(
+                "orchestrator.max_tool_calls_per_turn must be at least 1".into(),
             ));
         }
 
@@ -510,6 +539,12 @@ impl HeartbitConfig {
             if agent.max_fuzzy_identical_tool_calls == Some(0) {
                 return Err(Error::Config(format!(
                     "agent '{}': max_fuzzy_identical_tool_calls must be at least 1",
+                    agent.name
+                )));
+            }
+            if agent.max_tool_calls_per_turn == Some(0) {
+                return Err(Error::Config(format!(
+                    "agent '{}': max_tool_calls_per_turn must be at least 1",
                     agent.name
                 )));
             }
@@ -2683,6 +2718,114 @@ system_prompt = "s"
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert!(config.orchestrator.max_identical_tool_calls.is_none());
         assert!(config.agents[0].max_identical_tool_calls.is_none());
+    }
+
+    // --- max_tool_calls_per_turn Config Tests ---
+
+    #[test]
+    fn config_rejects_zero_orchestrator_max_tool_calls_per_turn() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_tool_calls_per_turn = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_tool_calls_per_turn"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_agent_max_tool_calls_per_turn() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "a"
+description = "d"
+system_prompt = "s"
+max_tool_calls_per_turn = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_tool_calls_per_turn"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_parses_max_tool_calls_per_turn() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_tool_calls_per_turn = 5
+
+[[agents]]
+name = "a"
+description = "d"
+system_prompt = "s"
+max_tool_calls_per_turn = 3
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(cfg.orchestrator.max_tool_calls_per_turn, Some(5));
+        assert_eq!(cfg.agents[0].max_tool_calls_per_turn, Some(3));
+    }
+
+    #[test]
+    fn config_parses_sandbox_section() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "a"
+description = "d"
+system_prompt = "s"
+
+[sandbox]
+allowed_dirs = ["/workspace", "/tmp/agent"]
+deny_globs = ["**/.env", "**/secrets/**"]
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        let sb = cfg.sandbox.unwrap();
+        assert_eq!(sb.allowed_dirs.len(), 2);
+        assert_eq!(sb.deny_globs.len(), 2);
+        assert_eq!(sb.deny_globs[0], "**/.env");
+    }
+
+    #[test]
+    fn config_parses_daemon_audit_section() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "a"
+description = "d"
+system_prompt = "s"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.audit]
+retain_days = 30
+prune_interval_minutes = 120
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        let daemon = cfg.daemon.unwrap();
+        assert_eq!(daemon.audit.retain_days, Some(30));
+        assert_eq!(daemon.audit.prune_interval_minutes, Some(120));
     }
 
     // --- Permission Rules Config Tests ---

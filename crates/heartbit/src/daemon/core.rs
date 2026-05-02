@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Error;
 use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonAuditConfig, DaemonConfig};
 use crate::store::PostgresStore;
 
 use super::notify::{OnTaskComplete, TaskOutcome};
@@ -275,6 +275,8 @@ pub struct DaemonCore {
     /// Optional Postgres store for audit log retention pruning.
     /// Set via [`DaemonCore::with_postgres_store`] after construction.
     postgres_store: Option<Arc<PostgresStore>>,
+    /// Audit retention configuration (TOML-driven; env var fallback in `run`).
+    audit_config: DaemonAuditConfig,
     semaphore: Arc<Semaphore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
     task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
@@ -307,6 +309,7 @@ impl DaemonCore {
             events_topic: kafka_config.events_topic.clone(),
             store,
             postgres_store: None,
+            audit_config: config.audit.clone(),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
             task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -358,19 +361,30 @@ impl DaemonCore {
             + 'static,
         Fut: Future<Output = Result<AgentOutput, Error>> + Send + 'static,
     {
-        // Spawn background audit retention prune task if Postgres + env var are configured.
-        // Task 9 will replace the env-var gate with a [daemon.audit] TOML config section.
-        let retain_days: Option<i64> = std::env::var("HEARTBIT_AUDIT_RETAIN_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        // Spawn background audit retention prune task if Postgres + retain_days are configured.
+        // TOML [daemon.audit] config is preferred; HEARTBIT_AUDIT_RETAIN_DAYS env var is fallback.
+        let retain_days: Option<u32> = self
+            .audit_config
+            .retain_days
+            .or_else(|| {
+                std::env::var("HEARTBIT_AUDIT_RETAIN_DAYS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .filter(|&d| d > 0);
         if let Some(days) = retain_days {
             if let Some(pg) = self.postgres_store.as_ref() {
                 let pg = pg.clone();
-                let retain = chrono::Duration::days(days);
+                let retain = chrono::Duration::days(i64::from(days));
                 let cancel = self.cancel.clone();
+                let interval_secs = self
+                    .audit_config
+                    .prune_interval_minutes
+                    .unwrap_or(60)
+                    .saturating_mul(60);
+                let interval = std::time::Duration::from_secs(interval_secs);
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+                    let mut tick = tokio::time::interval(interval);
                     tick.tick().await; // consume the immediate first tick
                     loop {
                         tokio::select! {
@@ -393,11 +407,12 @@ impl DaemonCore {
                 });
                 tracing::info!(
                     retain_days = days,
+                    interval_secs,
                     "audit retention background task spawned"
                 );
             } else {
                 tracing::debug!(
-                    "HEARTBIT_AUDIT_RETAIN_DAYS set but no Postgres store attached; \
+                    "audit retain_days set but no Postgres store attached; \
                      audit retention requires a Postgres store — in-memory trails grow without bound until prune is called explicitly"
                 );
             }
@@ -666,6 +681,7 @@ mod tests {
             database_url: None,
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
+            audit: crate::config::DaemonAuditConfig::default(),
         }
     }
 
