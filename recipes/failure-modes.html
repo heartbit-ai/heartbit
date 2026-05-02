@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Recipes - The Heartbit Book</title>
+        <title>Failure-mode hardening - The Heartbit Book</title>
 
 
         <!-- Custom HTML head -->
@@ -146,7 +146,7 @@
                         <a href="https://github.com/heartbit-ai/heartbit" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/heartbit-ai/heartbit/edit/main/book/src/recipes/README.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/heartbit-ai/heartbit/edit/main/book/src/recipes/failure-modes.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -180,42 +180,168 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="recipes"><a class="header" href="#recipes">Recipes</a></h1>
-<p>Practical, task-focused walkthroughs. Each recipe shows how to build one
-thing, end to end, with code that compiles.</p>
-<h2 id="recipes-in-this-cookbook"><a class="header" href="#recipes-in-this-cookbook">Recipes in this cookbook</a></h2>
+                        <h1 id="failure-mode-hardening-b5b"><a class="header" href="#failure-mode-hardening-b5b">Failure-Mode Hardening (B5b)</a></h1>
+<p>Three opt-in components that turn the daemon into a fault-tolerant
+multi-tenant runtime.</p>
+<h2 id="1-idempotency-keys"><a class="header" href="#1-idempotency-keys">1. Idempotency keys</a></h2>
+<p>Set the <code>Idempotency-Key</code> header on <code>POST /v1/tasks</code>:</p>
+<pre><code class="language-http">POST /v1/tasks
+Idempotency-Key: dedup-payment-12345
+
+{"task": "process payment 12345"}
+</code></pre>
+<p>Subsequent requests with the same <code>(tenant, key)</code> pair return the existing
+task id without re-executing. Keys do not expire by default — configure
+<code>ttl_hours</code> to enable the sweep. Once enabled, the daemon’s background task
+nulls keys older than the TTL.</p>
+<pre><code class="language-toml">[daemon.idempotency]
+ttl_hours = 24
+sweep_interval_minutes = 60
+</code></pre>
+<p>The dedup is scoped to <code>(tenant_id, idempotency_key)</code> via a partial unique
+index on <code>daemon_tasks</code>. Two different tenants supplying the same key create
+two separate tasks. The TTL sweep nulls out keys older than <code>ttl_hours</code> so
+they no longer dedup; the rows themselves are retained for audit purposes.</p>
+<h3 id="programmatic-api"><a class="header" href="#programmatic-api">Programmatic API</a></h3>
+<p>When using <code>DaemonCommand::SubmitTask</code> directly (non-HTTP path), set the
+<code>idempotency_key</code> field:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit::daemon::DaemonCommand;
+
+let cmd = DaemonCommand::SubmitTask {
+    task: "process payment 12345".into(),
+    idempotency_key: Some("dedup-payment-12345".into()),
+    // …other fields
+};
+<span class="boring">}</span></code></pre>
+<p>An <code>Ok(existing_task_id)</code> is returned without dispatching the task again.</p>
+<h2 id="2-per-tenant-token-cap"><a class="header" href="#2-per-tenant-token-cap">2. Per-tenant token cap</a></h2>
+<p>Cap concurrent in-flight tokens per tenant:</p>
+<pre><code class="language-toml">[orchestrator]
+max_tokens_in_flight_per_tenant = 1_000_000
+</code></pre>
+<p>Submissions estimated to push the tenant past the cap fail with
+<code>Error::TenantOverloaded</code> → HTTP 503 with a <code>Retry-After: 5</code> header.
+Single-tenant deployments leave this unset (effectively unbounded).</p>
+<p>The estimate at submit time is <code>task_input.len() / 4 + 4096</code> (rough
+chars-to-tokens conversion plus a fixed buffer for tool overhead). The
+runner reconciles actual usage per turn during execution, so the in-flight
+counter tracks real cost throughout the task’s lifetime. On task
+completion, the runner releases its cumulative actual tokens — the tenant
+returns to its pre-task baseline.</p>
+<h3 id="capacity-planning"><a class="header" href="#capacity-planning">Capacity planning</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Context window</th><th>Typical task estimate</th></tr>
+</thead>
+<tbody>
+<tr><td>200k (Claude 3.7)</td><td>~50k tokens end-to-end</td></tr>
+<tr><td>32k (GPT-4o)</td><td>~8k tokens end-to-end</td></tr>
+</tbody>
+</table>
+</div>
+<p>A cap of <code>1_000_000</code> allows roughly 20 simultaneous 50k-token tasks for a
+single tenant. Tune based on your provider’s rate limits and the number of
+concurrent users you expect per tenant.</p>
+<h2 id="3-per-tenant-provider-circuit-breaker"><a class="header" href="#3-per-tenant-provider-circuit-breaker">3. Per-(tenant, provider) circuit breaker</a></h2>
+<p>Trip the circuit after N consecutive retry-exhausted attempts. Composes
+with the existing <code>RetryingProvider</code>:</p>
+<pre><code class="language-toml">[provider.circuit]
+failure_threshold = 5
+initial_open_duration_seconds = 30
+max_open_duration_seconds = 300
+backoff_multiplier = 2.0
+</code></pre>
+<p>Composition order is <code>CircuitBreaker&lt;Retrying&lt;Provider&gt;&gt;</code>. <strong>One permit per
+outer call covers a full retry budget.</strong> A <code>failure_threshold = 5</code> means
+5 consecutive retry-exhausted outer attempts open the circuit — not 5 raw
+HTTP failures.</p>
+<h3 id="state-machine"><a class="header" href="#state-machine">State machine</a></h3>
+<pre><code>Closed ──(N consecutive failures)──&gt; Open ──(window expires)──&gt; HalfOpen
+  ^                                                                  |
+  └──────────────────────(probe succeeds)───────────────────────────┘
+                             (probe fails) ──&gt; Open (extended window)
+</code></pre>
 <ul>
-<li><a href="./chat-with-search.html">Chat agent with web search</a> — a conversational
-agent that browses the web and answers questions with sources.</li>
-<li><a href="./code-aware.html">Code-aware agent</a> — wire the file tools and the LSP
-client so the agent can navigate, read, and edit a real codebase.</li>
-<li><a href="./multi-agent-research.html">Multi-agent research workflow</a> — orchestrate
-a researcher and a writer that hand off work.</li>
-<li><a href="./persistent-memory.html">Long-running agent with persistent memory</a> —
-use the heartbit umbrella crate’s Postgres-backed memory so context
-survives across runs.</li>
-<li><a href="./eval-driven.html">Eval-driven prompt iteration</a> — write a fixed test
-set, iterate the system prompt against it, gate CI on the score.</li>
-<li><a href="./mcp-integration.html">MCP server integration</a> — connect to an MCP
-server (GitHub, Slack, Postgres, …) and expose its tools to the agent.</li>
-<li><a href="./multi-tenant.html">Multi-tenant hardening</a> — <code>TenantScope</code>, path policy,
-and per-turn tool-call caps for multi-tenant deployments.</li>
-<li><a href="./failure-modes.html">Failure-mode hardening</a> — idempotency keys,
-per-tenant token caps, and per-provider circuit breakers.</li>
+<li><strong>Closed</strong> — requests pass through. Consecutive failures count.</li>
+<li><strong>Open</strong> — requests fail fast with <code>Error::CircuitOpen</code> for the
+configured duration. After the window, transitions to HalfOpen.</li>
+<li><strong>HalfOpen</strong> — one request probes the upstream. Success → Closed (counter
+resets). Failure → Open with extended duration (capped at
+<code>max_open_duration_seconds</code>).</li>
 </ul>
-<p>If you’re new to heartbit, read <a href="../getting-started/README.html">Getting Started</a>
-first. Recipes assume you’ve read chapters 3 (<a href="../agents/README.html">Agents</a>)
-and 4 (<a href="../tools/README.html">Tools</a>).</p>
+<p>Note: <code>backoff_multiplier</code> is applied to <code>initial_open_duration</code> (not to
+the previous open duration). With the defaults above, repeated half-open
+failures produce a constant <code>60s</code> window — not a compounding
+<code>30s → 60s → 120s → 240s</code> sequence. This is intentional: the
+per-(tenant, provider) granularity already bounds blast radius without
+requiring true exponential backoff.</p>
+<h3 id="what-trips-the-circuit"><a class="header" href="#what-trips-the-circuit">What trips the circuit</a></h3>
+<p>The classifier trips on transient errors where waiting can help:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error class</th><th>Trips circuit?</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ServerError</code> (HTTP 5xx)</td><td>Yes</td><td>Provider outage</td></tr>
+<tr><td><code>RateLimited</code> (HTTP 429)</td><td>Yes</td><td>Quota exhausted</td></tr>
+<tr><td><code>Network</code> (TCP/DNS/TLS/timeout)</td><td>Yes</td><td>Connectivity</td></tr>
+<tr><td><code>AuthError</code> (HTTP 401/403)</td><td>No</td><td>Won’t recover from waiting</td></tr>
+<tr><td><code>InvalidRequest</code> (HTTP 400)</td><td>No</td><td>Caller bug, not transient</td></tr>
+<tr><td><code>ContextOverflow</code></td><td>No</td><td>Handled by auto-compaction</td></tr>
+</tbody>
+</table>
+</div>
+<p>Open circuits return <code>Error::CircuitOpen</code> immediately — no retries fire
+while open. Each <code>(tenant, provider)</code> pair has its own circuit, so a
+sustained outage at one provider does not impact other providers or other
+tenants on the same runtime.</p>
+<h3 id="observability"><a class="header" href="#observability">Observability</a></h3>
+<p>Observability of circuit state transitions is not yet instrumented — state
+changes are silent today. Consumers can pattern-match on
+<code>Error::CircuitOpen { until, prev_duration }</code> (returned when permits are
+denied) for telemetry at the call site. Per-transition <code>tracing::</code> events
+inside the breaker itself are a planned follow-up.</p>
+<p>Pair with an <code>AgentEvent::ModelEscalated</code> listener (from the cascading
+provider) if you want to detect provider-level escalation before the
+circuit trips.</p>
+<h2 id="combining-all-three"><a class="header" href="#combining-all-three">Combining all three</a></h2>
+<p>All three components compose. A recommended production <code>daemon-prod.toml</code>:</p>
+<pre><code class="language-toml">[orchestrator]
+max_tokens_in_flight_per_tenant = 1_000_000
+
+[daemon.idempotency]
+ttl_hours = 24
+sweep_interval_minutes = 60
+
+[provider.circuit]
+failure_threshold = 5
+initial_open_duration_seconds = 30
+max_open_duration_seconds = 300
+backoff_multiplier = 2.0
+</code></pre>
+<p>With these settings:</p>
+<ul>
+<li>Duplicate client retries deduplicate at the HTTP layer — safe to retry
+<code>POST /v1/tasks</code> on timeout without double-charging.</li>
+<li>A noisy tenant cannot starve others by spawning unlimited concurrent tasks.</li>
+<li>A flapping LLM provider trips fast and stays open for a bounded window
+per (tenant, provider) instead of being hammered by retries from every
+queued task.</li>
+</ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../eval/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../recipes/multi-tenant.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../recipes/chat-with-search.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../production/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -225,11 +351,11 @@ and 4 (<a href="../tools/README.html">Tools</a>).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../eval/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../recipes/multi-tenant.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../recipes/chat-with-search.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../production/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
