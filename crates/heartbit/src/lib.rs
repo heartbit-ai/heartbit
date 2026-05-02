@@ -18,7 +18,6 @@
 //! | `restate` | Durable workflow execution via Restate SDK 0.8 |
 //! | `postgres` | PostgreSQL-backed memory and task store (pgvector) |
 //! | `a2a` | Agent-to-Agent protocol |
-//! | `telegram` | Telegram bot adapter |
 //! | `local-embedding` | Local ONNX embeddings via fastembed (no API keys) |
 //! | `full` | All of the above (except `local-embedding`) |
 //!
@@ -106,14 +105,6 @@ pub use channel::slack::{
     SlackBridge, SlackConfig, SlackEnvelope, SlackEvent, SocketModeAck,
     chunk_message as slack_chunk_message, get_socket_url, strip_mention as slack_strip_mention,
     validate_bot_token,
-};
-
-#[cfg(feature = "telegram")]
-pub use channel::telegram::{
-    AccessControl as TelegramAccessControl, CallbackAction, ChatSessionMap, DmPolicy,
-    RateLimiter as TelegramRateLimiter, StreamBuffer, TelegramAdapter, TelegramBridge,
-    TelegramConfig, approval_buttons, chunk_message, markdown_to_telegram_html,
-    parse_callback_data, question_buttons,
 };
 
 // --- Config re-exports (always available — just data structs) ---

@@ -2,7 +2,7 @@
 //!
 //! Re-exports the base traits and shared types from `heartbit_core::channel`
 //! and adds the Postgres-backed [`SessionStore`] implementation plus the
-//! platform-specific adapters (Telegram, Discord, Slack) behind feature
+//! platform-specific adapters (Discord, Slack) behind feature
 //! flags.
 //!
 //! [`SessionStore`]: heartbit_core::channel::session::SessionStore
@@ -18,5 +18,3 @@ pub use session_postgres::PostgresSessionStore;
 pub mod discord;
 #[cfg(feature = "slack")]
 pub mod slack;
-#[cfg(feature = "telegram")]
-pub mod telegram;
