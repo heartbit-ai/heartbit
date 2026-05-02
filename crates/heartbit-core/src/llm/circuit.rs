@@ -6,11 +6,13 @@
 //! Locking: `parking_lot::Mutex` (no poisoning). A fault-tolerance layer
 //! that disables itself permanently on a single panic defeats its purpose.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 #[derive(Debug, Clone)]
@@ -151,6 +153,67 @@ impl ProviderCircuit {
     }
 }
 
+/// Composite key for the `CircuitTracker` registry.
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct CircuitKey {
+    pub tenant_id: String,
+    pub provider: String,
+}
+
+/// Registry that owns one [`ProviderCircuit`] per `(tenant_id, provider)` pair.
+///
+/// Locking strategy: `std::sync::RwLock` (never held across `.await`).
+/// Fast path: read lock + `Arc::clone`. Slow path (first insert): write lock
+/// with double-check to avoid duplicate allocation under races.
+pub struct CircuitTracker {
+    circuits: RwLock<HashMap<CircuitKey, Arc<ProviderCircuit>>>,
+    config: CircuitConfig,
+}
+
+impl CircuitTracker {
+    pub fn new(config: CircuitConfig) -> Self {
+        Self {
+            circuits: RwLock::new(HashMap::new()),
+            config,
+        }
+    }
+
+    /// Get or create the circuit for `(scope.tenant_id, provider)`.
+    pub fn circuit_for(&self, scope: &TenantScope, provider: &str) -> Arc<ProviderCircuit> {
+        let key = CircuitKey {
+            tenant_id: scope.tenant_id.clone(),
+            provider: provider.to_string(),
+        };
+        // Fast path: read lock + clone if present.
+        if let Ok(g) = self.circuits.read()
+            && let Some(c) = g.get(&key)
+        {
+            return Arc::clone(c);
+        }
+        // Slow path: write lock with double-check.
+        let mut g = self.circuits.write().expect("circuit tracker poisoned");
+        Arc::clone(
+            g.entry(key)
+                .or_insert_with(|| Arc::new(ProviderCircuit::new(self.config.clone()))),
+        )
+    }
+}
+
+/// Classify whether an error from a provider call should count as a
+/// circuit-tripping failure.
+///
+/// Trips: `ServerError` (500/502/503/529), `RateLimited` (429).
+/// Does NOT trip: `AuthError` (401/403 — permanent, won't recover by waiting),
+/// `InvalidRequest` (400 — caller bug), `ContextOverflow` (handled by
+/// auto-compaction, not the circuit), `Unknown`.
+pub fn is_circuit_failure(err: &Error) -> bool {
+    use crate::llm::error_class::ErrorClass;
+    matches!(
+        crate::llm::error_class::classify(err),
+        ErrorClass::ServerError | ErrorClass::RateLimited
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +351,60 @@ mod tests {
         // Probe records success → Closed
         probe.record_success();
         assert!(c.permit().is_ok());
+    }
+
+    #[test]
+    fn tracker_returns_same_arc_for_same_key() {
+        let t = CircuitTracker::new(cfg());
+        let a = t.circuit_for(&TenantScope::new("acme"), "anthropic");
+        let b = t.circuit_for(&TenantScope::new("acme"), "anthropic");
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn tracker_isolates_tenants() {
+        let t = CircuitTracker::new(cfg());
+        let a = t.circuit_for(&TenantScope::new("acme"), "anthropic");
+        let b = t.circuit_for(&TenantScope::new("globex"), "anthropic");
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn tracker_isolates_providers() {
+        let t = CircuitTracker::new(cfg());
+        let a = t.circuit_for(&TenantScope::new("acme"), "anthropic");
+        let b = t.circuit_for(&TenantScope::new("acme"), "openai");
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn is_circuit_failure_classifies_correctly() {
+        // Server error → trips
+        let server = Error::Api {
+            status: 503,
+            message: "service unavailable".into(),
+        };
+        assert!(is_circuit_failure(&server));
+
+        // Rate limited → trips
+        let rate = Error::Api {
+            status: 429,
+            message: "too many requests".into(),
+        };
+        assert!(is_circuit_failure(&rate));
+
+        // Auth error → does NOT trip (won't recover from retry)
+        let auth = Error::Api {
+            status: 401,
+            message: "unauthorized".into(),
+        };
+        assert!(!is_circuit_failure(&auth));
+
+        // Bad request → does NOT trip
+        let bad = Error::Api {
+            status: 400,
+            message: "bad json".into(),
+        };
+        assert!(!is_circuit_failure(&bad));
     }
 }
