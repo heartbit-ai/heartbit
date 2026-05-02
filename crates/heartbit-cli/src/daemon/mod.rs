@@ -336,7 +336,7 @@ pub async fn run_daemon(
                 heartbit::TenantScope::from_audit_fields(tenant_id.as_deref(), user_id.as_deref());
             let provider = crate::wrap_with_circuit(
                 base_provider,
-                task_circuit_tracker,
+                Arc::clone(&task_circuit_tracker),
                 &config.provider.name,
                 scope,
             );
@@ -502,8 +502,9 @@ pub async fn run_daemon(
                 .audit_tenant_id(tenant_id.as_deref())
                 .allow_shared_write(allow_shared_write)
                 .dangerous_tools(dangerous_tools)
-                // B5b: thread tenant tracker into orchestrator/agent runner
+                // B5b: thread tenant and circuit trackers into orchestrator/agent runner
                 .tenant_tracker(task_tenant_tracker)
+                .circuit_tracker(Some(task_circuit_tracker))
                 .run()
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));

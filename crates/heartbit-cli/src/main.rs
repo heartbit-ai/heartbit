@@ -817,7 +817,7 @@ async fn run_from_config(
     ));
     let provider = wrap_with_circuit(
         base_provider,
-        circuit_tracker,
+        Arc::clone(&circuit_tracker),
         &config.provider.name,
         heartbit::TenantScope::default(),
     );
@@ -845,6 +845,7 @@ async fn run_from_config(
         .workspace_dir(workspace_dir)
         .dangerous_tools(true)
         .tenant_tracker(tenant_tracker)
+        .circuit_tracker(Some(circuit_tracker))
         .run()
         .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -936,6 +937,8 @@ pub(crate) struct RuntimeBuilder<'a> {
     dangerous_tools: bool,
     /// B5b: optional tenant token tracker for in-flight token enforcement
     tenant_tracker: Option<Arc<heartbit::TenantTokenTracker>>,
+    /// B5b: shared circuit tracker — wraps per-agent provider overrides with circuit breaker
+    circuit_tracker: Option<Arc<heartbit::CircuitTracker>>,
 }
 
 impl<'a> RuntimeBuilder<'a> {
@@ -968,6 +971,7 @@ impl<'a> RuntimeBuilder<'a> {
             allow_shared_write: true,
             dangerous_tools: false,
             tenant_tracker: None,
+            circuit_tracker: None,
         }
     }
 
@@ -1071,6 +1075,11 @@ impl<'a> RuntimeBuilder<'a> {
 
     pub(crate) fn tenant_tracker(mut self, v: Option<Arc<heartbit::TenantTokenTracker>>) -> Self {
         self.tenant_tracker = v;
+        self
+    }
+
+    pub(crate) fn circuit_tracker(mut self, v: Option<Arc<heartbit::CircuitTracker>>) -> Self {
+        self.circuit_tracker = v;
         self
     }
 
@@ -1284,10 +1293,22 @@ impl<'a> RuntimeBuilder<'a> {
                 }
             }
 
-            // Provider: agent-specific or global
+            // Provider: agent-specific or global.
+            // When the agent has its own provider config, wrap it with the circuit breaker
+            // so per-agent overrides are not exempt from failure tracking.
             let agent_provider: Arc<BoxedProvider> = match &agent.provider {
                 Some(p) => {
-                    build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?
+                    let built =
+                        build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?;
+                    if let Some(ref ct) = self.circuit_tracker {
+                        let scope = heartbit::TenantScope::from_audit_fields(
+                            self.audit_tenant_id,
+                            self.audit_user_id,
+                        );
+                        wrap_with_circuit(built, Arc::clone(ct), &p.name, scope)
+                    } else {
+                        built
+                    }
                 }
                 None => Arc::clone(&self.provider),
             };
@@ -1771,12 +1792,22 @@ impl<'a> RuntimeBuilder<'a> {
 
             // Build per-agent provider override if configured.
             // Per-agent providers inherit the global retry config.
+            // Wrap with circuit breaker so overrides are not exempt from failure tracking.
             let agent_provider = match &agent.provider {
-                Some(p) => Some(build_agent_provider(
-                    p,
-                    retry_config_from(self.config),
-                    on_retry.clone(),
-                )?),
+                Some(p) => {
+                    let built =
+                        build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?;
+                    let wrapped = if let Some(ref ct) = self.circuit_tracker {
+                        let scope = heartbit::TenantScope::from_audit_fields(
+                            self.audit_tenant_id,
+                            self.audit_user_id,
+                        );
+                        wrap_with_circuit(built, Arc::clone(ct), &p.name, scope)
+                    } else {
+                        built
+                    };
+                    Some(wrapped)
+                }
                 None => None,
             };
 
