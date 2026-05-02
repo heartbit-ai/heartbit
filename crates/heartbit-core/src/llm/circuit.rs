@@ -3,8 +3,15 @@
 //! See `docs/superpowers/specs/2026-05-02-b5b-failure-mode-hardening-design.md`
 //! Component 3 for design rationale.
 //!
-//! Locking: `parking_lot::Mutex` (no poisoning). A fault-tolerance layer
-//! that disables itself permanently on a single panic defeats its purpose.
+//! Locking:
+//! - `ProviderCircuit::state` uses `parking_lot::Mutex` (no poisoning). A
+//!   fault-tolerance layer that disables itself permanently on a single panic
+//!   defeats its purpose.
+//! - `CircuitTracker::circuits` uses `std::sync::RwLock` (matches the standalone
+//!   project convention for never-await locks like `InMemoryStore`/`McpSession`).
+//!   Poisoning is unreachable in practice — the write-lock body only does
+//!   `HashMap::entry().or_insert_with(...)` + `Arc::new(ProviderCircuit::new(...))`,
+//!   neither of which can panic.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
