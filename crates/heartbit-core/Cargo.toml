@@ -36,6 +36,7 @@ sha1 = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
 petgraph = { workspace = true }
+parking_lot = { workspace = true }
 a2a-sdk = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

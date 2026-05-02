@@ -90,6 +90,7 @@ pub use llm::OnApproval;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
+pub use llm::circuit::{CircuitConfig, CircuitPermit, ProviderCircuit};
 pub use llm::error_class::{ErrorClass, classify as classify_error};
 pub use llm::gemini::GeminiProvider;
 pub use llm::openai_compat::{AuthStyle, OpenAiCompatProvider};

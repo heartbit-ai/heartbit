@@ -78,6 +78,12 @@ pub enum Error {
         cap: usize,
     },
 
+    #[error("circuit breaker open: retry after {until:?} (prev open duration: {prev_duration:?})")]
+    CircuitOpen {
+        until: std::time::Instant,
+        prev_duration: std::time::Duration,
+    },
+
     /// Wraps another error with partial token usage accumulated before failure.
     /// Used by `AgentRunner::execute` to surface tokens consumed before an error.
     #[error("{source}")]

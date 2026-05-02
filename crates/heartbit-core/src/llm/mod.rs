@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod circuit;
 
 /// Build an `Error::Api` from a failed HTTP response, sanitizing auth errors.
 ///
