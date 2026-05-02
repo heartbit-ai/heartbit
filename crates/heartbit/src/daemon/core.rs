@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Error;
 use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
+use crate::agent::tenant_tracker::TenantTokenTracker;
 #[cfg(feature = "postgres")]
 use crate::config::DaemonAuditConfig;
 use crate::config::{DaemonConfig, IdempotencyConfig};
@@ -61,6 +62,7 @@ pub struct DaemonHandle {
     commands_topic: Option<String>,
     store: Arc<dyn TaskStore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
+    pub(crate) tenant_tracker: Option<Arc<TenantTokenTracker>>,
 }
 
 impl DaemonHandle {
@@ -74,7 +76,19 @@ impl DaemonHandle {
             commands_topic: None,
             store,
             event_channels: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            tenant_tracker: None,
         }
+    }
+
+    /// Attach a per-tenant token tracker for admission-gate checks at submit time.
+    ///
+    /// When set, `submit_task_with_user_idem` and `submit_task_with_user` will call
+    /// `tracker.reserve()` before inserting the task. On `Error::TenantOverloaded`
+    /// the error propagates to the caller; on success the reservation is dropped
+    /// immediately (admission-only — actual per-turn usage is tracked by `AgentRunner`).
+    pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
+        self.tenant_tracker = Some(tracker);
+        self
     }
 
     /// Returns the Kafka producer and commands topic, or an error if not configured.
@@ -155,6 +169,13 @@ impl DaemonHandle {
         let task_str = task.into();
         let source_str = source.into();
 
+        // B5b: per-tenant overload gate — admission-only check.
+        if let Some(ref tracker) = self.tenant_tracker {
+            let scope = crate::auth::TenantScope::new(&user_context.tenant_id);
+            let estimated = task_str.len() / 4 + 4096;
+            let _reservation = tracker.reserve(&scope, estimated)?;
+        }
+
         let daemon_task = DaemonTask::new_with_user(
             id,
             &task_str,
@@ -215,6 +236,15 @@ impl DaemonHandle {
     ) -> Result<uuid::Uuid, Error> {
         let task_str = task.into();
         let source_str = source.into();
+
+        // B5b: per-tenant overload gate — admission-only check.
+        // The reservation is dropped immediately after the check; the runner's
+        // adjust() handles actual per-turn usage tracking during execution.
+        if let Some(ref tracker) = self.tenant_tracker {
+            let scope = crate::auth::TenantScope::new(&user_context.tenant_id);
+            let estimated = task_str.len() / 4 + 4096;
+            let _reservation = tracker.reserve(&scope, estimated)?;
+        }
 
         if let Some(key) = idempotency_key {
             // Lookup-first: return existing task id without producing to Kafka.
@@ -455,6 +485,8 @@ pub struct DaemonCore {
     task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
     active_tasks: JoinSet<()>,
     cancel: CancellationToken,
+    /// B5b: optional per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
+    tenant_tracker: Option<Arc<TenantTokenTracker>>,
 }
 
 impl DaemonCore {
@@ -475,6 +507,7 @@ impl DaemonCore {
             commands_topic: Some(kafka_config.commands_topic.clone()),
             store: store.clone(),
             event_channels: event_channels.clone(),
+            tenant_tracker: None,
         };
         let core = Self {
             consumer,
@@ -491,6 +524,7 @@ impl DaemonCore {
             task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
             active_tasks: JoinSet::new(),
             cancel,
+            tenant_tracker: None,
         };
         (core, handle)
     }
@@ -503,6 +537,22 @@ impl DaemonCore {
     #[cfg(feature = "postgres")]
     pub fn with_postgres_store(mut self, store: Arc<PostgresStore>) -> Self {
         self.postgres_store = Some(store);
+        self
+    }
+
+    /// Attach a per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
+    ///
+    /// When set, each `SubmitTask` command from Kafka is checked against the tracker
+    /// before work begins. On overload, the command is logged and skipped (early
+    /// return without committing the offset in manual-commit mode).
+    ///
+    /// NOTE: The daemon consumer uses `enable.auto.commit=true`, so in the current
+    /// configuration returning early still auto-commits the offset after the next poll
+    /// interval. The gate functions as an observation/logging point. True NACK-on-overload
+    /// requires switching to manual commits (`enable.auto.offset.store=false` +
+    /// `consumer.store_offset()`).
+    pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
+        self.tenant_tracker = Some(tracker);
         self
     }
 
@@ -678,6 +728,27 @@ impl DaemonCore {
 
                     match cmd {
                         DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens, idempotency_key } => {
+                            // B5b: per-tenant overload gate in the Kafka consumer loop.
+                            // NOTE: the consumer uses enable.auto.commit=true, so returning
+                            // early here does not prevent the offset from being committed after
+                            // the next poll interval. The gate still provides logging/metrics.
+                            // True NACK-on-overload requires switching to manual offset commits.
+                            if let Some(ref tracker) = self.tenant_tracker {
+                                let tid = tenant_id.as_deref().unwrap_or("");
+                                let scope = crate::auth::TenantScope::new(tid);
+                                let estimated = task.len() / 4 + 4096;
+                                if let Err(e) = tracker.reserve(&scope, estimated) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        tenant_id = ?tenant_id,
+                                        task_id = %id,
+                                        "submit overloaded; skipping task (auto-commit Kafka mode)"
+                                    );
+                                    continue;
+                                }
+                                // Drop the reservation immediately — admission-only check.
+                            }
+
                             // Re-insert task if missing (e.g. after restart with message replay).
                             ensure_task_inserted(
                                 &self.store,
@@ -1350,6 +1421,67 @@ mod tests {
             ids.len(),
             1,
             "all concurrent submits must dedup to one id, got {ids:?}"
+        );
+    }
+
+    // --- B5b Task 7: per-tenant overload gate tests ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_returns_tenant_overloaded_when_tracker_full() {
+        let handle = test_handle_with_store();
+        let tracker = Arc::new(TenantTokenTracker::new(100));
+        let handle = handle.with_tenant_tracker(tracker.clone());
+
+        // Pre-fill the tracker for tenant-A: 99 tokens in-flight, cap=100.
+        let scope = crate::auth::TenantScope::new("tenant-A");
+        let _hold = tracker.reserve(&scope, 99).unwrap();
+
+        let user_ctx = make_user_ctx("u", "tenant-A");
+        // Estimate for "hello" = 5 / 4 + 4096 = 4097, which exceeds remaining cap of 1.
+        let err = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::Error::TenantOverloaded { tenant_id, .. } => {
+                assert_eq!(tenant_id, "tenant-A");
+            }
+            other => panic!("expected TenantOverloaded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_succeeds_without_tracker() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+        // No tracker; should succeed unconditionally.
+        handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .expect("should succeed without tracker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_drops_reservation_after_admission_check() {
+        let handle = test_handle_with_store();
+        let tracker = Arc::new(TenantTokenTracker::new(1_000_000));
+        let handle = handle.with_tenant_tracker(tracker.clone());
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        let _id = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+
+        // After admission check, the reservation drops immediately.
+        // The runner's adjust() handles actual usage tracking.
+        // The entry exists with in_flight=0 (tracker creates it via or_default).
+        let snap = tracker.snapshot();
+        assert_eq!(
+            snap.iter()
+                .find(|(t, _)| t == "tenant-A")
+                .map(|(_, s)| s.in_flight),
+            Some(0)
         );
     }
 

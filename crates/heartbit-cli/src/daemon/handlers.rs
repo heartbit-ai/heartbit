@@ -198,6 +198,24 @@ pub(crate) async fn handle_submit(
             )
                 .into_response()
         }
+        Err(heartbit::Error::TenantOverloaded {
+            tenant_id,
+            in_flight,
+            cap,
+        }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            )],
+            axum::Json(serde_json::json!({
+                "error": "tenant_overloaded",
+                "tenant_id": tenant_id,
+                "in_flight": in_flight,
+                "cap": cap,
+            })),
+        )
+            .into_response(),
         Err(e) => {
             let status = if e.to_string().contains(KAFKA_REQUIRED) {
                 StatusCode::SERVICE_UNAVAILABLE
