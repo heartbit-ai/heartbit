@@ -1,0 +1,30 @@
+[package]
+name = "heartbit-sensors"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+heartbit = { path = "../heartbit", default-features = false, features = ["daemon"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
+prometheus = { workspace = true }
+quick-xml = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
