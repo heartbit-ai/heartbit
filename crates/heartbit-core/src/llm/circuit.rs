@@ -202,7 +202,8 @@ impl CircuitTracker {
 /// Classify whether an error from a provider call should count as a
 /// circuit-tripping failure.
 ///
-/// Trips: `ServerError` (500/502/503/529), `RateLimited` (429).
+/// Trips: `ServerError` (500/502/503/529), `RateLimited` (429),
+/// `Network` (TCP/DNS/TLS/timeout — transport failure).
 /// Does NOT trip: `AuthError` (401/403 — permanent, won't recover by waiting),
 /// `InvalidRequest` (400 — caller bug), `ContextOverflow` (handled by
 /// auto-compaction, not the circuit), `Unknown`.
@@ -210,7 +211,7 @@ pub fn is_circuit_failure(err: &Error) -> bool {
     use crate::llm::error_class::ErrorClass;
     matches!(
         crate::llm::error_class::classify(err),
-        ErrorClass::ServerError | ErrorClass::RateLimited
+        ErrorClass::ServerError | ErrorClass::RateLimited | ErrorClass::Network
     )
 }
 
@@ -392,6 +393,16 @@ mod tests {
             message: "too many requests".into(),
         };
         assert!(is_circuit_failure(&rate));
+
+        // Network/transport error → trips (sustained outage must open circuit)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let http_err = rt
+            .block_on(reqwest::get("http://[::0]:1"))
+            .expect_err("should fail");
+        assert!(is_circuit_failure(&Error::Http(http_err)));
 
         // Auth error → does NOT trip (won't recover from retry)
         let auth = Error::Api {

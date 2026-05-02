@@ -13,6 +13,9 @@ pub enum ErrorClass {
     ServerError,
     /// Client error that is not overflow (other HTTP 400).
     InvalidRequest,
+    /// Transport-level failure (`Error::Http`): TCP/DNS/TLS/timeout.
+    /// Treated as transient — the same signal used by `RetryingProvider`.
+    Network,
     /// Unrecognized error — no actionable recovery.
     Unknown,
 }
@@ -30,7 +33,7 @@ pub fn classify(error: &Error) -> ErrorClass {
 
     match inner {
         Error::Api { status, message } => classify_api(*status, message),
-        Error::Http(_) => ErrorClass::Unknown,
+        Error::Http(_) => ErrorClass::Network,
         _ => ErrorClass::Unknown,
     }
 }
@@ -262,7 +265,7 @@ mod tests {
     // --- HTTP / network errors ---
 
     #[test]
-    fn classify_http_error_as_unknown() {
+    fn classify_http_error_as_network() {
         // Build a reqwest error by making a request to an invalid URL.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -272,7 +275,7 @@ mod tests {
             .block_on(reqwest::get("http://[::0]:1"))
             .expect_err("should fail");
         let err = Error::Http(http_err);
-        assert_eq!(classify(&err), ErrorClass::Unknown);
+        assert_eq!(classify(&err), ErrorClass::Network);
     }
 
     // --- Other error variants ---
