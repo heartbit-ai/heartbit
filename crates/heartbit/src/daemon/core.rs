@@ -319,11 +319,11 @@ impl DaemonCore {
         (core, handle)
     }
 
-    /// Attach a [`PostgresStore`] for audit log retention pruning.
-    ///
-    /// When set, [`DaemonCore::run`] will spawn a background task that calls
-    /// [`PostgresStore::prune_audit`] every hour if `HEARTBIT_AUDIT_RETAIN_DAYS`
-    /// is set to a positive integer.
+    /// Attach a Postgres store for cross-task audit retention. When set together
+    /// with a `[daemon.audit].retain_days` (or the `HEARTBIT_AUDIT_RETAIN_DAYS`
+    /// env-var fallback), the daemon spawns a background task that calls
+    /// `PostgresStore::prune_audit` every `prune_interval_minutes` minutes
+    /// (default 60).
     pub fn with_postgres_store(mut self, store: Arc<PostgresStore>) -> Self {
         self.postgres_store = Some(store);
         self
@@ -380,6 +380,7 @@ impl DaemonCore {
                 let interval_secs = self
                     .audit_config
                     .prune_interval_minutes
+                    .filter(|&m| m > 0)
                     .unwrap_or(60)
                     .saturating_mul(60);
                 let interval = std::time::Duration::from_secs(interval_secs);

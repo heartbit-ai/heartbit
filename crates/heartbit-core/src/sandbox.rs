@@ -22,6 +22,12 @@ impl CorePathPolicy {
         CorePathPolicyBuilder::default()
     }
 
+    /// Returns the canonicalized allowed directories. Used by `SandboxPolicy::from_path_policy`
+    /// to derive Landlock read/write path lists.
+    pub fn allowed_dirs(&self) -> &[PathBuf] {
+        &self.allowed_dirs
+    }
+
     /// Returns `Ok(())` if `path` is allowed, `Err(Error::Sandbox(...))` otherwise.
     /// Canonicalizes the input so symlinks pointing outside `allowed_dirs`
     /// are rejected.
@@ -170,22 +176,30 @@ mod landlock_sandbox {
             }
         }
 
-        /// Build a SandboxPolicy from an externally-constructed `CorePathPolicy`.
+        /// Build a `SandboxPolicy` from an externally-constructed `CorePathPolicy`.
         ///
         /// Used when one path policy is shared across multiple tools (bash + write +
         /// edit + ...). The Landlock layer (`read_paths` / `write_paths`) is
-        /// initialized **empty**: this is intentional, but means callers that want
-        /// kernel-level enforcement on top of the path policy MUST populate
-        /// `read_paths` / `write_paths` before calling `into_pre_exec`. Otherwise
-        /// the Landlock ruleset locks the subprocess out of all filesystem access.
+        /// **derived** from the path policy's `allowed_dirs`: all allowed dirs are
+        /// treated as both readable and writable at the kernel level. The path
+        /// policy's deny-globs still gate specific paths inside (application layer).
         ///
-        /// For the common "workspace" case, prefer `SandboxPolicy::workspace_only`
-        /// which derives both layers from a single `&Path`.
+        /// Without this derivation, `into_pre_exec()` would build a Landlock ruleset
+        /// that handles write-access but adds no `PathBeneath` rules — locking the
+        /// subprocess out of all filesystem access in release builds (Landlock denies
+        /// all handled-but-unruled accesses).
+        ///
+        /// If `allowed_dirs` is empty the Landlock layer will be empty too; the
+        /// `debug_assert!` in `into_pre_exec` will catch this in debug/test builds.
         pub fn from_path_policy(path_policy: Arc<CorePathPolicy>) -> Self {
+            // Derive Landlock read/write paths from the path policy's allowed_dirs.
+            // Treat all allowed dirs as readable and writable; the path policy's
+            // deny_globs still gate specific paths inside (app-layer enforcement).
+            let dirs: Vec<PathBuf> = path_policy.allowed_dirs().to_vec();
             Self {
                 path_policy,
-                read_paths: Vec::new(),
-                write_paths: Vec::new(),
+                read_paths: dirs.clone(),
+                write_paths: dirs,
             }
         }
 
@@ -201,8 +215,8 @@ mod landlock_sandbox {
                 !self.read_paths.is_empty() || !self.write_paths.is_empty(),
                 "SandboxPolicy::into_pre_exec called with empty read_paths AND write_paths; \
                  the resulting Landlock ruleset would lock the subprocess out of all \
-                 filesystem access. Use workspace_only() or populate read_paths/write_paths \
-                 before calling into_pre_exec on a from_path_policy()-built sandbox."
+                 filesystem access. Check that [sandbox].allowed_dirs is non-empty in \
+                 your TOML config, or use workspace_only() to derive paths from a directory."
             );
 
             let abi = ABI::V5;
@@ -289,8 +303,26 @@ mod landlock_sandbox {
             );
             let sandbox = SandboxPolicy::from_path_policy(path_policy.clone());
             assert!(Arc::ptr_eq(&path_policy, &sandbox.path_policy()));
-            assert!(sandbox.read_paths.is_empty());
-            assert!(sandbox.write_paths.is_empty());
+            // from_path_policy now derives Landlock paths from allowed_dirs.
+            assert!(!sandbox.read_paths.is_empty());
+            assert!(!sandbox.write_paths.is_empty());
+        }
+
+        #[test]
+        fn from_path_policy_derives_read_write_paths_from_allowed_dirs() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = Arc::new(
+                CorePathPolicy::builder()
+                    .allow_dir(dir.path())
+                    .build()
+                    .unwrap(),
+            );
+            let sandbox = SandboxPolicy::from_path_policy(policy);
+            assert_eq!(sandbox.read_paths.len(), 1);
+            assert_eq!(sandbox.write_paths.len(), 1);
+            let canonical = dir.path().canonicalize().unwrap();
+            assert!(sandbox.read_paths.contains(&canonical));
+            assert!(sandbox.write_paths.contains(&canonical));
         }
 
         #[test]

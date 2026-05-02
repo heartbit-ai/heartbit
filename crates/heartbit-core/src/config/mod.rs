@@ -598,6 +598,11 @@ impl HeartbitConfig {
                     "daemon.max_concurrent_tasks must be at least 1".into(),
                 ));
             }
+            if daemon.audit.prune_interval_minutes == Some(0) {
+                return Err(Error::Config(
+                    "daemon.audit.prune_interval_minutes must be at least 1".into(),
+                ));
+            }
             if let Some(ref kafka) = daemon.kafka {
                 if kafka.brokers.is_empty() {
                     return Err(Error::Config(
@@ -2826,6 +2831,26 @@ prune_interval_minutes = 120
         let daemon = cfg.daemon.unwrap();
         assert_eq!(daemon.audit.retain_days, Some(30));
         assert_eq!(daemon.audit.prune_interval_minutes, Some(120));
+    }
+
+    #[test]
+    fn config_rejects_zero_prune_interval_minutes() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.audit]
+prune_interval_minutes = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("prune_interval_minutes"),
+            "error: {err}"
+        );
     }
 
     // --- Permission Rules Config Tests ---
