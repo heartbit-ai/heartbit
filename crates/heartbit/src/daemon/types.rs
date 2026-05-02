@@ -10,6 +10,10 @@ use crate::config::TrustLevel;
 use crate::llm::types::TokenUsage;
 
 /// Commands serialized to the `heartbit.commands` Kafka topic.
+// `SubmitTask` carries several optional String fields (user_id, tenant_id, idempotency_key,
+// story_id) that are infrequently constructed. Boxing is not warranted here — the command
+// is a short-lived value that exists only during serialization/deserialization.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonCommand {
@@ -37,6 +41,11 @@ pub enum DaemonCommand {
         /// Key: MCP server URL, Value: bearer token.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mcp_auth_tokens: Option<HashMap<String, String>>,
+        /// Stripe-style idempotency key, scoped to `(tenant_id, idempotency_key)`.
+        /// Used by the daemon to dedup Kafka redeliveries and HTTP retries.
+        /// `None` = no dedup (each submission creates a new task).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     CancelTask {
         id: Uuid,
@@ -296,6 +305,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: DaemonCommand = serde_json::from_str(&json).unwrap();
@@ -342,6 +352,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""type":"submit_task""#));
@@ -366,6 +377,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("story_id"));
@@ -702,6 +714,7 @@ mod tests {
             tenant_id: Some("acme".into()),
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""user_id":"alice""#));
@@ -730,6 +743,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains("user_id"));
@@ -784,6 +798,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: Some(tokens),
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("mcp_auth_tokens"));
@@ -814,6 +829,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains("mcp_auth_tokens"));
@@ -910,6 +926,62 @@ mod tests {
         let scope: TenantScope = (&ctx).into();
         assert_eq!(scope.tenant_id, "acme");
         assert_eq!(scope.user_id.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn submit_task_serializes_idempotency_key_when_present() {
+        let cmd = DaemonCommand::SubmitTask {
+            id: Uuid::nil(),
+            task: "x".into(),
+            source: "test".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: None,
+            tenant_id: None,
+            roles: vec![],
+            mcp_auth_tokens: None,
+            idempotency_key: Some("idem-zzz".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("idempotency_key"), "json was: {json}");
+        assert!(json.contains("idem-zzz"));
+    }
+
+    #[test]
+    fn submit_task_omits_idempotency_key_when_absent() {
+        let cmd = DaemonCommand::SubmitTask {
+            id: Uuid::nil(),
+            task: "x".into(),
+            source: "test".into(),
+            story_id: None,
+            trust_level: None,
+            user_id: None,
+            tenant_id: None,
+            roles: vec![],
+            mcp_auth_tokens: None,
+            idempotency_key: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(!json.contains("idempotency_key"), "json was: {json}");
+    }
+
+    #[test]
+    fn submit_task_legacy_payload_without_idempotency_key_deserializes() {
+        let legacy = r#"{
+            "type": "submit_task",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "task": "x",
+            "source": "test"
+        }"#;
+        let cmd: DaemonCommand = serde_json::from_str(legacy).unwrap();
+        if let DaemonCommand::SubmitTask {
+            idempotency_key, ..
+        } = cmd
+        {
+            assert!(idempotency_key.is_none());
+        } else {
+            panic!("wrong variant");
+        }
     }
 
     #[test]

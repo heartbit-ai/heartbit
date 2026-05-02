@@ -14,7 +14,6 @@ use crate::llm::types::TokenUsage;
 /// message for the `23505` SQLSTATE code that sqlx surfaces. Used by the
 /// idempotency-key insert flow to recover from concurrent inserts of the
 /// same `(tenant_id, idempotency_key)` pair.
-#[allow(dead_code)]
 pub(crate) fn is_unique_violation(err: &Error) -> bool {
     let msg = err.to_string().to_lowercase();
     msg.contains("23505") || msg.contains("duplicate key value violates unique constraint")
@@ -248,6 +247,22 @@ impl TaskStore for InMemoryTaskStore {
             .map_err(|e| Error::Daemon(e.to_string()))?;
         if tasks.contains_key(&id) {
             return Err(Error::Daemon(format!("task {id} already exists")));
+        }
+        // Enforce (tenant_id, idempotency_key) uniqueness, mirroring the
+        // Postgres partial unique index. Surfaces the same "duplicate key"
+        // message so `is_unique_violation` detects it correctly.
+        if let Some(idem_key) = task.idempotency_key.as_deref() {
+            let tenant = task.tenant_id.as_deref().unwrap_or("");
+            let duplicate = tasks.values().any(|t| {
+                t.tenant_id.as_deref().unwrap_or("") == tenant
+                    && t.idempotency_key.as_deref() == Some(idem_key)
+            });
+            if duplicate {
+                return Err(Error::Daemon(
+                    "duplicate key value violates unique constraint (tenant_id, idempotency_key)"
+                        .into(),
+                ));
+            }
         }
         tasks.insert(id, task);
         order.push(id);

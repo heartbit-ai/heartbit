@@ -92,6 +92,7 @@ impl DaemonHandle {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -147,6 +148,7 @@ impl DaemonHandle {
             tenant_id: Some(user_context.tenant_id.clone()),
             roles: user_context.roles.clone(),
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -162,6 +164,129 @@ impl DaemonHandle {
             .map_err(|(e, _)| Error::Daemon(format!("failed to produce command: {e}")))?;
 
         Ok(id)
+    }
+
+    /// Like `submit_task_with_user` but dedups on `idempotency_key`.
+    ///
+    /// When `idempotency_key` is supplied and an existing task with the same
+    /// `(tenant_id, idempotency_key)` pair exists, returns the existing task id
+    /// without producing a new Kafka message or creating a duplicate row.
+    ///
+    /// When `idempotency_key` is `None`, no dedup is applied — every call creates a new task.
+    /// In HTTP-only mode (no Kafka), the row is still inserted but no Kafka publish is
+    /// attempted (unlike `submit_task_with_user`, which errors if Kafka is absent).
+    pub async fn submit_task_with_user_idem(
+        &self,
+        task: impl Into<String>,
+        source: impl Into<String>,
+        story_id: Option<String>,
+        user_context: &super::types::UserContext,
+        idempotency_key: Option<&str>,
+    ) -> Result<uuid::Uuid, Error> {
+        let task_str = task.into();
+        let source_str = source.into();
+
+        if let Some(key) = idempotency_key {
+            // Lookup-first: return existing task id without producing to Kafka.
+            if let Some(existing) = self
+                .store
+                .find_by_idempotency_key(&user_context.tenant_id, key)?
+            {
+                return Ok(existing.id);
+            }
+
+            let id = uuid::Uuid::new_v4();
+            let mut daemon_task = DaemonTask::new_with_user(
+                id,
+                &task_str,
+                &source_str,
+                &user_context.user_id,
+                &user_context.tenant_id,
+            );
+            daemon_task.idempotency_key = Some(key.to_string());
+
+            match self.store.insert(daemon_task) {
+                Ok(()) => {
+                    // Fresh insert: publish to Kafka if configured.
+                    self.publish_submit_idem(
+                        id,
+                        task_str,
+                        source_str,
+                        story_id,
+                        user_context,
+                        Some(key.to_string()),
+                    )
+                    .await?;
+                    Ok(id)
+                }
+                Err(e) if super::store::is_unique_violation(&e) => {
+                    // Concurrent inserter raced ahead — resolve to their id.
+                    self.store
+                        .find_by_idempotency_key(&user_context.tenant_id, key)?
+                        .map(|t| t.id)
+                        .ok_or_else(|| {
+                            Error::Daemon("unique violation but idempotency row not found".into())
+                        })
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            // No key — insert without dedup, then publish (graceful in HTTP-only mode).
+            let id = uuid::Uuid::new_v4();
+            let daemon_task = DaemonTask::new_with_user(
+                id,
+                &task_str,
+                &source_str,
+                &user_context.user_id,
+                &user_context.tenant_id,
+            );
+            self.store.insert(daemon_task)?;
+            self.publish_submit_idem(id, task_str, source_str, story_id, user_context, None)
+                .await?;
+            Ok(id)
+        }
+    }
+
+    /// Publish a `SubmitTask` command with idempotency key, skipping gracefully
+    /// when no Kafka producer is configured (HTTP-only mode).
+    async fn publish_submit_idem(
+        &self,
+        id: uuid::Uuid,
+        task: String,
+        source: String,
+        story_id: Option<String>,
+        user_context: &super::types::UserContext,
+        idempotency_key: Option<String>,
+    ) -> Result<(), Error> {
+        let (producer, commands_topic) = match self.require_kafka() {
+            Ok(p) => p,
+            // HTTP-only mode: task is already in store; no Kafka publish needed.
+            Err(_) => return Ok(()),
+        };
+        let cmd = DaemonCommand::SubmitTask {
+            id,
+            task,
+            source,
+            story_id,
+            trust_level: None,
+            user_id: Some(user_context.user_id.clone()),
+            tenant_id: Some(user_context.tenant_id.clone()),
+            roles: user_context.roles.clone(),
+            mcp_auth_tokens: None,
+            idempotency_key,
+        };
+        let payload = serde_json::to_vec(&cmd)
+            .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
+        producer
+            .send(
+                FutureRecord::to(commands_topic)
+                    .key(&id.to_string())
+                    .payload(&payload),
+                rdkafka::util::Timeout::Never,
+            )
+            .await
+            .map_err(|(e, _)| Error::Daemon(format!("failed to produce command: {e}")))?;
+        Ok(())
     }
 
     /// Read task from store.
@@ -469,15 +594,19 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens } => {
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens, idempotency_key } => {
                             // Re-insert task if missing (e.g. after restart with message replay)
                             if let Ok(None) = self.store.get(id) {
                                 if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
-                                    let _ = self.store.insert(DaemonTask::new_with_user(
+                                    let mut daemon_task = DaemonTask::new_with_user(
                                         id, &task, &source, uid, tid,
-                                    ));
+                                    );
+                                    daemon_task.idempotency_key = idempotency_key.clone();
+                                    let _ = self.store.insert(daemon_task);
                                 } else {
-                                    let _ = self.store.insert(DaemonTask::new(id, &task, &source));
+                                    let mut daemon_task = DaemonTask::new(id, &task, &source);
+                                    daemon_task.idempotency_key = idempotency_key.clone();
+                                    let _ = self.store.insert(daemon_task);
                                 }
                             }
 
@@ -1049,5 +1178,98 @@ mod tests {
         let task = handle.get_task(id).unwrap().unwrap();
         assert_eq!(task.task, "test");
         assert_eq!(task.source, "execute");
+    }
+
+    fn test_handle_with_store() -> DaemonHandle {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        DaemonHandle::http_only(store)
+    }
+
+    fn make_user_ctx(user_id: &str, tenant_id: &str) -> crate::daemon::types::UserContext {
+        crate::daemon::types::UserContext {
+            user_id: user_id.into(),
+            tenant_id: tenant_id.into(),
+            roles: vec![],
+            raw_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_with_idem_returns_same_task_id_on_redelivery() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("user-1", "tenant-A");
+
+        let id1 = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, Some("idem-xyz"))
+            .await
+            .expect("first submit");
+
+        let id2 = handle
+            .submit_task_with_user_idem("hello again", "test", None, &user_ctx, Some("idem-xyz"))
+            .await
+            .expect("redelivery");
+
+        assert_eq!(id1, id2, "redelivery must dedup to same task id");
+    }
+
+    #[tokio::test]
+    async fn submit_with_idem_isolates_per_tenant() {
+        let handle = test_handle_with_store();
+        let user_a = make_user_ctx("u", "tenant-A");
+        let user_b = make_user_ctx("u", "tenant-B");
+
+        let id_a = handle
+            .submit_task_with_user_idem("x", "test", None, &user_a, Some("shared-key"))
+            .await
+            .unwrap();
+        let id_b = handle
+            .submit_task_with_user_idem("x", "test", None, &user_b, Some("shared-key"))
+            .await
+            .unwrap();
+
+        assert_ne!(id_a, id_b, "different tenants must NOT collide on same key");
+    }
+
+    #[tokio::test]
+    async fn submit_without_idem_creates_new_task_each_time() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        let id1 = handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+        let id2 = handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+
+        assert_ne!(id1, id2, "no idem key → no dedup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_submits_same_key_resolve_to_same_id() {
+        let handle = std::sync::Arc::new(test_handle_with_store());
+        let user_ctx = std::sync::Arc::new(make_user_ctx("u", "tenant-A"));
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let h = handle.clone();
+            let u = user_ctx.clone();
+            joinset.spawn(async move {
+                h.submit_task_with_user_idem("payload", "test", None, &u, Some("race-key"))
+                    .await
+            });
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        while let Some(res) = joinset.join_next().await {
+            ids.insert(res.unwrap().unwrap());
+        }
+        assert_eq!(
+            ids.len(),
+            1,
+            "all concurrent submits must dedup to one id, got {ids:?}"
+        );
     }
 }

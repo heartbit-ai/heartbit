@@ -379,6 +379,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd).expect("serialize");
 
