@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Tools - The Heartbit Book</title>
+        <title>Multi-tenant hardening - The Heartbit Book</title>
 
 
         <!-- Custom HTML head -->
@@ -146,7 +146,7 @@
                         <a href="https://github.com/heartbit-ai/heartbit" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/heartbit-ai/heartbit/edit/main/book/src/tools/README.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/heartbit-ai/heartbit/edit/main/book/src/recipes/multi-tenant.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -180,195 +180,199 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="tools"><a class="header" href="#tools">Tools</a></h1>
-<p>Tools are how an agent affects the outside world: reading files,
-running shell commands, fetching URLs, querying APIs, calling other
-agents. The framework ships a curated built-in suite, gives you a
-clean trait for your own, and integrates with any
-<a href="https://modelcontextprotocol.io">Model Context Protocol</a> server out
-of the box.</p>
-<h2 id="the-tool-trait"><a class="header" href="#the-tool-trait">The Tool trait</a></h2>
-<p>Every tool is a value that implements two methods:</p>
+                        <h1 id="multi-tenant-hardening"><a class="header" href="#multi-tenant-hardening">Multi-Tenant Hardening</a></h1>
+<p>Heartbit’s multi-tenant story is grounded in three load-bearing types added in
+the B4 round:</p>
 <ul>
-<li><code>definition() -&gt; ToolDefinition</code> — the name, human-readable
-description, and a JSON Schema for the input.</li>
-<li><code>execute(input: serde_json::Value) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;ToolOutput, Error&gt;&gt; + Send + '_&gt;&gt;</code> — the async body.</li>
+<li><code>TenantScope</code> — required parameter on every <code>Memory</code> and <code>AuditTrail</code> method.</li>
+<li><code>CorePathPolicy</code> — shared path allowlist + glob denylist for all filesystem
+builtins.</li>
+<li><code>max_tool_calls_per_turn</code> — caps tool dispatches per LLM turn.</li>
 </ul>
-<p><code>ToolOutput::success(text)</code> and <code>ToolOutput::error(text)</code> build the
-two terminal cases. The error variant is <strong>not</strong> a panic or a runtime
-abort: the runner feeds the error string back into the conversation as
-a tool result, and the model decides whether to retry, give up, or
-ask the user. Tools that <em>do</em> panic are caught by the runner and
-converted to <code>ToolOutput::error</code> for the same reason — a misbehaving
-tool must never take down the agent loop.</p>
-<h2 id="built-in-tools"><a class="header" href="#built-in-tools">Built-in tools</a></h2>
-<p><code>heartbit-core</code> includes a focused built-in set covering the cases an
-agent needs most:</p>
-<ul>
-<li><code>read</code> — read a file, with mtime tracking for safe edits.</li>
-<li><code>write</code> — write a file, blocked unless a recent <code>read</code> exists.</li>
-<li><code>edit</code> — find-and-replace within a file.</li>
-<li><code>patch</code> — apply a unified-diff hunk.</li>
-<li><code>bash</code> — run a shell command, sandboxable via Linux landlock
-(see <a href="../production/README.html">Production Considerations</a>).</li>
-<li><code>list</code>, <code>glob</code>, <code>grep</code> — directory traversal and search.</li>
-<li><code>todo</code> — track multi-step task progress across turns.</li>
-<li><code>web_fetch</code> — HTTP GET with default-deny on private IPs.</li>
-<li><code>web_search</code> — query a search backend.</li>
-<li><code>image_generate</code> — call image-generation APIs.</li>
-<li><code>tts</code> — text-to-speech.</li>
-<li><code>twitter_post</code> — post to X/Twitter (per-tenant credentials).</li>
-<li><code>skill</code> — load a named skill from a skill registry.</li>
-<li><code>question</code> — ask the user a structured question
-(interactive sessions).</li>
-</ul>
-<p>Build the suite with <code>builtin_tools(BuiltinToolsConfig::default())</code>.
-Dangerous tools like <code>bash</code> are gated behind <code>dangerous_tools = true</code>.
-For the full list and signatures see
-<a href="https://docs.rs/heartbit-core/latest/heartbit_core/tool/builtins/index.html"><code>heartbit_core::tool::builtins</code></a>.</p>
-<h2 id="writing-your-own-tool"><a class="header" href="#writing-your-own-tool">Writing your own tool</a></h2>
-<p>When the built-ins don’t cover your domain — pull a record from your
-database, hit an internal microservice, render a chart — implement the
-trait yourself. The pattern is short:</p>
-<pre class="playground"><code class="language-rust no_run">//! Implementing the `Tool` trait by hand.
-//!
-//! Defines a `WordCount` tool, attaches it to an agent, and lets the LLM
-//! decide when to call it.
-//!
-//! `ANTHROPIC_API_KEY=sk-... cargo run -p heartbit-core --example custom_tool`
+<p>Together they let one <code>heartbit</code> runtime serve many tenants without code paths
+having to remember which tenant they’re acting on. The compiler and the type
+system enforce the boundary.</p>
+<h2 id="tenantscope"><a class="header" href="#tenantscope">TenantScope</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
 
-use std::future::Future;
-use std::pin::Pin;
+let scope = TenantScope::new("acme-corp")
+    .with_user("user-42");
+
+memory.recall(&amp;scope, query).await?;
+audit.entries(&amp;scope, 100).await?;
+<span class="boring">}</span></code></pre>
+<p>The empty string is the single-tenant sentinel. <code>TenantScope::default()</code> gives
+you a single-tenant scope:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let scope = TenantScope::default();
+assert!(scope.is_single_tenant());
+<span class="boring">}</span></code></pre>
+<p><code>TenantScope::new("")</code> collapses to <code>single_tenant()</code> and <code>with_user("")</code>
+clears the user identity to <code>None</code> — both empty-string traps are normalized
+in code, not just in prose.</p>
+<p>In daemon mode the scope is built from JWT claims via <code>From&lt;&amp;UserContext&gt;</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
+use heartbit::daemon::UserContext;
+
+let ctx = UserContext { /* extracted from JWT */ };
+let scope: TenantScope = (&amp;ctx).into();
+<span class="boring">}</span></code></pre>
+<p>If your code already has the tenant id and user id as separate <code>Option&lt;String&gt;</code>
+fields, the <code>from_audit_fields</code> helper gives you a scope without writing a
+match arm:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let scope = TenantScope::from_audit_fields(
+    self.audit_tenant_id.as_deref(),
+    self.audit_user_id.as_deref(),
+);
+<span class="boring">}</span></code></pre>
+<h2 id="corepathpolicy"><a class="header" href="#corepathpolicy">CorePathPolicy</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::CorePathPolicy;
 use std::sync::Arc;
 
-use heartbit_core::llm::types::ToolDefinition;
-use heartbit_core::{
-    AgentRunner, AnthropicProvider, BoxedProvider, RetryingProvider, Tool, ToolOutput,
-};
+let policy = Arc::new(
+    CorePathPolicy::builder()
+        .allow_dir("/workspace")
+        .deny_glob("**/.env")
+        .deny_glob("**/secrets/**")
+        .build()?
+);
+<span class="boring">}</span></code></pre>
+<p>Every filesystem builtin accepts the same <code>Arc&lt;CorePathPolicy&gt;</code> via
+<code>with_path_policy</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let read_tool  = ReadTool::new(...).with_path_policy(policy.clone());
+let write_tool = WriteTool::new(...).with_path_policy(policy.clone());
+let edit_tool  = EditTool::new(...).with_path_policy(policy.clone());
+let patch_tool = PatchTool::new(...).with_path_policy(policy.clone());
+<span class="boring">}</span></code></pre>
+<p>For bash, compose a full <code>SandboxPolicy</code> so you also get kernel-level Landlock
+enforcement on Linux:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit::sandbox::SandboxPolicy;
 
-/// A tool that counts the words in a string.
-struct WordCount;
-
-impl Tool for WordCount {
-    fn definition(&amp;self) -&gt; ToolDefinition {
-        ToolDefinition {
-            name: "word_count".into(),
-            description: "Count the number of whitespace-separated words in a string.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to count words in.",
-                    }
-                },
-                "required": ["text"],
-            }),
-        }
-    }
-
-    fn execute(
-        &amp;self,
-        input: serde_json::Value,
-    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;ToolOutput, heartbit_core::Error&gt;&gt; + Send + '_&gt;&gt; {
-        Box::pin(async move {
-            let text = match input.get("text").and_then(|v| v.as_str()) {
-                Some(t) =&gt; t,
-                None =&gt; return Ok(ToolOutput::error("missing required field `text`")),
-            };
-            let count = text.split_whitespace().count();
-            Ok(ToolOutput::success(count.to_string()))
-        })
-    }
-}
-
-#[tokio::main]
-async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
-    let api_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("set ANTHROPIC_API_KEY environment variable");
-
-    let provider = Arc::new(BoxedProvider::new(RetryingProvider::with_defaults(
-        AnthropicProvider::new(api_key, "claude-sonnet-4-20250514"),
-    )));
-
-    let tools: Vec&lt;Arc&lt;dyn Tool&gt;&gt; = vec![Arc::new(WordCount)];
-
-    let agent = AgentRunner::builder(provider)
-        .system_prompt("Use the word_count tool to answer questions about word counts.")
-        .tools(tools)
-        .build()?;
-
-    let output = agent
-        .execute("How many words are in: 'The quick brown fox jumps over the lazy dog'?")
-        .await?;
-
-    println!("{}", output.result);
-    Ok(())
-}</code></pre>
-<p>The <code>definition()</code> returns a <code>ToolDefinition</code> whose <code>input_schema</code> is
-a JSON Schema object. The agent’s LLM uses the description and schema
-to decide when and how to call the tool, so write both for the model:
-say what the tool <em>does</em>, list each field, and give an example value
-where it helps. The <code>execute</code> body parses the validated input, does
-the work, and returns either <code>ToolOutput::success</code> or
-<code>ToolOutput::error</code>.</p>
-<h2 id="the-heartbit_tool-macro"><a class="header" href="#the-heartbit_tool-macro">The heartbit_tool macro</a></h2>
-<p>The <code>heartbit_tool</code> proc-macro in the
-<a href="https://docs.rs/heartbit-macro"><code>heartbit-macro</code></a> crate generates the
-trait impl and JSON Schema from the function signature, so simple
-tools collapse to a single annotated <code>async fn</code>:</p>
-<pre><code class="language-rust ignore">use heartbit_macro::heartbit_tool;
-
-#[heartbit_tool(description = "Count whitespace-separated words.")]
-async fn word_count(text: String) -&gt; Result&lt;ToolOutput, Error&gt; {
-    Ok(ToolOutput::success(text.split_whitespace().count().to_string()))
-}</code></pre>
-<p>Reach for the macro when the schema is mechanical. Drop down to the
-trait impl when you need custom validation, dynamic schemas, or
-request-scoped state.</p>
-<h2 id="tool-input-validation"><a class="header" href="#tool-input-validation">Tool input validation</a></h2>
-<p>Before dispatching a tool call, the runner validates the LLM-supplied
-input against the declared <code>input_schema</code> using
-<code>validate_tool_input</code>. A schema mismatch becomes a tool-result error
-the model sees on the next turn — so it self-corrects rather than
-crashing the run. This is one of the main payoffs of writing
-JSON Schemas: the LLM gets early, structured feedback when it
-hallucinates a field name.</p>
-<h2 id="tool-approval-human-in-the-loop"><a class="header" href="#tool-approval-human-in-the-loop">Tool approval (human-in-the-loop)</a></h2>
-<p>For high-stakes tools — anything that writes outside a sandbox, calls
-a paid API, or posts to a channel — set an <code>on_approval</code> callback.
-The runner pauses before each tool call, hands you the list of pending
-calls, and waits for an <code>ApprovalDecision</code>:</p>
+let sandbox = SandboxPolicy::from_path_policy(policy.clone());
+let bash = BashTool::new().with_sandbox_policy(Arc::new(sandbox));
+<span class="boring">}</span></code></pre>
+<p><code>from_path_policy</code> derives the Landlock read/write paths from the policy’s
+allowed directories — bash subprocesses can read and write everything the
+path policy allows, no extra wiring needed.</p>
+<h3 id="configuring-via-toml"><a class="header" href="#configuring-via-toml">Configuring via TOML</a></h3>
+<p>The CLI builds the policy automatically from <code>[sandbox]</code>:</p>
+<pre><code class="language-toml">[sandbox]
+allowed_dirs = ["/workspace", "/tmp/agent"]
+deny_globs = ["**/.env", "**/secrets/**"]
+</code></pre>
+<p>All five filesystem builtins inherit it. On Linux with the <code>sandbox</code> feature,
+bash also gets the wrapped <code>SandboxPolicy</code>.</p>
+<h2 id="max_tool_calls_per_turn"><a class="header" href="#max_tool_calls_per_turn">max_tool_calls_per_turn</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let runner = AgentRunnerBuilder::new()
+    .max_tool_calls_per_turn(8)  // production recommendation
+    .build()?;
+<span class="boring">}</span></code></pre>
+<p>This is <strong>distinct from</strong> <code>max_tools_per_turn</code>:</p>
 <ul>
-<li><code>Allow</code> — run this call once.</li>
-<li><code>Deny</code> — refuse and tell the model why.</li>
-<li><code>AlwaysAllow</code> — auto-approve this exact call shape for the rest of
-the run.</li>
-<li><code>AlwaysDeny</code> — auto-refuse this shape.</li>
+<li><code>max_tools_per_turn</code> limits the <em>tool definitions</em> offered to the LLM
+(pre-filter). Use it to keep the prompt tight when an agent has many tools.</li>
+<li><code>max_tool_calls_per_turn</code> caps the <em>invocations</em> the LLM produces per turn
+(post-response). Use it to bound concurrent dispatch and protect per-task
+budgets from a misbehaving model that emits dozens of tool calls in one turn.</li>
 </ul>
-<p>The CLI’s <code>--approve</code> flag wires this to an interactive prompt. In a
-web app you would route the request to a UI and resume on response.</p>
-<h2 id="mcp-integration"><a class="header" href="#mcp-integration">MCP integration</a></h2>
-<p>For tools you don’t want to write — Slack, Atlassian, GitHub, or any
-of the growing
-<a href="https://modelcontextprotocol.io">MCP server ecosystem</a> — connect an
-<a href="https://docs.rs/heartbit-core/latest/heartbit_core/struct.McpClient.html"><code>McpClient</code></a>
-and the server’s tools become first-class <code>Tool</code> instances you pass
-to <code>AgentRunnerBuilder::tools(...)</code> alongside the built-ins. The
-client speaks MCP Streamable HTTP, handles auth, sampling, and
-resource roots, and reuses connection pools across agents. See
-<a href="../recipes/mcp-integration.html">the MCP recipe</a> for an end-to-end
-walk-through.</p>
+<p>Excess returns <code>Error::Agent</code> wrapped in <code>Error::WithPartialUsage</code> — the
+caller can retry with a tighter system prompt or a smaller tool set, and the
+token cost from the offending turn is preserved. Zero is rejected at
+build time.</p>
+<h3 id="configuring-via-toml-1"><a class="header" href="#configuring-via-toml-1">Configuring via TOML</a></h3>
+<pre><code class="language-toml">[orchestrator]
+max_tool_calls_per_turn = 8
+
+[[agents]]
+name = "researcher"
+max_tool_calls_per_turn = 16  # per-agent override
+</code></pre>
+<p>Or via env var: <code>HEARTBIT_MAX_TOOL_CALLS_PER_TURN=8</code>.</p>
+<h2 id="postgres-tenant-columns"><a class="header" href="#postgres-tenant-columns">Postgres tenant columns</a></h2>
+<p>The <code>memories</code> and <code>audit_log</code> tables now carry tenant identity:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Column</th><th>Type</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>memories</code></td><td><code>author_tenant_id</code></td><td>TEXT NOT NULL DEFAULT ‘’</td><td>indexed</td></tr>
+<tr><td><code>memories</code></td><td><code>author_user_id</code></td><td>TEXT NULL</td><td></td></tr>
+<tr><td><code>audit_log</code></td><td><code>tenant_id</code></td><td>TEXT NOT NULL DEFAULT ‘’</td><td>indexed</td></tr>
+<tr><td><code>audit_log</code></td><td><code>user_id</code></td><td>TEXT NULL</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>The default is the empty string (single-tenant sentinel) so existing rows
+remain visible to <code>TenantScope::default()</code>-scoped queries. New rows under a
+real tenant store the actual tenant id.</p>
+<p>Run <code>PostgresStore::run_migration</code> once on upgrade. It’s idempotent and safe
+to re-run. Before upgrading from a pre-B4 deployment, audit existing data:</p>
+<pre><code class="language-sql">SELECT count(*) FROM memories WHERE author_tenant_id IS NULL;
+SELECT count(*) FROM audit_log WHERE tenant_id IS NULL;
+</code></pre>
+<p>Non-zero on a multi-tenant installation indicates rows that were written
+without a scope — investigate before running the migration.</p>
+<h2 id="audit-retention"><a class="header" href="#audit-retention">Audit retention</a></h2>
+<pre><code class="language-toml">[daemon.audit]
+retain_days = 90
+prune_interval_minutes = 60
+</code></pre>
+<p>The daemon spawns a background task that calls <code>audit.prune(retain)</code> on the
+configured interval. The task observes the daemon’s cancellation token and
+exits cleanly on graceful shutdown.</p>
+<p><code>retain_days = 0</code> and <code>prune_interval_minutes = 0</code> are rejected at config-load
+time (would either delete everything or cause a <code>tokio::time::interval</code> panic).</p>
+<p>For one-off retention via env var: <code>HEARTBIT_AUDIT_RETAIN_DAYS=90</code> (the TOML
+takes precedence when both are set).</p>
+<h2 id="programmatic-api"><a class="header" href="#programmatic-api">Programmatic API</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
+use heartbit_core::AuditTrail;
+
+// tenant-scoped read
+let recent = audit.entries(&amp;scope, 100).await?;
+
+// time-windowed scoped read
+let since = chrono::Utc::now() - chrono::Duration::hours(24);
+let last_day = audit.entries_since(&amp;scope, since, 1000).await?;
+
+// admin / cross-tenant read (loud, greppable)
+let all = audit.entries_unscoped(1000).await?;
+
+// retention prune
+let removed = audit.prune(chrono::Duration::days(90)).await?;
+<span class="boring">}</span></code></pre>
+<p>The rename from <code>entries()</code> (no args, returned all) to <code>entries_unscoped(limit)</code>
+is a deliberate breaking change so call sites must opt into cross-tenant
+visibility — a <code>grep entries_unscoped</code> shows every site that crosses the
+tenant boundary.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../agents/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../recipes/mcp-integration.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../memory/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../production/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -378,11 +382,11 @@ walk-through.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../agents/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../recipes/mcp-integration.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../memory/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../production/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

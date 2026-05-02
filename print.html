@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cfb2c6bc.js";
+            window.path_to_searchindex_js = "searchindex-668627ae.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-053f7758.js"></script>
+        <script src="toc-56d8a881.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -878,12 +878,14 @@ CPU and gives you private, offline semantic search.</p>
 
 use chrono::{Duration, Utc};
 
+use heartbit_core::auth::TenantScope;
 use heartbit_core::memory::Confidentiality;
 use heartbit_core::{InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 #[tokio::main]
 async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
     let store = InMemoryStore::new();
+    let scope = TenantScope::default();
 
     // 1. Store an episodic entry.
     let entry = MemoryEntry {
@@ -907,30 +909,33 @@ async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
         author_user_id: None,
         author_tenant_id: None,
     };
-    store.store(entry).await?;
+    store.store(&amp;scope, entry).await?;
 
     // 2. Recall by keyword. Composite scoring orders the result set by
     //    recency + importance + relevance + strength.
     let hits = store
-        .recall(MemoryQuery {
-            agent: Some("assistant".into()),
-            text: Some("preference".into()),
-            limit: 5,
-            ..MemoryQuery::default()
-        })
+        .recall(
+            &amp;scope,
+            MemoryQuery {
+                agent: Some("assistant".into()),
+                text: Some("preference".into()),
+                limit: 5,
+                ..MemoryQuery::default()
+            },
+        )
         .await?;
     println!("recalled {} entry/entries", hits.len());
 
     // 3. Update the content in place. The entry id is preserved.
     store
-        .update("m1", "User prefers terse, formal responses.".into())
+        .update(&amp;scope, "m1", "User prefers terse, formal responses.".into())
         .await?;
 
     // 4. Prune anything older than 1 hour with strength below 0.1. The
     //    fresh entry above is far above that threshold, so this is a
     //    no-op here — but it's the call you'd schedule periodically in a
     //    long-running deployment.
-    let pruned = store.prune(0.1, Duration::hours(1), None).await?;
+    let pruned = store.prune(&amp;scope, 0.1, Duration::hours(1), None).await?;
     println!("pruned {pruned} weak entries");
 
     Ok(())
@@ -2270,6 +2275,190 @@ full list and the per-preset env-var requirements.</p>
 for the full API, including <code>connect_with_auth</code> for OAuth token
 exchange and <code>connect</code> for already-running HTTP servers.</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-tenant-hardening"><a class="header" href="#multi-tenant-hardening">Multi-Tenant Hardening</a></h1>
+<p>Heartbit’s multi-tenant story is grounded in three load-bearing types added in
+the B4 round:</p>
+<ul>
+<li><code>TenantScope</code> — required parameter on every <code>Memory</code> and <code>AuditTrail</code> method.</li>
+<li><code>CorePathPolicy</code> — shared path allowlist + glob denylist for all filesystem
+builtins.</li>
+<li><code>max_tool_calls_per_turn</code> — caps tool dispatches per LLM turn.</li>
+</ul>
+<p>Together they let one <code>heartbit</code> runtime serve many tenants without code paths
+having to remember which tenant they’re acting on. The compiler and the type
+system enforce the boundary.</p>
+<h2 id="tenantscope"><a class="header" href="#tenantscope">TenantScope</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
+
+let scope = TenantScope::new("acme-corp")
+    .with_user("user-42");
+
+memory.recall(&amp;scope, query).await?;
+audit.entries(&amp;scope, 100).await?;
+<span class="boring">}</span></code></pre>
+<p>The empty string is the single-tenant sentinel. <code>TenantScope::default()</code> gives
+you a single-tenant scope:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let scope = TenantScope::default();
+assert!(scope.is_single_tenant());
+<span class="boring">}</span></code></pre>
+<p><code>TenantScope::new("")</code> collapses to <code>single_tenant()</code> and <code>with_user("")</code>
+clears the user identity to <code>None</code> — both empty-string traps are normalized
+in code, not just in prose.</p>
+<p>In daemon mode the scope is built from JWT claims via <code>From&lt;&amp;UserContext&gt;</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
+use heartbit::daemon::UserContext;
+
+let ctx = UserContext { /* extracted from JWT */ };
+let scope: TenantScope = (&amp;ctx).into();
+<span class="boring">}</span></code></pre>
+<p>If your code already has the tenant id and user id as separate <code>Option&lt;String&gt;</code>
+fields, the <code>from_audit_fields</code> helper gives you a scope without writing a
+match arm:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let scope = TenantScope::from_audit_fields(
+    self.audit_tenant_id.as_deref(),
+    self.audit_user_id.as_deref(),
+);
+<span class="boring">}</span></code></pre>
+<h2 id="corepathpolicy"><a class="header" href="#corepathpolicy">CorePathPolicy</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::CorePathPolicy;
+use std::sync::Arc;
+
+let policy = Arc::new(
+    CorePathPolicy::builder()
+        .allow_dir("/workspace")
+        .deny_glob("**/.env")
+        .deny_glob("**/secrets/**")
+        .build()?
+);
+<span class="boring">}</span></code></pre>
+<p>Every filesystem builtin accepts the same <code>Arc&lt;CorePathPolicy&gt;</code> via
+<code>with_path_policy</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let read_tool  = ReadTool::new(...).with_path_policy(policy.clone());
+let write_tool = WriteTool::new(...).with_path_policy(policy.clone());
+let edit_tool  = EditTool::new(...).with_path_policy(policy.clone());
+let patch_tool = PatchTool::new(...).with_path_policy(policy.clone());
+<span class="boring">}</span></code></pre>
+<p>For bash, compose a full <code>SandboxPolicy</code> so you also get kernel-level Landlock
+enforcement on Linux:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit::sandbox::SandboxPolicy;
+
+let sandbox = SandboxPolicy::from_path_policy(policy.clone());
+let bash = BashTool::new().with_sandbox_policy(Arc::new(sandbox));
+<span class="boring">}</span></code></pre>
+<p><code>from_path_policy</code> derives the Landlock read/write paths from the policy’s
+allowed directories — bash subprocesses can read and write everything the
+path policy allows, no extra wiring needed.</p>
+<h3 id="configuring-via-toml"><a class="header" href="#configuring-via-toml">Configuring via TOML</a></h3>
+<p>The CLI builds the policy automatically from <code>[sandbox]</code>:</p>
+<pre><code class="language-toml">[sandbox]
+allowed_dirs = ["/workspace", "/tmp/agent"]
+deny_globs = ["**/.env", "**/secrets/**"]
+</code></pre>
+<p>All five filesystem builtins inherit it. On Linux with the <code>sandbox</code> feature,
+bash also gets the wrapped <code>SandboxPolicy</code>.</p>
+<h2 id="max_tool_calls_per_turn"><a class="header" href="#max_tool_calls_per_turn">max_tool_calls_per_turn</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let runner = AgentRunnerBuilder::new()
+    .max_tool_calls_per_turn(8)  // production recommendation
+    .build()?;
+<span class="boring">}</span></code></pre>
+<p>This is <strong>distinct from</strong> <code>max_tools_per_turn</code>:</p>
+<ul>
+<li><code>max_tools_per_turn</code> limits the <em>tool definitions</em> offered to the LLM
+(pre-filter). Use it to keep the prompt tight when an agent has many tools.</li>
+<li><code>max_tool_calls_per_turn</code> caps the <em>invocations</em> the LLM produces per turn
+(post-response). Use it to bound concurrent dispatch and protect per-task
+budgets from a misbehaving model that emits dozens of tool calls in one turn.</li>
+</ul>
+<p>Excess returns <code>Error::Agent</code> wrapped in <code>Error::WithPartialUsage</code> — the
+caller can retry with a tighter system prompt or a smaller tool set, and the
+token cost from the offending turn is preserved. Zero is rejected at
+build time.</p>
+<h3 id="configuring-via-toml-1"><a class="header" href="#configuring-via-toml-1">Configuring via TOML</a></h3>
+<pre><code class="language-toml">[orchestrator]
+max_tool_calls_per_turn = 8
+
+[[agents]]
+name = "researcher"
+max_tool_calls_per_turn = 16  # per-agent override
+</code></pre>
+<p>Or via env var: <code>HEARTBIT_MAX_TOOL_CALLS_PER_TURN=8</code>.</p>
+<h2 id="postgres-tenant-columns"><a class="header" href="#postgres-tenant-columns">Postgres tenant columns</a></h2>
+<p>The <code>memories</code> and <code>audit_log</code> tables now carry tenant identity:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Column</th><th>Type</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>memories</code></td><td><code>author_tenant_id</code></td><td>TEXT NOT NULL DEFAULT ‘’</td><td>indexed</td></tr>
+<tr><td><code>memories</code></td><td><code>author_user_id</code></td><td>TEXT NULL</td><td></td></tr>
+<tr><td><code>audit_log</code></td><td><code>tenant_id</code></td><td>TEXT NOT NULL DEFAULT ‘’</td><td>indexed</td></tr>
+<tr><td><code>audit_log</code></td><td><code>user_id</code></td><td>TEXT NULL</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>The default is the empty string (single-tenant sentinel) so existing rows
+remain visible to <code>TenantScope::default()</code>-scoped queries. New rows under a
+real tenant store the actual tenant id.</p>
+<p>Run <code>PostgresStore::run_migration</code> once on upgrade. It’s idempotent and safe
+to re-run. Before upgrading from a pre-B4 deployment, audit existing data:</p>
+<pre><code class="language-sql">SELECT count(*) FROM memories WHERE author_tenant_id IS NULL;
+SELECT count(*) FROM audit_log WHERE tenant_id IS NULL;
+</code></pre>
+<p>Non-zero on a multi-tenant installation indicates rows that were written
+without a scope — investigate before running the migration.</p>
+<h2 id="audit-retention"><a class="header" href="#audit-retention">Audit retention</a></h2>
+<pre><code class="language-toml">[daemon.audit]
+retain_days = 90
+prune_interval_minutes = 60
+</code></pre>
+<p>The daemon spawns a background task that calls <code>audit.prune(retain)</code> on the
+configured interval. The task observes the daemon’s cancellation token and
+exits cleanly on graceful shutdown.</p>
+<p><code>retain_days = 0</code> and <code>prune_interval_minutes = 0</code> are rejected at config-load
+time (would either delete everything or cause a <code>tokio::time::interval</code> panic).</p>
+<p>For one-off retention via env var: <code>HEARTBIT_AUDIT_RETAIN_DAYS=90</code> (the TOML
+takes precedence when both are set).</p>
+<h2 id="programmatic-api"><a class="header" href="#programmatic-api">Programmatic API</a></h2>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use heartbit_core::auth::TenantScope;
+use heartbit_core::AuditTrail;
+
+// tenant-scoped read
+let recent = audit.entries(&amp;scope, 100).await?;
+
+// time-windowed scoped read
+let since = chrono::Utc::now() - chrono::Duration::hours(24);
+let last_day = audit.entries_since(&amp;scope, since, 1000).await?;
+
+// admin / cross-tenant read (loud, greppable)
+let all = audit.entries_unscoped(1000).await?;
+
+// retention prune
+let removed = audit.prune(chrono::Duration::days(90)).await?;
+<span class="boring">}</span></code></pre>
+<p>The rename from <code>entries()</code> (no args, returned all) to <code>entries_unscoped(limit)</code>
+is a deliberate breaking change so call sites must opt into cross-tenant
+visibility — a <code>grep entries_unscoped</code> shows every site that crosses the
+tenant boundary.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="production-considerations"><a class="header" href="#production-considerations">Production Considerations</a></h1>
 <p><code>heartbit-core</code> is the framework — agents, tools, providers, memory,

@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-cfb2c6bc.js";
+            window.path_to_searchindex_js = "../searchindex-668627ae.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-053f7758.js"></script>
+        <script src="../toc-56d8a881.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -276,12 +276,14 @@ CPU and gives you private, offline semantic search.</p>
 
 use chrono::{Duration, Utc};
 
+use heartbit_core::auth::TenantScope;
 use heartbit_core::memory::Confidentiality;
 use heartbit_core::{InMemoryStore, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
 #[tokio::main]
 async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
     let store = InMemoryStore::new();
+    let scope = TenantScope::default();
 
     // 1. Store an episodic entry.
     let entry = MemoryEntry {
@@ -305,30 +307,33 @@ async fn main() -&gt; Result&lt;(), heartbit_core::Error&gt; {
         author_user_id: None,
         author_tenant_id: None,
     };
-    store.store(entry).await?;
+    store.store(&amp;scope, entry).await?;
 
     // 2. Recall by keyword. Composite scoring orders the result set by
     //    recency + importance + relevance + strength.
     let hits = store
-        .recall(MemoryQuery {
-            agent: Some("assistant".into()),
-            text: Some("preference".into()),
-            limit: 5,
-            ..MemoryQuery::default()
-        })
+        .recall(
+            &amp;scope,
+            MemoryQuery {
+                agent: Some("assistant".into()),
+                text: Some("preference".into()),
+                limit: 5,
+                ..MemoryQuery::default()
+            },
+        )
         .await?;
     println!("recalled {} entry/entries", hits.len());
 
     // 3. Update the content in place. The entry id is preserved.
     store
-        .update("m1", "User prefers terse, formal responses.".into())
+        .update(&amp;scope, "m1", "User prefers terse, formal responses.".into())
         .await?;
 
     // 4. Prune anything older than 1 hour with strength below 0.1. The
     //    fresh entry above is far above that threshold, so this is a
     //    no-op here — but it's the call you'd schedule periodically in a
     //    long-running deployment.
-    let pruned = store.prune(0.1, Duration::hours(1), None).await?;
+    let pruned = store.prune(&amp;scope, 0.1, Duration::hours(1), None).await?;
     println!("pruned {pruned} weak entries");
 
     Ok(())
