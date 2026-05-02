@@ -497,6 +497,7 @@ mod tests {
             database_url: None,
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
+            audit: crate::config::DaemonAuditConfig::default(),
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =

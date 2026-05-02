@@ -138,6 +138,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// doom loop detection triggers. Fuzzy matching compares sorted tool names
     /// (ignoring inputs). `None` disables fuzzy detection.
     pub(super) max_fuzzy_identical_tool_calls: Option<u32>,
+    /// Hard cap on the number of tool invocations per LLM turn. When the LLM
+    /// emits more tool_use blocks than this limit, the run fails with
+    /// `Error::Agent` (wrapped in `Error::WithPartialUsage`). `None` = unlimited.
+    pub(super) max_tool_calls_per_turn: Option<u32>,
     /// Declarative permission rules evaluated per tool call before the
     /// `on_approval` callback. `Allow` → execute, `Deny` → error result,
     /// `Ask` → fall through to `on_approval`.
@@ -231,6 +235,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             tool_profile: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             permission_rules: permission::PermissionRuleset::default(),
             instruction_text: None,
             learned_permissions: None,
@@ -810,6 +815,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 let tool_calls = response.tool_calls();
+
+                // Tool-call cap: reject turns that exceed max_tool_calls_per_turn.
+                // Checked before dispatch so no tools are executed on a capped turn.
+                if let Some(cap) = self.max_tool_calls_per_turn
+                    && tool_calls.len() as u32 > cap
+                {
+                    let err = Error::Agent(format!(
+                        "tool-call cap exceeded: turn produced {} calls, max is {cap}",
+                        tool_calls.len()
+                    ));
+                    self.emit(AgentEvent::RunFailed {
+                        agent: self.name.clone(),
+                        error: err.to_string(),
+                        partial_usage: total_usage,
+                    });
+                    return Err((err, total_usage));
+                }
 
                 self.emit(AgentEvent::LlmResponse {
                     agent: self.name.clone(),
@@ -1610,6 +1632,16 @@ impl<P: LlmProvider> AgentRunner<P> {
         Ok((final_summary, total_usage))
     }
 
+    /// Build a `TenantScope` from the agent's audit identity fields.
+    ///
+    /// Falls back to single-tenant (empty `tenant_id`) when no audit context is set.
+    fn memory_scope(&self) -> crate::auth::TenantScope {
+        crate::auth::TenantScope::from_audit_fields(
+            self.audit_tenant_id.as_deref(),
+            self.audit_user_id.as_deref(),
+        )
+    }
+
     /// Flush key tool results to memory before compaction.
     ///
     /// Extracts non-error tool results exceeding a minimum length from messages
@@ -1666,7 +1698,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                         author_user_id: None,
                         author_tenant_id: None,
                     };
-                    if let Err(e) = memory.store(entry).await {
+                    let scope = self.memory_scope();
+                    if let Err(e) = memory.store(&scope, entry).await {
                         tracing::warn!(
                             agent = %self.name,
                             error = %e,
@@ -1686,8 +1719,10 @@ impl<P: LlmProvider> AgentRunner<P> {
         let Some(ref memory) = self.memory else {
             return;
         };
+        let scope = self.memory_scope();
         match crate::memory::pruning::prune_weak_entries(
             memory,
+            &scope,
             crate::memory::pruning::DEFAULT_MIN_STRENGTH,
             crate::memory::pruning::default_min_age(),
         )
@@ -1719,7 +1754,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             self.provider.clone(),
             &self.name,
         );
-        match pipeline.run().await {
+        let scope = self.memory_scope();
+        match pipeline.run(&scope).await {
             Ok((0, _, usage)) => usage,
             Ok((clusters, entries, usage)) => {
                 tracing::debug!(

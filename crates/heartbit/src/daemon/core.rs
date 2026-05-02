@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::Error;
 use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonAuditConfig, DaemonConfig};
+use crate::store::PostgresStore;
 
 use super::notify::{OnTaskComplete, TaskOutcome};
 use super::store::TaskStore;
@@ -271,6 +272,11 @@ pub struct DaemonCore {
     producer: FutureProducer,
     events_topic: String,
     store: Arc<dyn TaskStore>,
+    /// Optional Postgres store for audit log retention pruning.
+    /// Set via [`DaemonCore::with_postgres_store`] after construction.
+    postgres_store: Option<Arc<PostgresStore>>,
+    /// Audit retention configuration (TOML-driven; env var fallback in `run`).
+    audit_config: DaemonAuditConfig,
     semaphore: Arc<Semaphore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
     task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
@@ -302,6 +308,8 @@ impl DaemonCore {
             producer,
             events_topic: kafka_config.events_topic.clone(),
             store,
+            postgres_store: None,
+            audit_config: config.audit.clone(),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
             task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -309,6 +317,16 @@ impl DaemonCore {
             cancel,
         };
         (core, handle)
+    }
+
+    /// Attach a Postgres store for cross-task audit retention. When set together
+    /// with a `[daemon.audit].retain_days` (or the `HEARTBIT_AUDIT_RETAIN_DAYS`
+    /// env-var fallback), the daemon spawns a background task that calls
+    /// `PostgresStore::prune_audit` every `prune_interval_minutes` minutes
+    /// (default 60).
+    pub fn with_postgres_store(mut self, store: Arc<PostgresStore>) -> Self {
+        self.postgres_store = Some(store);
+        self
     }
 
     /// Run the Kafka consumer loop. Blocks until cancellation.
@@ -343,6 +361,64 @@ impl DaemonCore {
             + 'static,
         Fut: Future<Output = Result<AgentOutput, Error>> + Send + 'static,
     {
+        // Spawn background audit retention prune task if Postgres + retain_days are configured.
+        // TOML [daemon.audit] config is preferred; HEARTBIT_AUDIT_RETAIN_DAYS env var is fallback.
+        let retain_days: Option<u32> = self
+            .audit_config
+            .retain_days
+            .or_else(|| {
+                std::env::var("HEARTBIT_AUDIT_RETAIN_DAYS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .filter(|&d| d > 0);
+        if let Some(days) = retain_days {
+            if let Some(pg) = self.postgres_store.as_ref() {
+                let pg = pg.clone();
+                let retain = chrono::Duration::days(i64::from(days));
+                let cancel = self.cancel.clone();
+                let interval_secs = self
+                    .audit_config
+                    .prune_interval_minutes
+                    .filter(|&m| m > 0)
+                    .unwrap_or(60)
+                    .saturating_mul(60);
+                let interval = std::time::Duration::from_secs(interval_secs);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(interval);
+                    tick.tick().await; // consume the immediate first tick
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                tracing::info!("audit prune task: cancellation received, exiting");
+                                break;
+                            }
+                            _ = tick.tick() => {
+                                match pg.prune_audit(retain).await {
+                                    Ok(n) => {
+                                        tracing::info!(removed = n, "audit retention prune completed")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "audit retention prune failed")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                tracing::info!(
+                    retain_days = days,
+                    interval_secs,
+                    "audit retention background task spawned"
+                );
+            } else {
+                tracing::debug!(
+                    "audit retain_days set but no Postgres store attached; \
+                     audit retention requires a Postgres store — in-memory trails grow without bound until prune is called explicitly"
+                );
+            }
+        }
+
         use futures::StreamExt;
 
         let build_runner = Arc::new(build_runner);
@@ -606,6 +682,7 @@ mod tests {
             database_url: None,
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
+            audit: crate::config::DaemonAuditConfig::default(),
         }
     }
 

@@ -377,6 +377,9 @@ pub(super) async fn build_runner_from_request(
     if let Some(max) = adv.max_identical_tool_calls {
         builder = builder.max_identical_tool_calls(max);
     }
+    if let Some(cap) = adv.max_tool_calls_per_turn {
+        builder = builder.max_tool_calls_per_turn(cap);
+    }
     if let Some(max_tools) = adv.max_tools_per_turn {
         builder = builder.max_tools_per_turn(max_tools);
     }

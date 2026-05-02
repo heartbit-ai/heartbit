@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 use crate::llm::LlmProvider;
 use crate::llm::types::{CompletionRequest, Message, StopReason, TokenUsage};
@@ -46,19 +47,22 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
         self
     }
 
-    /// Run the consolidation pipeline.
+    /// Run the consolidation pipeline within the given tenant scope.
     ///
     /// Returns `(clusters_merged, total_entries_consolidated, token_usage)`.
-    pub async fn run(&self) -> Result<(usize, usize, TokenUsage), Error> {
+    pub async fn run(&self, scope: &TenantScope) -> Result<(usize, usize, TokenUsage), Error> {
         // 1. Recall all episodic memories
         let entries = self
             .memory
-            .recall(MemoryQuery {
-                agent: Some(self.agent_name.clone()),
-                memory_type: Some(MemoryType::Episodic),
-                limit: 0,
-                ..Default::default()
-            })
+            .recall(
+                scope,
+                MemoryQuery {
+                    agent: Some(self.agent_name.clone()),
+                    memory_type: Some(MemoryType::Episodic),
+                    limit: 0,
+                    ..Default::default()
+                },
+            )
             .await?;
 
         if entries.len() < self.min_cluster_size {
@@ -133,11 +137,11 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
                 author_tenant_id: None,
             };
 
-            self.memory.store(consolidated).await?;
+            self.memory.store(scope, consolidated).await?;
 
             // Delete originals
             for id in &source_ids {
-                let _ = self.memory.forget(id).await;
+                let _ = self.memory.forget(scope, id).await;
             }
 
             clusters_merged += 1;

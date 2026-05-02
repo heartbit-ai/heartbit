@@ -16,6 +16,7 @@ use std::pin::Pin;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 /// Classification of a memory entry's origin and purpose.
@@ -147,6 +148,10 @@ pub struct MemoryQuery {
 
 /// Trait for persistent memory stores.
 ///
+/// Every method requires a `&TenantScope` as the first parameter so the
+/// compiler rejects code that accidentally drops tenant context. Single-tenant
+/// deployments pass `&TenantScope::default()` (the empty-string sentinel).
+///
 /// Uses `Pin<Box<dyn Future>>` for dyn-compatibility, matching the `Tool` trait pattern.
 ///
 /// # Example
@@ -154,12 +159,14 @@ pub struct MemoryQuery {
 /// Recalling memory entries with the in-memory backend:
 ///
 /// ```rust,no_run
+/// use heartbit_core::auth::TenantScope;
 /// use heartbit_core::{InMemoryStore, Memory, MemoryQuery};
 ///
 /// # async fn run() -> Result<(), heartbit_core::Error> {
 /// let store = InMemoryStore::new();
+/// let scope = TenantScope::default();
 /// let hits = store
-///     .recall(MemoryQuery {
+///     .recall(&scope, MemoryQuery {
 ///         agent: Some("assistant".into()),
 ///         text: Some("preferences".into()),
 ///         ..MemoryQuery::default()
@@ -173,26 +180,34 @@ pub struct MemoryQuery {
 pub trait Memory: Send + Sync {
     fn store(
         &self,
+        scope: &TenantScope,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
     fn recall(
         &self,
+        scope: &TenantScope,
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>>;
 
     fn update(
         &self,
+        scope: &TenantScope,
         id: &str,
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
-    fn forget(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>>;
+    fn forget(
+        &self,
+        scope: &TenantScope,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>>;
 
     /// Add a bidirectional link between two memory entries.
     /// Default implementation is a no-op for backward compatibility.
     fn add_link(
         &self,
+        _scope: &TenantScope,
         _id: &str,
         _related_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
@@ -211,6 +226,7 @@ pub trait Memory: Send + Sync {
     /// Default implementation is a no-op for backward compatibility.
     fn prune(
         &self,
+        _scope: &TenantScope,
         _min_strength: f64,
         _min_age: chrono::Duration,
         _agent_prefix: Option<&str>,

@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
@@ -15,6 +16,7 @@ pub struct EditTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl EditTool {
@@ -27,7 +29,16 @@ impl EditTool {
             file_tracker,
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that restricts file paths beyond what the
+    /// workspace + protected_paths combination already enforces. The policy's
+    /// `check_path` is called before any I/O.
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -90,6 +101,12 @@ impl Tool for EditTool {
 
             if !path.exists() {
                 return Ok(ToolOutput::error(format!("File not found: {file_path}")));
+            }
+
+            if let Some(policy) = &self.path_policy
+                && let Err(e) = policy.check_path(&path)
+            {
+                return Ok(ToolOutput::error(format!("path policy: {e}")));
             }
 
             // No-op guard
@@ -317,6 +334,85 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("File not found"));
+    }
+
+    #[tokio::test]
+    async fn edit_tool_rejects_path_outside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        // Create a file outside the allowed dir
+        let target = outside.path().join("evil.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&target).unwrap();
+
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
+
+        let result = tool
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "bye"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "expected sandbox violation, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("path policy"),
+            "expected path policy error, got: {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_tool_allows_path_inside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        let target = allowed.path().join("ok.txt");
+        std::fs::write(&target, "hello world").unwrap();
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&target).unwrap();
+
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
+
+        let result = tool
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "old_string": "hello world",
+                "new_string": "goodbye world"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "expected success, got: {:?}",
+            result.content
+        );
     }
 
     #[test]

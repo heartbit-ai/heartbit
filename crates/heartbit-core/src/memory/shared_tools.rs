@@ -7,29 +7,33 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
 use super::{Memory, MemoryEntry, MemoryQuery};
 
-/// Create shared memory tools for cross-agent memory access.
+/// Create shared memory tools for cross-agent memory access within the caller's tenant.
 ///
-/// - `shared_memory_read`: read memories from any agent's namespace (always included)
-/// - `shared_memory_write`: write to a shared namespace visible to all agents
+/// - `shared_memory_read`: read memories from any agent's namespace in this tenant
+/// - `shared_memory_write`: write to a shared namespace visible to all agents in this tenant
 ///   (only included when `include_write` is `true`)
 pub fn shared_memory_tools(
     memory: Arc<dyn Memory>,
     agent_name: &str,
+    scope: TenantScope,
     include_write: bool,
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(SharedMemoryReadTool {
         memory: memory.clone(),
+        scope: scope.clone(),
     })];
     if include_write {
         tools.push(Arc::new(SharedMemoryWriteTool {
             memory,
             agent_name: agent_name.into(),
+            scope,
         }));
     }
     tools
@@ -39,6 +43,7 @@ pub fn shared_memory_tools(
 
 struct SharedMemoryReadTool {
     memory: Arc<dyn Memory>,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -101,14 +106,17 @@ impl Tool for SharedMemoryReadTool {
 
             let results = self
                 .memory
-                .recall(MemoryQuery {
-                    text: input.query,
-                    category: input.category,
-                    tags: input.tags,
-                    agent: input.agent, // None = all agents
-                    limit: input.limit,
-                    ..Default::default()
-                })
+                .recall(
+                    &self.scope,
+                    MemoryQuery {
+                        text: input.query,
+                        category: input.category,
+                        tags: input.tags,
+                        agent: input.agent, // None = all agents within this tenant
+                        limit: input.limit,
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
             if results.is_empty() {
@@ -145,6 +153,7 @@ impl Tool for SharedMemoryReadTool {
 struct SharedMemoryWriteTool {
     memory: Arc<dyn Memory>,
     agent_name: String,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -239,7 +248,7 @@ impl Tool for SharedMemoryWriteTool {
                 author_tenant_id: None,
             };
 
-            self.memory.store(entry).await?;
+            self.memory.store(&self.scope, entry).await?;
             Ok(ToolOutput::success(format!(
                 "Shared memory stored with id: {id}"
             )))
@@ -252,9 +261,13 @@ mod tests {
     use super::*;
     use crate::memory::in_memory::InMemoryStore;
 
+    fn test_scope() -> TenantScope {
+        TenantScope::default()
+    }
+
     fn setup() -> (Arc<dyn Memory>, Vec<Arc<dyn Tool>>) {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = shared_memory_tools(store.clone(), "agent_a", true);
+        let tools = shared_memory_tools(store.clone(), "agent_a", test_scope(), true);
         (store, tools)
     }
 
@@ -308,8 +321,8 @@ mod tests {
     #[tokio::test]
     async fn shared_memory_visible_to_all_agents() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools_a = shared_memory_tools(store.clone(), "agent_a", true);
-        let tools_b = shared_memory_tools(store.clone(), "agent_b", true);
+        let tools_a = shared_memory_tools(store.clone(), "agent_a", test_scope(), true);
+        let tools_b = shared_memory_tools(store.clone(), "agent_b", test_scope(), true);
 
         // Agent A writes
         let write_a = find_tool(&tools_a, "shared_memory_write");
@@ -327,8 +340,8 @@ mod tests {
     #[tokio::test]
     async fn filter_by_agent() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools_a = shared_memory_tools(store.clone(), "agent_a", true);
-        let tools_b = shared_memory_tools(store.clone(), "agent_b", true);
+        let tools_a = shared_memory_tools(store.clone(), "agent_a", test_scope(), true);
+        let tools_b = shared_memory_tools(store.clone(), "agent_b", test_scope(), true);
 
         let write_a = find_tool(&tools_a, "shared_memory_write");
         let write_b = find_tool(&tools_b, "shared_memory_write");
@@ -352,7 +365,8 @@ mod tests {
     #[tokio::test]
     async fn write_with_keywords_and_summary() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let tools = shared_memory_tools(store.clone(), "agent_a", true);
+        let scope = test_scope();
+        let tools = shared_memory_tools(store.clone(), "agent_a", scope.clone(), true);
         let write_tool = find_tool(&tools, "shared_memory_write");
 
         write_tool
@@ -366,10 +380,13 @@ mod tests {
 
         // Verify keywords and summary were stored
         let entries = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &scope,
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);

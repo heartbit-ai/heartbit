@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
@@ -15,6 +16,7 @@ pub struct WriteTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl WriteTool {
@@ -27,7 +29,16 @@ impl WriteTool {
             file_tracker,
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that restricts file paths beyond what the
+    /// workspace + protected_paths combination already enforces. The policy's
+    /// `check_path` is called before any I/O.
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -78,6 +89,21 @@ impl Tool for WriteTool {
                 Ok(p) => p,
                 Err(msg) => return Ok(ToolOutput::error(msg)),
             };
+
+            if let Some(policy) = &self.path_policy {
+                // Walk up to the first existing ancestor for canonicalization
+                // (the target file may not exist yet).
+                let mut probe = path.clone();
+                while !probe.exists() {
+                    match probe.parent() {
+                        Some(p) if p != probe => probe = p.to_path_buf(),
+                        _ => break,
+                    }
+                }
+                if let Err(e) = policy.check_path(&probe) {
+                    return Ok(ToolOutput::error(format!("path policy: {e}")));
+                }
+            }
 
             // If file exists, enforce read-before-write guard
             if path.exists() {
@@ -223,5 +249,73 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+    }
+
+    #[tokio::test]
+    async fn write_tool_rejects_path_outside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tool = WriteTool::new(Arc::new(FileTracker::new()), None, Arc::new(Vec::new()))
+            .with_path_policy(policy);
+
+        let target = outside.path().join("evil.txt");
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": target.to_string_lossy(),
+                "content": "x"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "expected sandbox violation, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("path policy"),
+            "expected path policy error, got: {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_allows_path_inside_policy() {
+        use crate::sandbox::CorePathPolicy;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+
+        // No workspace — absolute paths are accepted by resolve_path
+        let tool = WriteTool::new(Arc::new(FileTracker::new()), None, Arc::new(Vec::new()))
+            .with_path_policy(policy);
+
+        let target = allowed.path().join("ok.txt");
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": target.to_string_lossy(),
+                "content": "x"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "expected success, got: {:?}",
+            result.content
+        );
     }
 }

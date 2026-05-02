@@ -24,6 +24,9 @@ pub struct BashTool {
     /// Landlock filesystem sandbox policy (Linux only, feature-gated).
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
+    /// App-layer path policy. Applied to the working directory before spawning.
+    /// Compose with `with_sandbox_policy` for kernel-level enforcement on Linux.
+    path_policy: Option<std::sync::Arc<crate::sandbox::CorePathPolicy>>,
 }
 
 impl BashTool {
@@ -35,6 +38,7 @@ impl BashTool {
             env_policy: crate::workspace::EnvPolicy::Inherit,
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             sandbox_policy: None,
+            path_policy: None,
         }
     }
 
@@ -46,6 +50,7 @@ impl BashTool {
             env_policy,
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             sandbox_policy: None,
+            path_policy: None,
         }
     }
 
@@ -53,6 +58,16 @@ impl BashTool {
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     pub fn with_sandbox_policy(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
         self.sandbox_policy = Some(policy);
+        self
+    }
+
+    /// Set a `CorePathPolicy` that restricts the bash subprocess's working directory.
+    /// Application-layer; complements `with_sandbox_policy` (Linux Landlock).
+    pub fn with_path_policy(
+        mut self,
+        policy: std::sync::Arc<crate::sandbox::CorePathPolicy>,
+    ) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 }
@@ -101,6 +116,12 @@ impl Tool for BashTool {
                 let guard = self.cwd.lock().expect("bash cwd lock poisoned");
                 guard.clone()
             };
+
+            if let Some(policy) = &self.path_policy
+                && let Err(e) = policy.check_path(&cwd)
+            {
+                return Ok(ToolOutput::error(format!("path policy: {e}")));
+            }
 
             // Build the command: cd to tracked cwd, run user command, then print pwd.
             // Detect trailing `&` to avoid `{ cmd &; }` syntax error
@@ -503,5 +524,74 @@ mod tests {
             .unwrap();
         assert!(result.content.contains("visible_value"));
         unsafe { std::env::remove_var("__HEARTBIT_TEST_VAR") };
+    }
+
+    #[tokio::test]
+    async fn bash_with_path_policy_rejects_outside_cwd() {
+        use crate::sandbox::CorePathPolicy;
+        use std::sync::Arc;
+
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(inside.path())
+                .build()
+                .unwrap(),
+        );
+
+        // Set cwd to outside the policy
+        let tool = BashTool::with_sandbox(
+            outside.path().canonicalize().unwrap(),
+            crate::workspace::EnvPolicy::Inherit,
+        )
+        .with_path_policy(policy);
+
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
+        assert!(
+            result.is_error,
+            "expected path policy error, got: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("path policy"),
+            "expected path policy error, got: {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_with_path_policy_allows_inside_cwd() {
+        use crate::sandbox::CorePathPolicy;
+        use std::sync::Arc;
+
+        let inside = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(inside.path())
+                .build()
+                .unwrap(),
+        );
+
+        // Set cwd to inside the policy
+        let tool = BashTool::with_sandbox(
+            inside.path().canonicalize().unwrap(),
+            crate::workspace::EnvPolicy::Inherit,
+        )
+        .with_path_policy(policy);
+
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "expected success, got: {:?}",
+            result.content
+        );
+        assert!(result.content.contains("hello"));
     }
 }

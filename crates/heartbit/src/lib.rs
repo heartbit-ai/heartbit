@@ -80,7 +80,6 @@ pub mod memory;
 pub mod store;
 pub(crate) mod util;
 
-#[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod sandbox;
 
 #[cfg(feature = "daemon")]
@@ -126,19 +125,20 @@ pub use channel::telegram::{
 pub use config::{
     ActionBudgetConfig, ActionBudgetRuleConfig, ActiveHoursConfig, AgentConfig,
     AgentProviderConfig, AuthConfig, BehavioralConfig, BehavioralRuleConfig, CascadeConfig,
-    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonConfig,
+    CascadeGateConfig, CascadeTierConfig, ContextStrategyConfig, DaemonAuditConfig, DaemonConfig,
     DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KNOWN_BUILTINS, KafkaConfig,
     KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry,
     MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig, RetryProviderConfig,
-    SalienceConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig, SensorConfig,
-    SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, SpawnConfig,
-    StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
+    SalienceConfig, SandboxConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig,
+    SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml,
+    SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
     ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig, WsConfig, parse_reasoning_effort,
     parse_tool_profile, parse_workflow_type,
 };
 
-// --- Auth re-exports (feature-gated) ---
+// --- Auth re-exports ---
+pub use auth::TenantScope;
 #[cfg(feature = "vault")]
 pub use auth::vault::{CredentialResolver, CredentialVault};
 #[cfg(feature = "daemon")]
@@ -208,6 +208,9 @@ pub use store::PostgresStore;
 #[cfg(feature = "postgres")]
 pub use store::postgres::PostgresAuditTrail;
 
-// --- Sandbox re-exports (feature-gated) ---
+// --- Sandbox re-exports ---
+// CorePathPolicy/Builder are always available (pure Rust, no Linux/sandbox gate).
+pub use sandbox::{CorePathPolicy, CorePathPolicyBuilder};
+// SandboxPolicy (Landlock kernel enforcement) is Linux + sandbox-feature only.
 #[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub use sandbox::SandboxPolicy;

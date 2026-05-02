@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::Memory;
@@ -13,10 +14,11 @@ use super::Memory;
 /// parameters suitable for periodic maintenance.
 pub async fn prune_weak_entries(
     memory: &Arc<dyn Memory>,
+    scope: &TenantScope,
     min_strength: f64,
     min_age: chrono::Duration,
 ) -> Result<usize, Error> {
-    memory.prune(min_strength, min_age, None).await
+    memory.prune(scope, min_strength, min_age, None).await
 }
 
 /// Default minimum strength below which entries are prunable.
@@ -30,6 +32,7 @@ pub fn default_min_age() -> chrono::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TenantScope;
     use crate::memory::in_memory::InMemoryStore;
     use crate::memory::{Confidentiality, MemoryEntry, MemoryQuery, MemoryType};
     use chrono::Utc;
@@ -62,20 +65,33 @@ mod tests {
     #[tokio::test]
     async fn prune_removes_below_threshold() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        store.store(make_entry("m1", 0.05, 48)).await.unwrap(); // weak + old
-        store.store(make_entry("m2", 0.8, 48)).await.unwrap(); // strong + old
-        store.store(make_entry("m3", 0.05, 0)).await.unwrap(); // weak + recent
+        let scope = TenantScope::default();
+        store
+            .store(&scope, make_entry("m1", 0.05, 48))
+            .await
+            .unwrap(); // weak + old
+        store
+            .store(&scope, make_entry("m2", 0.8, 48))
+            .await
+            .unwrap(); // strong + old
+        store
+            .store(&scope, make_entry("m3", 0.05, 0))
+            .await
+            .unwrap(); // weak + recent
 
-        let removed = prune_weak_entries(&store, 0.1, chrono::Duration::hours(24))
+        let removed = prune_weak_entries(&store, &scope, 0.1, chrono::Duration::hours(24))
             .await
             .unwrap();
         assert_eq!(removed, 1, "only m1 should be pruned (weak + old)");
 
         let remaining = store
-            .recall(MemoryQuery {
-                limit: 0,
-                ..Default::default()
-            })
+            .recall(
+                &scope,
+                MemoryQuery {
+                    limit: 0,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(remaining.len(), 2);
@@ -87,10 +103,17 @@ mod tests {
     #[tokio::test]
     async fn prune_preserves_strong_entries() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        store.store(make_entry("m1", 0.9, 100)).await.unwrap();
-        store.store(make_entry("m2", 0.5, 100)).await.unwrap();
+        let scope = TenantScope::default();
+        store
+            .store(&scope, make_entry("m1", 0.9, 100))
+            .await
+            .unwrap();
+        store
+            .store(&scope, make_entry("m2", 0.5, 100))
+            .await
+            .unwrap();
 
-        let removed = prune_weak_entries(&store, 0.1, chrono::Duration::hours(24))
+        let removed = prune_weak_entries(&store, &scope, 0.1, chrono::Duration::hours(24))
             .await
             .unwrap();
         assert_eq!(removed, 0);
@@ -99,9 +122,13 @@ mod tests {
     #[tokio::test]
     async fn prune_respects_min_age() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        store.store(make_entry("m1", 0.01, 1)).await.unwrap(); // weak but only 1h old
+        let scope = TenantScope::default();
+        store
+            .store(&scope, make_entry("m1", 0.01, 1))
+            .await
+            .unwrap(); // weak but only 1h old
 
-        let removed = prune_weak_entries(&store, 0.1, chrono::Duration::hours(24))
+        let removed = prune_weak_entries(&store, &scope, 0.1, chrono::Duration::hours(24))
             .await
             .unwrap();
         assert_eq!(removed, 0, "entry too recent to prune");
@@ -110,7 +137,8 @@ mod tests {
     #[tokio::test]
     async fn prune_empty_store() {
         let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
-        let removed = prune_weak_entries(&store, 0.1, chrono::Duration::hours(24))
+        let scope = TenantScope::default();
+        let removed = prune_weak_entries(&store, &scope, 0.1, chrono::Duration::hours(24))
             .await
             .unwrap();
         assert_eq!(removed, 0);

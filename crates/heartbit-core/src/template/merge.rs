@@ -70,6 +70,9 @@ fn merge_partial(parent: &PartialAgentConfig, child: &PartialAgentConfig) -> Par
         max_fuzzy_identical_tool_calls: child
             .max_fuzzy_identical_tool_calls
             .or(parent.max_fuzzy_identical_tool_calls),
+        max_tool_calls_per_turn: child
+            .max_tool_calls_per_turn
+            .or(parent.max_tool_calls_per_turn),
         reasoning_effort: child
             .reasoning_effort
             .clone()
@@ -150,6 +153,9 @@ pub(super) fn apply_template(config: &AgentConfig, template: &AgentTemplate) -> 
         max_fuzzy_identical_tool_calls: config
             .max_fuzzy_identical_tool_calls
             .or(template.agent.max_fuzzy_identical_tool_calls),
+        max_tool_calls_per_turn: config
+            .max_tool_calls_per_turn
+            .or(template.agent.max_tool_calls_per_turn),
         session_prune: config.session_prune.clone(),
         recursive_summarization: config.recursive_summarization,
         reflection_threshold: config.reflection_threshold,
@@ -200,6 +206,7 @@ mod tests {
             tool_profile: None,
             max_identical_tool_calls: None,
             max_fuzzy_identical_tool_calls: None,
+            max_tool_calls_per_turn: None,
             session_prune: None,
             recursive_summarization: None,
             reflection_threshold: None,

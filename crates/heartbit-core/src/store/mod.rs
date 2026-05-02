@@ -27,4 +27,10 @@ pub struct AuditEntry {
     pub tokens_in: Option<i32>,
     pub tokens_out: Option<i32>,
     pub created_at: DateTime<Utc>,
+    /// Tenant that owns this audit entry. `None` for single-tenant deployments.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// User who triggered the action. `None` when identity is unavailable.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }

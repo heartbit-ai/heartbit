@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::{Memory, MemoryEntry};
@@ -155,8 +156,10 @@ impl EmbeddingMemory {
 impl Memory for EmbeddingMemory {
     fn store(
         &self,
+        scope: &TenantScope,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        let scope = scope.clone();
         Box::pin(async move {
             let mut entry = entry;
             // Only generate embedding if not already present and embedder is real (dimension > 0)
@@ -175,14 +178,16 @@ impl Memory for EmbeddingMemory {
                     }
                 }
             }
-            self.inner.store(entry).await
+            self.inner.store(&scope, entry).await
         })
     }
 
     fn recall(
         &self,
+        scope: &TenantScope,
         query: super::MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>> {
+        let scope = scope.clone();
         Box::pin(async move {
             let mut query = query;
             // Generate query embedding for hybrid retrieval when text is present
@@ -206,37 +211,57 @@ impl Memory for EmbeddingMemory {
                     }
                 }
             }
-            self.inner.recall(query).await
+            self.inner.recall(&scope, query).await
         })
     }
 
     fn update(
         &self,
+        scope: &TenantScope,
         id: &str,
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
-        self.inner.update(id, content)
+        let scope = scope.clone();
+        let id = id.to_string();
+        Box::pin(async move { self.inner.update(&scope, &id, content).await })
     }
 
-    fn forget(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
-        self.inner.forget(id)
+    fn forget(
+        &self,
+        scope: &TenantScope,
+        id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + '_>> {
+        let scope = scope.clone();
+        let id = id.to_string();
+        Box::pin(async move { self.inner.forget(&scope, &id).await })
     }
 
     fn add_link(
         &self,
+        scope: &TenantScope,
         id: &str,
         related_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
-        self.inner.add_link(id, related_id)
+        let scope = scope.clone();
+        let id = id.to_string();
+        let related_id = related_id.to_string();
+        Box::pin(async move { self.inner.add_link(&scope, &id, &related_id).await })
     }
 
     fn prune(
         &self,
+        scope: &TenantScope,
         min_strength: f64,
         min_age: chrono::Duration,
         agent_prefix: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
-        self.inner.prune(min_strength, min_age, agent_prefix)
+        let scope = scope.clone();
+        let agent_prefix = agent_prefix.map(String::from);
+        Box::pin(async move {
+            self.inner
+                .prune(&scope, min_strength, min_age, agent_prefix.as_deref())
+                .await
+        })
     }
 }
 
@@ -246,6 +271,10 @@ mod tests {
     use crate::memory::in_memory::InMemoryStore;
     use crate::memory::{Confidentiality, MemoryEntry, MemoryQuery, MemoryType};
     use chrono::Utc;
+
+    fn test_scope() -> TenantScope {
+        TenantScope::default()
+    }
 
     fn make_entry(id: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -301,13 +330,18 @@ mod tests {
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(NoopEmbedding);
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        em.store(make_entry("m1", "test content")).await.unwrap();
+        em.store(&test_scope(), make_entry("m1", "test content"))
+            .await
+            .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -348,13 +382,18 @@ mod tests {
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedding);
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        em.store(make_entry("m1", "hello")).await.unwrap();
+        em.store(&test_scope(), make_entry("m1", "hello"))
+            .await
+            .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -373,13 +412,16 @@ mod tests {
 
         let mut entry = make_entry("m1", "hello");
         entry.embedding = Some(vec![9.0, 8.0, 7.0]);
-        em.store(entry).await.unwrap();
+        em.store(&test_scope(), entry).await.unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let emb = results[0].embedding.as_ref().unwrap();
@@ -393,12 +435,18 @@ mod tests {
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(NoopEmbedding);
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        store.store(make_entry("m1", "test")).await.unwrap();
+        store
+            .store(&test_scope(), make_entry("m1", "test"))
+            .await
+            .unwrap();
         let results = em
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -438,15 +486,21 @@ mod tests {
         });
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        store.store(make_entry("m1", "hello world")).await.unwrap();
+        store
+            .store(&test_scope(), make_entry("m1", "hello world"))
+            .await
+            .unwrap();
 
         // Recall with text query should trigger embedding generation
         let _results = em
-            .recall(MemoryQuery {
-                text: Some("hello".into()),
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    text: Some("hello".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -486,14 +540,20 @@ mod tests {
         });
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        store.store(make_entry("m1", "hello world")).await.unwrap();
+        store
+            .store(&test_scope(), make_entry("m1", "hello world"))
+            .await
+            .unwrap();
 
         // Recall WITHOUT text query should NOT generate embedding
         let _results = em
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -509,15 +569,21 @@ mod tests {
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(NoopEmbedding);
         let em = EmbeddingMemory::new(store.clone(), embedder);
 
-        store.store(make_entry("m1", "test")).await.unwrap();
-        let removed = em.forget("m1").await.unwrap();
+        store
+            .store(&test_scope(), make_entry("m1", "test"))
+            .await
+            .unwrap();
+        let removed = em.forget(&test_scope(), "m1").await.unwrap();
         assert!(removed);
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(results.is_empty());

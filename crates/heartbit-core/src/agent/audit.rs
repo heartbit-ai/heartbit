@@ -5,6 +5,7 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 use crate::llm::types::TokenUsage;
 
@@ -69,7 +70,7 @@ pub struct AuditRecord {
     pub delegation_chain: Vec<String>,
 }
 
-/// Minimal 2-method interface for persisting audit records.
+/// Minimal interface for persisting and querying audit records.
 ///
 /// The trail instance is scoped to a single run. Callers hold `Arc<dyn AuditTrail>`
 /// and read entries after `execute()` returns.
@@ -80,15 +81,37 @@ pub trait AuditTrail: Send + Sync {
         entry: AuditRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
-    /// Retrieve all recorded entries in insertion order.
-    fn entries(&self)
-    -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>>;
-
-    /// Retrieve entries filtered by tenant ID. Returns all entries if `tenant_id` is `None`.
-    fn entries_for_tenant(
+    /// Tenant-scoped read. Returns the most recent `limit` entries whose
+    /// `tenant_id` matches `scope.tenant_id`. Single-tenant scope (empty
+    /// tenant_id) returns rows where `tenant_id` is `None` or `""`.
+    fn entries(
         &self,
-        tenant_id: Option<&str>,
+        scope: &TenantScope,
+        limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>>;
+
+    /// Cross-tenant admin read. Renamed from the previous unscoped `entries()`
+    /// so call sites must explicitly opt in to cross-tenant visibility.
+    /// Returns the most recent `limit` entries.
+    fn entries_unscoped(
+        &self,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>>;
+
+    /// Time-windowed scoped read. Returns the most recent `limit` entries for
+    /// the given scope where `timestamp >= since`.
+    fn entries_since(
+        &self,
+        scope: &TenantScope,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>>;
+
+    /// Delete entries older than `now - retain`. Returns count deleted.
+    fn prune(
+        &self,
+        retain: chrono::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>>;
 
     /// Erase all audit records for the given user (GDPR right to erasure).
     /// Returns the number of records removed. Default: no-op returning 0.
@@ -139,34 +162,76 @@ impl AuditTrail for InMemoryAuditTrail {
 
     fn entries(
         &self,
+        scope: &TenantScope,
+        limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
+        let tid = scope.tenant_id.clone();
         Box::pin(async move {
             let records = self
                 .records
                 .read()
                 .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
-            Ok(records.clone())
+            let matched: Vec<AuditRecord> = records
+                .iter()
+                .filter(|r| r.tenant_id.as_deref().unwrap_or("") == tid.as_str())
+                .cloned()
+                .collect();
+            let start = matched.len().saturating_sub(limit);
+            Ok(matched[start..].to_vec())
         })
     }
 
-    fn entries_for_tenant(
+    fn entries_unscoped(
         &self,
-        tenant_id: Option<&str>,
+        limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
-        let tenant_id = tenant_id.map(String::from);
         Box::pin(async move {
             let records = self
                 .records
                 .read()
                 .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
-            match tenant_id {
-                None => Ok(records.clone()),
-                Some(tid) => Ok(records
-                    .iter()
-                    .filter(|r| r.tenant_id.as_deref() == Some(tid.as_str()))
-                    .cloned()
-                    .collect()),
-            }
+            let start = records.len().saturating_sub(limit);
+            Ok(records[start..].to_vec())
+        })
+    }
+
+    fn entries_since(
+        &self,
+        scope: &TenantScope,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
+        let tid = scope.tenant_id.clone();
+        Box::pin(async move {
+            let records = self
+                .records
+                .read()
+                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let matched: Vec<AuditRecord> = records
+                .iter()
+                .filter(|r| {
+                    r.tenant_id.as_deref().unwrap_or("") == tid.as_str() && r.timestamp >= since
+                })
+                .cloned()
+                .collect();
+            let start = matched.len().saturating_sub(limit);
+            Ok(matched[start..].to_vec())
+        })
+    }
+
+    fn prune(
+        &self,
+        retain: chrono::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+        Box::pin(async move {
+            let cutoff = chrono::Utc::now() - retain;
+            let mut records = self
+                .records
+                .write()
+                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let before = records.len();
+            records.retain(|r| r.timestamp >= cutoff);
+            Ok(before - records.len())
         })
     }
 
@@ -232,7 +297,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = trail.entries().await.unwrap();
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].event_type, "llm_response");
         assert_eq!(entries[1].event_type, "tool_call");
@@ -242,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_trail_empty_by_default() {
         let trail = InMemoryAuditTrail::new();
-        let entries = trail.entries().await.unwrap();
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert!(entries.is_empty());
     }
 
@@ -331,7 +396,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entries_for_tenant_filters_correctly() {
+    async fn entries_scoped_filters_correctly() {
+        use crate::auth::TenantScope;
+
         let trail = InMemoryAuditTrail::new();
         trail
             .record(make_record_with_context(
@@ -367,7 +434,8 @@ mod tests {
             .await
             .unwrap();
 
-        let filtered = trail.entries_for_tenant(Some("tenant-a")).await.unwrap();
+        let scope = TenantScope::new("tenant-a");
+        let filtered = trail.entries(&scope, usize::MAX).await.unwrap();
         assert_eq!(filtered.len(), 2);
         assert!(
             filtered
@@ -377,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entries_for_tenant_none_returns_all() {
+    async fn entries_unscoped_returns_all() {
         let trail = InMemoryAuditTrail::new();
         trail
             .record(make_record_with_context(
@@ -413,7 +481,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = trail.entries_for_tenant(None).await.unwrap();
+        let all = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert_eq!(all.len(), 3);
     }
 
@@ -428,7 +496,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = trail.entries().await.unwrap();
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].payload, payload);
     }
@@ -550,7 +618,7 @@ mod tests {
         let removed = trail.erase_for_user("user-1").await.unwrap();
         assert_eq!(removed, 2);
 
-        let remaining = trail.entries().await.unwrap();
+        let remaining = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].user_id.as_deref(), Some("user-2"));
     }
@@ -573,7 +641,7 @@ mod tests {
         let removed = trail.erase_for_user("user-999").await.unwrap();
         assert_eq!(removed, 0);
 
-        let remaining = trail.entries().await.unwrap();
+        let remaining = trail.entries_unscoped(usize::MAX).await.unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -609,5 +677,104 @@ mod tests {
 
         let bool_val = json!(true);
         assert_eq!(strip_content(&bool_val), bool_val);
+    }
+
+    #[tokio::test]
+    async fn entries_filters_by_scope() {
+        use crate::auth::TenantScope;
+
+        let trail = InMemoryAuditTrail::new();
+        let acme = TenantScope::new("acme");
+        let globex = TenantScope::new("globex");
+
+        let mk = |tid: Option<&str>| AuditRecord {
+            agent: "a".into(),
+            turn: 0,
+            event_type: "x".into(),
+            payload: serde_json::Value::Null,
+            usage: TokenUsage::default(),
+            timestamp: chrono::Utc::now(),
+            user_id: None,
+            tenant_id: tid.map(|s| s.into()),
+            delegation_chain: vec![],
+        };
+
+        trail.record(mk(Some("acme"))).await.unwrap();
+        trail.record(mk(Some("globex"))).await.unwrap();
+
+        let acme_rows = trail.entries(&acme, 100).await.unwrap();
+        assert_eq!(acme_rows.len(), 1);
+        assert_eq!(acme_rows[0].tenant_id.as_deref(), Some("acme"));
+
+        let globex_rows = trail.entries(&globex, 100).await.unwrap();
+        assert_eq!(globex_rows.len(), 1);
+        assert_eq!(globex_rows[0].tenant_id.as_deref(), Some("globex"));
+
+        let unscoped = trail.entries_unscoped(100).await.unwrap();
+        assert_eq!(unscoped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_old_entries() {
+        let trail = InMemoryAuditTrail::new();
+        let now = chrono::Utc::now();
+        let mk = |timestamp| AuditRecord {
+            agent: "a".into(),
+            turn: 0,
+            event_type: "x".into(),
+            payload: serde_json::Value::Null,
+            usage: TokenUsage::default(),
+            timestamp,
+            user_id: None,
+            tenant_id: None,
+            delegation_chain: vec![],
+        };
+
+        trail
+            .record(mk(now - chrono::Duration::days(10)))
+            .await
+            .unwrap();
+        trail.record(mk(now)).await.unwrap();
+
+        let removed = trail.prune(chrono::Duration::days(7)).await.unwrap();
+        assert_eq!(removed, 1);
+
+        let rest = trail.entries_unscoped(100).await.unwrap();
+        assert_eq!(rest.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn entries_since_filters_by_time() {
+        use crate::auth::TenantScope;
+
+        let trail = InMemoryAuditTrail::new();
+        let now = chrono::Utc::now();
+        let scope = TenantScope::new("acme");
+        let mk = |timestamp| AuditRecord {
+            agent: "a".into(),
+            turn: 0,
+            event_type: "x".into(),
+            payload: serde_json::Value::Null,
+            usage: TokenUsage::default(),
+            timestamp,
+            user_id: None,
+            tenant_id: Some("acme".into()),
+            delegation_chain: vec![],
+        };
+
+        trail
+            .record(mk(now - chrono::Duration::hours(48)))
+            .await
+            .unwrap();
+        trail
+            .record(mk(now - chrono::Duration::hours(1)))
+            .await
+            .unwrap();
+
+        let recent = trail
+            .entries_since(&scope, now - chrono::Duration::hours(24), 100)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 1);
     }
 }
