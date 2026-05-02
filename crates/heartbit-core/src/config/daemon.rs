@@ -36,6 +36,9 @@ pub struct DaemonConfig {
     /// Audit log retention configuration.
     #[serde(default)]
     pub audit: DaemonAuditConfig,
+    /// Idempotency-key TTL sweep configuration.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
 }
 
 /// MCP server configuration for the daemon.
@@ -76,6 +79,22 @@ pub struct DaemonAuditConfig {
     /// Interval in minutes between prune runs. Defaults to 60 (hourly).
     #[serde(default)]
     pub prune_interval_minutes: Option<u64>,
+}
+
+/// Idempotency-key sweep settings.
+///
+/// When `ttl_hours` is `Some`, the daemon runs a background task that nulls
+/// out idempotency keys older than the TTL. The row itself is retained so
+/// existing primary-key lookups still work; only the dedup contract expires.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IdempotencyConfig {
+    /// Hours to retain idempotency keys before the sweep nulls them out.
+    /// Default `None` disables the sweep.
+    #[serde(default)]
+    pub ttl_hours: Option<u32>,
+    /// How often the sweep runs, in minutes. Default 60.
+    #[serde(default)]
+    pub sweep_interval_minutes: Option<u32>,
 }
 
 /// Memory access control configuration for the daemon.

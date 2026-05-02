@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::Error;
 use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
+use crate::agent::tenant_tracker::TenantTokenTracker;
 #[cfg(feature = "postgres")]
 use crate::config::DaemonAuditConfig;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, IdempotencyConfig};
 #[cfg(feature = "postgres")]
 use crate::store::PostgresStore;
 
@@ -28,6 +29,32 @@ use super::types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 /// Used by CLI handlers to map this specific error to HTTP 503.
 pub const KAFKA_REQUIRED: &str = "this operation requires Kafka (daemon is in HTTP-only mode)";
 
+/// Re-insert a task into the store if no row exists for the given id.
+///
+/// Called from the consumer match arm so that a Kafka redelivery (e.g. after restart)
+/// reconstructs the row with the original `idempotency_key`, `user_id`, and `tenant_id`.
+/// Insert errors are intentionally swallowed because a concurrent inserter may have
+/// already written the row — the consumer cares only about the post-condition.
+pub(crate) fn ensure_task_inserted(
+    store: &Arc<dyn TaskStore>,
+    id: uuid::Uuid,
+    task: &str,
+    source: &str,
+    user_id: Option<&str>,
+    tenant_id: Option<&str>,
+    idempotency_key: Option<&str>,
+) {
+    if !matches!(store.get(id), Ok(None)) {
+        return;
+    }
+    let mut daemon_task = match (user_id, tenant_id) {
+        (Some(uid), Some(tid)) => DaemonTask::new_with_user(id, task, source, uid, tid),
+        _ => DaemonTask::new(id, task, source),
+    };
+    daemon_task.idempotency_key = idempotency_key.map(String::from);
+    let _ = store.insert(daemon_task);
+}
+
 /// Cloneable handle for producing commands and reading state.
 #[derive(Clone)]
 pub struct DaemonHandle {
@@ -35,6 +62,7 @@ pub struct DaemonHandle {
     commands_topic: Option<String>,
     store: Arc<dyn TaskStore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
+    pub(crate) tenant_tracker: Option<Arc<TenantTokenTracker>>,
 }
 
 impl DaemonHandle {
@@ -48,7 +76,19 @@ impl DaemonHandle {
             commands_topic: None,
             store,
             event_channels: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            tenant_tracker: None,
         }
+    }
+
+    /// Attach a per-tenant token tracker for admission-gate checks at submit time.
+    ///
+    /// When set, `submit_task_with_user_idem` and `submit_task_with_user` will call
+    /// `tracker.reserve()` before inserting the task. On `Error::TenantOverloaded`
+    /// the error propagates to the caller; on success the reservation is dropped
+    /// immediately (admission-only — actual per-turn usage is tracked by `AgentRunner`).
+    pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
+        self.tenant_tracker = Some(tracker);
+        self
     }
 
     /// Returns the Kafka producer and commands topic, or an error if not configured.
@@ -92,6 +132,7 @@ impl DaemonHandle {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -128,6 +169,13 @@ impl DaemonHandle {
         let task_str = task.into();
         let source_str = source.into();
 
+        // B5b: per-tenant overload gate — admission-only check.
+        if let Some(ref tracker) = self.tenant_tracker {
+            let scope = crate::auth::TenantScope::new(&user_context.tenant_id);
+            let estimated = task_str.len() / 4 + 4096;
+            let _reservation = tracker.reserve(&scope, estimated)?;
+        }
+
         let daemon_task = DaemonTask::new_with_user(
             id,
             &task_str,
@@ -147,6 +195,7 @@ impl DaemonHandle {
             tenant_id: Some(user_context.tenant_id.clone()),
             roles: user_context.roles.clone(),
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd)
             .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
@@ -162,6 +211,153 @@ impl DaemonHandle {
             .map_err(|(e, _)| Error::Daemon(format!("failed to produce command: {e}")))?;
 
         Ok(id)
+    }
+
+    /// Like `submit_task_with_user` but dedups on `idempotency_key`.
+    ///
+    /// When `idempotency_key` is supplied and an existing task with the same
+    /// `(tenant_id, idempotency_key)` pair exists, returns the existing task id
+    /// without producing a new Kafka message or creating a duplicate row.
+    ///
+    /// When `idempotency_key` is `None`, no dedup is applied — every call creates a new task.
+    ///
+    /// In HTTP-only mode (no Kafka), the row is inserted and `Ok(id)` is returned without
+    /// attempting a Kafka publish. The caller is responsible for triggering execution by
+    /// another path (e.g. HTTP-direct dispatch). This intentionally diverges from
+    /// `submit_task_with_user`, which errors via `require_kafka()` when Kafka is absent —
+    /// HTTP-only deployment is a B5b goal.
+    pub async fn submit_task_with_user_idem(
+        &self,
+        task: impl Into<String>,
+        source: impl Into<String>,
+        story_id: Option<String>,
+        user_context: &super::types::UserContext,
+        idempotency_key: Option<&str>,
+    ) -> Result<uuid::Uuid, Error> {
+        let task_str = task.into();
+        let source_str = source.into();
+
+        // B5b: per-tenant overload gate — admission-only check.
+        // The reservation is dropped immediately after the check; the runner's
+        // adjust() handles actual per-turn usage tracking during execution.
+        if let Some(ref tracker) = self.tenant_tracker {
+            let scope = crate::auth::TenantScope::new(&user_context.tenant_id);
+            let estimated = task_str.len() / 4 + 4096;
+            let _reservation = tracker.reserve(&scope, estimated)?;
+        }
+
+        if let Some(key) = idempotency_key {
+            // Lookup-first: return existing task id without producing to Kafka.
+            if let Some(existing) = self
+                .store
+                .find_by_idempotency_key(&user_context.tenant_id, key)?
+            {
+                tracing::info!(
+                    idempotency_key = %key,
+                    tenant_id = %user_context.tenant_id,
+                    task_id = %existing.id,
+                    "idempotency hit; returning existing task id without re-execution"
+                );
+                return Ok(existing.id);
+            }
+
+            let id = uuid::Uuid::new_v4();
+            let mut daemon_task = DaemonTask::new_with_user(
+                id,
+                &task_str,
+                &source_str,
+                &user_context.user_id,
+                &user_context.tenant_id,
+            );
+            daemon_task.idempotency_key = Some(key.to_string());
+
+            match self.store.insert(daemon_task) {
+                Ok(()) => {
+                    // Fresh insert: publish to Kafka if configured.
+                    self.publish_submit_idem(
+                        id,
+                        task_str,
+                        source_str,
+                        story_id,
+                        user_context,
+                        Some(key.to_string()),
+                    )
+                    .await?;
+                    Ok(id)
+                }
+                Err(e) if super::store::is_unique_violation(&e) => {
+                    tracing::warn!(
+                        idempotency_key = %key,
+                        tenant_id = %user_context.tenant_id,
+                        "idempotency unique-violation fallback; concurrent inserter raced ahead"
+                    );
+                    // Concurrent inserter raced ahead — resolve to their id.
+                    self.store
+                        .find_by_idempotency_key(&user_context.tenant_id, key)?
+                        .map(|t| t.id)
+                        .ok_or_else(|| {
+                            Error::Daemon("unique violation but idempotency row not found".into())
+                        })
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            // No key — insert without dedup, then publish (graceful in HTTP-only mode).
+            let id = uuid::Uuid::new_v4();
+            let daemon_task = DaemonTask::new_with_user(
+                id,
+                &task_str,
+                &source_str,
+                &user_context.user_id,
+                &user_context.tenant_id,
+            );
+            self.store.insert(daemon_task)?;
+            self.publish_submit_idem(id, task_str, source_str, story_id, user_context, None)
+                .await?;
+            Ok(id)
+        }
+    }
+
+    /// Publish a `SubmitTask` command with idempotency key, skipping gracefully
+    /// when no Kafka producer is configured (HTTP-only mode).
+    async fn publish_submit_idem(
+        &self,
+        id: uuid::Uuid,
+        task: String,
+        source: String,
+        story_id: Option<String>,
+        user_context: &super::types::UserContext,
+        idempotency_key: Option<String>,
+    ) -> Result<(), Error> {
+        let (producer, commands_topic) = match self.require_kafka() {
+            Ok(p) => p,
+            // HTTP-only mode: task is already in store; no Kafka publish needed.
+            Err(_) => return Ok(()),
+        };
+        let cmd = DaemonCommand::SubmitTask {
+            id,
+            task,
+            source,
+            story_id,
+            trust_level: None,
+            user_id: Some(user_context.user_id.clone()),
+            tenant_id: Some(user_context.tenant_id.clone()),
+            roles: user_context.roles.clone(),
+            mcp_auth_tokens: None,
+            idempotency_key,
+        };
+        let payload = serde_json::to_vec(&cmd)
+            .map_err(|e| Error::Daemon(format!("failed to serialize command: {e}")))?;
+        producer
+            .send(
+                FutureRecord::to(commands_topic)
+                    .key(&id.to_string())
+                    .payload(&payload),
+                rdkafka::util::Timeout::Never,
+            )
+            .await
+            .map_err(|(e, _)| Error::Daemon(format!("failed to produce command: {e}")))?;
+        Ok(())
     }
 
     /// Read task from store.
@@ -282,11 +478,15 @@ pub struct DaemonCore {
     /// Audit retention configuration (TOML-driven; env var fallback in `run`).
     #[cfg(feature = "postgres")]
     audit_config: DaemonAuditConfig,
+    /// Idempotency-key TTL sweep configuration.
+    idempotency_config: IdempotencyConfig,
     semaphore: Arc<Semaphore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
     task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
     active_tasks: JoinSet<()>,
     cancel: CancellationToken,
+    /// B5b: optional per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
+    tenant_tracker: Option<Arc<TenantTokenTracker>>,
 }
 
 impl DaemonCore {
@@ -307,6 +507,7 @@ impl DaemonCore {
             commands_topic: Some(kafka_config.commands_topic.clone()),
             store: store.clone(),
             event_channels: event_channels.clone(),
+            tenant_tracker: None,
         };
         let core = Self {
             consumer,
@@ -317,11 +518,13 @@ impl DaemonCore {
             postgres_store: None,
             #[cfg(feature = "postgres")]
             audit_config: config.audit.clone(),
+            idempotency_config: config.idempotency.clone(),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
             task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
             active_tasks: JoinSet::new(),
             cancel,
+            tenant_tracker: None,
         };
         (core, handle)
     }
@@ -334,6 +537,23 @@ impl DaemonCore {
     #[cfg(feature = "postgres")]
     pub fn with_postgres_store(mut self, store: Arc<PostgresStore>) -> Self {
         self.postgres_store = Some(store);
+        self
+    }
+
+    /// Attach a per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
+    ///
+    /// When set, each `SubmitTask` command from Kafka is checked against the tracker
+    /// before work begins. On overload, the command is logged and skipped.
+    ///
+    /// NOTE: The daemon consumer is currently configured with `enable.auto.commit=true`,
+    /// so the early-return on overload does NOT prevent offset commit — the offset
+    /// auto-commits after the next poll interval regardless. The gate therefore
+    /// functions as an observation/logging point that prevents agent dispatch but does
+    /// not redeliver the message. True NACK-on-overload requires switching to manual
+    /// commits (`enable.auto.offset.store=false` + `consumer.store_offset()` only on
+    /// successful processing). Tracked as a follow-up.
+    pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
+        self.tenant_tracker = Some(tracker);
         self
     }
 
@@ -431,6 +651,45 @@ impl DaemonCore {
             }
         }
 
+        // B5b: idempotency-key TTL sweep task.
+        // Operates through the TaskStore trait — no cfg gate needed.
+        if let Some(ttl_hours) = self.idempotency_config.ttl_hours {
+            let store = self.store.clone();
+            let cancel = self.cancel.clone();
+            let interval_min = self.idempotency_config.sweep_interval_minutes.unwrap_or(60);
+            let interval = std::time::Duration::from_secs(u64::from(interval_min) * 60);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await; // skip immediate fire
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("idempotency sweep: cancellation received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            let cutoff = chrono::Utc::now()
+                                - chrono::Duration::hours(i64::from(ttl_hours));
+                            match store.sweep_expired_idempotency_keys(cutoff) {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(swept = n, "idempotency keys expired")
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "idempotency sweep failed")
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                ttl_hours,
+                interval_minutes = interval_min,
+                "idempotency key TTL sweep task spawned"
+            );
+        }
+
         use futures::StreamExt;
 
         let build_runner = Arc::new(build_runner);
@@ -469,17 +728,38 @@ impl DaemonCore {
                     };
 
                     match cmd {
-                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens } => {
-                            // Re-insert task if missing (e.g. after restart with message replay)
-                            if let Ok(None) = self.store.get(id) {
-                                if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
-                                    let _ = self.store.insert(DaemonTask::new_with_user(
-                                        id, &task, &source, uid, tid,
-                                    ));
-                                } else {
-                                    let _ = self.store.insert(DaemonTask::new(id, &task, &source));
+                        DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens, idempotency_key } => {
+                            // B5b: per-tenant overload gate in the Kafka consumer loop.
+                            // NOTE: the consumer uses enable.auto.commit=true, so returning
+                            // early here does not prevent the offset from being committed after
+                            // the next poll interval. The gate still provides logging/metrics.
+                            // True NACK-on-overload requires switching to manual offset commits.
+                            if let Some(ref tracker) = self.tenant_tracker {
+                                let tid = tenant_id.as_deref().unwrap_or("");
+                                let scope = crate::auth::TenantScope::new(tid);
+                                let estimated = task.len() / 4 + 4096;
+                                if let Err(e) = tracker.reserve(&scope, estimated) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        tenant_id = ?tenant_id,
+                                        task_id = %id,
+                                        "submit overloaded; skipping task (auto-commit Kafka mode)"
+                                    );
+                                    continue;
                                 }
+                                // Drop the reservation immediately — admission-only check.
                             }
+
+                            // Re-insert task if missing (e.g. after restart with message replay).
+                            ensure_task_inserted(
+                                &self.store,
+                                id,
+                                &task,
+                                &source,
+                                user_id.as_deref(),
+                                tenant_id.as_deref(),
+                                idempotency_key.as_deref(),
+                            );
 
                             let permit = match self.semaphore.clone().acquire_owned().await {
                                 Ok(p) => p,
@@ -695,6 +975,7 @@ mod tests {
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
             audit: crate::config::DaemonAuditConfig::default(),
+            idempotency: crate::config::IdempotencyConfig::default(),
         }
     }
 
@@ -1049,5 +1330,253 @@ mod tests {
         let task = handle.get_task(id).unwrap().unwrap();
         assert_eq!(task.task, "test");
         assert_eq!(task.source, "execute");
+    }
+
+    fn test_handle_with_store() -> DaemonHandle {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        DaemonHandle::http_only(store)
+    }
+
+    fn make_user_ctx(user_id: &str, tenant_id: &str) -> crate::daemon::types::UserContext {
+        crate::daemon::types::UserContext {
+            user_id: user_id.into(),
+            tenant_id: tenant_id.into(),
+            roles: vec![],
+            raw_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_with_idem_returns_same_task_id_on_redelivery() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("user-1", "tenant-A");
+
+        let id1 = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, Some("idem-xyz"))
+            .await
+            .expect("first submit");
+
+        let id2 = handle
+            .submit_task_with_user_idem("hello again", "test", None, &user_ctx, Some("idem-xyz"))
+            .await
+            .expect("redelivery");
+
+        assert_eq!(id1, id2, "redelivery must dedup to same task id");
+    }
+
+    #[tokio::test]
+    async fn submit_with_idem_isolates_per_tenant() {
+        let handle = test_handle_with_store();
+        let user_a = make_user_ctx("u", "tenant-A");
+        let user_b = make_user_ctx("u", "tenant-B");
+
+        let id_a = handle
+            .submit_task_with_user_idem("x", "test", None, &user_a, Some("shared-key"))
+            .await
+            .unwrap();
+        let id_b = handle
+            .submit_task_with_user_idem("x", "test", None, &user_b, Some("shared-key"))
+            .await
+            .unwrap();
+
+        assert_ne!(id_a, id_b, "different tenants must NOT collide on same key");
+    }
+
+    #[tokio::test]
+    async fn submit_without_idem_creates_new_task_each_time() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        let id1 = handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+        let id2 = handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+
+        assert_ne!(id1, id2, "no idem key → no dedup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_submits_same_key_resolve_to_same_id() {
+        let handle = std::sync::Arc::new(test_handle_with_store());
+        let user_ctx = std::sync::Arc::new(make_user_ctx("u", "tenant-A"));
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let h = handle.clone();
+            let u = user_ctx.clone();
+            joinset.spawn(async move {
+                h.submit_task_with_user_idem("payload", "test", None, &u, Some("race-key"))
+                    .await
+            });
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        while let Some(res) = joinset.join_next().await {
+            ids.insert(res.unwrap().unwrap());
+        }
+        assert_eq!(
+            ids.len(),
+            1,
+            "all concurrent submits must dedup to one id, got {ids:?}"
+        );
+    }
+
+    // --- B5b Task 7: per-tenant overload gate tests ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_returns_tenant_overloaded_when_tracker_full() {
+        let handle = test_handle_with_store();
+        let tracker = Arc::new(TenantTokenTracker::new(100));
+        let handle = handle.with_tenant_tracker(tracker.clone());
+
+        // Pre-fill the tracker for tenant-A: 99 tokens in-flight, cap=100.
+        let scope = crate::auth::TenantScope::new("tenant-A");
+        let _hold = tracker.reserve(&scope, 99).unwrap();
+
+        let user_ctx = make_user_ctx("u", "tenant-A");
+        // Estimate for "hello" = 5 / 4 + 4096 = 4097, which exceeds remaining cap of 1.
+        let err = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::Error::TenantOverloaded { tenant_id, .. } => {
+                assert_eq!(tenant_id, "tenant-A");
+            }
+            other => panic!("expected TenantOverloaded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_succeeds_without_tracker() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+        // No tracker; should succeed unconditionally.
+        handle
+            .submit_task_with_user_idem("x", "test", None, &user_ctx, None)
+            .await
+            .expect("should succeed without tracker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_drops_reservation_after_admission_check() {
+        let handle = test_handle_with_store();
+        let tracker = Arc::new(TenantTokenTracker::new(1_000_000));
+        let handle = handle.with_tenant_tracker(tracker.clone());
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        let _id = handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, None)
+            .await
+            .unwrap();
+
+        // After admission check, the reservation drops immediately.
+        // The runner's adjust() handles actual usage tracking.
+        // The entry exists with in_flight=0 (tracker creates it via or_default).
+        let snap = tracker.snapshot();
+        assert_eq!(
+            snap.iter()
+                .find(|(t, _)| t == "tenant-A")
+                .map(|(_, s)| s.in_flight),
+            Some(0)
+        );
+    }
+
+    /// Pins the "no second insert" half of the publish-only-on-fresh-insert contract.
+    ///
+    /// We can't observe the Kafka publish in `http_only` mode (no producer), and
+    /// `DaemonHandle.producer: Option<FutureProducer>` doesn't accept the
+    /// `ChannelCommandProducer` mock without a wider refactor. The publish-only-on-fresh-insert
+    /// guarantee is held by `submit_task_with_user_idem`'s early return (line ~196):
+    /// the lookup-hit path returns BEFORE `publish_submit_idem` is called. This test
+    /// asserts the observable consequence — exactly one row exists in the store after
+    /// two calls with the same key. Tracked as follow-up: refactor `DaemonHandle.producer`
+    /// to `Arc<dyn CommandProducer>` so a channel-backed end-to-end publish test is possible.
+    #[tokio::test]
+    async fn submit_with_idem_does_not_create_duplicate_row() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, Some("k"))
+            .await
+            .unwrap();
+        handle
+            .submit_task_with_user_idem("hello again", "test", None, &user_ctx, Some("k"))
+            .await
+            .unwrap();
+
+        let (rows, total) = handle.store.list(100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "redelivery must not insert a duplicate row");
+        assert_eq!(total, 1);
+        // Idempotency key must persist on the surviving row so subsequent lookups still hit.
+        assert_eq!(rows[0].idempotency_key.as_deref(), Some("k"));
+    }
+
+    /// I3: the consumer match arm reconstructs a missing row with `idempotency_key`,
+    /// `user_id`, and `tenant_id` preserved. Exercised here through the extracted
+    /// `ensure_task_inserted` helper so we don't need to drive a full Kafka loop.
+    #[test]
+    fn ensure_task_inserted_reconstructs_missing_row_with_idempotency_key() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+
+        ensure_task_inserted(
+            &store,
+            id,
+            "do the thing",
+            "kafka",
+            Some("alice"),
+            Some("acme"),
+            Some("k"),
+        );
+
+        let task = store.get(id).unwrap().expect("row was inserted");
+        assert_eq!(task.task, "do the thing");
+        assert_eq!(task.source, "kafka");
+        assert_eq!(task.user_id.as_deref(), Some("alice"));
+        assert_eq!(task.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(task.idempotency_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn ensure_task_inserted_skips_when_row_already_exists() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+        // Pre-seed an existing row with a DIFFERENT task body to detect overwrite.
+        let existing = DaemonTask::new(id, "original", "api");
+        store.insert(existing).unwrap();
+
+        ensure_task_inserted(
+            &store,
+            id,
+            "replayed",
+            "kafka",
+            Some("alice"),
+            Some("acme"),
+            Some("k"),
+        );
+
+        let task = store.get(id).unwrap().unwrap();
+        assert_eq!(task.task, "original", "must not overwrite existing row");
+        assert!(task.user_id.is_none());
+        assert!(task.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn ensure_task_inserted_without_user_context_uses_anonymous_constructor() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+
+        ensure_task_inserted(&store, id, "anon", "cron", None, None, Some("k"));
+
+        let task = store.get(id).unwrap().unwrap();
+        assert!(task.user_id.is_none());
+        assert!(task.tenant_id.is_none());
+        assert_eq!(task.idempotency_key.as_deref(), Some("k"));
     }
 }

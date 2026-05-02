@@ -10,6 +10,15 @@ use crate::Error;
 #[cfg(any(feature = "postgres", test))]
 use crate::llm::types::TokenUsage;
 
+/// Detect a Postgres unique-constraint violation by inspecting the error
+/// message for the `23505` SQLSTATE code that sqlx surfaces. Used by the
+/// idempotency-key insert flow to recover from concurrent inserts of the
+/// same `(tenant_id, idempotency_key)` pair.
+pub(crate) fn is_unique_violation(err: &Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("23505") || msg.contains("duplicate key value violates unique constraint")
+}
+
 /// Trait for persisting daemon task state.
 pub trait TaskStore: Send + Sync {
     /// Insert a new task. Returns an error if the task ID already exists.
@@ -25,6 +34,24 @@ pub trait TaskStore: Send + Sync {
     /// to the task and may modify it in place. Returns an error if the task
     /// is not found.
     fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error>;
+
+    /// Find a task by `(tenant_id, idempotency_key)`. Returns `None` if no
+    /// matching live row exists, or if the key has been nulled out by the
+    /// TTL sweep (the row may still exist; we just no longer dedup against it).
+    fn find_by_idempotency_key(
+        &self,
+        tenant_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<DaemonTask>, Error>;
+
+    /// Null out the `idempotency_key` field on rows older than `cutoff`.
+    /// Returns the number of rows updated. The row itself is retained so
+    /// existing primary-key lookups still hit; only the dedup contract
+    /// expires.
+    fn sweep_expired_idempotency_keys(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, Error>;
 
     /// List tasks with optional source, state, and tenant filters. Returns `(tasks, total_matching)`.
     fn list_filtered(
@@ -221,6 +248,22 @@ impl TaskStore for InMemoryTaskStore {
         if tasks.contains_key(&id) {
             return Err(Error::Daemon(format!("task {id} already exists")));
         }
+        // Enforce (tenant_id, idempotency_key) uniqueness, mirroring the
+        // Postgres partial unique index. Surfaces the same "duplicate key"
+        // message so `is_unique_violation` detects it correctly.
+        if let Some(idem_key) = task.idempotency_key.as_deref() {
+            let tenant = task.tenant_id.as_deref().unwrap_or("");
+            let duplicate = tasks.values().any(|t| {
+                t.tenant_id.as_deref().unwrap_or("") == tenant
+                    && t.idempotency_key.as_deref() == Some(idem_key)
+            });
+            if duplicate {
+                return Err(Error::Daemon(
+                    "duplicate key value violates unique constraint (tenant_id, idempotency_key)"
+                        .into(),
+                ));
+            }
+        }
         tasks.insert(id, task);
         order.push(id);
         Ok(())
@@ -295,6 +338,42 @@ impl TaskStore for InMemoryTaskStore {
         let result = filtered.into_iter().skip(offset).take(limit).collect();
         Ok((result, total))
     }
+
+    fn find_by_idempotency_key(
+        &self,
+        tenant_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<DaemonTask>, Error> {
+        let guard = self
+            .tasks
+            .read()
+            .map_err(|_| Error::Daemon("task store poisoned".into()))?;
+        Ok(guard
+            .values()
+            .find(|t| {
+                t.tenant_id.as_deref().unwrap_or("") == tenant_id
+                    && t.idempotency_key.as_deref() == Some(idempotency_key)
+            })
+            .cloned())
+    }
+
+    fn sweep_expired_idempotency_keys(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, Error> {
+        let mut guard = self
+            .tasks
+            .write()
+            .map_err(|_| Error::Daemon("task store poisoned".into()))?;
+        let mut count = 0usize;
+        for task in guard.values_mut() {
+            if task.idempotency_key.is_some() && task.created_at < cutoff {
+                task.idempotency_key = None;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 // --- PostgreSQL task store ---
@@ -325,6 +404,7 @@ mod postgres_store {
         pub(crate) agent_name: Option<String>,
         pub(crate) user_id: Option<String>,
         pub(crate) tenant_id: Option<String>,
+        pub(crate) idempotency_key: Option<String>,
         pub(crate) model_name: Option<String>,
     }
 
@@ -358,6 +438,7 @@ mod postgres_store {
                 agent_name: row.agent_name,
                 user_id: row.user_id,
                 tenant_id: row.tenant_id,
+                idempotency_key: row.idempotency_key,
                 model_name: row.model_name,
             }
         }
@@ -445,6 +526,27 @@ mod postgres_store {
                 .map_err(|e| Error::Daemon(format!("{col} migration failed: {e}")))?;
             }
 
+            // B5b: tighten tenant_id to NOT NULL DEFAULT '' for symmetry with
+            // audit_log (B4) and so the partial unique idempotency index has a
+            // guaranteed-present column to scope on.
+            for stmt in [
+                "UPDATE daemon_tasks SET tenant_id = '' WHERE tenant_id IS NULL",
+                "ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET DEFAULT ''",
+                "ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET NOT NULL",
+                "ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_daemon_tasks_idem \
+                   ON daemon_tasks (tenant_id, idempotency_key) \
+                   WHERE idempotency_key IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_tasks_created_at_for_sweep \
+                   ON daemon_tasks (created_at) \
+                   WHERE idempotency_key IS NOT NULL",
+            ] {
+                sqlx::query(stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("idempotency migration failed: {e}")))?;
+            }
+
             Ok(())
         }
     }
@@ -454,39 +556,42 @@ mod postgres_store {
             let pool = self.pool.clone();
             tokio::task::block_in_place(move || {
                 tokio::runtime::Handle::current().block_on(async move {
-                sqlx::query(
-                    r#"INSERT INTO daemon_tasks
+                    sqlx::query(
+                        r#"INSERT INTO daemon_tasks
                         (id, task, state, created_at, started_at, completed_at, result, error,
                          input_tokens, output_tokens, cache_creation_input_tokens,
                          cache_read_input_tokens, reasoning_tokens, tool_calls_made,
-                         estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"#,
-                )
-                .bind(task.id)
-                .bind(&task.task)
-                .bind(task.state.as_str())
-                .bind(task.created_at)
-                .bind(task.started_at)
-                .bind(task.completed_at)
-                .bind(&task.result)
-                .bind(&task.error)
-                .bind(task.tokens_used.input_tokens as i32)
-                .bind(task.tokens_used.output_tokens as i32)
-                .bind(task.tokens_used.cache_creation_input_tokens as i32)
-                .bind(task.tokens_used.cache_read_input_tokens as i32)
-                .bind(task.tokens_used.reasoning_tokens as i32)
-                .bind(task.tool_calls_made as i32)
-                .bind(task.estimated_cost_usd)
-                .bind(&task.source)
-                .bind(&task.agent_name)
-                .bind(&task.user_id)
-                .bind(&task.tenant_id)
-                .bind(&task.model_name)
-                .execute(&pool)
-                .await
-                .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
-                Ok(())
-            })
+                         estimated_cost_usd, source, agent_name, user_id, tenant_id,
+                         idempotency_key, model_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                            $16, $17, $18, $19, $20, $21)"#,
+                    )
+                    .bind(task.id)
+                    .bind(&task.task)
+                    .bind(task.state.as_str())
+                    .bind(task.created_at)
+                    .bind(task.started_at)
+                    .bind(task.completed_at)
+                    .bind(&task.result)
+                    .bind(&task.error)
+                    .bind(task.tokens_used.input_tokens as i32)
+                    .bind(task.tokens_used.output_tokens as i32)
+                    .bind(task.tokens_used.cache_creation_input_tokens as i32)
+                    .bind(task.tokens_used.cache_read_input_tokens as i32)
+                    .bind(task.tokens_used.reasoning_tokens as i32)
+                    .bind(task.tool_calls_made as i32)
+                    .bind(task.estimated_cost_usd)
+                    .bind(&task.source)
+                    .bind(&task.agent_name)
+                    .bind(&task.user_id)
+                    .bind(&task.tenant_id)
+                    .bind(&task.idempotency_key)
+                    .bind(&task.model_name)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("failed to insert task: {e}")))?;
+                    Ok(())
+                })
             })
         }
 
@@ -498,7 +603,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -522,7 +628,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
                 .bind(limit as i64)
@@ -545,7 +652,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks WHERE id = $1",
                 )
                 .bind(id)
@@ -566,7 +674,7 @@ mod postgres_store {
                         cache_creation_input_tokens = $10, cache_read_input_tokens = $11,
                         reasoning_tokens = $12, tool_calls_made = $13,
                         estimated_cost_usd = $14, source = $15, agent_name = $16,
-                        user_id = $17, tenant_id = $18, model_name = $19
+                        user_id = $17, tenant_id = $18, idempotency_key = $19, model_name = $20
                     WHERE id = $1"#,
                     )
                     .bind(task.id)
@@ -587,6 +695,7 @@ mod postgres_store {
                     .bind(&task.agent_name)
                     .bind(&task.user_id)
                     .bind(&task.tenant_id)
+                    .bind(&task.idempotency_key)
                     .bind(&task.model_name)
                     .execute(&pool)
                     .await
@@ -655,7 +764,8 @@ mod postgres_store {
                     "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
                      input_tokens, output_tokens, cache_creation_input_tokens, \
                      cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
-                     estimated_cost_usd, source, agent_name, user_id, tenant_id, model_name \
+                     estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                     idempotency_key, model_name \
                      FROM daemon_tasks {where_clause} ORDER BY created_at DESC \
                      LIMIT ${param_idx} OFFSET ${}",
                     param_idx + 1
@@ -901,6 +1011,56 @@ mod postgres_store {
                 })
             })
         }
+
+        fn find_by_idempotency_key(
+            &self,
+            tenant_id: &str,
+            idempotency_key: &str,
+        ) -> Result<Option<DaemonTask>, Error> {
+            let pool = self.pool.clone();
+            let tenant = tenant_id.to_string();
+            let key = idempotency_key.to_string();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let row: Option<TaskRow> = sqlx::query_as(
+                        "SELECT id, task, state, created_at, started_at, completed_at, result, error, \
+                         input_tokens, output_tokens, cache_creation_input_tokens, \
+                         cache_read_input_tokens, reasoning_tokens, tool_calls_made, \
+                         estimated_cost_usd, source, agent_name, user_id, tenant_id, \
+                         idempotency_key, model_name \
+                         FROM daemon_tasks \
+                         WHERE tenant_id = $1 AND idempotency_key = $2 \
+                         LIMIT 1",
+                    )
+                    .bind(&tenant)
+                    .bind(&key)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("idempotency lookup failed: {e}")))?;
+                    Ok(row.map(DaemonTask::from))
+                })
+            })
+        }
+
+        fn sweep_expired_idempotency_keys(
+            &self,
+            cutoff: chrono::DateTime<chrono::Utc>,
+        ) -> Result<usize, Error> {
+            let pool = self.pool.clone();
+            tokio::task::block_in_place(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let result = sqlx::query(
+                        "UPDATE daemon_tasks SET idempotency_key = NULL \
+                         WHERE idempotency_key IS NOT NULL AND created_at < $1",
+                    )
+                    .bind(cutoff)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| Error::Daemon(format!("idempotency sweep failed: {e}")))?;
+                    Ok(result.rows_affected() as usize)
+                })
+            })
+        }
     }
 } // mod postgres_store
 
@@ -1128,6 +1288,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1167,6 +1328,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1206,6 +1368,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1240,6 +1403,7 @@ mod tests {
             agent_name: None,
             user_id: None,
             tenant_id: None,
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1271,6 +1435,7 @@ mod tests {
             agent_name: Some("security-bot".into()),
             user_id: Some("user-42".into()),
             tenant_id: Some("tenant-a".into()),
+            idempotency_key: None,
             model_name: None,
         };
         let task = DaemonTask::from(row);
@@ -1954,5 +2119,90 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].task_count, 1);
         assert_eq!(rows[0].input_tokens, 100);
+    }
+
+    // --- idempotency key tests ---
+
+    #[test]
+    fn in_memory_find_by_idempotency_key_returns_match() {
+        let store = InMemoryTaskStore::new();
+        let id = Uuid::new_v4();
+        let mut task = DaemonTask::new_with_user(id, "hello", "kafka", "u1", "tenant-A");
+        task.idempotency_key = Some("idem-1".into());
+        store.insert(task).unwrap();
+
+        let found = store.find_by_idempotency_key("tenant-A", "idem-1").unwrap();
+        assert_eq!(found.map(|t| t.id), Some(id));
+    }
+
+    #[test]
+    fn in_memory_find_by_idempotency_key_isolates_tenants() {
+        let store = InMemoryTaskStore::new();
+        let mut t1 = DaemonTask::new_with_user(Uuid::new_v4(), "x", "kafka", "u1", "tenant-A");
+        t1.idempotency_key = Some("idem-shared".into());
+        store.insert(t1).unwrap();
+
+        let mut t2 = DaemonTask::new_with_user(Uuid::new_v4(), "y", "kafka", "u2", "tenant-B");
+        t2.idempotency_key = Some("idem-shared".into());
+        store.insert(t2).unwrap();
+
+        let found_a = store
+            .find_by_idempotency_key("tenant-A", "idem-shared")
+            .unwrap();
+        let found_b = store
+            .find_by_idempotency_key("tenant-B", "idem-shared")
+            .unwrap();
+        assert!(found_a.is_some());
+        assert!(found_b.is_some());
+        assert_ne!(found_a.unwrap().id, found_b.unwrap().id);
+    }
+
+    #[test]
+    fn in_memory_find_by_idempotency_key_returns_none_when_missing() {
+        let store = InMemoryTaskStore::new();
+        let found = store
+            .find_by_idempotency_key("tenant-A", "missing")
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn in_memory_sweep_clears_keys_older_than_cutoff() {
+        let store = InMemoryTaskStore::new();
+        let id_old = Uuid::new_v4();
+        let mut old = DaemonTask::new_with_user(id_old, "x", "kafka", "u", "t");
+        old.idempotency_key = Some("idem-old".into());
+        old.created_at = chrono::Utc::now() - chrono::Duration::hours(48);
+        store.insert(old).unwrap();
+
+        let id_new = Uuid::new_v4();
+        let mut fresh = DaemonTask::new_with_user(id_new, "x", "kafka", "u", "t");
+        fresh.idempotency_key = Some("idem-fresh".into());
+        store.insert(fresh).unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let cleared = store.sweep_expired_idempotency_keys(cutoff).unwrap();
+        assert_eq!(cleared, 1);
+        assert!(
+            store
+                .find_by_idempotency_key("t", "idem-old")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_by_idempotency_key("t", "idem-fresh")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn is_unique_violation_recognizes_pg_23505_signature() {
+        use crate::Error;
+        let err = Error::Daemon("failed to insert task: error returned from database: duplicate key value violates unique constraint \"idx_daemon_tasks_idem\" (code: 23505)".into());
+        assert!(super::is_unique_violation(&err));
+        let err2 = Error::Daemon("connection refused".into());
+        assert!(!super::is_unique_violation(&err2));
     }
 }

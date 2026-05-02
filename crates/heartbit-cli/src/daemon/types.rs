@@ -35,6 +35,10 @@ pub(crate) struct SubmitRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub mcp_auth_tokens: Option<HashMap<String, String>>,
+    /// Client-supplied idempotency key for safe retries (RFC 8472 / Stripe convention).
+    /// The `Idempotency-Key` HTTP header takes precedence when both are provided.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// User context embedded in the task submission body.

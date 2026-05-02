@@ -12,8 +12,8 @@ pub use agent::{
 };
 pub use daemon::{
     ActiveHoursConfig, AuthConfig, DaemonAuditConfig, DaemonConfig, DaemonMcpServerConfig,
-    DaemonMemoryConfig, HeartbitPulseConfig, KafkaConfig, MetricsConfig, ScheduleEntry,
-    TokenExchangeConfig, WsConfig,
+    DaemonMemoryConfig, HeartbitPulseConfig, IdempotencyConfig, KafkaConfig, MetricsConfig,
+    ScheduleEntry, TokenExchangeConfig, WsConfig,
 };
 pub use guardrails::{
     ActionBudgetConfig, ActionBudgetRuleConfig, BehavioralConfig, BehavioralRuleConfig,
@@ -25,7 +25,8 @@ pub use memory::{
     RestateConfig, TelemetryConfig, WorkspaceConfig,
 };
 pub use provider::{
-    CascadeConfig, CascadeGateConfig, CascadeTierConfig, ProviderConfig, RetryProviderConfig,
+    CascadeConfig, CascadeGateConfig, CascadeTierConfig, ProviderCircuitConfig, ProviderConfig,
+    RetryProviderConfig,
 };
 pub use sensor::{
     SalienceConfig, SensorConfig, SensorRoutingConfig, SensorSourceConfig, StoryCorrelationConfig,
@@ -401,6 +402,39 @@ impl HeartbitConfig {
             )));
         }
 
+        // Validate circuit breaker config (B5b)
+        if let Some(0) = self.provider.circuit.failure_threshold {
+            return Err(Error::Config(
+                "provider.circuit.failure_threshold must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.provider.circuit.initial_open_duration_seconds {
+            return Err(Error::Config(
+                "provider.circuit.initial_open_duration_seconds must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.provider.circuit.max_open_duration_seconds {
+            return Err(Error::Config(
+                "provider.circuit.max_open_duration_seconds must be > 0".into(),
+            ));
+        }
+        // backoff_multiplier must be finite and strictly positive.
+        // - 0.0 makes record_failure's HalfOpen branch produce a zero-duration backoff (degenerate).
+        // - Negative values panic in Duration::from_secs_f64.
+        // - NaN/Inf panic in Duration::from_secs_f64.
+        if let Some(m) = self.provider.circuit.backoff_multiplier
+            && (!m.is_finite() || m <= 0.0)
+        {
+            return Err(Error::Config(
+                "provider.circuit.backoff_multiplier must be > 0 and finite".into(),
+            ));
+        }
+        if let Some(0) = self.orchestrator.max_tokens_in_flight_per_tenant {
+            return Err(Error::Config(
+                "orchestrator.max_tokens_in_flight_per_tenant must be > 0".into(),
+            ));
+        }
+
         // Ensure agent names are unique
         let mut seen = std::collections::HashSet::new();
         for agent in &self.agents {
@@ -606,6 +640,16 @@ impl HeartbitConfig {
             if daemon.audit.retain_days == Some(0) {
                 return Err(Error::Config(
                     "daemon.audit.retain_days must be at least 1 if set".into(),
+                ));
+            }
+            if daemon.idempotency.ttl_hours == Some(0) {
+                return Err(Error::Config(
+                    "daemon.idempotency.ttl_hours must be at least 1 if set".into(),
+                ));
+            }
+            if daemon.idempotency.sweep_interval_minutes == Some(0) {
+                return Err(Error::Config(
+                    "daemon.idempotency.sweep_interval_minutes must be at least 1 if set".into(),
                 ));
             }
             if let Some(ref kafka) = daemon.kafka {
@@ -2875,6 +2919,59 @@ retain_days = 0
         assert!(err.to_string().contains("retain_days"), "error: {err}");
     }
 
+    #[test]
+    fn idempotency_config_defaults_are_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        let daemon = cfg.daemon.unwrap();
+        assert!(daemon.idempotency.ttl_hours.is_none());
+        assert!(daemon.idempotency.sweep_interval_minutes.is_none());
+    }
+
+    #[test]
+    fn config_rejects_zero_idempotency_ttl_hours() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.idempotency]
+ttl_hours = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(err.to_string().contains("ttl_hours"), "error: {err}");
+    }
+
+    #[test]
+    fn config_rejects_zero_idempotency_sweep_interval() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.idempotency]
+sweep_interval_minutes = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("sweep_interval_minutes"),
+            "error: {err}"
+        );
+    }
+
     // --- Permission Rules Config Tests ---
 
     #[test]
@@ -4945,5 +5042,161 @@ description = "Research specialist"
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert_eq!(config.agents[0].builtin_tools, None);
+    }
+
+    // B5b: circuit breaker + tenant tracker config tests
+    #[test]
+    fn b5b_full_config_parses() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+failure_threshold = 5
+initial_open_duration_seconds = 30
+max_open_duration_seconds = 300
+backoff_multiplier = 2.0
+
+[orchestrator]
+max_tokens_in_flight_per_tenant = 1000000
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(cfg.provider.circuit.failure_threshold, Some(5));
+        assert_eq!(cfg.provider.circuit.initial_open_duration_seconds, Some(30));
+        assert_eq!(cfg.provider.circuit.max_open_duration_seconds, Some(300));
+        assert_eq!(cfg.provider.circuit.backoff_multiplier, Some(2.0));
+        assert_eq!(
+            cfg.orchestrator.max_tokens_in_flight_per_tenant,
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_failure_threshold_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+failure_threshold = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.failure_threshold must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_initial_open_duration_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+initial_open_duration_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.initial_open_duration_seconds must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_max_open_duration_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+max_open_duration_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.max_open_duration_seconds must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_max_tokens_in_flight_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_tokens_in_flight_per_tenant = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("orchestrator.max_tokens_in_flight_per_tenant must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_invalid_backoff_multiplier_rejected() {
+        // TOML uses lowercase `nan` / `inf` literals; Rust's f64 Display formats
+        // f64::NAN as "NaN" and f64::INFINITY as "inf", so we hard-code the TOML
+        // literal forms here rather than `format!("{}", f64::NAN)`.
+        for bad in ["0.0", "-0.0", "-1.0", "nan", "inf", "-inf"] {
+            let toml = format!(
+                r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+backoff_multiplier = {bad}
+"#
+            );
+            let err = match HeartbitConfig::from_toml(&toml) {
+                Ok(cfg) => panic!("backoff_multiplier = {bad} must be rejected, got: {cfg:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string()
+                    .contains("provider.circuit.backoff_multiplier must be > 0 and finite"),
+                "value {bad} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn b5b_circuit_config_from_provider_circuit_config() {
+        use crate::llm::circuit::CircuitConfig;
+        let pcc = ProviderCircuitConfig {
+            failure_threshold: Some(3),
+            initial_open_duration_seconds: Some(10),
+            max_open_duration_seconds: Some(120),
+            backoff_multiplier: Some(1.5),
+        };
+        let cc = CircuitConfig::from(&pcc);
+        assert_eq!(cc.failure_threshold, 3);
+        assert_eq!(cc.initial_open_duration, std::time::Duration::from_secs(10));
+        assert_eq!(cc.max_open_duration, std::time::Duration::from_secs(120));
+        assert_eq!(cc.backoff_multiplier, 1.5);
+    }
+
+    #[test]
+    fn b5b_circuit_config_defaults_when_absent() {
+        use crate::llm::circuit::CircuitConfig;
+        let default_cc = CircuitConfig::default();
+        let pcc = ProviderCircuitConfig::default();
+        let cc = CircuitConfig::from(&pcc);
+        assert_eq!(cc.failure_threshold, default_cc.failure_threshold);
+        assert_eq!(cc.initial_open_duration, default_cc.initial_open_duration);
+        assert_eq!(cc.max_open_duration, default_cc.max_open_duration);
+        assert_eq!(cc.backoff_multiplier, default_cc.backoff_multiplier);
     }
 }

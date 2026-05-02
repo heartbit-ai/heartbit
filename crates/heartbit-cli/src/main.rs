@@ -698,6 +698,28 @@ pub(crate) fn build_provider_from_config(
     Ok(Arc::new(wrap_with_retry(base, retry, on_retry)))
 }
 
+/// Wrap a type-erased provider with a per-(tenant, provider) circuit breaker.
+///
+/// The layering is `CircuitBreakerProvider<BoxedProvider>` — the circuit sits
+/// outside retry so a persistent failure after all retries trips the circuit.
+/// The result is re-boxed so callers keep the `Arc<BoxedProvider>` signature.
+pub(crate) fn wrap_with_circuit(
+    provider: Arc<BoxedProvider>,
+    tracker: Arc<heartbit::CircuitTracker>,
+    provider_name: &str,
+    scope: heartbit::TenantScope,
+) -> Arc<BoxedProvider> {
+    // BoxedProvider::from_arc converts Arc<BoxedProvider> → BoxedProvider (via ArcAdapter).
+    // CircuitBreakerProvider<BoxedProvider> then wraps that, and we re-box for the caller.
+    let inner = BoxedProvider::from_arc(provider);
+    Arc::new(BoxedProvider::new(heartbit::CircuitBreakerProvider::new(
+        inner,
+        tracker,
+        provider_name,
+        scope,
+    )))
+}
+
 /// Build a type-erased LLM provider for a per-agent override.
 ///
 /// Reads the API key from the environment (same as `build_provider_from_config`).
@@ -787,7 +809,25 @@ async fn run_from_config(
         None
     };
     let on_retry = on_event.as_ref().map(build_on_retry);
-    let provider = build_provider_from_config(&config, on_retry)?;
+    let base_provider = build_provider_from_config(&config, on_retry)?;
+
+    // B5b: build circuit tracker and wrap provider
+    let circuit_tracker = Arc::new(heartbit::CircuitTracker::new(
+        heartbit::CircuitConfig::from(&config.provider.circuit),
+    ));
+    let provider = wrap_with_circuit(
+        base_provider,
+        Arc::clone(&circuit_tracker),
+        &config.provider.name,
+        heartbit::TenantScope::default(),
+    );
+
+    // B5b: build tenant tracker from config
+    let tenant_tracker = config
+        .orchestrator
+        .max_tokens_in_flight_per_tenant
+        .map(|cap| Arc::new(heartbit::TenantTokenTracker::new(cap)));
+
     let on_text = streaming_callback();
     let on_approval = if approve {
         Some(approval_callback())
@@ -804,6 +844,8 @@ async fn run_from_config(
         .observability_mode(mode)
         .workspace_dir(workspace_dir)
         .dangerous_tools(true)
+        .tenant_tracker(tenant_tracker)
+        .circuit_tracker(Some(circuit_tracker))
         .run()
         .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -893,6 +935,10 @@ pub(crate) struct RuntimeBuilder<'a> {
     audit_tenant_id: Option<&'a str>,
     allow_shared_write: bool,
     dangerous_tools: bool,
+    /// B5b: optional tenant token tracker for in-flight token enforcement
+    tenant_tracker: Option<Arc<heartbit::TenantTokenTracker>>,
+    /// B5b: shared circuit tracker — wraps per-agent provider overrides with circuit breaker
+    circuit_tracker: Option<Arc<heartbit::CircuitTracker>>,
 }
 
 impl<'a> RuntimeBuilder<'a> {
@@ -924,6 +970,8 @@ impl<'a> RuntimeBuilder<'a> {
             audit_tenant_id: None,
             allow_shared_write: true,
             dangerous_tools: false,
+            tenant_tracker: None,
+            circuit_tracker: None,
         }
     }
 
@@ -1022,6 +1070,16 @@ impl<'a> RuntimeBuilder<'a> {
 
     pub(crate) fn dangerous_tools(mut self, v: bool) -> Self {
         self.dangerous_tools = v;
+        self
+    }
+
+    pub(crate) fn tenant_tracker(mut self, v: Option<Arc<heartbit::TenantTokenTracker>>) -> Self {
+        self.tenant_tracker = v;
+        self
+    }
+
+    pub(crate) fn circuit_tracker(mut self, v: Option<Arc<heartbit::CircuitTracker>>) -> Self {
+        self.circuit_tracker = v;
         self
     }
 
@@ -1235,10 +1293,22 @@ impl<'a> RuntimeBuilder<'a> {
                 }
             }
 
-            // Provider: agent-specific or global
+            // Provider: agent-specific or global.
+            // When the agent has its own provider config, wrap it with the circuit breaker
+            // so per-agent overrides are not exempt from failure tracking.
             let agent_provider: Arc<BoxedProvider> = match &agent.provider {
                 Some(p) => {
-                    build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?
+                    let built =
+                        build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?;
+                    if let Some(ref ct) = self.circuit_tracker {
+                        let scope = heartbit::TenantScope::from_audit_fields(
+                            self.audit_tenant_id,
+                            self.audit_user_id,
+                        );
+                        wrap_with_circuit(built, Arc::clone(ct), &p.name, scope)
+                    } else {
+                        built
+                    }
                 }
                 None => Arc::clone(&self.provider),
             };
@@ -1273,6 +1343,11 @@ impl<'a> RuntimeBuilder<'a> {
                 rb = rb
                     .audit_user_context(uid, tid)
                     .audit_delegation_chain(vec![agent.name.clone()]);
+            }
+
+            // B5b: wire tenant token tracker into single-agent runner
+            if let Some(ref tracker) = self.tenant_tracker {
+                rb = rb.tenant_tracker(tracker.clone());
             }
 
             // Context strategy: agent-level, then orchestrator-level fallback
@@ -1576,6 +1651,11 @@ impl<'a> RuntimeBuilder<'a> {
                 .audit_delegation_chain(vec!["heartbit-daemon".into()]);
         }
 
+        // B5b: wire tenant token tracker into orchestrator
+        if let Some(tracker) = self.tenant_tracker.clone() {
+            builder = builder.tenant_tracker(tracker);
+        }
+
         // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
         {
             let mut all_guardrails = self.guardrails.clone();
@@ -1712,12 +1792,22 @@ impl<'a> RuntimeBuilder<'a> {
 
             // Build per-agent provider override if configured.
             // Per-agent providers inherit the global retry config.
+            // Wrap with circuit breaker so overrides are not exempt from failure tracking.
             let agent_provider = match &agent.provider {
-                Some(p) => Some(build_agent_provider(
-                    p,
-                    retry_config_from(self.config),
-                    on_retry.clone(),
-                )?),
+                Some(p) => {
+                    let built =
+                        build_agent_provider(p, retry_config_from(self.config), on_retry.clone())?;
+                    let wrapped = if let Some(ref ct) = self.circuit_tracker {
+                        let scope = heartbit::TenantScope::from_audit_fields(
+                            self.audit_tenant_id,
+                            self.audit_user_id,
+                        );
+                        wrap_with_circuit(built, Arc::clone(ct), &p.name, scope)
+                    } else {
+                        built
+                    };
+                    Some(wrapped)
+                }
                 None => None,
             };
 
@@ -2334,7 +2424,24 @@ async fn run_chat_from_config(
         None
     };
     let on_retry = on_event.as_ref().map(build_on_retry);
-    let provider = build_provider_from_config(&config, on_retry)?;
+    let base_provider = build_provider_from_config(&config, on_retry)?;
+
+    // B5b: circuit breaker wrapper for chat path
+    let circuit_tracker = Arc::new(heartbit::CircuitTracker::new(
+        heartbit::CircuitConfig::from(&config.provider.circuit),
+    ));
+    let provider = wrap_with_circuit(
+        base_provider,
+        circuit_tracker,
+        &config.provider.name,
+        heartbit::TenantScope::default(),
+    );
+
+    // B5b: tenant token tracker for chat path
+    let tenant_tracker = config
+        .orchestrator
+        .max_tokens_in_flight_per_tenant
+        .map(|cap| Arc::new(heartbit::TenantTokenTracker::new(cap)));
 
     let initial = read_initial_chat_message().await?;
     let Some(initial) = initial else {
@@ -2518,6 +2625,10 @@ async fn run_chat_from_config(
         if !guardrails.is_empty() {
             builder = builder.guardrails(guardrails);
         }
+    }
+    // B5b: wire tenant token tracker into chat agent runner
+    if let Some(tracker) = tenant_tracker {
+        builder = builder.tenant_tracker(tracker);
     }
 
     let runner = builder.build()?;
@@ -3167,5 +3278,84 @@ mod tests {
         }
         let mode = resolve_observability(Some("debug"), Some("production"), false);
         assert_eq!(mode, ObservabilityMode::Debug);
+    }
+
+    /// B5b regression test: lock in the per-(tenant, provider) circuit registry
+    /// behavior that the per-agent provider override path depends on. The earlier
+    /// fix-up commit `ae00217` was needed because no test exercised the override
+    /// wiring; this test prevents the silent-regression class of bug — so the
+    /// tracker's identity invariants (same scope+provider → same Arc; different
+    /// scopes → different Arcs) are pinned even if `wrap_with_circuit` is later
+    /// refactored.
+    #[test]
+    fn wrap_with_circuit_threads_scope_and_provider_name_to_tracker() {
+        use heartbit::{
+            BoxedProvider, CircuitConfig, CircuitTracker, CompletionRequest, CompletionResponse,
+            Error as HbError, LlmProvider, OnText, TenantScope,
+        };
+
+        // Minimal stub: the test does not invoke any provider method; it only
+        // needs a value that satisfies `LlmProvider` so we can build BoxedProvider.
+        struct StubProvider;
+        impl LlmProvider for StubProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, HbError> {
+                unreachable!("stub provider must not be called from this test")
+            }
+            async fn stream_complete(
+                &self,
+                _request: CompletionRequest,
+                _on_text: &OnText,
+            ) -> Result<CompletionResponse, HbError> {
+                unreachable!("stub provider must not be called from this test")
+            }
+        }
+
+        let tracker = Arc::new(CircuitTracker::new(CircuitConfig::default()));
+        let inner: Arc<BoxedProvider> = Arc::new(BoxedProvider::new(StubProvider));
+
+        let scope_a = TenantScope::new("tenant-a");
+        let scope_b = TenantScope::new("tenant-b");
+
+        // Wrapping must succeed for distinct (scope, provider) pairs and must
+        // not panic — this is the smoke test for the helper itself.
+        let _wrapped_a = wrap_with_circuit(
+            Arc::clone(&inner),
+            Arc::clone(&tracker),
+            "anthropic",
+            scope_a.clone(),
+        );
+        let _wrapped_b = wrap_with_circuit(
+            Arc::clone(&inner),
+            Arc::clone(&tracker),
+            "anthropic",
+            scope_b.clone(),
+        );
+
+        // Same scope+provider must resolve to the SAME Arc (the registry must
+        // not create a fresh circuit per call — that would defeat shared
+        // failure tracking across the per-agent override and global paths).
+        let circuit_a1 = tracker.circuit_for(&scope_a, "anthropic");
+        let circuit_a2 = tracker.circuit_for(&scope_a, "anthropic");
+        assert!(
+            Arc::ptr_eq(&circuit_a1, &circuit_a2),
+            "same scope+provider should resolve to same circuit"
+        );
+
+        // Different scopes (multi-tenant isolation) must resolve to distinct circuits.
+        let circuit_b = tracker.circuit_for(&scope_b, "anthropic");
+        assert!(
+            !Arc::ptr_eq(&circuit_a1, &circuit_b),
+            "different scopes should resolve to different circuits"
+        );
+
+        // Different provider names within the same scope must also be distinct.
+        let circuit_a_other = tracker.circuit_for(&scope_a, "openai");
+        assert!(
+            !Arc::ptr_eq(&circuit_a1, &circuit_a_other),
+            "different provider names should resolve to different circuits"
+        );
     }
 }

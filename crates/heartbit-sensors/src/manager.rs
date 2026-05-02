@@ -590,6 +590,7 @@ async fn run_triage_consumer(
                             tenant_id: None,
                             roles: vec![],
                             mcp_auth_tokens: None,
+                            idempotency_key: None,
                         };
 
                         let payload = match serde_json::to_vec(&cmd) {
@@ -1134,6 +1135,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: heartbit::daemon::types::DaemonCommand =
@@ -1159,6 +1161,7 @@ mod tests {
             tenant_id: None,
             roles: vec![],
             mcp_auth_tokens: None,
+            idempotency_key: None,
         };
         let payload = serde_json::to_vec(&cmd).unwrap();
         let parsed: heartbit::daemon::types::DaemonCommand =

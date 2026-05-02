@@ -138,6 +138,7 @@ impl HeartbitPulseScheduler {
                         tenant_id: None,
                         roles: vec![],
                         mcp_auth_tokens: None,
+                        idempotency_key: None,
                     };
                     let payload = match serde_json::to_vec(&cmd) {
                         Ok(p) => p,

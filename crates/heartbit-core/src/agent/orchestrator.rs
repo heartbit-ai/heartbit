@@ -257,6 +257,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             multi_agent_prompt: true,
             spawn_config: None,
             spawn_builtin_tools: Vec::new(),
+            tenant_tracker: None,
         }
     }
 
@@ -333,6 +334,8 @@ struct DelegateTaskTool {
     observability_mode: super::observability::ObservabilityMode,
     /// Whether sub-agents may write to shared institutional memory.
     allow_shared_write: bool,
+    /// Optional per-tenant token tracker propagated to all sub-agent runners.
+    tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
 }
 
 impl DelegateTaskTool {
@@ -396,6 +399,7 @@ impl DelegateTaskTool {
             let permission_rules = self.permission_rules.clone();
             let observability_mode = self.observability_mode;
             let allow_shared_write = self.allow_shared_write;
+            let tenant_tracker = self.tenant_tracker.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -490,6 +494,12 @@ impl DelegateTaskTool {
 
                 // Forward observability mode from orchestrator to sub-agents
                 builder = builder.observability_mode(observability_mode);
+
+                // Forward per-tenant token tracker so sub-agent usage counts toward
+                // the same per-tenant cap as the orchestrator.
+                if let Some(ref tracker) = tenant_tracker {
+                    builder = builder.tenant_tracker(tracker.clone());
+                }
 
                 // Forward LSP manager to sub-agents
                 if let Some(ref lsp) = lsp_manager {
@@ -705,6 +715,8 @@ struct FormSquadTool {
     observability_mode: super::observability::ObservabilityMode,
     /// Whether squad members may write to shared institutional memory.
     allow_shared_write: bool,
+    /// Optional per-tenant token tracker propagated to all squad member runners.
+    tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
 }
 
 impl Tool for FormSquadTool {
@@ -808,6 +820,7 @@ impl Tool for FormSquadTool {
                 let permission_rules = self.permission_rules.clone();
                 let observability_mode = self.observability_mode;
                 let allow_shared_write = self.allow_shared_write;
+                let tenant_tracker = self.tenant_tracker.clone();
 
                 info!(agent = %agent_def.name, task = %task.task, "spawning squad member");
 
@@ -902,6 +915,12 @@ impl Tool for FormSquadTool {
 
                     // Forward observability mode from orchestrator to squad members
                     builder = builder.observability_mode(observability_mode);
+
+                    // Forward per-tenant token tracker so squad member usage counts
+                    // toward the same per-tenant cap as the orchestrator.
+                    if let Some(ref tracker) = tenant_tracker {
+                        builder = builder.tenant_tracker(tracker.clone());
+                    }
 
                     // Forward LSP manager to squad members
                     if let Some(ref lsp) = lsp_manager {
@@ -1117,6 +1136,8 @@ struct SpawnAgentTool {
     audit_tenant_id: Option<String>,
     audit_delegation_chain: Vec<String>,
     cached_definition: ToolDefinition,
+    /// Optional per-tenant token tracker propagated to each spawned agent runner.
+    tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
 }
 
 #[derive(Deserialize)]
@@ -1294,6 +1315,12 @@ impl SpawnAgentTool {
             let mut chain = self.audit_delegation_chain.clone();
             chain.push(spawned_name.clone());
             builder = builder.audit_delegation_chain(chain);
+        }
+
+        // Forward per-tenant token tracker so spawned agent usage counts toward
+        // the same per-tenant cap as the orchestrator.
+        if let Some(ref tracker) = self.tenant_tracker {
+            builder = builder.tenant_tracker(tracker.clone());
         }
 
         // Memory: read-only shared access with namespaced isolation
@@ -1746,6 +1773,11 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     spawn_config: Option<crate::types::SpawnConfig>,
     /// Pre-built builtin tools to use as the spawn tool pool.
     spawn_builtin_tools: Vec<Arc<dyn Tool>>,
+    /// Optional per-tenant token tracker propagated to the orchestrator's own runner
+    /// and to all sub-agent runners dispatched via DelegateTaskTool, FormSquadTool,
+    /// and SpawnAgentTool. When set, multi-agent token usage is correctly accounted
+    /// per tenant so the per-tenant cap applies to the combined run.
+    tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -1883,6 +1915,22 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     ) -> Self {
         self.spawn_config = Some(config);
         self.spawn_builtin_tools = builtin_tools;
+        self
+    }
+
+    /// Attach a per-tenant token tracker to the orchestrator and all sub-agents.
+    ///
+    /// When set, the orchestrator's own runner and every sub-agent runner dispatched
+    /// via `delegate_task`, `form_squad`, or `spawn_agent` inherits the same tracker.
+    /// This ensures multi-agent token usage is correctly accounted per tenant so the
+    /// per-tenant cap applies to the combined run. Requires `audit_user_context` to
+    /// also be set — the tracker only fires when both a tracker and a tenant ID are
+    /// present.
+    pub fn tenant_tracker(
+        mut self,
+        tracker: Arc<crate::agent::tenant_tracker::TenantTokenTracker>,
+    ) -> Self {
+        self.tenant_tracker = Some(tracker);
         self
     }
 
@@ -2246,6 +2294,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             lsp_manager: self.lsp_manager.clone(),
             observability_mode: resolved_mode,
             allow_shared_write: self.allow_shared_write,
+            tenant_tracker: self.tenant_tracker.clone(),
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -2276,6 +2325,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 cached_definition: squad_def,
                 observability_mode: resolved_mode,
                 allow_shared_write: self.allow_shared_write,
+                tenant_tracker: self.tenant_tracker.clone(),
             });
             runner_builder = runner_builder.tool(form_squad_tool);
         }
@@ -2303,6 +2353,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 audit_tenant_id: self.audit_tenant_id.clone(),
                 audit_delegation_chain: self.audit_delegation_chain.clone(),
                 cached_definition: spawn_def,
+                tenant_tracker: self.tenant_tracker.clone(),
             });
             runner_builder = runner_builder.tool(spawn_tool);
         }
@@ -2404,6 +2455,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if !self.audit_delegation_chain.is_empty() {
             runner_builder =
                 runner_builder.audit_delegation_chain(self.audit_delegation_chain.clone());
+        }
+        if let Some(tracker) = self.tenant_tracker {
+            runner_builder = runner_builder.tenant_tracker(tracker);
         }
 
         let runner = runner_builder.build()?;
@@ -2722,6 +2776,7 @@ mod tests {
             lsp_manager: None,
             observability_mode: crate::ObservabilityMode::Production,
             allow_shared_write: true,
+            tenant_tracker: None,
         };
 
         let def = tool.definition();
@@ -6402,6 +6457,7 @@ mod tests {
             audit_tenant_id: None,
             audit_delegation_chain: vec![],
             cached_definition,
+            tenant_tracker: None,
         }
     }
 
@@ -6864,5 +6920,138 @@ model = "claude-sonnet-4-20250514"
         let output = orchestrator.run("test task").await.unwrap();
         // If spawn_agent tool is present, the orchestrator prompt should mention it
         assert!(output.result.contains("No delegation needed."));
+    }
+
+    /// Verify that when `OrchestratorBuilder::tenant_tracker` is set, both the
+    /// orchestrator's own LLM calls AND sub-agent LLM calls are tracked by the
+    /// same `TenantTokenTracker`.
+    ///
+    /// `adjust()` in the runner is a reconciliation call — it only mutates state
+    /// for tenants that already have a map entry (created by a prior `reserve()`).
+    /// We simulate the daemon's submit-time admission check by doing a
+    /// `reserve()`+`drop()` before the run, which creates the entry. The `adjust()`
+    /// calls during the run then accumulate into `in_flight` and `high_water`.
+    ///
+    /// ## Discriminating test design
+    ///
+    /// We make the sub-agent's token count **dominate** so `high_water` is only
+    /// large when the sub-agent is wired to the tracker:
+    ///
+    ///   - Orchestrator turn 1 (delegates): 5 input + 5 output = 10 cumulative.
+    ///   - Sub-agent turn   (completes):   400 input + 100 output = 500 total.
+    ///   - Orchestrator turn 2 (synth):     2 input + 2 output — orch cumulative = 14.
+    ///
+    /// **With** sub-agent wired: peak in-flight = 10 (orch) + 500 (sub) = 510 → `high_water = 510`.
+    /// **Without** sub-agent wired: sub-agent never adjusts → peak = 14 → `high_water = 14`.
+    ///
+    /// Asserting `high_water >= 500` is only true when the sub-agent is wired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orchestrator_propagates_tenant_tracker_to_sub_agents() {
+        use crate::agent::tenant_tracker::TenantTokenTracker;
+        use crate::auth::TenantScope;
+
+        let tracker = Arc::new(TenantTokenTracker::new(1_000_000));
+
+        // Simulate the admission-check reservation (creates the map entry).
+        // Drop immediately — this matches the daemon's submit-time semantics.
+        let scope = TenantScope::new("tenant-abc");
+        drop(tracker.reserve(&scope, 100_000).unwrap());
+
+        // Verify the entry now exists with in_flight=0.
+        let initial_snap = tracker.snapshot();
+        assert_eq!(initial_snap.len(), 1, "entry must exist after reserve+drop");
+        assert_eq!(initial_snap[0].1.in_flight, 0);
+
+        // Orchestrator turn 1 tokens: tiny (so the sub-agent dominates high_water).
+        // Sub-agent tokens: large (500) so high_water > 500 only when wired.
+        // Orchestrator turn 3 tokens: tiny (stays below 500).
+        let provider = Arc::new(MockProvider::new(vec![
+            // Orchestrator turn 1: delegates to "worker" (5+5=10 tokens)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tt-call-1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({
+                        "tasks": [{"agent": "worker", "task": "do work"}]
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            // Sub-agent "worker": large token usage (400+100=500)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Work done.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 400,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            // Orchestrator turn 2: synthesises (2+2=4 tokens; cumulative=14)
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "All done.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                model: None,
+            },
+        ]));
+
+        // audit_user_context MUST be set before sub_agent() so the tenant ID
+        // propagates into the sub-agent def (the builder copies it at call time).
+        let mut orch = Orchestrator::builder(provider)
+            .audit_user_context("user-1", "tenant-abc")
+            .sub_agent("worker", "Does work", "You work.")
+            .tenant_tracker(tracker.clone())
+            .build()
+            .unwrap();
+
+        orch.run("do work").await.unwrap();
+
+        // high_water check: with wiring, peak = orch(10) + sub-agent(500) = 510.
+        // Without wiring, peak = orch turn-2 cumulative (14) — well below 500.
+        let snap_mid = tracker.snapshot();
+        let state_mid = snap_mid
+            .iter()
+            .find(|(tid, _)| tid == "tenant-abc")
+            .map(|(_, s)| s.clone())
+            .expect("entry for 'tenant-abc' should still exist after the run");
+
+        assert!(
+            state_mid.high_water >= 500,
+            "high_water ({}) must be >= 500 (sub-agent's 500 tokens); \
+             if it is < 500, the sub-agent runner is not propagating the tracker",
+            state_mid.high_water
+        );
+
+        // Drop orch to release the orchestrator runner's RAII hold, then confirm
+        // in_flight returns to 0.
+        drop(orch);
+
+        let snap_final = tracker.snapshot();
+        let state_final = snap_final
+            .iter()
+            .find(|(tid, _)| tid == "tenant-abc")
+            .map(|(_, s)| s.clone())
+            .expect("entry should still exist after drop");
+
+        assert_eq!(
+            state_final.in_flight, 0,
+            "in_flight should return to 0 after all runners are dropped"
+        );
     }
 }

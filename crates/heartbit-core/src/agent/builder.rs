@@ -79,6 +79,11 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) audit_delegation_chain: Vec<String>,
     /// Optional LRU response cache size. When set, builds a `ResponseCache`.
     pub(super) response_cache_size: Option<usize>,
+    /// Optional per-tenant in-flight token tracker. When set, the runner calls
+    /// `tracker.adjust(&scope, delta)` after each LLM response to reconcile
+    /// actual usage against the estimate. Has no effect when `audit_tenant_id`
+    /// is unset.
+    pub(super) tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -470,6 +475,19 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Optional per-tenant in-flight token tracker. When set, the runner
+    /// calls `tracker.adjust(&scope, delta)` after each LLM response,
+    /// reconciling the per-tenant `in_flight` counter against the
+    /// estimated reservation made at submit time. Has no effect when
+    /// `audit_tenant_id` is unset.
+    pub fn tenant_tracker(
+        mut self,
+        tracker: Arc<crate::agent::tenant_tracker::TenantTokenTracker>,
+    ) -> Self {
+        self.tenant_tracker = Some(tracker);
+        self
+    }
+
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.name.is_empty() {
             return Err(Error::Config("agent name must not be empty".into()));
@@ -656,6 +674,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             audit_tenant_id: self.audit_tenant_id,
             audit_delegation_chain: self.audit_delegation_chain,
             response_cache: self.response_cache_size.map(cache::ResponseCache::new),
+            tenant_tracker: self.tenant_tracker,
+            cumulative_actual_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }

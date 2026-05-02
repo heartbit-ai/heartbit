@@ -181,6 +181,13 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Optional LRU cache for LLM completion responses. Skips the LLM call
     /// when an identical request (system prompt + messages + tool names) is found.
     pub(super) response_cache: Option<cache::ResponseCache>,
+    /// Optional per-tenant in-flight token tracker. When set, `adjust()` is called
+    /// after each LLM response to reconcile actual vs. estimated usage.
+    pub(super) tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Cumulative actual tokens (input + output) across all turns for this runner.
+    /// Used to compute signed deltas for `tenant_tracker.adjust()` and to release
+    /// the full amount on `Drop`.
+    pub(super) cumulative_actual_tokens: std::sync::atomic::AtomicUsize,
 }
 
 impl<P: LlmProvider> AgentRunner<P> {
@@ -253,6 +260,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
             response_cache_size: None,
+            tenant_tracker: None,
         }
     }
 
@@ -781,6 +789,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 };
                 total_usage += response.usage;
+
+                // Reconcile per-tenant in-flight token estimate with actual usage.
+                // Uses cumulative `total_usage` (not per-turn) so the tracker always
+                // reflects the true running total and multi-turn deltas are correct.
+                if let (Some(tracker), Some(tid)) =
+                    (&self.tenant_tracker, &self.audit_tenant_id)
+                {
+                    let actual =
+                        (total_usage.input_tokens + total_usage.output_tokens) as usize;
+                    let prev = self
+                        .cumulative_actual_tokens
+                        .swap(actual, std::sync::atomic::Ordering::SeqCst);
+                    let delta = actual as i64 - prev as i64;
+                    let scope = crate::auth::TenantScope::new(tid.clone());
+                    tracker.adjust(&scope, delta);
+                }
+
                 // Per-turn cost: prefer response.model (cascade) over static model_name()
                 let turn_model = response
                     .model
@@ -2133,10 +2158,150 @@ impl<P: LlmProvider> AgentRunner<P> {
     }
 }
 
+impl<P: LlmProvider> Drop for AgentRunner<P> {
+    fn drop(&mut self) {
+        if let (Some(tracker), Some(tid)) =
+            (self.tenant_tracker.as_ref(), self.audit_tenant_id.as_ref())
+        {
+            let actual = self
+                .cumulative_actual_tokens
+                .load(std::sync::atomic::Ordering::SeqCst) as i64;
+            if actual > 0 {
+                let scope = crate::auth::TenantScope::new(tid.clone());
+                tracker.adjust(&scope, -actual);
+            }
+        }
+    }
+}
+
 pub(super) fn tool_output_to_result(tool_use_id: String, output: ToolOutput) -> ToolResult {
     if output.is_error {
         ToolResult::error(tool_use_id, output.content)
     } else {
         ToolResult::success(tool_use_id, output.content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use crate::agent::tenant_tracker::TenantTokenTracker;
+    use crate::auth::TenantScope;
+    use crate::error::Error;
+    use crate::llm::types::{
+        CompletionResponse, ContentBlock, StopReason, TokenUsage, ToolDefinition,
+    };
+    use crate::tool::{Tool, ToolOutput};
+
+    use super::super::test_helpers::MockProvider;
+    use super::AgentRunner;
+
+    /// Trivial no-op tool so the runner can dispatch a tool_use response.
+    struct NoopTool;
+
+    impl Tool for NoopTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "noop".into(),
+                description: "Does nothing.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            Box::pin(async { Ok(ToolOutput::success("ok".to_string())) })
+        }
+    }
+
+    /// Build a tool-use response so the runner loops back for a second LLM call.
+    fn tool_use_response(input_tokens: u32, output_tokens: u32) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "noop".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            model: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_runner_adjusts_tenant_tracker_per_turn() {
+        let tracker = Arc::new(TenantTokenTracker::new(1_000_000));
+        let scope = TenantScope::new("acme");
+        // Simulate the daemon's submit-time admission check (Task 7) — drop
+        // the reservation immediately, matching admission-only semantics.
+        drop(tracker.reserve(&scope, 5000).unwrap());
+        assert_eq!(tracker.snapshot()[0].1.in_flight, 0);
+
+        // Build a mock provider that returns known TokenUsage in one turn.
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 100, 200,
+        )]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .audit_user_context("test-user", "acme")
+            .tenant_tracker(tracker.clone())
+            .max_turns(1)
+            .build()
+            .unwrap();
+        let _output = runner.execute("hello").await.unwrap();
+
+        // After one turn: cumulative_actual_tokens = 300, so adjust(+300).
+        let snap = tracker.snapshot();
+        assert_eq!(snap[0].1.in_flight, 300);
+
+        // After runner Drop: in_flight returns to 0.
+        drop(runner);
+        let snap = tracker.snapshot();
+        assert_eq!(snap[0].1.in_flight, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_runner_adjusts_tracker_cumulatively_across_turns() {
+        // Two-turn test: verifies cumulative semantics (not per-turn deltas).
+        // Turn 1: tool_use response (300 tokens) → runner loops.
+        // Turn 2: text response (200 tokens) → runner stops.
+        // Expected: in_flight = 500 (cumulative), zeroed on Drop.
+        let tracker = Arc::new(TenantTokenTracker::new(1_000_000));
+        let scope = TenantScope::new("acme");
+        drop(tracker.reserve(&scope, 5000).unwrap());
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_response(100, 200), // turn 1: +300 → 300 cumulative
+            MockProvider::text_response("done", 50, 150), // turn 2: +200 → 500 cumulative
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .audit_user_context("test-user", "acme")
+            .tenant_tracker(tracker.clone())
+            .max_turns(2)
+            .tool(Arc::new(NoopTool))
+            .build()
+            .unwrap();
+        let _output = runner.execute("hello").await.unwrap();
+
+        // After two turns: cumulative = 300 + 200 = 500.
+        let snap = tracker.snapshot();
+        assert_eq!(snap[0].1.in_flight, 500);
+
+        drop(runner);
+        assert_eq!(tracker.snapshot()[0].1.in_flight, 0);
     }
 }

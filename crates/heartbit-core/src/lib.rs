@@ -64,6 +64,7 @@ pub use agent::routing::{
     AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,
     RoutingStrategy, TaskComplexityAnalyzer, resolve_routing_mode, should_escalate,
 };
+pub use agent::tenant_tracker::{TenantTokenState, TenantTokenTracker, TokenReservation};
 pub use agent::tool_filter::ToolProfile;
 pub use agent::voting::{VoteResult, VotingAgent, VotingAgentBuilder};
 pub use agent::workflow::{
@@ -89,6 +90,10 @@ pub use llm::OnApproval;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
+pub use llm::circuit::{
+    CircuitBreakerProvider, CircuitConfig, CircuitKey, CircuitPermit, CircuitTracker,
+    ProviderCircuit, is_circuit_failure,
+};
 pub use llm::error_class::{ErrorClass, classify as classify_error};
 pub use llm::gemini::GeminiProvider;
 pub use llm::openai_compat::{AuthStyle, OpenAiCompatProvider};
