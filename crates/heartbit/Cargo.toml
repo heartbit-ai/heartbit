@@ -32,10 +32,6 @@ regex = { workspace = true }
 tokio-util = { workspace = true }
 petgraph = { workspace = true }
 
-# --- OAuth / HMAC signing (used by twitter_post builtin + sensor) ---
-hmac = { workspace = true }
-sha1 = { workspace = true }
-
 # --- Optional (feature-gated) ---
 rdkafka = { workspace = true, optional = true }
 restate-sdk = { workspace = true, optional = true }
@@ -43,11 +39,6 @@ sqlx = { workspace = true, optional = true }
 pgvector = { workspace = true, optional = true }
 cron = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
-quick-xml = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
-subtle = { workspace = true }
-teloxide = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
@@ -62,18 +53,16 @@ default = ["core"]
 core = []
 kafka = ["dep:rdkafka"]
 daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken"]
-sensor = ["daemon", "heartbit-core/sensor", "dep:quick-xml", "dep:sha2", "dep:hex"]
 restate = ["dep:restate-sdk"]
 postgres = ["dep:sqlx", "dep:pgvector"]
 a2a = ["heartbit-core/a2a"]
-telegram = ["dep:teloxide"]
 discord = ["dep:tokio-tungstenite"]
 slack = ["dep:tokio-tungstenite"]
 local-embedding = ["dep:fastembed"]
 sandbox = ["heartbit-core/sandbox"]
 macro = ["dep:heartbit-macro", "heartbit-core/macro"]
 vault = ["dep:aes-gcm", "dep:argon2", "dep:rand"]
-full = ["daemon", "sensor", "restate", "postgres", "a2a", "telegram", "discord", "slack", "vault"]
+full = ["daemon", "restate", "postgres", "a2a", "discord", "slack", "vault"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

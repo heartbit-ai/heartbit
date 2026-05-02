@@ -26,21 +26,21 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 
+use heartbit::Error;
 use heartbit::config::KafkaConfig;
 use heartbit::daemon::kafka;
-use heartbit::sensor::compression::CompressionPolicy;
-use heartbit::sensor::metrics::SensorMetrics;
-use heartbit::sensor::routing::{ModelRouter, ModelTier};
-use heartbit::sensor::stories::StoryCorrelator;
-use heartbit::sensor::triage::audio::AudioTriageProcessor;
-use heartbit::sensor::triage::email::EmailTriageProcessor;
-use heartbit::sensor::triage::image::ImageTriageProcessor;
-use heartbit::sensor::triage::rss::RssTriageProcessor;
-use heartbit::sensor::triage::structured::StructuredTriageProcessor;
-use heartbit::sensor::triage::webhook::WebhookTriageProcessor;
-use heartbit::sensor::triage::{TriageDecision, TriageProcessor};
-use heartbit::sensor::{SensorEvent, SensorModality};
-use heartbit::{Error, Priority};
+use heartbit_sensors::compression::CompressionPolicy;
+use heartbit_sensors::metrics::SensorMetrics;
+use heartbit_sensors::routing::{ModelRouter, ModelTier};
+use heartbit_sensors::stories::StoryCorrelator;
+use heartbit_sensors::triage::audio::AudioTriageProcessor;
+use heartbit_sensors::triage::email::EmailTriageProcessor;
+use heartbit_sensors::triage::image::ImageTriageProcessor;
+use heartbit_sensors::triage::rss::RssTriageProcessor;
+use heartbit_sensors::triage::structured::StructuredTriageProcessor;
+use heartbit_sensors::triage::webhook::WebhookTriageProcessor;
+use heartbit_sensors::triage::{Priority, TriageDecision, TriageProcessor};
+use heartbit_sensors::{SensorEvent, SensorModality};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -3653,7 +3653,7 @@ async fn kafka_pipeline_compression_invalid_regex_passthrough() {
         return;
     }
 
-    use heartbit::sensor::compression::CompressionRule;
+    use heartbit_sensors::compression::CompressionRule;
 
     let policy = CompressionPolicy::with_rules(
         SensorModality::Text,
@@ -4206,7 +4206,7 @@ async fn kafka_pipeline_compression_multi_rule_pipeline() {
         return;
     }
 
-    use heartbit::sensor::compression::CompressionRule;
+    use heartbit_sensors::compression::CompressionRule;
 
     let policy = CompressionPolicy::with_rules(
         SensorModality::Text,
@@ -4651,8 +4651,8 @@ async fn slm_audio_triage_with_openrouter() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_rss_sensor_produces_events() {
-    use heartbit::sensor::Sensor;
-    use heartbit::sensor::sources::rss::RssSensor;
+    use heartbit_sensors::Sensor;
+    use heartbit_sensors::sources::rss::RssSensor;
     use tokio_util::sync::CancellationToken;
 
     if !kafka_is_reachable() {
@@ -4783,8 +4783,8 @@ async fn kafka_source_rss_sensor_produces_events() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_image_sensor_produces_events() {
-    use heartbit::sensor::Sensor;
-    use heartbit::sensor::sources::image::ImageSensor;
+    use heartbit_sensors::Sensor;
+    use heartbit_sensors::sources::image::ImageSensor;
     use tokio_util::sync::CancellationToken;
 
     if !kafka_is_reachable() {
@@ -4871,7 +4871,7 @@ async fn kafka_source_image_sensor_produces_events() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_webhook_sensor_build_and_produce() {
-    use heartbit::sensor::sources::webhook::WebhookSensor;
+    use heartbit_sensors::sources::webhook::WebhookSensor;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -4953,8 +4953,8 @@ async fn kafka_source_webhook_sensor_build_and_produce() {
 #[tokio::test]
 #[ignore]
 async fn kafka_full_pipeline_rss_source_to_commands() {
-    use heartbit::sensor::Sensor;
-    use heartbit::sensor::sources::rss::RssSensor;
+    use heartbit_sensors::Sensor;
+    use heartbit_sensors::sources::rss::RssSensor;
     use tokio_util::sync::CancellationToken;
 
     if !kafka_is_reachable() {
@@ -5136,8 +5136,8 @@ async fn kafka_full_pipeline_rss_source_to_commands() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_jmap_sensor_produces_events() {
-    use heartbit::sensor::Sensor;
-    use heartbit::sensor::sources::jmap::JmapEmailSensor;
+    use heartbit_sensors::Sensor;
+    use heartbit_sensors::sources::jmap::JmapEmailSensor;
     use tokio_util::sync::CancellationToken;
 
     if !kafka_is_reachable() {
@@ -5342,7 +5342,7 @@ async fn kafka_source_weather_sensor_produces_events() {
     let consumer = test_consumer(topic, &format!("weather-src-{suffix}"));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let triage = heartbit::sensor::triage::structured::StructuredTriageProcessor::new();
+    let triage = heartbit_sensors::triage::structured::StructuredTriageProcessor::new();
     let sensor_name = format!("weather_e2e_{suffix}");
 
     let mut found = false;
@@ -5374,7 +5374,7 @@ async fn kafka_source_weather_sensor_produces_events() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_weather_alert_only_drops_normal() {
-    use heartbit::sensor::triage::structured::StructuredTriageProcessor;
+    use heartbit_sensors::triage::structured::StructuredTriageProcessor;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -5454,8 +5454,8 @@ async fn kafka_source_weather_alert_only_drops_normal() {
 #[tokio::test]
 #[ignore]
 async fn kafka_source_audio_sensor_produces_events() {
-    use heartbit::sensor::Sensor;
-    use heartbit::sensor::sources::audio::AudioSensor;
+    use heartbit_sensors::Sensor;
+    use heartbit_sensors::sources::audio::AudioSensor;
     use tokio_util::sync::CancellationToken;
 
     if !kafka_is_reachable() {
@@ -5554,7 +5554,7 @@ async fn kafka_source_audio_sensor_produces_events() {
 #[tokio::test]
 #[ignore]
 async fn kafka_pipeline_compression_chain_truncate_then_strip() {
-    use heartbit::sensor::compression::CompressionRule;
+    use heartbit_sensors::compression::CompressionRule;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -5602,7 +5602,7 @@ async fn kafka_pipeline_compression_chain_truncate_then_strip() {
 #[tokio::test]
 #[ignore]
 async fn kafka_pipeline_compression_strip_on_structured() {
-    use heartbit::sensor::compression::CompressionRule;
+    use heartbit_sensors::compression::CompressionRule;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -5643,7 +5643,7 @@ async fn kafka_pipeline_compression_strip_on_structured() {
 #[tokio::test]
 #[ignore]
 async fn kafka_pipeline_jmap_email_through_triage() {
-    use heartbit::sensor::triage::email::EmailTriageProcessor;
+    use heartbit_sensors::triage::email::EmailTriageProcessor;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -5726,7 +5726,7 @@ async fn kafka_pipeline_jmap_email_through_triage() {
 #[tokio::test]
 #[ignore]
 async fn kafka_pipeline_email_reply_in_thread_boost() {
-    use heartbit::sensor::triage::email::EmailTriageProcessor;
+    use heartbit_sensors::triage::email::EmailTriageProcessor;
 
     if !kafka_is_reachable() {
         eprintln!("SKIP: Kafka not reachable at {BROKERS}");
@@ -5890,7 +5890,7 @@ async fn kafka_pipeline_cross_sensor_story_correlation() {
 
     let email_slm = Arc::new(MockSlmProvider::email_classifier(true, false));
     let email_proc =
-        heartbit::sensor::triage::email::EmailTriageProcessor::new(email_slm, vec![], vec![]);
+        heartbit_sensors::triage::email::EmailTriageProcessor::new(email_slm, vec![], vec![]);
 
     let correlator = std::sync::Mutex::new(StoryCorrelator::new(Duration::from_secs(3600)));
 
@@ -5921,7 +5921,7 @@ async fn kafka_pipeline_cross_sensor_story_correlation() {
         })
         .to_string(),
     ));
-    let image_proc = heartbit::sensor::triage::image::ImageTriageProcessor::new(image_slm);
+    let image_proc = heartbit_sensors::triage::image::ImageTriageProcessor::new(image_slm);
 
     let d2 = run_triage_once(
         &image_consumer,

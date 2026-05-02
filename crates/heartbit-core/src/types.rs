@@ -15,9 +15,8 @@ pub enum DispatchMode {
 /// Resolved deterministically from config lists — never LLM-based.
 /// Ordered from least to most trusted; `PartialOrd`/`Ord` follow declaration order.
 ///
-/// Defined in core types so it's always available for TOML/JSON deserialization
-/// even when the `sensor` feature is disabled. Re-exported from
-/// `heartbit::config` and `heartbit::sensor::triage::context`.
+/// Defined in core types so it's always available for TOML/JSON deserialization.
+/// Re-exported from `heartbit::config` and `heartbit_sensors::triage::context`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]

@@ -15,11 +15,9 @@
 //! | `core` (default) | Agent runner, orchestrator, LLM providers, tools, memory, config |
 //! | `kafka` | Kafka consumer/producer |
 //! | `daemon` | Daemon with HTTP API, cron scheduling, metrics |
-//! | `sensor` | 7 sensor sources, triage pipeline, story correlation |
 //! | `restate` | Durable workflow execution via Restate SDK 0.8 |
 //! | `postgres` | PostgreSQL-backed memory and task store (pgvector) |
 //! | `a2a` | Agent-to-Agent protocol |
-//! | `telegram` | Telegram bot adapter |
 //! | `local-embedding` | Local ONNX embeddings via fastembed (no API keys) |
 //! | `full` | All of the above (except `local-embedding`) |
 //!
@@ -65,7 +63,7 @@
 extern crate self as heartbit;
 
 // All core modules and flat re-exports flow through this glob. Local module
-// declarations below (channel, memory, store, auth, daemon, sensor, workflow,
+// declarations below (channel, memory, store, auth, daemon, workflow,
 // sandbox) shadow the glob-imported names — that's the point: the umbrella's
 // versions add platform-specific extensions on top of core.
 pub use heartbit_core::*;
@@ -77,15 +75,11 @@ pub use heartbit_core::*;
 pub mod auth;
 pub mod channel;
 pub mod memory;
-pub mod store;
-pub(crate) mod util;
-
 pub mod sandbox;
+pub mod store;
 
 #[cfg(feature = "daemon")]
 pub mod daemon;
-#[cfg(feature = "sensor")]
-pub mod sensor;
 #[cfg(feature = "restate")]
 pub mod workflow;
 
@@ -111,14 +105,6 @@ pub use channel::slack::{
     SlackBridge, SlackConfig, SlackEnvelope, SlackEvent, SocketModeAck,
     chunk_message as slack_chunk_message, get_socket_url, strip_mention as slack_strip_mention,
     validate_bot_token,
-};
-
-#[cfg(feature = "telegram")]
-pub use channel::telegram::{
-    AccessControl as TelegramAccessControl, CallbackAction, ChatSessionMap, DmPolicy,
-    RateLimiter as TelegramRateLimiter, StreamBuffer, TelegramAdapter, TelegramBridge,
-    TelegramConfig, approval_buttons, chunk_message, markdown_to_telegram_html,
-    parse_callback_data, question_buttons,
 };
 
 // --- Config re-exports (always available — just data structs) ---
@@ -176,22 +162,6 @@ pub use eval::{
 pub use memory::LocalEmbeddingProvider;
 #[cfg(feature = "postgres")]
 pub use memory::postgres::PostgresMemoryStore;
-
-// --- Sensor re-exports (feature-gated) ---
-#[cfg(feature = "sensor")]
-pub use sensor::manager::SensorManager;
-#[cfg(feature = "sensor")]
-pub use sensor::metrics::SensorMetrics;
-#[cfg(feature = "sensor")]
-pub use sensor::routing::{ModelRouter, ModelTier};
-#[cfg(feature = "sensor")]
-pub use sensor::stories::{Story, StoryCorrelator, StoryStatus, SubjectType};
-#[cfg(feature = "sensor")]
-pub use sensor::triage::context::TaskContext;
-#[cfg(feature = "sensor")]
-pub use sensor::triage::{ActionCategory, Priority, TriageDecision, TriageProcessor};
-#[cfg(feature = "sensor")]
-pub use sensor::{Sensor, SensorEvent};
 
 // --- Template re-exports ---
 pub use template::registry::{known_templates, resolve_template};

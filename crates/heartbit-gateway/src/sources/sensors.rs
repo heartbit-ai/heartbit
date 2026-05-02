@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use heartbit::KafkaConfig;
 use heartbit::llm::DynLlmProvider;
-use heartbit::{KafkaConfig, SensorConfig, SensorManager, SensorMetrics};
+use heartbit_sensors::{SensorConfig, SensorManager, SensorMetrics};
 use rdkafka::producer::FutureProducer;
 use tokio_util::sync::CancellationToken;
 

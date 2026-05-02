@@ -168,8 +168,10 @@ Full TOML schema and environment variables: [`docs/configuration.md`](../../docs
 | `local-embedding` | Offline ONNX embeddings (fastembed) — no API keys |
 
 The CLI links against the umbrella `heartbit` crate with `features = ["full"]`,
-so `restate`, `postgres`, `a2a`, `telegram`, `discord`, `slack`, `vault`,
-`sensor` are all enabled in the binary by default.
+so `restate`, `postgres`, `a2a`, `discord`, `slack`, and `vault` are all
+enabled in the binary by default. Sensor and Telegram capabilities ship
+as standalone satellite crates (`heartbit-sensors`, `heartbit-telegram`)
+that the CLI pulls directly.
 
 ## Operations
 
