@@ -28,6 +28,32 @@ use super::types::{DaemonCommand, DaemonTask, TaskState, TaskStats};
 /// Used by CLI handlers to map this specific error to HTTP 503.
 pub const KAFKA_REQUIRED: &str = "this operation requires Kafka (daemon is in HTTP-only mode)";
 
+/// Re-insert a task into the store if no row exists for the given id.
+///
+/// Called from the consumer match arm so that a Kafka redelivery (e.g. after restart)
+/// reconstructs the row with the original `idempotency_key`, `user_id`, and `tenant_id`.
+/// Insert errors are intentionally swallowed because a concurrent inserter may have
+/// already written the row — the consumer cares only about the post-condition.
+pub(crate) fn ensure_task_inserted(
+    store: &Arc<dyn TaskStore>,
+    id: uuid::Uuid,
+    task: &str,
+    source: &str,
+    user_id: Option<&str>,
+    tenant_id: Option<&str>,
+    idempotency_key: Option<&str>,
+) {
+    if !matches!(store.get(id), Ok(None)) {
+        return;
+    }
+    let mut daemon_task = match (user_id, tenant_id) {
+        (Some(uid), Some(tid)) => DaemonTask::new_with_user(id, task, source, uid, tid),
+        _ => DaemonTask::new(id, task, source),
+    };
+    daemon_task.idempotency_key = idempotency_key.map(String::from);
+    let _ = store.insert(daemon_task);
+}
+
 /// Cloneable handle for producing commands and reading state.
 #[derive(Clone)]
 pub struct DaemonHandle {
@@ -173,8 +199,12 @@ impl DaemonHandle {
     /// without producing a new Kafka message or creating a duplicate row.
     ///
     /// When `idempotency_key` is `None`, no dedup is applied — every call creates a new task.
-    /// In HTTP-only mode (no Kafka), the row is still inserted but no Kafka publish is
-    /// attempted (unlike `submit_task_with_user`, which errors if Kafka is absent).
+    ///
+    /// In HTTP-only mode (no Kafka), the row is inserted and `Ok(id)` is returned without
+    /// attempting a Kafka publish. The caller is responsible for triggering execution by
+    /// another path (e.g. HTTP-direct dispatch). This intentionally diverges from
+    /// `submit_task_with_user`, which errors via `require_kafka()` when Kafka is absent —
+    /// HTTP-only deployment is a B5b goal.
     pub async fn submit_task_with_user_idem(
         &self,
         task: impl Into<String>,
@@ -192,6 +222,12 @@ impl DaemonHandle {
                 .store
                 .find_by_idempotency_key(&user_context.tenant_id, key)?
             {
+                tracing::info!(
+                    idempotency_key = %key,
+                    tenant_id = %user_context.tenant_id,
+                    task_id = %existing.id,
+                    "idempotency hit; returning existing task id without re-execution"
+                );
                 return Ok(existing.id);
             }
 
@@ -220,6 +256,11 @@ impl DaemonHandle {
                     Ok(id)
                 }
                 Err(e) if super::store::is_unique_violation(&e) => {
+                    tracing::warn!(
+                        idempotency_key = %key,
+                        tenant_id = %user_context.tenant_id,
+                        "idempotency unique-violation fallback; concurrent inserter raced ahead"
+                    );
                     // Concurrent inserter raced ahead — resolve to their id.
                     self.store
                         .find_by_idempotency_key(&user_context.tenant_id, key)?
@@ -595,20 +636,16 @@ impl DaemonCore {
 
                     match cmd {
                         DaemonCommand::SubmitTask { id, task, source, story_id, trust_level, user_id, tenant_id, roles, mcp_auth_tokens, idempotency_key } => {
-                            // Re-insert task if missing (e.g. after restart with message replay)
-                            if let Ok(None) = self.store.get(id) {
-                                if let (Some(uid), Some(tid)) = (&user_id, &tenant_id) {
-                                    let mut daemon_task = DaemonTask::new_with_user(
-                                        id, &task, &source, uid, tid,
-                                    );
-                                    daemon_task.idempotency_key = idempotency_key.clone();
-                                    let _ = self.store.insert(daemon_task);
-                                } else {
-                                    let mut daemon_task = DaemonTask::new(id, &task, &source);
-                                    daemon_task.idempotency_key = idempotency_key.clone();
-                                    let _ = self.store.insert(daemon_task);
-                                }
-                            }
+                            // Re-insert task if missing (e.g. after restart with message replay).
+                            ensure_task_inserted(
+                                &self.store,
+                                id,
+                                &task,
+                                &source,
+                                user_id.as_deref(),
+                                tenant_id.as_deref(),
+                                idempotency_key.as_deref(),
+                            );
 
                             let permit = match self.semaphore.clone().acquire_owned().await {
                                 Ok(p) => p,
@@ -1271,5 +1308,99 @@ mod tests {
             1,
             "all concurrent submits must dedup to one id, got {ids:?}"
         );
+    }
+
+    /// Pins the "no second insert" half of the publish-only-on-fresh-insert contract.
+    ///
+    /// We can't observe the Kafka publish in `http_only` mode (no producer), and
+    /// `DaemonHandle.producer: Option<FutureProducer>` doesn't accept the
+    /// `ChannelCommandProducer` mock without a wider refactor. The publish-only-on-fresh-insert
+    /// guarantee is held by `submit_task_with_user_idem`'s early return (line ~196):
+    /// the lookup-hit path returns BEFORE `publish_submit_idem` is called. This test
+    /// asserts the observable consequence — exactly one row exists in the store after
+    /// two calls with the same key. Tracked as follow-up: refactor `DaemonHandle.producer`
+    /// to `Arc<dyn CommandProducer>` so a channel-backed end-to-end publish test is possible.
+    #[tokio::test]
+    async fn submit_with_idem_does_not_create_duplicate_row() {
+        let handle = test_handle_with_store();
+        let user_ctx = make_user_ctx("u", "tenant-A");
+
+        handle
+            .submit_task_with_user_idem("hello", "test", None, &user_ctx, Some("k"))
+            .await
+            .unwrap();
+        handle
+            .submit_task_with_user_idem("hello again", "test", None, &user_ctx, Some("k"))
+            .await
+            .unwrap();
+
+        let (rows, total) = handle.store.list(100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "redelivery must not insert a duplicate row");
+        assert_eq!(total, 1);
+        // Idempotency key must persist on the surviving row so subsequent lookups still hit.
+        assert_eq!(rows[0].idempotency_key.as_deref(), Some("k"));
+    }
+
+    /// I3: the consumer match arm reconstructs a missing row with `idempotency_key`,
+    /// `user_id`, and `tenant_id` preserved. Exercised here through the extracted
+    /// `ensure_task_inserted` helper so we don't need to drive a full Kafka loop.
+    #[test]
+    fn ensure_task_inserted_reconstructs_missing_row_with_idempotency_key() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+
+        ensure_task_inserted(
+            &store,
+            id,
+            "do the thing",
+            "kafka",
+            Some("alice"),
+            Some("acme"),
+            Some("k"),
+        );
+
+        let task = store.get(id).unwrap().expect("row was inserted");
+        assert_eq!(task.task, "do the thing");
+        assert_eq!(task.source, "kafka");
+        assert_eq!(task.user_id.as_deref(), Some("alice"));
+        assert_eq!(task.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(task.idempotency_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn ensure_task_inserted_skips_when_row_already_exists() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+        // Pre-seed an existing row with a DIFFERENT task body to detect overwrite.
+        let existing = DaemonTask::new(id, "original", "api");
+        store.insert(existing).unwrap();
+
+        ensure_task_inserted(
+            &store,
+            id,
+            "replayed",
+            "kafka",
+            Some("alice"),
+            Some("acme"),
+            Some("k"),
+        );
+
+        let task = store.get(id).unwrap().unwrap();
+        assert_eq!(task.task, "original", "must not overwrite existing row");
+        assert!(task.user_id.is_none());
+        assert!(task.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn ensure_task_inserted_without_user_context_uses_anonymous_constructor() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let id = uuid::Uuid::new_v4();
+
+        ensure_task_inserted(&store, id, "anon", "cron", None, None, Some("k"));
+
+        let task = store.get(id).unwrap().unwrap();
+        assert!(task.user_id.is_none());
+        assert!(task.tenant_id.is_none());
+        assert_eq!(task.idempotency_key.as_deref(), Some("k"));
     }
 }
