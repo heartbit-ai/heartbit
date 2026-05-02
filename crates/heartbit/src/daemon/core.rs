@@ -543,14 +543,15 @@ impl DaemonCore {
     /// Attach a per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
     ///
     /// When set, each `SubmitTask` command from Kafka is checked against the tracker
-    /// before work begins. On overload, the command is logged and skipped (early
-    /// return without committing the offset in manual-commit mode).
+    /// before work begins. On overload, the command is logged and skipped.
     ///
-    /// NOTE: The daemon consumer uses `enable.auto.commit=true`, so in the current
-    /// configuration returning early still auto-commits the offset after the next poll
-    /// interval. The gate functions as an observation/logging point. True NACK-on-overload
-    /// requires switching to manual commits (`enable.auto.offset.store=false` +
-    /// `consumer.store_offset()`).
+    /// NOTE: The daemon consumer is currently configured with `enable.auto.commit=true`,
+    /// so the early-return on overload does NOT prevent offset commit — the offset
+    /// auto-commits after the next poll interval regardless. The gate therefore
+    /// functions as an observation/logging point that prevents agent dispatch but does
+    /// not redeliver the message. True NACK-on-overload requires switching to manual
+    /// commits (`enable.auto.offset.store=false` + `consumer.store_offset()` only on
+    /// successful processing). Tracked as a follow-up.
     pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
         self.tenant_tracker = Some(tracker);
         self
