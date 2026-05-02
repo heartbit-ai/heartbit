@@ -91,7 +91,8 @@ pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
 pub use llm::circuit::{
-    CircuitConfig, CircuitKey, CircuitPermit, CircuitTracker, ProviderCircuit, is_circuit_failure,
+    CircuitBreakerProvider, CircuitConfig, CircuitKey, CircuitPermit, CircuitTracker,
+    ProviderCircuit, is_circuit_failure,
 };
 pub use llm::error_class::{ErrorClass, classify as classify_error};
 pub use llm::gemini::GeminiProvider;

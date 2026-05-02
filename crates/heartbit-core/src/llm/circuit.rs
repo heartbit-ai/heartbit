@@ -60,8 +60,14 @@ pub struct ProviderCircuit {
 
 /// Arc-owning permit so it can outlive any borrow of the circuit and survive
 /// movement across `.await`.
+///
+/// On drop, if neither `record_success` nor `record_failure` was called
+/// (e.g., on panic or task cancellation), the permit conservatively records a
+/// failure. This prevents the HalfOpen state from wedging indefinitely when a
+/// probe is dropped mid-flight.
 pub struct CircuitPermit {
     circuit: Arc<ProviderCircuit>,
+    consumed: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for CircuitPermit {
@@ -72,10 +78,25 @@ impl std::fmt::Debug for CircuitPermit {
 
 impl CircuitPermit {
     pub fn record_success(self) {
+        self.consumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.circuit.record_success();
     }
     pub fn record_failure(self) {
+        self.consumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.circuit.record_failure();
+    }
+}
+
+impl Drop for CircuitPermit {
+    fn drop(&mut self) {
+        // Conservative: if neither record_success nor record_failure was called
+        // (e.g., panic, cancellation, or wrapper bug), treat the permit as a
+        // failed probe. This prevents the half-open state from wedging forever.
+        if !self.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.circuit.record_failure();
+        }
     }
 }
 
@@ -96,6 +117,7 @@ impl ProviderCircuit {
         match *state {
             CircuitState::Closed { .. } => Ok(CircuitPermit {
                 circuit: Arc::clone(self),
+                consumed: std::sync::atomic::AtomicBool::new(false),
             }),
             CircuitState::Open {
                 until,
@@ -105,6 +127,7 @@ impl ProviderCircuit {
                     *state = CircuitState::HalfOpen;
                     Ok(CircuitPermit {
                         circuit: Arc::clone(self),
+                        consumed: std::sync::atomic::AtomicBool::new(false),
                     })
                 } else {
                     Err(Error::CircuitOpen {
@@ -222,6 +245,100 @@ pub fn is_circuit_failure(err: &Error) -> bool {
     )
 }
 
+/// Per-runner wrapper around any [`super::LlmProvider`]. Looks up the
+/// per-(tenant, provider) circuit from the shared [`Arc<CircuitTracker>`] and
+/// gates each request on a permit.
+///
+/// ## Composition order
+///
+/// The intended layering is `CircuitBreakerProvider<RetryingProvider<P>>`.
+/// One `CircuitPermit` covers the full retry budget of the inner
+/// `RetryingProvider`: the circuit counts a failure only when all retries are
+/// exhausted, not on individual transient blips. Set `failure_threshold = 5`
+/// to mean "5 retry-exhausted outer attempts before opening".
+///
+/// ## Tenant identity
+///
+/// `CompletionRequest` does not carry tenant scope; each `AgentRunner` binds
+/// the scope at construction time via [`CircuitBreakerProvider::new`].
+///
+/// ## Backoff note
+///
+/// When a HalfOpen probe fails, the reopened duration is
+/// `initial_open_duration * backoff_multiplier`, NOT `prev_duration *
+/// backoff_multiplier`. This means the backoff is constant-after-first-failure
+/// rather than compounding.
+///
+/// ## Non-circuit-tripping errors
+///
+/// Auth errors (401/403), bad requests (400), and context-overflow errors are
+/// NOT counted as circuit failures. From the circuit's perspective these are
+/// caller-side issues and the provider is healthy — such errors are recorded as
+/// `record_success` so they don't accumulate toward the threshold.
+pub struct CircuitBreakerProvider<P: super::LlmProvider> {
+    inner: P,
+    tracker: Arc<CircuitTracker>,
+    provider_name: String,
+    scope: TenantScope,
+}
+
+impl<P: super::LlmProvider> CircuitBreakerProvider<P> {
+    pub fn new(
+        inner: P,
+        tracker: Arc<CircuitTracker>,
+        provider_name: impl Into<String>,
+        scope: TenantScope,
+    ) -> Self {
+        Self {
+            inner,
+            tracker,
+            provider_name: provider_name.into(),
+            scope,
+        }
+    }
+}
+
+impl<P: super::LlmProvider> super::LlmProvider for CircuitBreakerProvider<P> {
+    fn model_name(&self) -> Option<&str> {
+        self.inner.model_name()
+    }
+
+    async fn complete(
+        &self,
+        request: super::types::CompletionRequest,
+    ) -> Result<super::types::CompletionResponse, Error> {
+        let circuit = self.tracker.circuit_for(&self.scope, &self.provider_name);
+        let permit = circuit.permit()?;
+        let result = self.inner.complete(request).await;
+        match &result {
+            Ok(_) => permit.record_success(),
+            // Circuit-tripping error (5xx, 429, network): provider is degraded.
+            Err(e) if is_circuit_failure(e) => permit.record_failure(),
+            // Non-circuit-tripping error (auth, 4xx, etc.): provider is healthy
+            // from the circuit's POV; record success so caller bugs / permanent
+            // auth failures don't accumulate toward the threshold.
+            Err(_) => permit.record_success(),
+        }
+        result
+    }
+
+    async fn stream_complete(
+        &self,
+        request: super::types::CompletionRequest,
+        on_text: &super::OnText,
+    ) -> Result<super::types::CompletionResponse, Error> {
+        let circuit = self.tracker.circuit_for(&self.scope, &self.provider_name);
+        let permit = circuit.permit()?;
+        let result = self.inner.stream_complete(request, on_text).await;
+        match &result {
+            Ok(_) => permit.record_success(),
+            Err(e) if is_circuit_failure(e) => permit.record_failure(),
+            Err(_) => permit.record_success(),
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,9 +399,12 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(60));
         c.permit().unwrap().record_success();
-        // Closed now: many permits in a row.
+        // Closed now: many permits in a row — consume each one so the Drop
+        // impl doesn't count unrecorded drops as failures.
         for _ in 0..10 {
-            assert!(c.permit().is_ok());
+            let p = c.permit();
+            assert!(p.is_ok());
+            p.unwrap().record_success();
         }
     }
 
@@ -424,5 +544,144 @@ mod tests {
             message: "bad json".into(),
         };
         assert!(!is_circuit_failure(&bad));
+    }
+
+    // --- CircuitBreakerProvider tests ---
+
+    use crate::llm::LlmProvider;
+    use crate::llm::types::{CompletionRequest, Message};
+
+    struct FailingProvider {
+        error: Box<dyn Fn() -> Error + Send + Sync>,
+    }
+
+    impl LlmProvider for FailingProvider {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<crate::llm::types::CompletionResponse, Error> {
+            Err((self.error)())
+        }
+    }
+
+    fn dummy_request() -> CompletionRequest {
+        CompletionRequest {
+            system: "test".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 10,
+            tool_choice: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn circuit_opens_after_threshold_failures() {
+        let tracker = Arc::new(CircuitTracker::new(CircuitConfig {
+            failure_threshold: 3,
+            initial_open_duration: Duration::from_secs(60),
+            max_open_duration: Duration::from_secs(120),
+            backoff_multiplier: 2.0,
+        }));
+        let inner = FailingProvider {
+            error: Box::new(|| Error::Api {
+                status: 503,
+                message: "down".into(),
+            }),
+        };
+        let wrapper = CircuitBreakerProvider::new(
+            inner,
+            tracker.clone(),
+            "anthropic",
+            TenantScope::new("acme"),
+        );
+
+        // Three failing calls → circuit opens
+        for _ in 0..3 {
+            let _ = wrapper.complete(dummy_request()).await;
+        }
+        // Fourth call: short-circuits with CircuitOpen, no inner call
+        let err = wrapper.complete(dummy_request()).await.unwrap_err();
+        assert!(matches!(err, Error::CircuitOpen { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_errors_do_not_trip_circuit() {
+        let tracker = Arc::new(CircuitTracker::new(cfg()));
+        let inner = FailingProvider {
+            error: Box::new(|| Error::Api {
+                status: 401,
+                message: "no key".into(),
+            }),
+        };
+        let wrapper = CircuitBreakerProvider::new(
+            inner,
+            tracker.clone(),
+            "anthropic",
+            TenantScope::new("acme"),
+        );
+
+        for _ in 0..10 {
+            let _ = wrapper.complete(dummy_request()).await;
+        }
+        // Circuit still closed: 401s don't trip
+        let circuit = tracker.circuit_for(&TenantScope::new("acme"), "anthropic");
+        assert!(circuit.permit().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn circuit_outer_retry_inner_one_permit_per_outer_call() {
+        // Wrapped: CircuitBreaker<Retrying<FailingProvider>>
+        let tracker = Arc::new(CircuitTracker::new(CircuitConfig {
+            failure_threshold: 2,
+            initial_open_duration: Duration::from_secs(60),
+            max_open_duration: Duration::from_secs(120),
+            backoff_multiplier: 2.0,
+        }));
+        let inner = FailingProvider {
+            error: Box::new(|| Error::Api {
+                status: 503,
+                message: "down".into(),
+            }),
+        };
+        let retrying = crate::llm::retry::RetryingProvider::new(
+            inner,
+            crate::llm::retry::RetryConfig {
+                max_retries: 3,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+            },
+        );
+        let wrapper = CircuitBreakerProvider::new(
+            retrying,
+            tracker.clone(),
+            "anthropic",
+            TenantScope::new("acme"),
+        );
+
+        // Two outer calls → 2 circuit failures → opens.
+        let _ = wrapper.complete(dummy_request()).await;
+        let _ = wrapper.complete(dummy_request()).await;
+        let err = wrapper.complete(dummy_request()).await.unwrap_err();
+        assert!(matches!(err, Error::CircuitOpen { .. }));
+    }
+
+    #[test]
+    fn permit_drop_without_consume_records_failure() {
+        // Verifies the Drop impl safety net: an unconsumed permit counts as failure.
+        let c = Arc::new(ProviderCircuit::new(CircuitConfig {
+            failure_threshold: 1,
+            initial_open_duration: Duration::from_millis(50),
+            max_open_duration: Duration::from_millis(500),
+            backoff_multiplier: 2.0,
+        }));
+        // Get a permit without consuming it — simulates a cancelled task.
+        let permit = c.permit().unwrap();
+        drop(permit); // Drop without record_* → Drop impl fires record_failure
+        // With threshold=1, one failure → circuit opens.
+        assert!(
+            c.permit().is_err(),
+            "circuit should be open after unconsumed permit drop"
+        );
     }
 }
