@@ -11,10 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Idempotency keys.** `DaemonCommand::SubmitTask` and `POST /v1/tasks`
   accept an `idempotency_key` (`Option<String>` field / `Idempotency-Key`
   HTTP header). Scoped to `(tenant_id, idempotency_key)` via a partial
-  unique index on `daemon_tasks`. 24 h TTL with a background sweep task
-  configurable via `[daemon.idempotency]` (`ttl_hours`,
-  `sweep_interval_minutes`). Duplicate requests return the existing task id
-  without re-executing.
+  unique index on `daemon_tasks`. No TTL by default; configurable via
+  `[daemon.idempotency]` (`ttl_hours`, `sweep_interval_minutes`) — when
+  `ttl_hours` is set, a background sweep task nulls expired keys.
+  Duplicate requests return the existing task id without re-executing.
 - **Per-tenant token cap.** `TenantTokenTracker` with `Arc`-owning RAII
   reservation tracks in-flight tokens per tenant. Configurable cap via
   `orchestrator.max_tokens_in_flight_per_tenant`. Submissions estimated to

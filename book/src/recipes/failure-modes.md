@@ -15,7 +15,9 @@ Idempotency-Key: dedup-payment-12345
 ```
 
 Subsequent requests with the same `(tenant, key)` pair return the existing
-task id without re-executing. Keys expire after 24 h by default. Configure:
+task id without re-executing. Keys do not expire by default — configure
+`ttl_hours` to enable the sweep. Once enabled, the daemon's background task
+nulls keys older than the TTL.
 
 ```toml
 [daemon.idempotency]
@@ -110,6 +112,13 @@ Closed ──(N consecutive failures)──> Open ──(window expires)──> 
   resets). Failure → Open with extended duration (capped at
   `max_open_duration_seconds`).
 
+Note: `backoff_multiplier` is applied to `initial_open_duration` (not to
+the previous open duration). With the defaults above, repeated half-open
+failures produce a constant `60s` window — not a compounding
+`30s → 60s → 120s → 240s` sequence. This is intentional: the
+per-(tenant, provider) granularity already bounds blast radius without
+requiring true exponential backoff.
+
 ### What trips the circuit
 
 The classifier trips on transient errors where waiting can help:
@@ -130,15 +139,11 @@ tenants on the same runtime.
 
 ### Observability
 
-The daemon emits a structured log event on every state transition:
-
-```
-INFO circuit_breaker state=Open tenant=acme-corp provider=anthropic
-     consecutive_failures=5 open_duration_secs=30
-INFO circuit_breaker state=HalfOpen tenant=acme-corp provider=anthropic
-INFO circuit_breaker state=Closed tenant=acme-corp provider=anthropic
-     consecutive_failures=0
-```
+Observability of circuit state transitions is not yet instrumented — state
+changes are silent today. Consumers can pattern-match on
+`Error::CircuitOpen { until, prev_duration }` (returned when permits are
+denied) for telemetry at the call site. Per-transition `tracing::` events
+inside the breaker itself are a planned follow-up.
 
 Pair with an `AgentEvent::ModelEscalated` listener (from the cascading
 provider) if you want to detect provider-level escalation before the
@@ -168,5 +173,6 @@ With these settings:
 - Duplicate client retries deduplicate at the HTTP layer — safe to retry
   `POST /v1/tasks` on timeout without double-charging.
 - A noisy tenant cannot starve others by spawning unlimited concurrent tasks.
-- A flapping LLM provider closes fast and reopens with exponential backoff
-  instead of hammering it with retries from every queued task.
+- A flapping LLM provider trips fast and stays open for a bounded window
+  per (tenant, provider) instead of being hammered by retries from every
+  queued task.
