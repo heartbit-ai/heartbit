@@ -6,7 +6,6 @@ pub mod injection;
 pub mod llm_judge;
 pub mod pii;
 pub mod secret_scanner;
-#[cfg(feature = "sensor")]
 pub mod sensor_security;
 pub mod tool_policy;
 
@@ -18,6 +17,5 @@ pub use injection::{GuardrailMode, InjectionClassifierGuardrail};
 pub use llm_judge::{LlmJudgeGuardrail, LlmJudgeGuardrailBuilder};
 pub use pii::{PiiAction, PiiDetector, PiiGuardrail};
 pub use secret_scanner::{SecretAction, SecretScannerGuardrail, SecretScannerGuardrailBuilder};
-#[cfg(feature = "sensor")]
 pub use sensor_security::SensorSecurityGuardrail;
 pub use tool_policy::{InputConstraint, ToolPolicyGuardrail, ToolRule};

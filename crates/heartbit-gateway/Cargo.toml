@@ -9,7 +9,8 @@ homepage.workspace = true
 description = "Heartbit ingestion gateway — cron, sensors, and webhooks to Kafka"
 
 [dependencies]
-heartbit = { path = "../heartbit", features = ["daemon", "sensor"] }
+heartbit = { path = "../heartbit", features = ["daemon"] }
+heartbit-sensors = { path = "../heartbit-sensors" }
 tokio = { workspace = true }
 axum = { workspace = true }
 rdkafka = { workspace = true }

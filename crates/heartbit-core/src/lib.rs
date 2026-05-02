@@ -39,15 +39,14 @@ pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
 pub use agent::guardrail::{GuardAction, Guardrail};
-#[cfg(feature = "sensor")]
-pub use agent::guardrails::SensorSecurityGuardrail;
 pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
 pub use agent::guardrails::{
     ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BehaviorRule, BehavioralMonitorGuardrail,
     BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, ContentFenceGuardrail,
     GuardrailChain, GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail,
     LlmJudgeGuardrailBuilder, PiiAction, PiiDetector, PiiGuardrail, SecretAction,
-    SecretScannerGuardrail, SecretScannerGuardrailBuilder, ToolPolicyGuardrail, WarnToDeny,
+    SecretScannerGuardrail, SecretScannerGuardrailBuilder, SensorSecurityGuardrail,
+    ToolPolicyGuardrail, WarnToDeny,
 };
 pub use agent::handoff::{HandoffRunner, HandoffRunnerBuilder, make_handoff_tool};
 pub use agent::instructions::{
