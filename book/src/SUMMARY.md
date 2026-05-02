@@ -27,6 +27,7 @@
   - [Long-running agent with persistent memory](./recipes/persistent-memory.md)
   - [Eval-driven prompt iteration](./recipes/eval-driven.md)
   - [MCP server integration](./recipes/mcp-integration.md)
+  - [Multi-tenant hardening](./recipes/multi-tenant.md)
 
 # Operations
 

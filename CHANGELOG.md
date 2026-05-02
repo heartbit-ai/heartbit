@@ -6,6 +6,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — B4 Multi-Tenant Hardening
+
+- `heartbit_core::auth::TenantScope` — owned `(tenant_id: String, user_id: Option<String>)`
+  type required by `Memory` and `AuditTrail`. Empty-string tenant is the
+  single-tenant sentinel; `new("")` and `with_user("")` normalize via code,
+  not just prose. `From<&UserContext>` builds a scope from the daemon's JWT
+  user context. `from_audit_fields(Option<&str>, Option<&str>)` is the
+  helper for code paths that already split tenant/user into separate fields.
+- `heartbit_core::sandbox::CorePathPolicy` + `CorePathPolicyBuilder` — path
+  allowlist + glob denylist shared across filesystem-touching builtins.
+  Canonicalize-first symlink defense. Always available (not Linux-gated).
+- `heartbit_core::sandbox::SandboxPolicy` (moved from the umbrella; gated
+  `target_os = "linux"` + `feature = "sandbox"`) composes a `CorePathPolicy`.
+  `from_path_policy(Arc<CorePathPolicy>)` derives Landlock read/write paths
+  from the policy's allowed dirs so bash subprocesses get kernel-level
+  enforcement out of the box.
+- `with_path_policy(Arc<CorePathPolicy>)` builder method on `BashTool`,
+  `PatchTool`, `EditTool`, `WriteTool`, `ReadTool`. The policy's
+  `check_path` is called before any I/O so denied paths return a sandbox
+  error without ever touching the filesystem.
+- `AgentRunnerBuilder::max_tool_calls_per_turn(u32)` — caps dispatched
+  tool-use blocks per LLM turn. Distinct from the existing
+  `max_tools_per_turn` (which limits *tool definitions*, a pre-filter on the
+  LLM's tool list). Excess returns `Error::Agent` wrapped in
+  `Error::WithPartialUsage`. Zero rejected at build time. Available via
+  TOML `orchestrator.max_tool_calls_per_turn` (with per-agent override) and
+  `HEARTBIT_MAX_TOOL_CALLS_PER_TURN` env var.
+- `AuditTrail::entries_since(&TenantScope, since, limit)` — windowed scoped
+  read.
+- `AuditTrail::prune(retain)` — retention DELETE. `PostgresAuditTrail`
+  implementation runs `DELETE FROM audit_log WHERE created_at < $1` against
+  the new `idx_audit_created_at` index.
+- `[sandbox]` config section: `allowed_dirs: Vec<PathBuf>`,
+  `deny_globs: Vec<String>`. CLI builds a shared `CorePathPolicy` and threads
+  it into all five filesystem builtins (and bash's `SandboxPolicy` on Linux).
+- `[daemon.audit]` config section: `retain_days`, `prune_interval_minutes`.
+  Daemon spawns a cancellation-aware background prune task. `retain_days = 0`
+  and `prune_interval_minutes = 0` rejected at config-load time. Falls back
+  to `HEARTBIT_AUDIT_RETAIN_DAYS` env var when TOML doesn't set it.
+- Postgres schema: `memories.author_tenant_id TEXT NOT NULL DEFAULT ''`,
+  `memories.author_user_id TEXT`, `audit_log.tenant_id TEXT NOT NULL DEFAULT ''`,
+  `audit_log.user_id TEXT`. Composite indexes
+  `idx_memories_author_tenant`, `idx_audit_tenant`, `idx_audit_created_at`.
+  All `ADD COLUMN IF NOT EXISTS` — idempotent, safe to re-run.
+- Multi-tenant recipe chapter in the user docs (`book/src/recipes/multi-tenant.md`).
+
+### Changed — B4 Multi-Tenant Hardening (breaking; pre-release)
+
+- `Memory` trait: every method now takes `&TenantScope` as the first
+  parameter (after `&self`). Migrate single-tenant call sites by passing
+  `&TenantScope::default()`. Daemon-mode call sites build the scope from
+  the request's `UserContext` via the `From<&UserContext>` impl.
+  `InMemoryStore`, `NamespacedMemory`, `EmbeddingMemory`, and
+  `PostgresMemoryStore` all updated. `NamespacedMemory` keeps its
+  `agent_prefix` for intra-tenant namespacing — orthogonal to the new
+  cross-tenant `TenantScope`.
+- `AuditTrail::entries()` (no args) renamed to `entries_unscoped(limit)`.
+  Callers must explicitly opt into cross-tenant visibility — `grep
+  entries_unscoped` now finds every site that crosses the tenant boundary.
+- `AuditTrail::entries_for_tenant(Option<&str>)` replaced by
+  `entries(&TenantScope, limit)` — typed instead of stringly.
+- The umbrella's `crates/heartbit/src/sandbox.rs` becomes a re-export of
+  `heartbit_core::sandbox::*`. Existing `heartbit::sandbox::SandboxPolicy`
+  imports continue to work. `heartbit::CorePathPolicy` and
+  `heartbit::CorePathPolicyBuilder` are now flat-reachable from the umbrella
+  on all platforms (previously the entire `sandbox` module was Linux+sandbox-gated).
+- `landlock` dep migrated from the umbrella's optional deps to
+  heartbit-core (under `[target.'cfg(target_os = "linux")'.dependencies]`).
+  The umbrella's `sandbox = ["dep:landlock", "heartbit-core/sandbox"]`
+  feature is now `sandbox = ["heartbit-core/sandbox"]`.
+
+### Migration notes
+
+heartbit-core is not yet on crates.io, so the `Memory` and `AuditTrail`
+trait changes are pre-release breaking — any external consumer
+(heartbit-cloud, downstream forks) needs to update call sites.
+
+Before upgrading the Postgres schema on a multi-tenant deployment, run:
+
+```sql
+SELECT count(*) FROM memories WHERE author_tenant_id IS NULL;
+SELECT count(*) FROM audit_log WHERE tenant_id IS NULL;
+```
+
+Non-zero on a multi-tenant installation means rows were written without a
+scope — the migration backfills them with the empty-string sentinel,
+making them invisible to multi-tenant queries.
+
 ### Refactor
 
 - Workspace restructured: `heartbit-core` extracted as the official Rust
