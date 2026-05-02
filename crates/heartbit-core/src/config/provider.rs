@@ -28,6 +28,10 @@ pub struct ProviderConfig {
     /// Model cascading configuration. When enabled, tries cheaper models first
     /// and escalates to the main model only when the confidence gate rejects.
     pub cascade: Option<CascadeConfig>,
+    /// Circuit breaker configuration for this provider.
+    /// When absent, sensible defaults are used (5 failures → 30 s open, max 300 s).
+    #[serde(default)]
+    pub circuit: ProviderCircuitConfig,
 }
 
 /// Model cascading configuration for cost-efficient LLM selection.
@@ -85,6 +89,46 @@ impl Default for CascadeGateConfig {
 
 fn default_min_output_tokens() -> u32 {
     5
+}
+
+/// Circuit breaker configuration for the LLM provider.
+///
+/// Controls how quickly the circuit opens on consecutive failures and how long
+/// it stays open before allowing a probe request through. All fields are optional;
+/// absent fields fall back to [`crate::llm::circuit::CircuitConfig`] defaults.
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCircuitConfig {
+    /// Number of consecutive failures before the circuit opens. Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<u32>,
+    /// Initial duration in seconds the circuit stays open after tripping. Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_open_duration_seconds: Option<u32>,
+    /// Maximum backoff duration in seconds before a half-open probe. Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_open_duration_seconds: Option<u32>,
+    /// Backoff multiplier applied after each re-trip (exponential backoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_multiplier: Option<f64>,
+}
+
+impl From<&ProviderCircuitConfig> for crate::llm::circuit::CircuitConfig {
+    fn from(c: &ProviderCircuitConfig) -> Self {
+        let default = crate::llm::circuit::CircuitConfig::default();
+        Self {
+            failure_threshold: c.failure_threshold.unwrap_or(default.failure_threshold),
+            initial_open_duration: c
+                .initial_open_duration_seconds
+                .map(|s| std::time::Duration::from_secs(u64::from(s)))
+                .unwrap_or(default.initial_open_duration),
+            max_open_duration: c
+                .max_open_duration_seconds
+                .map(|s| std::time::Duration::from_secs(u64::from(s)))
+                .unwrap_or(default.max_open_duration),
+            backoff_multiplier: c.backoff_multiplier.unwrap_or(default.backoff_multiplier),
+        }
+    }
 }
 
 /// Retry configuration for transient LLM API failures (429, 500, 502, 503, 529).

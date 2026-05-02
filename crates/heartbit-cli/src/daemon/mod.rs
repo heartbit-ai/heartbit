@@ -124,6 +124,17 @@ pub async fn run_daemon(
     // Keep a reference for background tasks that may need the store after it's moved.
     let store_for_tasks = store.clone();
 
+    // B5b: per-tenant in-flight token tracker (optional; None = unbounded)
+    let tenant_tracker: Option<Arc<heartbit::TenantTokenTracker>> = config
+        .orchestrator
+        .max_tokens_in_flight_per_tenant
+        .map(|cap| Arc::new(heartbit::TenantTokenTracker::new(cap)));
+
+    // B5b: circuit breaker tracker (always created; defaults are sensible when unconfigured)
+    let circuit_tracker: Arc<heartbit::CircuitTracker> = Arc::new(heartbit::CircuitTracker::new(
+        heartbit::CircuitConfig::from(&config.provider.circuit),
+    ));
+
     // Create DaemonCore + DaemonHandle — Kafka is optional
     let (core, handle) = if let Some(ref kafka_config) = daemon_config.kafka {
         tracing::info!("ensuring Kafka topics exist");
@@ -144,12 +155,25 @@ pub async fn run_daemon(
         } else {
             core
         };
+        // B5b: thread tenant tracker into DaemonCore for in-flight token enforcement
+        let core = if let Some(ref tracker) = tenant_tracker {
+            core.with_tenant_tracker(tracker.clone())
+        } else {
+            core
+        };
         tracing::info!("Kafka consumer/producer initialized");
         (Some(core), handle)
     } else {
         tracing::info!("no [daemon.kafka] configured — running in HTTP-only mode");
         let handle = heartbit::DaemonHandle::http_only(store);
         (None, handle)
+    };
+
+    // B5b: thread tenant tracker into DaemonHandle
+    let handle = if let Some(ref tracker) = tenant_tracker {
+        handle.with_tenant_tracker(tracker.clone())
+    } else {
+        handle
     };
 
     // Create shared memory store (one store for all execution paths)
@@ -259,6 +283,9 @@ pub async fn run_daemon(
     let state_auth_provider = runner_auth_provider.clone();
     let runner_transport_pool = transport_pool.clone();
     let runner_user_tokens = user_tokens.clone();
+    // B5b: capture trackers for per-task provider wrapping
+    let runner_circuit_tracker = circuit_tracker.clone();
+    let runner_tenant_tracker = tenant_tracker.clone();
     // Shared pending approvals map: REST endpoint writes decisions, on_approval callback reads them.
     let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let runner_pending_approvals = pending_approvals.clone();
@@ -284,6 +311,9 @@ pub async fn run_daemon(
         let task_transport_pool = runner_transport_pool.clone();
         let task_user_tokens = runner_user_tokens.clone();
         let task_pending_approvals = runner_pending_approvals.clone();
+        // B5b: capture trackers inside async block
+        let task_circuit_tracker = runner_circuit_tracker.clone();
+        let task_tenant_tracker = runner_tenant_tracker.clone();
         Box::pin(async move {
             // Wrap on_event to also record metrics
             let on_event: Arc<heartbit::OnEvent> = if let Some(ref m) = task_metrics {
@@ -299,8 +329,17 @@ pub async fn run_daemon(
             };
 
             let on_retry = build_on_retry(&on_event);
-            let provider = build_provider_from_config(&config, Some(on_retry.clone()))
+            let base_provider = build_provider_from_config(&config, Some(on_retry.clone()))
                 .map_err(|e| HeartbitError::Daemon(e.to_string()))?;
+            // B5b: wrap with circuit breaker using per-task tenant scope
+            let scope =
+                heartbit::TenantScope::from_audit_fields(tenant_id.as_deref(), user_id.as_deref());
+            let provider = crate::wrap_with_circuit(
+                base_provider,
+                task_circuit_tracker,
+                &config.provider.name,
+                scope,
+            );
 
             // Record submission and track active tasks (after provider creation to avoid gauge leak on error)
             if let Some(ref m) = task_metrics {
@@ -463,6 +502,8 @@ pub async fn run_daemon(
                 .audit_tenant_id(tenant_id.as_deref())
                 .allow_shared_write(allow_shared_write)
                 .dangerous_tools(dangerous_tools)
+                // B5b: thread tenant tracker into orchestrator/agent runner
+                .tenant_tracker(task_tenant_tracker)
                 .run()
                 .await
                 .map_err(|e| HeartbitError::Daemon(e.to_string()));

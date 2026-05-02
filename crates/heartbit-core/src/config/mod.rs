@@ -25,7 +25,8 @@ pub use memory::{
     RestateConfig, TelemetryConfig, WorkspaceConfig,
 };
 pub use provider::{
-    CascadeConfig, CascadeGateConfig, CascadeTierConfig, ProviderConfig, RetryProviderConfig,
+    CascadeConfig, CascadeGateConfig, CascadeTierConfig, ProviderCircuitConfig, ProviderConfig,
+    RetryProviderConfig,
 };
 pub use sensor::{
     SalienceConfig, SensorConfig, SensorRoutingConfig, SensorSourceConfig, StoryCorrelationConfig,
@@ -399,6 +400,28 @@ impl HeartbitConfig {
                 "provider.retry.base_delay_ms ({}) must not exceed max_delay_ms ({})",
                 retry.base_delay_ms, retry.max_delay_ms
             )));
+        }
+
+        // Validate circuit breaker config (B5b)
+        if let Some(0) = self.provider.circuit.failure_threshold {
+            return Err(Error::Config(
+                "provider.circuit.failure_threshold must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.provider.circuit.initial_open_duration_seconds {
+            return Err(Error::Config(
+                "provider.circuit.initial_open_duration_seconds must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.provider.circuit.max_open_duration_seconds {
+            return Err(Error::Config(
+                "provider.circuit.max_open_duration_seconds must be > 0".into(),
+            ));
+        }
+        if let Some(0) = self.orchestrator.max_tokens_in_flight_per_tenant {
+            return Err(Error::Config(
+                "orchestrator.max_tokens_in_flight_per_tenant must be > 0".into(),
+            ));
         }
 
         // Ensure agent names are unique
@@ -5008,5 +5031,133 @@ description = "Research specialist"
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert_eq!(config.agents[0].builtin_tools, None);
+    }
+
+    // B5b: circuit breaker + tenant tracker config tests
+    #[test]
+    fn b5b_full_config_parses() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+failure_threshold = 5
+initial_open_duration_seconds = 30
+max_open_duration_seconds = 300
+backoff_multiplier = 2.0
+
+[orchestrator]
+max_tokens_in_flight_per_tenant = 1000000
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        assert_eq!(cfg.provider.circuit.failure_threshold, Some(5));
+        assert_eq!(cfg.provider.circuit.initial_open_duration_seconds, Some(30));
+        assert_eq!(cfg.provider.circuit.max_open_duration_seconds, Some(300));
+        assert_eq!(cfg.provider.circuit.backoff_multiplier, Some(2.0));
+        assert_eq!(
+            cfg.orchestrator.max_tokens_in_flight_per_tenant,
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_failure_threshold_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+failure_threshold = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.failure_threshold must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_initial_open_duration_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+initial_open_duration_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.initial_open_duration_seconds must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_max_open_duration_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+max_open_duration_seconds = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("provider.circuit.max_open_duration_seconds must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_config_zero_max_tokens_in_flight_rejected() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[orchestrator]
+max_tokens_in_flight_per_tenant = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("orchestrator.max_tokens_in_flight_per_tenant must be > 0"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn b5b_circuit_config_from_provider_circuit_config() {
+        use crate::llm::circuit::CircuitConfig;
+        let pcc = ProviderCircuitConfig {
+            failure_threshold: Some(3),
+            initial_open_duration_seconds: Some(10),
+            max_open_duration_seconds: Some(120),
+            backoff_multiplier: Some(1.5),
+        };
+        let cc = CircuitConfig::from(&pcc);
+        assert_eq!(cc.failure_threshold, 3);
+        assert_eq!(cc.initial_open_duration, std::time::Duration::from_secs(10));
+        assert_eq!(cc.max_open_duration, std::time::Duration::from_secs(120));
+        assert_eq!(cc.backoff_multiplier, 1.5);
+    }
+
+    #[test]
+    fn b5b_circuit_config_defaults_when_absent() {
+        use crate::llm::circuit::CircuitConfig;
+        let default_cc = CircuitConfig::default();
+        let pcc = ProviderCircuitConfig::default();
+        let cc = CircuitConfig::from(&pcc);
+        assert_eq!(cc.failure_threshold, default_cc.failure_threshold);
+        assert_eq!(cc.initial_open_duration, default_cc.initial_open_duration);
+        assert_eq!(cc.max_open_duration, default_cc.max_open_duration);
+        assert_eq!(cc.backoff_multiplier, default_cc.backoff_multiplier);
     }
 }

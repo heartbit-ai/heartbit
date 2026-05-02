@@ -698,6 +698,28 @@ pub(crate) fn build_provider_from_config(
     Ok(Arc::new(wrap_with_retry(base, retry, on_retry)))
 }
 
+/// Wrap a type-erased provider with a per-(tenant, provider) circuit breaker.
+///
+/// The layering is `CircuitBreakerProvider<BoxedProvider>` — the circuit sits
+/// outside retry so a persistent failure after all retries trips the circuit.
+/// The result is re-boxed so callers keep the `Arc<BoxedProvider>` signature.
+pub(crate) fn wrap_with_circuit(
+    provider: Arc<BoxedProvider>,
+    tracker: Arc<heartbit::CircuitTracker>,
+    provider_name: &str,
+    scope: heartbit::TenantScope,
+) -> Arc<BoxedProvider> {
+    // BoxedProvider::from_arc converts Arc<BoxedProvider> → BoxedProvider (via ArcAdapter).
+    // CircuitBreakerProvider<BoxedProvider> then wraps that, and we re-box for the caller.
+    let inner = BoxedProvider::from_arc(provider);
+    Arc::new(BoxedProvider::new(heartbit::CircuitBreakerProvider::new(
+        inner,
+        tracker,
+        provider_name,
+        scope,
+    )))
+}
+
 /// Build a type-erased LLM provider for a per-agent override.
 ///
 /// Reads the API key from the environment (same as `build_provider_from_config`).
@@ -787,7 +809,25 @@ async fn run_from_config(
         None
     };
     let on_retry = on_event.as_ref().map(build_on_retry);
-    let provider = build_provider_from_config(&config, on_retry)?;
+    let base_provider = build_provider_from_config(&config, on_retry)?;
+
+    // B5b: build circuit tracker and wrap provider
+    let circuit_tracker = Arc::new(heartbit::CircuitTracker::new(
+        heartbit::CircuitConfig::from(&config.provider.circuit),
+    ));
+    let provider = wrap_with_circuit(
+        base_provider,
+        circuit_tracker,
+        &config.provider.name,
+        heartbit::TenantScope::default(),
+    );
+
+    // B5b: build tenant tracker from config
+    let tenant_tracker = config
+        .orchestrator
+        .max_tokens_in_flight_per_tenant
+        .map(|cap| Arc::new(heartbit::TenantTokenTracker::new(cap)));
+
     let on_text = streaming_callback();
     let on_approval = if approve {
         Some(approval_callback())
@@ -804,6 +844,7 @@ async fn run_from_config(
         .observability_mode(mode)
         .workspace_dir(workspace_dir)
         .dangerous_tools(true)
+        .tenant_tracker(tenant_tracker)
         .run()
         .await?;
     // Cost estimate is only accurate when all agents use the same model.
@@ -893,6 +934,8 @@ pub(crate) struct RuntimeBuilder<'a> {
     audit_tenant_id: Option<&'a str>,
     allow_shared_write: bool,
     dangerous_tools: bool,
+    /// B5b: optional tenant token tracker for in-flight token enforcement
+    tenant_tracker: Option<Arc<heartbit::TenantTokenTracker>>,
 }
 
 impl<'a> RuntimeBuilder<'a> {
@@ -924,6 +967,7 @@ impl<'a> RuntimeBuilder<'a> {
             audit_tenant_id: None,
             allow_shared_write: true,
             dangerous_tools: false,
+            tenant_tracker: None,
         }
     }
 
@@ -1022,6 +1066,11 @@ impl<'a> RuntimeBuilder<'a> {
 
     pub(crate) fn dangerous_tools(mut self, v: bool) -> Self {
         self.dangerous_tools = v;
+        self
+    }
+
+    pub(crate) fn tenant_tracker(mut self, v: Option<Arc<heartbit::TenantTokenTracker>>) -> Self {
+        self.tenant_tracker = v;
         self
     }
 
@@ -1273,6 +1322,11 @@ impl<'a> RuntimeBuilder<'a> {
                 rb = rb
                     .audit_user_context(uid, tid)
                     .audit_delegation_chain(vec![agent.name.clone()]);
+            }
+
+            // B5b: wire tenant token tracker into single-agent runner
+            if let Some(ref tracker) = self.tenant_tracker {
+                rb = rb.tenant_tracker(tracker.clone());
             }
 
             // Context strategy: agent-level, then orchestrator-level fallback
@@ -1574,6 +1628,11 @@ impl<'a> RuntimeBuilder<'a> {
             builder = builder
                 .audit_user_context(uid, tid)
                 .audit_delegation_chain(vec!["heartbit-daemon".into()]);
+        }
+
+        // B5b: wire tenant token tracker into orchestrator
+        if let Some(tracker) = self.tenant_tracker.clone() {
+            builder = builder.tenant_tracker(tracker);
         }
 
         // Wire guardrails: external (e.g., SensorSecurityGuardrail) + config-based
@@ -2334,7 +2393,24 @@ async fn run_chat_from_config(
         None
     };
     let on_retry = on_event.as_ref().map(build_on_retry);
-    let provider = build_provider_from_config(&config, on_retry)?;
+    let base_provider = build_provider_from_config(&config, on_retry)?;
+
+    // B5b: circuit breaker wrapper for chat path
+    let circuit_tracker = Arc::new(heartbit::CircuitTracker::new(
+        heartbit::CircuitConfig::from(&config.provider.circuit),
+    ));
+    let provider = wrap_with_circuit(
+        base_provider,
+        circuit_tracker,
+        &config.provider.name,
+        heartbit::TenantScope::default(),
+    );
+
+    // B5b: tenant token tracker for chat path
+    let tenant_tracker = config
+        .orchestrator
+        .max_tokens_in_flight_per_tenant
+        .map(|cap| Arc::new(heartbit::TenantTokenTracker::new(cap)));
 
     let initial = read_initial_chat_message().await?;
     let Some(initial) = initial else {
@@ -2518,6 +2594,10 @@ async fn run_chat_from_config(
         if !guardrails.is_empty() {
             builder = builder.guardrails(guardrails);
         }
+    }
+    // B5b: wire tenant token tracker into chat agent runner
+    if let Some(tracker) = tenant_tracker {
+        builder = builder.tenant_tracker(tracker);
     }
 
     let runner = builder.build()?;

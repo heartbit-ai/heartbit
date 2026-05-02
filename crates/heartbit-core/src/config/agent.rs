@@ -108,6 +108,11 @@ pub struct OrchestratorConfig {
     /// Dynamic agent spawning configuration. When present, enables the `spawn_agent`
     /// tool on the orchestrator, allowing the LLM to create specialist agents at runtime.
     pub spawn: Option<SpawnConfig>,
+    /// Per-tenant in-flight token cap for the `TenantTokenTracker`.
+    /// When `None`, in-flight token tracking is disabled (effectively unbounded).
+    /// Must be > 0 when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_in_flight_per_tenant: Option<usize>,
 }
 
 pub(super) fn default_max_turns() -> usize {
@@ -142,6 +147,7 @@ impl Default for OrchestratorConfig {
             escalation: true,
             multi_agent_prompt: None,
             spawn: None,
+            max_tokens_in_flight_per_tenant: None,
         }
     }
 }
