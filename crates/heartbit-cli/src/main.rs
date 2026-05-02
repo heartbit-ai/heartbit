@@ -3279,4 +3279,83 @@ mod tests {
         let mode = resolve_observability(Some("debug"), Some("production"), false);
         assert_eq!(mode, ObservabilityMode::Debug);
     }
+
+    /// B5b regression test: lock in the per-(tenant, provider) circuit registry
+    /// behavior that the per-agent provider override path depends on. The earlier
+    /// fix-up commit `ae00217` was needed because no test exercised the override
+    /// wiring; this test prevents the silent-regression class of bug — so the
+    /// tracker's identity invariants (same scope+provider → same Arc; different
+    /// scopes → different Arcs) are pinned even if `wrap_with_circuit` is later
+    /// refactored.
+    #[test]
+    fn wrap_with_circuit_threads_scope_and_provider_name_to_tracker() {
+        use heartbit::{
+            BoxedProvider, CircuitConfig, CircuitTracker, CompletionRequest, CompletionResponse,
+            Error as HbError, LlmProvider, OnText, TenantScope,
+        };
+
+        // Minimal stub: the test does not invoke any provider method; it only
+        // needs a value that satisfies `LlmProvider` so we can build BoxedProvider.
+        struct StubProvider;
+        impl LlmProvider for StubProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, HbError> {
+                unreachable!("stub provider must not be called from this test")
+            }
+            async fn stream_complete(
+                &self,
+                _request: CompletionRequest,
+                _on_text: &OnText,
+            ) -> Result<CompletionResponse, HbError> {
+                unreachable!("stub provider must not be called from this test")
+            }
+        }
+
+        let tracker = Arc::new(CircuitTracker::new(CircuitConfig::default()));
+        let inner: Arc<BoxedProvider> = Arc::new(BoxedProvider::new(StubProvider));
+
+        let scope_a = TenantScope::new("tenant-a");
+        let scope_b = TenantScope::new("tenant-b");
+
+        // Wrapping must succeed for distinct (scope, provider) pairs and must
+        // not panic — this is the smoke test for the helper itself.
+        let _wrapped_a = wrap_with_circuit(
+            Arc::clone(&inner),
+            Arc::clone(&tracker),
+            "anthropic",
+            scope_a.clone(),
+        );
+        let _wrapped_b = wrap_with_circuit(
+            Arc::clone(&inner),
+            Arc::clone(&tracker),
+            "anthropic",
+            scope_b.clone(),
+        );
+
+        // Same scope+provider must resolve to the SAME Arc (the registry must
+        // not create a fresh circuit per call — that would defeat shared
+        // failure tracking across the per-agent override and global paths).
+        let circuit_a1 = tracker.circuit_for(&scope_a, "anthropic");
+        let circuit_a2 = tracker.circuit_for(&scope_a, "anthropic");
+        assert!(
+            Arc::ptr_eq(&circuit_a1, &circuit_a2),
+            "same scope+provider should resolve to same circuit"
+        );
+
+        // Different scopes (multi-tenant isolation) must resolve to distinct circuits.
+        let circuit_b = tracker.circuit_for(&scope_b, "anthropic");
+        assert!(
+            !Arc::ptr_eq(&circuit_a1, &circuit_b),
+            "different scopes should resolve to different circuits"
+        );
+
+        // Different provider names within the same scope must also be distinct.
+        let circuit_a_other = tracker.circuit_for(&scope_a, "openai");
+        assert!(
+            !Arc::ptr_eq(&circuit_a1, &circuit_a_other),
+            "different provider names should resolve to different circuits"
+        );
+    }
 }

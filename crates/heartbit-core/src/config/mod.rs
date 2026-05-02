@@ -418,6 +418,17 @@ impl HeartbitConfig {
                 "provider.circuit.max_open_duration_seconds must be > 0".into(),
             ));
         }
+        // backoff_multiplier must be finite and strictly positive.
+        // - 0.0 makes record_failure's HalfOpen branch produce a zero-duration backoff (degenerate).
+        // - Negative values panic in Duration::from_secs_f64.
+        // - NaN/Inf panic in Duration::from_secs_f64.
+        if let Some(m) = self.provider.circuit.backoff_multiplier
+            && (!m.is_finite() || m <= 0.0)
+        {
+            return Err(Error::Config(
+                "provider.circuit.backoff_multiplier must be > 0 and finite".into(),
+            ));
+        }
         if let Some(0) = self.orchestrator.max_tokens_in_flight_per_tenant {
             return Err(Error::Config(
                 "orchestrator.max_tokens_in_flight_per_tenant must be > 0".into(),
@@ -5131,6 +5142,34 @@ max_tokens_in_flight_per_tenant = 0
                 .contains("orchestrator.max_tokens_in_flight_per_tenant must be > 0"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn b5b_config_invalid_backoff_multiplier_rejected() {
+        // TOML uses lowercase `nan` / `inf` literals; Rust's f64 Display formats
+        // f64::NAN as "NaN" and f64::INFINITY as "inf", so we hard-code the TOML
+        // literal forms here rather than `format!("{}", f64::NAN)`.
+        for bad in ["0.0", "-0.0", "-1.0", "nan", "inf", "-inf"] {
+            let toml = format!(
+                r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[provider.circuit]
+backoff_multiplier = {bad}
+"#
+            );
+            let err = match HeartbitConfig::from_toml(&toml) {
+                Ok(cfg) => panic!("backoff_multiplier = {bad} must be rejected, got: {cfg:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string()
+                    .contains("provider.circuit.backoff_multiplier must be > 0 and finite"),
+                "value {bad} produced unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
