@@ -1,0 +1,22 @@
+# Kafka-free daemon configuration.
+# Runs as a lightweight HTTP API using in-process channels.
+# Zero external dependencies beyond an LLM key and optional Postgres.
+#
+# Usage: heartbit daemon --config daemon-lite.toml
+
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[agents]]
+name = "assistant"
+description = "General-purpose assistant"
+system_prompt = "You are a helpful assistant."
+
+[daemon]
+bind = "0.0.0.0:8080"
+max_concurrent_tasks = 4
+# No [daemon.kafka] → uses in-process channel
+
+[daemon.metrics]
+enabled = true
