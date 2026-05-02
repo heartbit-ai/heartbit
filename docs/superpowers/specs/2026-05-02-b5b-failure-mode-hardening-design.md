@@ -44,8 +44,9 @@ Three independent components landing as three sequential commits + verification 
 ┌──────────────────────────────────────────────────────────────────┐
 │ Component 1: Idempotency keys on SubmitTask                      │
 │   DaemonCommand::SubmitTask gains idempotency_key: Option<String>│
-│   tasks table: idempotency_key TEXT + UNIQUE INDEX on            │
-│                (tenant_id, idempotency_key) WHERE NOT NULL       │
+│   daemon_tasks: tenant_id NOT NULL DEFAULT '' (B4 pattern) +     │
+│                 idempotency_key TEXT + partial UNIQUE INDEX on   │
+│                 (tenant_id, idempotency_key) WHERE NOT NULL      │
 │   Both InMemoryTaskStore + PostgresTaskStore implement lookup    │
 │   Background sweep: NULL out keys older than 24h                 │
 └──────────────────────────────────────────────────────────────────┘
@@ -69,31 +70,31 @@ Three independent components landing as three sequential commits + verification 
 
 ### Component 1: Idempotency keys on `DaemonCommand::SubmitTask`
 
-**Prerequisite: bind `tenant_id` onto `tasks`.** The current `tasks` table (verified in `crates/heartbit/src/store/postgres.rs`) has no `tenant_id` column:
-
-```
-id, status, task_input, config_name, result, error, token_usage, created_at, completed_at
-```
-
-The unique idempotency index needs a real `tenant_id` to scope against — otherwise two tenants supplying the same key collide. Component 1 therefore lands in two phases inside the same commit:
+**Target table.** The daemon stores tasks in `daemon_tasks` (managed by `PostgresTaskStore` in `crates/heartbit/src/daemon/store.rs`), **not** the older `tasks` table in `crates/heartbit/src/store/postgres.rs`. `daemon_tasks` already has a nullable `tenant_id TEXT` column from B4. Component 1 only needs to:
 
 ```sql
--- Phase A: add tenant_id column with safe default for existing rows
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
-CREATE INDEX IF NOT EXISTS idx_tasks_tenant_id ON tasks (tenant_id);
+-- Phase A: tighten tenant_id to NOT NULL DEFAULT '' (matches the B4 pattern
+-- already applied to audit_log). Backfills NULL rows to '' before the constraint flip.
+UPDATE daemon_tasks SET tenant_id = '' WHERE tenant_id IS NULL;
+ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET DEFAULT '';
+ALTER TABLE daemon_tasks ALTER COLUMN tenant_id SET NOT NULL;
 
 -- Phase B: add idempotency_key column + partial unique index
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem
-  ON tasks (tenant_id, idempotency_key)
+ALTER TABLE daemon_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daemon_tasks_idem
+  ON daemon_tasks (tenant_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 ```
 
-The `DEFAULT ''` is a backfill sentinel matching `TenantScope::default()` (single-tenant deployments serialize as the empty string today). Migration is additive — existing rows survive with `tenant_id = ''`. The partial index on Phase B then references a guaranteed-present column.
+The empty-string sentinel matches `TenantScope::default()` so single-tenant deployments remain transparent. The partial index allows multiple `NULL` values (most submissions don't supply a key) while enforcing uniqueness on `(tenant_id, key)` pairs.
 
-**`TaskStore` write path.** `create_task` and `create_task_with_idem` are extended to take `&TenantScope` and persist `scope.tenant_id` onto the row. `complete_task` and `find_by_id` continue to operate by primary key (`id`), so they don't need scope rebinding. New tenant-scoped lookups (`find_by_idempotency_key`, `find_recent_by_tenant`) take `&TenantScope` and filter by `tenant_id`.
+**`TaskStore` trait extension.** The existing `TaskStore` trait (`crates/heartbit/src/daemon/store.rs:14`) already operates on `DaemonTask` which carries `tenant_id: Option<String>`. New methods take `&TenantScope` (or `tenant_id: &str`) and the optional idempotency key:
 
-**Existing call sites.** `DaemonCore::dispatch_command` already has `scope: &TenantScope` in hand from B4's audit-logging path; threading it through to `create_task` is a single-call-site change.
+- `find_by_idempotency_key(tenant_id: &str, key: &str) -> Result<Option<DaemonTask>, Error>`
+- `insert_with_idem(task: DaemonTask) -> Result<(), Error>` — `task.idempotency_key` is set; insert may fail with `Error::Store` on unique violation.
+- `sweep_expired_idempotency_keys(cutoff: DateTime<Utc>) -> Result<usize, Error>`
+
+**Existing submission entry points.** Both `DaemonHandle::submit_task` and `DaemonHandle::submit_task_with_user` (in `crates/heartbit/src/daemon/core.rs`) construct a `DaemonTask`, call `self.store.insert(daemon_task)`, then publish `DaemonCommand::SubmitTask` to Kafka (or HTTP-only direct dispatch). They become `submit_task_with_idem(...)` aware: when an idempotency key is provided, the lookup-then-insert-or-fallback pattern below applies before the Kafka publish.
 
 **Wire format change.** `DaemonCommand::SubmitTask` (in `crates/heartbit/src/daemon/types.rs`) gains:
 
@@ -116,58 +117,60 @@ pub enum DaemonCommand {
 
 Both populate the same field on the underlying `SubmitTask` command.
 
-**Storage.** `DaemonTask` struct gets a new `idempotency_key: Option<String>` field. The schema migration (above) provides the `idempotency_key TEXT` column and the `idx_tasks_idem` partial unique index. The partial index allows multiple `NULL` values (the common case — most submissions don't supply a key) while enforcing uniqueness on `(tenant_id, key)` pairs.
+**Storage.** `DaemonTask` struct gains a new `idempotency_key: Option<String>` field (with `#[serde(default, skip_serializing_if = "Option::is_none")]`). The schema migration (above) provides the `idempotency_key TEXT` column and the `idx_daemon_tasks_idem` partial unique index.
 
-**Submission flow.** Inside `DaemonCore::handle_submit_task` (or equivalent — verify exact call site during implementation):
+**Submission flow.** Inside `DaemonHandle::submit_task_with_user` (the B4 entry point — see `crates/heartbit/src/daemon/core.rs:118-165`):
 
 ```rust
-match command.idempotency_key {
-    Some(ref key) => {
-        // Look up first
-        if let Some(existing_task) = store.find_by_idempotency_key(&scope, key)? {
-            return Ok(existing_task.id); // No execution
-        }
-        // Create with key. Unique index makes the insert atomic;
-        // a concurrent insert of the same key fails the second insert.
-        match store.create_task_with_idem(&scope, key, ...) {
-            Ok(task) => task.id,
-            Err(Error::Store(msg)) if is_unique_violation(&msg) => {
-                // Concurrent inserter won; look up and return their task id.
-                store.find_by_idempotency_key(&scope, key)?
-                    .expect("unique violation but row not found?")
-                    .id
-            }
-            Err(e) => return Err(e),
-        }
+if let Some(ref key) = idempotency_key {
+    // Look up first
+    if let Some(existing_task) = self.store.find_by_idempotency_key(&user_context.tenant_id, key)? {
+        return Ok(existing_task.id); // No second execution; no Kafka publish.
     }
-    None => {
-        // Existing path: create task without key.
-        store.create_task(...)?.id
+    // Create with key. The partial unique index makes the insert atomic;
+    // a concurrent insert of the same (tenant, key) fails the second insert.
+    let mut daemon_task = DaemonTask::new_with_user(id, &task_str, &source_str,
+        &user_context.user_id, &user_context.tenant_id);
+    daemon_task.idempotency_key = Some(key.clone());
+    match self.store.insert(daemon_task) {
+        Ok(()) => {}
+        Err(e) if is_unique_violation(&e) => {
+            // Concurrent inserter won; look up and return their task id.
+            return Ok(self.store
+                .find_by_idempotency_key(&user_context.tenant_id, key)?
+                .ok_or_else(|| Error::Daemon("unique violation but row not found".into()))?
+                .id);
+        }
+        Err(e) => return Err(e),
     }
 }
+// Then continue with the normal Kafka publish.
 ```
 
-The `is_unique_violation` helper inspects the error string for the Postgres unique-constraint signature (`SQLSTATE 23505`) — standard pattern for sqlx.
+The `is_unique_violation` helper (added in `crates/heartbit/src/daemon/store.rs`) inspects the error message for the Postgres unique-constraint signature `code: "23505"` — standard pattern for sqlx errors that have already been mapped to `Error::Daemon` / `Error::Store`.
 
-**`TaskStore` trait extension.** Add:
+**`TaskStore` trait extension.** Add to the existing trait at `crates/heartbit/src/daemon/store.rs:14`:
 
 ```rust
+/// Find a task by its (tenant_id, idempotency_key) pair. Returns `None` when no
+/// matching live row exists, OR when the row exists but its key has been
+/// nulled out by the TTL sweep.
 fn find_by_idempotency_key(
     &self,
-    scope: &TenantScope,
-    key: &str,
+    tenant_id: &str,
+    idempotency_key: &str,
 ) -> Result<Option<DaemonTask>, Error>;
 
-fn create_task_with_idem(
+/// Sweep idempotency keys older than `cutoff` by setting them to NULL.
+/// (We retain the rows themselves so callers that look up by `id` still hit.)
+/// Returns the number of rows updated.
+fn sweep_expired_idempotency_keys(
     &self,
-    scope: &TenantScope,
-    key: &str,
-    task_input: &str,
-    ...
-) -> Result<DaemonTask, Error>;
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, Error>;
 ```
 
-`InMemoryTaskStore` implements via `HashMap<(tenant_id, idempotency_key), task_id>` lookup. `PostgresTaskStore` implements via the `idx_tasks_idem` index.
+`insert` itself is reused — the `idempotency_key` field travels on `DaemonTask`. Both `InMemoryTaskStore` and `PostgresTaskStore` implement the new methods.
 
 **TTL sweep.** A background task in `DaemonCore::run` (matching the existing audit-prune pattern from B4 Task 7):
 
@@ -196,7 +199,7 @@ if let Some(ttl) = self.config.idempotency.ttl_hours {
 }
 ```
 
-`InMemoryTaskStore::sweep_expired_idempotency_keys` walks its HashMap and drops entries with `created_at < cutoff`. `PostgresTaskStore` runs `UPDATE tasks SET idempotency_key = NULL WHERE idempotency_key IS NOT NULL AND created_at < $1`.
+`InMemoryTaskStore::sweep_expired_idempotency_keys` walks its `HashMap<Uuid, DaemonTask>` and clears `idempotency_key` on entries where `created_at < cutoff`. `PostgresTaskStore` runs `UPDATE daemon_tasks SET idempotency_key = NULL WHERE idempotency_key IS NOT NULL AND created_at < $1`.
 
 **Configuration:**
 
@@ -495,39 +498,68 @@ CircuitOpen {
 },
 ```
 
-**Wrapper provider:**
+**Wrapper provider.** `CompletionRequest` does not carry tenant identity. Rather than bolting metadata onto requests, the wrapper takes the `TenantScope` at construction — each `AgentRunner` already has tenant identity (`audit_tenant_id` / `audit_user_id`) and is the natural place to build a per-runner wrapper that points at the *shared* `Arc<CircuitTracker>`:
 
 ```rust
 pub struct CircuitBreakerProvider<P: LlmProvider> {
     inner: P,
     tracker: Arc<CircuitTracker>,
     provider_name: String,
+    scope: TenantScope,
 }
 
 impl<P: LlmProvider> CircuitBreakerProvider<P> {
-    pub fn new(inner: P, tracker: Arc<CircuitTracker>, provider_name: impl Into<String>) -> Self {
-        Self { inner, tracker, provider_name: provider_name.into() }
+    pub fn new(
+        inner: P,
+        tracker: Arc<CircuitTracker>,
+        provider_name: impl Into<String>,
+        scope: TenantScope,
+    ) -> Self {
+        Self {
+            inner,
+            tracker,
+            provider_name: provider_name.into(),
+            scope,
+        }
     }
 }
 
 impl<P: LlmProvider> LlmProvider for CircuitBreakerProvider<P> {
-    fn complete(&self, request: CompletionRequest) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + '_>> {
-        let circuit = self.tracker.circuit_for(&request.tenant_scope, &self.provider_name);
-        Box::pin(async move {
-            let permit = circuit.permit()?;
-            let result = self.inner.complete(request).await;
-            match &result {
-                Ok(_) => permit.record_success(),
-                Err(e) if is_circuit_failure(e) => permit.record_failure(),
-                Err(_) => permit.record_success(), // Non-circuit-tripping errors don't count
-            }
-            result
-        })
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
+        let circuit = self.tracker.circuit_for(&self.scope, &self.provider_name);
+        let permit = circuit.permit()?;
+        let result = self.inner.complete(request).await;
+        match &result {
+            Ok(_) => permit.record_success(),
+            Err(e) if is_circuit_failure(e) => permit.record_failure(),
+            Err(_) => permit.record_success(), // Non-circuit-tripping errors don't count
+        }
+        result
     }
 
-    // ... stream_complete with same pattern ...
+    async fn stream_complete(
+        &self,
+        request: CompletionRequest,
+        on_text: &super::OnText,
+    ) -> Result<CompletionResponse, Error> {
+        let circuit = self.tracker.circuit_for(&self.scope, &self.provider_name);
+        let permit = circuit.permit()?;
+        let result = self.inner.stream_complete(request, on_text).await;
+        match &result {
+            Ok(_) => permit.record_success(),
+            Err(e) if is_circuit_failure(e) => permit.record_failure(),
+            Err(_) => permit.record_success(),
+        }
+        result
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        self.inner.model_name()
+    }
 }
 ```
+
+`CircuitTracker::circuit_for(&scope, provider)` returns an existing `Arc<ProviderCircuit>` from the inner `HashMap`, or inserts a new one with `CircuitConfig::default()` and returns the clone. The Arc-owning permit (defined above) is returned by `permit()`.
 
 **Error classification.** The `is_circuit_failure` predicate uses the existing `crate::llm::error_class::classify()` from heartbit-core:
 
@@ -653,7 +685,7 @@ Estimated total: ~37 new unit tests + ~6 Postgres integration tests (`#[ignore]`
 
 | # | Commit | Notes |
 |---|---|---|
-| 1 | `feat(daemon): idempotency keys on SubmitTask` | Schema migration in `PostgresStore::run_migration` (additive); `DaemonCommand::SubmitTask.idempotency_key` field; `TaskStore::find_by_idempotency_key` + `create_task_with_idem` + `sweep_expired_idempotency_keys` methods; both `InMemoryTaskStore` and `PostgresTaskStore` impls; HTTP API header support; daemon background sweep task. |
+| 1 | `feat(daemon): idempotency keys on SubmitTask` | Schema migration in `PostgresTaskStore::run_migration` (additive — tightens `daemon_tasks.tenant_id`, adds `idempotency_key` + partial unique index); `DaemonCommand::SubmitTask.idempotency_key` and `DaemonTask.idempotency_key` fields; `TaskStore::find_by_idempotency_key` + `sweep_expired_idempotency_keys` methods; both `InMemoryTaskStore` and `PostgresTaskStore` impls; HTTP API header support; daemon background sweep task. |
 | 2 | `feat(core): per-tenant context-overflow tracker` | `TenantTokenTracker` + `TenantTokenState` + `TokenReservation` (RAII) types; `Error::TenantOverloaded` variant; `AgentRunnerBuilder::tenant_tracker` builder; submission-time reserve + per-turn adjustment. |
 | 3 | `feat(provider): per-(tenant, provider) circuit breaker` | `CircuitTracker` + `ProviderCircuit` + `CircuitState` + `CircuitConfig` + `CircuitPermit` types; `Error::CircuitOpen` variant; `CircuitBreakerProvider<P>` wrapper; CLI wiring. |
 | — | Verification matrix | Cross-feature builds + new unit tests + (optional) Postgres integration tests. |
