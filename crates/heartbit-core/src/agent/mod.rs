@@ -22,6 +22,7 @@ pub mod prompts;
 pub mod pruner;
 pub mod routing;
 mod runner;
+pub mod tenant_tracker;
 pub mod token_estimator;
 pub mod tool_filter;
 pub mod voting;

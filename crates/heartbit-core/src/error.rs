@@ -71,6 +71,13 @@ pub enum Error {
     #[error("Sandbox violation: {0}")]
     Sandbox(String),
 
+    #[error("tenant {tenant_id} overloaded: in_flight={in_flight}, cap={cap}")]
+    TenantOverloaded {
+        tenant_id: String,
+        in_flight: usize,
+        cap: usize,
+    },
+
     /// Wraps another error with partial token usage accumulated before failure.
     /// Used by `AgentRunner::execute` to surface tokens consumed before an error.
     #[error("{source}")]

@@ -64,6 +64,7 @@ pub use agent::routing::{
     AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,
     RoutingStrategy, TaskComplexityAnalyzer, resolve_routing_mode, should_escalate,
 };
+pub use agent::tenant_tracker::{TenantTokenState, TenantTokenTracker, TokenReservation};
 pub use agent::tool_filter::ToolProfile;
 pub use agent::voting::{VoteResult, VotingAgent, VotingAgentBuilder};
 pub use agent::workflow::{
