@@ -499,6 +499,7 @@ mod tests {
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
             audit: crate::config::DaemonAuditConfig::default(),
+            idempotency: crate::config::IdempotencyConfig::default(),
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =

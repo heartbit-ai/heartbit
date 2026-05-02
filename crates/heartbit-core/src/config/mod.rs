@@ -12,8 +12,8 @@ pub use agent::{
 };
 pub use daemon::{
     ActiveHoursConfig, AuthConfig, DaemonAuditConfig, DaemonConfig, DaemonMcpServerConfig,
-    DaemonMemoryConfig, HeartbitPulseConfig, KafkaConfig, MetricsConfig, ScheduleEntry,
-    TokenExchangeConfig, WsConfig,
+    DaemonMemoryConfig, HeartbitPulseConfig, IdempotencyConfig, KafkaConfig, MetricsConfig,
+    ScheduleEntry, TokenExchangeConfig, WsConfig,
 };
 pub use guardrails::{
     ActionBudgetConfig, ActionBudgetRuleConfig, BehavioralConfig, BehavioralRuleConfig,
@@ -606,6 +606,16 @@ impl HeartbitConfig {
             if daemon.audit.retain_days == Some(0) {
                 return Err(Error::Config(
                     "daemon.audit.retain_days must be at least 1 if set".into(),
+                ));
+            }
+            if daemon.idempotency.ttl_hours == Some(0) {
+                return Err(Error::Config(
+                    "daemon.idempotency.ttl_hours must be at least 1 if set".into(),
+                ));
+            }
+            if daemon.idempotency.sweep_interval_minutes == Some(0) {
+                return Err(Error::Config(
+                    "daemon.idempotency.sweep_interval_minutes must be at least 1 if set".into(),
                 ));
             }
             if let Some(ref kafka) = daemon.kafka {
@@ -2873,6 +2883,59 @@ retain_days = 0
 "#;
         let err = HeartbitConfig::from_toml(toml).unwrap_err();
         assert!(err.to_string().contains("retain_days"), "error: {err}");
+    }
+
+    #[test]
+    fn idempotency_config_defaults_are_none() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+"#;
+        let cfg = HeartbitConfig::from_toml(toml).unwrap();
+        let daemon = cfg.daemon.unwrap();
+        assert!(daemon.idempotency.ttl_hours.is_none());
+        assert!(daemon.idempotency.sweep_interval_minutes.is_none());
+    }
+
+    #[test]
+    fn config_rejects_zero_idempotency_ttl_hours() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.idempotency]
+ttl_hours = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(err.to_string().contains("ttl_hours"), "error: {err}");
+    }
+
+    #[test]
+    fn config_rejects_zero_idempotency_sweep_interval() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.idempotency]
+sweep_interval_minutes = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("sweep_interval_minutes"),
+            "error: {err}"
+        );
     }
 
     // --- Permission Rules Config Tests ---

@@ -15,7 +15,7 @@ use crate::agent::AgentOutput;
 use crate::agent::events::AgentEvent;
 #[cfg(feature = "postgres")]
 use crate::config::DaemonAuditConfig;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, IdempotencyConfig};
 #[cfg(feature = "postgres")]
 use crate::store::PostgresStore;
 
@@ -448,6 +448,8 @@ pub struct DaemonCore {
     /// Audit retention configuration (TOML-driven; env var fallback in `run`).
     #[cfg(feature = "postgres")]
     audit_config: DaemonAuditConfig,
+    /// Idempotency-key TTL sweep configuration.
+    idempotency_config: IdempotencyConfig,
     semaphore: Arc<Semaphore>,
     event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
     task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
@@ -483,6 +485,7 @@ impl DaemonCore {
             postgres_store: None,
             #[cfg(feature = "postgres")]
             audit_config: config.audit.clone(),
+            idempotency_config: config.idempotency.clone(),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
             task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -595,6 +598,45 @@ impl DaemonCore {
                     );
                 }
             }
+        }
+
+        // B5b: idempotency-key TTL sweep task.
+        // Operates through the TaskStore trait — no cfg gate needed.
+        if let Some(ttl_hours) = self.idempotency_config.ttl_hours {
+            let store = self.store.clone();
+            let cancel = self.cancel.clone();
+            let interval_min = self.idempotency_config.sweep_interval_minutes.unwrap_or(60);
+            let interval = std::time::Duration::from_secs(u64::from(interval_min) * 60);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await; // skip immediate fire
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("idempotency sweep: cancellation received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            let cutoff = chrono::Utc::now()
+                                - chrono::Duration::hours(i64::from(ttl_hours));
+                            match store.sweep_expired_idempotency_keys(cutoff) {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(swept = n, "idempotency keys expired")
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "idempotency sweep failed")
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                ttl_hours,
+                interval_minutes = interval_min,
+                "idempotency key TTL sweep task spawned"
+            );
         }
 
         use futures::StreamExt;
@@ -861,6 +903,7 @@ mod tests {
             auth: None,
             memory: crate::config::DaemonMemoryConfig::default(),
             audit: crate::config::DaemonAuditConfig::default(),
+            idempotency: crate::config::IdempotencyConfig::default(),
         }
     }
 

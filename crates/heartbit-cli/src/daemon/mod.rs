@@ -121,6 +121,9 @@ pub async fn run_daemon(
     // Create cancellation token
     let cancel = CancellationToken::new();
 
+    // Keep a reference for background tasks that may need the store after it's moved.
+    let store_for_tasks = store.clone();
+
     // Create DaemonCore + DaemonHandle — Kafka is optional
     let (core, handle) = if let Some(ref kafka_config) = daemon_config.kafka {
         tracing::info!("ensuring Kafka topics exist");
@@ -568,6 +571,50 @@ pub async fn run_daemon(
                 "audit retention prune task started (HTTP-only mode)"
             );
         }
+    }
+
+    // B5b: idempotency-key TTL sweep task (HTTP-only mode).
+    // In Kafka mode, DaemonCore::run handles this.
+    if core.is_none()
+        && let Some(ttl_hours) = daemon_config.idempotency.ttl_hours
+    {
+        let sweep_store = store_for_tasks.clone();
+        let cancel_sweep = cancel.clone();
+        let interval_min = daemon_config
+            .idempotency
+            .sweep_interval_minutes
+            .unwrap_or(60);
+        let interval = std::time::Duration::from_secs(u64::from(interval_min) * 60);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // skip immediate fire
+            loop {
+                tokio::select! {
+                    _ = cancel_sweep.cancelled() => {
+                        tracing::info!("idempotency sweep: cancellation received, exiting");
+                        break;
+                    }
+                    _ = tick.tick() => {
+                        let cutoff = chrono::Utc::now()
+                            - chrono::Duration::hours(i64::from(ttl_hours));
+                        match sweep_store.sweep_expired_idempotency_keys(cutoff) {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(swept = n, "idempotency keys expired")
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "idempotency sweep failed")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            ttl_hours,
+            interval_minutes = interval_min,
+            "idempotency key TTL sweep task started (HTTP-only mode)"
+        );
     }
 
     // Start HTTP server

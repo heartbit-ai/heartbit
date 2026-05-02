@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{MatchedPath, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json};
@@ -113,10 +113,17 @@ pub(crate) async fn mcp_tools_for_user(
 // --- Handlers ---
 
 pub(crate) async fn handle_submit(
+    headers: HeaderMap,
     State(state): State<AppState>,
     user_context: Option<axum::Extension<UserContext>>,
     Json(body): Json<SubmitRequest>,
 ) -> impl IntoResponse {
+    // Header takes precedence over body field (RFC 8472 convention).
+    let idempotency_key: Option<String> = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| body.idempotency_key.clone());
     // Resolve user context: JWT middleware takes precedence; fall back to body user_context
     // (used when the caller authenticates with a service API key, e.g. CRM->Heartbit).
     let body_ctx: Option<UserContext> = user_context
@@ -162,7 +169,13 @@ pub(crate) async fn handle_submit(
         }
         state
             .handle
-            .submit_task_with_user(task_text, "api", body.story_id, ctx)
+            .submit_task_with_user_idem(
+                task_text,
+                "api",
+                body.story_id,
+                ctx,
+                idempotency_key.as_deref(),
+            )
             .await
     } else {
         state
