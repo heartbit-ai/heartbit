@@ -78,9 +78,29 @@ impl TenantTokenTracker {
         })
     }
 
+    /// Adjust the in-flight token count for `scope` by `delta` (signed).
+    ///
+    /// Used by `AgentRunner` after each LLM response to reconcile the
+    /// initial estimate with actual usage. Best-effort:
+    /// - Positive deltas are silently **clamped at `per_tenant_cap`** to
+    ///   avoid the per-turn caller having to handle a "we already accepted
+    ///   this work" error mid-task. The clamp is intentional accounting
+    ///   drift: if a tenant overshoots its cap during execution, the
+    ///   tracker reports `in_flight == cap` rather than the true usage.
+    ///   Subsequent `reserve()` calls will see the clamped value and
+    ///   gate accordingly.
+    /// - Negative deltas saturate at 0.
+    /// - No-op on poisoned lock (logged via `tracing::warn!`) or unknown tenant.
     pub fn adjust(&self, scope: &TenantScope, delta: i64) {
-        let Ok(mut guard) = self.states.write() else {
-            return;
+        let mut guard = match self.states.write() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!(
+                    tenant_id = %scope.tenant_id,
+                    "token tracker poisoned during adjust; skipping reconciliation"
+                );
+                return;
+            }
         };
         let Some(state) = guard.get_mut(&scope.tenant_id) else {
             return;
@@ -91,7 +111,11 @@ impl TenantTokenTracker {
                 .saturating_add(delta as usize)
                 .min(self.per_tenant_cap);
         } else {
-            state.in_flight = state.in_flight.saturating_sub((-delta) as usize);
+            // `i64::unsigned_abs()` returns `u64` and handles `i64::MIN`
+            // correctly; `-i64::MIN` would otherwise overflow.
+            state.in_flight = state
+                .in_flight
+                .saturating_sub(delta.unsigned_abs() as usize);
         }
         if state.in_flight > state.high_water {
             state.high_water = state.in_flight;
@@ -188,7 +212,9 @@ mod tests {
         let t = Arc::new(TenantTokenTracker::new(1000));
         let _r = t.reserve(&scope("a"), 500).unwrap();
         t.adjust(&scope("a"), 800);
-        assert_eq!(t.snapshot()[0].1.in_flight, 1000); // clamped
+        let snap = t.snapshot();
+        assert_eq!(snap[0].1.in_flight, 1000); // clamped
+        assert_eq!(snap[0].1.high_water, 1000);
     }
 
     #[test]
@@ -197,6 +223,14 @@ mod tests {
         let _r = t.reserve(&scope("a"), 500).unwrap();
         t.adjust(&scope("a"), -200);
         assert_eq!(t.snapshot()[0].1.in_flight, 300);
+    }
+
+    #[test]
+    fn adjust_negative_i64_min_does_not_panic() {
+        let t = Arc::new(TenantTokenTracker::new(1000));
+        let _r = t.reserve(&scope("a"), 500).unwrap();
+        t.adjust(&scope("a"), i64::MIN); // must not panic in debug
+        assert_eq!(t.snapshot()[0].1.in_flight, 0);
     }
 
     #[tokio::test]
