@@ -1077,9 +1077,10 @@ impl<'a> RuntimeBuilder<'a> {
         if let Some(ref base_memory) = base_memory
             && let Some(sid) = self.story_id
         {
+            let scope = TenantScope::from_audit_fields(self.audit_tenant_id, self.audit_user_id);
             let prior = base_memory
                 .recall(
-                    &TenantScope::default(),
+                    &scope,
                     MemoryQuery {
                         limit: 10,
                         agent_prefix: Some(sid.to_string()),

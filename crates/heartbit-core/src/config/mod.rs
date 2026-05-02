@@ -603,6 +603,11 @@ impl HeartbitConfig {
                     "daemon.audit.prune_interval_minutes must be at least 1".into(),
                 ));
             }
+            if daemon.audit.retain_days == Some(0) {
+                return Err(Error::Config(
+                    "daemon.audit.retain_days must be at least 1 if set".into(),
+                ));
+            }
             if let Some(ref kafka) = daemon.kafka {
                 if kafka.brokers.is_empty() {
                     return Err(Error::Config(
@@ -2851,6 +2856,23 @@ prune_interval_minutes = 0
             err.to_string().contains("prune_interval_minutes"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn config_rejects_zero_retain_days() {
+        let toml = r#"
+[provider]
+name = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[daemon]
+bind = "127.0.0.1:3000"
+
+[daemon.audit]
+retain_days = 0
+"#;
+        let err = HeartbitConfig::from_toml(toml).unwrap_err();
+        assert!(err.to_string().contains("retain_days"), "error: {err}");
     }
 
     // --- Permission Rules Config Tests ---

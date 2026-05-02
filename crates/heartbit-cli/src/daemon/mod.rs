@@ -519,6 +519,57 @@ pub async fn run_daemon(
             Arc::new(validator)
         });
 
+    // In HTTP-only mode, spawn the audit retention prune task here.
+    // (DaemonCore::run handles the Kafka-mode case.)
+    if core.is_none()
+        && let Some(ref pool) = db_pool
+    {
+        let retain_days = daemon_config
+            .audit
+            .retain_days
+            .or_else(|| {
+                std::env::var("HEARTBIT_AUDIT_RETAIN_DAYS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .filter(|&d| d > 0);
+        let interval_minutes = daemon_config
+            .audit
+            .prune_interval_minutes
+            .filter(|&m| m > 0)
+            .unwrap_or(60);
+
+        if let Some(days) = retain_days {
+            let store = std::sync::Arc::new(PostgresStore::new(pool.clone()));
+            let cancel_prune = cancel.clone();
+            let retain = chrono::Duration::days(days as i64);
+            let interval = std::time::Duration::from_secs(interval_minutes * 60);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = cancel_prune.cancelled() => {
+                            tracing::info!("audit prune task: cancellation received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            match store.prune_audit(retain).await {
+                                Ok(n) => tracing::info!(removed = n, "audit retention prune"),
+                                Err(e) => tracing::warn!(error = %e, "audit prune failed"),
+                            }
+                        }
+                    }
+                }
+            });
+            tracing::info!(
+                retain_days = days,
+                interval_minutes = interval_minutes,
+                "audit retention prune task started (HTTP-only mode)"
+            );
+        }
+    }
+
     // Start HTTP server
     let app_state = AppState {
         handle,

@@ -229,6 +229,8 @@ impl PostgresMemoryStore {
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_tenant_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS author_user_id TEXT",
             "CREATE INDEX IF NOT EXISTS idx_memories_author_tenant ON memories(author_tenant_id)",
+            // Composite index for tenant-scoped agent-recall ordered by recency.
+            "CREATE INDEX IF NOT EXISTS idx_memories_tenant_agent_created ON memories(author_tenant_id, agent, created_at DESC)",
         ];
 
         for stmt in statements {

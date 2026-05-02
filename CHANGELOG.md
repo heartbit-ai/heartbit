@@ -47,9 +47,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to `HEARTBIT_AUDIT_RETAIN_DAYS` env var when TOML doesn't set it.
 - Postgres schema: `memories.author_tenant_id TEXT NOT NULL DEFAULT ''`,
   `memories.author_user_id TEXT`, `audit_log.tenant_id TEXT NOT NULL DEFAULT ''`,
-  `audit_log.user_id TEXT`. Composite indexes
-  `idx_memories_author_tenant`, `idx_audit_tenant`, `idx_audit_created_at`.
-  All `ADD COLUMN IF NOT EXISTS` — idempotent, safe to re-run.
+  `audit_log.user_id TEXT`. Indexes — single-column on `tenant_id` and
+  `created_at` for the most common scoped/retention paths
+  (`idx_audit_tenant`, `idx_audit_created_at`, `idx_memories_author_tenant`)
+  plus composite indexes `(tenant_id, created_at DESC)` on `audit_log` and
+  `(author_tenant_id, agent, created_at DESC)` on `memories` for the
+  scoped-recall query shapes. All `ADD COLUMN IF NOT EXISTS` — idempotent,
+  safe to re-run.
 - Multi-tenant recipe chapter in the user docs (`book/src/recipes/multi-tenant.md`).
 
 ### Changed — B4 Multi-Tenant Hardening (breaking; pre-release)

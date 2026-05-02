@@ -139,6 +139,9 @@ impl PostgresStore {
             "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id)",
             // idx_audit_created_at is required by prune_audit's DELETE to avoid full table scans.
             "CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_log(created_at)",
+            // Composite index for the most common scoped-retention query shape:
+            // tenant-scoped recall ordered by recency.
+            "CREATE INDEX IF NOT EXISTS idx_audit_tenant_created ON audit_log(tenant_id, created_at DESC)",
         ];
         for stmt in statements {
             sqlx::query(stmt)
@@ -279,15 +282,35 @@ impl PostgresStore {
         Ok(entries.into_iter().map(|e| e.into()).collect())
     }
 
-    /// Delete audit_log rows older than `now - retain`. Returns the number of rows deleted.
+    /// Delete audit_log rows older than `now - retain`. Returns the total number of rows deleted.
+    ///
+    /// Rows are deleted in batches of 10 000 with a 50 ms yield between chunks so that
+    /// the DELETE transactions stay short and avoid long-running exclusive locks on large
+    /// audit tables.
     pub async fn prune_audit(&self, retain: chrono::Duration) -> Result<usize, Error> {
         let cutoff = chrono::Utc::now() - retain;
-        let result = sqlx::query("DELETE FROM audit_log WHERE created_at < $1")
+        let mut total_removed = 0usize;
+        loop {
+            let result = sqlx::query(
+                "DELETE FROM audit_log WHERE id IN (
+                     SELECT id FROM audit_log WHERE created_at < $1 LIMIT 10000
+                 )",
+            )
             .bind(cutoff)
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Store(format!("failed to prune audit log: {e}")))?;
-        Ok(result.rows_affected() as usize)
+
+            let removed = result.rows_affected() as usize;
+            total_removed += removed;
+            if removed < 10000 {
+                // Last batch was partial — no more rows to delete.
+                break;
+            }
+            // Yield to other writers between chunks.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(total_removed)
     }
 }
 
