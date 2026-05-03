@@ -1,3 +1,6 @@
+//! Memory consolidation pipeline — clusters and merges episodic memories into semantic summaries.
+
+#![allow(missing_docs)]
 use std::collections::HashSet;
 use std::sync::Arc;
 

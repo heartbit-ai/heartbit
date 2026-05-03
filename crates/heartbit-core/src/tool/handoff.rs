@@ -4,6 +4,7 @@
 //! transfer to a different agent. The `HandoffRunner` detects this sentinel
 //! output and routes the conversation accordingly.
 
+#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 

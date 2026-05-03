@@ -1,3 +1,5 @@
+//! Anthropic Claude LLM provider with SSE streaming, prompt caching, and tool use.
+
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
@@ -13,6 +15,7 @@ use crate::llm::types::{
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 
+/// Anthropic Claude LLM provider (Messages API).
 pub struct AnthropicProvider {
     client: Client,
     api_key: String,
@@ -21,6 +24,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Create a new Anthropic provider with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: Client::new(),

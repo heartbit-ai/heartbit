@@ -1,3 +1,5 @@
+//! MCP (Model Context Protocol) client for connecting to external tool servers.
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -1572,12 +1574,10 @@ fn sanitize_tool_name(name: &str) -> String {
         .collect()
 }
 
-/// Client for the Model Context Protocol (MCP).
-///
-/// Connects to an MCP server via Streamable HTTP or stdio, performs the
-/// handshake, discovers tools/resources/prompts, and produces `Vec<Arc<dyn Tool>>`
-/// that plug into `AgentRunnerBuilder::tools()`.
 /// A root directory exposed to MCP servers via the `roots` capability.
+///
+/// Roots allow the client to advertise local directories to the MCP server
+/// so it can resolve relative URIs and restrict filesystem access.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpRoot {
     pub uri: String,
@@ -1585,6 +1585,11 @@ pub struct McpRoot {
     pub name: Option<String>,
 }
 
+/// Client for the Model Context Protocol (MCP).
+///
+/// Connects to an MCP server via Streamable HTTP or stdio, performs the
+/// handshake, discovers tools/resources/prompts, and produces `Vec<Arc<dyn Tool>>`
+/// that plug into `AgentRunnerBuilder::tools()`.
 pub struct McpClient {
     transport: Arc<Transport>,
     tools: Vec<McpToolDef>,

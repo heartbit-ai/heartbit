@@ -9,6 +9,7 @@
 //! Resolution happens at the config boundary (before agent construction).
 //! All downstream code sees a fully materialized `AgentConfig`.
 
+#![allow(missing_docs)]
 mod merge;
 pub mod registry;
 pub mod skills;
@@ -22,8 +23,10 @@ use crate::config::AgentConfig;
 use crate::error::Error;
 
 /// Template metadata.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TemplateMeta {
+    /// Human-readable description of this template.
     pub description: String,
     #[serde(default = "default_version")]
     pub version: String,
@@ -40,6 +43,7 @@ fn default_version() -> String {
 
 /// A partial agent config where all fields are optional.
 /// Used for template defaults that can be overridden by user config.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartialAgentConfig {
     pub system_prompt: Option<String>,

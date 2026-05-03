@@ -5,6 +5,7 @@
 //! - **Tier 2**: Agent capability matching (< 1ms, zero LLM calls)
 //! - **Tier 3**: Runtime escalation on failure (zero upfront overhead)
 
+#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
 use super::events::AgentEvent;

@@ -1,3 +1,6 @@
+//! Session management for WebSocket-connected agent interactions.
+
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::RwLock;
 

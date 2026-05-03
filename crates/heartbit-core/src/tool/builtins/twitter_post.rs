@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
@@ -47,14 +48,29 @@ pub struct TwitterPostTool {
 }
 
 impl TwitterPostTool {
+    /// Create a `TwitterPostTool` with the given credentials.
+    ///
+    /// Panics if the HTTP client cannot be built. Use [`TwitterPostTool::try_new`]
+    /// if you need to handle the error.
     pub fn new(credentials: TwitterCredentials) -> Self {
-        Self {
+        Self::try_new(credentials).expect("failed to build reqwest client")
+    }
+
+    /// Create a `TwitterPostTool` with the given credentials, returning `Err` on failure.
+    ///
+    /// Returns `Err` if the underlying HTTP client cannot be constructed
+    /// (e.g., TLS initialisation failure).
+    pub fn try_new(credentials: TwitterCredentials) -> Result<Self, crate::error::Error> {
+        let client = crate::http::vendor_client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                crate::error::Error::Agent(format!("failed to build reqwest client: {e}"))
+            })?;
+        Ok(Self {
             credentials,
-            client: crate::http::vendor_client_builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("failed to build reqwest client"),
-        }
+            client,
+        })
     }
 }
 

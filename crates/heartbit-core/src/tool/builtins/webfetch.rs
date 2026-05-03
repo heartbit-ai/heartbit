@@ -20,8 +20,21 @@ pub struct WebFetchTool {
 impl WebFetchTool {
     /// Construct with `IpPolicy::default()` — `Strict` unless
     /// `HEARTBIT_ALLOW_PRIVATE_IPS=1` is set in the environment.
+    ///
+    /// Panics if the HTTP client cannot be built. Use [`WebFetchTool::try_new`]
+    /// if you need to handle the error.
     pub fn new() -> Self {
-        Self::with_ip_policy(crate::http::IpPolicy::default())
+        Self::try_with_ip_policy(crate::http::IpPolicy::default())
+            .expect("failed to build reqwest client")
+    }
+
+    /// Construct with `IpPolicy::default()`, returning `Err` on failure.
+    ///
+    /// Returns `Err` if the underlying HTTP client cannot be constructed
+    /// (e.g., TLS initialisation failure).
+    #[allow(dead_code)]
+    pub fn try_new() -> Result<Self, crate::error::Error> {
+        Self::try_with_ip_policy(crate::http::IpPolicy::default())
     }
 
     /// Construct with an explicit IP policy.
@@ -29,14 +42,27 @@ impl WebFetchTool {
     /// Use `IpPolicy::AllowPrivate` only for single-tenant / dev
     /// deployments where the agent legitimately needs to access internal
     /// services.
+    ///
+    /// Panics if the HTTP client cannot be built. Use [`WebFetchTool::try_with_ip_policy`]
+    /// if you need to handle the error.
+    #[allow(dead_code)]
     pub fn with_ip_policy(ip_policy: crate::http::IpPolicy) -> Self {
-        Self {
-            client: crate::http::safe_client_builder()
-                .user_agent("heartbit/0.1")
-                .build()
-                .expect("failed to build reqwest client"),
-            ip_policy,
-        }
+        Self::try_with_ip_policy(ip_policy).expect("failed to build reqwest client")
+    }
+
+    /// Construct with an explicit IP policy, returning `Err` on failure.
+    ///
+    /// Returns `Err` if the underlying HTTP client cannot be constructed.
+    pub fn try_with_ip_policy(
+        ip_policy: crate::http::IpPolicy,
+    ) -> Result<Self, crate::error::Error> {
+        let client = crate::http::safe_client_builder()
+            .user_agent("heartbit/0.1")
+            .build()
+            .map_err(|e| {
+                crate::error::Error::Agent(format!("failed to build reqwest client: {e}"))
+            })?;
+        Ok(Self { client, ip_policy })
     }
 }
 

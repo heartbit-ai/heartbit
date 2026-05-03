@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

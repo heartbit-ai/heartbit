@@ -1,3 +1,5 @@
+//! Sensor-triggered security guardrail — enforces topic boundaries during sensor-activated sessions.
+
 use std::future::Future;
 use std::pin::Pin;
 
@@ -109,6 +111,7 @@ pub struct SensorSecurityGuardrail {
 }
 
 impl SensorSecurityGuardrail {
+    /// Create a sensor security guardrail for the given `source` with `trust_level`.
     pub fn new(
         source: impl Into<String>,
         trust_level: TrustLevel,

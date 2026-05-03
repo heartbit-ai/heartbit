@@ -925,7 +925,6 @@ pub(crate) struct RuntimeBuilder<'a> {
     on_question: Option<Arc<OnQuestion>>,
     external_memory: Option<Arc<dyn Memory>>,
     workspace_dir: Option<std::path::PathBuf>,
-    daemon_todo_store: Option<Arc<heartbit::FileTodoStore>>,
     pre_loaded_tools: Option<&'a HashMap<String, Vec<Arc<dyn Tool>>>>,
     content_blocks: Option<Vec<heartbit::ContentBlock>>,
     guardrails: Vec<Arc<dyn heartbit::Guardrail>>,
@@ -960,7 +959,6 @@ impl<'a> RuntimeBuilder<'a> {
             on_question: None,
             external_memory: None,
             workspace_dir: None,
-            daemon_todo_store: None,
             pre_loaded_tools: None,
             content_blocks: None,
             guardrails: vec![],
@@ -1008,12 +1006,6 @@ impl<'a> RuntimeBuilder<'a> {
 
     pub(crate) fn workspace_dir(mut self, v: Option<std::path::PathBuf>) -> Self {
         self.workspace_dir = v;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn daemon_todo_store(mut self, v: Option<Arc<heartbit::FileTodoStore>>) -> Self {
-        self.daemon_todo_store = v;
         self
     }
 
@@ -1100,21 +1092,14 @@ impl<'a> RuntimeBuilder<'a> {
 
         // Create shared built-in tools (FileTracker, TodoStore shared across all agents).
         let builtins = {
-            #[allow(unused_mut)]
-            let mut btc = BuiltinToolsConfig {
-                on_question: self
-                    .on_question
-                    .clone()
-                    .or_else(|| Some(question_callback())),
-                workspace: self.workspace_dir.clone(),
-                dangerous_tools: self.dangerous_tools,
-                path_policy: path_policy.clone(),
-                ..Default::default()
-            };
-            #[cfg(feature = "daemon")]
-            {
-                btc.daemon_todo_store = self.daemon_todo_store;
-            }
+            let mut btc = BuiltinToolsConfig::default();
+            btc.on_question = self
+                .on_question
+                .clone()
+                .or_else(|| Some(question_callback()));
+            btc.workspace = self.workspace_dir.clone();
+            btc.dangerous_tools = self.dangerous_tools;
+            btc.path_policy = path_policy.clone();
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             if let Some(ref pp) = path_policy {
                 btc.sandbox_policy =
@@ -2199,12 +2184,10 @@ async fn run_default_agent(
     workspace_dir: Option<PathBuf>,
 ) -> Result<AgentOutput> {
     let mut tools = {
-        let btc = BuiltinToolsConfig {
-            on_question: Some(question_callback()),
-            workspace: workspace_dir.clone(),
-            dangerous_tools: true, // CLI mode: enable bash for backward compat
-            ..Default::default()
-        };
+        let mut btc = BuiltinToolsConfig::default();
+        btc.on_question = Some(question_callback());
+        btc.workspace = workspace_dir.clone();
+        btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
         builtin_tools(btc)
     };
 
@@ -2456,14 +2439,11 @@ async fn run_chat_from_config(
 
     // Load MCP + A2A tools from all configured agents
     let mut tools = {
-        #[allow(unused_mut)]
-        let mut btc = BuiltinToolsConfig {
-            on_question: Some(question_callback()),
-            workspace: workspace_dir.clone(),
-            dangerous_tools: true, // CLI mode: enable bash for backward compat
-            path_policy: path_policy.clone(),
-            ..Default::default()
-        };
+        let mut btc = BuiltinToolsConfig::default();
+        btc.on_question = Some(question_callback());
+        btc.workspace = workspace_dir.clone();
+        btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
+        btc.path_policy = path_policy.clone();
         #[cfg(all(target_os = "linux", feature = "sandbox"))]
         if let Some(ref pp) = path_policy {
             btc.sandbox_policy = Some(heartbit::SandboxPolicy::from_path_policy(Arc::clone(pp)));
@@ -2668,12 +2648,10 @@ async fn run_chat_from_env(
     let workspace_dir = provision_workspace(&ws_root);
 
     let mut tools = {
-        let btc = BuiltinToolsConfig {
-            on_question: Some(question_callback()),
-            workspace: workspace_dir.clone(),
-            dangerous_tools: true, // CLI mode: enable bash for backward compat
-            ..Default::default()
-        };
+        let mut btc = BuiltinToolsConfig::default();
+        btc.on_question = Some(question_callback());
+        btc.workspace = workspace_dir.clone();
+        btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
         builtin_tools(btc)
     };
     if let Ok(servers) = std::env::var("HEARTBIT_MCP_SERVERS") {

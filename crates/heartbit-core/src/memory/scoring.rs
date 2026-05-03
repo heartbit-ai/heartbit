@@ -1,3 +1,5 @@
+//! Composite memory recall scoring — recency, importance, relevance, and Ebbinghaus strength.
+
 use chrono::{DateTime, Utc};
 
 /// Weights for composite memory scoring (Park et al., 2023).

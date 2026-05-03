@@ -1,3 +1,5 @@
+//! Sensor pipeline configuration types.
+#![allow(missing_docs)]
 use serde::Deserialize;
 
 use super::SensorModality;

@@ -1,3 +1,6 @@
+//! Built-in agent tool implementations — filesystem I/O, web, code execution, search, and more.
+
+#![allow(missing_docs)]
 mod bash;
 mod edit;
 mod file_tracker;
@@ -110,6 +113,7 @@ pub enum ToolRisk {
 }
 
 /// Configuration for creating built-in tools.
+#[non_exhaustive]
 pub struct BuiltinToolsConfig {
     pub file_tracker: Arc<FileTracker>,
     pub todo_store: Arc<TodoStore>,
@@ -124,8 +128,6 @@ pub struct BuiltinToolsConfig {
     /// Landlock filesystem sandbox policy for bash (Linux only).
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     pub sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
-    #[cfg(feature = "daemon")]
-    pub daemon_todo_store: Option<Arc<crate::daemon::todo::FileTodoStore>>,
     /// X/Twitter credentials for the `twitter_post` builtin tool (per-tenant).
     pub twitter_credentials: Option<TwitterCredentials>,
     /// Optional allowlist of builtin tool names. When `Some`, only tools whose
@@ -151,8 +153,6 @@ impl Default for BuiltinToolsConfig {
             protected_paths: Vec::new(),
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             sandbox_policy: None,
-            #[cfg(feature = "daemon")]
-            daemon_todo_store: None,
             twitter_credentials: None,
             allowlist: None,
             path_policy: None,
@@ -230,13 +230,6 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
 
     if let Some(on_question) = config.on_question {
         tools.push(Arc::new(question::QuestionTool::new(on_question)));
-    }
-
-    #[cfg(feature = "daemon")]
-    if let Some(daemon_store) = config.daemon_todo_store {
-        tools.push(Arc::new(crate::daemon::todo::TodoManageTool::new(
-            daemon_store,
-        )));
     }
 
     if let Some(creds) = config.twitter_credentials {
@@ -399,21 +392,6 @@ mod tests {
         };
         let tools = builtin_tools(config);
         assert_eq!(tools.len(), 16);
-    }
-
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn builtin_tools_with_daemon_todo_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::daemon::todo::FileTodoStore::new(dir.path()).unwrap());
-        let config = BuiltinToolsConfig {
-            dangerous_tools: true,
-            daemon_todo_store: Some(store),
-            ..Default::default()
-        };
-        let tools = builtin_tools(config);
-        assert_eq!(tools.len(), 16);
-        assert!(tools.iter().any(|t| t.definition().name == "todo_manage"));
     }
 
     #[test]

@@ -1,3 +1,6 @@
+//! Agent memory system — `Memory` trait, in-memory and PostgreSQL stores, BM25 and vector recall, Ebbinghaus decay, reflection, and consolidation.
+
+#![allow(missing_docs)]
 pub mod bm25;
 pub mod consolidation;
 pub mod embedding;

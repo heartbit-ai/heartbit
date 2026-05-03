@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-05-02-b5b-failure-mode-hardening-design.md`
 //! Component 2 for design rationale.
 
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

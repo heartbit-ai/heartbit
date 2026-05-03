@@ -1,3 +1,5 @@
+//! Document loader — reads plain text, Markdown, and PDF files into the knowledge base.
+
 use std::path::Path;
 
 use crate::error::Error;

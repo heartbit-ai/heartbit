@@ -1,3 +1,11 @@
+//! JSON-RPC message types and constants for the channel protocol.
+//!
+//! Wire types for the WebSocket and SSE channel. Field names are self-describing
+//! protocol properties; see the `method` and `event` sub-modules for the
+//! corresponding RPC method and event name constants.
+
+#![allow(missing_docs)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -33,6 +41,7 @@ pub enum WsFrame {
 // --- Method constants ---
 
 pub mod method {
+    //! JSON-RPC method name constants for the channel protocol.
     pub const CHAT_SEND: &str = "chat.send";
     pub const CHAT_ABORT: &str = "chat.abort";
     pub const CHAT_HISTORY: &str = "chat.history";
@@ -47,6 +56,7 @@ pub mod method {
 // --- Event constants ---
 
 pub mod event {
+    //! SSE event name constants for the channel protocol.
     pub const CHAT_DELTA: &str = "chat.delta";
     pub const CHAT_FINAL: &str = "chat.final";
     pub const CHAT_ERROR: &str = "chat.error";

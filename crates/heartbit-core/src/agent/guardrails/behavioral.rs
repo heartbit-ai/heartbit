@@ -5,6 +5,7 @@
 //! denial storms). Stateful — uses `set_turn` for turn context and records
 //! calls in `pre_tool` (denied) and `post_tool` (allowed).
 
+#![allow(missing_docs)]
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;

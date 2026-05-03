@@ -1,3 +1,5 @@
+//! Retrying LLM provider with exponential backoff on 429 and 5xx errors.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +54,7 @@ pub struct RetryingProvider<P> {
 }
 
 impl<P> RetryingProvider<P> {
+    /// Wrap `inner` with the given retry configuration.
     pub fn new(inner: P, config: RetryConfig) -> Self {
         Self {
             inner,

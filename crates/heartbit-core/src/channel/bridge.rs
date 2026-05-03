@@ -1,3 +1,6 @@
+//! In-process channel bridge connecting the HTTP layer to the agent runtime.
+
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

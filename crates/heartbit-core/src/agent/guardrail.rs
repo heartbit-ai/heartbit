@@ -1,3 +1,6 @@
+//! `Guardrail` trait and `GuardAction` — base types for all guardrail implementations.
+
+#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 

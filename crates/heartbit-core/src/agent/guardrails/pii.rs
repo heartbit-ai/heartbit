@@ -3,6 +3,7 @@
 //! Scans LLM responses and tool outputs for personally identifiable
 //! information (email, phone, SSN, credit card) and can redact, warn, or deny.
 
+#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;

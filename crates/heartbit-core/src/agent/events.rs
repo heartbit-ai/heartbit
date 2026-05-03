@@ -1,3 +1,5 @@
+//! Agent lifecycle events emitted during execution via the `OnEvent` callback.
+
 use serde::{Deserialize, Serialize};
 
 use crate::llm::types::{StopReason, TokenUsage};
@@ -25,6 +27,7 @@ pub fn truncate_for_event(text: &str, max_bytes: usize) -> String {
 /// All events carry the agent name for identification in multi-agent runs.
 /// Events are emitted synchronously via the `OnEvent` callback — keep
 /// handlers fast to avoid blocking the agent loop.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {

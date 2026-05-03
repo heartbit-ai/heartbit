@@ -1,3 +1,5 @@
+//! In-memory knowledge base backed by BM25 scoring.
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +21,7 @@ pub struct InMemoryKnowledgeBase {
 }
 
 impl InMemoryKnowledgeBase {
+    /// Create an empty in-memory knowledge base.
     pub fn new() -> Self {
         Self {
             chunks: RwLock::new(HashMap::new()),

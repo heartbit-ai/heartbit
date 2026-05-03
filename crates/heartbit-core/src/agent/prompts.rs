@@ -1,3 +1,5 @@
+//! Built-in system prompt fragments for multi-agent collaboration.
+
 /// Multi-agent collaboration prompt appended to sub-agent system prompts.
 ///
 /// Contains `{name}` and `{description}` placeholders that must be replaced

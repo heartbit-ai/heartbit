@@ -1,3 +1,5 @@
+//! Session context pruner — trims old messages before LLM calls to control context size.
+
 use crate::llm::types::{ContentBlock, Message, Role};
 use crate::tool::builtins::floor_char_boundary;
 

@@ -1,3 +1,5 @@
+//! Agent runtime — `AgentRunner`, `Orchestrator`, workflow agents, guardrails, and supporting types.
+
 pub mod audit;
 pub mod batch;
 pub mod blackboard;

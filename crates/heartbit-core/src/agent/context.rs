@@ -1,3 +1,5 @@
+//! Context management strategy for long-running agent sessions.
+
 use crate::llm::types::{
     CompletionRequest, ContentBlock, Message, ReasoningEffort, Role, ToolDefinition, ToolResult,
 };
@@ -10,7 +12,10 @@ pub enum ContextStrategy {
     /// No trimming — all messages are sent (current default behavior).
     Unlimited,
     /// Keep first message + as many recent messages as fit in `max_tokens`.
-    SlidingWindow { max_tokens: u32 },
+    SlidingWindow {
+        /// Maximum token budget for the sliding window.
+        max_tokens: u32,
+    },
 }
 
 /// Conversation context for an agent run.

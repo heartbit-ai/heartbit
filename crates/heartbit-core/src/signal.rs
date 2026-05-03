@@ -1,3 +1,5 @@
+//! Unix signal handling utilities for graceful agent shutdown.
+
 use tokio_util::sync::CancellationToken;
 
 /// Spawn a task that cancels `token` on SIGINT or SIGTERM.

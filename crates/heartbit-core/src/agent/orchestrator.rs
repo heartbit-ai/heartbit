@@ -1,3 +1,5 @@
+//! Multi-agent orchestrator for parallel and sequential sub-agent delegation.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -214,6 +216,7 @@ pub struct Orchestrator<P: LlmProvider> {
 }
 
 impl<P: LlmProvider + 'static> Orchestrator<P> {
+    /// Create a new [`OrchestratorBuilder`] with the given LLM provider.
     pub fn builder(provider: Arc<P>) -> OrchestratorBuilder<P> {
         OrchestratorBuilder {
             provider,
@@ -1655,13 +1658,21 @@ pub(crate) fn build_form_squad_tool_schema(agents: &[(&str, &str, &[String])]) -
 /// Used by `OrchestratorBuilder::sub_agent_full` to avoid a long parameter list.
 #[derive(Default)]
 pub struct SubAgentConfig {
+    /// Unique name for this sub-agent.
     pub name: String,
+    /// Human-readable description of what this sub-agent does.
     pub description: String,
+    /// System prompt to give this sub-agent.
     pub system_prompt: String,
+    /// Tools available to this sub-agent.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Context window management strategy for this sub-agent.
     pub context_strategy: Option<ContextStrategy>,
+    /// Summarize conversation when message count exceeds this threshold.
     pub summarize_threshold: Option<u32>,
+    /// Per-tool execution timeout for this sub-agent.
     pub tool_timeout: Option<Duration>,
+    /// Maximum tool output size in bytes for this sub-agent.
     pub max_tool_output_bytes: Option<usize>,
     /// Per-agent turn limit. When `None`, uses orchestrator default.
     pub max_turns: Option<usize>,
@@ -1718,6 +1729,9 @@ pub struct SubAgentConfig {
     pub audit_delegation_chain: Vec<String>,
 }
 
+/// Builder for [`Orchestrator`].
+///
+/// Construct with [`Orchestrator::builder`] and call `.build()` to get an `Orchestrator`.
 pub struct OrchestratorBuilder<P: LlmProvider> {
     provider: Arc<P>,
     sub_agents: Vec<SubAgentDef>,
@@ -1781,6 +1795,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
+    /// Add a sub-agent with the given name, description, and system prompt.
     pub fn sub_agent(
         mut self,
         name: impl Into<String>,
@@ -1797,6 +1812,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Add a sub-agent with a predefined set of tools.
     pub fn sub_agent_with_tools(
         mut self,
         name: impl Into<String>,
@@ -1815,6 +1831,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Add a sub-agent using a fully specified [`SubAgentConfig`].
     pub fn sub_agent_full(mut self, config: SubAgentConfig) -> Self {
         let mut def = SubAgentDef::from(config);
         if def.workspace.is_none() {
@@ -1836,11 +1853,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Set the maximum number of turns for the orchestrator's own LLM loop.
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
     }
 
+    /// Set the maximum number of tokens for the orchestrator's own LLM calls.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
@@ -2037,36 +2056,43 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Enable or disable reflection prompts after tool results.
     pub fn enable_reflection(mut self, enabled: bool) -> Self {
         self.enable_reflection = enabled;
         self
     }
 
+    /// Compress tool outputs larger than `threshold` bytes before including in context.
     pub fn tool_output_compression_threshold(mut self, threshold: usize) -> Self {
         self.tool_output_compression_threshold = Some(threshold);
         self
     }
 
+    /// Limit the number of tools the LLM may call in a single turn.
     pub fn max_tools_per_turn(mut self, max: usize) -> Self {
         self.max_tools_per_turn = Some(max);
         self
     }
 
+    /// Set the doom-loop threshold: abort after this many consecutive identical tool-call batches.
     pub fn max_identical_tool_calls(mut self, max: u32) -> Self {
         self.max_identical_tool_calls = Some(max);
         self
     }
 
+    /// Set the fuzzy doom-loop threshold for near-duplicate tool-call batches.
     pub fn max_fuzzy_identical_tool_calls(mut self, max: u32) -> Self {
         self.max_fuzzy_identical_tool_calls = Some(max);
         self
     }
 
+    /// Cap the total number of tool calls the LLM may make in a single turn.
     pub fn max_tool_calls_per_turn(mut self, cap: u32) -> Self {
         self.max_tool_calls_per_turn = Some(cap);
         self
     }
 
+    /// Set the permission ruleset applied to tool calls made by the orchestrator's own runner.
     pub fn permission_rules(mut self, rules: super::permission::PermissionRuleset) -> Self {
         self.permission_rules = rules;
         self
@@ -2130,6 +2156,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Build the [`Orchestrator`], validating all sub-agent definitions.
     pub fn build(mut self) -> Result<Orchestrator<P>, Error> {
         // Append multi-agent collaboration prompt to each sub-agent's system prompt
         if self.multi_agent_prompt {

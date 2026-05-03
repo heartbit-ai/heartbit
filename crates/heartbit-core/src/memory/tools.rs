@@ -1,3 +1,5 @@
+//! Per-agent memory tool definitions (store, recall, update, forget, consolidate).
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

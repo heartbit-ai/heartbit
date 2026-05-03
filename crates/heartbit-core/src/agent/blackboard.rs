@@ -1,3 +1,6 @@
+//! Shared blackboard for inter-agent state exchange in squad-based orchestration.
+
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;

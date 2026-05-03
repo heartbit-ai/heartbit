@@ -1,3 +1,5 @@
+//! Namespaced memory wrapper that scopes all operations to a tenant or agent prefix.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

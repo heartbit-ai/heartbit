@@ -1,3 +1,5 @@
+//! Language Server Protocol (LSP) client for inline diagnostics in agent tool responses.
+
 mod client;
 mod language;
 mod server;
@@ -24,6 +26,7 @@ pub struct LspManager {
 }
 
 impl LspManager {
+    /// Create a new LSP manager rooted at `workspace_root`.
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
             servers: tokio::sync::Mutex::new(HashMap::new()),

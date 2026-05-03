@@ -1,3 +1,5 @@
+//! Lightweight token estimation for context budget management.
+
 use crate::llm::types::{ContentBlock, Message};
 
 /// Estimate token count for a text string using 4 chars/token heuristic.

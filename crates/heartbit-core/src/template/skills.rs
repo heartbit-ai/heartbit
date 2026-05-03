@@ -1,3 +1,6 @@
+//! Built-in agent skill fragments — short prompt blocks injected via `skills = ["rust-expert"]`.
+
+#![allow(missing_docs)]
 use std::path::PathBuf;
 
 use crate::error::Error;

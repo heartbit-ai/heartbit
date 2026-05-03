@@ -1,5 +1,6 @@
 //! Path-level sandbox policy shared across filesystem-touching builtins.
 
+#![allow(missing_docs)]
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;

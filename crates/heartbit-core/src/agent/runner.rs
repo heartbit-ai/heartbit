@@ -46,11 +46,17 @@ Before claiming you cannot do something or lack access to a tool:\n\
 - Try alternative approaches when the first attempt fails.\n\
 Never say \"I don't have access\" or \"I can't\" without evidence. Investigate first.";
 
-/// Output of an agent run.
+/// Output of a completed agent run.
+///
+/// Returned by [`AgentRunner::execute`] on success. Contains the agent's
+/// final text response and usage accounting for the entire run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutput {
+    /// The agent's final text response.
     pub result: String,
+    /// Total number of tool calls made during the run.
     pub tool_calls_made: usize,
+    /// Aggregate token usage for the entire run.
     pub tokens_used: TokenUsage,
     /// Structured output when the agent was configured with a response schema.
     /// Contains the validated JSON conforming to the schema.
@@ -363,6 +369,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             .and_then(|model| crate::llm::pricing::estimate_cost(model, usage))
     }
 
+    /// Run the agent on `task` and return the final output.
     pub async fn execute(&self, task: &str) -> Result<AgentOutput, Error> {
         let ctx = AgentContext::new(&self.system_prompt, task, self.tool_defs.clone())
             .with_max_turns(self.max_turns)

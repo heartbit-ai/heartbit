@@ -1,3 +1,5 @@
+//! Google Gemini LLM provider via the Gemini REST API.
+
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
@@ -25,6 +27,7 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
+    /// Create a new Gemini provider with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: Client::new(),

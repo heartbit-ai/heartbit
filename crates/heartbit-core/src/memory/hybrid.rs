@@ -1,3 +1,5 @@
+//! Hybrid retrieval — cosine similarity + BM25 fused via Reciprocal Rank Fusion.
+
 use std::collections::HashMap;
 
 /// Reciprocal Rank Fusion (RRF) combines ranked lists from multiple retrieval

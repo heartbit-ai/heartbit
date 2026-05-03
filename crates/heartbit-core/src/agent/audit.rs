@@ -1,3 +1,6 @@
+//! Agent audit trail — structured records of LLM calls, tool invocations, and completions.
+
+#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;

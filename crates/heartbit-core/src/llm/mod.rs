@@ -1,3 +1,5 @@
+//! LLM provider abstractions — `LlmProvider` trait, Anthropic/Gemini/OpenRouter/OpenAI-compat backends, retry, cascade, and circuit-breaker wrappers.
+
 pub mod anthropic;
 pub mod circuit;
 
@@ -89,6 +91,7 @@ pub type OnApproval = dyn Fn(&[crate::llm::types::ToolCall]) -> ApprovalDecision
 /// For dynamic dispatch, use [`BoxedProvider`] which wraps any `LlmProvider`
 /// behind [`DynLlmProvider`].
 pub trait LlmProvider: Send + Sync {
+    /// Send a completion request and wait for the full response.
     fn complete(
         &self,
         request: CompletionRequest,
@@ -131,17 +134,20 @@ pub trait LlmProvider: Send + Sync {
 /// Used by the Restate service layer (`AgentServiceImpl`) and by
 /// [`BoxedProvider`] for type-erased standalone use.
 pub trait DynLlmProvider: Send + Sync {
+    /// Boxed-future version of [`LlmProvider::complete`] for object-safe dispatch.
     fn complete<'a>(
         &'a self,
         request: CompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
 
+    /// Boxed-future version of [`LlmProvider::stream_complete`] for object-safe dispatch.
     fn stream_complete<'a>(
         &'a self,
         request: CompletionRequest,
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
 
+    /// Return the model identifier, if known.
     fn model_name(&self) -> Option<&str>;
 }
 

@@ -1,3 +1,5 @@
+//! Shared-memory tool definitions for inter-agent institutional memory access.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

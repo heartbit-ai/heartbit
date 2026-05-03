@@ -40,6 +40,7 @@ pub struct EvaluatorOptimizerAgentBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> EvaluatorOptimizerAgent<P> {
+    /// Create a new [`EvaluatorOptimizerAgentBuilder`].
     pub fn builder() -> EvaluatorOptimizerAgentBuilder<P> {
         EvaluatorOptimizerAgentBuilder {
             generator: None,

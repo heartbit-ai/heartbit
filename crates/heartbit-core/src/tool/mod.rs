@@ -1,3 +1,6 @@
+//! Tool trait and built-in tool implementations (filesystem, web, MCP, A2A, etc.).
+
+#![allow(missing_docs)]
 #[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod builtins;

@@ -46,6 +46,7 @@ pub struct HandoffRunnerBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> HandoffRunner<P> {
+    /// Create a new [`HandoffRunnerBuilder`] for configuring a handoff runner.
     pub fn builder() -> HandoffRunnerBuilder<P> {
         HandoffRunnerBuilder {
             agents: HashMap::new(),

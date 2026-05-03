@@ -1,3 +1,7 @@
+//! Core LLM request/response types — messages, content blocks, tool definitions, usage.
+
+#![allow(missing_docs)]
+
 use serde::{Deserialize, Serialize};
 
 // Re-export TokenUsage from sibling module for backward compatibility

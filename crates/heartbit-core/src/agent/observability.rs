@@ -1,3 +1,5 @@
+//! Observability mode — controls tracing verbosity and metric emission.
+
 /// Controls the verbosity of agent execution observability.
 ///
 /// Configurable via:
@@ -164,12 +166,14 @@ mod tests {
     fn resolve_env_overrides_config() {
         // Use a unique env var to avoid test interference
         let key = "HEARTBIT_OBSERVABILITY_TEST_1";
+        // SAFETY: test-only, no concurrent env access during this test.
         unsafe {
             std::env::set_var(key, "debug");
         }
         let mode =
             ObservabilityMode::resolve(key, Some("production"), Some(ObservabilityMode::Analysis));
         assert_eq!(mode, ObservabilityMode::Debug);
+        // SAFETY: test-only, no concurrent env access during this test.
         unsafe {
             std::env::remove_var(key);
         }
@@ -178,6 +182,7 @@ mod tests {
     #[test]
     fn resolve_config_overrides_builder() {
         let key = "HEARTBIT_OBSERVABILITY_TEST_2";
+        // SAFETY: test-only, no concurrent env access during this test.
         unsafe {
             std::env::remove_var(key);
         }
@@ -189,6 +194,7 @@ mod tests {
     #[test]
     fn resolve_default_fallback() {
         let key = "HEARTBIT_OBSERVABILITY_TEST_3";
+        // SAFETY: test-only, no concurrent env access during this test.
         unsafe {
             std::env::remove_var(key);
         }

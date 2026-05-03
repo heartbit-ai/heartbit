@@ -1,3 +1,5 @@
+//! Workspace root management and path normalization for sandboxed agent file access.
+
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::Error;

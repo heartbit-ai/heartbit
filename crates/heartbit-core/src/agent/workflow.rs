@@ -165,6 +165,7 @@ pub struct ParallelAgentBuilder<P: LlmProvider + 'static> {
 }
 
 impl<P: LlmProvider + 'static> ParallelAgent<P> {
+    /// Create a new [`ParallelAgentBuilder`].
     pub fn builder() -> ParallelAgentBuilder<P> {
         ParallelAgentBuilder { agents: Vec::new() }
     }
@@ -271,6 +272,7 @@ pub struct LoopAgentBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> LoopAgent<P> {
+    /// Create a new [`LoopAgentBuilder`].
     pub fn builder() -> LoopAgentBuilder<P> {
         LoopAgentBuilder {
             agent: None,
@@ -363,12 +365,19 @@ impl<P: LlmProvider> LoopAgentBuilder<P> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowType {
+    /// Run agents one after another, piping output to input.
     Sequential,
+    /// Run agents concurrently, merging results.
     Parallel,
+    /// Repeat an agent until a stop condition is met.
     Loop,
+    /// Run agents according to a dependency graph.
     Dag,
+    /// Run agents as debaters with an optional judge.
     Debate,
+    /// Run agents as voters and aggregate the result.
     Voting,
+    /// Run proposer agents and synthesize with a final agent.
     Mixture,
 }
 
@@ -379,12 +388,19 @@ pub enum WorkflowType {
 /// Routes execution to one of the workflow agent types.
 /// Allows config-driven workflow selection without hardcoding the type.
 pub enum WorkflowRouter<P: LlmProvider + 'static> {
+    /// A sequential pipeline workflow agent.
     Sequential(Box<SequentialAgent<P>>),
+    /// A parallel (concurrent) workflow agent.
     Parallel(Box<ParallelAgent<P>>),
+    /// A looping workflow agent.
     Loop(Box<LoopAgent<P>>),
+    /// A DAG-based workflow agent.
     Dag(Box<DagAgent<P>>),
+    /// A debate workflow agent.
     Debate(Box<DebateAgent<P>>),
+    /// A voting workflow agent.
     Voting(Box<VotingAgent<P>>),
+    /// A mixture-of-agents workflow agent.
     Mixture(Box<MixtureOfAgentsAgent<P>>),
 }
 

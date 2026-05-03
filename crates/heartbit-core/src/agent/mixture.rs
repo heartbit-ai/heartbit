@@ -47,6 +47,7 @@ pub struct MixtureOfAgentsAgentBuilder<P: LlmProvider + 'static> {
 }
 
 impl<P: LlmProvider + 'static> MixtureOfAgentsAgent<P> {
+    /// Create a new [`MixtureOfAgentsAgentBuilder`].
     pub fn builder() -> MixtureOfAgentsAgentBuilder<P> {
         MixtureOfAgentsAgentBuilder {
             proposers: Vec::new(),

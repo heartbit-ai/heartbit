@@ -3,6 +3,7 @@
 //! Platform-specific adapters (Telegram, Discord, Slack) and the
 //! Postgres-backed session store live in the heartbit umbrella crate.
 
+#![allow(missing_docs)]
 pub mod bridge;
 pub mod session;
 pub mod types;

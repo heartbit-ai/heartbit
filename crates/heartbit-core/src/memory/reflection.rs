@@ -1,3 +1,5 @@
+//! Reflection tracker — triggers agent self-reflection when cumulative memory importance exceeds a threshold.
+
 use std::sync::Mutex;
 
 /// Tracks cumulative importance of stored memories to trigger reflection.

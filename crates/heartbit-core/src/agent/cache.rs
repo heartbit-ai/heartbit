@@ -1,3 +1,5 @@
+//! LLM response caching for deterministic replay and cost reduction.
+
 use std::sync::Mutex;
 
 use crate::llm::types::{CompletionResponse, Message};

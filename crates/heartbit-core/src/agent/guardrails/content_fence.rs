@@ -1,3 +1,5 @@
+//! Content fence guardrail — denies responses containing prohibited topics or patterns.
+
 use std::future::Future;
 use std::pin::Pin;
 

@@ -1,3 +1,5 @@
+//! Error classification for LLM API errors — distinguishes retryable from fatal conditions.
+
 use crate::error::Error;
 
 /// Actionable classification of LLM provider errors.

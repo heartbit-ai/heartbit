@@ -136,10 +136,12 @@ impl SafeUrl {
         Ok(Self(url))
     }
 
+    /// Return the URL as a string slice.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
+    /// Consume this wrapper and return the inner [`Url`].
     pub fn into_url(self) -> Url {
         self.0
     }

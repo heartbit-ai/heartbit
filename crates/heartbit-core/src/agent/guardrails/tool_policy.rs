@@ -16,9 +16,19 @@ use crate::llm::types::ToolCall;
 #[derive(Debug, Clone)]
 pub enum InputConstraint {
     /// Deny if a JSON field value matches a regex pattern.
-    FieldDenied { path: String, pattern: Regex },
+    FieldDenied {
+        /// Dot-separated JSON path to the field to check.
+        path: String,
+        /// Regular expression that triggers a denial when matched.
+        pattern: Regex,
+    },
     /// Deny if a JSON field's string value exceeds max_bytes.
-    MaxFieldLength { path: String, max_bytes: usize },
+    MaxFieldLength {
+        /// Dot-separated JSON path to the field to check.
+        path: String,
+        /// Maximum allowed byte length for the field value.
+        max_bytes: usize,
+    },
 }
 
 impl InputConstraint {
@@ -82,6 +92,7 @@ pub struct ToolPolicyGuardrail {
 }
 
 impl ToolPolicyGuardrail {
+    /// Create a tool policy guardrail with the given rules and default action.
     pub fn new(rules: Vec<ToolRule>, default_action: GuardAction) -> Self {
         Self {
             rules,

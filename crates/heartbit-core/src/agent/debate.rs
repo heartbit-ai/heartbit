@@ -58,6 +58,7 @@ pub struct DebateAgentBuilder<P: LlmProvider + 'static> {
 }
 
 impl<P: LlmProvider + 'static> DebateAgent<P> {
+    /// Create a new [`DebateAgentBuilder`] for constructing a debate agent.
     pub fn builder() -> DebateAgentBuilder<P> {
         DebateAgentBuilder {
             debaters: Vec::new(),

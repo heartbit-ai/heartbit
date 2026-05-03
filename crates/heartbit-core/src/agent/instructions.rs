@@ -1,3 +1,5 @@
+//! Dynamic instruction loading from `.heartbit/INSTRUCTIONS.md` files.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

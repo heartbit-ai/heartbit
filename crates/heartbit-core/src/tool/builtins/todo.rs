@@ -11,21 +11,32 @@ use crate::tool::{Tool, ToolOutput};
 
 // --- TodoStore ---
 
+/// A single item in the agent's task list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
+    /// The task description.
     pub content: String,
+    /// Current status of the task.
     pub status: TodoStatus,
+    /// Priority level of the task.
     pub priority: TodoPriority,
 }
 
+/// Status of a to-do item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    /// Task has not been started.
     Pending,
+    /// Task is currently being worked on (at most one at a time).
     InProgress,
+    /// Task has been successfully completed.
     Completed,
+    /// Task was abandoned.
     Cancelled,
+    /// Task could not be completed due to an error.
     Failed,
+    /// Task is waiting on an external dependency.
     Blocked,
 }
 
@@ -42,12 +53,17 @@ impl std::fmt::Display for TodoStatus {
     }
 }
 
+/// Priority level of a to-do item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoPriority {
+    /// Must be done immediately.
     Critical,
+    /// Should be done next.
     High,
+    /// Normal priority.
     Medium,
+    /// Do when convenient.
     Low,
 }
 
@@ -62,6 +78,10 @@ impl std::fmt::Display for TodoPriority {
     }
 }
 
+/// Shared in-process store for agent to-do items.
+///
+/// Accessed via the `todo_read` and `todo_write` builtin tools.
+/// Thread-safe: backed by a `std::sync::RwLock`.
 pub struct TodoStore {
     todos: RwLock<Vec<TodoItem>>,
 }
@@ -73,6 +93,7 @@ impl Default for TodoStore {
 }
 
 impl TodoStore {
+    /// Create an empty `TodoStore`.
     pub fn new() -> Self {
         Self {
             todos: RwLock::new(Vec::new()),
@@ -104,6 +125,7 @@ impl TodoStore {
 
 // --- Tools ---
 
+/// Create the `todo_read` and `todo_write` tool pair sharing a single store.
 pub fn todo_tools(store: Arc<TodoStore>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(TodoWriteTool {

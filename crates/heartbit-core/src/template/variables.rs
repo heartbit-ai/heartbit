@@ -1,3 +1,5 @@
+//! Prompt variable substitution — replaces `{variable}` placeholders in system prompts.
+
 use std::collections::HashMap;
 
 /// Substitute `{var_name}` placeholders in text.

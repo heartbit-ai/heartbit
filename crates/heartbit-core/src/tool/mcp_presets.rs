@@ -8,6 +8,7 @@
 //! preset = "github"
 //! ```
 
+#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

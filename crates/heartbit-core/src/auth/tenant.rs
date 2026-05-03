@@ -1,5 +1,6 @@
 //! Tenant + optional user identity for scoping memory, audit, and policy.
 
+#![allow(missing_docs)]
 /// Tenant + optional user identity for scoping memory, audit, and policy
 /// decisions. Owned (no lifetime parameter) so it composes cleanly into
 /// async contexts and can be stored in `Arc`-shared state.

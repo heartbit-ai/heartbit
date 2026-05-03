@@ -1,3 +1,5 @@
+//! TOML configuration types for agents, orchestrators, LLM providers, and integrations.
+
 mod agent;
 mod daemon;
 mod guardrails;
@@ -165,19 +167,26 @@ pub struct SandboxConfig {
 /// Top-level configuration loaded from `heartbit.toml`.
 #[derive(Debug, Deserialize)]
 pub struct HeartbitConfig {
+    /// LLM provider selection and API key configuration.
     #[serde(default)]
     pub provider: ProviderConfig,
+    /// Orchestrator-level defaults applied to all sub-agents.
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
+    /// Per-agent configurations. Each entry defines one sub-agent.
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
     /// Custom variables for template prompt substitution.
     /// Available as `{var_name}` in system_prompt, template prompts, and skill content.
     #[serde(default)]
     pub variables: std::collections::HashMap<String, String>,
+    /// Restate durable workflow configuration.
     pub restate: Option<RestateConfig>,
+    /// OpenTelemetry tracing configuration.
     pub telemetry: Option<TelemetryConfig>,
+    /// Persistent memory backend configuration.
     pub memory: Option<MemoryConfig>,
+    /// Knowledge base (RAG) configuration.
     pub knowledge: Option<KnowledgeConfig>,
     /// Declarative permission rules applied to all agents.
     /// Rules are evaluated in order — first match wins.

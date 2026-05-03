@@ -1,3 +1,5 @@
+//! Built-in guardrail implementations — LLM judge, secret scanner, PII detector, content fence, action budget, behavioral monitor, injection classifier, tool policy, and composition helpers.
+
 pub mod action_budget;
 pub mod behavioral;
 pub mod compose;

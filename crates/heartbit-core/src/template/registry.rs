@@ -1,3 +1,5 @@
+//! Built-in agent template registry — maps template names to base configurations.
+
 use crate::error::Error;
 
 use super::AgentTemplate;

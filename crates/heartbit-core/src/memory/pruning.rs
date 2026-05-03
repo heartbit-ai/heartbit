@@ -1,3 +1,5 @@
+//! Memory entry pruning — removes weak or stale entries to keep the store compact.
+
 use std::sync::Arc;
 
 use crate::auth::TenantScope;

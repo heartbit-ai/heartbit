@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,10 @@ use super::pruner;
 use super::runner::{AgentRunner, OnInput, RESOURCEFULNESS_GUIDELINES};
 use super::tool_filter;
 
+/// Builder for [`AgentRunner`].
+///
+/// Construct via [`AgentRunner::builder`]. All setter methods are chainable.
+/// Call [`build`](AgentRunnerBuilder::build) to create the runner.
 pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) provider: Arc<P>,
     pub(super) name: String,

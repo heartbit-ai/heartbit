@@ -58,6 +58,7 @@ pub struct VotingAgentBuilder<P: LlmProvider + 'static> {
 }
 
 impl<P: LlmProvider + 'static> VotingAgent<P> {
+    /// Create a new [`VotingAgentBuilder`].
     pub fn builder() -> VotingAgentBuilder<P> {
         VotingAgentBuilder {
             voters: Vec::new(),

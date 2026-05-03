@@ -1,3 +1,5 @@
+//! Knowledge base — document ingestion, chunking, and vector or BM25 retrieval.
+
 pub mod chunker;
 pub mod in_memory;
 pub mod loader;

@@ -1,3 +1,5 @@
+//! Document chunker — splits large documents into overlapping text chunks for indexing.
+
 use super::{Chunk, DocumentSource};
 
 /// Configuration for text chunking.

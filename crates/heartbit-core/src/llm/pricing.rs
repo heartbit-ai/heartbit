@@ -1,3 +1,5 @@
+//! Per-model cost estimation for LLM token usage.
+
 use crate::llm::types::TokenUsage;
 
 /// Estimate the cost in USD for a given model and token usage.

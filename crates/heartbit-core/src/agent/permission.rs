@@ -1,3 +1,5 @@
+//! Runtime permission rules for tool usage — deny, allow, and learned-via-HITL decisions.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,7 @@ pub struct PermissionRuleset {
 }
 
 impl PermissionRuleset {
+    /// Create a permission ruleset from an ordered list of rules.
     pub fn new(rules: Vec<PermissionRule>) -> Self {
         Self { rules }
     }

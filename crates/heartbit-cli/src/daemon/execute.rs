@@ -505,14 +505,12 @@ pub(super) async fn collect_tools(
         } else {
             heartbit::workspace::EnvPolicy::Inherit
         };
-        let bt_config = BuiltinToolsConfig {
-            dangerous_tools: builtin_tool_names.iter().any(|t| t == "bash"),
-            workspace: workspace.map(|p| p.to_path_buf()),
-            env_policy,
-            twitter_credentials,
-            allowlist: Some(builtin_tool_names.to_vec()),
-            ..Default::default()
-        };
+        let mut bt_config = BuiltinToolsConfig::default();
+        bt_config.dangerous_tools = builtin_tool_names.iter().any(|t| t == "bash");
+        bt_config.workspace = workspace.map(|p| p.to_path_buf());
+        bt_config.env_policy = env_policy;
+        bt_config.twitter_credentials = twitter_credentials;
+        bt_config.allowlist = Some(builtin_tool_names.to_vec());
         tools.extend(heartbit::builtin_tools(bt_config));
     }
 
@@ -576,10 +574,8 @@ async fn execute_orchestrator_inner(
                 max_tokens: spawn.max_tokens,
                 max_total_tokens: spawn.max_total_tokens,
             };
-            let spawn_bt_config = BuiltinToolsConfig {
-                workspace: workspace.clone(),
-                ..Default::default()
-            };
+            let mut spawn_bt_config = BuiltinToolsConfig::default();
+            spawn_bt_config.workspace = workspace.clone();
             let builtin_tools = heartbit::builtin_tools(spawn_bt_config);
             builder = builder.spawn_config(spawn_cfg, builtin_tools);
         }

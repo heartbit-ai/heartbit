@@ -29,27 +29,52 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
+    /// Create a `WebSearchTool` with automatic provider selection.
+    ///
+    /// Panics if the HTTP client cannot be built (TLS initialisation failure).
+    /// Use [`WebSearchTool::try_new`] if you need to handle the error.
     pub fn new() -> Self {
-        Self {
-            client: crate::http::vendor_client_builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("failed to build reqwest client"),
+        Self::try_new().expect("failed to build reqwest client")
+    }
+
+    /// Create a `WebSearchTool` with automatic provider selection.
+    ///
+    /// Returns `Err` if the underlying HTTP client cannot be constructed
+    /// (e.g., TLS initialisation failure).
+    pub fn try_new() -> Result<Self, crate::error::Error> {
+        let client = crate::http::vendor_client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                crate::error::Error::Agent(format!("failed to build reqwest client: {e}"))
+            })?;
+        Ok(Self {
+            client,
             provider: SearchProvider::Auto,
-        }
+        })
     }
 
     /// Create a `WebSearchTool` that uses a specific search provider
     /// instead of auto-detecting from environment variables.
+    ///
+    /// Panics if the HTTP client cannot be built. Use [`WebSearchTool::try_with_provider`]
+    /// if you need to handle the error.
     #[allow(dead_code)] // Public API — not yet re-exported from lib.rs
     pub fn with_provider(provider: SearchProvider) -> Self {
-        Self {
-            client: crate::http::vendor_client_builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("failed to build reqwest client"),
-            provider,
-        }
+        Self::try_with_provider(provider).expect("failed to build reqwest client")
+    }
+
+    /// Create a `WebSearchTool` that uses a specific search provider.
+    ///
+    /// Returns `Err` if the underlying HTTP client cannot be constructed.
+    pub fn try_with_provider(provider: SearchProvider) -> Result<Self, crate::error::Error> {
+        let client = crate::http::vendor_client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                crate::error::Error::Agent(format!("failed to build reqwest client: {e}"))
+            })?;
+        Ok(Self { client, provider })
     }
 
     async fn search_with(

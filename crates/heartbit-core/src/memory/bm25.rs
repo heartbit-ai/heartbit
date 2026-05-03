@@ -1,3 +1,5 @@
+//! BM25 keyword scoring for memory recall.
+
 /// Compute a BM25-like score for a single document against query terms.
 ///
 /// Uses the standard BM25 formula:

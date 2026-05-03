@@ -1,3 +1,5 @@
+//! OpenRouter LLM provider — access 200+ models via a single OpenAI-compatible API.
+
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
@@ -25,6 +27,7 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    /// Create a new OpenRouter provider with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: Client::new(),

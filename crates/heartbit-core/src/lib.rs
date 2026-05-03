@@ -5,7 +5,7 @@
 //! Documentation lands here as the crate's docs.rs preamble. The README
 //! is rendered above this on docs.rs.
 
-#![allow(unexpected_cfgs)]
+#![deny(missing_docs)]
 
 // Modules are added one at a time as subsequent tasks move them in.
 pub mod agent;
@@ -20,6 +20,7 @@ pub mod llm;
 pub mod lsp;
 pub mod memory;
 pub mod sandbox;
+#[cfg(unix)]
 pub mod signal;
 pub mod store;
 pub mod template;
@@ -75,6 +76,13 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
 // --- Error re-exports ---
 pub use error::Error;
+
+// --- Eval re-exports ---
+pub use eval::{
+    CaseComparison, CostScorer, EvalCase, EvalComparison, EvalResult, EvalRunner, EvalScorer,
+    EvalSummary, EventCollector, KeywordScorer, LatencyScorer, SafetyScorer, ScorerResult,
+    SimilarityScorer, ToolCallCountScorer, TrajectoryScorer, build_eval_agent, clear_events,
+};
 
 // --- Sandbox re-exports ---
 pub use sandbox::{CorePathPolicy, CorePathPolicyBuilder};

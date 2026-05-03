@@ -1,3 +1,5 @@
+//! Knowledge base tool definitions for agent document retrieval.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

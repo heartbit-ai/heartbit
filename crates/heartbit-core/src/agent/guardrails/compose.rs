@@ -34,6 +34,7 @@ pub struct GuardrailChain {
 }
 
 impl GuardrailChain {
+    /// Create a new guardrail chain from a list of guardrails.
     pub fn new(guardrails: Vec<Arc<dyn Guardrail>>) -> Self {
         Self { guardrails }
     }
@@ -149,6 +150,7 @@ pub struct WarnToDeny {
 }
 
 impl WarnToDeny {
+    /// Create a `WarnToDeny` adaptor that escalates after `threshold` consecutive warnings.
     pub fn new(inner: Arc<dyn Guardrail>, threshold: u32) -> Self {
         Self {
             inner,
@@ -245,6 +247,7 @@ pub struct ConditionalGuardrail {
 }
 
 impl ConditionalGuardrail {
+    /// Create a guardrail that only activates for tool calls matching `predicate`.
     pub fn new(
         inner: Arc<dyn Guardrail>,
         predicate: Arc<dyn Fn(&str) -> bool + Send + Sync>,

@@ -1,3 +1,5 @@
+//! Cascading provider — tries cheaper models first and escalates on rejection or error.
+
 use crate::error::Error;
 use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock, StopReason};
 use crate::llm::{DynLlmProvider, LlmProvider, OnText};
@@ -5,6 +7,7 @@ use crate::llm::{DynLlmProvider, LlmProvider, OnText};
 /// Evaluates whether a cheaper model's response is "good enough"
 /// to avoid escalating to a more expensive tier.
 pub trait ConfidenceGate: Send + Sync {
+    /// Return `true` if the response is good enough to accept without escalating to a higher tier.
     fn accept(&self, request: &CompletionRequest, response: &CompletionResponse) -> bool;
 }
 
@@ -99,6 +102,7 @@ pub struct CascadingProvider {
 }
 
 impl CascadingProvider {
+    /// Create a new [`CascadingProviderBuilder`].
     pub fn builder() -> CascadingProviderBuilder {
         CascadingProviderBuilder {
             tiers: Vec::new(),

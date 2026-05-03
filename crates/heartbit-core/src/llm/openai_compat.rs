@@ -1,3 +1,5 @@
+//! OpenAI-compatible LLM provider for any API that follows the OpenAI chat completions format.
+
 use reqwest::Client;
 
 use crate::error::Error;
