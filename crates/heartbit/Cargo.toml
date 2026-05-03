@@ -60,7 +60,7 @@ discord = ["dep:tokio-tungstenite"]
 slack = ["dep:tokio-tungstenite"]
 local-embedding = ["dep:fastembed"]
 sandbox = ["heartbit-core/sandbox"]
-macro = ["dep:heartbit-macro", "heartbit-core/macro"]
+macro = ["dep:heartbit-macro"]
 vault = ["dep:aes-gcm", "dep:argon2", "dep:rand"]
 full = ["daemon", "restate", "postgres", "a2a", "discord", "slack", "vault"]
 
