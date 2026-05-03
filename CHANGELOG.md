@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [2026.306.7] - 2026-05-02
+## [2026.503.1] - 2026-05-03
+
+> **Note:** `2026.306.7` was published earlier the same day but was misnumbered
+> against the project's `YEAR.MMDD.patch` CalVer convention (`306` looks like
+> `MM=03 DD=06`, but the release date was 2026-05-03). That artifact was yanked
+> from crates.io. `2026.503.1` is the canonical first publish — same code,
+> correct version.
 
 ### Added — B5b Failure-Mode Hardening
 
