@@ -11,6 +11,12 @@ use crate::tool::{Tool, ToolOutput};
 
 const MAX_RESULTS: usize = 100;
 
+/// Builtin tool that finds files matching a glob pattern.
+///
+/// Walks the workspace (or the current working directory when no workspace is
+/// set) and returns up to `MAX_RESULTS = 100` paths that match the given pattern
+/// (e.g., `**/*.rs`). Results are sorted lexicographically. Protected paths are
+/// filtered from the output so the agent cannot enumerate sensitive locations.
 pub struct GlobTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,

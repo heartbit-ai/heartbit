@@ -10,17 +10,37 @@ use std::sync::{Arc, RwLock};
 use crate::auth::TenantScope;
 use crate::error::Error;
 
+/// Snapshot of in-flight token usage for a single tenant.
+///
+/// `in_flight` is the total number of tokens currently reserved across all active
+/// requests for the tenant. `high_water` is the all-time peak, useful for
+/// capacity planning and alerting. Both values are updated atomically under the
+/// `TenantTokenTracker`'s write lock.
 #[derive(Debug, Default, Clone)]
 pub struct TenantTokenState {
     pub in_flight: usize,
     pub high_water: usize,
 }
 
+/// Registry that enforces a per-tenant in-flight token cap across concurrent agent runs.
+///
+/// Each call to `reserve` atomically increments the tenant's `in_flight` counter
+/// and returns a `TokenReservation`; the counter is decremented automatically when
+/// the reservation is dropped. If the requested tokens would exceed `per_tenant_cap`,
+/// `reserve` returns `Error::TenantOverloaded` rather than blocking, enabling
+/// load-shedding at the orchestration layer. Pass an `Arc<TenantTokenTracker>` to
+/// `OrchestratorBuilder::tenant_tracker` so sub-agents also participate in the cap.
 pub struct TenantTokenTracker {
     states: RwLock<HashMap<String, TenantTokenState>>,
     per_tenant_cap: usize,
 }
 
+/// RAII guard that holds a token reservation for a tenant.
+///
+/// Created by `TenantTokenTracker::reserve` and automatically releases the
+/// reserved token count back to the tracker when dropped, whether the request
+/// succeeds, fails, or is cancelled. Callers should hold the reservation for
+/// the duration of the LLM call to ensure the in-flight counter stays accurate.
 pub struct TokenReservation {
     tracker: Arc<TenantTokenTracker>,
     tenant_id: String,

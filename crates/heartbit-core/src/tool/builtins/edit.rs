@@ -12,6 +12,13 @@ use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
 
+/// Builtin tool that performs exact-string in-place replacements within a file.
+///
+/// Locates a unique `old_string` in the file and replaces it with `new_string`,
+/// writing the result back atomically. Because the match must be unique, `EditTool`
+/// is safer than line-number-based edits for files that may shift between turns.
+/// Like `WriteTool`, it requires a prior `ReadTool` call to guard against editing
+/// files the agent has not seen. For patch-format multi-hunk edits use `PatchTool`.
 pub struct EditTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,

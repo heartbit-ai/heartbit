@@ -12,6 +12,14 @@ const MAX_OUTPUT_CHARS: usize = 50_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 
+/// Builtin tool that fetches a URL and returns the response body as text.
+///
+/// Designed for agents that need to retrieve documentation, APIs, or web pages.
+/// Responses are capped at 5 MB and then character-truncated to 50 000 chars;
+/// HTML is not stripped — the agent receives the raw body. By default the tool
+/// blocks requests to private/link-local IP ranges (`IpPolicy::Strict`) to
+/// prevent SSRF; set `HEARTBIT_ALLOW_PRIVATE_IPS=1` to relax this for local
+/// development.
 pub struct WebFetchTool {
     client: reqwest::Client,
     ip_policy: crate::http::IpPolicy,

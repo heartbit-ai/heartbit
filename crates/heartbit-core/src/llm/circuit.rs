@@ -23,6 +23,13 @@ use parking_lot::Mutex;
 use crate::auth::TenantScope;
 use crate::error::Error;
 
+/// Configuration parameters for the per-provider circuit breaker state machine.
+///
+/// Controls the failure threshold that trips the circuit open, the initial
+/// cooldown duration, the maximum backoff cap, and the exponential multiplier
+/// applied when a half-open probe fails. The defaults (`failure_threshold = 5`,
+/// `initial_open_duration = 30s`, `max = 300s`, `multiplier = 2.0`) are
+/// conservative starting points suitable for most production deployments.
 #[derive(Debug, Clone)]
 pub struct CircuitConfig {
     pub failure_threshold: u32,
@@ -54,6 +61,15 @@ enum CircuitState {
     HalfOpen,
 }
 
+/// State machine for a single `(tenant, provider)` circuit.
+///
+/// Transitions through three states: `Closed` (normal operation, counting
+/// consecutive failures), `Open` (blocking requests until the cooldown expires),
+/// and `HalfOpen` (allowing one probe request to test recovery). Callers
+/// obtain a `CircuitPermit` via `permit()` and must call `record_success` or
+/// `record_failure` on it; a permit that is dropped without recording conservatively
+/// counts as a failure so the half-open state never wedges. The internal lock is
+/// `parking_lot::Mutex` so it never poisons on panic.
 pub struct ProviderCircuit {
     state: Mutex<CircuitState>,
     config: CircuitConfig,
@@ -185,6 +201,10 @@ impl ProviderCircuit {
 }
 
 /// Composite key for the `CircuitTracker` registry.
+///
+/// Identifies a unique `(tenant_id, provider)` pair. Two agent runners serving
+/// different tenants against the same provider share no circuit state, so a
+/// misbehaving tenant cannot trip the circuit for other tenants.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct CircuitKey {
     pub tenant_id: String,

@@ -8,6 +8,13 @@ use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
+/// Builtin tool that executes pre-written prompt scripts ("skills") from disk.
+///
+/// Searches upward from the current working directory for a `.heartbit/skills/`
+/// directory, then reads the named skill file and returns its contents as
+/// instructions for the agent. This enables reusable, version-controlled
+/// prompt recipes. Skill names are validated against path traversal: names
+/// containing `/`, `\`, `..`, or empty strings are rejected.
 pub struct SkillTool {
     /// Override the starting directory for skill search. When `None`, uses `cwd`.
     /// Exposed for testing without mutating the process-global cwd.

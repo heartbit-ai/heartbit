@@ -27,6 +27,13 @@ const DEFAULT_IGNORES: &[&str] = &[
     "*.dylib",
 ];
 
+/// Builtin tool that lists directory contents as an indented tree.
+///
+/// Recursively walks up to `MAX_DEPTH = 20` levels and returns up to
+/// `MAX_ENTRIES = 1000` entries in a tree format. Common build artifacts and
+/// VCS directories (`node_modules`, `target`, `.git`, etc.) are skipped by
+/// default via `DEFAULT_IGNORES`. Useful for giving agents a structural overview
+/// of a project without reading individual files.
 pub struct ListTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,

@@ -25,8 +25,13 @@ use super::tool_filter;
 
 /// Builder for [`AgentRunner`].
 ///
-/// Construct via [`AgentRunner::builder`]. All setter methods are chainable.
-/// Call [`build`](AgentRunnerBuilder::build) to create the runner.
+/// Construct via [`AgentRunner::builder`], configure the agent with chainable
+/// setter methods, then call [`build`](AgentRunnerBuilder::build) to produce
+/// the runner. Build validates several invariants: `on_input` and
+/// `structured_schema` are mutually exclusive, `max_tool_calls_per_turn = 0` is
+/// rejected, and turn/token limits must be non-zero. For multi-agent scenarios
+/// use [`OrchestratorBuilder`](crate::agent::orchestrator::OrchestratorBuilder)
+/// instead, which internally wraps an `AgentRunner` with sub-agent delegation.
 pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) provider: Arc<P>,
     pub(super) name: String,

@@ -1515,12 +1515,14 @@ pub struct SamplingRequest {
     pub max_tokens: Option<u32>,
 }
 
+/// A single message in an MCP sampling request, with a role and content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingMessage {
     pub role: String,
     pub content: SamplingContent,
 }
 
+/// Content payload for an MCP sampling message — currently text only (`type = "text"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingContent {
     #[serde(rename = "type")]
@@ -1529,6 +1531,10 @@ pub struct SamplingContent {
     pub text: Option<String>,
 }
 
+/// Model selection hints from the MCP server for a sampling request.
+///
+/// The server may suggest preferred models via `hints`; the client is free to
+/// ignore these or use them as ordering hints when multiple models are available.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SamplingModelPreferences {
@@ -1536,6 +1542,10 @@ pub struct SamplingModelPreferences {
     pub hints: Vec<SamplingModelHint>,
 }
 
+/// A single model name hint from the MCP server's sampling preferences.
+///
+/// `name` is an optional partial model identifier (e.g., `"claude"`, `"gpt-4"`).
+/// The client should prefer models whose names contain this hint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SamplingModelHint {
     #[serde(default)]

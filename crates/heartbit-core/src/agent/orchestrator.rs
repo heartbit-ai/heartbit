@@ -1732,6 +1732,14 @@ pub struct SubAgentConfig {
 /// Builder for [`Orchestrator`].
 ///
 /// Construct with [`Orchestrator::builder`] and call `.build()` to get an `Orchestrator`.
+/// Builder for [`Orchestrator`].
+///
+/// Construct via [`Orchestrator::builder`], register sub-agents with
+/// [`sub_agent`](OrchestratorBuilder::sub_agent), then call
+/// [`build`](OrchestratorBuilder::build) to produce an `Orchestrator` ready to
+/// run. The builder validates that all sub-agent names are unique and rejects
+/// zero-valued turn/token limits. Sub-agent settings that are not explicitly set
+/// on the sub-agent inherit the orchestrator-level defaults at build time.
 pub struct OrchestratorBuilder<P: LlmProvider> {
     provider: Arc<P>,
     sub_agents: Vec<SubAgentDef>,

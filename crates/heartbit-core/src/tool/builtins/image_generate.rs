@@ -10,6 +10,13 @@ use crate::tool::{Tool, ToolOutput};
 const DEFAULT_MODEL: &str = "google/gemini-3.1-flash-image-preview";
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:base64:";
 
+/// Builtin tool that generates images from a text prompt via the OpenRouter image API.
+///
+/// Sends a request to the configured model (default: `google/gemini-3.1-flash-image-preview`)
+/// and returns the result as a base64-encoded inline image block marked with the
+/// `[IMAGE:base64:...]` prefix so downstream handlers can decode it. Requires an
+/// `OPENROUTER_API_KEY` environment variable; construction fails gracefully via
+/// `try_new` if the HTTP client cannot be initialised.
 pub struct ImageGenerateTool {
     client: reqwest::Client,
 }

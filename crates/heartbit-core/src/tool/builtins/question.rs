@@ -44,6 +44,14 @@ pub type OnQuestion = dyn Fn(QuestionRequest) -> Pin<Box<dyn Future<Output = Res
 
 // --- Tool ---
 
+/// Builtin tool that pauses the agent to ask the user structured questions.
+///
+/// When the agent needs clarification before proceeding it can call this tool
+/// with a list of questions, each with a header and a set of labelled options.
+/// Execution is suspended until the registered `OnQuestion` callback returns
+/// the user's answers, enabling interactive human-in-the-loop flows within an
+/// otherwise autonomous run. Each question may allow single or multiple
+/// selections via the `multiple` flag.
 pub struct QuestionTool {
     on_question: Arc<OnQuestion>,
 }

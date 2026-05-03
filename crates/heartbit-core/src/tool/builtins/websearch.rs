@@ -23,6 +23,13 @@ pub enum SearchProvider {
     DuckDuckGo,
 }
 
+/// Builtin tool that performs web searches and returns ranked result snippets.
+///
+/// Delegates to one of four backends selected via `SearchProvider`; the default
+/// `Auto` mode tries Exa → Tavily → Brave → DuckDuckGo in priority order based
+/// on which API keys are present in the environment. DuckDuckGo requires no key
+/// and is always available as a zero-config fallback. Results are returned as
+/// title + URL + snippet text, capped at `MAX_NUM_RESULTS = 50`.
 pub struct WebSearchTool {
     client: reqwest::Client,
     provider: SearchProvider,

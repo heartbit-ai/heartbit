@@ -16,6 +16,14 @@ const MAX_FILE_SIZE: u64 = 256 * 1024; // 256 KB
 const MAX_LINE_LENGTH: usize = 2000;
 const DEFAULT_LIMIT: usize = 2000;
 
+/// Builtin tool that reads file contents with line-number prefix and range support.
+///
+/// Enforces a read-before-write policy via `FileTracker` — the agent must read a
+/// file before `WriteTool` or `EditTool` will allow modifying it, preventing
+/// accidental overwrites of unread files. Files larger than 256 KB or lines
+/// exceeding 2000 characters are truncated to keep LLM context manageable.
+/// An optional `CorePathPolicy` restricts which paths the agent may access
+/// beyond the workspace root.
 pub struct ReadTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,

@@ -12,6 +12,14 @@ use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
 
+/// Builtin tool that applies unified-diff hunks to a file.
+///
+/// Accepts a standard unified diff (with `---`/`+++` headers and `@@ ... @@`
+/// hunk markers) and applies all hunks in a single pass. Matching is fuzzy:
+/// it tries exact, then trim-end, then trim-both, then unicode-normalisation
+/// (smart quotes, em dashes, non-breaking spaces) so LLM-generated patches
+/// survive minor whitespace or encoding drift. Requires a prior `ReadTool`
+/// call for the same read-before-write invariant enforced by `WriteTool`.
 pub struct PatchTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,

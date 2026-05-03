@@ -12,6 +12,14 @@ use crate::tool::{Tool, ToolOutput};
 
 use super::file_tracker::FileTracker;
 
+/// Builtin tool that writes full file contents (create or overwrite).
+///
+/// Requires the target file to have been read first via `ReadTool` in the same
+/// session (mtime-based guard in `FileTracker`), preventing the agent from
+/// overwriting files it has never seen. Protected paths and an optional
+/// `CorePathPolicy` act as additional guardrails. Prefer `EditTool` for
+/// targeted in-place modifications and `PatchTool` for unified-diff patches;
+/// use `WriteTool` only when creating a new file or rewriting the entire content.
 pub struct WriteTool {
     file_tracker: Arc<FileTracker>,
     workspace: Option<PathBuf>,

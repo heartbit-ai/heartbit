@@ -14,6 +14,14 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 30_000;
 const HEAD_TAIL_SIZE: usize = 14_000;
 
+/// Builtin tool that executes shell commands in a persistent working directory.
+///
+/// Each agent session gets one `BashTool` instance; `cd` commands update an
+/// internal `cwd` that survives across calls within the session. On Linux with
+/// the `sandbox` feature the tool can be restricted to a Landlock filesystem
+/// policy via `with_sandbox_policy`; the `workspace` field additionally jails
+/// the working directory to a project root. Output is capped and head-tailed
+/// when it exceeds `MAX_OUTPUT_CHARS` so the LLM context is not overwhelmed.
 pub struct BashTool {
     /// Tracked working directory that persists across calls.
     cwd: Mutex<PathBuf>,

@@ -15,7 +15,16 @@ use crate::llm::types::{
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 
-/// Anthropic Claude LLM provider (Messages API).
+/// Anthropic Claude LLM provider using the Messages API.
+///
+/// Communicates with `api.anthropic.com` using the native Anthropic wire format,
+/// supporting both non-streaming (`complete`) and streaming (`stream_complete`)
+/// modes with a hand-rolled SSE parser. Prompt caching can be enabled via
+/// [`AnthropicProvider::with_prompt_caching`], which injects `cache_control`
+/// breakpoints into the system prompt and tool list to reduce input-token cost on
+/// repeated turns. Use [`crate::llm::retry::RetryingProvider`] and
+/// [`crate::llm::circuit::CircuitBreakerProvider`] to wrap this provider with
+/// automatic retry and circuit-breaking.
 pub struct AnthropicProvider {
     client: Client,
     api_key: String,

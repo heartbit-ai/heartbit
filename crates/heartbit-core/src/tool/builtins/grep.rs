@@ -12,6 +12,12 @@ use crate::tool::{Tool, ToolOutput};
 
 const MAX_MATCHES: usize = 100;
 
+/// Builtin tool that searches file contents for a regex pattern.
+///
+/// Delegates to the system `grep` binary (with `-r -n --include` flags) and
+/// returns up to `MAX_MATCHES = 100` matching lines with file name and line number.
+/// The search is scoped to the configured workspace root when set, and respects
+/// `protected_paths` to prevent the agent from searching sensitive directories.
 pub struct GrepTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,

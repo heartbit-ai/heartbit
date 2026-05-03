@@ -68,28 +68,36 @@ pub mod event {
 
 // --- Payload structs ---
 
+/// Parameters for the `chat.send` method — send a user message to an agent session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSendParams {
     pub session_id: Uuid,
     pub message: String,
 }
 
+/// Response to `chat.send` — carries the task ID for tracking streaming deltas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSendResult {
     pub task_id: Uuid,
 }
 
+/// Parameters for the `chat.abort` method — cancel an in-progress agent task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAbortParams {
     pub session_id: Uuid,
     pub task_id: Uuid,
 }
 
+/// Parameters for the `chat.history` method — retrieve past messages for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatHistoryParams {
     pub session_id: Uuid,
 }
 
+/// Parameters for `approval.resolve` — human-in-the-loop decision for a pending tool call.
+///
+/// `interaction_id` identifies the pending approval request; `decision` must be one
+/// of `"allow"`, `"deny"`, `"always_allow"`, or `"always_deny"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResolveParams {
     pub interaction_id: Uuid,
@@ -97,6 +105,9 @@ pub struct ApprovalResolveParams {
     pub decision: String,
 }
 
+/// Parameters for `input.resolve` — provide the next user message during an interactive session.
+///
+/// A `None` or empty `message` signals end-of-input and terminates the interactive loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputResolveParams {
     pub interaction_id: Uuid,
@@ -104,6 +115,7 @@ pub struct InputResolveParams {
     pub message: Option<String>,
 }
 
+/// Parameters for `question.resolve` — submit answers to a structured agent question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResolveParams {
     pub interaction_id: Uuid,
@@ -111,26 +123,31 @@ pub struct QuestionResolveParams {
     pub answers: Vec<Vec<String>>,
 }
 
+/// Parameters for `session.create` — create a new conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateParams {
     pub title: Option<String>,
 }
 
+/// Response to `session.create` — carries the newly allocated session ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateResult {
     pub session_id: Uuid,
 }
 
+/// Parameters for `session.delete` — remove a session and its history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDeleteParams {
     pub session_id: Uuid,
 }
 
+/// Response to `session.list` — returns all sessions visible to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListResult {
     pub sessions: Vec<SessionSummary>,
 }
 
+/// Metadata summary for a single conversation session, used in list responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
@@ -141,18 +158,21 @@ pub struct SessionSummary {
 
 // --- Push event payloads ---
 
+/// Push-event payload for `chat.delta` — a streaming text chunk from the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatDeltaPayload {
     pub session_id: Uuid,
     pub text: String,
 }
 
+/// Push-event payload for `chat.final` — signals that the agent run completed with a result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFinalPayload {
     pub session_id: Uuid,
     pub result: String,
 }
 
+/// Push-event payload for `chat.error` — signals that the agent run failed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatErrorPayload {
     pub session_id: Uuid,
