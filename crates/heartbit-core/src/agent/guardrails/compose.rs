@@ -61,9 +61,13 @@ impl Guardrail for GuardrailChain {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
-        // Eagerly call each guardrail's post_llm.
+        // Eagerly call each guardrail's `post_llm`. By contract the synchronous
+        // portion of every implementation (including any redaction mutation)
+        // runs *before* the returned future is built, so each call here sees
+        // the cumulative effect of prior ones — correct semantics for chained
+        // redaction. The collected futures only carry the resulting action.
         let futs: Vec<_> = self
             .guardrails
             .iter()
@@ -79,7 +83,6 @@ impl Guardrail for GuardrailChain {
                 if action.is_denied() {
                     return Ok(action);
                 }
-                // Escalate Allow → Warn (keep first Warn reason)
                 if matches!(action, GuardAction::Warn { .. }) && matches!(worst, GuardAction::Allow)
                 {
                     worst = action;
@@ -197,9 +200,8 @@ impl Guardrail for WarnToDeny {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
-        // Eagerly call inner (doesn't capture `response` per trait elision).
         let fut = self.inner.post_llm(response);
         Box::pin(async move {
             let action = fut.await?;
@@ -270,7 +272,7 @@ impl Guardrail for ConditionalGuardrail {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
         self.inner.post_llm(response)
     }
@@ -315,7 +317,7 @@ mod tests {
         }
         fn post_llm(
             &self,
-            _response: &CompletionResponse,
+            _response: &mut CompletionResponse,
         ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
             Box::pin(async { Ok(GuardAction::deny("blocked")) })
         }
@@ -336,7 +338,7 @@ mod tests {
         }
         fn post_llm(
             &self,
-            _response: &CompletionResponse,
+            _response: &mut CompletionResponse,
         ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
             Box::pin(async { Ok(GuardAction::warn("suspicious")) })
         }
@@ -388,7 +390,7 @@ mod tests {
             Arc::new(AlwaysAllowGuardrail) as Arc<dyn Guardrail>,
             Arc::new(AlwaysDenyGuardrail),
         ]);
-        let action = chain.post_llm(&test_response()).await.unwrap();
+        let action = chain.post_llm(&mut test_response()).await.unwrap();
         assert!(action.is_denied());
     }
 
@@ -429,8 +431,44 @@ mod tests {
             Arc::new(AlwaysWarnGuardrail) as Arc<dyn Guardrail>,
             Arc::new(AlwaysAllowGuardrail),
         ]);
-        let action = chain.post_llm(&test_response()).await.unwrap();
+        let action = chain.post_llm(&mut test_response()).await.unwrap();
         assert!(matches!(action, GuardAction::Warn { .. }));
+    }
+
+    #[tokio::test]
+    async fn chain_post_llm_propagates_pii_redaction() {
+        // Issue #7 regression guard: a `PiiGuardrail` wrapped in a chain must
+        // still mutate `response` in place. This pins the contract that
+        // post_llm impls perform any mutation synchronously, before the
+        // chain's collected futures are awaited.
+        use crate::agent::guardrails::pii::{PiiAction, PiiGuardrail};
+        use crate::llm::types::ContentBlock;
+
+        let chain = GuardrailChain::new(vec![
+            Arc::new(AlwaysAllowGuardrail) as Arc<dyn Guardrail>,
+            Arc::new(PiiGuardrail::all_builtin(PiiAction::Redact)),
+        ]);
+
+        let mut response = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "Contact john@example.com about it".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+
+        let action = chain.post_llm(&mut response).await.unwrap();
+        assert!(matches!(action, GuardAction::Warn { .. }));
+
+        let ContentBlock::Text { text } = &response.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(
+            !text.contains("john@example.com"),
+            "PiiGuardrail mutation didn't propagate through GuardrailChain: {text}"
+        );
+        assert!(text.contains("[REDACTED:email]"));
     }
 
     // --- WarnToDeny tests ---
@@ -494,12 +532,12 @@ mod tests {
     async fn warn_to_deny_post_llm_escalates() {
         let inner = Arc::new(AlwaysWarnGuardrail) as Arc<dyn Guardrail>;
         let g = WarnToDeny::new(inner, 2);
-        let resp = test_response();
+        let mut resp = test_response();
 
-        let a1 = g.post_llm(&resp).await.unwrap();
+        let a1 = g.post_llm(&mut resp).await.unwrap();
         assert!(matches!(a1, GuardAction::Warn { .. }));
 
-        let a2 = g.post_llm(&resp).await.unwrap();
+        let a2 = g.post_llm(&mut resp).await.unwrap();
         assert!(a2.is_denied());
     }
 
@@ -543,7 +581,7 @@ mod tests {
             Arc::new(AlwaysDenyGuardrail) as Arc<dyn Guardrail>,
             Arc::new(|_name: &str| false),
         );
-        let action = g.post_llm(&test_response()).await.unwrap();
+        let action = g.post_llm(&mut test_response()).await.unwrap();
         assert!(action.is_denied());
     }
 

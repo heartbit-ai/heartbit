@@ -556,15 +556,28 @@ mod tests {
     }
 
     #[test]
-    fn build_errors_on_empty_name() {
+    fn build_errors_on_explicit_empty_name() {
         let provider = Arc::new(MockProvider::new(vec![]));
-        let result = AgentRunner::builder(provider).system_prompt("sys").build();
+        let result = AgentRunner::builder(provider)
+            .name("")
+            .system_prompt("sys")
+            .build();
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
             err.to_string().contains("agent name must not be empty"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn build_succeeds_with_default_name() {
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .system_prompt("sys")
+            .build()
+            .expect("minimal builder chain must succeed without an explicit name");
+        assert_eq!(runner.name(), "agent");
     }
 
     #[test]
@@ -2374,7 +2387,7 @@ mod tests {
         impl Guardrail for DenyOnce {
             fn post_llm(
                 &self,
-                _response: &crate::llm::types::CompletionResponse,
+                _response: &mut crate::llm::types::CompletionResponse,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>,
             > {
@@ -2450,7 +2463,7 @@ mod tests {
         impl Guardrail for DenyOnce {
             fn post_llm(
                 &self,
-                _response: &CompletionResponse,
+                _response: &mut CompletionResponse,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>,
             > {
@@ -5285,7 +5298,7 @@ mod tests {
         impl Guardrail for WarnAlways {
             fn post_llm(
                 &self,
-                _response: &crate::llm::types::CompletionResponse,
+                _response: &mut crate::llm::types::CompletionResponse,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>,
             > {

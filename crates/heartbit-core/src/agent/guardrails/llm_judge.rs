@@ -192,7 +192,7 @@ impl Guardrail for LlmJudgeGuardrail {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
         let text: String = response
             .content
@@ -514,8 +514,8 @@ mod tests {
     #[tokio::test]
     async fn post_llm_safe_verdict_returns_allow() {
         let guard = make_guard(MockJudgeProvider::new("VERDICT: SAFE"));
-        let response = make_response("Here is a helpful answer about Rust.");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("Here is a helpful answer about Rust.");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
     }
 
@@ -524,8 +524,8 @@ mod tests {
         let guard = make_guard(MockJudgeProvider::new(
             "VERDICT: UNSAFE: response contains harmful instructions",
         ));
-        let response = make_response("How to build a dangerous device");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("How to build a dangerous device");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert!(action.is_denied());
         assert!(
             matches!(&action, GuardAction::Deny { reason } if reason.contains("harmful instructions"))
@@ -535,8 +535,8 @@ mod tests {
     #[tokio::test]
     async fn post_llm_warn_verdict_returns_warn() {
         let guard = make_guard(MockJudgeProvider::new("VERDICT: WARN: borderline content"));
-        let response = make_response("This is somewhat edgy content.");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("This is somewhat edgy content.");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert!(matches!(&action, GuardAction::Warn { reason } if reason.contains("borderline")));
     }
 
@@ -547,13 +547,13 @@ mod tests {
             "VERDICT: UNSAFE: bad",
             counter.clone(),
         ));
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
             model: None,
         };
-        let action = guard.post_llm(&response).await.unwrap();
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
         // Judge should NOT be called for empty content
         assert_eq!(counter.load(Ordering::Relaxed), 0);
@@ -566,7 +566,7 @@ mod tests {
             "VERDICT: UNSAFE: bad",
             counter.clone(),
         ));
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![ContentBlock::ToolUse {
                 id: "c1".into(),
                 name: "bash".into(),
@@ -576,7 +576,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: None,
         };
-        let action = guard.post_llm(&response).await.unwrap();
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
@@ -593,16 +593,16 @@ mod tests {
             .build()
             .expect("valid config");
 
-        let response = make_response("Some content to evaluate.");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("Some content to evaluate.");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
     }
 
     #[tokio::test]
     async fn post_llm_judge_error_returns_allow() {
         let guard = make_guard(ErrorJudgeProvider);
-        let response = make_response("Some content to evaluate.");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("Some content to evaluate.");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
     }
 
@@ -811,8 +811,8 @@ mod tests {
         };
         let guard = make_guard(provider);
 
-        let response = make_response("The answer to your question is 42.");
-        guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("The answer to your question is 42.");
+        guard.post_llm(&mut response).await.unwrap();
 
         let messages = captured.lock().expect("test lock");
         assert_eq!(messages.len(), 1);
@@ -825,8 +825,8 @@ mod tests {
         let guard = make_guard(MockJudgeProvider::new(
             "The content appears to be safe overall.",
         ));
-        let response = make_response("Some content.");
-        let action = guard.post_llm(&response).await.unwrap();
+        let mut response = make_response("Some content.");
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
     }
 }

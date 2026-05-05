@@ -156,7 +156,7 @@ impl Guardrail for SecretScannerGuardrail {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
         let text = response
             .content
@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn post_llm_denies_on_secret() {
         let guard = SecretScannerGuardrail::builder().build();
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),
             }],
@@ -339,14 +339,14 @@ mod tests {
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };
-        let action = guard.post_llm(&response).await.unwrap();
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert!(action.is_denied());
     }
 
     #[tokio::test]
     async fn post_llm_allows_clean_response() {
         let guard = SecretScannerGuardrail::builder().build();
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "Hello, how can I help?".into(),
             }],
@@ -354,7 +354,7 @@ mod tests {
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };
-        let action = guard.post_llm(&response).await.unwrap();
+        let action = guard.post_llm(&mut response).await.unwrap();
         assert!(!action.is_denied());
     }
 

@@ -28,7 +28,10 @@ static CC_RE: LazyLock<Regex> =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PiiAction {
-    /// Replace matched PII with `[REDACTED:type]` (recommended default).
+    /// Replace matched PII with `[REDACTED:type]` in both `post_tool` (tool
+    /// outputs) and `post_llm` (LLM response text blocks). Returns
+    /// `GuardAction::Warn` so the redaction is surfaced via audit and
+    /// `GuardrailWarned` events without blocking the response.
     #[default]
     Redact,
     /// Issue a warning but allow the content through unmodified.
@@ -137,11 +140,8 @@ impl PiiGuardrail {
         result
     }
 
-    /// Determine the guard action for detected PII matches.
-    ///
-    /// In `Redact` mode, returns `Warn` — actual redaction is done inline in
-    /// `post_tool` (which has `&mut ToolOutput`). For `post_llm` (immutable
-    /// response), the `Warn` ensures the PII detection is logged.
+    /// Determine the guard action for detected PII matches. Used after the
+    /// (possibly mutating) scan has already run.
     fn handle_pii(&self, matches: &[(usize, usize, String)]) -> GuardAction {
         if matches.is_empty() {
             return GuardAction::Allow;
@@ -163,15 +163,23 @@ impl Guardrail for PiiGuardrail {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
-        // Scan LLM response text for PII (synchronous — no captured refs needed).
-        // In Redact mode, handle_pii returns Warn since the response is
-        // immutable (actual redaction only works in post_tool via &mut ToolOutput).
+        // Scan every text block once. In Redact mode, replace each block's
+        // text with the redacted version in place — the trait now hands us
+        // `&mut CompletionResponse`, so the mutation actually reaches the
+        // caller (Issue #7).
         let mut all_matches = Vec::new();
-        for block in &response.content {
+        let redact = matches!(self.action, PiiAction::Redact);
+        for block in &mut response.content {
             if let ContentBlock::Text { text } = block {
-                all_matches.extend(self.scan(text));
+                let scanned = self.scan(text);
+                if !scanned.is_empty() {
+                    if redact {
+                        *text = self.redact(text);
+                    }
+                    all_matches.extend(scanned);
+                }
             }
         }
         let action = self.handle_pii(&all_matches);
@@ -398,24 +406,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_llm_redact_mode_warns_on_pii() {
+    async fn post_llm_redact_mode_actually_redacts_response() {
+        // Issue #7: Redact must mutate the LLM response in place, not just
+        // return a Warn while leaving raw PII in the user-visible output.
         use crate::llm::types::{StopReason, TokenUsage};
 
         let g = make_guard(PiiAction::Redact);
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![ContentBlock::Text {
-                text: "Contact john@example.com for help".into(),
+                text: "Contact john@example.com or 415-555-0142 for help".into(),
             }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage::default(),
             model: None,
         };
-        let action = g.post_llm(&response).await.unwrap();
-        // Can't redact immutable response — should warn instead of silently allowing
+        let action = g.post_llm(&mut response).await.unwrap();
+
+        // Audit signal preserved.
         assert!(
             matches!(action, GuardAction::Warn { .. }),
-            "expected Warn for PII in LLM response with Redact mode, got: {action:?}"
+            "expected Warn after redaction so the detection is auditable, got: {action:?}"
         );
+
+        // The raw PII must be gone from the response the caller sees.
+        let ContentBlock::Text { text } = &response.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(!text.contains("john@example.com"), "email survived: {text}");
+        assert!(!text.contains("415-555-0142"), "phone survived: {text}");
+        assert!(
+            text.contains("[REDACTED:email]"),
+            "missing email tag: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:phone]"),
+            "missing phone tag: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_llm_warn_mode_leaves_response_unchanged() {
+        use crate::llm::types::{StopReason, TokenUsage};
+
+        let g = make_guard(PiiAction::Warn);
+        let original = "Contact john@example.com for help".to_string();
+        let mut response = CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: original.clone(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        let action = g.post_llm(&mut response).await.unwrap();
+        assert!(matches!(action, GuardAction::Warn { .. }));
+        let ContentBlock::Text { text } = &response.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text, &original, "Warn mode must not mutate text");
     }
 
     #[tokio::test]
@@ -423,7 +471,7 @@ mod tests {
         use crate::llm::types::{StopReason, TokenUsage};
 
         let g = make_guard(PiiAction::Deny);
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "SSN: 123-45-6789".into(),
             }],
@@ -431,7 +479,7 @@ mod tests {
             usage: TokenUsage::default(),
             model: None,
         };
-        let action = g.post_llm(&response).await.unwrap();
+        let action = g.post_llm(&mut response).await.unwrap();
         assert!(action.is_denied());
     }
 

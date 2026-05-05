@@ -133,7 +133,7 @@ impl Guardrail for InjectionClassifierGuardrail {
 
     fn post_llm(
         &self,
-        response: &CompletionResponse,
+        response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
         // Score LLM response for injection patterns (e.g., if the LLM was
         // tricked into echoing injected content).

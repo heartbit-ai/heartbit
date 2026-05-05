@@ -88,7 +88,7 @@ impl GuardAction {
 ///
 ///     fn post_llm(
 ///         &self,
-///         response: &CompletionResponse,
+///         response: &mut CompletionResponse,
 ///     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, heartbit_core::Error>> + Send + '_>> {
 ///         let leaked = response
 ///             .content
@@ -121,12 +121,23 @@ pub trait Guardrail: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Called after each LLM response. Can inspect the response and deny it.
+    /// Called after each LLM response. Can inspect *and mutate* the response
+    /// (e.g. redact PII in `ContentBlock::Text` blocks before it reaches the
+    /// caller, audit log, or downstream tools).
+    ///
     /// `Deny` discards the response and injects the denial reason as a user
-    /// message (consumes a turn). `Err` aborts the run.
+    /// message (consumes a turn). `Warn` lets the (possibly mutated) response
+    /// flow through but raises an audit signal. `Err` aborts the run.
+    ///
+    /// **Mutations must run synchronously inside this method body** — the
+    /// returned future's lifetime is tied to `&self`, not to `response`, so
+    /// it cannot capture `&mut response`. Apply any changes to
+    /// `response.content` before constructing the `Box::pin(async move { … })`.
+    /// This is also what lets `GuardrailChain` pipe each guardrail's mutations
+    /// through before any future is awaited.
     fn post_llm(
         &self,
-        _response: &CompletionResponse,
+        _response: &mut CompletionResponse,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
         Box::pin(async { Ok(GuardAction::Allow) })
     }
@@ -241,13 +252,13 @@ mod tests {
         };
         g.pre_llm(&mut request).await.unwrap();
 
-        let response = CompletionResponse {
+        let mut response = CompletionResponse {
             content: vec![],
             stop_reason: crate::llm::types::StopReason::EndTurn,
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };
-        let action = g.post_llm(&response).await.unwrap();
+        let action = g.post_llm(&mut response).await.unwrap();
         assert!(matches!(action, GuardAction::Allow));
 
         let call = ToolCall {

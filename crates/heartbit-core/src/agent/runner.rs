@@ -222,7 +222,7 @@ impl<P: LlmProvider> AgentRunner<P> {
     pub fn builder(provider: Arc<P>) -> AgentRunnerBuilder<P> {
         AgentRunnerBuilder {
             provider,
-            name: String::new(),
+            name: "agent".into(),
             system_prompt: String::new(),
             tools: Vec::new(),
             max_turns: 10,
@@ -721,7 +721,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         truncate_for_event(&r.text(), EVENT_MAX_PAYLOAD_BYTES).as_str(),
                     );
                 }
-                let response = match llm_result {
+                let mut response = match llm_result {
                     Ok(r) => r,
                     Err(e) => {
                         // Auto-compaction: on context overflow, summarize and retry
@@ -907,7 +907,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // invariant required by the Anthropic API.
                 let mut post_llm_denied = false;
                 for g in &self.guardrails {
-                    match g.post_llm(&response).await.map_err(|e| (e, total_usage))? {
+                    match g
+                        .post_llm(&mut response)
+                        .await
+                        .map_err(|e| (e, total_usage))?
+                    {
                         GuardAction::Allow => {}
                         GuardAction::Warn { reason } => {
                             self.emit(AgentEvent::GuardrailWarned {
