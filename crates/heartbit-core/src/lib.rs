@@ -123,7 +123,9 @@ pub use lsp::{Diagnostic as LspDiagnostic, LspManager};
 
 // --- Memory re-exports ---
 pub use memory::Confidentiality;
-pub use memory::consolidation::{ConsolidationPipeline, cluster_by_keywords};
+pub use memory::consolidation::{
+    ConsolidationPipeline, ConsolidationResult, DEFAULT_SUMMARY_MAX_TOKENS, cluster_by_keywords,
+};
 pub use memory::embedding::{EmbeddingMemory, EmbeddingProvider, NoopEmbedding, OpenAiEmbedding};
 pub use memory::hybrid::{cosine_similarity, rrf_fuse};
 pub use memory::in_memory::InMemoryStore;

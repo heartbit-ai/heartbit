@@ -14,6 +14,32 @@ use crate::llm::types::{CompletionRequest, Message, StopReason, TokenUsage};
 
 use super::{Confidentiality, Memory, MemoryEntry, MemoryQuery, MemoryType};
 
+/// Outcome of a consolidation pass.
+///
+/// `clusters_merged + clusters_skipped == clusters_identified` (clusters whose
+/// member count >= `min_cluster_size`). Skips happen when the per-cluster LLM
+/// summary returns `StopReason::MaxTokens` (raise the budget via
+/// [`ConsolidationPipeline::with_summary_max_tokens`]) or when the LLM call
+/// itself errors.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidationResult {
+    /// Clusters that were summarised, stored as Semantic, and whose source
+    /// episodic entries were deleted.
+    pub clusters_merged: usize,
+    /// Clusters identified by the keyword-overlap pass but skipped during
+    /// summarisation. Each skip is also surfaced via `tracing::warn!`.
+    pub clusters_skipped: usize,
+    /// Total source entries that contributed to merged clusters.
+    pub entries_consolidated: usize,
+    /// LLM token usage accumulated across all summary attempts (including
+    /// the ones that ended up skipped).
+    pub token_usage: TokenUsage,
+}
+
+/// Default per-cluster summary budget. Mirrors `summary_max_tokens` so callers
+/// who want to raise / lower it know the baseline.
+pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 512;
+
 /// Consolidation pipeline that clusters related memories and merges them.
 ///
 /// At session end, finds clusters of related memories (by keyword overlap),
@@ -27,6 +53,11 @@ pub struct ConsolidationPipeline<P: LlmProvider> {
     similarity_threshold: f64,
     /// Minimum cluster size to consolidate. Default: 2.
     min_cluster_size: usize,
+    /// Per-cluster summary token budget passed to the provider. Default:
+    /// [`DEFAULT_SUMMARY_MAX_TOKENS`]. When the LLM trips this cap (i.e. it
+    /// returns `StopReason::MaxTokens`) the cluster is skipped and reported
+    /// in [`ConsolidationResult::clusters_skipped`].
+    summary_max_tokens: u32,
 }
 
 impl<P: LlmProvider> ConsolidationPipeline<P> {
@@ -37,6 +68,7 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
             agent_name: agent_name.into(),
             similarity_threshold: 0.3,
             min_cluster_size: 2,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
         }
     }
 
@@ -50,10 +82,34 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
         self
     }
 
+    /// Override the per-cluster summary token budget (default: 512).
+    ///
+    /// Verbose clusters can trip the default cap and end up silently skipped;
+    /// raise this when consolidating long episodic transcripts. The cap maps
+    /// directly to `CompletionRequest::max_tokens` for the summary LLM call.
+    pub fn with_summary_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.summary_max_tokens = max_tokens;
+        self
+    }
+
     /// Run the consolidation pipeline within the given tenant scope.
     ///
-    /// Returns `(clusters_merged, total_entries_consolidated, token_usage)`.
+    /// Returns `(clusters_merged, total_entries_consolidated, token_usage)`
+    /// for backward compatibility. Use [`ConsolidationPipeline::run_detailed`]
+    /// when callers need the `clusters_skipped` count to detect partial runs.
     pub async fn run(&self, scope: &TenantScope) -> Result<(usize, usize, TokenUsage), Error> {
+        let result = self.run_detailed(scope).await?;
+        Ok((
+            result.clusters_merged,
+            result.entries_consolidated,
+            result.token_usage,
+        ))
+    }
+
+    /// Run the consolidation pipeline and return a structured outcome,
+    /// including the count of clusters that were identified but skipped
+    /// during summarisation.
+    pub async fn run_detailed(&self, scope: &TenantScope) -> Result<ConsolidationResult, Error> {
         // 1. Recall all episodic memories
         let entries = self
             .memory
@@ -69,7 +125,7 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
             .await?;
 
         if entries.len() < self.min_cluster_size {
-            return Ok((0, 0, TokenUsage::default()));
+            return Ok(ConsolidationResult::default());
         }
 
         // 2. Cluster by keyword overlap (Jaccard similarity)
@@ -78,6 +134,7 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
 
         let mut total_usage = TokenUsage::default();
         let mut clusters_merged = 0;
+        let mut clusters_skipped = 0;
         let mut entries_consolidated = 0;
 
         // 3. For each cluster, generate summary and consolidate
@@ -92,15 +149,27 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
                 Err(e) => {
                     tracing::warn!(
                         agent = %self.agent_name,
+                        cluster_size = cluster.len(),
                         error = %e,
                         "failed to summarize cluster, skipping"
                     );
+                    clusters_skipped += 1;
                     continue;
                 }
             };
             total_usage += usage;
 
             let Some(summary_text) = summary else {
+                let first_id = cluster.first().map(|e| e.id.as_str()).unwrap_or("");
+                tracing::warn!(
+                    agent = %self.agent_name,
+                    cluster_size = cluster.len(),
+                    first_entry_id = %first_id,
+                    summary_max_tokens = self.summary_max_tokens,
+                    "consolidation summary hit max_tokens, cluster skipped — \
+                     raise the budget via with_summary_max_tokens"
+                );
+                clusters_skipped += 1;
                 continue;
             };
 
@@ -151,7 +220,12 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
             entries_consolidated += cluster.len();
         }
 
-        Ok((clusters_merged, entries_consolidated, total_usage))
+        Ok(ConsolidationResult {
+            clusters_merged,
+            clusters_skipped,
+            entries_consolidated,
+            token_usage: total_usage,
+        })
     }
 
     async fn summarize_cluster(
@@ -165,7 +239,7 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
                 .into(),
             messages: vec![Message::user(content.to_string())],
             tools: vec![],
-            max_tokens: 512,
+            max_tokens: self.summary_max_tokens,
             tool_choice: None,
             reasoning_effort: None,
         };
@@ -350,5 +424,119 @@ mod tests {
         let ids: Vec<&str> = clusters[0].iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"m1"));
         assert!(ids.contains(&"m2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_detailed: skip accounting + summary token budget (Issue #8)
+    // -----------------------------------------------------------------------
+
+    use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock};
+    use crate::memory::in_memory::InMemoryStore;
+    use std::sync::Mutex;
+
+    /// Provider that always responds with `StopReason::MaxTokens` and records
+    /// the `max_tokens` budget it received.
+    struct MaxTokensProvider {
+        observed_max_tokens: Mutex<Vec<u32>>,
+    }
+
+    impl LlmProvider for MaxTokensProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            self.observed_max_tokens
+                .lock()
+                .expect("lock")
+                .push(request.max_tokens);
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "partial".into(),
+                }],
+                stop_reason: StopReason::MaxTokens,
+                usage: TokenUsage::default(),
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_detailed_reports_clusters_skipped_on_max_tokens() {
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let scope = TenantScope::default();
+
+        for entry in [
+            make_entry_with_keywords("a1", vec!["rust".into(), "perf".into()]),
+            make_entry_with_keywords("a2", vec!["rust".into(), "speed".into()]),
+            make_entry_with_keywords("b1", vec!["python".into(), "ml".into()]),
+            make_entry_with_keywords("b2", vec!["python".into(), "data".into()]),
+        ] {
+            store.store(&scope, entry).await.unwrap();
+        }
+
+        let provider = Arc::new(MaxTokensProvider {
+            observed_max_tokens: Mutex::new(Vec::new()),
+        });
+
+        let pipeline = ConsolidationPipeline::new(store.clone(), provider.clone(), "test")
+            .with_min_cluster_size(2);
+
+        let result = pipeline.run_detailed(&scope).await.unwrap();
+
+        // Two clusters identified, both summaries trip MaxTokens, so both
+        // should be reported as skipped instead of being silently dropped.
+        assert_eq!(result.clusters_merged, 0);
+        assert_eq!(result.clusters_skipped, 2);
+        assert_eq!(result.entries_consolidated, 0);
+
+        // Default budget is DEFAULT_SUMMARY_MAX_TOKENS.
+        let observed = provider.observed_max_tokens.lock().expect("lock").clone();
+        assert!(
+            observed.iter().all(|m| *m == DEFAULT_SUMMARY_MAX_TOKENS),
+            "default summary max_tokens = {DEFAULT_SUMMARY_MAX_TOKENS}, observed: {observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_uses_configured_summary_max_tokens() {
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let scope = TenantScope::default();
+
+        for entry in [
+            make_entry_with_keywords("a1", vec!["rust".into()]),
+            make_entry_with_keywords("a2", vec!["rust".into()]),
+        ] {
+            store.store(&scope, entry).await.unwrap();
+        }
+
+        let provider = Arc::new(MaxTokensProvider {
+            observed_max_tokens: Mutex::new(Vec::new()),
+        });
+
+        let pipeline = ConsolidationPipeline::new(store.clone(), provider.clone(), "test")
+            .with_min_cluster_size(2)
+            .with_summary_max_tokens(4096);
+
+        let _ = pipeline.run_detailed(&scope).await.unwrap();
+
+        let observed = provider.observed_max_tokens.lock().expect("lock").clone();
+        assert_eq!(
+            observed,
+            vec![4096],
+            "with_summary_max_tokens must be passed to the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tuple_keeps_backward_compatible_shape() {
+        // The original `run()` returns a 3-tuple — ensure we kept that
+        // shape so existing callers don't break.
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+        let scope = TenantScope::default();
+        let provider = Arc::new(MaxTokensProvider {
+            observed_max_tokens: Mutex::new(Vec::new()),
+        });
+        let pipeline = ConsolidationPipeline::new(store, provider, "test");
+
+        let (merged, entries, _usage) = pipeline.run(&scope).await.unwrap();
+        assert_eq!(merged, 0);
+        assert_eq!(entries, 0);
     }
 }
