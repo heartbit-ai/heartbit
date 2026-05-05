@@ -394,13 +394,19 @@ impl Memory for InMemoryStore {
                 }
             }
 
-            // Update access counts and reinforce strength (still under the same lock)
+            // Update access counts (always) and reinforce strength (opt-in).
+            // `reinforce: false` makes recall a pure read for strength —
+            // necessary so callers can observe the literal strength they
+            // stored without it drifting upward on every read.
+            let reinforce = query.reinforce;
             for r in &mut results {
                 if let Some(e) = entries.get_mut(&r.id) {
                     e.access_count += 1;
                     e.last_accessed = now;
-                    // Reinforce strength on access (Ebbinghaus reinforcement)
-                    e.strength = (e.strength + 0.2).min(1.0);
+                    if reinforce {
+                        // Ebbinghaus reinforcement: +0.2 per access, capped at 1.0.
+                        e.strength = (e.strength + 0.2).min(1.0);
+                    }
                     r.access_count = e.access_count;
                     r.last_accessed = now;
                     r.strength = e.strength;
@@ -1243,6 +1249,73 @@ mod tests {
             .await
             .unwrap();
         assert!((results[0].strength - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn store_preserves_caller_supplied_strength() {
+        // Issue #5: callers persisting an explicit `strength` (e.g. a freshly
+        // weakened decay test fixture) must read the same value back on the
+        // next pure recall.
+        let store = InMemoryStore::new();
+
+        let mut weak = make_entry("m1", "a", "test", "fact");
+        weak.strength = 0.05;
+        store.store(&test_scope(), weak).await.unwrap();
+
+        let results = store
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    reinforce: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            (results[0].strength - 0.05).abs() < f64::EPSILON,
+            "store must preserve caller strength; recall(reinforce=false) must not mutate it (got {})",
+            results[0].strength
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_with_reinforce_false_is_idempotent_for_strength() {
+        let store = InMemoryStore::new();
+
+        let mut entry = make_entry("m1", "a", "test", "fact");
+        entry.strength = 0.4;
+        store.store(&test_scope(), entry).await.unwrap();
+
+        for _ in 0..5 {
+            let results = store
+                .recall(
+                    &test_scope(),
+                    MemoryQuery {
+                        limit: 10,
+                        reinforce: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!((results[0].strength - 0.4).abs() < f64::EPSILON);
+        }
+
+        // access_count still ticks even when strength is frozen.
+        let results = store
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    reinforce: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(results[0].access_count >= 5);
     }
 
     #[tokio::test]

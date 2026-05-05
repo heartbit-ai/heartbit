@@ -80,6 +80,12 @@ pub struct MemoryEntry {
     pub summary: Option<String>,
     /// Ebbinghaus strength score. Starts at 1.0, decays over time,
     /// reinforced on access. Entries with low strength may be pruned.
+    ///
+    /// `Memory::store` preserves whatever value the caller supplies — no
+    /// normalisation or clamping at insert time. `Memory::recall` reinforces
+    /// the stored value by `+0.2` per access (capped at 1.0) unless the
+    /// caller opts out via [`MemoryQuery::reinforce`] = `false`. Decay is
+    /// applied lazily at read time via `effective_strength`.
     #[serde(default = "default_strength")]
     pub strength: f64,
     /// Bidirectional links to related memory entries.
@@ -122,7 +128,7 @@ pub(crate) fn default_recall_limit() -> usize {
 ///
 /// `limit` controls the maximum number of results returned. A value of `0`
 /// means no limit (return all matching entries). This is the default.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MemoryQuery {
     pub text: Option<String>,
     pub category: Option<String>,
@@ -147,6 +153,34 @@ pub struct MemoryQuery {
     /// When set, recall excludes entries with confidentiality above this level.
     /// `None` means no restriction (all levels returned).
     pub max_confidentiality: Option<Confidentiality>,
+    /// Whether to reinforce the `strength` of returned entries on this read
+    /// (Ebbinghaus reinforcement, +0.2 per access, capped at 1.0).
+    ///
+    /// Defaults to `true` to preserve historical recall semantics. Set to
+    /// `false` for a pure read — useful when surfacing strength to a UI,
+    /// driving deterministic decay tests, or letting `prune_weak_entries`
+    /// observe a freshly-stored low-strength entry without first promoting
+    /// it above the prune threshold. `last_accessed` and `access_count`
+    /// are still updated regardless.
+    pub reinforce: bool,
+}
+
+impl Default for MemoryQuery {
+    fn default() -> Self {
+        Self {
+            text: None,
+            category: None,
+            tags: Vec::new(),
+            agent: None,
+            agent_prefix: None,
+            limit: 0,
+            memory_type: None,
+            min_strength: None,
+            query_embedding: None,
+            max_confidentiality: None,
+            reinforce: true,
+        }
+    }
 }
 
 /// Trait for persistent memory stores.
@@ -181,12 +215,23 @@ pub struct MemoryQuery {
 /// # Ok(()) }
 /// ```
 pub trait Memory: Send + Sync {
+    /// Persist `entry` under `scope`.
+    ///
+    /// The caller-supplied [`MemoryEntry::strength`] is preserved verbatim;
+    /// implementations must not normalise or clamp it at insert time.
+    /// Reinforcement happens on read via [`Memory::recall`], not on write.
     fn store(
         &self,
         scope: &TenantScope,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
+    /// Recall entries matching `query` from `scope`.
+    ///
+    /// By default, recall reinforces the `strength` of returned entries
+    /// (Ebbinghaus reinforcement, +0.2 per access, capped at 1.0). To
+    /// observe strength without modifying it, set
+    /// [`MemoryQuery::reinforce`] to `false`.
     fn recall(
         &self,
         scope: &TenantScope,
