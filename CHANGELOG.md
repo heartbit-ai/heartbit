@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.505.1] - 2026-05-05
+
+### Fixed — Runtime Usability Audit
+
+- **`AgentRunner::builder()` minimal chain now works.** The builder used to
+  initialise `name` to `String::new()` while `build()` rejected empty names —
+  every minimal chain (including `examples/hello_agent.rs` and the runner
+  doctest) crashed at runtime with `agent name must not be empty`. The
+  default is now `"agent"`; explicit `.name("")` still errors. (#4)
+- **`MemoryQuery::reinforce` makes recall-time strength reinforcement
+  opt-out.** `InMemoryStore::recall` previously reinforced `strength` by
+  `+0.2` on every read, defeating decay-based pruning workflows that needed
+  to observe the literal stored value. Default is `true` (preserves prior
+  behaviour); set `reinforce: false` for a pure read. `Memory::store`,
+  `Memory::recall`, and `MemoryEntry::strength` rustdoc now document the
+  contract. (#5)
+- **`EvalRunner::with_event_collector` clears events between cases.**
+  `EvalRunner::run` never cleared the shared `EventCollector`, so
+  `CostScorer` / `LatencyScorer` / `SafetyScorer` accumulated events across
+  cases. Attach the collector via the new builder method to isolate per-case
+  scoring. (#6)
+- **`ConsolidationPipeline` skips are visible.** The pipeline silently
+  dropped clusters when the per-cluster summary tripped the hardcoded
+  `max_tokens = 512`. New `ConsolidationResult` struct + `run_detailed()`
+  method surface `clusters_skipped`; new `with_summary_max_tokens(u32)`
+  builder lets callers raise the cap; skipped clusters now emit
+  `tracing::warn!`. The legacy `run()` 3-tuple shape is preserved. (#8)
+
+### Changed — Breaking
+
+- **`Guardrail::post_llm` now takes `&mut CompletionResponse`.** This is
+  what makes `PiiGuardrail::Redact` actually redact LLM response text
+  instead of silently degrading to `Warn`. Trait rustdoc explains that
+  mutations must run synchronously inside the method body — the future's
+  lifetime is tied to `&self`, not to `response`. Built-in guardrails and
+  tests are updated; downstream guardrail implementors must change
+  `&CompletionResponse` to `&mut CompletionResponse` in their `post_llm`
+  impls. (#7)
+
 ## [2026.503.1] - 2026-05-03
 
 > **Note:** `2026.306.7` was published earlier the same day but was misnumbered
