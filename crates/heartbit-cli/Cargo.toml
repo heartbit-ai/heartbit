@@ -42,6 +42,14 @@ sqlx = { workspace = true }
 regex = { workspace = true }
 
 [features]
+# SECURITY (F-FS-5): the `sandbox` feature is enabled by default on Linux
+# so the kernel-level Landlock layer is active out of the box. Without this,
+# `bash` runs with the host process's full capabilities — `cat /etc/passwd`,
+# `find / -name '*.env'`, etc. The opt-out (`--no-default-features`) is for
+# users who explicitly accept that risk. macOS and Windows have no Landlock
+# equivalent; on those platforms, BashTool emits a `tracing::warn!` at build
+# time so the user knows kernel sandboxing is unavailable.
+default = ["sandbox"]
 local-embedding = ["heartbit/local-embedding"]
 daemon = ["heartbit/daemon"]
 sandbox = ["heartbit/sandbox"]

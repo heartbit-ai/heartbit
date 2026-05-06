@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 const MAX_ENTRIES: usize = 1000;
@@ -37,6 +38,7 @@ const DEFAULT_IGNORES: &[&str] = &[
 pub struct ListTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl ListTool {
@@ -44,7 +46,15 @@ impl ListTool {
         Self {
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that restricts which directories list can walk.
+    /// SECURITY (F-FS-4).
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -99,6 +109,14 @@ impl Tool for ListTool {
                 }
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
+            // SECURITY (F-FS-4): apply the path policy to the root before
+            // walking. Without this, `list({path: "/home"})` enumerates the
+            // entire home tree when no workspace is configured.
+            if let Some(ref policy) = self.path_policy
+                && let Err(e) = policy.check_path(&root)
+            {
+                return Ok(ToolOutput::error(format!("path policy: {e}")));
+            }
             let path = root.display().to_string();
             if !root.exists() {
                 return Ok(ToolOutput::error(format!("Path not found: {path}")));

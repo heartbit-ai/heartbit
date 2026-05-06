@@ -112,6 +112,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Register a batch of tools.
+    ///
+    /// SECURITY (F-MCP-2): when MCP-discovered tools and builtins coexist,
+    /// **register the trusted builtins first**. The runner deduplicates by
+    /// name with first-wins semantics, so a hostile MCP server that exports a
+    /// tool named `bash` will be shadowed by the local `bash` builtin only if
+    /// the builtin was added before. The collision is logged at `error!` and
+    /// emits a `tool_name_collision` audit signal.
     pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools.extend(tools);
         self
@@ -572,7 +580,12 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             ));
         }
         if let Some(kb) = self.knowledge_base {
-            all_tools.extend(crate::knowledge::tools::knowledge_tools(kb));
+            // SECURITY (F-KB-1): scope the KB tool to this runner's tenant.
+            let kb_scope = crate::auth::TenantScope::from_audit_fields(
+                self.audit_tenant_id.as_deref(),
+                self.audit_user_id.as_deref(),
+            );
+            all_tools.extend(crate::knowledge::tools::knowledge_tools(kb, kb_scope));
         }
         if let Some(on_question) = self.on_question {
             all_tools.push(Arc::new(crate::tool::builtins::QuestionTool::new(
@@ -586,7 +599,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         for t in all_tools {
             let def = t.definition();
             if tools.contains_key(&def.name) {
-                tracing::warn!(tool = %def.name, "duplicate tool name, keeping first registration");
+                // SECURITY (F-MCP-2): elevate the log level — a duplicate tool
+                // name is a potential MCP-shadowing attempt. The existing
+                // first-wins behavior is preserved (so trusted builtins added
+                // first take precedence) but the event is now auditable.
+                tracing::error!(
+                    tool = %def.name,
+                    "duplicate tool name (potential MCP-shadowing); keeping first registration"
+                );
                 continue;
             }
             tool_defs.push(def.clone());

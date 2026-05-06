@@ -872,10 +872,12 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
     };
 
     for source in &config.sources {
+        // SECURITY (F-KB-1): single-tenant CLI uses the default scope (`""`).
+        let kb_scope = heartbit::TenantScope::default();
         match source {
             KnowledgeSourceConfig::File { path } => {
                 let path = std::path::Path::new(path);
-                match loader::load_file(&*kb, path, &chunk_config).await {
+                match loader::load_file(&*kb, &kb_scope, path, &chunk_config).await {
                     Ok(count) => {
                         tracing::info!(path = %path.display(), chunks = count, "indexed knowledge file");
                     }
@@ -885,7 +887,7 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
                 }
             }
             KnowledgeSourceConfig::Glob { pattern } => {
-                match loader::load_glob(&*kb, pattern, &chunk_config).await {
+                match loader::load_glob(&*kb, &kb_scope, pattern, &chunk_config).await {
                     Ok(count) => {
                         tracing::info!(pattern = %pattern, chunks = count, "indexed knowledge glob");
                     }
@@ -895,7 +897,7 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
                 }
             }
             KnowledgeSourceConfig::Url { url } => {
-                match loader::load_url(&*kb, url, &chunk_config).await {
+                match loader::load_url(&*kb, &kb_scope, url, &chunk_config).await {
                     Ok(count) => {
                         tracing::info!(url = %url, chunks = count, "indexed knowledge URL");
                     }
@@ -907,7 +909,10 @@ async fn load_knowledge_base(config: &heartbit::KnowledgeConfig) -> Result<Arc<d
         }
     }
 
-    let total = kb.chunk_count().await.unwrap_or(0);
+    let total = kb
+        .chunk_count(&heartbit::TenantScope::default())
+        .await
+        .unwrap_or(0);
     tracing::info!(total_chunks = total, "knowledge base loaded");
 
     Ok(kb)

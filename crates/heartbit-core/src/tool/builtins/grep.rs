@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 const MAX_MATCHES: usize = 100;
@@ -18,9 +19,14 @@ const MAX_MATCHES: usize = 100;
 /// returns up to `MAX_MATCHES = 100` matching lines with file name and line number.
 /// The search is scoped to the configured workspace root when set, and respects
 /// `protected_paths` to prevent the agent from searching sensitive directories.
+///
+/// SECURITY (F-FS-4): when a `CorePathPolicy` is set, `path` is checked
+/// against it before grep runs. Without this, the LLM can pass an absolute
+/// `path = "/home"` and read every file under it.
 pub struct GrepTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl GrepTool {
@@ -28,7 +34,14 @@ impl GrepTool {
         Self {
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that restricts the directory grep can search.
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -92,6 +105,14 @@ impl Tool for GrepTool {
                 }
                 None => self.workspace.clone().unwrap_or_else(|| PathBuf::from(".")),
             };
+            // SECURITY (F-FS-4): apply the path policy to the search root
+            // before invoking ripgrep / fallback search. Without this, an LLM
+            // can grep `/etc` or `/home` for secrets when no workspace is set.
+            if let Some(ref policy) = self.path_policy
+                && let Err(e) = policy.check_path(&search_path)
+            {
+                return Ok(ToolOutput::error(format!("path policy: {e}")));
+            }
             let path = search_path.display().to_string();
             if !search_path.exists() {
                 return Ok(ToolOutput::error(format!("Path not found: {path}")));

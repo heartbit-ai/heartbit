@@ -37,8 +37,45 @@ pub struct BashTool {
     path_policy: Option<std::sync::Arc<crate::sandbox::CorePathPolicy>>,
 }
 
+/// Emit a one-time warning when BashTool is constructed without a kernel
+/// sandbox. Helps operators notice the absence of Landlock on macOS / Windows
+/// or when the `sandbox` feature was disabled.
+fn warn_kernel_sandbox_status() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    #[cfg(all(target_os = "linux", feature = "sandbox"))]
+    {
+        tracing::debug!("BashTool: Linux Landlock kernel sandbox available");
+    }
+    #[cfg(all(target_os = "linux", not(feature = "sandbox")))]
+    {
+        tracing::warn!(
+            "BashTool: built without `sandbox` feature on Linux. \
+             The kernel-level Landlock filesystem isolation is OFF; \
+             agents can read/write the entire filesystem under this process's \
+             identity. Rebuild with --features sandbox to enable. (F-FS-5)"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            "BashTool: kernel-level filesystem sandbox is unavailable on this \
+             platform. Only application-layer `path_policy` enforcement is \
+             active. For multi-tenant deployments, prefer Linux + the \
+             `sandbox` feature. (F-FS-5)"
+        );
+    }
+}
+
 impl BashTool {
     pub fn new() -> Self {
+        warn_kernel_sandbox_status();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         Self {
             cwd: Mutex::new(cwd),
@@ -52,6 +89,7 @@ impl BashTool {
 
     /// Create a BashTool with workspace jailing and optional env variable filtering.
     pub fn with_sandbox(workspace: PathBuf, env_policy: crate::workspace::EnvPolicy) -> Self {
+        warn_kernel_sandbox_status();
         Self {
             cwd: Mutex::new(workspace.clone()),
             workspace: Some(workspace),

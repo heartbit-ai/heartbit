@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
+use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
 const MAX_RESULTS: usize = 100;
@@ -17,9 +18,14 @@ const MAX_RESULTS: usize = 100;
 /// set) and returns up to `MAX_RESULTS = 100` paths that match the given pattern
 /// (e.g., `**/*.rs`). Results are sorted lexicographically. Protected paths are
 /// filtered from the output so the agent cannot enumerate sensitive locations.
+///
+/// SECURITY (F-FS-4): when a `CorePathPolicy` is set, every result path is
+/// checked against it before being included; results outside the allowed
+/// directories (or matching deny-globs) are silently dropped.
 pub struct GlobTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
+    path_policy: Option<Arc<CorePathPolicy>>,
 }
 
 impl GlobTool {
@@ -27,7 +33,14 @@ impl GlobTool {
         Self {
             workspace,
             protected_paths,
+            path_policy: None,
         }
+    }
+
+    /// Set a `CorePathPolicy` that filters glob results.
+    pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 }
 
@@ -117,6 +130,28 @@ impl Tool for GlobTool {
                                 .is_ok_and(|m| m.file_type().is_symlink())
                             && let Ok(canonical) = path.canonicalize()
                             && !canonical.starts_with(ws)
+                        {
+                            continue;
+                        }
+
+                        // SECURITY (F-FS-4): apply the path policy to every
+                        // result. Without this, glob can enumerate arbitrary
+                        // directories outside the workspace when the LLM
+                        // provides an absolute `path` and no workspace is set.
+                        if let Some(ref policy) = self.path_policy
+                            && policy.check_path(&path).is_err()
+                        {
+                            continue;
+                        }
+
+                        // Reject any symlink whose target lies outside the
+                        // path policy, even when no workspace is configured.
+                        if path
+                            .symlink_metadata()
+                            .is_ok_and(|m| m.file_type().is_symlink())
+                            && let Ok(canonical) = path.canonicalize()
+                            && let Some(ref policy) = self.path_policy
+                            && policy.check_path(&canonical).is_err()
                         {
                             continue;
                         }

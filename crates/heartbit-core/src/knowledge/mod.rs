@@ -10,6 +10,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 /// Provenance of a document chunk.
@@ -32,6 +33,14 @@ pub struct Chunk {
     pub source: DocumentSource,
     /// Position of this chunk within its source document (0-based).
     pub chunk_index: usize,
+    /// Tenant that owns this chunk. `None` means single-tenant (legacy).
+    ///
+    /// SECURITY (F-KB-1): in a multi-tenant deployment, this MUST be set to
+    /// `Some(tenant_id)` so cross-tenant searches do not return another
+    /// tenant's documents. The `KnowledgeBase` implementations filter
+    /// by this field on `search`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Query parameters for knowledge search.
@@ -58,18 +67,31 @@ pub struct SearchResult {
 ///
 /// Uses `Pin<Box<dyn Future>>` for dyn-compatibility, matching `Tool`, `Memory`,
 /// and `Blackboard` traits.
+///
+/// SECURITY (F-KB-1): every method takes a `&TenantScope`. Implementations
+/// MUST stamp `chunk.tenant_id = scope.tenant_id` on `index` and filter
+/// `search`/`chunk_count` by it. A shared `Arc<dyn KnowledgeBase>` across
+/// tenants would otherwise leak documents cross-tenant via `knowledge_search`.
 pub trait KnowledgeBase: Send + Sync {
-    /// Index a chunk into the knowledge base.
-    fn index(&self, chunk: Chunk) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
+    /// Index a chunk into the knowledge base under the given tenant scope.
+    fn index(
+        &self,
+        scope: &TenantScope,
+        chunk: Chunk,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
-    /// Search the knowledge base.
+    /// Search the knowledge base, filtered by tenant scope.
     fn search(
         &self,
+        scope: &TenantScope,
         query: KnowledgeQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchResult>, Error>> + Send + '_>>;
 
-    /// Return the total number of indexed chunks.
-    fn chunk_count(&self) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>>;
+    /// Return the number of indexed chunks for the given tenant scope.
+    fn chunk_count(
+        &self,
+        scope: &TenantScope,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>>;
 }
 
 #[cfg(test)]
@@ -99,6 +121,7 @@ mod tests {
                 title: "Test".into(),
             },
             chunk_index: 0,
+            tenant_id: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let parsed: Chunk = serde_json::from_str(&json).unwrap();
@@ -141,6 +164,7 @@ mod tests {
                     title: "F".into(),
                 },
                 chunk_index: 0,
+                tenant_id: None,
             },
             match_count: 3,
         };

@@ -60,6 +60,7 @@ pub fn split_into_chunks(text: &str, source: &DocumentSource, config: &ChunkConf
                 content: current.clone(),
                 source: source.clone(),
                 chunk_index,
+                tenant_id: None,
             });
             chunk_index += 1;
 
@@ -85,6 +86,7 @@ pub fn split_into_chunks(text: &str, source: &DocumentSource, config: &ChunkConf
                     content: current.clone(),
                     source: source.clone(),
                     chunk_index,
+                    tenant_id: None,
                 });
                 chunk_index += 1;
                 current.clear();
@@ -103,6 +105,7 @@ pub fn split_into_chunks(text: &str, source: &DocumentSource, config: &ChunkConf
                     content: para[pos..end].to_string(),
                     source: source.clone(),
                     chunk_index,
+                    tenant_id: None,
                 });
                 chunk_index += 1;
 
@@ -136,6 +139,7 @@ pub fn split_into_chunks(text: &str, source: &DocumentSource, config: &ChunkConf
             content: current,
             source: source.clone(),
             chunk_index,
+            tenant_id: None,
         });
     }
 

@@ -6,6 +6,7 @@ use std::pin::Pin;
 
 use tokio::sync::RwLock;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::{Chunk, KnowledgeBase, KnowledgeQuery, SearchResult};
@@ -58,8 +59,16 @@ fn count_matches(query_tokens: &[String], content: &str) -> usize {
 }
 
 impl KnowledgeBase for InMemoryKnowledgeBase {
-    fn index(&self, chunk: Chunk) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+    fn index(
+        &self,
+        scope: &TenantScope,
+        mut chunk: Chunk,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        // SECURITY (F-KB-1): stamp the chunk with the caller's tenant_id at
+        // index time. The argument is &str → owned String for the async block.
+        let tid = scope.tenant_id.clone();
         Box::pin(async move {
+            chunk.tenant_id = if tid.is_empty() { None } else { Some(tid) };
             let mut data = self.chunks.write().await;
             data.insert(chunk.id.clone(), chunk);
             Ok(())
@@ -68,8 +77,10 @@ impl KnowledgeBase for InMemoryKnowledgeBase {
 
     fn search(
         &self,
+        scope: &TenantScope,
         query: KnowledgeQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchResult>, Error>> + Send + '_>> {
+        let tid = scope.tenant_id.clone();
         Box::pin(async move {
             let data = self.chunks.read().await;
             let tokens = tokenize(&query.text);
@@ -78,8 +89,16 @@ impl KnowledgeBase for InMemoryKnowledgeBase {
                 return Ok(vec![]);
             }
 
+            // Tenant filter: keep chunks whose tenant_id matches scope.
+            // Single-tenant scope (`""`) matches `None` and `""`.
+            let tenant_match = move |chunk: &Chunk| -> bool {
+                let chunk_tid = chunk.tenant_id.as_deref().unwrap_or("");
+                chunk_tid == tid.as_str()
+            };
+
             let mut results: Vec<SearchResult> = data
                 .values()
+                .filter(|chunk| tenant_match(chunk))
                 .filter(|chunk| {
                     if let Some(ref filter) = query.source_filter {
                         chunk.source.uri.starts_with(filter)
@@ -116,10 +135,18 @@ impl KnowledgeBase for InMemoryKnowledgeBase {
         })
     }
 
-    fn chunk_count(&self) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+    fn chunk_count(
+        &self,
+        scope: &TenantScope,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
+        let tid = scope.tenant_id.clone();
         Box::pin(async move {
             let data = self.chunks.read().await;
-            Ok(data.len())
+            let count = data
+                .values()
+                .filter(|c| c.tenant_id.as_deref().unwrap_or("") == tid.as_str())
+                .count();
+            Ok(count)
         })
     }
 }
@@ -139,27 +166,38 @@ mod tests {
                 title: uri.into(),
             },
             chunk_index: index,
+            tenant_id: None,
         }
+    }
+
+    fn s() -> TenantScope {
+        TenantScope::default()
     }
 
     #[tokio::test]
     async fn index_and_search_roundtrip() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk(
-            "c1",
-            "Rust is a systems programming language",
-            "docs/rust.md",
-            0,
-        ))
+        kb.index(
+            &s(),
+            make_chunk(
+                "c1",
+                "Rust is a systems programming language",
+                "docs/rust.md",
+                0,
+            ),
+        )
         .await
         .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust programming".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust programming".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -171,16 +209,19 @@ mod tests {
     #[tokio::test]
     async fn search_is_case_insensitive() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "RUST is GREAT", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "RUST is GREAT", "f.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust great".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust great".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -191,19 +232,22 @@ mod tests {
     #[tokio::test]
     async fn source_filter_restricts_results() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "Rust language", "docs/rust.md", 0))
+        kb.index(&s(), make_chunk("c1", "Rust language", "docs/rust.md", 0))
             .await
             .unwrap();
-        kb.index(make_chunk("c2", "Rust compiler", "api/rust.md", 0))
+        kb.index(&s(), make_chunk("c2", "Rust compiler", "api/rust.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust".into(),
-                source_filter: Some("docs/".into()),
-                limit: 10,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: Some("docs/".into()),
+                    limit: 10,
+                },
+            )
             .await
             .unwrap();
 
@@ -215,22 +259,28 @@ mod tests {
     async fn limit_truncates_results() {
         let kb = InMemoryKnowledgeBase::new();
         for i in 0..10 {
-            kb.index(make_chunk(
-                &format!("c{i}"),
-                "rust programming language",
-                "docs/rust.md",
-                i,
-            ))
+            kb.index(
+                &s(),
+                make_chunk(
+                    &format!("c{i}"),
+                    "rust programming language",
+                    "docs/rust.md",
+                    i,
+                ),
+            )
             .await
             .unwrap();
         }
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust".into(),
-                source_filter: None,
-                limit: 3,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: None,
+                    limit: 3,
+                },
+            )
             .await
             .unwrap();
 
@@ -240,20 +290,28 @@ mod tests {
     #[tokio::test]
     async fn sorted_by_match_count_descending() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "rust", "f.md", 0)).await.unwrap();
-        kb.index(make_chunk("c2", "rust programming rust systems", "f.md", 1))
+        kb.index(&s(), make_chunk("c1", "rust", "f.md", 0))
             .await
             .unwrap();
-        kb.index(make_chunk("c3", "rust programming", "f.md", 2))
+        kb.index(
+            &s(),
+            make_chunk("c2", "rust programming rust systems", "f.md", 1),
+        )
+        .await
+        .unwrap();
+        kb.index(&s(), make_chunk("c3", "rust programming", "f.md", 2))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust programming systems".into(),
-                source_filter: None,
-                limit: 10,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust programming systems".into(),
+                    source_filter: None,
+                    limit: 10,
+                },
+            )
             .await
             .unwrap();
 
@@ -266,21 +324,24 @@ mod tests {
     #[tokio::test]
     async fn reindex_replaces_chunk() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "old content", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "old content", "f.md", 0))
             .await
             .unwrap();
-        kb.index(make_chunk("c1", "new content about rust", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "new content about rust", "f.md", 0))
             .await
             .unwrap();
 
-        assert_eq!(kb.chunk_count().await.unwrap(), 1);
+        assert_eq!(kb.chunk_count(&s()).await.unwrap(), 1);
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -291,16 +352,19 @@ mod tests {
     #[tokio::test]
     async fn empty_query_returns_no_results() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "some content", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "some content", "f.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -310,16 +374,19 @@ mod tests {
     #[tokio::test]
     async fn no_match_returns_empty() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "hello world", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "hello world", "f.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "zzzznotfound".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "zzzznotfound".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -329,11 +396,15 @@ mod tests {
     #[tokio::test]
     async fn chunk_count_tracks_size() {
         let kb = InMemoryKnowledgeBase::new();
-        assert_eq!(kb.chunk_count().await.unwrap(), 0);
+        assert_eq!(kb.chunk_count(&s()).await.unwrap(), 0);
 
-        kb.index(make_chunk("c1", "a", "f.md", 0)).await.unwrap();
-        kb.index(make_chunk("c2", "b", "f.md", 1)).await.unwrap();
-        assert_eq!(kb.chunk_count().await.unwrap(), 2);
+        kb.index(&s(), make_chunk("c1", "a", "f.md", 0))
+            .await
+            .unwrap();
+        kb.index(&s(), make_chunk("c2", "b", "f.md", 1))
+            .await
+            .unwrap();
+        assert_eq!(kb.chunk_count(&s()).await.unwrap(), 2);
     }
 
     #[test]
@@ -352,12 +423,15 @@ mod tests {
         for i in 0..20 {
             let kb = kb.clone();
             handles.push(tokio::spawn(async move {
-                kb.index(make_chunk(
-                    &format!("c{i}"),
-                    &format!("rust content item {i}"),
-                    "f.md",
-                    i,
-                ))
+                kb.index(
+                    &s(),
+                    make_chunk(
+                        &format!("c{i}"),
+                        &format!("rust content item {i}"),
+                        "f.md",
+                        i,
+                    ),
+                )
                 .await
                 .unwrap();
             }));
@@ -368,11 +442,14 @@ mod tests {
             let kb = kb.clone();
             handles.push(tokio::spawn(async move {
                 let _ = kb
-                    .search(KnowledgeQuery {
-                        text: "rust".into(),
-                        source_filter: None,
-                        limit: 5,
-                    })
+                    .search(
+                        &s(),
+                        KnowledgeQuery {
+                            text: "rust".into(),
+                            source_filter: None,
+                            limit: 5,
+                        },
+                    )
                     .await
                     .unwrap();
             }));
@@ -382,22 +459,25 @@ mod tests {
             h.await.unwrap();
         }
 
-        assert_eq!(kb.chunk_count().await.unwrap(), 20);
+        assert_eq!(kb.chunk_count(&s()).await.unwrap(), 20);
     }
 
     #[tokio::test]
     async fn duplicate_query_terms_not_inflated() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "rust is great", "f.md", 0))
+        kb.index(&s(), make_chunk("c1", "rust is great", "f.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust rust rust".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust rust rust".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
 
@@ -405,22 +485,83 @@ mod tests {
         assert_eq!(results[0].match_count, 1); // deduplicated, not 3
     }
 
+    /// SECURITY (F-KB-1): tenant A's chunks must not be visible to tenant B
+    /// when both share an `Arc<dyn KnowledgeBase>`. The trait now requires a
+    /// `&TenantScope` for both index and search; without filtering, a daemon
+    /// shared across tenants would leak documents.
+    #[tokio::test]
+    async fn search_isolates_by_tenant() {
+        let kb = InMemoryKnowledgeBase::new();
+        let scope_a = TenantScope::new("tenant-a");
+        let scope_b = TenantScope::new("tenant-b");
+
+        kb.index(
+            &scope_a,
+            make_chunk("a1", "alice secret rust note", "a/notes.md", 0),
+        )
+        .await
+        .unwrap();
+        kb.index(
+            &scope_b,
+            make_chunk("b1", "bob secret rust note", "b/notes.md", 0),
+        )
+        .await
+        .unwrap();
+
+        // Tenant A search must NOT return B's chunk.
+        let results_a = kb
+            .search(
+                &scope_a,
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results_a.len(), 1);
+        assert_eq!(results_a[0].chunk.id, "a1");
+
+        // Tenant B sees only B's chunk.
+        let results_b = kb
+            .search(
+                &scope_b,
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results_b.len(), 1);
+        assert_eq!(results_b[0].chunk.id, "b1");
+
+        // chunk_count is also tenant-scoped.
+        assert_eq!(kb.chunk_count(&scope_a).await.unwrap(), 1);
+        assert_eq!(kb.chunk_count(&scope_b).await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn sort_stable_across_sources() {
         let kb = InMemoryKnowledgeBase::new();
-        kb.index(make_chunk("c1", "rust programming", "z_file.md", 0))
+        kb.index(&s(), make_chunk("c1", "rust programming", "z_file.md", 0))
             .await
             .unwrap();
-        kb.index(make_chunk("c2", "rust programming", "a_file.md", 0))
+        kb.index(&s(), make_chunk("c2", "rust programming", "a_file.md", 0))
             .await
             .unwrap();
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust".into(),
-                source_filter: None,
-                limit: 10,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust".into(),
+                    source_filter: None,
+                    limit: 10,
+                },
+            )
             .await
             .unwrap();
 

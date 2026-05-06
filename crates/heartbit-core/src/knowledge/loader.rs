@@ -2,20 +2,50 @@
 
 use std::path::Path;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 
 use super::chunker::{ChunkConfig, split_into_chunks};
 use super::{DocumentSource, KnowledgeBase};
 
-/// Load a single file and index its chunks into the knowledge base.
+/// Maximum bytes loaded from a single file by [`load_file`].
+///
+/// SECURITY (F-KB-3): a hostile filesystem (or accidental glob hit on a
+/// large dump file) would otherwise OOM the process via
+/// `read_to_string`. 50 MiB covers any reasonable Markdown / code file.
+pub const KNOWLEDGE_LOAD_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Maximum bytes loaded from a single URL by [`load_url`].
+///
+/// SECURITY (F-KB-2): cap at 16 MiB to bound memory.
+pub const KNOWLEDGE_LOAD_URL_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Load a single file and index its chunks into the knowledge base under the given tenant.
+///
+/// SECURITY (F-KB-3): bounded by [`KNOWLEDGE_LOAD_FILE_MAX_BYTES`].
 pub async fn load_file(
     kb: &dyn KnowledgeBase,
+    scope: &TenantScope,
     path: &Path,
     config: &ChunkConfig,
 ) -> Result<usize, Error> {
-    let content = tokio::fs::read_to_string(path)
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| Error::Knowledge(format!("failed to open {}: {e}", path.display())))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    let read = (&mut file)
+        .take(KNOWLEDGE_LOAD_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
         .await
         .map_err(|e| Error::Knowledge(format!("failed to read {}: {e}", path.display())))?;
+    if read as u64 > KNOWLEDGE_LOAD_FILE_MAX_BYTES {
+        return Err(Error::Knowledge(format!(
+            "{} exceeds {KNOWLEDGE_LOAD_FILE_MAX_BYTES} bytes (F-KB-3)",
+            path.display()
+        )));
+    }
+    let content = String::from_utf8_lossy(&bytes).into_owned();
 
     let title = path
         .file_name()
@@ -30,7 +60,7 @@ pub async fn load_file(
     let chunks = split_into_chunks(&content, &source, config);
     let count = chunks.len();
     for chunk in chunks {
-        kb.index(chunk).await?;
+        kb.index(scope, chunk).await?;
     }
     Ok(count)
 }
@@ -38,6 +68,7 @@ pub async fn load_file(
 /// Load all files matching a glob pattern and index their chunks.
 pub async fn load_glob(
     kb: &dyn KnowledgeBase,
+    scope: &TenantScope,
     pattern: &str,
     config: &ChunkConfig,
 ) -> Result<usize, Error> {
@@ -48,7 +79,7 @@ pub async fn load_glob(
     for entry in paths {
         let path = entry.map_err(|e| Error::Knowledge(format!("glob error: {e}")))?;
         if path.is_file() {
-            match load_file(kb, &path, config).await {
+            match load_file(kb, scope, &path, config).await {
                 Ok(count) => total += count,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "skipping file");
@@ -60,12 +91,30 @@ pub async fn load_glob(
 }
 
 /// Load a URL, strip HTML tags, and index chunks.
+///
+/// SECURITY (F-KB-2): the URL is validated via [`crate::http::SafeUrl::parse`]
+/// (scheme allowlist + IP blocklist), the request uses
+/// [`crate::http::safe_client_builder`] (redirect:none, no_proxy,
+/// connect_timeout), and the body is capped at
+/// [`KNOWLEDGE_LOAD_URL_MAX_BYTES`].
 pub async fn load_url(
     kb: &dyn KnowledgeBase,
+    scope: &TenantScope,
     url: &str,
     config: &ChunkConfig,
 ) -> Result<usize, Error> {
-    let response = reqwest::get(url)
+    // SECURITY (F-KB-2): SSRF blocklist + scheme allowlist.
+    let safe = crate::http::SafeUrl::parse(url, crate::http::IpPolicy::default())
+        .await
+        .map_err(|e| Error::Knowledge(format!("URL refused for {url}: {e}")))?;
+
+    let client = crate::http::safe_client_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Knowledge(format!("client build error: {e}")))?;
+    let response = client
+        .get(safe.as_str())
+        .send()
         .await
         .map_err(|e| Error::Knowledge(format!("failed to fetch {url}: {e}")))?;
 
@@ -76,8 +125,7 @@ pub async fn load_url(
         )));
     }
 
-    let body = response
-        .text()
+    let body = crate::http::read_text_capped(response, KNOWLEDGE_LOAD_URL_MAX_BYTES)
         .await
         .map_err(|e| Error::Knowledge(format!("failed to read body from {url}: {e}")))?;
 
@@ -91,7 +139,7 @@ pub async fn load_url(
     let chunks = split_into_chunks(&content, &source, config);
     let count = chunks.len();
     for chunk in chunks {
-        kb.index(chunk).await?;
+        kb.index(scope, chunk).await?;
     }
     Ok(count)
 }
@@ -157,6 +205,10 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn s() -> TenantScope {
+        TenantScope::default()
+    }
+
     #[tokio::test]
     async fn load_file_indexes_content() {
         let mut tmp = NamedTempFile::new().unwrap();
@@ -165,17 +217,20 @@ mod tests {
         writeln!(tmp, "It provides memory safety without garbage collection.").unwrap();
 
         let kb = InMemoryKnowledgeBase::new();
-        let count = load_file(&kb, tmp.path(), &ChunkConfig::default())
+        let count = load_file(&kb, &s(), tmp.path(), &ChunkConfig::default())
             .await
             .unwrap();
         assert!(count >= 1);
 
         let results = kb
-            .search(KnowledgeQuery {
-                text: "rust memory".into(),
-                source_filter: None,
-                limit: 5,
-            })
+            .search(
+                &s(),
+                KnowledgeQuery {
+                    text: "rust memory".into(),
+                    source_filter: None,
+                    limit: 5,
+                },
+            )
             .await
             .unwrap();
         assert!(!results.is_empty());
@@ -186,13 +241,20 @@ mod tests {
         let kb = InMemoryKnowledgeBase::new();
         let err = load_file(
             &kb,
+            &s(),
             Path::new("/nonexistent/file.md"),
             &ChunkConfig::default(),
         )
         .await
         .unwrap_err();
         assert!(matches!(err, Error::Knowledge(_)));
-        assert!(err.to_string().contains("failed to read"));
+        // Either failed to open or failed to read — both are acceptable
+        // (we now open then take(...).read_to_end, F-KB-3).
+        let s = err.to_string();
+        assert!(
+            s.contains("failed to read") || s.contains("failed to open"),
+            "expected open/read error, got: {s}"
+        );
     }
 
     #[tokio::test]
@@ -205,17 +267,17 @@ mod tests {
 
         let kb = InMemoryKnowledgeBase::new();
         let pattern = format!("{}/*.md", dir.path().display());
-        let count = load_glob(&kb, &pattern, &ChunkConfig::default())
+        let count = load_glob(&kb, &s(), &pattern, &ChunkConfig::default())
             .await
             .unwrap();
         assert!(count >= 2, "expected >= 2 chunks, got {count}");
-        assert!(kb.chunk_count().await.unwrap() >= 2);
+        assert!(kb.chunk_count(&s()).await.unwrap() >= 2);
     }
 
     #[tokio::test]
     async fn load_glob_invalid_pattern_returns_error() {
         let kb = InMemoryKnowledgeBase::new();
-        let err = load_glob(&kb, "[invalid", &ChunkConfig::default())
+        let err = load_glob(&kb, &s(), "[invalid", &ChunkConfig::default())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Knowledge(_)));

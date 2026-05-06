@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::auth::TenantScope;
 use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
@@ -17,8 +18,12 @@ use super::KnowledgeBase;
 ///
 /// Returns 1 tool:
 /// - `knowledge_search` — search the knowledge base for relevant documentation
-pub fn knowledge_tools(kb: Arc<dyn KnowledgeBase>) -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(KnowledgeSearchTool { kb })]
+///
+/// SECURITY (F-KB-1): the `scope` is baked into the tool so every search is
+/// filtered by tenant. A shared `Arc<dyn KnowledgeBase>` across tenants would
+/// otherwise leak documents cross-tenant via `knowledge_search`.
+pub fn knowledge_tools(kb: Arc<dyn KnowledgeBase>, scope: TenantScope) -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(KnowledgeSearchTool { kb, scope })]
 }
 
 fn default_limit() -> usize {
@@ -27,6 +32,7 @@ fn default_limit() -> usize {
 
 struct KnowledgeSearchTool {
     kb: Arc<dyn KnowledgeBase>,
+    scope: TenantScope,
 }
 
 #[derive(Deserialize)]
@@ -81,11 +87,14 @@ impl Tool for KnowledgeSearchTool {
 
             let results = self
                 .kb
-                .search(super::KnowledgeQuery {
-                    text: input.query,
-                    source_filter: input.source_filter,
-                    limit,
-                })
+                .search(
+                    &self.scope,
+                    super::KnowledgeQuery {
+                        text: input.query,
+                        source_filter: input.source_filter,
+                        limit,
+                    },
+                )
                 .await?;
 
             if results.is_empty() {
@@ -124,9 +133,13 @@ mod tests {
     use crate::knowledge::in_memory::InMemoryKnowledgeBase;
     use crate::knowledge::{Chunk, DocumentSource};
 
+    fn s() -> TenantScope {
+        TenantScope::default()
+    }
+
     fn setup() -> (Arc<dyn KnowledgeBase>, Vec<Arc<dyn Tool>>) {
         let kb: Arc<dyn KnowledgeBase> = Arc::new(InMemoryKnowledgeBase::new());
-        let tools = knowledge_tools(kb.clone());
+        let tools = knowledge_tools(kb.clone(), s());
         (kb, tools)
     }
 
@@ -160,15 +173,19 @@ mod tests {
     #[tokio::test]
     async fn search_returns_formatted_results() {
         let (kb, tools) = setup();
-        kb.index(Chunk {
-            id: "c1".into(),
-            content: "Rust provides memory safety without garbage collection.".into(),
-            source: DocumentSource {
-                uri: "docs/rust.md".into(),
-                title: "Rust Guide".into(),
+        kb.index(
+            &s(),
+            Chunk {
+                id: "c1".into(),
+                content: "Rust provides memory safety without garbage collection.".into(),
+                source: DocumentSource {
+                    uri: "docs/rust.md".into(),
+                    title: "Rust Guide".into(),
+                },
+                chunk_index: 0,
+                tenant_id: None,
             },
-            chunk_index: 0,
-        })
+        )
         .await
         .unwrap();
 
@@ -200,26 +217,34 @@ mod tests {
     #[tokio::test]
     async fn search_with_source_filter() {
         let (kb, tools) = setup();
-        kb.index(Chunk {
-            id: "c1".into(),
-            content: "Rust API reference".into(),
-            source: DocumentSource {
-                uri: "api/rust.md".into(),
-                title: "API".into(),
+        kb.index(
+            &s(),
+            Chunk {
+                id: "c1".into(),
+                content: "Rust API reference".into(),
+                source: DocumentSource {
+                    uri: "api/rust.md".into(),
+                    title: "API".into(),
+                },
+                chunk_index: 0,
+                tenant_id: None,
             },
-            chunk_index: 0,
-        })
+        )
         .await
         .unwrap();
-        kb.index(Chunk {
-            id: "c2".into(),
-            content: "Rust tutorial docs".into(),
-            source: DocumentSource {
-                uri: "docs/tutorial.md".into(),
-                title: "Tutorial".into(),
+        kb.index(
+            &s(),
+            Chunk {
+                id: "c2".into(),
+                content: "Rust tutorial docs".into(),
+                source: DocumentSource {
+                    uri: "docs/tutorial.md".into(),
+                    title: "Tutorial".into(),
+                },
+                chunk_index: 0,
+                tenant_id: None,
             },
-            chunk_index: 0,
-        })
+        )
         .await
         .unwrap();
 
@@ -238,15 +263,19 @@ mod tests {
     async fn search_with_limit() {
         let (kb, tools) = setup();
         for i in 0..10 {
-            kb.index(Chunk {
-                id: format!("c{i}"),
-                content: format!("Rust document {i}"),
-                source: DocumentSource {
-                    uri: "docs/rust.md".into(),
-                    title: "Rust".into(),
+            kb.index(
+                &s(),
+                Chunk {
+                    id: format!("c{i}"),
+                    content: format!("Rust document {i}"),
+                    source: DocumentSource {
+                        uri: "docs/rust.md".into(),
+                        title: "Rust".into(),
+                    },
+                    chunk_index: i,
+                    tenant_id: None,
                 },
-                chunk_index: i,
-            })
+            )
             .await
             .unwrap();
         }
@@ -273,15 +302,19 @@ mod tests {
     async fn search_default_limit_is_five() {
         let (kb, tools) = setup();
         for i in 0..10 {
-            kb.index(Chunk {
-                id: format!("c{i}"),
-                content: format!("Rust item {i}"),
-                source: DocumentSource {
-                    uri: "f.md".into(),
-                    title: "F".into(),
+            kb.index(
+                &s(),
+                Chunk {
+                    id: format!("c{i}"),
+                    content: format!("Rust item {i}"),
+                    source: DocumentSource {
+                        uri: "f.md".into(),
+                        title: "F".into(),
+                    },
+                    chunk_index: i,
+                    tenant_id: None,
                 },
-                chunk_index: i,
-            })
+            )
             .await
             .unwrap();
         }

