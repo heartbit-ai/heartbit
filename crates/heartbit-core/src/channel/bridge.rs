@@ -52,7 +52,19 @@ pub enum OutboundMessage {
     RawFrame(crate::channel::types::WsFrame),
 }
 
-/// Sender half for pending interactions.
+/// Sender half for pending interactions, paired with the session_id that
+/// owns the interaction.
+///
+/// SECURITY (F-AUTH-5): the session_id is stored alongside the sender so
+/// `resolve_*_for_session` can verify the resolving client owns the
+/// interaction. UUID v4 (122 bits) makes guessing infeasible, but if the
+/// id ever leaks (logs, metrics, debug output), the session check provides
+/// a second line of defense.
+struct PendingEntry {
+    session_id: Uuid,
+    sender: PendingSender,
+}
+
 enum PendingSender {
     Input(tokio::sync::oneshot::Sender<Option<String>>),
     Approval(std::sync::mpsc::Sender<ApprovalDecision>),
@@ -69,7 +81,7 @@ const GRACE_PERIOD: Duration = Duration::from_secs(15);
 /// Maintains a map of pending interactions and an outbound channel for
 /// pushing events to the WebSocket handler.
 pub struct InteractionBridge {
-    pending: RwLock<HashMap<Uuid, PendingSender>>,
+    pending: RwLock<HashMap<Uuid, PendingEntry>>,
     outbound: tokio::sync::mpsc::Sender<OutboundMessage>,
     timeout: Duration,
 }
@@ -118,7 +130,13 @@ impl InteractionBridge {
                 // Store the sender
                 {
                     let mut pending = bridge.pending.write().expect("pending lock not poisoned");
-                    pending.insert(interaction_id, PendingSender::Input(tx));
+                    pending.insert(
+                        interaction_id,
+                        PendingEntry {
+                            session_id,
+                            sender: PendingSender::Input(tx),
+                        },
+                    );
                 }
 
                 // Send outbound event
@@ -161,7 +179,13 @@ impl InteractionBridge {
             // Store the sender
             {
                 let mut pending = bridge.pending.write().expect("pending lock not poisoned");
-                pending.insert(interaction_id, PendingSender::Approval(tx));
+                pending.insert(
+                    interaction_id,
+                    PendingEntry {
+                        session_id,
+                        sender: PendingSender::Approval(tx),
+                    },
+                );
             }
 
             // Send outbound event (non-blocking try_send)
@@ -208,7 +232,13 @@ impl InteractionBridge {
                 // Store the sender
                 {
                     let mut pending = bridge.pending.write().expect("pending lock not poisoned");
-                    pending.insert(interaction_id, PendingSender::Question(tx));
+                    pending.insert(
+                        interaction_id,
+                        PendingEntry {
+                            session_id,
+                            sender: PendingSender::Question(tx),
+                        },
+                    );
                 }
 
                 // Send outbound event
@@ -247,9 +277,25 @@ impl InteractionBridge {
     // --- Resolve methods ---
 
     /// Resolve a pending input interaction.
+    ///
+    /// SECURITY (F-AUTH-5): when `expected_session` is `Some`, the
+    /// resolver checks that the pending entry belongs to that session
+    /// before delivering the result. Use this in network handlers where
+    /// the resolving frame's session id is known.
     pub fn resolve_input(&self, id: Uuid, message: Option<String>) -> Result<(), Error> {
-        let sender = self.take_pending(id)?;
-        match sender {
+        self.resolve_input_for_session(None, id, message)
+    }
+
+    /// Like [`resolve_input`] but verifies the interaction belongs to
+    /// `expected_session` before resolving (F-AUTH-5).
+    pub fn resolve_input_for_session(
+        &self,
+        expected_session: Option<Uuid>,
+        id: Uuid,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        let entry = self.take_pending(id, expected_session)?;
+        match entry.sender {
             PendingSender::Input(tx) => {
                 let _ = tx.send(message);
                 Ok(())
@@ -265,8 +311,19 @@ impl InteractionBridge {
 
     /// Resolve a pending approval interaction.
     pub fn resolve_approval(&self, id: Uuid, decision: ApprovalDecision) -> Result<(), Error> {
-        let sender = self.take_pending(id)?;
-        match sender {
+        self.resolve_approval_for_session(None, id, decision)
+    }
+
+    /// Like [`resolve_approval`] but verifies the interaction belongs to
+    /// `expected_session` (F-AUTH-5).
+    pub fn resolve_approval_for_session(
+        &self,
+        expected_session: Option<Uuid>,
+        id: Uuid,
+        decision: ApprovalDecision,
+    ) -> Result<(), Error> {
+        let entry = self.take_pending(id, expected_session)?;
+        match entry.sender {
             PendingSender::Approval(tx) => {
                 let _ = tx.send(decision);
                 Ok(())
@@ -282,8 +339,19 @@ impl InteractionBridge {
 
     /// Resolve a pending question interaction.
     pub fn resolve_question(&self, id: Uuid, response: QuestionResponse) -> Result<(), Error> {
-        let sender = self.take_pending(id)?;
-        match sender {
+        self.resolve_question_for_session(None, id, response)
+    }
+
+    /// Like [`resolve_question`] but verifies the interaction belongs to
+    /// `expected_session` (F-AUTH-5).
+    pub fn resolve_question_for_session(
+        &self,
+        expected_session: Option<Uuid>,
+        id: Uuid,
+        response: QuestionResponse,
+    ) -> Result<(), Error> {
+        let entry = self.take_pending(id, expected_session)?;
+        match entry.sender {
             PendingSender::Question(tx) => {
                 let _ = tx.send(Ok(response));
                 Ok(())
@@ -298,14 +366,30 @@ impl InteractionBridge {
     }
 
     /// Remove and return a pending interaction, or error if not found.
-    fn take_pending(&self, id: Uuid) -> Result<PendingSender, Error> {
+    /// When `expected_session` is `Some`, also enforces session ownership
+    /// (F-AUTH-5). The entry is consumed even on session mismatch — this
+    /// is intentional: a mismatched resolve aborts the pending interaction
+    /// to prevent replay.
+    fn take_pending(
+        &self,
+        id: Uuid,
+        expected_session: Option<Uuid>,
+    ) -> Result<PendingEntry, Error> {
         let mut pending = self
             .pending
             .write()
             .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        pending
+        let entry = pending
             .remove(&id)
-            .ok_or_else(|| Error::Channel(format!("no pending interaction with id {id}")))
+            .ok_or_else(|| Error::Channel(format!("no pending interaction with id {id}")))?;
+        if let Some(expected) = expected_session
+            && entry.session_id != expected
+        {
+            return Err(Error::Channel(format!(
+                "interaction {id} does not belong to session {expected} (F-AUTH-5)"
+            )));
+        }
+        Ok(entry)
     }
 
     /// Remove a pending interaction without error (cleanup after timeout).

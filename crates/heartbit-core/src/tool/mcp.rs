@@ -224,29 +224,54 @@ struct McpPromptGetResult {
 ///
 /// Called by stdio and HTTP transports when they encounter a notification
 /// with `method: "notifications/message"`.
+///
+/// SECURITY (F-MCP-6): both `data` and `logger` come from the MCP server
+/// and are forwarded into the tracing pipeline. A hostile server can stuff
+/// `\n[FAKE LOG]…` or ANSI escape sequences to spoof log entries. Strip
+/// control characters and cap length before forwarding.
 fn handle_log_notification(value: &Value) {
+    /// Replace control chars (CR/LF/ANSI ESC) with single spaces and cap
+    /// at 4 KiB.
+    fn sanitize_log_field(s: &str) -> String {
+        const MAX: usize = 4 * 1024;
+        let mut out = String::with_capacity(s.len().min(MAX));
+        for c in s.chars() {
+            if out.len() >= MAX {
+                out.push_str("…[truncated]");
+                break;
+            }
+            if c.is_control() {
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
     if let Some(params) = value.get("params") {
         let level = params
             .get("level")
             .and_then(|v| v.as_str())
             .unwrap_or("info");
-        let logger = params
+        let logger_raw = params
             .get("logger")
             .and_then(|v| v.as_str())
             .unwrap_or("mcp");
-        let data = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let data_raw = params.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let logger = sanitize_log_field(logger_raw);
+        let data = sanitize_log_field(data_raw);
         match level {
             "error" | "critical" | "alert" | "emergency" => {
-                tracing::error!(target: "mcp_server", logger = logger, "{data}");
+                tracing::error!(target: "mcp_server", logger = %logger, "{data}");
             }
             "warning" => {
-                tracing::warn!(target: "mcp_server", logger = logger, "{data}");
+                tracing::warn!(target: "mcp_server", logger = %logger, "{data}");
             }
             "debug" => {
-                tracing::debug!(target: "mcp_server", logger = logger, "{data}");
+                tracing::debug!(target: "mcp_server", logger = %logger, "{data}");
             }
             _ => {
-                tracing::info!(target: "mcp_server", logger = logger, "{data}");
+                tracing::info!(target: "mcp_server", logger = %logger, "{data}");
             }
         }
     }
@@ -385,6 +410,39 @@ fn mcp_tool_to_definition(tool: &McpToolDef) -> ToolDefinition {
             .clone()
             .unwrap_or_else(|| serde_json::json!({"type": "object"})),
     }
+}
+
+/// Redact bearer-like substrings from an IdP error body before logging.
+///
+/// SECURITY (F-MCP-16): Auth0 / Okta / custom OIDC providers occasionally
+/// echo the rejected `subject_token` or partial bearer values in their
+/// `error_description` / `details` fields. Strip the longest suspected
+/// token-bearing values before they hit log sinks.
+fn redact_idp_body(body: &str) -> String {
+    use regex::Regex;
+    // Best-effort patterns. Avoid dependency on a JSON parser (the IdP
+    // body may not be JSON; some return text/plain on errors).
+    let patterns: &[(&str, &str)] = &[
+        // JWT-like (eyJ + base64 segments separated by `.`).
+        (
+            r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
+            "[redacted-jwt]",
+        ),
+        // Bearer header.
+        (r"(?i)bearer\s+[A-Za-z0-9_\-\.=]+", "[redacted-bearer]"),
+        // access_token / id_token / refresh_token / subject_token JSON values.
+        (
+            r#"(?i)("(?:access|id|refresh|subject)_token"\s*:\s*")[^"]+"#,
+            "$1[redacted]",
+        ),
+    ];
+    let mut out = body.to_string();
+    for (pat, repl) in patterns.iter() {
+        if let Ok(re) = Regex::new(pat) {
+            out = re.replace_all(&out, *repl).into_owned();
+        }
+    }
+    out
 }
 
 /// Replace control characters (incl. CR/LF/ANSI escapes) with single spaces
@@ -729,9 +787,24 @@ pub struct TokenExchangeAuthProvider {
     /// Subject tokens for token exchange: key is `"{tenant_id}:{user_id}"`.
     /// Populated externally (e.g. by the daemon HTTP handler when a user submits a task).
     user_tokens: Arc<RwLock<HashMap<String, String>>>,
-    /// Cache of exchanged tokens: (tenant_id, user_id) -> (access_token, expires_at).
-    /// Keyed by both tenant and user to prevent cross-tenant token leakage.
-    token_cache: RwLock<HashMap<(String, String), (String, Instant)>>,
+    /// Cache of exchanged tokens: structured key prevents cross-tenant or
+    /// cross-user collision. SECURITY (F-MCP-8): the previous flat-string
+    /// key `format!("{user_id}:{resource_key}:{scopes_key}")` was vulnerable
+    /// to user_id collision when an IdP allows `:` in `sub`.
+    token_cache: RwLock<HashMap<TokenCacheKey, (String, Instant)>>,
+}
+
+/// Composite key for the per-user-resource-scope token cache.
+///
+/// SECURITY (F-MCP-8): tuple structure prevents flat-string collisions
+/// when any field contains `:` (rare for user_id but possible in IdP
+/// configurations using email or custom subject formats).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenCacheKey {
+    tenant_id: String,
+    user_id: String,
+    resource: String,
+    scopes: String,
 }
 
 /// Token exchange response per RFC 8693.
@@ -890,6 +963,9 @@ impl TokenExchangeAuthProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
+                // SECURITY (F-MCP-16): redact bearer-like fragments before
+                // logging the IdP response body.
+                let body = redact_idp_body(&body);
                 let cut = crate::tool::builtins::floor_char_boundary(&body, 512);
                 return Err(Error::Mcp(format!(
                     "Agent token fetch failed (HTTP {status}): {}",
@@ -923,8 +999,15 @@ impl AuthProvider for TokenExchangeAuthProvider {
         tenant_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>> {
         Box::pin(async move {
-            // Check cache first — keyed by (tenant_id, user_id) to prevent cross-tenant leakage
-            let cache_key = (tenant_id.to_string(), user_id.to_string());
+            // Check cache first — keyed by tenant + user with empty
+            // resource/scopes (legacy non-resource-scoped lookup).
+            // SECURITY (F-MCP-8): structured key prevents `:` collisions.
+            let cache_key = TokenCacheKey {
+                tenant_id: tenant_id.to_string(),
+                user_id: user_id.to_string(),
+                resource: String::new(),
+                scopes: String::new(),
+            };
             if let Ok(cache) = self.token_cache.read()
                 && let Some((token, expires_at)) = cache.get(&cache_key)
                 && Instant::now() < *expires_at
@@ -1032,10 +1115,15 @@ impl AuthProvider for TokenExchangeAuthProvider {
                     sorted.join(",")
                 })
                 .unwrap_or_default();
-            let cache_key = (
-                tenant_id.to_string(),
-                format!("{user_id}:{resource_key}:{scopes_key}"),
-            );
+            // SECURITY (F-MCP-8): structured cache key (4 separate fields)
+            // instead of flat-string concatenation; protects against `:` in
+            // user_id colliding into a sibling cache slot.
+            let cache_key = TokenCacheKey {
+                tenant_id: tenant_id.to_string(),
+                user_id: user_id.to_string(),
+                resource: resource_key.to_string(),
+                scopes: scopes_key.clone(),
+            };
 
             // Check cache
             if let Ok(cache) = self.token_cache.read()
@@ -1100,6 +1188,9 @@ impl AuthProvider for TokenExchangeAuthProvider {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
+                // SECURITY (F-MCP-16): redact bearer-like fragments before
+                // logging the IdP response body.
+                let body = redact_idp_body(&body);
                 let cut = crate::tool::builtins::floor_char_boundary(&body, 512);
                 return Err(Error::Mcp(format!(
                     "Token exchange failed (HTTP {status}): {}",
@@ -1932,13 +2023,22 @@ impl McpClient {
     /// Perform MCP handshake and tool/resource/prompt discovery on the given transport.
     async fn handshake_and_discover(transport: Arc<Transport>) -> Result<Self, Error> {
         // Initialize — for HTTP, rpc() captures Mcp-Session-Id automatically.
+        //
+        // SECURITY (F-MCP-9): we previously advertised `sampling: {}` in our
+        // capabilities, but no dispatch path actually serves
+        // `sampling/createMessage` requests. A spec-compliant MCP server
+        // would interpret the advertised capability and try to use it,
+        // hanging until timeout. Worse, a future implementation that adds
+        // sampling without budget+model whitelisting would be vulnerable to
+        // a hostile server forcing the client to pay N expensive Opus
+        // calls. Until sampling is properly implemented (with consent +
+        // budget caps), do NOT advertise the capability.
         let init_result = transport
             .rpc(
                 "initialize",
                 Some(serde_json::json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {
-                        "sampling": {},
                         "roots": { "listChanged": true }
                     },
                     "clientInfo": {
@@ -2762,13 +2862,16 @@ mod tests {
     #[test]
     fn process_rpc_response_error_truncates_long_message() {
         let huge = "X".repeat(8 * 1024);
-        let json_str = format!(
-            r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"{huge}"}},"id":1}}"#
-        );
+        let json_str =
+            format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"{huge}"}},"id":1}}"#);
         let err = process_rpc_response(&json_str).unwrap_err();
         let s = err.to_string();
         assert!(s.contains("…[truncated]"), "missing truncation marker: {s}");
-        assert!(s.len() < 2048, "error message not bounded: {} bytes", s.len());
+        assert!(
+            s.len() < 2048,
+            "error message not bounded: {} bytes",
+            s.len()
+        );
     }
 
     #[test]

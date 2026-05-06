@@ -250,6 +250,22 @@ impl A2aSession {
 
         let rpc_response: Value = serde_json::from_str(&body)?;
 
+        // SECURITY (F-MCP-13): verify the response's `id` matches the request.
+        // Without this, a peer can ship the response from a previous (or
+        // future) call — breaking the JSON-RPC request/response correlation
+        // contract and potentially feeding the agent stale or unrelated
+        // results. Spec-compliant null-id is allowed only for parse errors.
+        let resp_id = rpc_response.get("id");
+        let id_matches = resp_id.and_then(|v| v.as_u64()) == Some(id);
+        let null_id_with_error =
+            resp_id.is_some_and(|v| v.is_null()) && rpc_response.get("error").is_some();
+        if !id_matches && !null_id_with_error {
+            return Err(Error::A2a(format!(
+                "A2A response id {:?} does not match request id {id} (F-MCP-13)",
+                resp_id
+            )));
+        }
+
         if let Some(error) = rpc_response.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             let message = error

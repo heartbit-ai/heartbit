@@ -40,9 +40,9 @@ pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
 pub use agent::guardrail::{GuardAction, Guardrail};
-pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
 #[allow(deprecated)]
 pub use agent::guardrails::ContentFenceGuardrail;
+pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
 pub use agent::guardrails::{
     ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BehaviorRule, BehavioralMonitorGuardrail,
     BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, GuardrailChain,

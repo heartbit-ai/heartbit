@@ -384,7 +384,15 @@ fn parse_unified_diff(text: &str) -> Result<Vec<FilePatch>, Error> {
                 old_path.clone()
             };
 
-            // Security: reject path traversal (.. components)
+            // Security: reject path traversal (.. components).
+            //
+            // F-FS-12 NOTE: refusing absolute paths at parse time was
+            // attempted but rejected — many test scenarios and legitimate
+            // workflows use absolute tempdir paths. The defence-in-depth is
+            // provided downstream: `resolve_path` jails to workspace when
+            // set; `CorePathPolicy::check_path_for_create` enforces the
+            // allowed-dirs list when set. Both must be configured by
+            // operators in any multi-tenant deployment (cf. F-FS-2/3/4).
             if path != "/dev/null"
                 && std::path::Path::new(&path)
                     .components()

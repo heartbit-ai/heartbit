@@ -54,6 +54,13 @@ pub struct OpenAiEmbedding {
 }
 
 impl OpenAiEmbedding {
+    /// Create an `OpenAiEmbedding` provider.
+    ///
+    /// SECURITY (F-MEM-4): the HTTP client is hardened with
+    /// `redirect::Policy::none()`, `https_only(true)`,
+    /// `connect_timeout(10s)`, `timeout(60s)`, and `.no_proxy()`. Without
+    /// these, a slow-loris embedding endpoint wedges every `memory_store`,
+    /// and a redirect to a non-HTTPS host would leak the Bearer API key.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         let model = model.into();
         let dimension = match model.as_str() {
@@ -62,8 +69,16 @@ impl OpenAiEmbedding {
             "text-embedding-ada-002" => 1536,
             _ => 1536, // default
         };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("failed to build hardened HTTPS client for OpenAiEmbedding");
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: api_key.into(),
             model,
             base_url: "https://api.openai.com".into(),
@@ -71,6 +86,12 @@ impl OpenAiEmbedding {
         }
     }
 
+    /// Override the base URL.
+    ///
+    /// SECURITY (F-MEM-4): the URL must be HTTPS — `https_only(true)` is
+    /// already set on the client, so a plaintext URL here will fail at
+    /// request time. For local non-secret endpoints (Ollama embeddings,
+    /// vLLM), build a separate provider with a custom client.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self

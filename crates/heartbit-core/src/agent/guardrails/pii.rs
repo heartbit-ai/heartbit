@@ -18,8 +18,22 @@ use crate::tool::ToolOutput;
 // Static compiled regexes for built-in PII detectors.
 static EMAIL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
-static PHONE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}").unwrap());
+// SECURITY (F-AGENT-15): broaden the phone-number pattern beyond US/CA
+// (NANP). Covers E.164 international (`+33 6 12 34 56 78`,
+// `+44 20 7946 0958`, etc.) plus the original NANP (US/CA `(555)
+// 123-4567`). Best-effort: a serious deployment should swap in a
+// `phonenumber`-crate detector. Kept as a single regex so the existing
+// match-replace loop continues to work unchanged.
+static PHONE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        // Group 1: international E.164 (+CC NN NN NN NN, 7-15 digits total)
+        r"(?:\+\d{1,3}[-.\s]?(?:\(?\d{1,4}\)?[-.\s]?){2,5}\d{2,4})",
+        r"|",
+        // Group 2: NANP / generic US-style
+        r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}",
+    ))
+    .unwrap()
+});
 static SSN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
 static CC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}\b").unwrap());

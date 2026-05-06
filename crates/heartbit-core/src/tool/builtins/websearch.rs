@@ -266,10 +266,10 @@ impl WebSearchTool {
             .client
             .get("https://html.duckduckgo.com/html/")
             .query(&[("q", query)])
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (compatible; Heartbit/1.0; +https://heartbit.ai)",
-            )
+            // SECURITY (F-NET-5): generic User-Agent. The previous string
+            // explicitly identified the framework, enabling search-engine
+            // fingerprinting and tailored prompt injection in HTML.
+            .header("User-Agent", "Mozilla/5.0 (compatible)")
             .send()
             .await
             .map_err(|e| Error::Agent(format!("DuckDuckGo request failed: {e}")))?;

@@ -25,15 +25,23 @@ use std::sync::Arc;
 use crate::tool::Tool;
 
 /// Check if a path matches any protected pattern.
+///
+/// SECURITY (F-FS-11): the input path is normalised first
+/// (`crate::workspace::normalize_path`) so trivial variants like
+/// `/home/user//.ssh/key` or `/home/user/./.ssh/key` cannot bypass a
+/// `~/.ssh` protection. Extension match is case-insensitive (ASCII)
+/// since `secret.ENV` and `secret.env` are the same file on
+/// HFS+/APFS/NTFS.
 fn is_protected(path: &std::path::Path, protected: &[PathBuf]) -> bool {
+    let normalized = crate::workspace::normalize_path(path);
     for pp in protected {
-        if path.starts_with(pp) || path == pp {
+        if normalized.starts_with(pp) || normalized == *pp {
             return true;
         }
         if let Some(pattern) = pp.to_str()
             && let Some(pat_ext) = pattern.strip_prefix("*.")
-            && let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && ext == pat_ext
+            && let Some(ext) = normalized.extension().and_then(|e| e.to_str())
+            && ext.eq_ignore_ascii_case(pat_ext)
         {
             return true;
         }
@@ -179,6 +187,40 @@ pub struct BuiltinToolsConfig {
     pub path_policy: Option<Arc<crate::sandbox::CorePathPolicy>>,
 }
 
+/// Sensible default `protected_paths` patterns for filesystem builtins.
+///
+/// SECURITY (F-FS-9): when no workspace is configured, file builtins
+/// otherwise accept arbitrary absolute paths under the process's identity.
+/// The default `protected_paths` is now populated with widely-recognised
+/// secret-bearing files and directories. Operators can override via
+/// `BuiltinToolsConfig::protected_paths` (replaces the default).
+pub fn default_protected_paths() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec![
+        // Patterns (matched by glob in is_protected). The leading `*.` form
+        // is recognised by the existing matcher.
+        PathBuf::from("*.env"),
+        PathBuf::from("*.pem"),
+        PathBuf::from("*.key"),
+        PathBuf::from("*.p12"),
+        PathBuf::from("*.pfx"),
+        PathBuf::from("*.kdbx"),
+        // Common system / process secret containers.
+        PathBuf::from("/etc/shadow"),
+        PathBuf::from("/etc/sudoers"),
+        PathBuf::from("/proc/self/environ"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = PathBuf::from(home);
+        v.push(h.join(".ssh"));
+        v.push(h.join(".aws"));
+        v.push(h.join(".gnupg"));
+        v.push(h.join(".config").join("heartbit"));
+        v.push(h.join(".docker").join("config.json"));
+        v.push(h.join(".netrc"));
+    }
+    v
+}
+
 impl Default for BuiltinToolsConfig {
     fn default() -> Self {
         Self {
@@ -188,7 +230,8 @@ impl Default for BuiltinToolsConfig {
             workspace: None,
             dangerous_tools: false,
             env_policy: crate::workspace::EnvPolicy::Inherit,
-            protected_paths: Vec::new(),
+            // SECURITY (F-FS-9): default protected paths populated.
+            protected_paths: default_protected_paths(),
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             sandbox_policy: None,
             twitter_credentials: None,

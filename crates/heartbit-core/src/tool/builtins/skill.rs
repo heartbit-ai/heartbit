@@ -119,17 +119,27 @@ impl Tool for SkillTool {
 fn collect_search_dirs(override_root: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    // Walk up from the starting directory to git root
+    // SECURITY (F-FS-7): cap the walk depth so a `cwd` deep under `/home`
+    // does not pick up `.opencode/skills/` or `.claude/skills/` from the
+    // user's home root or even from `/`. Without the cap, a malicious
+    // sibling repo (or a tampered `~/.opencode/skills/build/SKILL.md`)
+    // would silently inject prompts into a project that has no `.git/`.
+    const MAX_WALK_DEPTH: usize = 8;
     let cwd = override_root
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let mut current = cwd.as_path();
+    let mut depth = 0usize;
     loop {
         dirs.push(current.join(".opencode").join("skills"));
         dirs.push(current.join(".claude").join("skills"));
 
         // Stop at git root or filesystem root
         if current.join(".git").exists() {
+            break;
+        }
+        depth += 1;
+        if depth >= MAX_WALK_DEPTH {
             break;
         }
         match current.parent() {

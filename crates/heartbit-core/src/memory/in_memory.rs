@@ -135,7 +135,7 @@ impl Memory for InMemoryStore {
                 .values()
                 .filter(|e| {
                     // Tenant isolation: only return entries for this scope's tenant.
-                    if e.author_tenant_id.as_deref().unwrap_or("") != tenant_id.as_str() {
+                    if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
                         return false;
                     }
                     if let Some(ref text) = query.text {
@@ -482,9 +482,7 @@ impl Memory for InMemoryStore {
                 .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
             match entries.get_mut(&id) {
-                Some(entry)
-                    if entry.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str() =>
-                {
+                Some(entry) if entry.author_tenant_id.as_deref() == Some(tenant_id.as_str()) => {
                     entry.content = content;
                     entry.last_accessed = Utc::now();
                     Ok(())
@@ -515,7 +513,7 @@ impl Memory for InMemoryStore {
             // revealing cross-tenant id existence.
             let belongs = entries
                 .get(&id)
-                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .map(|e| e.author_tenant_id.as_deref() == Some(tenant_id.as_str()))
                 .unwrap_or(false);
             if belongs {
                 Ok(entries.remove(&id).is_some())
@@ -543,11 +541,11 @@ impl Memory for InMemoryStore {
             // Only link entries that belong to the same tenant.
             let id_ok = entries
                 .get(&id)
-                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .map(|e| e.author_tenant_id.as_deref() == Some(tenant_id.as_str()))
                 .unwrap_or(false);
             let rel_ok = entries
                 .get(&related_id)
-                .map(|e| e.author_tenant_id.as_deref().unwrap_or("") == tenant_id.as_str())
+                .map(|e| e.author_tenant_id.as_deref() == Some(tenant_id.as_str()))
                 .unwrap_or(false);
 
             if id_ok
@@ -586,7 +584,7 @@ impl Memory for InMemoryStore {
                 .values()
                 .filter(|e| {
                     // Tenant isolation: only prune entries belonging to this scope.
-                    if e.author_tenant_id.as_deref().unwrap_or("") != tenant_id.as_str() {
+                    if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
                         return false;
                     }
                     // SECURITY (F-MEM-1): match only on EXACT agent name or

@@ -177,9 +177,25 @@ pub struct LearnedPermissions {
     rules: Vec<PermissionRule>,
 }
 
+/// Maximum size of a permissions TOML file we will accept on load.
+///
+/// SECURITY (F-AGENT-13): a tampered file (NFS sync, container shared
+/// volume, sloppy backup tooling) could be arbitrary size; without a cap,
+/// `read_to_string` + `toml::from_str` would happily allocate gigabytes.
+/// 1 MiB allows tens of thousands of rules — well above any sane usage.
+const PERMISSIONS_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Maximum number of rules accepted from a parsed permissions file.
+const PERMISSIONS_MAX_RULES: usize = 10_000;
+
 impl LearnedPermissions {
     /// Load learned permissions from a TOML file. Creates an empty set if the
     /// file does not exist.
+    ///
+    /// SECURITY (F-AGENT-13): file size is capped at
+    /// [`PERMISSIONS_FILE_MAX_BYTES`] and the parsed rule count is capped at
+    /// [`PERMISSIONS_MAX_RULES`]. Both protect against a tampered file
+    /// turning the agent boot into a multi-second hang or OOM.
     pub fn load(path: &Path) -> Result<Self, Error> {
         if !path.exists() {
             return Ok(Self {
@@ -187,11 +203,27 @@ impl LearnedPermissions {
                 rules: Vec::new(),
             });
         }
+        // Pre-check file size to bail early before allocating.
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.len() > PERMISSIONS_FILE_MAX_BYTES
+        {
+            return Err(Error::Config(format!(
+                "{} exceeds {PERMISSIONS_FILE_MAX_BYTES} bytes (F-AGENT-13)",
+                path.display()
+            )));
+        }
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("failed to read {}: {e}", path.display())))?;
         let file: LearnedPermissionsFile = toml::from_str(&content).map_err(|e| {
             Error::Config(format!("invalid permissions file {}: {e}", path.display()))
         })?;
+        if file.rules.len() > PERMISSIONS_MAX_RULES {
+            return Err(Error::Config(format!(
+                "{} contains {} rules (cap {PERMISSIONS_MAX_RULES}, F-AGENT-13)",
+                path.display(),
+                file.rules.len()
+            )));
+        }
         Ok(Self {
             path: path.to_path_buf(),
             rules: file.rules,

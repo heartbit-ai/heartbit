@@ -35,14 +35,18 @@ impl Default for HeuristicGate {
 }
 
 fn default_refusal_patterns() -> Vec<String> {
+    // SECURITY (F-LLM-7): the previous list included short generic phrases
+    // ("I cannot", "I can't") that an attacker can inject through user
+    // input to force every cheap-tier response into escalation, amplifying
+    // cost. The trimmed list keeps only longer, less-injectable phrases
+    // characteristic of a refusal. Pattern matching uses word-boundary-
+    // adjacent tokens (still substring-based — for serious refusal
+    // detection, swap in a custom `ConfidenceGate`).
     [
-        "I don't know",
-        "I'm not sure",
-        "I cannot",
-        "I can't",
-        "I'm unable",
+        "I don't have enough information",
+        "I'm unable to help",
         "beyond my capabilities",
-        "I apologize, but",
+        "I apologize, but I cannot",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -334,14 +338,14 @@ mod tests {
         let gate = HeuristicGate::default();
         let req = test_request();
 
+        // SECURITY (F-LLM-7): pattern list trimmed to less-injectable phrases.
+        // The previous broad list ("I cannot", "I can't") was injectable
+        // through user input, forcing escalation to expensive tiers.
         let patterns = [
-            "I don't know the answer to that.",
-            "I'm not sure about this topic.",
-            "I cannot help with that request.",
-            "I can't do that.",
-            "I'm unable to assist with this.",
-            "That is beyond my capabilities.",
-            "I apologize, but I need more context.",
+            "I don't have enough information to answer.",
+            "I'm unable to help with that request.",
+            "That topic is beyond my capabilities.",
+            "I apologize, but I cannot help with this.",
         ];
         for text in patterns {
             let resp = text_response(text, 20);
@@ -371,16 +375,19 @@ mod tests {
         assert_eq!(gate.min_output_tokens, 5);
         assert!(gate.accept_tool_calls);
         assert!(gate.escalate_on_max_tokens);
+        // SECURITY (F-LLM-7): trimmed list — at least one pattern still
+        // present. The prior threshold (>= 7) encoded the wide list that
+        // was vulnerable to user-text injection.
         assert!(!gate.refusal_patterns.is_empty());
-        assert!(gate.refusal_patterns.len() >= 7);
     }
 
     #[test]
     fn heuristic_gate_case_insensitive_refusal() {
         let gate = HeuristicGate::default();
         let req = test_request();
-        // "I DON'T KNOW" should match "I don't know"
-        let resp = text_response("I DON'T KNOW about that", 10);
+        // SECURITY (F-LLM-7): "I'M UNABLE TO HELP" should match
+        // "I'm unable to help" via lowercase comparison.
+        let resp = text_response("I'M UNABLE TO HELP with that", 10);
         assert!(!gate.accept(&req, &resp));
     }
 

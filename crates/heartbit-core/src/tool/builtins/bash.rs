@@ -177,8 +177,14 @@ impl Tool for BashTool {
             } else {
                 format!("{{ {}; }}", command)
             };
+            // SECURITY (F-FS-8): use a per-spawn nonce in the cwd marker so
+            // the running command cannot forge it via `echo`. The previous
+            // fixed `__HEARTBIT_CWD__=` was emit-able from any echo and let
+            // a hostile command mutate the tracked cwd to e.g. `/etc`.
+            let cwd_nonce = uuid::Uuid::new_v4().simple().to_string();
+            let cwd_marker = format!("__HEARTBIT_CWD_{cwd_nonce}__");
             let full_command = format!(
-                "cd {} && {}; __exit_code=$?; echo; echo \"__HEARTBIT_CWD__=$(pwd)\"; exit $__exit_code",
+                "cd {} && {}; __exit_code=$?; echo; echo \"{cwd_marker}=$(pwd)\"; exit $__exit_code",
                 shell_escape(&cwd.display().to_string()),
                 wrapped
             );
@@ -239,8 +245,9 @@ impl Tool for BashTool {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-            // Extract new cwd from the output
-            let (user_stdout, new_cwd) = extract_cwd(&stdout);
+            // Extract new cwd from the output (using the per-spawn nonce —
+            // F-FS-8 — so a hostile echo cannot inject a fake marker).
+            let (user_stdout, new_cwd) = extract_cwd_marker(&stdout, &cwd_marker);
             if let Some(new_dir) = new_cwd {
                 let new_path = PathBuf::from(&new_dir);
                 let mut guard = self.cwd.lock().expect("bash cwd lock poisoned");
@@ -285,10 +292,15 @@ impl Tool for BashTool {
 }
 
 /// Extract the cwd marker from stdout, returning (user output, optional new cwd).
-fn extract_cwd(stdout: &str) -> (String, Option<String>) {
-    if let Some(marker_pos) = stdout.rfind("__HEARTBIT_CWD__=") {
+///
+/// SECURITY (F-FS-8): pass the per-spawn nonce-bearing marker so a user
+/// command's `echo __HEARTBIT_CWD_xxx__=/etc` cannot forge a hijack of the
+/// tracked cwd; only the marker generated at spawn time matches.
+fn extract_cwd_marker(stdout: &str, marker: &str) -> (String, Option<String>) {
+    let needle = format!("{marker}=");
+    if let Some(marker_pos) = stdout.rfind(&needle) {
         let user_output = stdout[..marker_pos].trim_end().to_string();
-        let cwd_line = &stdout[marker_pos + "__HEARTBIT_CWD__=".len()..];
+        let cwd_line = &stdout[marker_pos + needle.len()..];
         let cwd = cwd_line.trim().to_string();
         if cwd.is_empty() {
             (user_output, None)
@@ -298,6 +310,12 @@ fn extract_cwd(stdout: &str) -> (String, Option<String>) {
     } else {
         (stdout.to_string(), None)
     }
+}
+
+/// Legacy extract — kept for tests, uses the unguarded fixed marker.
+#[cfg(test)]
+fn extract_cwd(stdout: &str) -> (String, Option<String>) {
+    extract_cwd_marker(stdout, "__HEARTBIT_CWD__")
 }
 
 /// Truncate output with middle omission if it exceeds max bytes.
