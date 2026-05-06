@@ -6,6 +6,147 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.506.2] - 2026-05-06
+
+### Performance — heartbit-core deep perf audit + first remediation cycle
+
+A 113-finding static perf audit landed at
+`tasks/performance-audit-heartbit-core-2026-05-06.md` (7 sub-reports
+under `tasks/perf-audit-*.md`). This release lands the first
+remediation cycle: 5 atomic perf commits, validated by criterion
+benches scaffolded under `crates/heartbit-core/benches/`.
+
+#### Bench deltas (this release vs the audit baseline)
+
+| Bench | Baseline | This release | Delta |
+|---|---|---|---|
+| `sse_parse/feed_16kb_one_shot` | 11.3 µs | **7.0 µs** | **−38.5%** (620 → 980 MiB/s) |
+| `sse_parse/feed_4kb_chunks` | 10.1 µs | **7.5 µs** | −27.5% |
+| `memory_recall/text_query_top10@10k` | 19.8 ms | **13.25 ms** | **−37%** |
+| `memory_recall/agent_filter_top10@10k` | 3.20 ms | **2.22 ms** | −28% |
+| `memory_recall/agent_filter_top10@1k` | 308 µs | **207 µs** | −32% |
+
+#### Phase 1 — drop-in workspace sweeps (`891d80b`)
+
+Frequency-multiplied micro-wins across the hot paths. Static-only,
+~10+ fixes:
+- **T1 — `LazyLock<Regex>`** for `redact_idp_body` (3 patterns,
+  ~500–800 µs / IdP-error call), `sanitize_html_for_agent` (3 HTML
+  patterns, ~100–200 µs / fetch), and `list.rs` `DEFAULT_IGNORES`
+  (~200–500 µs / list call).
+- **T2 — `parking_lot::RwLock` / `Mutex`** on every hot non-await
+  lock: `InMemoryAuditTrail`, `permission_rules` on `AgentRunner`,
+  `TenantTokenTracker`, `ResponseCache`, `ActionBudgetGuardrail.counts`,
+  `CircuitTracker.circuits`, `InMemorySessionStore.sessions`,
+  `McpServer.sessions`, `FileTracker.records`,
+  `ReflectionTracker.accumulated`. Drops the `expect("...lock
+  poisoned")` chains; ~2× faster uncontended reads, no fairness
+  pile-ups under heavy concurrent traffic.
+- **P-TOOL-5 / P-TOOL-14** patch.rs short-circuit ladder for
+  `fuzzy_lines_match` (exact → trim_end → trim_both → unicode-
+  normalise) with an ASCII fast-path that skips the unicode pass
+  entirely when both sides are pure ASCII. ~50–200 µs / patch call.
+- **P-TOOL-10** bash cwd marker uses a process-startup `LazyLock<
+  String>` UUID base + `AtomicU64` counter instead of a fresh
+  `Uuid::new_v4()` per spawn. F-FS-8 forge resistance preserved
+  (attacker still can't observe the per-process random base).
+  ~5–50 µs / bash call.
+- **P-CROSS-7** `audit::strip_content_owned(Value) -> Value`
+  consumes the payload by ownership and walks the tree without
+  cloning preserved scalars. The runner uses `mem::take(&mut record.
+  payload)` + the owned variant. ~1 ms / record on 100 KB payloads.
+  F-AUTH-3 allow-list semantics identical.
+
+#### Phase 2a — memory `parking_lot::RwLock` swap (`0828700`)
+
+Drop-in lock swap on `InMemoryStore`. Six call sites cleaned up; no
+single-threaded delta on the bench (the lock isn't the bottleneck
+single-threaded), but ~2–3× faster acquisition under contention.
+
+#### Phase 2b — defer `MemoryEntry` clone after limit (`8a47256`)
+
+The recall pipeline now collects candidate entries as
+`Vec<&MemoryEntry>` and carries references through filter / BM25 /
+sort / truncate / graph-expansion / re-sort, only cloning the
+surviving top-K **after** the limit has been applied. At N=10k
+that's ~5 MB of `MemoryEntry` allocation eliminated per recall.
+
+Bonus refactors in the same commit:
+- **Filter ordering**: cheap field comparisons before the expensive
+  `to_lowercase()` text scan.
+- **Composite-cache via pair-and-sort**: `effective_strength` runs
+  once per entry instead of twice per `sort_by` comparison
+  (~280k redundant `exp()` calls eliminated at N=10k).
+- **`HashMap<&str, f64>`** for `bm25_map` / `relevance_map` — keys
+  are slices into entries, zero String-key allocations during
+  scoring.
+- **Graph expansion** scores related entries inline against the
+  shared `avgdl` / `max_bm25`, eliminating duplicate `new_bm25_map`.
+
+#### Phase 3 — SSE parser zero-copy (`74d315d`)
+
+Eliminates two per-event allocation hotspots in
+`crates/heartbit-core/src/llm/anthropic.rs` `SseParser`:
+- **P-LLM-2 — zero-copy line scan**: `feed()` `mem::take`s the
+  buffer once at the top of the chunk and processes each line as a
+  `&str` slice via the new `next_line_boundary` free helper, instead
+  of allocating a fresh `String` per line via `next_line().to_string()`.
+- **P-LLM-14 — single `data` buffer**: `data_lines: Vec<String>`
+  collapsed to `data: String` with an explicit `\n` separator
+  inserted before each non-first `data:` line. `emit_event()` no
+  longer joins per dispatch and skips `mem::take` entirely on empty
+  events. Cap accounting (F-LLM-3) still applies.
+
+A `bench-internals` cargo feature gates a `__bench` module that
+exposes a thin wrapper over `SseParser` for the `sse_parse`
+criterion bench. Downstream consumers cannot accidentally enable it.
+
+#### Audit infrastructure (`78b911d`, `eedd435`)
+
+- `crates/heartbit-core/benches/` — three criterion benches
+  (`memory_recall`, `guardrail_pii`, `sse_parse`), `criterion`
+  added as a dev-dependency only.
+- `tasks/performance-audit-heartbit-core-2026-05-06.md` — master
+  report with 113 findings ranked by `(execution frequency) ×
+  (per-call overhead)`, security-regression cross-check against
+  the 78-finding security audit, recommended 3-PR phasing.
+
+### Fixed
+
+- **gh#9 — `KeywordRoutingStrategy` Tier 1 short-circuit + step /
+  delegation patterns** (`9c17a8c`):
+  - **#A** — Tier 1 now picks the best-covering agent from
+    `domain_signals` instead of hardcoding `agent_index: 0`. Helper
+    `best_covering_agent(task_domains, agents)` returns the index
+    with the most overlap; ties break on registration order; falls
+    back to 0 when no agent matches any detected domain (preserves
+    the empty-domain semantics).
+  - **#A.2** — `DELEGATION_PHRASES` extended with `"ask the "`,
+    `"have the "`, `"use the "`, `"tell the "`, `"instruct the "`,
+    `"let the "`, `"get the "`. False-positive cost bounded
+    (a 0.30 score boost only ever moves a task into Tier 2
+    capability matching, never into unsolicited orchestration).
+  - **#B** — new `is_numbered_step_marker(word)` recognises
+    `1.`, `(1)`, `1)`, and the same patterns followed by `;` /
+    `,` / `:` so the gh#9 repro `(1); (2); (3); ...` now reports
+    `step_markers >= 4`.
+
+### Notes
+
+- Recommended Phase 2c (BM25 inverted index, est. drop the residual
+  13.25 ms text@10k recall toward <2 ms) is deferred to a follow-up
+  release. Tracked in the audit report; would require a side cache
+  maintained on `store` / `forget` / `update` with careful handling
+  of substring-match semantics in the BM25 inner loop.
+- Quality gates throughout: 3669 workspace tests passing
+  (2397 heartbit-core + 454 umbrella + 65 CLI + others). `cargo fmt
+  -- --check` clean; `cargo clippy --workspace --all-targets
+  --features heartbit-core/bench-internals -- -D warnings` clean.
+- No security regressions: the 30+ "obvious wins" rejected during
+  the audit (cross-tenant caching, lifted DoS caps, removed nonce
+  markers, `==` on auth tokens, etc.) remain rejected. F-* findings
+  from the security cycle are all intact.
+
 ## [2026.506.1] - 2026-05-06
 
 ### Security — heartbit-core Deep Audit

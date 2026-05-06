@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core", "crates/heartbit-sensors", "crates/heartbit-telegram"]
 
 [workspace.package]
-version = "2026.506.1"
+version = "2026.506.2"
 authors = ["Pascal Le Clech <pascal@heartbit.ai>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/heartbit-ai/heartbit"
