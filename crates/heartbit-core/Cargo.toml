@@ -47,6 +47,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [features]
 default = []
@@ -56,3 +57,20 @@ sandbox = ["dep:landlock"]
 # Mirror umbrella's `sensor` feature so cfg-gated items
 # (`agent::guardrails::sensor_security`) compile when the umbrella enables it.
 sensor = []
+# Exposes selected crate-internal types for criterion benchmarks under
+# `crates/heartbit-core/benches/`. Enabled automatically when running
+# `cargo bench`; should not be enabled by downstream consumers.
+bench-internals = []
+
+[[bench]]
+name = "memory_recall"
+harness = false
+
+[[bench]]
+name = "guardrail_pii"
+harness = false
+
+[[bench]]
+name = "sse_parse"
+harness = false
+required-features = ["bench-internals"]

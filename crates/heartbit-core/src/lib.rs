@@ -158,3 +158,24 @@ pub use tool::{Tool, ToolOutput, validate_tool_input};
 
 // --- Workspace re-exports ---
 pub use workspace::Workspace;
+
+// --- Benchmark-only helpers ---
+//
+// Thin wrappers over crate-internal hot paths exposed exclusively for
+// criterion benchmarks under `crates/heartbit-core/benches/`. Gated
+// behind the `bench-internals` feature so downstream consumers cannot
+// accidentally rely on this surface; the wrappers allocate their own
+// internal state and never leak crate-private types across the boundary.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod __bench {
+    #![allow(missing_docs)]
+
+    /// Feed `chunk` to a fresh `SseParser` and return the number of
+    /// emitted events. Used to benchmark per-chunk allocation overhead
+    /// in the Anthropic SSE hot path (P-LLM-2, P-LLM-14).
+    pub fn sse_parse_chunk(chunk: &str) -> usize {
+        let mut parser = crate::llm::anthropic::SseParser::new();
+        parser.feed(chunk).len()
+    }
+}
