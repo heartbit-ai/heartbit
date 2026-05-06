@@ -2964,6 +2964,74 @@ mod tests {
         );
     }
 
+    /// SECURITY (F-AGENT-5): the audit record emitted when a `post_tool`
+    /// guardrail returns `Err` MUST carry the runner's `tenant_id` and
+    /// `user_id`. Before the fix this site set them to `None`, leaving
+    /// post_tool denials orphaned of tenant context — bad for forensic
+    /// correlation in a multi-tenant SOC pipeline.
+    #[tokio::test]
+    async fn post_tool_guardrail_error_audit_carries_tenant_user() {
+        struct FailingPostTool;
+        impl Guardrail for FailingPostTool {
+            fn post_tool(
+                &self,
+                _call: &crate::llm::types::ToolCall,
+                _output: &mut ToolOutput,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>
+            {
+                Box::pin(async { Err(Error::Guardrail("denied by policy".into())) })
+            }
+        }
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "search".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: "OK.".into() }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        let trail = Arc::new(crate::agent::audit::InMemoryAuditTrail::new());
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("search", "result")))
+            .guardrail(Arc::new(FailingPostTool))
+            .audit_trail(trail.clone())
+            .audit_user_context("alice", "tenant-1")
+            .build()
+            .unwrap();
+
+        runner.execute("search").await.unwrap();
+
+        let entries = trail.entries_unscoped(usize::MAX).await.unwrap();
+        let denial = entries
+            .iter()
+            .find(|e| e.event_type == "guardrail_denied")
+            .expect("expected a guardrail_denied audit record");
+        assert_eq!(
+            denial.user_id.as_deref(),
+            Some("alice"),
+            "audit record should carry user_id: {denial:?}"
+        );
+        assert_eq!(
+            denial.tenant_id.as_deref(),
+            Some("tenant-1"),
+            "audit record should carry tenant_id: {denial:?}"
+        );
+    }
+
     #[tokio::test]
     async fn without_on_input_returns_immediately() {
         // Without on_input, a text response ends the run (existing behavior)
@@ -5510,5 +5578,69 @@ mod tests {
 
         let output = runner.execute("go").await.unwrap();
         assert_eq!(output.tool_calls_made, 2);
+    }
+
+    /// SECURITY (F-AGENT-1): a Levenshtein-close tool name (e.g. `bask` for `bash`)
+    /// must not bypass a `ToolPolicyGuardrail` deny rule on the canonical name.
+    /// Before the fix, repair happened in `execute_tools_parallel` AFTER pre_tool —
+    /// so a typo passed the policy and dispatched to the real tool.
+    #[tokio::test]
+    async fn levenshtein_repair_runs_before_tool_policy() {
+        use crate::agent::guardrails::tool_policy::{ToolPolicyGuardrail, ToolRule};
+
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    // typo: should match `bash` via Levenshtein distance 1
+                    name: "bask".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        // Policy denies the canonical name `bash`. If repair were post-policy,
+        // the typo `bask` would pass the policy and execute the bash tool.
+        let policy = Arc::new(ToolPolicyGuardrail::new(
+            vec![ToolRule {
+                tool_pattern: "bash".into(),
+                action: crate::GuardAction::deny("blocked"),
+                input_constraints: vec![],
+            }],
+            crate::GuardAction::Allow,
+        ));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("bash", "DANGEROUS_OUTPUT")))
+            .guardrails(vec![policy])
+            .build()
+            .unwrap();
+
+        let output = runner.execute("run shell").await.unwrap();
+
+        // The deny must have fired. The tool result returned to the LLM should
+        // be the deny-message, NOT "DANGEROUS_OUTPUT".
+        assert!(
+            !output.result.contains("DANGEROUS_OUTPUT"),
+            "tool result leaked despite policy deny: {}",
+            output.result
+        );
+        assert_eq!(
+            output.tool_calls_made, 1,
+            "exactly one tool call should be recorded (denied)"
+        );
     }
 }

@@ -107,16 +107,51 @@ pub struct ServerResource {
 pub type ResourceReader =
     Arc<dyn Fn(&str) -> Result<Vec<(Option<String>, String)>, Error> + Send + Sync>;
 
+/// Callback to authorize a JSON-RPC call. Receives the parsed `method`, the
+/// session id (if the client provided one), and any HTTP-level credentials
+/// the integrator wants to forward (typically a Bearer token extracted from
+/// the `Authorization` header upstream). Return `true` to allow, `false` to
+/// reject with HTTP-401-equivalent JSON-RPC error.
+pub type AuthCallback = Arc<dyn Fn(&str, Option<&str>, Option<&str>) -> bool + Send + Sync>;
+
+/// JSON-RPC error code used when [`McpServer`] rejects a call via its
+/// `auth_callback`. Mirrors HTTP 401 semantics in the MCP transport layer.
+const UNAUTHORIZED: i64 = -32001;
+
+/// Maximum number of MCP sessions retained simultaneously.
+///
+/// SECURITY (F-MCP-3): without a cap, a hostile/unauth client can issue
+/// distinct `Mcp-Session-Id` values indefinitely and balloon the in-memory
+/// `sessions` map. The cap drops older entries (insertion order best-effort)
+/// once the limit is reached, keeping memory bounded.
+const MAX_SESSIONS: usize = 256;
+
 /// MCP server that handles JSON-RPC requests.
 ///
 /// Exposes heartbit tools, resources, and prompts to external MCP clients.
 /// Designed to be mounted on an existing Axum router via `handle_request()`.
+///
+/// # Security
+///
+/// **The caller is responsible for authentication.** This server does not
+/// authenticate JSON-RPC requests by default. When the server is reachable
+/// over an untrusted network, the integrator MUST either:
+///
+/// 1. Mount the server behind an HTTP middleware that rejects unauth'd
+///    requests before they reach `handle_request`, **or**
+/// 2. Wire an [`AuthCallback`] via [`McpServer::with_auth_callback`] which is
+///    consulted on every JSON-RPC call.
+///
+/// Without one of these, any network-reachable client can call `tools/call`
+/// with arbitrary tool names — including potentially destructive builtins
+/// like `bash`, `write`, or `patch` if those have been registered.
 pub struct McpServer {
     config: McpServerConfig,
     tools: Vec<Arc<dyn Tool>>,
     resources: Vec<ServerResource>,
     resource_reader: Option<ResourceReader>,
     sessions: std::sync::RwLock<HashMap<String, ()>>,
+    auth_callback: Option<AuthCallback>,
 }
 
 impl McpServer {
@@ -127,6 +162,7 @@ impl McpServer {
             resources: Vec::new(),
             resource_reader: None,
             sessions: std::sync::RwLock::new(HashMap::new()),
+            auth_callback: None,
         }
     }
 
@@ -147,6 +183,17 @@ impl McpServer {
         self
     }
 
+    /// Install an authentication callback (`fn(method, session_id, auth_header) -> bool`).
+    ///
+    /// SECURITY (F-MCP-3): when set, every `handle_request` call is gated by
+    /// this callback. The integrator should extract the relevant credentials
+    /// from the HTTP layer (e.g. Authorization header) and pass them through
+    /// [`McpServer::handle_request_with_auth`].
+    pub fn with_auth_callback(mut self, callback: AuthCallback) -> Self {
+        self.auth_callback = Some(callback);
+        self
+    }
+
     /// Create or validate a session ID.
     fn ensure_session(&self, session_id: Option<&str>) -> String {
         if let Some(sid) = session_id
@@ -157,17 +204,54 @@ impl McpServer {
         }
         let new_sid = Uuid::new_v4().to_string();
         if let Ok(mut sessions) = self.sessions.write() {
+            // SECURITY (F-MCP-3): bound the session map. When at capacity,
+            // drop one existing entry before inserting the new one. Best-effort
+            // FIFO via HashMap iteration order; for higher-traffic deployments
+            // an LRU cache would be more appropriate.
+            if sessions.len() >= MAX_SESSIONS
+                && let Some(victim) = sessions.keys().next().cloned()
+            {
+                sessions.remove(&victim);
+            }
             sessions.insert(new_sid.clone(), ());
         }
         new_sid
     }
 
     /// Handle a JSON-RPC request and return a response with session ID.
+    ///
+    /// If an [`AuthCallback`] is installed, this method calls it without an
+    /// auth header (`None`). Use [`McpServer::handle_request_with_auth`] when
+    /// the integrator wants to forward HTTP-level credentials.
     pub async fn handle_request(&self, body: &str, session_id: Option<&str>) -> (String, String) {
+        self.handle_request_with_auth(body, session_id, None).await
+    }
+
+    /// Handle a JSON-RPC request with an explicit auth header (e.g. extracted
+    /// from the upstream HTTP Authorization header). When an
+    /// [`AuthCallback`] is installed, it receives this value.
+    pub async fn handle_request_with_auth(
+        &self,
+        body: &str,
+        session_id: Option<&str>,
+        auth_header: Option<&str>,
+    ) -> (String, String) {
         let sid = self.ensure_session(session_id);
 
         let response = match serde_json::from_str::<JsonRpcRequest>(body) {
-            Ok(req) => self.route(req).await,
+            Ok(req) => {
+                // SECURITY (F-MCP-3): authentication gate. Run BEFORE routing
+                // so unauthorized callers cannot probe or exercise tools.
+                if let Some(ref cb) = self.auth_callback
+                    && !cb(&req.method, session_id, auth_header)
+                {
+                    let id = req.id.clone().unwrap_or(Value::Null);
+                    let err = JsonRpcResponse::error(id, UNAUTHORIZED, "Unauthorized");
+                    serde_json::to_string(&err).unwrap_or_default()
+                } else {
+                    self.route(req).await
+                }
+            }
             Err(e) => {
                 let err = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
                 serde_json::to_string(&err).unwrap_or_default()
@@ -867,5 +951,80 @@ mod tests {
         let r: ServerResource = serde_json::from_value(json).unwrap();
         assert!(r.description.is_none());
         assert!(r.mime_type.is_none());
+    }
+
+    /// SECURITY (F-MCP-3): an installed `auth_callback` returning `false` must
+    /// produce a JSON-RPC unauthorized response and **not** route to the tool.
+    #[tokio::test]
+    async fn auth_callback_rejects_when_returning_false() {
+        let echo: Arc<dyn Tool> = Arc::new(EchoTool);
+        let server = McpServer::new(McpServerConfig::default())
+            .with_tools(vec![echo])
+            .with_auth_callback(Arc::new(|_method, _sid, _auth| false));
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 7,
+            "params": {"name": "echo", "arguments": {"text": "should not run"}}
+        });
+        let (resp, _sid) = server.handle_request(&req.to_string(), None).await;
+        let parsed: Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_object(), "expected error response");
+        let code = parsed["error"]["code"].as_i64().unwrap_or_default();
+        assert_eq!(code, UNAUTHORIZED, "expected 'Unauthorized' code");
+        assert!(
+            parsed["result"].is_null(),
+            "result must be absent on auth failure"
+        );
+    }
+
+    /// SECURITY (F-MCP-3): an `auth_callback` returning `true` allows the call
+    /// to route normally. Confirms we did not introduce a regression.
+    #[tokio::test]
+    async fn auth_callback_allows_when_returning_true() {
+        let echo: Arc<dyn Tool> = Arc::new(EchoTool);
+        let server = McpServer::new(McpServerConfig::default())
+            .with_tools(vec![echo])
+            .with_auth_callback(Arc::new(|_method, _sid, _auth| true));
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 8,
+            "params": {"name": "echo", "arguments": {"text": "ok"}}
+        });
+        let (resp, _sid) = server.handle_request(&req.to_string(), None).await;
+        let parsed: Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_null(), "expected success: {parsed}");
+        assert!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ok")
+        );
+    }
+
+    /// SECURITY (F-MCP-3): the session map MUST be bounded so unauth'd clients
+    /// cannot exhaust memory by minting fresh `Mcp-Session-Id` values.
+    #[tokio::test]
+    async fn session_map_is_bounded() {
+        let server = McpServer::new(McpServerConfig::default());
+        // Force the cap to fill — we do this by manipulating the lock directly.
+        {
+            let mut sessions = server.sessions.write().unwrap();
+            for i in 0..MAX_SESSIONS {
+                sessions.insert(format!("sid-{i}"), ());
+            }
+            assert_eq!(sessions.len(), MAX_SESSIONS);
+        }
+        // Issue another `ensure_session` with a new id — should evict and stay bounded.
+        let _ = server.ensure_session(None);
+        let sessions = server.sessions.read().unwrap();
+        assert!(
+            sessions.len() <= MAX_SESSIONS,
+            "session map exceeded MAX_SESSIONS = {MAX_SESSIONS}: {}",
+            sessions.len()
+        );
     }
 }

@@ -460,9 +460,43 @@ impl A2aClient {
             .await
             .map_err(|e| Error::A2a(format!("Failed to parse agent card: {e}")))?;
 
+        // SECURITY (F-MCP-12): re-validate the URL the server points us at.
+        // The initial `SafeUrl::parse` only protected the well-known card
+        // fetch; without re-checking `agent_card.url`, a legitimately-hosted
+        // peer could redirect every subsequent JSON-RPC call to AWS metadata
+        // (`http://169.254.169.254/...`) or an internal service. Same pattern
+        // as OpenID Connect discovery hardening.
+        let safe_endpoint =
+            crate::http::SafeUrl::parse(&agent_card.url, crate::http::IpPolicy::default())
+                .await
+                .map_err(|e| {
+                    Error::A2a(format!(
+                        "agent_card.url failed SSRF check ({}): {e}",
+                        agent_card.url
+                    ))
+                })?;
+
+        // Defense in depth: warn if the peer's advertised URL switches host
+        // away from the one we originally trusted via base_url. Hosts may
+        // legitimately differ (e.g., host vs. discovery endpoint), so we
+        // log rather than reject — but the SafeUrl check above already
+        // closes the SSRF.
+        if let (Ok(base), Ok(advertised)) = (
+            reqwest::Url::parse(base_url),
+            reqwest::Url::parse(&agent_card.url),
+        ) && base.host_str() != advertised.host_str()
+        {
+            tracing::warn!(
+                base_host = ?base.host_str(),
+                advertised_host = ?advertised.host_str(),
+                "A2A peer advertised a different host than the discovery base; \
+                 still allowed because it passed the SSRF blocklist"
+            );
+        }
+
         let session = Arc::new(A2aSession {
             client,
-            endpoint: agent_card.url.clone(),
+            endpoint: safe_endpoint.as_str().to_string(),
             auth_header,
             next_id: AtomicU64::new(0),
         });

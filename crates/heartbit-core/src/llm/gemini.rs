@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::warn;
 
 use crate::error::Error;
@@ -14,6 +16,22 @@ use crate::llm::types::{
 };
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// Build a hardened reqwest Client for the Gemini API.
+///
+/// SECURITY (F-LLM-1, F-LLM-2): see `anthropic::build_secure_client` for the
+/// rationale. The custom `x-goog-api-key` header is not stripped by reqwest's
+/// cross-host redirect logic, so disabling redirects is necessary to prevent
+/// API-key leakage to a hostile redirect target.
+fn build_secure_client() -> Result<Client, Error> {
+    Client::builder()
+        .redirect(Policy::none())
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(Error::from)
+}
 
 /// Google Gemini LLM provider (native API).
 ///
@@ -28,9 +46,14 @@ pub struct GeminiProvider {
 
 impl GeminiProvider {
     /// Create a new Gemini provider with the given API key and model identifier.
+    ///
+    /// HTTP client is hardened (`https_only`, `redirect::Policy::none()`,
+    /// connect+total timeouts). See [`build_secure_client`] for the rationale
+    /// (F-LLM-1, F-LLM-2).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: build_secure_client()
+                .expect("failed to build hardened HTTPS client for GeminiProvider"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: BASE_URL.into(),
@@ -38,13 +61,18 @@ impl GeminiProvider {
     }
 
     /// Create with a custom base URL (for testing or Vertex AI).
+    ///
+    /// **Security note**: `https_only(true)` is enforced; the base URL must
+    /// be HTTPS even for testing. Use a TLS-terminating mock server (e.g.
+    /// `wiremock` with `hyper-rustls`) rather than plain HTTP.
     pub fn with_base_url(
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: build_secure_client()
+                .expect("failed to build hardened HTTPS client for GeminiProvider"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),

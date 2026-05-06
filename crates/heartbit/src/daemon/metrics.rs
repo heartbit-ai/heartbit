@@ -634,6 +634,10 @@ impl DaemonMetrics {
             | AgentEvent::WorkflowNodeFailed { .. } => {
                 // Workflow node lifecycle events are informational — no metric needed yet.
             }
+            AgentEvent::ToolNameRepaired { .. } => {
+                // Tool name repair is informational — could become a security signal,
+                // but right now it's an audit trail event only.
+            }
         }
     }
 

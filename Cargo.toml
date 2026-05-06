@@ -65,3 +65,4 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 parking_lot = "0.12"
+libc = "0.2"

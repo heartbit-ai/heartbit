@@ -1,10 +1,30 @@
 //! OpenAI-compatible LLM provider for any API that follows the OpenAI chat completions format.
 
 use reqwest::Client;
+use reqwest::redirect::Policy;
+use std::time::Duration;
 
 use crate::error::Error;
 use crate::llm::LlmProvider;
 use crate::llm::types::{CompletionRequest, CompletionResponse};
+
+/// Build a hardened reqwest Client.
+///
+/// SECURITY (F-LLM-1, F-LLM-2, F-LLM-8): when `enforce_https` is true, the
+/// client refuses non-HTTPS URLs entirely — protecting custom auth headers
+/// like `api-key` (Azure-style) which reqwest does NOT strip on cross-host
+/// redirect. When `false` (used only for `AuthStyle::None`, i.e. local
+/// providers like Ollama/vLLM), HTTP is allowed.
+fn build_secure_client(enforce_https: bool) -> Result<Client, Error> {
+    let mut builder = Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120));
+    if enforce_https {
+        builder = builder.https_only(true);
+    }
+    builder.build().map_err(Error::from)
+}
 
 /// Authentication style for OpenAI-compatible API endpoints.
 #[derive(Debug, Clone)]
@@ -31,14 +51,23 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     /// Create a new provider with custom base URL and auth style.
+    ///
+    /// **Security**: when `auth_style != AuthStyle::None`, the client enforces
+    /// HTTPS — a non-HTTPS `base_url` will fail at request time. This protects
+    /// API keys (`Authorization: Bearer ...` and `AuthStyle::ApiKeyHeader`)
+    /// from being sent in clear over HTTP. For local providers like Ollama
+    /// or vLLM that need plain HTTP, use `AuthStyle::None` (or the
+    /// [`OpenAiCompatProvider::local`] convenience constructor).
     pub fn new(
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
         auth_style: AuthStyle,
     ) -> Self {
+        let enforce_https = !matches!(auth_style, AuthStyle::None);
         Self {
-            client: Client::new(),
+            client: build_secure_client(enforce_https)
+                .expect("failed to build hardened HTTPS client for OpenAiCompatProvider"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),

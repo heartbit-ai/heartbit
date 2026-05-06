@@ -41,6 +41,44 @@ fn is_protected(path: &std::path::Path, protected: &[PathBuf]) -> bool {
     false
 }
 
+/// Write `bytes` to `path`, refusing to follow symlinks at the final
+/// component (Unix). On non-Unix platforms, falls back to plain `tokio::fs::write`.
+///
+/// SECURITY (F-FS-1): combined with `CorePathPolicy::check_path_for_create`,
+/// this eliminates the TOCTOU window where a parallel tool call could have
+/// replaced the target path with a symlink between the policy check and the
+/// open syscall.
+pub(crate) async fn write_no_follow(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path_owned = path.to_path_buf();
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path_owned)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking failed: {e}")))?
+    }
+    #[cfg(not(unix))]
+    {
+        // No equivalent of O_NOFOLLOW in the std/tokio stable API on Windows.
+        // The `CorePathPolicy::check_path_for_create` parent-canonicalize check
+        // still applies; combined with the absence of inotify-style TOCTOU
+        // primitives this is the best we can do portably here.
+        tokio::fs::write(path, bytes).await
+    }
+}
+
 /// Resolve a file path with workspace jail enforcement and protected path checks.
 pub(crate) fn resolve_path(
     path: &str,
@@ -210,9 +248,22 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
             ws.clone(),
             Arc::clone(&pp),
         ))),
-        Arc::new(grep::GrepTool::new(ws.clone(), Arc::clone(&pp))),
-        Arc::new(glob::GlobTool::new(ws.clone(), Arc::clone(&pp))),
-        Arc::new(list::ListTool::new(ws.clone(), Arc::clone(&pp))),
+        // SECURITY (F-FS-4): apply the same `path_policy` to grep/glob/list
+        // that read/write/edit/patch already use. Without this, an LLM with
+        // no workspace configured can enumerate `/home` or grep `/etc` for
+        // secrets while the path policy blocks the file builtins.
+        Arc::new(maybe_policy!(grep::GrepTool::new(
+            ws.clone(),
+            Arc::clone(&pp)
+        ))),
+        Arc::new(maybe_policy!(glob::GlobTool::new(
+            ws.clone(),
+            Arc::clone(&pp)
+        ))),
+        Arc::new(maybe_policy!(list::ListTool::new(
+            ws.clone(),
+            Arc::clone(&pp)
+        ))),
         Arc::new(maybe_policy!(patch::PatchTool::new(
             config.file_tracker.clone(),
             ws,

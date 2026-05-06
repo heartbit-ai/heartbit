@@ -600,13 +600,24 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 }
                 // Response cache: compute key for non-streaming requests.
+                // SECURITY (F-AGENT-3): scope the cache by tenant_id+user_id
+                // when known. Otherwise a runner shared across tenants could
+                // serve tenant A's cached response to tenant B if their
+                // (system_prompt, messages, tools) tuple coincides.
                 let cache_key = if self.response_cache.is_some() && self.on_text.is_none() {
                     let tool_names: Vec<&str> =
                         request.tools.iter().map(|t| t.name.as_str()).collect();
-                    Some(cache::ResponseCache::compute_key(
+                    let namespace = match (&self.audit_tenant_id, &self.audit_user_id) {
+                        (Some(t), Some(u)) => Some(format!("{t}:{u}")),
+                        (Some(t), None) => Some(t.clone()),
+                        (None, Some(u)) => Some(format!(":{u}")),
+                        (None, None) => None,
+                    };
+                    Some(cache::ResponseCache::compute_key_scoped(
                         &request.system,
                         &request.messages,
                         &tool_names,
+                        namespace.as_deref(),
                     ))
                 } else {
                     None
@@ -846,7 +857,34 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 }
 
-                let tool_calls = response.tool_calls();
+                let mut tool_calls = response.tool_calls();
+
+                // SECURITY (F-AGENT-1): repair Levenshtein-close typos in tool names
+                // BEFORE permissions and pre_tool guardrails see them. Otherwise an
+                // LLM could emit `bask` to bypass a `bash` deny-rule and have it
+                // silently dispatched to `bash` later. We mutate `call.name` here
+                // and emit a `ToolNameRepaired` event so the audit trail records
+                // the substitution. The repair only fires for unknown names; exact
+                // matches are untouched.
+                for call in tool_calls.iter_mut() {
+                    if !self.tools.contains_key(&call.name)
+                        && let Some(repaired) = self.find_closest_tool(&call.name, 2)
+                    {
+                        let repaired = repaired.to_string();
+                        tracing::warn!(
+                            agent = %self.name,
+                            original = %call.name,
+                            repaired = %repaired,
+                            "tool name repaired via Levenshtein match (pre-policy)"
+                        );
+                        self.emit(AgentEvent::ToolNameRepaired {
+                            agent: self.name.clone(),
+                            original: call.name.clone(),
+                            repaired: repaired.clone(),
+                        });
+                        call.name = repaired;
+                    }
+                }
 
                 // Tool-call cap: reject turns that exceed max_tool_calls_per_turn.
                 // Checked before dispatch so no tools are executed on a capped turn.
@@ -1993,18 +2031,12 @@ impl<P: LlmProvider> AgentRunner<P> {
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, call) in calls.iter().enumerate() {
-            let tool = self.tools.get(&call.name).cloned().or_else(|| {
-                self.find_closest_tool(&call.name, 2)
-                    .and_then(|repaired_name| {
-                        tracing::warn!(
-                            agent = %self.name,
-                            original = %call.name,
-                            repaired = %repaired_name,
-                            "tool name repaired via Levenshtein match"
-                        );
-                        self.tools.get(repaired_name).cloned()
-                    })
-            });
+            // SECURITY (F-AGENT-1): names are already repaired upstream of the
+            // permission and pre_tool guardrails. If the lookup fails here, the
+            // name was unknown AND not Levenshtein-close to any tool — return a
+            // "Tool not found" error and let the LLM correct itself. Repairing
+            // at dispatch time would bypass the policy that just ran.
+            let tool = self.tools.get(&call.name).cloned();
             let input = call.input.clone();
             let call_name = call.name.clone();
             let timeout = self.tool_timeout;
@@ -2122,8 +2154,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                         }),
                         usage: TokenUsage::default(),
                         timestamp: chrono::Utc::now(),
-                        user_id: None,
-                        tenant_id: None,
+                        // SECURITY (F-AGENT-5): attribute the deny to the
+                        // identity the rest of the run is attributed to. All
+                        // other AuditRecord sites in this file pass these
+                        // fields; this one used to set them to None, leaving
+                        // post_tool denials unattributable cross-tenant.
+                        user_id: self.audit_user_id.clone(),
+                        tenant_id: self.audit_tenant_id.clone(),
                         delegation_chain: self.audit_delegation_chain.clone(),
                     })
                     .await;

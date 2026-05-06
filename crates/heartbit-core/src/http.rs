@@ -161,6 +161,42 @@ fn is_blocked(ip: &IpAddr) -> bool {
     }
 }
 
+/// Synchronous best-effort URL validation: scheme + literal-IP only.
+///
+/// Use when the constructor is not async (`TokenExchangeAuthProvider::new`,
+/// `OpenAiCompatProvider::new`, etc). Returns `Ok` for hostnames (no DNS
+/// lookup performed) under `IpPolicy::Strict` — call [`SafeUrl::parse`] on
+/// the actual request path for the full check including DNS resolution.
+///
+/// Catches the obvious misconfigurations (e.g., `http://127.0.0.1` or
+/// `http://169.254.169.254`) at construction time. Defense in depth, not
+/// a substitute for `SafeUrl::parse`.
+pub fn validate_url_sync(s: &str, policy: IpPolicy) -> Result<(), Error> {
+    let url = Url::parse(s).map_err(|e| Error::Agent(format!("invalid URL: {e}")))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::Agent(format!(
+            "URL scheme {scheme:?} not allowed; only http and https"
+        )));
+    }
+    if matches!(policy, IpPolicy::AllowPrivate) {
+        return Ok(());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::Agent("URL has no host".into()))?;
+    let bare_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = IpAddr::from_str(bare_host)
+        && is_blocked(&ip)
+    {
+        return Err(reject(host));
+    }
+    Ok(())
+}
+
 fn is_blocked_v4(ip: &Ipv4Addr) -> bool {
     ip.is_loopback()
         || ip.is_link_local()
@@ -209,23 +245,93 @@ fn is_ula_v6(ip: &Ipv6Addr) -> bool {
     (s & 0xfe00) == 0xfc00
 }
 
-/// `reqwest::ClientBuilder` with `redirect(Policy::none())` baked in.
+/// Default cap for vendor response bodies (5 MiB).
+///
+/// SECURITY (F-NET-1): vendor APIs (Twitter, OpenAI TTS, image gen, search)
+/// are operator-trusted but trust ≠ unbounded. A compromised vendor (DNS
+/// hijack, BGP, sub-CA) could OOM the agent by streaming gigabytes. This cap
+/// is per-response.
+pub const DEFAULT_VENDOR_BODY_CAP: usize = 5 * 1024 * 1024;
+
+/// Read up to `max_bytes` from `response` and return the bytes plus a flag
+/// indicating whether truncation happened.
+///
+/// SECURITY (F-NET-1): use this helper instead of `response.text()` /
+/// `response.bytes()` / `response.json()` directly when the response is from
+/// a vendor that could in principle be hostile. Streams chunk-by-chunk and
+/// aborts at the cap; never holds more than `max_bytes` in memory.
+pub async fn read_body_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), Error> {
+    use futures::TryStreamExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut truncated = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.try_next().await.map_err(Error::Http)? {
+        let remaining = max_bytes.saturating_sub(buf.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let take = chunk.len().min(remaining);
+        buf.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+    Ok((buf, truncated))
+}
+
+/// Read response body as text, capped at `max_bytes`. Lossy UTF-8 on
+/// non-UTF-8 input.
+pub async fn read_text_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<String, Error> {
+    let (bytes, truncated) = read_body_capped(response, max_bytes).await?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("…[truncated]");
+    }
+    Ok(text)
+}
+
+/// `reqwest::ClientBuilder` with `redirect(Policy::none())`, `.no_proxy()`,
+/// and `connect_timeout(5s)` baked in.
 ///
 /// Use for clients that send to user-controllable URLs (`webfetch`, `a2a`,
 /// `rss`). The caller is responsible for validating the URL via
 /// [`SafeUrl::parse`] before issuing the request.
+///
+/// SECURITY (F-NET-3): `.no_proxy()` refuses env-driven `HTTP_PROXY` /
+/// `HTTPS_PROXY` / `ALL_PROXY` by default. A misconfigured or attacker-set
+/// proxy would otherwise route every outbound call (LLM, search, fetch)
+/// through an attacker MITM.
+///
+/// SECURITY (F-NET-4): `connect_timeout(5s)` aborts a stalled TCP handshake
+/// before the longer total timeout fires — slow-loris dialing only ties up
+/// an agent slot for ~5s instead of 30–120s.
 pub fn safe_client_builder() -> ClientBuilder {
-    reqwest::Client::builder().redirect(Policy::none())
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(5))
 }
 
-/// `reqwest::ClientBuilder` with `redirect(Policy::none())` baked in.
+/// `reqwest::ClientBuilder` with `redirect(Policy::none())`, `.no_proxy()`,
+/// and `connect_timeout(5s)` baked in.
 ///
 /// Use for clients that send to operator-trusted vendor APIs (Twitter, OpenAI,
 /// SerpAPI, etc.). No IP validation is implied — the caller asserts the host
-/// is operator-trusted. Redirects are still disabled so a hijacked DNS for the
-/// vendor host cannot redirect a vendor call to a private address.
+/// is operator-trusted. See [`safe_client_builder`] for the security
+/// rationale of the redirect / proxy / connect-timeout settings.
 pub fn vendor_client_builder() -> ClientBuilder {
-    reqwest::Client::builder().redirect(Policy::none())
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(5))
 }
 
 #[cfg(test)]
@@ -531,5 +637,50 @@ mod tests {
     #[test]
     fn vendor_client_builder_compiles_and_builds() {
         let _ = vendor_client_builder().build().unwrap();
+    }
+
+    /// SECURITY (F-NET-1): `read_body_capped` MUST stop reading once the cap
+    /// is reached. A hostile vendor that streams gigabytes would otherwise
+    /// OOM the agent.
+    #[tokio::test]
+    async fn read_body_capped_truncates_at_limit() {
+        use std::convert::Infallible;
+        use tokio::io::AsyncWriteExt;
+        // Spin a tiny TCP server that streams 10 MiB.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read & discard request, then send headers + huge body.
+                let mut tmp = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut tmp).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10485760\r\n\r\n")
+                    .await;
+                // Stream 10 MiB of 'A'. We don't care if the peer hangs up.
+                let chunk = vec![b'A'; 64 * 1024];
+                for _ in 0..160 {
+                    if sock.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Ok::<_, Infallible>(())
+            } else {
+                Ok(())
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+        let (bytes, truncated) = read_body_capped(resp, 1024 * 1024).await.unwrap();
+        assert!(truncated, "must report truncation");
+        assert!(
+            bytes.len() <= 1024 * 1024 + 64 * 1024,
+            "must not exceed cap by more than one chunk; got {}",
+            bytes.len()
+        );
     }
 }

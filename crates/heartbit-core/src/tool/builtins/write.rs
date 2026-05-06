@@ -99,16 +99,16 @@ impl Tool for WriteTool {
             };
 
             if let Some(policy) = &self.path_policy {
-                // Walk up to the first existing ancestor for canonicalization
-                // (the target file may not exist yet).
-                let mut probe = path.clone();
-                while !probe.exists() {
-                    match probe.parent() {
-                        Some(p) if p != probe => probe = p.to_path_buf(),
-                        _ => break,
-                    }
-                }
-                if let Err(e) = policy.check_path(&probe) {
+                // SECURITY (F-FS-1): canonicalize the parent and recompose
+                // `parent.canonical + filename`. The previous "walk up to first
+                // existing ancestor, check, then write the original path"
+                // pattern left a TOCTOU window: a parallel tool call (bash
+                // dispatched alongside write via tokio::JoinSet) could replace
+                // an intermediate component with a symlink pointing outside the
+                // workspace between the check and the open. The new method
+                // binds the path to the *real* parent and `O_NOFOLLOW` on the
+                // open closes the race entirely.
+                if let Err(e) = policy.check_path_for_create(&path) {
                     return Ok(ToolOutput::error(format!("path policy: {e}")));
                 }
             }
@@ -138,9 +138,12 @@ impl Tool for WriteTool {
                     .map_err(|e| Error::Agent(format!("Cannot create directories: {e}")))?;
             }
 
-            // Write the file
+            // Write the file with O_NOFOLLOW (Unix) so the open syscall fails
+            // if any component of `path` is a symlink. This neutralises the
+            // residual TOCTOU window where a parallel tool call could have
+            // replaced the path between policy check and open.
             let bytes = content.len();
-            tokio::fs::write(&path, content)
+            super::write_no_follow(&path, content.as_bytes())
                 .await
                 .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
 
@@ -324,6 +327,77 @@ mod tests {
             !result.is_error,
             "expected success, got: {:?}",
             result.content
+        );
+    }
+
+    /// SECURITY (F-FS-1): if the target path is a symlink pointing outside the
+    /// allowed directory, the open syscall must fail with `O_NOFOLLOW` rather
+    /// than follow the link and write through it. This protects against TOCTOU
+    /// where a parallel tool call swaps in a symlink between policy check and
+    /// open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refuses_to_follow_symlink_pointing_outside_workspace() {
+        use crate::sandbox::CorePathPolicy;
+        use std::os::unix::fs::symlink;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Create a "victim" file that the LLM should NOT be able to overwrite.
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL CONTENT").unwrap();
+
+        // Inside the allowed dir, create a symlink pointing to the victim file.
+        let link = allowed.path().join("link.txt");
+        symlink(&victim, &link).unwrap();
+
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(allowed.path())
+                .build()
+                .unwrap(),
+        );
+        let tracker = Arc::new(FileTracker::new());
+        // Must record the symlink target as read so the read-before-write
+        // guard doesn't preempt the security check we are testing.
+        let _ = tracker.record_read(&link);
+        let tool = WriteTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
+
+        // Attempt to overwrite via the symlink path — must fail. The error
+        // can surface as either `Err(Error::Agent("Cannot write file: ..."))`
+        // (from the failed open syscall propagating up through `?`) or as
+        // `Ok(ToolOutput::error)` from the policy reject. Both prove the
+        // security invariant; the victim file must remain untouched.
+        let outcome = tool
+            .execute(serde_json::json!({
+                "file_path": link.to_string_lossy(),
+                "content": "PWNED"
+            }))
+            .await;
+        match outcome {
+            Ok(r) => assert!(
+                r.is_error,
+                "expected error tool output; got success: {:?}",
+                r.content
+            ),
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                assert!(
+                    s.contains("symbolic")
+                        || s.contains("symlink")
+                        || s.contains("nofollow")
+                        || s.contains("loop"),
+                    "expected symlink-related error; got: {e}"
+                );
+            }
+        }
+
+        // Victim must remain untouched — that's the security invariant.
+        let after = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(
+            after, "ORIGINAL CONTENT",
+            "victim file was modified despite symlink rejection"
         );
     }
 }

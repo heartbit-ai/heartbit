@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
+use reqwest::redirect::Policy;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::warn;
 
 use crate::error::Error;
@@ -15,6 +17,22 @@ use crate::llm::types::{
 };
 
 const API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+/// Build a hardened reqwest Client for the OpenRouter API.
+///
+/// SECURITY (F-LLM-1, F-LLM-2): although `Authorization: Bearer ...` *is*
+/// stripped by reqwest on cross-host redirects, disable redirects entirely
+/// for consistency with the other providers and to neutralise any future
+/// addition of custom auth headers (e.g. `HTTP-Referer`).
+fn build_secure_client() -> Result<Client, Error> {
+    Client::builder()
+        .redirect(Policy::none())
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(Error::from)
+}
 
 /// OpenRouter LLM provider (OpenAI-compatible API).
 ///
@@ -30,7 +48,8 @@ impl OpenRouterProvider {
     /// Create a new OpenRouter provider with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: build_secure_client()
+                .expect("failed to build hardened HTTPS client for OpenRouterProvider"),
             api_key: api_key.into(),
             model: model.into(),
         }
@@ -626,12 +645,36 @@ fn process_openai_event(
 
     if let Some(choice) = chunk.choices.first() {
         if let Some(ref content) = choice.delta.content {
-            text.push_str(content);
-            on_text(content);
+            // SECURITY (F-LLM-4): cap text accumulation per response.
+            if text.len().saturating_add(content.len()) <= super::STREAM_MAX_TEXT_BYTES {
+                text.push_str(content);
+                on_text(content);
+            } else if text.len() < super::STREAM_MAX_TEXT_BYTES {
+                let remaining = super::STREAM_MAX_TEXT_BYTES - text.len();
+                let take = std::cmp::min(remaining, content.len());
+                let boundary = crate::tool::builtins::floor_char_boundary(content, take);
+                let safe = &content[..boundary];
+                text.push_str(safe);
+                on_text(safe);
+                tracing::warn!(
+                    text_len = text.len(),
+                    limit = super::STREAM_MAX_TEXT_BYTES,
+                    "OpenAI-format streaming text exceeded cap; truncated"
+                );
+            }
         }
 
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc_delta in tcs {
+                // SECURITY (F-LLM-4): refuse outsized tool_call indices.
+                if tc_delta.index >= super::STREAM_MAX_TOOL_CALLS {
+                    tracing::warn!(
+                        index = tc_delta.index,
+                        limit = super::STREAM_MAX_TOOL_CALLS,
+                        "OpenAI-format tool_call index exceeds cap; dropping delta"
+                    );
+                    continue;
+                }
                 while tool_calls.len() <= tc_delta.index {
                     tool_calls.push(AccumulatedToolCall::default());
                 }
@@ -643,7 +686,10 @@ fn process_openai_event(
                     if let Some(ref name) = func.name {
                         tc.name.clone_from(name);
                     }
-                    if let Some(ref args) = func.arguments {
+                    if let Some(ref args) = func.arguments
+                        && tc.arguments.len().saturating_add(args.len())
+                            <= super::STREAM_MAX_TOOL_ARGS_BYTES
+                    {
                         tc.arguments.push_str(args);
                     }
                 }

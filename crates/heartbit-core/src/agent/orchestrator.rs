@@ -339,6 +339,11 @@ struct DelegateTaskTool {
     allow_shared_write: bool,
     /// Optional per-tenant token tracker propagated to all sub-agent runners.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Orchestrator-level guardrails propagated to delegated sub-agents.
+    /// SECURITY (F-AGENT-2): without this, sub-agents tournaient sans les
+    /// défenses (PII, secret scanner, LLM judge) que l'opérateur avait
+    /// configurées au niveau orchestrator.
+    guardrails: Vec<Arc<dyn Guardrail>>,
 }
 
 impl DelegateTaskTool {
@@ -403,6 +408,12 @@ impl DelegateTaskTool {
             let observability_mode = self.observability_mode;
             let allow_shared_write = self.allow_shared_write;
             let tenant_tracker = self.tenant_tracker.clone();
+            // SECURITY (F-AGENT-2): propagate orchestrator guardrails to delegated
+            // sub-agents. Without this, an opérator who hardens the orchestrator
+            // (PII, secret scanner, LLM judge) sees their defenses silently drop
+            // the moment work is delegated. SpawnAgentTool already does this; the
+            // delegate path used to skip it.
+            let orchestrator_guardrails = self.guardrails.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -429,8 +440,13 @@ impl DelegateTaskTool {
                 if let Some(schema) = agent_def.response_schema {
                     builder = builder.structured_schema(schema);
                 }
-                if !agent_def.guardrails.is_empty() {
-                    builder = builder.guardrails(agent_def.guardrails);
+                // SECURITY (F-AGENT-2): combine orchestrator guardrails with the
+                // sub-agent's own. Both lists are appended (orchestrator first so
+                // global denies fire before agent-local ones). Either may be empty.
+                let mut combined_guardrails = orchestrator_guardrails;
+                combined_guardrails.extend(agent_def.guardrails);
+                if !combined_guardrails.is_empty() {
+                    builder = builder.guardrails(combined_guardrails);
                 }
                 if let Some(timeout) = agent_def.run_timeout {
                     builder = builder.run_timeout(timeout);
@@ -541,9 +557,12 @@ impl DelegateTaskTool {
                     ));
                 }
 
-                // Add blackboard tools if blackboard is configured
+                // Add blackboard tools if blackboard is configured.
+                // SECURITY (F-AGENT-7): pass the sub-agent name so writes are
+                // caller-namespaced (`caller:{name}/...`) and the reserved
+                // `agent:` prefix is denied to sub-agents.
                 if let Some(ref bb) = blackboard {
-                    builder = builder.tools(blackboard_tools(bb.clone()));
+                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
                 }
 
                 // Add knowledge tools if knowledge base is configured
@@ -962,8 +981,10 @@ impl Tool for FormSquadTool {
                         ));
                     }
 
-                    // Add blackboard tools using the PRIVATE blackboard
-                    builder = builder.tools(blackboard_tools(bb.clone()));
+                    // Add blackboard tools using the PRIVATE blackboard.
+                    // SECURITY (F-AGENT-7): caller-namespaced; reserved
+                    // `agent:` prefix denied to sub-agents.
+                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
 
                     // Add knowledge tools if knowledge base is configured
                     if let Some(ref kb) = knowledge_base {
@@ -2330,6 +2351,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             observability_mode: resolved_mode,
             allow_shared_write: self.allow_shared_write,
             tenant_tracker: self.tenant_tracker.clone(),
+            guardrails: self.guardrails.clone(),
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -2812,6 +2834,7 @@ mod tests {
             observability_mode: crate::ObservabilityMode::Production,
             allow_shared_write: true,
             tenant_tracker: None,
+            guardrails: vec![],
         };
 
         let def = tool.definition();
@@ -3749,6 +3772,144 @@ mod tests {
             !systems[0].contains("[GUARDRAIL_ACTIVE]"),
             "orchestrator system prompt should NOT contain guardrail marker: {}",
             systems[0]
+        );
+    }
+
+    /// SECURITY (F-AGENT-2): orchestrator-level guardrails must propagate to
+    /// sub-agents launched via the delegate_task path (not just via SpawnAgentTool).
+    /// Before the fix, an opérator who hardened the orchestrator with PII /
+    /// secret-scanner / LLM-judge guardrails saw their defenses silently drop the
+    /// moment work was delegated to a sub-agent that had no guardrails of its own.
+    #[tokio::test]
+    async fn orchestrator_guardrails_propagate_to_delegated_sub_agents() {
+        use crate::agent::guardrail::Guardrail;
+        use crate::llm::types::CompletionRequest;
+
+        struct MarkerGuardrail;
+        impl Guardrail for MarkerGuardrail {
+            fn pre_llm(
+                &self,
+                request: &mut CompletionRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), crate::error::Error>> + Send + '_>,
+            > {
+                request.system = format!("{} [ORCH_GUARD_ACTIVE]", request.system);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        struct CapturingProvider {
+            responses: Mutex<Vec<CompletionResponse>>,
+            systems_seen: Mutex<Vec<String>>,
+        }
+
+        impl LlmProvider for CapturingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::Error> {
+                self.systems_seen
+                    .lock()
+                    .unwrap()
+                    .push(request.system.clone());
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Err(crate::error::Error::Agent("no more responses".into()));
+                }
+                Ok(responses.remove(0))
+            }
+        }
+
+        let guardrail: Arc<dyn Guardrail> = Arc::new(MarkerGuardrail);
+
+        let provider = Arc::new(CapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: Orchestrator delegates
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({
+                            "tasks": [{"agent": "worker", "task": "do work"}]
+                        }),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: Sub-agent responds (NO guardrail of its own)
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Work done.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 3: Orchestrator synthesis
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Synthesized.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+            ]),
+            systems_seen: Mutex::new(vec![]),
+        });
+
+        // Sub-agent has NO guardrails of its own — the only protection comes
+        // from the orchestrator-level guardrail being propagated.
+        let mut orch = Orchestrator::builder(provider.clone())
+            .guardrail(guardrail)
+            .sub_agent_full(SubAgentConfig {
+                name: "worker".into(),
+                description: "Worker agent".into(),
+                system_prompt: "You work.".into(),
+                tools: vec![],
+                context_strategy: None,
+                summarize_threshold: None,
+                tool_timeout: None,
+                max_tool_output_bytes: None,
+                max_turns: None,
+                max_tokens: None,
+                response_schema: None,
+                run_timeout: None,
+                guardrails: vec![],
+                provider: None,
+                reasoning_effort: None,
+                enable_reflection: None,
+                tool_output_compression_threshold: None,
+                max_tools_per_turn: None,
+                tool_profile: None,
+                max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
+                session_prune_config: None,
+                enable_recursive_summarization: None,
+                reflection_threshold: None,
+                consolidate_on_exit: None,
+                workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
+            })
+            .build()
+            .unwrap();
+
+        orch.run("do work").await.unwrap();
+
+        let systems = provider.systems_seen.lock().unwrap();
+        assert!(systems.len() >= 2, "expected at least 2 LLM calls");
+        // systems[1] is the sub-agent call. The marker MUST be present —
+        // proves the orchestrator's guardrail propagated to the delegated agent.
+        assert!(
+            systems[1].contains("[ORCH_GUARD_ACTIVE]"),
+            "sub-agent system prompt should contain orchestrator guardrail marker; got: {}",
+            systems[1]
         );
     }
 
@@ -5052,7 +5213,8 @@ mod tests {
                 | AgentEvent::ModelEscalated { agent, .. }
                 | AgentEvent::BudgetExceeded { agent, .. }
                 | AgentEvent::AgentSpawned { agent, .. }
-                | AgentEvent::KillSwitchActivated { agent, .. } => agent,
+                | AgentEvent::KillSwitchActivated { agent, .. }
+                | AgentEvent::ToolNameRepaired { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5736,7 +5898,8 @@ mod tests {
                 | AgentEvent::ModelEscalated { agent, .. }
                 | AgentEvent::BudgetExceeded { agent, .. }
                 | AgentEvent::AgentSpawned { agent, .. }
-                | AgentEvent::KillSwitchActivated { agent, .. } => agent,
+                | AgentEvent::KillSwitchActivated { agent, .. }
+                | AgentEvent::ToolNameRepaired { agent, .. } => agent,
                 AgentEvent::SensorEventProcessed { sensor_name, .. } => sensor_name,
                 AgentEvent::StoryUpdated { story_id, .. } => story_id,
                 AgentEvent::TaskRouted { decision, .. } => decision,
@@ -5777,6 +5940,7 @@ mod tests {
                 AgentEvent::WorkflowNodeStarted { .. } => "WorkflowNodeStarted",
                 AgentEvent::WorkflowNodeCompleted { .. } => "WorkflowNodeCompleted",
                 AgentEvent::WorkflowNodeFailed { .. } => "WorkflowNodeFailed",
+                AgentEvent::ToolNameRepaired { .. } => "ToolNameRepaired",
             }
         }
 

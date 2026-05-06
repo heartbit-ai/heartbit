@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
+use reqwest::redirect::Policy;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::warn;
 
 use crate::error::Error;
@@ -14,6 +16,29 @@ use crate::llm::types::{
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+
+/// Build a hardened reqwest Client for the Anthropic API.
+///
+/// SECURITY (F-LLM-1): reqwest's default `redirect::Policy::limited(10)` will
+/// follow redirects, but its cross-host secret-stripping is hard-coded to the
+/// IETF-standardised auth headers (Authorization, Cookie, cookie2,
+/// Proxy-Authorization, WWW-Authenticate). The custom `x-api-key` header is
+/// **not** stripped — a hostile or compromised endpoint that responds with a
+/// 302 leaks the key to an attacker. Disabling redirects entirely closes the
+/// bypass: the Anthropic API never legitimately returns a redirect.
+///
+/// SECURITY (F-LLM-2): no timeout means a slow-loris upstream wedges the agent
+/// indefinitely (no retry, no circuit-break). Use a 120s total cap and 10s
+/// connect cap.
+fn build_secure_client() -> Result<Client, Error> {
+    Client::builder()
+        .redirect(Policy::none())
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(Error::from)
+}
 
 /// Anthropic Claude LLM provider using the Messages API.
 ///
@@ -34,9 +59,18 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     /// Create a new Anthropic provider with the given API key and model identifier.
+    ///
+    /// The HTTP client is hardened with `https_only`, `redirect::Policy::none()`,
+    /// 10s connect-timeout and 120s total timeout. See [`build_secure_client`]
+    /// for the security rationale (F-LLM-1, F-LLM-2).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            // SAFETY: the only way `build_secure_client` can fail is if the
+            // global TLS init fails — which crashes any reqwest user. Falling
+            // back to `Client::new()` would silently re-introduce the redirect
+            // bypass (F-LLM-1). Panic loudly instead of degrading security.
+            client: build_secure_client()
+                .expect("failed to build hardened HTTPS client for AnthropicProvider"),
             api_key: api_key.into(),
             model: model.into(),
             prompt_caching: false,
@@ -50,7 +84,8 @@ impl AnthropicProvider {
     /// server-side, reducing input tokens on subsequent turns.
     pub fn with_prompt_caching(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: build_secure_client()
+                .expect("failed to build hardened HTTPS client for AnthropicProvider"),
             api_key: api_key.into(),
             model: model.into(),
             prompt_caching: true,
@@ -288,16 +323,39 @@ fn build_request_body(
 
 // --- SSE Parser ---
 
+/// Maximum size (bytes) of the in-flight SSE line buffer.
+///
+/// SECURITY (F-LLM-3): a hostile or compromised upstream that streams without
+/// ever emitting a line break would otherwise grow `self.buffer` unbounded
+/// until OOM. 1 MiB is more than enough for any legitimate SSE event from
+/// Anthropic / OpenAI-style providers.
+pub(crate) const SSE_MAX_BUFFER_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Maximum total size (bytes) of accumulated `data:` lines for one event.
+///
+/// SECURITY (F-LLM-3): even with line breaks, a single SSE event can carry
+/// arbitrarily many `data:` fields. Capping the sum protects against a
+/// drip-fed multi-MB event.
+pub(crate) const SSE_MAX_EVENT_DATA_BYTES: usize = 8 << 20; // 8 MiB
+
 /// Incremental SSE parser that handles:
 /// - `\n`, `\r\n`, and `\r` line endings
 /// - Multiple `data:` fields (concatenated with `\n` per SSE spec)
 /// - `data:value` (no space) and `data: value` (space stripped per spec)
 /// - Arbitrary chunk boundaries (events split across chunks)
 /// - Remaining data after stream ends (via `flush()`)
+///
+/// SECURITY: hardened with `SSE_MAX_BUFFER_BYTES` and
+/// `SSE_MAX_EVENT_DATA_BYTES` caps so a hostile upstream cannot exhaust
+/// memory by streaming without line breaks (F-LLM-3).
 pub(crate) struct SseParser {
     buffer: String,
     event_type: String,
     data_lines: Vec<String>,
+    /// Set when a buffer/event-data cap is exceeded. After this, the parser
+    /// rejects further input and returns no more events; the caller will
+    /// observe the partial events received before the overflow.
+    overflowed: bool,
 }
 
 impl SseParser {
@@ -306,17 +364,46 @@ impl SseParser {
             buffer: String::new(),
             event_type: String::new(),
             data_lines: Vec::new(),
+            overflowed: false,
         }
+    }
+
+    /// Returns true if a previous `feed()` call exceeded the buffer or
+    /// event-data caps. Once set, the parser refuses to grow further.
+    #[cfg(test)]
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Feed a chunk of data and return any complete events.
     pub(crate) fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
+        if self.overflowed {
+            return Vec::new();
+        }
+        // Cap the line buffer. If feeding this chunk would exceed the cap,
+        // mark overflow and stop accepting data — the existing buffer is
+        // discarded so memory pressure is released immediately.
+        if self.buffer.len().saturating_add(chunk.len()) > SSE_MAX_BUFFER_BYTES {
+            tracing::warn!(
+                buffer_len = self.buffer.len(),
+                chunk_len = chunk.len(),
+                limit = SSE_MAX_BUFFER_BYTES,
+                "SSE parser buffer exceeded cap; stream will be truncated"
+            );
+            self.overflowed = true;
+            self.buffer.clear();
+            self.data_lines.clear();
+            return Vec::new();
+        }
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
         while let Some((line, consumed)) = self.next_line() {
             self.buffer.drain(..consumed);
             self.process_line(&line, &mut events);
+            if self.overflowed {
+                break;
+            }
         }
 
         events
@@ -375,8 +462,21 @@ impl SseParser {
         } else if let Some(rest) = line.strip_prefix("event:") {
             self.event_type = rest.strip_prefix(' ').unwrap_or(rest).to_string();
         } else if let Some(rest) = line.strip_prefix("data:") {
-            self.data_lines
-                .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            // SECURITY (F-LLM-3): cap accumulated data-line bytes per event.
+            let stripped = rest.strip_prefix(' ').unwrap_or(rest);
+            let current_total: usize = self.data_lines.iter().map(String::len).sum();
+            if current_total.saturating_add(stripped.len()) > SSE_MAX_EVENT_DATA_BYTES {
+                tracing::warn!(
+                    accumulated = current_total,
+                    new_chunk = stripped.len(),
+                    limit = SSE_MAX_EVENT_DATA_BYTES,
+                    "SSE event data exceeded cap; stream will be truncated"
+                );
+                self.overflowed = true;
+                self.data_lines.clear();
+                return;
+            }
+            self.data_lines.push(stripped.to_string());
         }
         // Ignore other fields (id, retry, etc.)
     }
@@ -546,15 +646,26 @@ fn process_sse_event(
                             if !delta.is_empty() {
                                 on_text(delta);
                             }
-                            if let Some(ref mut text) = state.current_text {
+                            // SECURITY (F-LLM-4): cap accumulated text per
+                            // response. A malicious upstream can drip-feed
+                            // `text_delta` events forever.
+                            if let Some(ref mut text) = state.current_text
+                                && text.len().saturating_add(delta.len())
+                                    <= super::STREAM_MAX_TEXT_BYTES
+                            {
                                 text.push_str(delta);
                             }
                         }
                     }
                     "input_json_delta" => {
                         if let Some(ref mut tool) = state.current_tool_use {
-                            tool.input_json
-                                .push_str(&parsed.delta.partial_json.unwrap_or_default());
+                            let chunk = parsed.delta.partial_json.unwrap_or_default();
+                            // SECURITY (F-LLM-4): cap accumulated tool args.
+                            if tool.input_json.len().saturating_add(chunk.len())
+                                <= super::STREAM_MAX_TOOL_ARGS_BYTES
+                            {
+                                tool.input_json.push_str(&chunk);
+                            }
                         }
                     }
                     _ => {}
@@ -840,6 +951,34 @@ mod tests {
         let flushed = parser.flush();
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].data, "hello"); // no trailing \r
+    }
+
+    /// SECURITY (F-LLM-3): a hostile upstream that streams without ever
+    /// emitting a line terminator must NOT grow the in-flight buffer
+    /// indefinitely. `feed()` should mark overflow once `SSE_MAX_BUFFER_BYTES`
+    /// is exceeded, drop the buffer, and return no further events.
+    #[test]
+    fn parser_buffer_cap_protects_against_no_linebreak_attack() {
+        let mut parser = SseParser::new();
+
+        // First feed stays well under the cap.
+        let small = "event: ok\ndata: small\n\n";
+        let events = parser.feed(small);
+        assert_eq!(events.len(), 1);
+        assert!(!parser.overflowed());
+
+        // Now feed a single chunk larger than the cap with no line breaks.
+        let big = "x".repeat(SSE_MAX_BUFFER_BYTES + 1);
+        let events = parser.feed(&big);
+        assert!(
+            events.is_empty(),
+            "no events should be returned on overflow"
+        );
+        assert!(parser.overflowed(), "parser should be marked overflowed");
+
+        // Subsequent feeds are ignored (memory pressure released, no further work).
+        let events = parser.feed("data: anything\n\n");
+        assert!(events.is_empty());
     }
 
     // --- build_request_body tests ---
@@ -1530,6 +1669,23 @@ mod tests {
     fn model_name_returns_configured_model() {
         let provider = AnthropicProvider::new("key", "claude-3-5-sonnet-20241022");
         assert_eq!(provider.model_name(), Some("claude-3-5-sonnet-20241022"));
+    }
+
+    /// SECURITY (F-LLM-1, F-LLM-2): the secure client must refuse plaintext HTTP
+    /// (would leak `x-api-key` over the wire) and must have a finite timeout
+    /// (otherwise a slow-loris upstream wedges the agent indefinitely).
+    #[tokio::test]
+    async fn secure_client_rejects_plaintext_http() {
+        let client = build_secure_client().expect("client must build");
+        // `https_only(true)` causes plaintext HTTP requests to fail at send time.
+        let result = client.get("http://example.com/").send().await;
+        assert!(result.is_err(), "https_only must reject http:// URLs");
+        let err = result.unwrap_err();
+        let s = err.to_string().to_lowercase();
+        assert!(
+            s.contains("http") || s.contains("scheme") || s.contains("https"),
+            "error should mention scheme, got: {err}"
+        );
     }
 
     #[test]

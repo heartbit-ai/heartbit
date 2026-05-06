@@ -102,16 +102,11 @@ impl Tool for PatchTool {
                 };
 
                 if let Some(policy) = &self.path_policy {
-                    // Walk up to the first existing ancestor for canonicalization
-                    // (new files from the patch may not exist yet).
-                    let mut probe = resolved.clone();
-                    while !probe.exists() {
-                        match probe.parent() {
-                            Some(p) if p != probe => probe = p.to_path_buf(),
-                            _ => break,
-                        }
-                    }
-                    if let Err(e) = policy.check_path(&probe) {
+                    // SECURITY (F-FS-1): canonicalize parent + recompose,
+                    // matching write.rs. The previous walk-up-ancestor
+                    // pattern was vulnerable to TOCTOU symlink swapping by a
+                    // parallel tool call (cf. write.rs comment).
+                    if let Err(e) = policy.check_path_for_create(&resolved) {
                         return Ok(ToolOutput::error(format!("path policy: {e}")));
                     }
                 }
@@ -270,7 +265,10 @@ impl Tool for PatchTool {
                         .map_err(|e| Error::Agent(format!("Cannot create directories: {e}")))?;
                 }
 
-                tokio::fs::write(&path, &new_content)
+                // SECURITY (F-FS-1): use O_NOFOLLOW (Unix) so the open syscall
+                // fails if any component of `path` was swapped to a symlink
+                // between policy check and now (parallel tool call race).
+                super::write_no_follow(path, new_content.as_bytes())
                     .await
                     .map_err(|e| Error::Agent(format!("Cannot write {}: {e}", fp.path)))?;
 

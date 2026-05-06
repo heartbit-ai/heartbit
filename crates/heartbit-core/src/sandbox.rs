@@ -37,6 +37,41 @@ impl CorePathPolicy {
             .canonicalize()
             .map_err(|e| Error::Sandbox(format!("canonicalize {}: {e}", path.display())))?;
 
+        self.check_canonical(&canonical)
+    }
+
+    /// Like [`check_path`] but for files that don't exist yet (about to be
+    /// created or overwritten). Canonicalizes the parent directory then
+    /// recomposes `parent.canonicalize() + file_name` to produce a path that
+    /// is bound to the *real* parent (not a symlink to elsewhere). The
+    /// returned `PathBuf` is the canonical target the caller should write to.
+    ///
+    /// SECURITY (F-FS-1): the previous pattern of "walk up to first existing
+    /// ancestor, then `check_path` on it" left a TOCTOU window: between the
+    /// check and the write, an attacker (or another tool call dispatched in
+    /// parallel via `tokio::JoinSet`) could replace an intermediate component
+    /// with a symlink pointing outside the workspace, and the write would
+    /// follow the symlink. Combine this method with `O_NOFOLLOW` on the open
+    /// syscall to close the race window entirely.
+    pub fn check_path_for_create(&self, path: &Path) -> Result<PathBuf, Error> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Sandbox(format!("path has no parent: {}", path.display())))?;
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            Error::Sandbox(format!("canonicalize parent {}: {e}", parent.display()))
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            Error::Sandbox(format!(
+                "path has no file name component: {}",
+                path.display()
+            ))
+        })?;
+        let composed = canonical_parent.join(file_name);
+        self.check_canonical(&composed)?;
+        Ok(composed)
+    }
+
+    fn check_canonical(&self, canonical: &Path) -> Result<(), Error> {
         let allowed = self
             .allowed_dirs
             .iter()
@@ -49,7 +84,7 @@ impl CorePathPolicy {
         }
 
         for pat in &self.deny_globs {
-            if pat.matches_path(&canonical) {
+            if pat.matches_path(canonical) {
                 return Err(Error::Sandbox(format!(
                     "path {} matches deny pattern {}",
                     canonical.display(),
@@ -142,6 +177,14 @@ mod landlock_sandbox {
 
     impl SandboxPolicy {
         /// Default policy: R/W on workspace, read-only on system dirs.
+        ///
+        /// **BREAKING CHANGE (F-FS-3)**: `/tmp` is no longer included in
+        /// `read_paths` or `write_paths`. Sticky-writable shared `/tmp` is a
+        /// vector for cross-tenant TOCTOU and information disclosure on
+        /// shared hosts. Callers that need scratch space should pass a
+        /// per-session subdir under `std::env::temp_dir()` (created `0o700`)
+        /// to a custom `CorePathPolicy::builder().allow_dir(...)` and use
+        /// [`SandboxPolicy::from_path_policy`] instead.
         pub fn workspace_only(workspace: &std::path::Path) -> Self {
             let read_paths = vec![
                 PathBuf::from("/usr"),
@@ -149,10 +192,9 @@ mod landlock_sandbox {
                 PathBuf::from("/lib64"),
                 PathBuf::from("/bin"),
                 PathBuf::from("/etc"),
-                PathBuf::from("/tmp"),
                 workspace.to_path_buf(),
             ];
-            let write_paths = vec![workspace.to_path_buf(), PathBuf::from("/tmp")];
+            let write_paths = vec![workspace.to_path_buf()];
             // Build a corresponding CorePathPolicy (best-effort: skip missing dirs).
             let mut builder = CorePathPolicy::builder();
             for p in read_paths.iter().chain(write_paths.iter()) {
@@ -276,6 +318,23 @@ mod landlock_sandbox {
             assert!(policy.read_paths.contains(&PathBuf::from("/usr")));
             assert!(policy.read_paths.contains(&PathBuf::from("/bin")));
             assert!(policy.read_paths.contains(&PathBuf::from("/etc")));
+        }
+
+        /// SECURITY (F-FS-3): `/tmp` MUST NOT be in either read or write paths.
+        /// World-writable shared `/tmp` is a vector for cross-tenant TOCTOU
+        /// and information disclosure on shared hosts.
+        #[test]
+        fn workspace_only_excludes_tmp() {
+            let dir = tempfile::tempdir().unwrap();
+            let policy = SandboxPolicy::workspace_only(dir.path());
+            assert!(
+                !policy.read_paths.contains(&PathBuf::from("/tmp")),
+                "/tmp must NOT be readable by default (F-FS-3)"
+            );
+            assert!(
+                !policy.write_paths.contains(&PathBuf::from("/tmp")),
+                "/tmp must NOT be writable by default (F-FS-3)"
+            );
         }
 
         #[test]

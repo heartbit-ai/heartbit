@@ -3,19 +3,75 @@
 pub mod anthropic;
 pub mod circuit;
 
+/// Maximum bytes read from an upstream LLM error body.
+///
+/// SECURITY (F-LLM-5, F-LLM-6): a hostile or compromised provider can stream
+/// gigabytes of body in response to a 4xx/5xx and OOM the agent. We also
+/// truncate to keep accidentally-included secrets / internal IPs from
+/// flooding logs.
+const ERROR_BODY_MAX_BYTES: usize = 8 << 10; // 8 KiB
+
+/// SECURITY (F-LLM-4): hard cap on accumulated streaming text bytes per
+/// response. A drip-fed `text_delta` event sequence would otherwise grow
+/// unbounded.
+pub(crate) const STREAM_MAX_TEXT_BYTES: usize = 16 << 20; // 16 MiB
+
+/// SECURITY (F-LLM-4): hard cap on accumulated tool-call arguments JSON per
+/// individual tool call.
+pub(crate) const STREAM_MAX_TOOL_ARGS_BYTES: usize = 1 << 20; // 1 MiB
+
+/// SECURITY (F-LLM-4): hard cap on the number of tool calls a single
+/// streaming response may emit. Protects against a hostile `tool_calls[].index`
+/// of `u32::MAX` triggering a multi-billion-entry Vec allocation.
+pub(crate) const STREAM_MAX_TOOL_CALLS: usize = 256;
+
 /// Build an `Error::Api` from a failed HTTP response, sanitizing auth errors.
 ///
 /// For 401/403 responses, the body is NOT read to avoid leaking API key
-/// fragments in logs. For all other statuses the response body is included.
+/// fragments in logs. For all other statuses the response body is included
+/// but capped at `ERROR_BODY_MAX_BYTES` and stripped of control characters
+/// (newlines, ANSI escapes) so a hostile body cannot poison structured logs
+/// (F-LLM-6).
 pub(crate) async fn api_error_from_response(response: reqwest::Response) -> Error {
+    use futures::TryStreamExt;
     let status = response.status().as_u16();
     let message = if status == 401 || status == 403 {
         format!("authentication failed (HTTP {status})")
     } else {
-        response
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<body read error: {e}>"))
+        let mut buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut stream = response.bytes_stream();
+        let mut overflowed = false;
+        loop {
+            match stream.try_next().await {
+                Ok(Some(chunk)) => {
+                    let remaining = ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        overflowed = true;
+                        break;
+                    }
+                    let take = chunk.len().min(remaining);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < chunk.len() {
+                        overflowed = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Error::Api {
+                        status,
+                        message: format!("<body read error: {e}>"),
+                    };
+                }
+            }
+        }
+        let mut text = String::from_utf8_lossy(&buf).to_string();
+        // Strip control characters (CR/LF/ANSI ESC). Keep tabs and printable.
+        text.retain(|c| c == '\t' || (!c.is_control() && c != '\u{1b}'));
+        if overflowed {
+            text.push_str("…[truncated]");
+        }
+        text
     };
     Error::Api { status, message }
 }

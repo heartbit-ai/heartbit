@@ -287,6 +287,15 @@ pub enum AgentEvent {
 
     /// A workflow node agent has failed (emitted by the workflow executor).
     WorkflowNodeFailed { node: String },
+
+    /// LLM emitted an unknown tool name that was repaired via Levenshtein distance.
+    /// The repair happens **before** permission/guardrail evaluation so the policy
+    /// applies to the repaired name, not the typo.
+    ToolNameRepaired {
+        agent: String,
+        original: String,
+        repaired: String,
+    },
 }
 
 impl AgentEvent {
@@ -325,6 +334,7 @@ impl AgentEvent {
             Self::WorkflowNodeStarted { .. } => "workflow_node_started",
             Self::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             Self::WorkflowNodeFailed { .. } => "workflow_node_failed",
+            Self::ToolNameRepaired { .. } => "tool_name_repaired",
         }
     }
 }
