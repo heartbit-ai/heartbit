@@ -6,20 +6,18 @@
 //! - [`vendor_client_builder`] — for clients that send to operator-trusted
 //!   vendor APIs (Twitter, OpenAI, etc.). No URL validation is implied.
 //!
-//! Both builders set `redirect(Policy::none())` so a 302 to a private IP
-//! cannot bypass parse-time checks.
-//!
-//! # Limitation
-//!
-//! The IP blocklist is parse-time only. An attacker who controls a DNS name
-//! can return a public IP at parse time and a private IP at TCP-connect time
-//! and bypass this design. Defending against DNS rebind requires a custom
-//! `reqwest::dns::Resolve` implementation that filters at connect time and
-//! is deferred to a future round.
+//! Both builders set `redirect(Policy::none())`, `.no_proxy()`, and a
+//! `connect_timeout(5s)`. They also install a custom DNS resolver
+//! ([`SafeDnsResolver`]) that re-applies the IP blocklist at connect time
+//! — closing the DNS-rebinding bypass that the parse-time check alone
+//! left open (F-NET-2).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 
+use reqwest::dns::{Addrs, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use reqwest::{ClientBuilder, Url};
 
@@ -298,8 +296,64 @@ pub async fn read_text_capped(
     Ok(text)
 }
 
+/// Custom DNS resolver that re-validates resolved IPs against the
+/// [`IpPolicy`] at connect time.
+///
+/// SECURITY (F-NET-2): the parse-time IP blocklist on [`SafeUrl::parse`]
+/// catches `http://127.0.0.1` and `http://169.254.169.254` literally, but
+/// an attacker who controls `evil.com` with TTL=0 can return `8.8.8.8`
+/// (passes parse) and then `127.0.0.1` (used at TCP connect). This
+/// resolver re-applies the blocklist to every resolved `SocketAddr` —
+/// rebind attempts fail with a connect-time error before any byte
+/// reaches the loopback / metadata service.
+pub struct SafeDnsResolver {
+    policy: IpPolicy,
+}
+
+impl SafeDnsResolver {
+    /// Resolver under the given IP policy.
+    pub fn new(policy: IpPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl Resolve for SafeDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let policy = self.policy;
+        Box::pin(async move {
+            let resolved: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if resolved.is_empty() {
+                return Err::<Addrs, _>(
+                    format!("DNS lookup for {host} returned no addresses").into(),
+                );
+            }
+            let filtered: Vec<SocketAddr> = match policy {
+                IpPolicy::AllowPrivate => resolved,
+                IpPolicy::Strict => resolved
+                    .into_iter()
+                    .filter(|sa| !is_blocked(&sa.ip()))
+                    .collect(),
+            };
+            if filtered.is_empty() {
+                return Err::<Addrs, _>(
+                    format!(
+                        "host {host} resolves to private/loopback addresses; \
+                         refused at connect time (set HEARTBIT_ALLOW_PRIVATE_IPS=1 to override)"
+                    )
+                    .into(),
+                );
+            }
+            // SAFETY: the iterator type wants `Send`; Vec<SocketAddr>::IntoIter is Send.
+            let iter: Addrs = Box::new(filtered.into_iter());
+            Ok(iter)
+        }) as Pin<Box<_>>
+    }
+}
+
 /// `reqwest::ClientBuilder` with `redirect(Policy::none())`, `.no_proxy()`,
-/// and `connect_timeout(5s)` baked in.
+/// `connect_timeout(5s)`, and a [`SafeDnsResolver`] baked in.
 ///
 /// Use for clients that send to user-controllable URLs (`webfetch`, `a2a`,
 /// `rss`). The caller is responsible for validating the URL via
@@ -313,11 +367,15 @@ pub async fn read_text_capped(
 /// SECURITY (F-NET-4): `connect_timeout(5s)` aborts a stalled TCP handshake
 /// before the longer total timeout fires — slow-loris dialing only ties up
 /// an agent slot for ~5s instead of 30–120s.
+///
+/// SECURITY (F-NET-2): `SafeDnsResolver` filters resolved IPs at connect
+/// time, defeating DNS-rebinding bypasses of the parse-time blocklist.
 pub fn safe_client_builder() -> ClientBuilder {
     reqwest::Client::builder()
         .redirect(Policy::none())
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(5))
+        .dns_resolver(Arc::new(SafeDnsResolver::new(IpPolicy::default())))
 }
 
 /// `reqwest::ClientBuilder` with `redirect(Policy::none())`, `.no_proxy()`,
@@ -327,11 +385,17 @@ pub fn safe_client_builder() -> ClientBuilder {
 /// SerpAPI, etc.). No IP validation is implied — the caller asserts the host
 /// is operator-trusted. See [`safe_client_builder`] for the security
 /// rationale of the redirect / proxy / connect-timeout settings.
+///
+/// **NOTE**: the SafeDnsResolver is also installed here under `IpPolicy::Strict`
+/// — even vendor calls should not silently route to private IPs if a DNS
+/// hijack swings the host. Operators that need internal vendor endpoints can
+/// opt out via `HEARTBIT_ALLOW_PRIVATE_IPS=1`.
 pub fn vendor_client_builder() -> ClientBuilder {
     reqwest::Client::builder()
         .redirect(Policy::none())
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(5))
+        .dns_resolver(Arc::new(SafeDnsResolver::new(IpPolicy::default())))
 }
 
 #[cfg(test)]
