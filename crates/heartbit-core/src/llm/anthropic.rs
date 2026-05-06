@@ -351,7 +351,12 @@ pub(crate) const SSE_MAX_EVENT_DATA_BYTES: usize = 8 << 20; // 8 MiB
 pub(crate) struct SseParser {
     buffer: String,
     event_type: String,
-    data_lines: Vec<String>,
+    /// Accumulated `data:` field bytes for the current event, with `\n`
+    /// separators inserted between successive data lines. Replaces the
+    /// prior `Vec<String>` (P-LLM-14) so `emit_event()` no longer joins
+    /// per-event and per-line allocations are amortised by the String's
+    /// growth strategy.
+    data: String,
     /// Set when a buffer/event-data cap is exceeded. After this, the parser
     /// rejects further input and returns no more events; the caller will
     /// observe the partial events received before the overflow.
@@ -363,7 +368,7 @@ impl SseParser {
         Self {
             buffer: String::new(),
             event_type: String::new(),
-            data_lines: Vec::new(),
+            data: String::new(),
             overflowed: false,
         }
     }
@@ -376,6 +381,12 @@ impl SseParser {
     }
 
     /// Feed a chunk of data and return any complete events.
+    ///
+    /// PERF (P-LLM-2): the inner loop processes each line as a slice into
+    /// the parser's owned `buffer`, with no per-line `String` allocation.
+    /// We `mem::take` the buffer for the duration of the scan so the
+    /// borrow checker accepts `&mut self` (for `event_type` / `data`)
+    /// alongside the `&str` slice into the temporarily-owned scan buffer.
     pub(crate) fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         if self.overflowed {
             return Vec::new();
@@ -392,18 +403,34 @@ impl SseParser {
             );
             self.overflowed = true;
             self.buffer.clear();
-            self.data_lines.clear();
+            self.data.clear();
             return Vec::new();
         }
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
-        while let Some((line, consumed)) = self.next_line() {
-            self.buffer.drain(..consumed);
-            self.process_line(&line, &mut events);
+        // Move the buffer out so we can hold both `&str` slices (for the
+        // line) and `&mut self` (for `event_type` / `data`) at the same
+        // time. The bytes are valid UTF-8 by construction of `String`.
+        let scan = std::mem::take(&mut self.buffer);
+        let mut consumed = 0usize;
+
+        while let Some(boundary) = next_line_boundary(&scan, consumed) {
+            let line = &scan[consumed..boundary.line_end];
+            self.process_line(line, &mut events);
+            consumed = boundary.consume_end;
             if self.overflowed {
                 break;
             }
+        }
+
+        // Restore the unprocessed tail.
+        if consumed >= scan.len() {
+            // Whole scan consumed — `self.buffer` already empty after the
+            // `mem::take`; drop the owned `String` capacity.
+            drop(scan);
+        } else {
+            self.buffer.push_str(&scan[consumed..]);
         }
 
         events
@@ -414,8 +441,9 @@ impl SseParser {
         let mut events = Vec::new();
 
         // Process remaining buffer as a final line.
-        // Strip trailing \r since next_line() defers lone \r at buffer end
-        // (waiting for a possible \n in the next chunk that never arrives).
+        // Strip trailing \r since `next_line_boundary` defers lone `\r`
+        // at the buffer end (waiting for a possible `\n` in the next chunk
+        // that never arrives).
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             let line = line.trim_end_matches('\r');
@@ -430,27 +458,6 @@ impl SseParser {
         events
     }
 
-    fn next_line(&self) -> Option<(String, usize)> {
-        let bytes = self.buffer.as_bytes();
-        for i in 0..bytes.len() {
-            match bytes[i] {
-                b'\n' => {
-                    return Some((self.buffer[..i].to_string(), i + 1));
-                }
-                b'\r' => {
-                    if i + 1 >= bytes.len() {
-                        // \r at end of buffer — might be \r\n split across chunks
-                        return None;
-                    }
-                    let consumed = if bytes[i + 1] == b'\n' { i + 2 } else { i + 1 };
-                    return Some((self.buffer[..i].to_string(), consumed));
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
     fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
         if line.is_empty() {
             // Blank line: dispatch event
@@ -460,37 +467,91 @@ impl SseParser {
         } else if line.starts_with(':') {
             // Comment, ignore
         } else if let Some(rest) = line.strip_prefix("event:") {
-            self.event_type = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+            let value = rest.strip_prefix(' ').unwrap_or(rest);
+            self.event_type.clear();
+            self.event_type.push_str(value);
         } else if let Some(rest) = line.strip_prefix("data:") {
             // SECURITY (F-LLM-3): cap accumulated data-line bytes per event.
             let stripped = rest.strip_prefix(' ').unwrap_or(rest);
-            let current_total: usize = self.data_lines.iter().map(String::len).sum();
-            if current_total.saturating_add(stripped.len()) > SSE_MAX_EVENT_DATA_BYTES {
+            // +1 for the `\n` separator inserted before every data line
+            // after the first; matches the legacy `data_lines.join("\n")`.
+            let separator = if self.data.is_empty() { 0 } else { 1 };
+            if self
+                .data
+                .len()
+                .saturating_add(separator)
+                .saturating_add(stripped.len())
+                > SSE_MAX_EVENT_DATA_BYTES
+            {
                 tracing::warn!(
-                    accumulated = current_total,
+                    accumulated = self.data.len(),
                     new_chunk = stripped.len(),
                     limit = SSE_MAX_EVENT_DATA_BYTES,
                     "SSE event data exceeded cap; stream will be truncated"
                 );
                 self.overflowed = true;
-                self.data_lines.clear();
+                self.data.clear();
                 return;
             }
-            self.data_lines.push(stripped.to_string());
+            if separator == 1 {
+                self.data.push('\n');
+            }
+            self.data.push_str(stripped);
         }
         // Ignore other fields (id, retry, etc.)
     }
 
     fn emit_event(&mut self) -> Option<SseEvent> {
-        if self.event_type.is_empty() && self.data_lines.is_empty() {
+        // P-LLM-14: skip the empty case without taking either field.
+        // Previously the join over `data_lines` ran every dispatch
+        // even when both fields were empty (comment lines, keep-alives).
+        if self.event_type.is_empty() && self.data.is_empty() {
             return None;
         }
 
         Some(SseEvent {
             event_type: std::mem::take(&mut self.event_type),
-            data: std::mem::take(&mut self.data_lines).join("\n"),
+            data: std::mem::take(&mut self.data),
         })
     }
+}
+
+/// Inclusive line-end + post-terminator consume position for the next
+/// line in `buffer[start..]`. Returns `None` when no terminator is seen
+/// (or a lone `\r` is the last byte — wait for the next chunk that may
+/// complete a `\r\n`).
+struct LineBoundary {
+    line_end: usize,
+    consume_end: usize,
+}
+
+fn next_line_boundary(buffer: &str, start: usize) -> Option<LineBoundary> {
+    let bytes = buffer.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                return Some(LineBoundary {
+                    line_end: i,
+                    consume_end: i + 1,
+                });
+            }
+            b'\r' => {
+                if i + 1 >= bytes.len() {
+                    // \r at end — might be \r\n split across chunks.
+                    return None;
+                }
+                let consume = if bytes[i + 1] == b'\n' { i + 2 } else { i + 1 };
+                return Some(LineBoundary {
+                    line_end: i,
+                    consume_end: consume,
+                });
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 pub(crate) struct SseEvent {
