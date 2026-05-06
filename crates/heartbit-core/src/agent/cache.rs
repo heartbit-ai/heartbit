@@ -68,13 +68,39 @@ impl ResponseCache {
     /// Compute a cache key from the request components.
     ///
     /// Uses FNV-1a hash of system prompt, serialized messages, and sorted tool names.
+    ///
+    /// **Backward-compatible** with single-tenant code: prefer
+    /// [`ResponseCache::compute_key_scoped`] when the runner is shared across
+    /// tenants/users (F-AGENT-3).
     pub fn compute_key(system_prompt: &str, messages: &[Message], tool_names: &[&str]) -> u64 {
+        Self::compute_key_scoped(system_prompt, messages, tool_names, None)
+    }
+
+    /// Compute a cache key including a tenant/user namespace.
+    ///
+    /// SECURITY (F-AGENT-3): when a single `AgentRunner` is shared across
+    /// tenants (typical daemon deployment), the cache key MUST disambiguate
+    /// otherwise-identical requests — otherwise tenant A's cached response
+    /// could be served to tenant B if their system_prompt + messages happened
+    /// to coincide. Pass `Some("{tenant_id}:{user_id}")` (or any unique
+    /// namespace string) to scope the cache.
+    pub fn compute_key_scoped(
+        system_prompt: &str,
+        messages: &[Message],
+        tool_names: &[&str],
+        namespace: Option<&str>,
+    ) -> u64 {
         let mut sorted_names: Vec<&str> = tool_names.to_vec();
         sorted_names.sort();
 
         let messages_json = serde_json::to_string(messages).expect("messages serialize infallibly");
 
         let mut data = Vec::new();
+        if let Some(ns) = namespace {
+            data.extend_from_slice(b"ns=");
+            data.extend_from_slice(ns.as_bytes());
+            data.push(0);
+        }
         data.extend_from_slice(system_prompt.as_bytes());
         data.push(0); // separator
         data.extend_from_slice(messages_json.as_bytes());
@@ -253,5 +279,35 @@ mod tests {
         }
 
         assert!(cache.len() <= 100);
+    }
+
+    /// SECURITY (F-AGENT-3): identical (system_prompt, messages, tools) under
+    /// different tenant namespaces MUST produce different cache keys. Without
+    /// this, a daemon shared across tenants could leak tenant A's cached
+    /// response to tenant B when their inputs coincide.
+    #[test]
+    fn compute_key_scoped_differs_per_tenant() {
+        let msgs = vec![Message::user("hello")];
+        let key_a = ResponseCache::compute_key_scoped("sys", &msgs, &["a"], Some("tenant-a:user1"));
+        let key_b = ResponseCache::compute_key_scoped("sys", &msgs, &["a"], Some("tenant-b:user1"));
+        let key_unscoped = ResponseCache::compute_key("sys", &msgs, &["a"]);
+        assert_ne!(
+            key_a, key_b,
+            "different tenants must produce different keys"
+        );
+        assert_ne!(
+            key_a, key_unscoped,
+            "scoped key must differ from unscoped key"
+        );
+    }
+
+    /// SECURITY (F-AGENT-3): same tenant + same input → same key (cache hit).
+    /// Confirms scoping does not break the deterministic-replay property.
+    #[test]
+    fn compute_key_scoped_stable_for_same_tenant() {
+        let msgs = vec![Message::user("hello")];
+        let key1 = ResponseCache::compute_key_scoped("sys", &msgs, &["a"], Some("tenant-a:user1"));
+        let key2 = ResponseCache::compute_key_scoped("sys", &msgs, &["a"], Some("tenant-a:user1"));
+        assert_eq!(key1, key2);
     }
 }

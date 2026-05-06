@@ -130,16 +130,27 @@ impl Tool for ImageGenerateTool {
 
             let status = response.status();
             if !status.is_success() {
-                let error_body = response.text().await.unwrap_or_default();
+                // SECURITY (F-NET-1): cap error body.
+                let error_body = crate::http::read_text_capped(response, 4 * 1024)
+                    .await
+                    .unwrap_or_default();
                 return Ok(ToolOutput::error(format!(
                     "OpenRouter API error (HTTP {}): {error_body}",
                     status.as_u16()
                 )));
             }
 
-            let data: serde_json::Value = response
-                .json()
+            // SECURITY (F-NET-1): cap successful body before parsing JSON.
+            // Image responses include base64 — generous 15 MiB cap.
+            let (bytes, was_truncated) = crate::http::read_body_capped(response, 15 * 1024 * 1024)
                 .await
+                .map_err(|e| Error::Agent(format!("Failed to read OpenRouter response: {e}")))?;
+            if was_truncated {
+                return Ok(ToolOutput::error(
+                    "OpenRouter image response exceeded 15 MiB cap",
+                ));
+            }
+            let data: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Agent(format!("Failed to parse OpenRouter response: {e}")))?;
 
             // Extract image data from response

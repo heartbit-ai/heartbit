@@ -174,12 +174,18 @@ impl LlmJudgeGuardrail {
                 verdict_to_action(parse_verdict(&text))
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "LLM judge call failed, allowing (fail-open)");
-                GuardAction::Allow
+                // SECURITY (F-AGENT-4): the judge is the strongest applicative
+                // defense — its silent fail-open is exploitable (force a judge
+                // error and slip past). Return `Warn` so the runner still
+                // emits a `GuardrailWarned` audit event, making the bypass
+                // visible to the SOC pipeline. The decision still allows
+                // execution (fail-open semantics) but is auditable.
+                tracing::warn!(error = %e, "LLM judge call failed, allowing (fail-open with audit)");
+                GuardAction::warn(format!("judge unavailable: {e}"))
             }
             Err(_elapsed) => {
-                tracing::warn!("LLM judge timed out, allowing (fail-open)");
-                GuardAction::Allow
+                tracing::warn!("LLM judge timed out, allowing (fail-open with audit)");
+                GuardAction::warn("judge timed out".to_string())
             }
         }
     }
@@ -585,8 +591,12 @@ mod tests {
     // Timeout and error tests (fail-open)
     // -----------------------------------------------------------------------
 
+    /// SECURITY (F-AGENT-4): on timeout, the judge returns `Warn` (not
+    /// `Allow`). Execution still proceeds (fail-open) but the runner emits a
+    /// `GuardrailWarned` audit event so a SOC pipeline can spot judges that
+    /// keep hitting their deadline.
     #[tokio::test]
-    async fn post_llm_timeout_returns_allow() {
+    async fn post_llm_timeout_returns_warn() {
         let guard = LlmJudgeGuardrail::builder(Arc::new(BoxedProvider::new(SlowJudgeProvider)))
             .criterion("No harmful content")
             .timeout(Duration::from_millis(50))
@@ -595,15 +605,24 @@ mod tests {
 
         let mut response = make_response("Some content to evaluate.");
         let action = guard.post_llm(&mut response).await.unwrap();
-        assert_eq!(action, GuardAction::Allow);
+        assert!(
+            matches!(&action, GuardAction::Warn { reason } if reason.contains("timed out")),
+            "expected Warn(timed out); got {action:?}"
+        );
     }
 
+    /// SECURITY (F-AGENT-4): on judge error, the guardrail returns `Warn`
+    /// (not `Allow`). Same rationale as timeout: keep fail-open behavior but
+    /// make it auditable.
     #[tokio::test]
-    async fn post_llm_judge_error_returns_allow() {
+    async fn post_llm_judge_error_returns_warn() {
         let guard = make_guard(ErrorJudgeProvider);
         let mut response = make_response("Some content to evaluate.");
         let action = guard.post_llm(&mut response).await.unwrap();
-        assert_eq!(action, GuardAction::Allow);
+        assert!(
+            matches!(&action, GuardAction::Warn { reason } if reason.contains("judge unavailable")),
+            "expected Warn(judge unavailable); got {action:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -647,8 +666,9 @@ mod tests {
         assert_eq!(action, GuardAction::Allow);
     }
 
+    /// SECURITY (F-AGENT-4): see `post_llm_timeout_returns_warn`.
     #[tokio::test]
-    async fn pre_tool_timeout_returns_allow() {
+    async fn pre_tool_timeout_returns_warn() {
         let guard = LlmJudgeGuardrail::builder(Arc::new(BoxedProvider::new(SlowJudgeProvider)))
             .criterion("No harmful content")
             .evaluate_tool_inputs(true)
@@ -658,7 +678,10 @@ mod tests {
 
         let call = make_tool_call("bash");
         let action = guard.pre_tool(&call).await.unwrap();
-        assert_eq!(action, GuardAction::Allow);
+        assert!(
+            matches!(&action, GuardAction::Warn { reason } if reason.contains("timed out")),
+            "expected Warn(timed out); got {action:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

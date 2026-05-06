@@ -179,7 +179,10 @@ impl Tool for TtsTool {
 
             let status = response.status();
             if !status.is_success() {
-                let error_body = response.text().await.unwrap_or_default();
+                // SECURITY (F-NET-1): cap error body to 4 KiB.
+                let error_body = crate::http::read_text_capped(response, 4 * 1024)
+                    .await
+                    .unwrap_or_default();
                 let truncated = if error_body.len() > 500 {
                     let end = super::floor_char_boundary(&error_body, 500);
                     format!("{}...", &error_body[..end])
@@ -192,10 +195,18 @@ impl Tool for TtsTool {
                 )));
             }
 
-            let audio_bytes = response
-                .bytes()
-                .await
-                .map_err(|e| Error::Agent(format!("Failed to read TTS response: {e}")))?;
+            // SECURITY (F-NET-1): TTS audio can legitimately be up to a few MB
+            // (especially for long-form text). Use a generous cap (10 MiB) to
+            // accommodate that while protecting against a hostile vendor.
+            let (audio_bytes, was_truncated) =
+                crate::http::read_body_capped(response, 10 * 1024 * 1024)
+                    .await
+                    .map_err(|e| Error::Agent(format!("Failed to read TTS response: {e}")))?;
+            if was_truncated {
+                return Ok(ToolOutput::error(
+                    "TTS response exceeded 10 MiB cap; refusing to truncate audio",
+                ));
+            }
 
             use base64::Engine;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&audio_bytes);

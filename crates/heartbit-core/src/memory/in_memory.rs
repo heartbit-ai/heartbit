@@ -16,6 +16,14 @@ use super::hybrid;
 use super::scoring::{STRENGTH_DECAY_RATE, ScoringWeights, composite_score, effective_strength};
 use super::{Memory, MemoryEntry, MemoryQuery};
 
+/// Default cap on the number of entries an `InMemoryStore` will hold.
+///
+/// SECURITY (F-MEM-3): without a cap, a hostile or buggy agent that spams
+/// `memory_store` can balloon the process memory linearly. Once the cap is
+/// reached, `store()` evicts the entry with the lowest effective strength
+/// (i.e., the weakest, oldest memory) before inserting the new one.
+pub const IN_MEMORY_STORE_DEFAULT_CAP: usize = 100_000;
+
 /// Thread-safe in-memory store for agent memories.
 ///
 /// Backed by `RwLock<HashMap>`. Suitable for tests and single-process use.
@@ -23,6 +31,7 @@ use super::{Memory, MemoryEntry, MemoryQuery};
 pub struct InMemoryStore {
     entries: RwLock<HashMap<String, MemoryEntry>>,
     scoring_weights: ScoringWeights,
+    max_entries: usize,
 }
 
 impl InMemoryStore {
@@ -30,11 +39,18 @@ impl InMemoryStore {
         Self {
             entries: RwLock::new(HashMap::new()),
             scoring_weights: ScoringWeights::default(),
+            max_entries: IN_MEMORY_STORE_DEFAULT_CAP,
         }
     }
 
     pub fn with_scoring_weights(mut self, weights: ScoringWeights) -> Self {
         self.scoring_weights = weights;
+        self
+    }
+
+    /// Override the max-entries cap. Set to `usize::MAX` to disable.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
         self
     }
 }
@@ -59,6 +75,41 @@ impl Memory for InMemoryStore {
                 .entries
                 .write()
                 .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            // SECURITY (F-MEM-3): when at capacity, evict the entry with the
+            // lowest effective strength (most-decayed, oldest weak memory)
+            // before inserting the new one. Without this cap, a hostile or
+            // buggy agent could balloon process memory by spamming
+            // `memory_store`. Eviction happens BEFORE insertion to avoid a
+            // transient over-cap state.
+            if !entries.contains_key(&entry.id) && entries.len() >= self.max_entries {
+                let now = Utc::now();
+                if let Some(victim_id) = entries
+                    .values()
+                    .min_by(|a, b| {
+                        let ea = effective_strength(
+                            a.strength,
+                            a.last_accessed,
+                            now,
+                            STRENGTH_DECAY_RATE,
+                        );
+                        let eb = effective_strength(
+                            b.strength,
+                            b.last_accessed,
+                            now,
+                            STRENGTH_DECAY_RATE,
+                        );
+                        ea.partial_cmp(&eb).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|e| e.id.clone())
+                {
+                    entries.remove(&victim_id);
+                    tracing::warn!(
+                        evicted = %victim_id,
+                        cap = self.max_entries,
+                        "InMemoryStore at cap; evicted weakest entry (F-MEM-3)"
+                    );
+                }
+            }
             entries.insert(entry.id.clone(), entry);
             Ok(())
         })
@@ -538,11 +589,22 @@ impl Memory for InMemoryStore {
                     if e.author_tenant_id.as_deref().unwrap_or("") != tenant_id.as_str() {
                         return false;
                     }
-                    // If agent_prefix is set, only consider entries whose agent starts with it
-                    if let Some(ref prefix) = owned_prefix
-                        && !e.agent.starts_with(prefix.as_str())
-                    {
-                        return false;
+                    // SECURITY (F-MEM-1): match only on EXACT agent name or
+                    // proper `prefix:` separator. Plain `starts_with` lets
+                    // `user:alice` match `user:alice2` / `user:alice-staging`,
+                    // which would let a NamespacedMemory for one user prune
+                    // weak entries of a sibling user with an overlapping
+                    // prefix. The recall path uses exact `agent ==` matching;
+                    // align prune to the same semantics.
+                    if let Some(ref prefix) = owned_prefix {
+                        let p = prefix.as_str();
+                        let agent = e.agent.as_str();
+                        let separator_match = agent.len() > p.len()
+                            && agent.starts_with(p)
+                            && agent.as_bytes()[p.len()] == b':';
+                        if agent != p && !separator_match {
+                            return false;
+                        }
                     }
                     let eff =
                         effective_strength(e.strength, e.last_accessed, now, STRENGTH_DECAY_RATE);
@@ -1564,6 +1626,67 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "m2");
         assert_eq!(results[0].agent, "agent_b");
+    }
+
+    /// SECURITY (F-MEM-1): a NamespacedMemory whose name is a prefix of
+    /// another sibling's must NOT prune the sibling's entries. Before the fix,
+    /// `e.agent.starts_with("user:alice")` matched `user:alice2`, letting
+    /// alice's NamespacedMemory wipe weak entries belonging to alice2 (or
+    /// alice-staging, alice_admin, etc.).
+    #[tokio::test]
+    async fn prune_does_not_match_overlapping_agent_prefix() {
+        let store = InMemoryStore::new();
+
+        // alice — should be pruned
+        let mut weak_alice = make_entry("ma", "user:alice", "weak alice", "fact");
+        weak_alice.strength = 0.01;
+        weak_alice.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_alice.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(&test_scope(), weak_alice).await.unwrap();
+
+        // alice2 — overlapping prefix; must NOT be pruned by `user:alice` prune.
+        let mut weak_alice2 = make_entry("m2", "user:alice2", "weak alice2", "fact");
+        weak_alice2.strength = 0.01;
+        weak_alice2.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_alice2.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(&test_scope(), weak_alice2).await.unwrap();
+
+        // user:alice:tool — proper sub-namespace, MUST be pruned (separator match).
+        let mut weak_subagent = make_entry("ms", "user:alice:tool", "weak sub", "fact");
+        weak_subagent.strength = 0.01;
+        weak_subagent.created_at = Utc::now() - chrono::Duration::hours(48);
+        weak_subagent.last_accessed = Utc::now() - chrono::Duration::hours(48);
+        store.store(&test_scope(), weak_subagent).await.unwrap();
+
+        let pruned = store
+            .prune(
+                &test_scope(),
+                0.1,
+                chrono::Duration::hours(1),
+                Some("user:alice"),
+            )
+            .await
+            .unwrap();
+
+        // Must prune alice + alice's sub-tool (separator match), NOT alice2.
+        assert_eq!(pruned, 2, "must prune alice and user:alice:tool only");
+
+        let results = store
+            .recall(
+                &test_scope(),
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let agents: std::collections::HashSet<&str> =
+            results.iter().map(|e| e.agent.as_str()).collect();
+        assert!(
+            agents.contains("user:alice2"),
+            "alice2 must survive (overlapping prefix bypass): got {agents:?}"
+        );
     }
 
     #[tokio::test]

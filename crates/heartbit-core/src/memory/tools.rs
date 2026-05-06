@@ -125,8 +125,8 @@ impl Tool for MemoryStoreTool {
                     },
                     "confidentiality": {
                         "type": "string",
-                        "enum": ["public", "internal", "confidential", "restricted"],
-                        "description": "Access level. 'public' = shareable, 'internal' = verified+ only, 'confidential' = owner only, 'restricted' = never in LLM context. Default: public."
+                        "enum": ["public", "internal", "confidential"],
+                        "description": "Access level. 'public' = shareable, 'internal' = verified+ only, 'confidential' = owner only. Default: public. ('restricted' is reserved for sensor-pipeline ingestion of secrets and is rejected here — security: F-MEM-2/F-MEM-6.)"
                     }
                 },
                 "required": ["content"]
@@ -142,6 +142,19 @@ impl Tool for MemoryStoreTool {
             let input: StoreInput =
                 serde_json::from_value(input).map_err(|e| Error::Memory(e.to_string()))?;
 
+            // SECURITY (F-MEM-2/F-MEM-6): cap LLM-driven confidentiality at
+            // `Confidential`. The `Restricted` level is reserved for the
+            // sensor pipeline (where secrets ingest from email/incidents go)
+            // and means "never in LLM context". An LLM that can call
+            // `memory_store` with `restricted` could "launder" a secret then
+            // exfiltrate via shared_memory_read. Cap defensively here even
+            // though the JSON schema also drops the enum value — schema is
+            // advisory, this cap is the real boundary.
+            let confidentiality = if input.confidentiality > super::Confidentiality::Confidential {
+                super::Confidentiality::Confidential
+            } else {
+                input.confidentiality
+            };
             let id = Uuid::new_v4().to_string();
             let now = Utc::now();
             let entry = MemoryEntry {
@@ -161,7 +174,7 @@ impl Tool for MemoryStoreTool {
                 related_ids: vec![],
                 source_ids: vec![],
                 embedding: None,
-                confidentiality: input.confidentiality,
+                confidentiality,
                 author_user_id: None,
                 author_tenant_id: None,
             };
@@ -1528,8 +1541,13 @@ mod tests {
         assert_eq!(entries[0].confidentiality, Confidentiality::Confidential);
     }
 
+    /// SECURITY (F-MEM-2/F-MEM-6): when an LLM passes `confidentiality:
+    /// "restricted"`, the tool MUST cap to `Confidential`. `Restricted` is
+    /// reserved for sensor-pipeline ingestion of secrets and means "never in
+    /// LLM context"; allowing the LLM to set it would let a jailbroken agent
+    /// "launder" a secret then exfiltrate via shared_memory_read.
     #[tokio::test]
-    async fn store_tool_restricted_confidentiality() {
+    async fn store_tool_caps_restricted_to_confidential() {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
@@ -1540,7 +1558,6 @@ mod tests {
         .await
         .unwrap();
 
-        // With no cap, should be found
         let entries = store
             .recall(
                 &test_scope(),
@@ -1551,23 +1568,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(entries[0].confidentiality, Confidentiality::Restricted);
-
-        // With Public cap, should be filtered out
-        let entries = store
-            .recall(
-                &test_scope(),
-                MemoryQuery {
-                    limit: 10,
-                    max_confidentiality: Some(Confidentiality::Public),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            entries.is_empty(),
-            "restricted entry should be filtered by Public cap"
+        assert_eq!(
+            entries[0].confidentiality,
+            Confidentiality::Confidential,
+            "LLM-passed Restricted MUST be capped to Confidential"
         );
     }
 

@@ -15,21 +15,36 @@ use super::blackboard::Blackboard;
 ///
 /// Returns 3 tools:
 /// - `blackboard_read` — read a key
-/// - `blackboard_write` — write a key-value pair
+/// - `blackboard_write` — write a key-value pair (caller-namespaced; `agent:` prefix is reserved)
 /// - `blackboard_list` — list all keys
 ///
-/// Note: `Blackboard::clear()` is intentionally not exposed as a tool to prevent
-/// sub-agents from wiping shared coordination data.
-pub fn blackboard_tools(blackboard: Arc<dyn Blackboard>) -> Vec<Arc<dyn Tool>> {
+/// SECURITY (F-AGENT-7): the write tool is caller-namespaced. A sub-agent
+/// named `worker` that writes key `notes` actually writes to
+/// `caller:worker/notes`. The `agent:` prefix is reserved for the
+/// orchestrator's automatic per-agent result writes; sub-agents cannot
+/// shadow each other's results by writing `agent:other_worker`. The read
+/// tool stays unnamespaced so sub-agents can read peers' published results.
+pub fn blackboard_tools(blackboard: Arc<dyn Blackboard>, caller: &str) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BlackboardReadTool {
             blackboard: blackboard.clone(),
         }),
         Arc::new(BlackboardWriteTool {
             blackboard: blackboard.clone(),
+            caller: caller.to_string(),
         }),
         Arc::new(BlackboardListTool { blackboard }),
     ]
+}
+
+/// Reserved key prefix for orchestrator-managed per-agent result entries.
+/// Sub-agents cannot write keys starting with this prefix via the
+/// `blackboard_write` tool (F-AGENT-7).
+const RESERVED_AGENT_PREFIX: &str = "agent:";
+
+/// Compose a caller-scoped namespace from the caller agent name.
+fn caller_namespace(caller: &str) -> String {
+    format!("caller:{caller}/")
 }
 
 // --- blackboard_read ---
@@ -91,6 +106,7 @@ impl Tool for BlackboardReadTool {
 
 struct BlackboardWriteTool {
     blackboard: Arc<dyn Blackboard>,
+    caller: String,
 }
 
 #[derive(Deserialize)]
@@ -104,14 +120,15 @@ impl Tool for BlackboardWriteTool {
         ToolDefinition {
             name: "blackboard_write".into(),
             description: "Write a key-value pair to the shared blackboard. Use this to store \
-                          intermediate results or data for other agents to consume."
+                          intermediate results or data for other agents to consume. \
+                          Note: keys starting with 'agent:' are reserved for the orchestrator."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "key": {
                         "type": "string",
-                        "description": "The key to write"
+                        "description": "The key to write (will be namespaced under your agent name)"
                     },
                     "value": {
                         "description": "The JSON value to store"
@@ -130,10 +147,24 @@ impl Tool for BlackboardWriteTool {
             let input: WriteInput =
                 serde_json::from_value(input).map_err(|e| Error::Agent(e.to_string()))?;
 
-            self.blackboard.write(&input.key, input.value).await?;
+            // SECURITY (F-AGENT-7): refuse writes to the reserved orchestrator
+            // prefix. Without this, a compromised sub-agent could write
+            // `agent:other_worker = {fake_result}` and shadow another peer's
+            // legitimate result that the orchestrator later reads back.
+            if input.key.starts_with(RESERVED_AGENT_PREFIX) {
+                return Ok(ToolOutput::error(format!(
+                    "key prefix '{RESERVED_AGENT_PREFIX}' is reserved for the orchestrator; \
+                     pick a different key (it will be namespaced under your agent name)"
+                )));
+            }
+
+            // Caller-namespacing: keep the user-visible key intact for
+            // discovery via blackboard_list, but prepend the caller scope so
+            // two agents writing the same logical key don't collide.
+            let key = format!("{}{}", caller_namespace(&self.caller), input.key);
+            self.blackboard.write(&key, input.value).await?;
             Ok(ToolOutput::success(format!(
-                "Written to blackboard key '{}'.",
-                input.key
+                "Written to blackboard key '{key}'."
             )))
         })
     }
@@ -188,7 +219,7 @@ mod tests {
 
     fn setup() -> (Arc<dyn Blackboard>, Vec<Arc<dyn Tool>>) {
         let bb: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
-        let tools = blackboard_tools(bb.clone());
+        let tools = blackboard_tools(bb.clone(), "test_agent");
         (bb, tools)
     }
 
@@ -244,9 +275,36 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("my-key"));
 
-        // Verify via blackboard directly
-        let val = bb.read("my-key").await.unwrap();
-        assert_eq!(val, Some(json!({"result": 42})));
+        // SECURITY (F-AGENT-7): the write must be caller-namespaced.
+        // The plain key "my-key" should NOT be a top-level entry; the actual
+        // entry is under "caller:test_agent/my-key".
+        let plain = bb.read("my-key").await.unwrap();
+        assert!(plain.is_none(), "plain key must not be the storage key");
+        let scoped = bb.read("caller:test_agent/my-key").await.unwrap();
+        assert_eq!(scoped, Some(json!({"result": 42})));
+    }
+
+    /// SECURITY (F-AGENT-7): a sub-agent must NOT be able to write keys with
+    /// the reserved `agent:` prefix — that would let it shadow another peer's
+    /// orchestrator-managed result entry.
+    #[tokio::test]
+    async fn write_tool_refuses_reserved_agent_prefix() {
+        let (bb, tools) = setup();
+        let write = find_tool(&tools, "blackboard_write");
+
+        let result = write
+            .execute(json!({"key": "agent:other_worker", "value": "fake_result"}))
+            .await
+            .unwrap();
+        assert!(result.is_error, "agent: prefix must be rejected");
+        assert!(
+            result.content.contains("reserved"),
+            "error should mention reservation: {}",
+            result.content
+        );
+        // Storage must remain empty for that key.
+        let val = bb.read("agent:other_worker").await.unwrap();
+        assert!(val.is_none(), "blackboard must not have been written");
     }
 
     #[tokio::test]

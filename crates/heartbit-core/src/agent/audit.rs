@@ -23,30 +23,109 @@ pub enum AuditMode {
     MetadataOnly,
 }
 
+/// Allow-list of audit payload keys that are guaranteed to contain only
+/// metadata (no user content). Anything outside this list is stripped in
+/// `MetadataOnly` mode.
+///
+/// SECURITY (F-AUTH-3): the previous implementation used a deny-list
+/// (`text|input|output|data|command|content|result`) which silently leaked
+/// `result_preview`, `error`, `reason`, and any nested user content (deny
+/// list was not recursive). For privacy-by-default the boundary needs to be
+/// "deny everything except known metadata", recursively.
+const METADATA_ALLOWLIST: &[&str] = &[
+    "tool_name",
+    "tool_call_id",
+    "tool_call_count",
+    "duration_ms",
+    "latency_ms",
+    "is_error",
+    "turn",
+    "hook",
+    "event_type",
+    "stop_reason",
+    "model",
+    "total_tool_calls",
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "reasoning_tokens",
+    "agent",
+    "tenant_id",
+    "user_id",
+    "verdict",
+    "guardrail_name",
+    "consecutive_count",
+    "tool_names",
+    "from_tier",
+    "to_tier",
+    "decision",
+    "priority",
+    "spawned_name",
+    "complexity_score",
+    "escalated",
+    "tool_results_pruned",
+    "tool_results_total",
+    "bytes_saved",
+    "success",
+    // `reason` is the policy-rule descriptor on guardrail denials and
+    // doom-loop signals — content is the rule pattern / event type, not
+    // user data. Documented as a metadata field by upstream call sites.
+    "reason",
+];
+
 /// Strip user-content fields from an audit record payload, keeping only metadata.
 ///
-/// Keeps: `tool_name`, `duration_ms`, `is_error`, `turn`, `hook`, `reason`, `event_type`,
-/// `stop_reason`, `tool_call_count`, token usage fields.
-/// Strips: `text`, `input`, `output`, `data`, `command`, `content`, `result`.
+/// Recursive walk: keeps only keys in [`METADATA_ALLOWLIST`]; replaces every
+/// other field's value with the string `"[stripped]"` so the audit log
+/// records *which* fields existed without their content. Numbers and bools
+/// are preserved (they cannot leak content). Arrays/objects are recursed.
 pub fn strip_content(payload: &serde_json::Value) -> serde_json::Value {
-    match payload {
+    strip_value(payload)
+}
+
+fn strip_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
         serde_json::Value::Object(map) => {
             let mut stripped = serde_json::Map::new();
-            for (key, value) in map {
-                match key.as_str() {
-                    "text" | "input" | "output" | "data" | "command" | "content" | "result" => {
-                        // Replace with a marker instead of omitting, so we know it existed
-                        stripped
-                            .insert(key.clone(), serde_json::Value::String("[stripped]".into()));
-                    }
-                    _ => {
-                        stripped.insert(key.clone(), value.clone());
-                    }
+            for (key, val) in map {
+                if METADATA_ALLOWLIST.contains(&key.as_str()) {
+                    // Even allow-listed keys: recurse so nested user content
+                    // inside `tool_names: [...]` is still cleaned (it's a
+                    // string array, scalars survive — see strip_scalar).
+                    stripped.insert(key.clone(), strip_scalar_or_recurse(val));
+                } else {
+                    // Replace non-metadata content with a marker. Preserve
+                    // the structural type so downstream tooling sees a
+                    // similarly-shaped object.
+                    stripped.insert(key.clone(), redact_marker(val));
                 }
             }
             serde_json::Value::Object(stripped)
         }
+        // Top-level non-object scalars/arrays pass through. AuditRecord.payload
+        // is always built as a JSON object in production — the non-object case
+        // exists only for tests / legacy callers.
         other => other.clone(),
+    }
+}
+
+fn strip_scalar_or_recurse(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => strip_value(value),
+        // Scalars under allow-listed keys are safe (numbers, bools, string
+        // metadata like tool names).
+        other => other.clone(),
+    }
+}
+
+fn redact_marker(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        // Numbers and bools cannot leak user content; keep them.
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            value.clone()
+        }
+        _ => serde_json::Value::String("[stripped]".into()),
     }
 }
 
@@ -662,6 +741,61 @@ mod tests {
         let deserialized: AuditMode =
             serde_json::from_str(&json_meta).expect("deserialize metadata_only");
         assert_eq!(deserialized, AuditMode::MetadataOnly);
+    }
+
+    /// SECURITY (F-AUTH-3): the previous deny-list missed `result_preview`,
+    /// `error`, and any nested user-content fields. The new allow-list
+    /// approach must redact these even though they were not in the old list.
+    #[test]
+    fn strip_content_redacts_result_preview_and_error() {
+        // run_completed payload — result_preview is the first 1000 chars of
+        // the LLM's reply, which is user-facing content.
+        let payload = json!({
+            "total_tool_calls": 2,
+            "result_preview": "user secret content here"
+        });
+        let stripped = strip_content(&payload);
+        let obj = stripped.as_object().unwrap();
+        assert_eq!(obj["total_tool_calls"], 2);
+        assert_eq!(
+            obj["result_preview"], "[stripped]",
+            "result_preview MUST be stripped (F-AUTH-3)"
+        );
+
+        // run_failed payload — error message can echo user input.
+        let payload = json!({
+            "error": "tool foo failed: <user data was here>"
+        });
+        let stripped = strip_content(&payload);
+        let obj = stripped.as_object().unwrap();
+        assert_eq!(
+            obj["error"], "[stripped]",
+            "error MUST be stripped (F-AUTH-3)"
+        );
+    }
+
+    /// SECURITY (F-AUTH-3): nested user content inside arbitrary parent keys
+    /// (e.g. `meta.command`) was previously preserved because the deny-list
+    /// only scanned top-level keys. The recursive walk redacts the parent
+    /// when its key is not in the allow-list.
+    #[test]
+    fn strip_content_recursive_no_leak_via_nested_object() {
+        let payload = json!({
+            "meta": {
+                "command": "rm -rf /",
+                "input": {"file": "secret.txt"}
+            }
+        });
+        let stripped = strip_content(&payload);
+        let s = serde_json::to_string(&stripped).unwrap();
+        assert!(
+            !s.contains("rm -rf"),
+            "nested command must be redacted (F-AUTH-3): {s}"
+        );
+        assert!(
+            !s.contains("secret.txt"),
+            "nested user content must be redacted: {s}"
+        );
     }
 
     #[test]

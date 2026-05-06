@@ -125,16 +125,23 @@ impl WebSearchTool {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
+            // SECURITY (F-NET-1): cap error body.
+            let error_body = crate::http::read_text_capped(response, 4 * 1024)
+                .await
+                .unwrap_or_default();
             return Err(Error::Agent(format!(
                 "Exa API error (HTTP {}): {error_body}",
                 status.as_u16()
             )));
         }
 
-        let data: serde_json::Value = response
-            .json()
-            .await
+        // SECURITY (F-NET-1): cap successful body. Search results can be a
+        // few hundred KB; 5 MiB is a comfortable upper bound.
+        let (bytes, _) =
+            crate::http::read_body_capped(response, crate::http::DEFAULT_VENDOR_BODY_CAP)
+                .await
+                .map_err(|e| Error::Agent(format!("Failed to read Exa response: {e}")))?;
+        let data: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Agent(format!("Failed to parse Exa response: {e}")))?;
 
         let results = data
@@ -192,16 +199,20 @@ impl WebSearchTool {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
+            let error_body = crate::http::read_text_capped(response, 4 * 1024)
+                .await
+                .unwrap_or_default();
             return Err(Error::Agent(format!(
                 "Tavily API error (HTTP {}): {error_body}",
                 status.as_u16()
             )));
         }
 
-        let data: serde_json::Value = response
-            .json()
-            .await
+        let (bytes, _) =
+            crate::http::read_body_capped(response, crate::http::DEFAULT_VENDOR_BODY_CAP)
+                .await
+                .map_err(|e| Error::Agent(format!("Failed to read Tavily response: {e}")))?;
+        let data: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Agent(format!("Failed to parse Tavily response: {e}")))?;
 
         Ok(parse_tavily_results(&data))
@@ -227,16 +238,20 @@ impl WebSearchTool {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
+            let error_body = crate::http::read_text_capped(response, 4 * 1024)
+                .await
+                .unwrap_or_default();
             return Err(Error::Agent(format!(
                 "Brave API error (HTTP {}): {error_body}",
                 status.as_u16()
             )));
         }
 
-        let data: serde_json::Value = response
-            .json()
-            .await
+        let (bytes, _) =
+            crate::http::read_body_capped(response, crate::http::DEFAULT_VENDOR_BODY_CAP)
+                .await
+                .map_err(|e| Error::Agent(format!("Failed to read Brave response: {e}")))?;
+        let data: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Agent(format!("Failed to parse Brave response: {e}")))?;
 
         Ok(parse_brave_results(&data))
@@ -267,8 +282,9 @@ impl WebSearchTool {
             )));
         }
 
-        let html = response
-            .text()
+        // SECURITY (F-NET-1): cap DuckDuckGo HTML response. Search HTML is
+        // typically <500 KiB; 5 MiB is a generous cap.
+        let html = crate::http::read_text_capped(response, crate::http::DEFAULT_VENDOR_BODY_CAP)
             .await
             .map_err(|e| Error::Agent(format!("Failed to read DuckDuckGo response: {e}")))?;
 

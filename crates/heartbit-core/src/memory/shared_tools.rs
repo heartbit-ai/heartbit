@@ -106,6 +106,12 @@ impl Tool for SharedMemoryReadTool {
             let input: SharedReadInput =
                 serde_json::from_value(input).map_err(|e| Error::Memory(e.to_string()))?;
 
+            // SECURITY (F-MEM-2): cap recalled confidentiality at `Internal`.
+            // `Confidentiality::Restricted` is documented as "never in LLM
+            // context" — this tool short-circuits NamespacedMemory's per-agent
+            // cap and would leak Restricted entries cross-agent if any code
+            // path stored them. Cap defensively here so even a malformed
+            // store does not become a leak.
             let results = self
                 .memory
                 .recall(
@@ -116,6 +122,7 @@ impl Tool for SharedMemoryReadTool {
                         tags: input.tags,
                         agent: input.agent, // None = all agents within this tenant
                         limit: input.limit,
+                        max_confidentiality: Some(crate::memory::Confidentiality::Internal),
                         ..Default::default()
                     },
                 )
@@ -238,14 +245,14 @@ impl Tool for SharedMemoryWriteTool {
                 last_accessed: now,
                 access_count: 0,
                 importance: input.importance.clamp(1, 10),
-                memory_type: super::MemoryType::default(),
+                memory_type: crate::memory::MemoryType::default(),
                 keywords: input.keywords,
                 summary: input.summary,
                 strength: 1.0,
                 related_ids: vec![],
                 source_ids: vec![],
                 embedding: None,
-                confidentiality: super::Confidentiality::default(),
+                confidentiality: crate::memory::Confidentiality::default(),
                 author_user_id: None,
                 author_tenant_id: None,
             };
@@ -399,6 +406,55 @@ mod tests {
         assert_eq!(
             entries[0].summary.as_deref(),
             Some("Key Rust language feature")
+        );
+    }
+
+    /// SECURITY (F-MEM-2): `shared_memory_read` MUST cap recall confidentiality
+    /// at `Internal`. Even if a `Restricted` (or `Confidential`) entry was
+    /// somehow stored cross-namespace, the LLM-facing tool must not surface it.
+    #[tokio::test]
+    async fn shared_memory_read_filters_confidential_and_restricted() {
+        use chrono::Utc;
+        let store: Arc<dyn Memory> = Arc::new(InMemoryStore::new());
+
+        // Stash a Confidential entry directly via the store API (bypassing
+        // the tool's own cap, since the read-cap is the boundary we test).
+        let mut entry = MemoryEntry {
+            id: Uuid::new_v4().to_string(),
+            agent: "sensor".into(),
+            content: "secret-token=abc".into(),
+            category: "secret".into(),
+            tags: vec![],
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            importance: 5,
+            memory_type: crate::memory::MemoryType::default(),
+            keywords: vec![],
+            summary: None,
+            strength: 1.0,
+            related_ids: vec![],
+            source_ids: vec![],
+            embedding: None,
+            confidentiality: crate::memory::Confidentiality::Confidential,
+            author_user_id: None,
+            author_tenant_id: None,
+        };
+        store.store(&test_scope(), entry.clone()).await.unwrap();
+
+        // Also stash a Restricted entry for completeness.
+        entry.id = Uuid::new_v4().to_string();
+        entry.confidentiality = crate::memory::Confidentiality::Restricted;
+        store.store(&test_scope(), entry).await.unwrap();
+
+        let tools = shared_memory_tools(store.clone(), "agent_a", test_scope(), false);
+        let read_tool = find_tool(&tools, "shared_memory_read");
+
+        let result = read_tool.execute(json!({})).await.unwrap();
+        assert!(
+            !result.content.contains("secret-token"),
+            "shared_memory_read must filter Confidential+Restricted; got: {}",
+            result.content
         );
     }
 }

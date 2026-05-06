@@ -225,9 +225,12 @@ impl Tool for TwitterPostTool {
                 .map_err(|e| Error::Agent(format!("X API request failed: {e}")))?;
 
             let status = response.status();
-            let response_body: serde_json::Value = response
-                .json()
+            // SECURITY (F-NET-1): cap response body. Tweet responses are tiny
+            // (well under 1 MiB) — 256 KiB is generous and bounds memory.
+            let (body_bytes, _truncated) = crate::http::read_body_capped(response, 256 * 1024)
                 .await
+                .map_err(|e| Error::Agent(format!("Failed to read X API response: {e}")))?;
+            let response_body: serde_json::Value = serde_json::from_slice(&body_bytes)
                 .map_err(|e| Error::Agent(format!("Failed to parse X API response: {e}")))?;
 
             if !status.is_success() {

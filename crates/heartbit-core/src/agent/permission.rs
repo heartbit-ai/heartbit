@@ -43,8 +43,12 @@ fn default_pattern() -> String {
 impl PermissionRule {
     /// Check if this rule matches the given tool call.
     fn matches(&self, tool_name: &str, input: &serde_json::Value) -> bool {
-        // Tool name: "*" matches all, otherwise exact match.
-        if self.tool != "*" && self.tool != tool_name {
+        // SECURITY (F-AUTH-4): tool-name match is case-insensitive (ASCII).
+        // Tool names are ASCII identifiers in practice, so `eq_ignore_ascii_case`
+        // closes a Windows/macOS bypass where a `Read_File` rule wouldn't
+        // catch `read_file` (or vice versa) and vice versa for any case
+        // permutation a hostile MCP server might emit.
+        if self.tool != "*" && !self.tool.eq_ignore_ascii_case(tool_name) {
             return false;
         }
 
@@ -53,15 +57,46 @@ impl PermissionRule {
             return true;
         }
 
-        // Match pattern against all string values in the input object.
-        match input {
-            serde_json::Value::Object(map) => map.values().any(|v| match v {
-                serde_json::Value::String(s) => glob_match(&self.pattern, s),
-                _ => false,
-            }),
-            // Non-object input: only match if pattern is "*" (handled above).
-            _ => false,
-        }
+        // SECURITY (F-AUTH-1): walk the input recursively and match the
+        // pattern against EVERY string we find — top-level fields, nested
+        // objects, AND arrays. The previous implementation only inspected
+        // first-level Object values, so a deny rule for `*.env*` did not
+        // fire on inputs like `{"paths": [".env"]}` (array) or
+        // `{"options": {"file": ".env"}}` (nested), letting MCP / custom
+        // tools with non-flat schemas bypass the policy.
+        //
+        // SECURITY (F-AUTH-4): glob match is case-insensitive on FS-case-
+        // insensitive platforms (macOS, Windows). On Linux it stays case-
+        // sensitive — Linux filesystems treat `secret.env` and `SECRET.ENV`
+        // as distinct files.
+        any_string_matches(input, &|s| {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                glob_match_ci(&self.pattern, s)
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                glob_match(&self.pattern, s)
+            }
+        })
+    }
+}
+
+/// Case-insensitive glob match (lowercases both sides — ASCII only).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    glob_match(&pattern.to_ascii_lowercase(), &text.to_ascii_lowercase())
+}
+
+/// Walk a JSON value and return `true` if any string contained in it
+/// satisfies the predicate. Recurses into objects and arrays. Non-string
+/// scalars (numbers, bools, null) never match.
+fn any_string_matches(value: &serde_json::Value, pred: &dyn Fn(&str) -> bool) -> bool {
+    match value {
+        serde_json::Value::String(s) => pred(s),
+        serde_json::Value::Array(items) => items.iter().any(|v| any_string_matches(v, pred)),
+        serde_json::Value::Object(map) => map.values().any(|v| any_string_matches(v, pred)),
+        _ => false,
     }
 }
 
@@ -164,6 +199,13 @@ impl LearnedPermissions {
     }
 
     /// Save learned permissions to disk. Creates parent directories as needed.
+    ///
+    /// SECURITY (F-AUTH-2): the file contains privileged information — the
+    /// list of tools/inputs the user has approved without re-asking. A
+    /// world-readable file lets a co-tenant on a shared host enumerate the
+    /// agent's capabilities, and a world-writable file lets them inject
+    /// `allow *` rules to bypass HITL. On Unix we create the file `0o600`
+    /// and the parent dir `0o700`.
     pub fn save(&self) -> Result<(), Error> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -172,14 +214,48 @@ impl LearnedPermissions {
                     parent.display()
                 ))
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(parent) {
+                    let mut perms = metadata.permissions();
+                    // 0o700 — owner rwx only.
+                    if perms.mode() & 0o077 != 0 {
+                        perms.set_mode(0o700);
+                        let _ = std::fs::set_permissions(parent, perms);
+                    }
+                }
+            }
         }
         let file = LearnedPermissionsFile {
             rules: self.rules.clone(),
         };
         let content = toml::to_string_pretty(&file)
             .map_err(|e| Error::Config(format!("failed to serialize permissions: {e}")))?;
-        std::fs::write(&self.path, content)
-            .map_err(|e| Error::Config(format!("failed to write {}: {e}", self.path.display())))?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)
+                .map_err(|e| {
+                    Error::Config(format!("failed to open {}: {e}", self.path.display()))
+                })?;
+            file.write_all(content.as_bytes()).map_err(|e| {
+                Error::Config(format!("failed to write {}: {e}", self.path.display()))
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, content).map_err(|e| {
+                Error::Config(format!("failed to write {}: {e}", self.path.display()))
+            })?;
+        }
         Ok(())
     }
 
@@ -387,13 +463,24 @@ mod tests {
 
     #[test]
     fn rule_non_object_input() {
+        // SECURITY (F-AUTH-1): the old behavior was that a top-level string
+        // input (rather than an object) bypassed all string-pattern matching,
+        // because the matcher only inspected `Value::Object` values. With the
+        // recursive walk, a raw string input is matched against the pattern
+        // — closing a bypass where a tool accepting a single-string input
+        // (rare but valid JSON-schema) escaped policy enforcement.
         let rule = PermissionRule {
             tool: "test".into(),
             pattern: "*.rs".into(),
             action: PermissionAction::Allow,
         };
-        // Non-object input: only "*" pattern matches (handled before this)
-        assert!(!rule.matches("test", &json!("hello.rs")));
+        assert!(
+            rule.matches("test", &json!("hello.rs")),
+            "raw string input must be matched against the pattern (F-AUTH-1)"
+        );
+        // Non-string scalar still doesn't match.
+        assert!(!rule.matches("test", &json!(42)));
+        assert!(!rule.matches("test", &json!(null)));
     }
 
     // --- PermissionRuleset evaluation ---
@@ -635,6 +722,31 @@ mod tests {
         assert_eq!(reloaded.rules()[0].action, PermissionAction::Allow);
     }
 
+    /// SECURITY (F-AUTH-2): on Unix, the saved permissions.toml MUST be
+    /// owner-only readable (0o600). A co-tenant or local attacker should
+    /// not be able to read or tamper with the agent's learned rules.
+    #[cfg(unix)]
+    #[test]
+    fn save_uses_mode_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perms.toml");
+        let mut learned = LearnedPermissions::load(&path).unwrap();
+        learned
+            .add_rule(PermissionRule {
+                tool: "bash".into(),
+                pattern: "ls".into(),
+                action: PermissionAction::Allow,
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "permissions.toml must be 0o600, got 0o{mode:o}"
+        );
+    }
+
     #[test]
     fn learned_add_rule_deduplicates() {
         let dir = tempfile::tempdir().unwrap();
@@ -777,6 +889,59 @@ action = "deny"
         assert_eq!(
             ruleset.evaluate("bash", &json!({"cmd": "ls"})),
             Some(PermissionAction::Allow)
+        );
+    }
+
+    /// SECURITY (F-AUTH-1): a deny rule for a string pattern must fire when
+    /// the offending string appears inside a nested array or sub-object,
+    /// not just at the top level of the input. Before the fix, only flat
+    /// string fields were inspected, so MCP / custom tools with non-flat
+    /// schemas could bypass deny rules.
+    #[test]
+    fn deny_rule_matches_strings_inside_array() {
+        let ruleset = PermissionRuleset::new(vec![PermissionRule {
+            tool: "*".into(),
+            pattern: "*.env*".into(),
+            action: PermissionAction::Deny,
+        }]);
+
+        // Array of paths (typical MCP "read multiple files" tool shape)
+        assert_eq!(
+            ruleset.evaluate("read_files", &json!({"paths": [".env", "ok.txt"]})),
+            Some(PermissionAction::Deny),
+            "deny rule should match strings inside an array"
+        );
+    }
+
+    #[test]
+    fn deny_rule_matches_strings_inside_nested_object() {
+        let ruleset = PermissionRuleset::new(vec![PermissionRule {
+            tool: "*".into(),
+            pattern: "*.env*".into(),
+            action: PermissionAction::Deny,
+        }]);
+
+        // Nested object (config-style tool input)
+        assert_eq!(
+            ruleset.evaluate("config_tool", &json!({"options": {"file": ".env"}})),
+            Some(PermissionAction::Deny),
+            "deny rule should match strings inside a nested object"
+        );
+    }
+
+    #[test]
+    fn deny_rule_does_not_falsepositive_on_unrelated_strings() {
+        let ruleset = PermissionRuleset::new(vec![PermissionRule {
+            tool: "*".into(),
+            pattern: "*.env*".into(),
+            action: PermissionAction::Deny,
+        }]);
+
+        // No `.env` substring anywhere — must not match.
+        assert_eq!(
+            ruleset.evaluate("read_files", &json!({"paths": ["ok.txt", "ok2.txt"]})),
+            None,
+            "deny rule must not match when no string contains the pattern"
         );
     }
 }
