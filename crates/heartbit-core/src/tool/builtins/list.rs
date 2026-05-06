@@ -125,13 +125,20 @@ impl Tool for ListTool {
                 return Ok(ToolOutput::error(format!("{path} is not a directory")));
             }
 
-            // Compile ignore patterns
-            let mut ignore_patterns: Vec<glob::Pattern> = Vec::new();
-            for pat in DEFAULT_IGNORES
-                .iter()
-                .copied()
-                .chain(user_ignores.iter().map(|s| s.as_str()))
-            {
+            // Compile ignore patterns. The default set is shared
+            // across every list invocation via `LazyLock` (P-TOOL-3,
+            // T1) so the per-call cost is just user-supplied patterns.
+            static DEFAULT_IGNORE_PATTERNS: std::sync::LazyLock<Vec<glob::Pattern>> =
+                std::sync::LazyLock::new(|| {
+                    DEFAULT_IGNORES
+                        .iter()
+                        .filter_map(|p| glob::Pattern::new(p).ok())
+                        .collect()
+                });
+            let mut ignore_patterns: Vec<glob::Pattern> =
+                Vec::with_capacity(DEFAULT_IGNORE_PATTERNS.len() + user_ignores.len());
+            ignore_patterns.extend(DEFAULT_IGNORE_PATTERNS.iter().cloned());
+            for pat in user_ignores.iter() {
                 if let Ok(p) = glob::Pattern::new(pat) {
                     ignore_patterns.push(p);
                 }

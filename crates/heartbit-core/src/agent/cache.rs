@@ -1,18 +1,22 @@
 //! LLM response caching for deterministic replay and cost reduction.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::llm::types::{CompletionResponse, Message};
 use crate::util::fnv1a_hash;
 
 /// LRU cache for LLM completion responses.
 ///
-/// Thread-safe via `std::sync::Mutex` (never held across `.await`).
+/// Thread-safe via `parking_lot::Mutex` (never held across `.await`).
 /// Entries are keyed by FNV-1a hash of (system_prompt, messages, sorted tool names).
 ///
 /// Uses a `Vec` with move-to-front on hit and eviction from back, giving O(n)
 /// operations per access. This is efficient for typical capacities (10–100).
 /// For very large caches (1000+), consider an alternative implementation.
+///
+/// `parking_lot::Mutex` is adopted on this hot path (every cached LLM call) for
+/// ~2× faster acquisition vs. `std::sync::Mutex`; see T2 in
+/// `tasks/performance-audit-heartbit-core-2026-05-06.md`.
 pub struct ResponseCache {
     entries: Mutex<Vec<(u64, CompletionResponse)>>,
     capacity: usize,
@@ -20,10 +24,9 @@ pub struct ResponseCache {
 
 impl std::fmt::Debug for ResponseCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.entries.lock().map(|e| e.len()).unwrap_or(0);
         f.debug_struct("ResponseCache")
             .field("capacity", &self.capacity)
-            .field("len", &len)
+            .field("len", &self.entries.lock().len())
             .finish()
     }
 }
@@ -39,7 +42,7 @@ impl ResponseCache {
 
     /// Look up a cached response by key. On hit, moves the entry to the front (LRU).
     pub fn get(&self, key: u64) -> Option<CompletionResponse> {
-        let mut entries = self.entries.lock().expect("cache lock poisoned");
+        let mut entries = self.entries.lock();
         if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
             let entry = entries.remove(pos);
             let response = entry.1.clone();
@@ -53,7 +56,7 @@ impl ResponseCache {
     /// Insert a response into the cache. Evicts the least-recently-used entry
     /// if at capacity.
     pub fn put(&self, key: u64, response: CompletionResponse) {
-        let mut entries = self.entries.lock().expect("cache lock poisoned");
+        let mut entries = self.entries.lock();
         // Remove existing entry with same key (will be re-inserted at front)
         if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
             entries.remove(pos);
@@ -115,18 +118,17 @@ impl ResponseCache {
 
     /// Remove all entries from the cache.
     pub fn clear(&self) {
-        let mut entries = self.entries.lock().expect("cache lock poisoned");
-        entries.clear();
+        self.entries.lock().clear();
     }
 
     /// Number of entries currently in the cache.
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("cache lock poisoned").len()
+        self.entries.lock().len()
     }
 
     /// Returns true if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().expect("cache lock poisoned").is_empty()
+        self.entries.lock().is_empty()
     }
 }
 

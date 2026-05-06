@@ -419,30 +419,43 @@ fn mcp_tool_to_definition(tool: &McpToolDef) -> ToolDefinition {
 /// `error_description` / `details` fields. Strip the longest suspected
 /// token-bearing values before they hit log sinks.
 fn redact_idp_body(body: &str) -> String {
-    use regex::Regex;
     // Best-effort patterns. Avoid dependency on a JSON parser (the IdP
     // body may not be JSON; some return text/plain on errors).
-    let patterns: &[(&str, &str)] = &[
-        // JWT-like (eyJ + base64 segments separated by `.`).
-        (
-            r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
-            "[redacted-jwt]",
-        ),
-        // Bearer header.
-        (r"(?i)bearer\s+[A-Za-z0-9_\-\.=]+", "[redacted-bearer]"),
-        // access_token / id_token / refresh_token / subject_token JSON values.
-        (
-            r#"(?i)("(?:access|id|refresh|subject)_token"\s*:\s*")[^"]+"#,
-            "$1[redacted]",
-        ),
-    ];
-    let mut out = body.to_string();
-    for (pat, repl) in patterns.iter() {
-        if let Ok(re) = Regex::new(pat) {
-            out = re.replace_all(&out, *repl).into_owned();
+    //
+    // Patterns are LazyLock-compiled at first use (P-MCP-1, P-MCP-2,
+    // T1 from `tasks/performance-audit-heartbit-core-2026-05-06.md`).
+    // The redact pipeline runs on every IdP error path; per-call
+    // `Regex::new` cost was ~500–800 µs.
+    static REDACTORS: std::sync::LazyLock<[(regex::Regex, &'static str); 3]> =
+        std::sync::LazyLock::new(|| {
+            [
+                (
+                    regex::Regex::new(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
+                        .expect("static jwt pattern"),
+                    "[redacted-jwt]",
+                ),
+                (
+                    regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]+")
+                        .expect("static bearer pattern"),
+                    "[redacted-bearer]",
+                ),
+                (
+                    regex::Regex::new(
+                        r#"(?i)("(?:access|id|refresh|subject)_token"\s*:\s*")[^"]+"#,
+                    )
+                    .expect("static token-field pattern"),
+                    "$1[redacted]",
+                ),
+            ]
+        });
+    let mut out = std::borrow::Cow::Borrowed(body);
+    for (re, repl) in REDACTORS.iter() {
+        match re.replace_all(&out, *repl) {
+            std::borrow::Cow::Borrowed(_) => {}
+            std::borrow::Cow::Owned(s) => out = std::borrow::Cow::Owned(s),
         }
     }
-    out
+    out.into_owned()
 }
 
 /// Replace control characters (incl. CR/LF/ANSI escapes) with single spaces

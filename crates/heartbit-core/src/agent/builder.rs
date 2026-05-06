@@ -685,7 +685,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_identical_tool_calls: self.max_identical_tool_calls,
             max_fuzzy_identical_tool_calls: self.max_fuzzy_identical_tool_calls,
             max_tool_calls_per_turn: self.max_tool_calls_per_turn,
-            permission_rules: std::sync::RwLock::new(self.permission_rules),
+            permission_rules: parking_lot::RwLock::new(self.permission_rules),
             learned_permissions: self.learned_permissions,
             lsp_manager: self.lsp_manager,
             session_prune_config: self.session_prune_config,

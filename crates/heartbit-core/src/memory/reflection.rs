@@ -1,6 +1,6 @@
 //! Reflection tracker — triggers agent self-reflection when cumulative memory importance exceeds a threshold.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Tracks cumulative importance of stored memories to trigger reflection.
 ///
@@ -23,7 +23,7 @@ impl ReflectionTracker {
     /// Record an importance value. Returns `true` if the threshold was exceeded,
     /// triggering a reflection. The accumulator is reset after triggering.
     pub fn record(&self, importance: u8) -> bool {
-        let mut acc = self.accumulated.lock().expect("reflection lock poisoned");
+        let mut acc = self.accumulated.lock();
         *acc += importance as u32;
         if *acc >= self.threshold {
             *acc = 0;
@@ -35,7 +35,7 @@ impl ReflectionTracker {
 
     /// Current accumulated importance (for testing/debugging).
     pub fn accumulated(&self) -> u32 {
-        *self.accumulated.lock().expect("reflection lock poisoned")
+        *self.accumulated.lock()
     }
 }
 

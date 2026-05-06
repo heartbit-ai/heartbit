@@ -285,41 +285,33 @@ impl Tool for PatchTool {
 
 // --- Multi-pass fuzzy matching ---
 
-/// Match pass for progressive fuzzy line matching.
-#[derive(Debug, Clone, Copy)]
-enum MatchPass {
-    /// Exact byte-for-byte match.
-    Exact,
-    /// Match after stripping trailing whitespace.
-    TrimEnd,
-    /// Match after stripping leading and trailing whitespace.
-    TrimBoth,
-    /// Match after normalizing unicode characters (smart quotes → ASCII, etc.).
-    UnicodeNormalize,
-}
-
-const MATCH_PASSES: &[MatchPass] = &[
-    MatchPass::Exact,
-    MatchPass::TrimEnd,
-    MatchPass::TrimBoth,
-    MatchPass::UnicodeNormalize,
-];
-
-/// Check if two lines match under the given pass strategy.
-fn lines_match(actual: &str, expected: &str, pass: MatchPass) -> bool {
-    match pass {
-        MatchPass::Exact => actual == expected,
-        MatchPass::TrimEnd => actual.trim_end() == expected.trim_end(),
-        MatchPass::TrimBoth => actual.trim() == expected.trim(),
-        MatchPass::UnicodeNormalize => normalize_unicode(actual) == normalize_unicode(expected),
-    }
-}
-
-/// Try all passes in order, return true if any pass matches.
+/// Try progressively looser matches: exact → trailing-whitespace → both-side
+/// trim → smart-quote / em-dash unicode normalisation.
+///
+/// PERF (P-TOOL-5, P-TOOL-14): hand-rolled short-circuit ladder so the
+/// hot exact-match path skips every later pass — and the trim/unicode
+/// passes only allocate when their cheaper predecessor has failed. The
+/// previous `MATCH_PASSES.iter().any(...)` walked every pass even when
+/// the exact path would have matched, paying ~4 string operations per
+/// line × every patch hunk.
 fn fuzzy_lines_match(actual: &str, expected: &str) -> bool {
-    MATCH_PASSES
-        .iter()
-        .any(|pass| lines_match(actual, expected, *pass))
+    if actual == expected {
+        return true;
+    }
+    if actual.trim_end() == expected.trim_end() {
+        return true;
+    }
+    if actual.trim() == expected.trim() {
+        return true;
+    }
+    // Unicode normalisation is the only pass that allocates; defer until
+    // every cheaper comparator has been ruled out, and skip entirely
+    // when both sides are pure ASCII (no smart-punctuation can possibly
+    // collapse).
+    if actual.is_ascii() && expected.is_ascii() {
+        return false;
+    }
+    normalize_unicode(actual) == normalize_unicode(expected)
 }
 
 /// Normalize unicode characters that LLMs commonly substitute:
@@ -328,6 +320,9 @@ fn fuzzy_lines_match(actual: &str, expected: &str) -> bool {
 /// - Non-breaking space → regular space
 /// - Other common unicode whitespace → ASCII space
 fn normalize_unicode(s: &str) -> String {
+    // Preserve the legacy `.trim().to_string()` semantics. The ASCII
+    // fast-path lives in `fuzzy_lines_match` so direct callers (tests,
+    // future call sites) retain identical behaviour.
     s.chars()
         .map(|c| match c {
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',

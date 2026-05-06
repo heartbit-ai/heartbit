@@ -15,7 +15,9 @@
 
 #![allow(missing_docs)]
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -213,7 +215,7 @@ pub struct CircuitKey {
 
 /// Registry that owns one [`ProviderCircuit`] per `(tenant_id, provider)` pair.
 ///
-/// Locking strategy: `std::sync::RwLock` (never held across `.await`).
+/// Locking strategy: `parking_lot::RwLock` (never held across `.await`).
 /// Fast path: read lock + `Arc::clone`. Slow path (first insert): write lock
 /// with double-check to avoid duplicate allocation under races.
 pub struct CircuitTracker {
@@ -236,13 +238,11 @@ impl CircuitTracker {
             provider: provider.to_string(),
         };
         // Fast path: read lock + clone if present.
-        if let Ok(g) = self.circuits.read()
-            && let Some(c) = g.get(&key)
-        {
+        if let Some(c) = self.circuits.read().get(&key) {
             return Arc::clone(c);
         }
         // Slow path: write lock with double-check.
-        let mut g = self.circuits.write().expect("circuit tracker poisoned");
+        let mut g = self.circuits.write();
         Arc::clone(
             g.entry(key)
                 .or_insert_with(|| Arc::new(ProviderCircuit::new(self.config.clone()))),

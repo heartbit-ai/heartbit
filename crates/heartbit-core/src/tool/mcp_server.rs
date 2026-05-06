@@ -150,7 +150,7 @@ pub struct McpServer {
     tools: Vec<Arc<dyn Tool>>,
     resources: Vec<ServerResource>,
     resource_reader: Option<ResourceReader>,
-    sessions: std::sync::RwLock<HashMap<String, ()>>,
+    sessions: parking_lot::RwLock<HashMap<String, ()>>,
     auth_callback: Option<AuthCallback>,
 }
 
@@ -161,7 +161,9 @@ impl McpServer {
             tools: Vec::new(),
             resources: Vec::new(),
             resource_reader: None,
-            sessions: std::sync::RwLock::new(HashMap::new()),
+            // parking_lot adopted on this hot path (every MCP request);
+            // see T2 in `tasks/performance-audit-heartbit-core-2026-05-06.md`.
+            sessions: parking_lot::RwLock::new(HashMap::new()),
             auth_callback: None,
         }
     }
@@ -197,24 +199,22 @@ impl McpServer {
     /// Create or validate a session ID.
     fn ensure_session(&self, session_id: Option<&str>) -> String {
         if let Some(sid) = session_id
-            && let Ok(sessions) = self.sessions.read()
-            && sessions.contains_key(sid)
+            && self.sessions.read().contains_key(sid)
         {
             return sid.to_string();
         }
         let new_sid = Uuid::new_v4().to_string();
-        if let Ok(mut sessions) = self.sessions.write() {
-            // SECURITY (F-MCP-3): bound the session map. When at capacity,
-            // drop one existing entry before inserting the new one. Best-effort
-            // FIFO via HashMap iteration order; for higher-traffic deployments
-            // an LRU cache would be more appropriate.
-            if sessions.len() >= MAX_SESSIONS
-                && let Some(victim) = sessions.keys().next().cloned()
-            {
-                sessions.remove(&victim);
-            }
-            sessions.insert(new_sid.clone(), ());
+        let mut sessions = self.sessions.write();
+        // SECURITY (F-MCP-3): bound the session map. When at capacity,
+        // drop one existing entry before inserting the new one. Best-effort
+        // FIFO via HashMap iteration order; for higher-traffic deployments
+        // an LRU cache would be more appropriate.
+        if sessions.len() >= MAX_SESSIONS
+            && let Some(victim) = sessions.keys().next().cloned()
+        {
+            sessions.remove(&victim);
         }
+        sessions.insert(new_sid.clone(), ());
         new_sid
     }
 
@@ -1012,7 +1012,7 @@ mod tests {
         let server = McpServer::new(McpServerConfig::default());
         // Force the cap to fill — we do this by manipulating the lock directly.
         {
-            let mut sessions = server.sessions.write().unwrap();
+            let mut sessions = server.sessions.write();
             for i in 0..MAX_SESSIONS {
                 sessions.insert(format!("sid-{i}"), ());
             }
@@ -1020,7 +1020,7 @@ mod tests {
         }
         // Issue another `ensure_session` with a new id — should evict and stay bounded.
         let _ = server.ensure_session(None);
-        let sessions = server.sessions.read().unwrap();
+        let sessions = server.sessions.read();
         assert!(
             sessions.len() <= MAX_SESSIONS,
             "session map exceeded MAX_SESSIONS = {MAX_SESSIONS}: {}",

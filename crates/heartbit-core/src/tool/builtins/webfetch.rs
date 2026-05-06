@@ -230,23 +230,32 @@ impl Tool for WebFetchTool {
 /// when the caller asks for `format=html`. Defence-in-depth against prompt
 /// injection through hidden adversarial content (F-NET-7).
 fn sanitize_html_for_agent(html: &str) -> String {
-    use regex::Regex;
     // Note: these patterns are intentionally non-strict — they remove tag
     // pairs and HTML comments. The user still gets readable HTML for layout
     // purposes; they just don't get raw script/style payloads or comment-
     // hidden instructions.
-    let patterns = [
-        r"(?is)<script\b[^>]*>.*?</script\s*>",
-        r"(?is)<style\b[^>]*>.*?</style\s*>",
-        r"(?s)<!--.*?-->",
-    ];
-    let mut out = html.to_string();
-    for p in patterns.iter() {
-        if let Ok(re) = Regex::new(p) {
-            out = re.replace_all(&out, "").into_owned();
+    //
+    // Patterns are LazyLock-compiled at first use (P-TOOL-2, T1 from
+    // `tasks/performance-audit-heartbit-core-2026-05-06.md`). Per-call
+    // `Regex::new` cost was ~100–200 µs; the sanitisation runs on every
+    // html/markdown webfetch.
+    static SANITIZERS: std::sync::LazyLock<[regex::Regex; 3]> = std::sync::LazyLock::new(|| {
+        [
+            regex::Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>")
+                .expect("static script-strip pattern"),
+            regex::Regex::new(r"(?is)<style\b[^>]*>.*?</style\s*>")
+                .expect("static style-strip pattern"),
+            regex::Regex::new(r"(?s)<!--.*?-->").expect("static html-comment pattern"),
+        ]
+    });
+    let mut out = std::borrow::Cow::Borrowed(html);
+    for re in SANITIZERS.iter() {
+        match re.replace_all(&out, "") {
+            std::borrow::Cow::Borrowed(_) => {}
+            std::borrow::Cow::Owned(s) => out = std::borrow::Cow::Owned(s),
         }
     }
-    out
+    out.into_owned()
 }
 
 fn html_to_markdown(html: &str) -> String {

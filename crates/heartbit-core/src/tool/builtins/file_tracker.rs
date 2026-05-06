@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::time::SystemTime;
+
+use parking_lot::RwLock;
 
 /// Tracks when files were last read/written.
 ///
@@ -10,8 +11,10 @@ use std::time::SystemTime;
 /// mtime has changed since the last recorded read. Shared across read, write,
 /// edit, and patch tools via `Arc<FileTracker>`.
 ///
-/// Uses `std::sync::RwLock` (not tokio) because locks are never held across
-/// `.await` points.
+/// Uses `parking_lot::RwLock` (not tokio) because locks are never held across
+/// `.await` points; `parking_lot` is adopted on this hot path (every read/
+/// write/edit/patch tool call) for ~2× faster uncontended reads, see T2 in
+/// `tasks/performance-audit-heartbit-core-2026-05-06.md`.
 pub struct FileTracker {
     records: RwLock<HashMap<PathBuf, FileRecord>>,
 }
@@ -44,8 +47,9 @@ impl FileTracker {
         let canonical = std::fs::canonicalize(path)
             .or_else(|_| std::path::absolute(path))
             .unwrap_or_else(|_| path.to_path_buf());
-        let mut records = self.records.write().expect("file tracker lock poisoned");
-        records.insert(canonical, FileRecord { modified_at });
+        self.records
+            .write()
+            .insert(canonical, FileRecord { modified_at });
         Ok(())
     }
 
@@ -57,7 +61,7 @@ impl FileTracker {
         let canonical = std::fs::canonicalize(path)
             .or_else(|_| std::path::absolute(path))
             .unwrap_or_else(|_| path.to_path_buf());
-        let records = self.records.read().expect("file tracker lock poisoned");
+        let records = self.records.read();
         let record = records.get(&canonical).ok_or_else(|| {
             format!(
                 "File {} has not been read yet. Read it first before editing.",
@@ -82,8 +86,7 @@ impl FileTracker {
         let canonical = std::fs::canonicalize(path)
             .or_else(|_| std::path::absolute(path))
             .unwrap_or_else(|_| path.to_path_buf());
-        let records = self.records.read().expect("file tracker lock poisoned");
-        records.contains_key(&canonical)
+        self.records.read().contains_key(&canonical)
     }
 }
 

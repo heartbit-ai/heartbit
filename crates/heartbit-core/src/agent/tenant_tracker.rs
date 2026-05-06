@@ -5,7 +5,9 @@
 
 #![allow(missing_docs)]
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::auth::TenantScope;
 use crate::error::Error;
@@ -76,10 +78,7 @@ impl TenantTokenTracker {
         tokens: usize,
     ) -> Result<TokenReservation, Error> {
         let tenant = scope.tenant_id.clone();
-        let mut guard = self
-            .states
-            .write()
-            .map_err(|_| Error::Agent("token tracker poisoned".into()))?;
+        let mut guard = self.states.write();
         let state = guard.entry(tenant.clone()).or_default();
         if state.in_flight.saturating_add(tokens) > self.per_tenant_cap {
             return Err(Error::TenantOverloaded {
@@ -113,16 +112,7 @@ impl TenantTokenTracker {
     /// - Negative deltas saturate at 0.
     /// - No-op on poisoned lock (logged via `tracing::warn!`) or unknown tenant.
     pub fn adjust(&self, scope: &TenantScope, delta: i64) {
-        let mut guard = match self.states.write() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!(
-                    tenant_id = %scope.tenant_id,
-                    "token tracker poisoned during adjust; skipping reconciliation"
-                );
-                return;
-            }
-        };
+        let mut guard = self.states.write();
         let Some(state) = guard.get_mut(&scope.tenant_id) else {
             return;
         };
@@ -144,18 +134,18 @@ impl TenantTokenTracker {
     }
 
     fn release(&self, tenant_id: &str, tokens: usize) {
-        if let Ok(mut guard) = self.states.write()
-            && let Some(state) = guard.get_mut(tenant_id)
-        {
+        let mut guard = self.states.write();
+        if let Some(state) = guard.get_mut(tenant_id) {
             state.in_flight = state.in_flight.saturating_sub(tokens);
         }
     }
 
     pub fn snapshot(&self) -> Vec<(String, TenantTokenState)> {
-        match self.states.read() {
-            Ok(g) => g.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            Err(_) => vec![],
-        }
+        self.states
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 

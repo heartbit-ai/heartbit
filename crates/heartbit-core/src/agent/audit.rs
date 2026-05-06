@@ -1,9 +1,9 @@
 //! Agent audit trail — structured records of LLM calls, tool invocations, and completions.
 
 #![allow(missing_docs)]
+use parking_lot::RwLock;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -87,51 +87,65 @@ const METADATA_ALLOWLIST: &[&str] = &[
 /// other field's value with the string `"[stripped]"` so the audit log
 /// records *which* fields existed without their content. Numbers and bools
 /// are preserved (they cannot leak content). Arrays/objects are recursed.
+///
+/// Prefer [`strip_content_owned`] in hot paths — it consumes the payload by
+/// ownership and avoids the top-level `clone()` (P-CROSS-7).
 pub fn strip_content(payload: &serde_json::Value) -> serde_json::Value {
-    strip_value(payload)
+    strip_content_owned(payload.clone())
 }
 
-fn strip_value(value: &serde_json::Value) -> serde_json::Value {
+/// Owned variant of [`strip_content`] — consumes `payload` and walks the tree
+/// without cloning any preserved scalars/arrays. Used by the agent runner to
+/// strip audit payloads in place when `AuditMode::MetadataOnly` is active.
+///
+/// Per `tasks/perf-audit-cross.md` (P-CROSS-7): the previous `&Value` variant
+/// cloned every scalar, every recursed sub-value, and the top-level payload
+/// — ~1 ms of avoidable CPU per audit record on 100 KB tool outputs.
+pub fn strip_content_owned(payload: serde_json::Value) -> serde_json::Value {
+    strip_value_owned(payload)
+}
+
+fn strip_value_owned(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let mut stripped = serde_json::Map::new();
+            let mut stripped = serde_json::Map::with_capacity(map.len());
             for (key, val) in map {
                 if METADATA_ALLOWLIST.contains(&key.as_str()) {
                     // Even allow-listed keys: recurse so nested user content
                     // inside `tool_names: [...]` is still cleaned (it's a
                     // string array, scalars survive — see strip_scalar).
-                    stripped.insert(key.clone(), strip_scalar_or_recurse(val));
+                    stripped.insert(key, strip_scalar_or_recurse_owned(val));
                 } else {
                     // Replace non-metadata content with a marker. Preserve
                     // the structural type so downstream tooling sees a
                     // similarly-shaped object.
-                    stripped.insert(key.clone(), redact_marker(val));
+                    stripped.insert(key, redact_marker_owned(val));
                 }
             }
             serde_json::Value::Object(stripped)
         }
-        // Top-level non-object scalars/arrays pass through. AuditRecord.payload
-        // is always built as a JSON object in production — the non-object case
-        // exists only for tests / legacy callers.
-        other => other.clone(),
+        // Top-level non-object scalars/arrays pass through unchanged. The
+        // production `AuditRecord.payload` is always built as a JSON object;
+        // the non-object case exists only for tests / legacy callers.
+        other => other,
     }
 }
 
-fn strip_scalar_or_recurse(value: &serde_json::Value) -> serde_json::Value {
+fn strip_scalar_or_recurse_owned(value: serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::Object(_) | serde_json::Value::Array(_) => strip_value(value),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => strip_value_owned(value),
         // Scalars under allow-listed keys are safe (numbers, bools, string
         // metadata like tool names).
-        other => other.clone(),
+        other => other,
     }
 }
 
-fn redact_marker(value: &serde_json::Value) -> serde_json::Value {
+fn redact_marker_owned(value: serde_json::Value) -> serde_json::Value {
     match value {
         // Numbers and bools cannot leak user content; keep them.
-        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
-            value.clone()
-        }
+        v @ (serde_json::Value::Number(_)
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Null) => v,
         _ => serde_json::Value::String("[stripped]".into()),
     }
 }
@@ -212,10 +226,13 @@ pub trait AuditTrail: Send + Sync {
     }
 }
 
-/// In-memory audit trail backed by `std::sync::RwLock<Vec<AuditRecord>>`.
+/// In-memory audit trail backed by `parking_lot::RwLock<Vec<AuditRecord>>`.
 ///
 /// Lock is never held across `.await` — all operations are synchronous inside
-/// the lock, then wrapped in `Box::pin(async { ... })`.
+/// the lock, then wrapped in `Box::pin(async { ... })`. `parking_lot` is used
+/// (not `std::sync::RwLock`) for ~2× faster uncontended read acquisition on
+/// the audit hot path (every turn, every tool call); see T2 in
+/// `tasks/performance-audit-heartbit-core-2026-05-06.md`.
 pub struct InMemoryAuditTrail {
     records: RwLock<Vec<AuditRecord>>,
 }
@@ -240,11 +257,7 @@ impl AuditTrail for InMemoryAuditTrail {
         entry: AuditRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
         Box::pin(async move {
-            let mut records = self
-                .records
-                .write()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
-            records.push(entry);
+            self.records.write().push(entry);
             Ok(())
         })
     }
@@ -256,10 +269,7 @@ impl AuditTrail for InMemoryAuditTrail {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
         let tid = scope.tenant_id.clone();
         Box::pin(async move {
-            let records = self
-                .records
-                .read()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let records = self.records.read();
             let matched: Vec<AuditRecord> = records
                 .iter()
                 .filter(|r| r.tenant_id.as_deref().unwrap_or("") == tid.as_str())
@@ -275,10 +285,7 @@ impl AuditTrail for InMemoryAuditTrail {
         limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
         Box::pin(async move {
-            let records = self
-                .records
-                .read()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let records = self.records.read();
             let start = records.len().saturating_sub(limit);
             Ok(records[start..].to_vec())
         })
@@ -292,10 +299,7 @@ impl AuditTrail for InMemoryAuditTrail {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AuditRecord>, Error>> + Send + '_>> {
         let tid = scope.tenant_id.clone();
         Box::pin(async move {
-            let records = self
-                .records
-                .read()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let records = self.records.read();
             let matched: Vec<AuditRecord> = records
                 .iter()
                 .filter(|r| {
@@ -314,10 +318,7 @@ impl AuditTrail for InMemoryAuditTrail {
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         Box::pin(async move {
             let cutoff = chrono::Utc::now() - retain;
-            let mut records = self
-                .records
-                .write()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let mut records = self.records.write();
             let before = records.len();
             records.retain(|r| r.timestamp >= cutoff);
             Ok(before - records.len())
@@ -330,10 +331,7 @@ impl AuditTrail for InMemoryAuditTrail {
     ) -> Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + '_>> {
         let user_id = user_id.to_string();
         Box::pin(async move {
-            let mut records = self
-                .records
-                .write()
-                .map_err(|e| Error::Agent(format!("audit lock poisoned: {e}")))?;
+            let mut records = self.records.write();
             let before = records.len();
             records.retain(|r| r.user_id.as_deref() != Some(user_id.as_str()));
             Ok(before - records.len())

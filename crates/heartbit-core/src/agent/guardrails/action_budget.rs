@@ -3,10 +3,10 @@
 //! Tracks how many times each tool (or tool pattern) has been called and
 //! denies further calls once the budget is exhausted. First matching rule wins.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 
 use crate::agent::guardrail::{GuardAction, Guardrail};
 use crate::error::Error;
@@ -85,10 +85,7 @@ impl Guardrail for ActionBudgetGuardrail {
         // permanently in the "over by one" state — biasing any future cap
         // adjustments. Now we only count successful Allow decisions.
         let action = {
-            let mut counts = self
-                .counts
-                .lock()
-                .expect("action_budget counts lock poisoned");
+            let mut counts = self.counts.lock();
             let entry = counts.entry(pattern_key.clone()).or_insert(0);
             if *entry + 1 > max_calls {
                 GuardAction::deny(format!(

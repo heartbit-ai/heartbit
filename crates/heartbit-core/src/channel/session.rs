@@ -1,8 +1,8 @@
 //! Session management for WebSocket-connected agent interactions.
 
 #![allow(missing_docs)]
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -101,8 +101,10 @@ pub trait SessionStore: Send + Sync {
     }
 }
 
-/// In-memory session store using `std::sync::RwLock` (not tokio — matches codebase pattern
-/// for locks never held across `.await`).
+/// In-memory session store using `parking_lot::RwLock` (not tokio — matches
+/// codebase pattern for locks never held across `.await`; `parking_lot` is
+/// adopted on the channel hot path for ~2× faster uncontended reads, see T2
+/// in `tasks/performance-audit-heartbit-core-2026-05-06.md`).
 pub struct InMemorySessionStore {
     sessions: RwLock<HashMap<Uuid, Session>>,
 }
@@ -131,11 +133,7 @@ impl SessionStore for InMemorySessionStore {
             user_id: None,
             tenant_id: None,
         };
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        sessions.insert(session.id, session.clone());
+        self.sessions.write().insert(session.id, session.clone());
         Ok(session)
     }
 
@@ -153,47 +151,27 @@ impl SessionStore for InMemorySessionStore {
             user_id: Some(user_id.to_string()),
             tenant_id: Some(tenant_id.to_string()),
         };
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        sessions.insert(session.id, session.clone());
+        self.sessions.write().insert(session.id, session.clone());
         Ok(session)
     }
 
     fn get(&self, id: Uuid) -> Result<Option<Session>, Error> {
-        let sessions = self
-            .sessions
-            .read()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        Ok(sessions.get(&id).cloned())
+        Ok(self.sessions.read().get(&id).cloned())
     }
 
     fn list(&self) -> Result<Vec<Session>, Error> {
-        let sessions = self
-            .sessions
-            .read()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        let mut list: Vec<Session> = sessions.values().cloned().collect();
+        let mut list: Vec<Session> = self.sessions.read().values().cloned().collect();
         // Most recent first
         list.sort_by_key(|s| std::cmp::Reverse(s.created_at));
         Ok(list)
     }
 
     fn delete(&self, id: Uuid) -> Result<bool, Error> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        Ok(sessions.remove(&id).is_some())
+        Ok(self.sessions.write().remove(&id).is_some())
     }
 
     fn add_message(&self, id: Uuid, message: SessionMessage) -> Result<(), Error> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| Error::Channel(format!("lock poisoned: {e}")))?;
-        match sessions.get_mut(&id) {
+        match self.sessions.write().get_mut(&id) {
             Some(session) => {
                 session.messages.push(message);
                 Ok(())
@@ -275,7 +253,7 @@ mod tests {
         // Create sessions — they get Utc::now() timestamps so ordering depends on
         // insertion order. To test sorting, manually insert with controlled timestamps.
         {
-            let mut sessions = store.sessions.write().unwrap();
+            let mut sessions = store.sessions.write();
 
             let old = Session {
                 id: Uuid::new_v4(),

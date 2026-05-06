@@ -155,7 +155,7 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Wrapped in `RwLock` for interior mutability: learned rules from
     /// `AlwaysAllow`/`AlwaysDeny` are injected at runtime via `&self`.
     /// Lock is never held across `.await`.
-    pub(super) permission_rules: std::sync::RwLock<permission::PermissionRuleset>,
+    pub(super) permission_rules: parking_lot::RwLock<permission::PermissionRuleset>,
     /// Optional learned permissions for persisting AlwaysAllow/AlwaysDeny decisions.
     pub(super) learned_permissions: Option<Arc<std::sync::Mutex<permission::LearnedPermissions>>>,
     /// Optional LSP manager for collecting diagnostics after file-modifying tools.
@@ -281,19 +281,12 @@ impl<P: LlmProvider> AgentRunner<P> {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Option<permission::PermissionAction> {
-        self.permission_rules
-            .read()
-            .expect("permission rules lock poisoned")
-            .evaluate(tool_name, input)
+        self.permission_rules.read().evaluate(tool_name, input)
     }
 
     /// Check if the permission ruleset has any rules.
     fn has_permission_rules(&self) -> bool {
-        !self
-            .permission_rules
-            .read()
-            .expect("permission rules lock poisoned")
-            .is_empty()
+        !self.permission_rules.read().is_empty()
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -306,7 +299,10 @@ impl<P: LlmProvider> AgentRunner<P> {
     async fn audit(&self, mut record: AuditRecord) {
         if let Some(ref trail) = self.audit_trail {
             if self.audit_mode == super::audit::AuditMode::MetadataOnly {
-                record.payload = super::audit::strip_content(&record.payload);
+                // Owned variant skips the top-level + per-scalar clones
+                // (P-CROSS-7) — ~1 ms saved per record on 100 KB payloads.
+                let payload = std::mem::take(&mut record.payload);
+                record.payload = super::audit::strip_content_owned(payload);
             }
             if let Err(e) = trail.record(record).await {
                 tracing::warn!(error = %e, "audit record failed");
@@ -343,10 +339,7 @@ impl<P: LlmProvider> AgentRunner<P> {
         }
         // Inject into the live ruleset so the rule takes effect immediately
         // within this session (not just after restart).
-        self.permission_rules
-            .write()
-            .expect("permission rules lock poisoned")
-            .append_rules(&new_rules);
+        self.permission_rules.write().append_rules(&new_rules);
         // Persist to disk if learned permissions are configured
         if let Some(ref learned) = self.learned_permissions {
             for rule in new_rules {
