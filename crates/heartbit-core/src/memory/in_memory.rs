@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use chrono::Utc;
 
@@ -26,8 +27,10 @@ pub const IN_MEMORY_STORE_DEFAULT_CAP: usize = 100_000;
 
 /// Thread-safe in-memory store for agent memories.
 ///
-/// Backed by `RwLock<HashMap>`. Suitable for tests and single-process use.
-/// Uses composite scoring (recency + importance + relevance) for recall ordering.
+/// Backed by `parking_lot::RwLock<HashMap>` (T2 — `tasks/performance-audit-
+/// heartbit-core-2026-05-06.md`). Suitable for tests and single-process use.
+/// Uses composite scoring (recency + importance + relevance) for recall
+/// ordering.
 pub struct InMemoryStore {
     entries: RwLock<HashMap<String, MemoryEntry>>,
     scoring_weights: ScoringWeights,
@@ -71,10 +74,7 @@ impl Memory for InMemoryStore {
         entry.author_tenant_id = Some(scope.tenant_id.clone());
         entry.author_user_id = scope.user_id.clone();
         Box::pin(async move {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
             // SECURITY (F-MEM-3): when at capacity, evict the entry with the
             // lowest effective strength (most-decayed, oldest weak memory)
             // before inserting the new one. Without this cap, a hostile or
@@ -126,10 +126,7 @@ impl Memory for InMemoryStore {
             // access_count as a side effect, so we need write access anyway.
             // Using one lock avoids a TOCTOU window where concurrent forget()
             // or store() could interleave between filter and access-count update.
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
 
             let mut results: Vec<MemoryEntry> = entries
                 .values()
@@ -477,10 +474,7 @@ impl Memory for InMemoryStore {
         let id = id.to_string();
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
             match entries.get_mut(&id) {
                 Some(entry) if entry.author_tenant_id.as_deref() == Some(tenant_id.as_str()) => {
                     entry.content = content;
@@ -504,10 +498,7 @@ impl Memory for InMemoryStore {
         let id = id.to_string();
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
             // Only remove if the entry belongs to this tenant.
             // Return false for both "not found" and "wrong tenant" to avoid
             // revealing cross-tenant id existence.
@@ -533,10 +524,7 @@ impl Memory for InMemoryStore {
         let related_id = related_id.to_string();
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
 
             // Only link entries that belong to the same tenant.
             let id_ok = entries
@@ -574,10 +562,7 @@ impl Memory for InMemoryStore {
         let owned_prefix = agent_prefix.map(String::from);
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|e| Error::Memory(format!("lock poisoned: {e}")))?;
+            let mut entries = self.entries.write();
 
             let now = Utc::now();
             let to_remove: Vec<String> = entries
