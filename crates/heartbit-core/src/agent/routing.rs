@@ -280,6 +280,18 @@ const DELEGATION_PHRASES: &[&str] = &[
     "assign to",
     "hand off",
     "pass to",
+    // gh#9 — common natural-language delegation cues that previously
+    // didn't fire `explicit_delegation` even when they clearly named a
+    // sub-agent. False-positives are bounded (a 0.30 score boost only
+    // ever moves a task into Tier 2 capability matching, never into
+    // unsolicited orchestration).
+    "ask the ",
+    "have the ",
+    "use the ",
+    "tell the ",
+    "instruct the ",
+    "let the ",
+    "get the ",
 ];
 
 // ── Thresholds ──
@@ -334,12 +346,30 @@ impl<'a> TaskComplexityAnalyzer<'a> {
     pub fn analyze(&self, task: &str) -> (RoutingDecision, ComplexitySignals) {
         let mut signals = self.heuristic_signals(task);
 
-        // Tier 1: clear decision from score alone
+        // Tier 1: clear decision from score alone.
+        //
+        // gh#9 — even on the low-complexity path, prefer an agent whose
+        // advertised domains overlap the task's `domain_signals`. The
+        // previous behaviour hardcoded `agent_index: 0`, silently
+        // routing every simple-but-domain-specific task to whichever
+        // agent had been registered first.
         if signals.complexity_score < SINGLE_AGENT_THRESHOLD {
+            let agent_index = if signals.domain_signals.is_empty() {
+                0
+            } else {
+                best_covering_agent(&signals.domain_signals, self.agents).unwrap_or(0)
+            };
+            let reason = if agent_index == 0 && signals.domain_signals.is_empty() {
+                "heuristic score below single-agent threshold (no domain signals)"
+            } else if agent_index == 0 {
+                "heuristic score below single-agent threshold (no agent matched detected domains)"
+            } else {
+                "heuristic score below single-agent threshold (matched by domain coverage)"
+            };
             return (
                 RoutingDecision::SingleAgent {
-                    agent_index: 0,
-                    reason: "heuristic score below single-agent threshold",
+                    agent_index,
+                    reason,
                 },
                 signals,
             );
@@ -369,15 +399,10 @@ impl<'a> TaskComplexityAnalyzer<'a> {
 
         // Step markers
         let step_markers = count_step_markers(&task_lower);
-        // Also count numbered list items (e.g., "1.", "2.", "3.")
-        let numbered_items = words
-            .iter()
-            .filter(|w| {
-                w.len() >= 2
-                    && w.ends_with('.')
-                    && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit())
-            })
-            .count();
+        // Numbered list items: covers `1.`, `(1)`, `1)`. Trailing
+        // punctuation like `;` or `,` is stripped before classifying so
+        // tokens such as `(1);` (gh#9 repro) still register.
+        let numbered_items = words.iter().filter(|w| is_numbered_step_marker(w)).count();
         let total_step_markers = step_markers + numbered_items;
 
         // Delegation language
@@ -491,6 +516,39 @@ fn count_step_markers(task_lower: &str) -> usize {
         .count()
 }
 
+/// Whether `word` (a single whitespace-separated token) is a numbered
+/// step marker. Recognises `1.`, `(1)`, and `1)` styles, with optional
+/// trailing punctuation (`;`, `,`, `:`) — e.g. the `(1);` tokens that
+/// appear in the gh#9 repro.
+fn is_numbered_step_marker(word: &str) -> bool {
+    let trimmed = word.trim_end_matches([';', ',', ':']);
+    if trimmed.len() < 2 {
+        return false;
+    }
+    // `1.` `12.`
+    if let Some(prefix) = trimmed.strip_suffix('.')
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    // `(1)` `(12)`
+    if let Some(inner) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+        && !inner.is_empty()
+        && inner.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    // `1)` `12)`
+    if let Some(prefix) = trimmed.strip_suffix(')')
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
 /// Check if `text` contains `keyword` as a whole word (not a substring of a larger word).
 /// For multi-word keywords (e.g., "unit test"), uses plain `contains`.
 fn contains_keyword(text: &str, keyword: &str) -> bool {
@@ -508,6 +566,37 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
         }
     }
     false
+}
+
+/// Pick the single agent whose advertised `domains` overlap the task's
+/// detected `task_domains` the most. Used by the Tier 1 short-circuit
+/// (gh#9): when the heuristic score is below the single-agent threshold
+/// but the task does have domain signals, route to the best-fitting
+/// agent instead of hardcoding `agent_index: 0`.
+///
+/// Ties are broken by the registration order (earliest agent wins),
+/// preserving the previous "default to first agent" semantics for
+/// genuinely ambiguous cases. Returns `None` when no agent advertises
+/// any of the requested domains; the caller should fall back to 0.
+fn best_covering_agent(task_domains: &[String], agents: &[AgentCapability]) -> Option<usize> {
+    if task_domains.is_empty() || agents.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (i, agent) in agents.iter().enumerate() {
+        let count = task_domains
+            .iter()
+            .filter(|d| agent.domains.contains(d))
+            .count();
+        if count == 0 {
+            continue;
+        }
+        match best {
+            Some((_, c)) if c >= count => {}
+            _ => best = Some((i, count)),
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// Detect which domains are referenced in the task.
@@ -1166,5 +1255,131 @@ mod tests {
         match decision {
             RoutingDecision::SingleAgent { .. } | RoutingDecision::Orchestrate { .. } => {}
         }
+    }
+
+    // ── Regressions for gh#9 ──
+    //
+    // Two findings reported by 100-tokens against v2026.503.1:
+    //   #A — Tier 1 short-circuit hardcodes `agent_index: 0` even when
+    //        domain_signals would point to a clearly-better agent, and
+    //        common delegation phrasings ("ask the X to ...") don't fire
+    //        `explicit_delegation`.
+    //   #B — Step-marker detection misses `(1) (2) (3)` and `1) 2) 3)`
+    //        formats, leaving long multi-step tasks at complexity_score
+    //        below the threshold and routing to agent #0.
+    //
+    // These tests fail on the buggy implementation and pass after the
+    // domain-aware Tier 1 + extended STEP_MARKERS / DELEGATION_PHRASES.
+
+    fn issue9_agents() -> Vec<AgentCapability> {
+        vec![
+            AgentCapability::from_config(
+                "researcher",
+                "Investigates a topic, gathers facts.",
+                &["web_search".into()],
+            ),
+            AgentCapability::from_config(
+                "coder",
+                "Writes and refactors Rust code.",
+                &["read".into(), "write".into(), "edit".into()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn gh9_tier1_routes_to_best_covering_agent_when_domains_present() {
+        // Repro from gh#9: a low-complexity task with domain_signals
+        // = ["code", ...] should NOT default to agent_index=0
+        // (researcher) when agent_index=1 (coder) clearly covers the
+        // detected code domain.
+        let agents = issue9_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let task = "Ask the coder to refactor the parse_args function and write tests.";
+        let (decision, signals) = analyzer.analyze(task);
+        assert!(
+            signals.domain_signals.contains(&"code".to_string()),
+            "expected `code` in domain_signals, got: {:?}",
+            signals.domain_signals
+        );
+        match decision {
+            RoutingDecision::SingleAgent { agent_index, .. } => assert_eq!(
+                agent_index, 1,
+                "Tier 1 should route to coder (idx 1), got idx {agent_index}",
+            ),
+            // Orchestrate is also acceptable as long as we are NOT
+            // returning a hardcoded agent_index = 0.
+            RoutingDecision::Orchestrate { .. } => {}
+        }
+    }
+
+    #[test]
+    fn gh9_parenthesised_numbers_count_as_step_markers() {
+        // Repro from gh#9: six numbered steps in `(N)` format.
+        let agents = make_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let task = "We need to: (1) investigate Rust async; (2) compare tokio vs smol; \
+                    (3) write a benchmark; (4) implement it; (5) review the code; \
+                    (6) summarize findings.";
+        let signals = analyzer.heuristic_signals(task);
+        assert!(
+            signals.step_markers >= 4,
+            "expected step_markers >= 4 for `(1) (2) ... (6)` pattern, got {}",
+            signals.step_markers
+        );
+    }
+
+    #[test]
+    fn gh9_right_paren_numbers_count_as_step_markers() {
+        // `1) ... 2) ... 3) ...` — common in informal lists.
+        let agents = make_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let task = "Plan: 1) gather data; 2) draft outline; 3) review; 4) publish.";
+        let signals = analyzer.heuristic_signals(task);
+        assert!(
+            signals.step_markers >= 3,
+            "expected step_markers >= 3 for `1) 2) 3) 4)` pattern, got {}",
+            signals.step_markers
+        );
+    }
+
+    #[test]
+    fn gh9_ask_the_phrasing_triggers_delegation() {
+        let agents = issue9_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let signals =
+            analyzer.heuristic_signals("Ask the coder to refactor the parse_args function.");
+        assert!(
+            signals.explicit_delegation,
+            "`ask the X to ...` should trigger explicit_delegation",
+        );
+    }
+
+    #[test]
+    fn gh9_have_the_phrasing_triggers_delegation() {
+        let agents = issue9_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let signals = analyzer.heuristic_signals("Have the researcher gather data on Rust async.");
+        assert!(
+            signals.explicit_delegation,
+            "`have the X ...` should trigger explicit_delegation",
+        );
+    }
+
+    #[test]
+    fn gh9_no_domains_still_falls_back_to_agent_zero() {
+        // The new domain-aware Tier 1 must preserve the previous
+        // semantics for tasks with no detectable domain at all.
+        let agents = issue9_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let (decision, signals) = analyzer.analyze("Hello, are you there?");
+        assert!(
+            signals.domain_signals.is_empty(),
+            "domains should be empty for plain greeting, got: {:?}",
+            signals.domain_signals
+        );
+        assert!(matches!(
+            decision,
+            RoutingDecision::SingleAgent { agent_index: 0, .. }
+        ));
     }
 }
