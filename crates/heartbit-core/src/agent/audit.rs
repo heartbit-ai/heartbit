@@ -13,13 +13,20 @@ use crate::error::Error;
 use crate::llm::types::TokenUsage;
 
 /// Controls what data is stored in audit records.
+///
+/// **BREAKING CHANGE (F-AUTH-6)**: the default is now `MetadataOnly`.
+/// Previously the default was `Full`, which logged complete LLM responses,
+/// tool inputs, and tool outputs — incompatible with privacy-by-default
+/// for regulated deployments (RGPD/HIPAA). Set `AuditMode::Full` explicitly
+/// when you want content captured (e.g., debugging, single-tenant CLI dev).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditMode {
-    /// Full content logging (current behavior, explicit opt-in for production).
-    #[default]
+    /// Full content logging — explicit opt-in.
     Full,
     /// Metadata only: tool names, timing, token counts, verdicts. No user content.
+    /// **Default** (F-AUTH-6).
+    #[default]
     MetadataOnly,
 }
 
