@@ -191,6 +191,17 @@ impl JsonRpcClient {
                         .trim()
                         .parse()
                         .map_err(|e| format!("invalid Content-Length: {e}"))?;
+                    // SECURITY (F-LSP-1): cap Content-Length at 64 MiB. A
+                    // hostile or compromised LSP server could send
+                    // `Content-Length: 99999999999999`; without this cap, the
+                    // `vec![0u8; len]` below would attempt a multi-TB
+                    // allocation and OOM the agent.
+                    const LSP_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+                    if len > LSP_MAX_BODY_BYTES {
+                        return Err(format!(
+                            "LSP Content-Length {len} exceeds cap of {LSP_MAX_BODY_BYTES} bytes (F-LSP-1)"
+                        ));
+                    }
                     // Read the blank line after headers
                     header_buf.clear();
                     reader

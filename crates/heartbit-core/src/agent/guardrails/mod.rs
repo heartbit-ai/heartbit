@@ -14,6 +14,7 @@ pub mod tool_policy;
 pub use action_budget::{ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BudgetRule};
 pub use behavioral::{BehaviorRule, BehavioralMonitorGuardrail, BehavioralMonitorGuardrailBuilder};
 pub use compose::{ConditionalGuardrail, GuardrailChain, WarnToDeny};
+#[allow(deprecated)]
 pub use content_fence::ContentFenceGuardrail;
 pub use injection::{GuardrailMode, InjectionClassifierGuardrail};
 pub use llm_judge::{LlmJudgeGuardrail, LlmJudgeGuardrailBuilder};

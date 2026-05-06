@@ -79,24 +79,29 @@ impl Guardrail for ActionBudgetGuardrail {
             },
         };
 
-        // Lock is not held across .await — synchronous increment
-        let count = {
+        // SECURITY (F-AGENT-10): test the budget BEFORE incrementing. The
+        // previous code incremented unconditionally and then checked if the
+        // post-increment count exceeded the cap, which left the counter
+        // permanently in the "over by one" state — biasing any future cap
+        // adjustments. Now we only count successful Allow decisions.
+        let action = {
             let mut counts = self
                 .counts
                 .lock()
                 .expect("action_budget counts lock poisoned");
             let entry = counts.entry(pattern_key.clone()).or_insert(0);
-            *entry += 1;
-            *entry
-        };
-
-        let action = if count > max_calls {
-            GuardAction::deny(format!(
-                "Tool `{}` denied: budget exhausted for pattern `{}` ({}/{})",
-                tool_name, pattern_key, count, max_calls
-            ))
-        } else {
-            GuardAction::Allow
+            if *entry + 1 > max_calls {
+                GuardAction::deny(format!(
+                    "Tool `{}` denied: budget exhausted for pattern `{}` ({}/{})",
+                    tool_name,
+                    pattern_key,
+                    *entry + 1,
+                    max_calls
+                ))
+            } else {
+                *entry += 1;
+                GuardAction::Allow
+            }
         };
 
         Box::pin(async move { Ok(action) })

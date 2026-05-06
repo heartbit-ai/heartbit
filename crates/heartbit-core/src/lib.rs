@@ -41,13 +41,14 @@ pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuild
 pub use agent::events::{AgentEvent, OnEvent};
 pub use agent::guardrail::{GuardAction, Guardrail};
 pub use agent::guardrails::tool_policy::{InputConstraint, ToolRule};
+#[allow(deprecated)]
+pub use agent::guardrails::ContentFenceGuardrail;
 pub use agent::guardrails::{
     ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BehaviorRule, BehavioralMonitorGuardrail,
-    BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, ContentFenceGuardrail,
-    GuardrailChain, GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail,
-    LlmJudgeGuardrailBuilder, PiiAction, PiiDetector, PiiGuardrail, SecretAction,
-    SecretScannerGuardrail, SecretScannerGuardrailBuilder, SensorSecurityGuardrail,
-    ToolPolicyGuardrail, WarnToDeny,
+    BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, GuardrailChain,
+    GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail, LlmJudgeGuardrailBuilder,
+    PiiAction, PiiDetector, PiiGuardrail, SecretAction, SecretScannerGuardrail,
+    SecretScannerGuardrailBuilder, SensorSecurityGuardrail, ToolPolicyGuardrail, WarnToDeny,
 };
 pub use agent::handoff::{HandoffRunner, HandoffRunnerBuilder, make_handoff_tool};
 pub use agent::instructions::{

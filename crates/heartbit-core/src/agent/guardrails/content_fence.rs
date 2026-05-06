@@ -32,10 +32,21 @@ fn is_email_tool(name: &str) -> bool {
 /// outputs in clearly delimited fencing so the frontier LLM treats the
 /// content as data, not instructions.
 ///
-/// **Deprecated**: Use [`SensorSecurityGuardrail`](super::SensorSecurityGuardrail)
-/// instead, which provides trust-aware authorization, injection detection,
-/// unique boundary IDs, and action blocking in addition to content fencing.
+/// SECURITY (F-AGENT-11): the marker `|||UNTRUSTED_EMAIL_CONTENT|||` is a
+/// fixed string that an attacker can embed in their email body to break out
+/// of the fence. Use [`SensorSecurityGuardrail`](super::SensorSecurityGuardrail)
+/// instead — it generates a unique, unpredictable boundary per call and
+/// escapes any nested fence markers in the content.
+#[deprecated(
+    since = "2026.506.0",
+    note = "Use SensorSecurityGuardrail instead. ContentFenceGuardrail uses a \
+            fixed boundary marker that an attacker can embed in their email body \
+            to break out of the fence (F-AGENT-11)."
+)]
 pub struct ContentFenceGuardrail;
+
+#[allow(deprecated, clippy::empty_line_after_outer_attr)]
+// implementing the trait on the deprecated type
 
 impl Guardrail for ContentFenceGuardrail {
     fn name(&self) -> &str {
@@ -62,6 +73,7 @@ impl Guardrail for ContentFenceGuardrail {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests still cover the deprecated guardrail
 mod tests {
     use super::*;
 

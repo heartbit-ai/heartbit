@@ -99,13 +99,37 @@ fn is_retryable(err: &Error) -> bool {
     }
 }
 
-/// Compute the delay for a given attempt using exponential backoff.
-/// Attempt 0 = base_delay, attempt 1 = 2*base_delay, etc.
+/// Compute the delay for a given attempt using exponential backoff with
+/// **decorrelated jitter**.
+///
+/// Attempt 0 ≈ U(base_delay, base_delay*3); subsequent attempts grow
+/// exponentially but each picks a random duration in `[base_delay, prev*3]`,
+/// capped at `max_delay`.
+///
+/// SECURITY (F-LLM-10): without jitter, all clients of a momentarily-down
+/// provider retry on the same millisecond, producing a thundering herd that
+/// extends the outage. Decorrelated jitter spreads retries uniformly. Pattern
+/// from AWS architecture blog: <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
 fn compute_delay(config: &RetryConfig, attempt: u32) -> Duration {
-    let delay = config
-        .base_delay
-        .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX));
-    delay.min(config.max_delay)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let base_ms = config.base_delay.as_millis() as u64;
+    let max_ms = config.max_delay.as_millis() as u64;
+
+    // Cheap thread-local LCG seed — adequate for jitter. Avoids pulling rand
+    // into the hot path.
+    static SEED: AtomicU64 = AtomicU64::new(0x9E3779B97F4A7C15);
+    let prev_max_ms = base_ms.saturating_mul(1u64.checked_shl(attempt).unwrap_or(u32::MAX as u64));
+    let upper = prev_max_ms.saturating_mul(3).min(max_ms.max(base_ms));
+    let lower = base_ms.min(upper);
+    // Linear-congruential PRNG step (Numerical Recipes constants).
+    let next = SEED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+            Some(s.wrapping_mul(1664525).wrapping_add(1013904223))
+        })
+        .unwrap_or(0);
+    let span = upper - lower + 1;
+    let pick = lower + (next % span);
+    Duration::from_millis(pick.min(max_ms))
 }
 
 impl<P: LlmProvider> LlmProvider for RetryingProvider<P> {
@@ -504,18 +528,28 @@ mod tests {
         assert!(!is_retryable(&Error::Memory("test".into())));
     }
 
+    /// SECURITY (F-LLM-10): with decorrelated jitter, the exact delay is
+    /// random within `[base_delay, prev*3]`. The test asserts the bounds
+    /// rather than exact values.
     #[test]
-    fn compute_delay_exponential_backoff() {
+    fn compute_delay_in_jitter_range() {
         let config = RetryConfig {
             max_retries: 5,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(10),
         };
 
-        assert_eq!(compute_delay(&config, 0), Duration::from_millis(100));
-        assert_eq!(compute_delay(&config, 1), Duration::from_millis(200));
-        assert_eq!(compute_delay(&config, 2), Duration::from_millis(400));
-        assert_eq!(compute_delay(&config, 3), Duration::from_millis(800));
+        for attempt in 0..4 {
+            let delay = compute_delay(&config, attempt);
+            assert!(
+                delay >= config.base_delay,
+                "attempt {attempt}: delay {delay:?} below base"
+            );
+            assert!(
+                delay <= config.max_delay,
+                "attempt {attempt}: delay {delay:?} above max"
+            );
+        }
     }
 
     #[test]
@@ -526,9 +560,14 @@ mod tests {
             max_delay: Duration::from_secs(5),
         };
 
-        // attempt 3 = 8000ms, capped to 5000ms
-        assert_eq!(compute_delay(&config, 3), Duration::from_secs(5));
-        assert_eq!(compute_delay(&config, 10), Duration::from_secs(5));
+        // F-LLM-10: even for late attempts, the delay must never exceed
+        // max_delay regardless of jitter.
+        for _ in 0..50 {
+            let d = compute_delay(&config, 3);
+            assert!(d <= config.max_delay, "delay {d:?} exceeds max");
+            let d = compute_delay(&config, 10);
+            assert!(d <= config.max_delay, "delay {d:?} exceeds max");
+        }
     }
 
     #[test]
@@ -539,9 +578,11 @@ mod tests {
             max_delay: Duration::from_secs(60),
         };
 
-        // Very large attempt number should not panic
-        let delay = compute_delay(&config, 50);
-        assert_eq!(delay, Duration::from_secs(60)); // capped at max
+        // Very large attempt number should not panic and stay <= max.
+        for _ in 0..50 {
+            let delay = compute_delay(&config, 50);
+            assert!(delay <= config.max_delay);
+        }
     }
 
     #[tokio::test]

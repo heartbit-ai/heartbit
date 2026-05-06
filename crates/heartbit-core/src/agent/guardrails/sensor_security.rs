@@ -74,15 +74,16 @@ fn detect_injection_patterns(content: &str) -> Vec<&'static str> {
 }
 
 /// Generate a unique hex boundary ID for content fencing.
+///
+/// SECURITY (F-AGENT-9): use UUID v4 (122 bits of CSPRNG entropy via
+/// `getrandom`) instead of `nanos + stack_addr`. The previous mix was
+/// predictable for an attacker who could observe the timing of multi-email
+/// processing batches — and stack addresses on the same thread don't vary
+/// enough between calls to add real entropy. A predictable boundary lets a
+/// hostile email body inject a counterfeit `|||FENCE:<predicted>|||` marker
+/// that the LLM treats as the end of the untrusted region.
 fn unique_boundary_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // Mix with a random-ish value from stack address
-    let stack_val = &nanos as *const _ as usize;
-    format!("{:016x}{:08x}", nanos, stack_val & 0xFFFF_FFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Escape nested boundary markers in content to prevent breakout.
