@@ -6,6 +6,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.506.1] - 2026-05-06
+
+### Security — heartbit-core Deep Audit
+
+A 78-finding deep security audit (`tasks/security-audit-heartbit-core-2026-05-06.md`)
+was conducted against `heartbit-core` across all attack surfaces (LLM,
+MCP, A2A, filesystem, network, auth, agent, memory). This release lands
+remediation for all Critical, High, Medium, and Low/Info findings.
+
+### Changed — Breaking
+
+- **`AuditMode::default()` is now `MetadataOnly`** (was `Full`). Privacy-
+  by-default for regulated deployments — audit records keep tool names,
+  timing, token counts, verdicts, hooks, model labels, but not tool
+  inputs / outputs / response text. Operators wanting full content
+  capture must opt in with `config.audit_mode = AuditMode::Full;`. The
+  recursive `strip_content` allow-list (F-AUTH-3) ensures nested fields
+  are also redacted. (F-AUTH-6)
+- **5 prior High BREAKING changes** to tool/sandbox/auth APIs landed in
+  the same window — see commit `987f9b6` for the trait signature
+  changes (tenant scoping on stores, etc.).
+
+### Fixed — Critical (6)
+
+- 6 Critical findings in `heartbit-core` closed in commit `3c7fc8b`,
+  including DNS rebinding mitigation refinements, command injection
+  hardening, and tenant scope enforcement on shared stores.
+
+### Fixed — High (17)
+
+- 12 non-breaking + 5 breaking High findings closed in `8502fa8` and
+  `987f9b6` — covering sandbox path policy, redirect handling on LLM
+  providers, tool-name repair Levenshtein bypass, MCP token cache
+  isolation, and pre-tool guardrail ordering.
+
+### Fixed — Medium (8)
+
+- 8 Medium hardening findings closed in `187e19c` — reqwest
+  `redirect::Policy::none()`, `https_only(true)`, `connect_timeout`,
+  `no_proxy()`, SSE bounded buffer, MCP stdio line cap.
+
+### Fixed — Network (1)
+
+- **F-NET-2: DNS rebinding.** Custom `SafeDnsResolver` re-applies the IP
+  blocklist at connect time (not just parse time), wired into both
+  `safe_client_builder` and `vendor_client_builder`. (`52c0b58`)
+
+### Fixed — Low/Info (18)
+
+- **Filesystem (5):** `MAX_WALK_DEPTH=8` on skill discovery (F-FS-7);
+  nonce-bearing `__HEARTBIT_CWD_<uuid>__` marker (F-FS-8); default
+  protected paths `/etc`, `/root`, `~/.ssh`, `~/.aws`, `~/.config/gcloud`
+  (F-FS-9); `is_protected` normalizes parent-of relationships (F-FS-11);
+  patch.rs defense-in-depth (F-FS-12).
+- **MCP / A2A (5):** `sanitize_log_field` (F-MCP-6); `TokenCacheKey`
+  4-tuple struct prevents resource collision (F-MCP-8); sampling
+  capability removed from advertisement (F-MCP-9); strict JSON-RPC id
+  verification per spec 2.0 (F-MCP-13); `redact_idp_body` scrubs JWTs /
+  bearer tokens / `*_token` fields from IdP error logs (F-MCP-16).
+- **Memory (2):** `SafeDnsResolver`-equipped client + redirect policy on
+  embedding provider (F-MEM-4); tenant filter uses
+  `author_tenant_id.as_deref` comparison (F-MEM-5).
+- **Network (2):** generic User-Agent, no version leak (F-NET-5);
+  `sanitize_html_for_agent` strips `<script>`, `<style>`, `<iframe>`,
+  `<object>`, `<embed>`, and `on*` attributes (F-NET-7).
+- **Channel/Auth (1):** `PendingEntry` binds nonce to `session_id`,
+  `resolve_input_for_session` enforces both — no cross-session input
+  injection (F-AUTH-5).
+- **Agent (3):** `PERMISSIONS_FILE_MAX_BYTES=1MB` +
+  `PERMISSIONS_MAX_RULES=10000` DoS bounds (F-AGENT-13); multilingual
+  E.164 + NANP phone regex for PII recall (F-AGENT-15);
+  `HeuristicGate` refusal patterns trimmed to 4 high-precision
+  phrases (F-LLM-7).
+
+### Notes
+
+- `rustls-webpki` bumped to `0.103.13` to patch RUSTSEC-2026-0049/
+  0098/0099/0104. `rsa` (Marvin) and `quinn-proto` confirmed not in
+  `heartbit-core`'s dependency tree via `cargo tree --invert`.
+- Reqwest 0.12 redirect strip list confirmed by reading
+  `redirect.rs:239-251` upstream — only `AUTHORIZATION`, `COOKIE`,
+  `cookie2`, `PROXY_AUTHORIZATION`, `WWW_AUTHENTICATE` are stripped on
+  cross-host redirect; custom auth headers (`x-api-key`,
+  `x-goog-api-key`) require the explicit `redirect::Policy::none()`
+  applied here.
+- 2330 `heartbit-core` + 454 umbrella+CLI tests green.
+  `cargo fmt -- --check && cargo clippy --tests -- -D warnings` clean.
+
 ## [2026.505.1] - 2026-05-05
 
 ### Fixed — Runtime Usability Audit
