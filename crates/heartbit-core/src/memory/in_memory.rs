@@ -128,71 +128,6 @@ impl Memory for InMemoryStore {
             // or store() could interleave between filter and access-count update.
             let mut entries = self.entries.write();
 
-            let mut results: Vec<MemoryEntry> = entries
-                .values()
-                .filter(|e| {
-                    // Tenant isolation: only return entries for this scope's tenant.
-                    if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
-                        return false;
-                    }
-                    if let Some(ref text) = query.text {
-                        let lower_content = e.content.to_lowercase();
-                        let lower_keywords: Vec<String> =
-                            e.keywords.iter().map(|k| k.to_lowercase()).collect();
-                        let has_match = text.to_lowercase().split_whitespace().any(|token| {
-                            lower_content.contains(token)
-                                || lower_keywords.iter().any(|k| k.contains(token))
-                        });
-                        if !has_match {
-                            return false;
-                        }
-                    }
-                    if let Some(ref cat) = query.category
-                        && e.category != *cat
-                    {
-                        return false;
-                    }
-                    if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
-                        return false;
-                    }
-                    if let Some(ref agent) = query.agent {
-                        if e.agent != *agent {
-                            return false;
-                        }
-                    } else if let Some(ref prefix) = query.agent_prefix
-                        && !e.agent.starts_with(prefix.as_str())
-                    {
-                        return false;
-                    }
-                    if let Some(ref mt) = query.memory_type
-                        && e.memory_type != *mt
-                    {
-                        return false;
-                    }
-                    if let Some(min_s) = query.min_strength {
-                        let now = Utc::now();
-                        let eff = effective_strength(
-                            e.strength,
-                            e.last_accessed,
-                            now,
-                            STRENGTH_DECAY_RATE,
-                        );
-                        if eff < min_s {
-                            return false;
-                        }
-                    }
-                    if let Some(max_conf) = query.max_confidentiality
-                        && e.confidentiality > max_conf
-                    {
-                        return false;
-                    }
-                    true
-                })
-                .cloned()
-                .collect();
-
-            // Sort by composite score descending (recency + importance + relevance)
-            // Relevance uses BM25 scoring over content + keywords.
             let now = Utc::now();
             let query_tokens: Vec<String> = query
                 .text
@@ -206,20 +141,94 @@ impl Memory for InMemoryStore {
                         .collect()
                 })
                 .unwrap_or_default();
+            let lower_query_tokens_for_filter: Vec<String> = query_tokens.clone();
 
-            // Compute average document length for BM25 normalization
-            let avgdl = if results.is_empty() {
+            // PERF (P-MEM-5): collect candidate entries as references so we
+            // never clone the 10k+ entries that pass the filter — only the
+            // top-K (after limit and graph expansion) ever turn into owned
+            // `MemoryEntry`s, and that final clone happens against
+            // `entries.get_mut(&id)` below.
+            //
+            // Filter ordering: cheap field comparisons first, then the
+            // text-substring scan last so we don't lowercase content for
+            // entries that fail tenant / agent / category / tag checks.
+            let candidates: Vec<&MemoryEntry> = entries
+                .values()
+                .filter(|e| {
+                    // Tenant isolation first — fastest reject.
+                    if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
+                        return false;
+                    }
+                    if let Some(ref agent) = query.agent {
+                        if e.agent != *agent {
+                            return false;
+                        }
+                    } else if let Some(ref prefix) = query.agent_prefix
+                        && !e.agent.starts_with(prefix.as_str())
+                    {
+                        return false;
+                    }
+                    if let Some(ref cat) = query.category
+                        && e.category != *cat
+                    {
+                        return false;
+                    }
+                    if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
+                        return false;
+                    }
+                    if let Some(ref mt) = query.memory_type
+                        && e.memory_type != *mt
+                    {
+                        return false;
+                    }
+                    if let Some(max_conf) = query.max_confidentiality
+                        && e.confidentiality > max_conf
+                    {
+                        return false;
+                    }
+                    if let Some(min_s) = query.min_strength {
+                        let eff = effective_strength(
+                            e.strength,
+                            e.last_accessed,
+                            now,
+                            STRENGTH_DECAY_RATE,
+                        );
+                        if eff < min_s {
+                            return false;
+                        }
+                    }
+                    // Expensive filter (tokenisation) last.
+                    if !lower_query_tokens_for_filter.is_empty() {
+                        let lower_content = e.content.to_lowercase();
+                        let lower_keywords: Vec<String> =
+                            e.keywords.iter().map(|k| k.to_lowercase()).collect();
+                        let has_match = lower_query_tokens_for_filter.iter().any(|token| {
+                            lower_content.contains(token.as_str())
+                                || lower_keywords.iter().any(|k| k.contains(token.as_str()))
+                        });
+                        if !has_match {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            // Compute average document length for BM25 normalisation.
+            let avgdl = if candidates.is_empty() {
                 1.0
             } else {
-                let total_words: usize = results
+                let total_words: usize = candidates
                     .iter()
                     .map(|e| e.content.split_whitespace().count())
                     .sum();
-                (total_words as f64 / results.len() as f64).max(1.0)
+                (total_words as f64 / candidates.len() as f64).max(1.0)
             };
 
-            // Pre-compute BM25 scores into a map keyed by entry ID
-            let bm25_map: HashMap<String, f64> = results
+            // Pre-compute BM25 scores. Keyed by `&str` slices into the
+            // entries map; lifetime is tied to the immutable borrow held
+            // by `candidates` (released before any `get_mut` below).
+            let bm25_map: HashMap<&str, f64> = candidates
                 .iter()
                 .map(|e| {
                     let score = bm25::bm25_score(
@@ -230,22 +239,21 @@ impl Memory for InMemoryStore {
                         bm25::DEFAULT_K1,
                         bm25::DEFAULT_B,
                     );
-                    (e.id.clone(), score)
+                    (e.id.as_str(), score)
                 })
                 .collect();
 
             // Compute relevance scores: hybrid (BM25 + cosine via RRF) when
             // query_embedding is available, otherwise pure BM25.
-            let relevance_map: HashMap<String, f64> = if let Some(ref q_emb) = query.query_embedding
-            {
+            let relevance_map: HashMap<&str, f64> = if let Some(ref q_emb) = query.query_embedding {
                 // BM25 ranked list (descending by score)
                 let mut bm25_ranked: Vec<(&str, f64)> =
-                    bm25_map.iter().map(|(id, &s)| (id.as_str(), s)).collect();
+                    bm25_map.iter().map(|(id, &s)| (*id, s)).collect();
                 bm25_ranked
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Vector ranked list (cosine similarity, descending)
-                let mut vector_ranked: Vec<(&str, f64)> = results
+                let mut vector_ranked: Vec<(&str, f64)> = candidates
                     .iter()
                     .filter_map(|e| {
                         e.embedding
@@ -265,20 +273,26 @@ impl Memory for InMemoryStore {
                         .max(1.0);
                     bm25_map
                         .iter()
-                        .map(|(id, &s)| (id.clone(), s / max_bm25))
+                        .map(|(id, &s)| (*id, s / max_bm25))
                         .collect()
                 } else {
-                    // RRF fusion
                     let fused = hybrid::rrf_fuse(&bm25_ranked, &vector_ranked, 50);
                     let max_fused = fused
                         .iter()
                         .map(|(_, s)| *s)
                         .fold(f64::NEG_INFINITY, f64::max)
                         .max(f64::EPSILON);
-                    fused
-                        .into_iter()
-                        .map(|(id, s)| (id, s / max_fused))
-                        .collect()
+                    // `rrf_fuse` returns owned `String` keys; project them
+                    // back onto the original `&str` slices we already
+                    // hold via the bm25_map's keys to keep the lifetime
+                    // discipline consistent across both branches.
+                    let mut out: HashMap<&str, f64> = HashMap::with_capacity(fused.len());
+                    for (id_owned, score) in &fused {
+                        if let Some((k, _)) = bm25_map.get_key_value(id_owned.as_str()) {
+                            out.insert(k, score / max_fused);
+                        }
+                    }
+                    out
                 }
             } else {
                 // Pure BM25 path
@@ -289,62 +303,59 @@ impl Memory for InMemoryStore {
                     .max(1.0);
                 bm25_map
                     .iter()
-                    .map(|(id, &s)| (id.clone(), s / max_bm25))
+                    .map(|(id, &s)| (*id, s / max_bm25))
                     .collect()
             };
 
-            results.sort_by(|a, b| {
-                let relevance_a = relevance_map.get(&a.id).copied().unwrap_or(0.0);
-                let relevance_b = relevance_map.get(&b.id).copied().unwrap_or(0.0);
-                // Apply Ebbinghaus decay to strength based on last access time
-                let eff_a =
-                    effective_strength(a.strength, a.last_accessed, now, STRENGTH_DECAY_RATE);
-                let eff_b =
-                    effective_strength(b.strength, b.last_accessed, now, STRENGTH_DECAY_RATE);
-                let score_a = composite_score(
-                    &self.scoring_weights,
-                    a.created_at,
-                    now,
-                    a.importance,
-                    relevance_a,
-                    eff_a,
-                );
-                let score_b = composite_score(
-                    &self.scoring_weights,
-                    b.created_at,
-                    now,
-                    b.importance,
-                    relevance_b,
-                    eff_b,
-                );
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Pair refs with composite score (computed **once** per entry)
+            // and sort the pairs. The previous `sort_by` recomputed
+            // `effective_strength` on both elements of every comparison —
+            // at N=10k that's ~280k redundant exp() calls per recall.
+            let mut scored: Vec<(&MemoryEntry, f64)> = candidates
+                .iter()
+                .copied()
+                .map(|e| {
+                    let relevance = relevance_map.get(e.id.as_str()).copied().unwrap_or(0.0);
+                    let eff =
+                        effective_strength(e.strength, e.last_accessed, now, STRENGTH_DECAY_RATE);
+                    let score = composite_score(
+                        &self.scoring_weights,
+                        e.created_at,
+                        now,
+                        e.importance,
+                        relevance,
+                        eff,
+                    );
+                    (e, score)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            if query.limit > 0 {
-                results.truncate(query.limit);
+            if query.limit > 0 && scored.len() > query.limit {
+                scored.truncate(query.limit);
             }
 
-            // Graph expansion: follow related_ids one hop to surface linked entries
-            // that may not have matched the keyword query directly.
-            // Collect IDs to expand first to avoid borrow conflict.
+            // Graph expansion: collect related_ids that aren't already in
+            // the top-K. Uses owned `String` ids to keep lifetimes simple.
             let top_ids: std::collections::HashSet<String> =
-                results.iter().map(|e| e.id.clone()).collect();
+                scored.iter().map(|(e, _)| e.id.clone()).collect();
             let mut to_expand = Vec::new();
             let mut seen_expanded = std::collections::HashSet::new();
-            for entry in &results {
+            for (entry, _) in &scored {
                 for related_id in &entry.related_ids {
                     if !top_ids.contains(related_id) && seen_expanded.insert(related_id.clone()) {
                         to_expand.push(related_id.clone());
                     }
                 }
             }
-            let mut expanded_ids = std::collections::HashSet::new();
+
+            // Compute BM25 + composite for related entries (still under
+            // the same immutable borrow on `entries`) and append to the
+            // scored Vec.
             let min_s = query.min_strength.unwrap_or(0.0);
+            let mut expanded_added = 0usize;
             for related_id in &to_expand {
                 if let Some(related) = entries.get(related_id) {
-                    // Respect confidentiality cap for expanded entries too
                     if let Some(max_conf) = query.max_confidentiality
                         && related.confidentiality > max_conf
                     {
@@ -356,108 +367,67 @@ impl Memory for InMemoryStore {
                         now,
                         STRENGTH_DECAY_RATE,
                     );
-                    if eff >= min_s {
-                        expanded_ids.insert(related_id.clone());
-                        results.push(related.clone());
+                    if eff < min_s {
+                        continue;
                     }
+                    // Score the related entry against the same query.
+                    let relevance = bm25::bm25_score(
+                        &related.content,
+                        &related.keywords,
+                        &query_tokens,
+                        avgdl,
+                        bm25::DEFAULT_K1,
+                        bm25::DEFAULT_B,
+                    );
+                    // Normalise against the same scale as the top-K.
+                    let max_bm25 = bm25_map
+                        .values()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max)
+                        .max(1.0);
+                    let normalised = relevance / max_bm25;
+                    let score = composite_score(
+                        &self.scoring_weights,
+                        related.created_at,
+                        now,
+                        related.importance,
+                        normalised,
+                        eff,
+                    );
+                    scored.push((related, score));
+                    expanded_added += 1;
                 }
             }
 
-            // Re-score and re-sort if we expanded, then re-apply limit
-            if !expanded_ids.is_empty() {
-                // Recompute avgdl with expanded set
-                let new_avgdl = if results.is_empty() {
-                    1.0
-                } else {
-                    let total_words: usize = results
-                        .iter()
-                        .map(|e| e.content.split_whitespace().count())
-                        .sum();
-                    (total_words as f64 / results.len() as f64).max(1.0)
-                };
-
-                let new_bm25_map: HashMap<String, f64> = results
-                    .iter()
-                    .filter(|e| !bm25_map.contains_key(&e.id))
-                    .map(|e| {
-                        let score = bm25::bm25_score(
-                            &e.content,
-                            &e.keywords,
-                            &query_tokens,
-                            new_avgdl,
-                            bm25::DEFAULT_K1,
-                            bm25::DEFAULT_B,
-                        );
-                        (e.id.clone(), score)
-                    })
-                    .collect();
-
-                let combined_max = bm25_map
-                    .values()
-                    .chain(new_bm25_map.values())
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max)
-                    .max(1.0);
-
-                results.sort_by(|a, b| {
-                    let rel_a = bm25_map
-                        .get(&a.id)
-                        .or_else(|| new_bm25_map.get(&a.id))
-                        .copied()
-                        .unwrap_or(0.0)
-                        / combined_max;
-                    let rel_b = bm25_map
-                        .get(&b.id)
-                        .or_else(|| new_bm25_map.get(&b.id))
-                        .copied()
-                        .unwrap_or(0.0)
-                        / combined_max;
-                    let eff_a =
-                        effective_strength(a.strength, a.last_accessed, now, STRENGTH_DECAY_RATE);
-                    let eff_b =
-                        effective_strength(b.strength, b.last_accessed, now, STRENGTH_DECAY_RATE);
-                    let score_a = composite_score(
-                        &self.scoring_weights,
-                        a.created_at,
-                        now,
-                        a.importance,
-                        rel_a,
-                        eff_a,
-                    );
-                    let score_b = composite_score(
-                        &self.scoring_weights,
-                        b.created_at,
-                        now,
-                        b.importance,
-                        rel_b,
-                        eff_b,
-                    );
-                    score_b
-                        .partial_cmp(&score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                if query.limit > 0 {
-                    results.truncate(query.limit);
+            if expanded_added > 0 {
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if query.limit > 0 && scored.len() > query.limit {
+                    scored.truncate(query.limit);
                 }
             }
 
-            // Update access counts (always) and reinforce strength (opt-in).
-            // `reinforce: false` makes recall a pure read for strength —
-            // necessary so callers can observe the literal strength they
-            // stored without it drifting upward on every read.
+            // Collect top-K ids (owned), drop the immutable borrow on the
+            // entries map so we can call `get_mut` for the access-count
+            // updates and the *single* clone per surviving entry.
+            let top_ids_final: Vec<String> = scored.iter().map(|(e, _)| e.id.clone()).collect();
+            drop(scored);
+            drop(candidates);
+
+            // PERF (P-MEM-5): clone only the top-K, after the limit has
+            // been applied. Previously the entire filtered set was cloned
+            // before sorting / truncation — at N=10k that's ~5 MB of
+            // allocation per recall.
             let reinforce = query.reinforce;
-            for r in &mut results {
-                if let Some(e) = entries.get_mut(&r.id) {
+            let mut results: Vec<MemoryEntry> = Vec::with_capacity(top_ids_final.len());
+            for id in top_ids_final {
+                if let Some(e) = entries.get_mut(&id) {
                     e.access_count += 1;
                     e.last_accessed = now;
                     if reinforce {
                         // Ebbinghaus reinforcement: +0.2 per access, capped at 1.0.
                         e.strength = (e.strength + 0.2).min(1.0);
                     }
-                    r.access_count = e.access_count;
-                    r.last_accessed = now;
-                    r.strength = e.strength;
+                    results.push(e.clone());
                 }
             }
 
