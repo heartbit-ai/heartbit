@@ -103,7 +103,7 @@ The existing `TwitterPostTool` schema gains two optional fields:
 Behaviour:
 - If `media_url` is absent → existing path (post text-only via `POST /2/tweets`)
 - If `media_url` is present:
-  1. Fetch the image from the URL (HTTP GET; ≤5 MB; reject if HTTPS-only verification fails)
+  1. Fetch the image from the URL (HTTP GET; ≤5 MB; HTTPS recommended but not enforced — security baseline comes from `vendor_client_builder`'s SafeDnsResolver and redirect=none policy)
   2. Upload bytes via `POST /1.1/media/upload.json` (multipart form-data) → receive `media_id_string`
   3. If `media_alt_text` is set, attach it via `POST /1.1/media/metadata/create.json`
   4. Post the tweet via `POST /2/tweets` with `media.media_ids = [media_id_string]`

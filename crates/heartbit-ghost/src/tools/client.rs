@@ -95,7 +95,7 @@ impl XClient {
         access_token: Secret,
         access_token_secret: Secret,
     ) -> Result<Self, XApiError> {
-        let http = reqwest::Client::builder()
+        let http = heartbit_core::http::vendor_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| XApiError::Network(format!("failed to build HTTP client: {e}")))?;

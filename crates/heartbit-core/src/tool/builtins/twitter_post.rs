@@ -313,7 +313,7 @@ impl Tool for TwitterPostTool {
                     },
                     "media_url": {
                         "type": "string",
-                        "description": "Optional. Public HTTPS URL of one image to attach (≤5 MB, JPEG/PNG/WebP/GIF)."
+                        "description": "Optional. Public URL of one image to attach (≤5 MB, JPEG/PNG/WebP/GIF). HTTPS recommended."
                     },
                     "media_alt_text": {
                         "type": "string",
