@@ -40,6 +40,7 @@ impl Tool for PriceLookupTool {
 
     fn execute<'a>(
         &'a self,
+        _ctx: &heartbit::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, heartbit::Error>> + Send + 'a>>
     {

@@ -132,6 +132,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &crate::ExecutionContext,
             _input: serde_json::Value,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
@@ -1003,6 +1004,7 @@ mod tests {
             }
             fn execute(
                 &self,
+                _ctx: &crate::ExecutionContext,
                 _input: serde_json::Value,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
@@ -1177,6 +1179,7 @@ mod tests {
             }
             fn execute(
                 &self,
+                _ctx: &crate::ExecutionContext,
                 _input: serde_json::Value,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
@@ -1236,6 +1239,7 @@ mod tests {
             }
             fn execute(
                 &self,
+                _ctx: &crate::ExecutionContext,
                 _input: serde_json::Value,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
@@ -1731,6 +1735,7 @@ mod tests {
             }
             fn execute(
                 &self,
+                _ctx: &crate::ExecutionContext,
                 _input: serde_json::Value,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,

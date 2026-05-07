@@ -113,6 +113,7 @@ impl Tool for QuestionTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {

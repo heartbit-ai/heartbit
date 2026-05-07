@@ -95,6 +95,7 @@ impl ToolOutput {
 ///
 ///     fn execute(
 ///         &self,
+///         _ctx: &heartbit_core::ExecutionContext,
 ///         input: serde_json::Value,
 ///     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, heartbit_core::Error>> + Send + '_>> {
 ///         Box::pin(async move {
@@ -109,6 +110,7 @@ pub trait Tool: Send + Sync {
 
     fn execute(
         &self,
+        ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>>;
 }

@@ -493,6 +493,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &crate::ExecutionContext,
             input: Value,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
             Box::pin(async move {
@@ -518,6 +519,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &crate::ExecutionContext,
             _input: Value,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
             Box::pin(async move { Err(Error::Mcp("intentional failure".into())) })

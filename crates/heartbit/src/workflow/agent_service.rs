@@ -219,6 +219,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &heartbit_core::ExecutionContext,
             _input: serde_json::Value,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
             let output = self.output.clone();

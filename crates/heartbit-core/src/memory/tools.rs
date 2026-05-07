@@ -136,6 +136,7 @@ impl Tool for MemoryStoreTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -272,6 +273,7 @@ impl Tool for MemoryRecallTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -384,6 +386,7 @@ impl Tool for MemoryUpdateTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -430,6 +433,7 @@ impl Tool for MemoryForgetTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -511,6 +515,7 @@ impl Tool for MemoryConsolidateTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {

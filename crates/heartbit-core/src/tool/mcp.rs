@@ -1557,6 +1557,7 @@ impl Tool for McpTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -1618,6 +1619,7 @@ impl Tool for McpResourceTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         _input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -1729,6 +1731,7 @@ impl Tool for McpPromptTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {

@@ -357,6 +357,7 @@ impl Tool for A2aTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {

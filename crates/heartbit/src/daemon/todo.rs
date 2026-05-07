@@ -440,6 +440,7 @@ impl Tool for TodoManageTool {
 
     fn execute(
         &self,
+        _ctx: &heartbit_core::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {

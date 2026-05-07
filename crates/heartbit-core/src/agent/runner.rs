@@ -2253,6 +2253,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &crate::ExecutionContext,
             _input: serde_json::Value,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
         {

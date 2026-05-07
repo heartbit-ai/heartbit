@@ -688,6 +688,7 @@ impl Tool for DelegateTaskTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -748,6 +749,7 @@ impl Tool for FormSquadTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -1430,6 +1432,7 @@ impl Tool for SpawnAgentTool {
 
     fn execute(
         &self,
+        _ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -2587,6 +2590,7 @@ mod tests {
 
         fn execute(
             &self,
+            _ctx: &crate::ExecutionContext,
             _input: serde_json::Value,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
