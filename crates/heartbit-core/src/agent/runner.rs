@@ -2023,6 +2023,17 @@ impl<P: LlmProvider> AgentRunner<P> {
         let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         let mut join_set = tokio::task::JoinSet::new();
 
+        // Construct per-turn ExecutionContext from runner's audit fields.
+        // Phase 0: workspace, credentials, audit_sink are not yet populated on
+        // AgentRunner — leave them None until persona/credential plumbing lands.
+        let exec_ctx = crate::ExecutionContext {
+            tenant_id: self.audit_tenant_id.clone(),
+            user_id: self.audit_user_id.clone(),
+            workspace: None,
+            credentials: None,
+            audit_sink: None,
+        };
+
         for (idx, call) in calls.iter().enumerate() {
             // SECURITY (F-AGENT-1): names are already repaired upstream of the
             // permission and pre_tool guardrails. If the lookup fails here, the
@@ -2077,19 +2088,22 @@ impl<P: LlmProvider> AgentRunner<P> {
                 agent = %self.name,
                 tool_name = %call.name,
             );
+            let task_ctx = exec_ctx.clone();
             join_set.spawn(
                 async move {
                     let start = std::time::Instant::now();
                     let output = match tool {
                         Some(t) => match timeout {
-                            Some(dur) => match tokio::time::timeout(dur, t.execute(input)).await {
-                                Ok(result) => result,
-                                Err(_) => Ok(ToolOutput::error(format!(
-                                    "Tool execution timed out after {}s",
-                                    dur.as_secs_f64()
-                                ))),
-                            },
-                            None => t.execute(input).await,
+                            Some(dur) => {
+                                match tokio::time::timeout(dur, t.execute(&task_ctx, input)).await {
+                                    Ok(result) => result,
+                                    Err(_) => Ok(ToolOutput::error(format!(
+                                        "Tool execution timed out after {}s",
+                                        dur.as_secs_f64()
+                                    ))),
+                                }
+                            }
+                            None => t.execute(&task_ctx, input).await,
                         },
                         None => Ok(ToolOutput::error(format!("Tool not found: {call_name}"))),
                     };
@@ -2345,5 +2359,69 @@ mod tests {
 
         drop(runner);
         assert_eq!(tracker.snapshot()[0].1.in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_context_propagates_to_tool() {
+        use std::sync::Mutex;
+
+        use crate::ExecutionContext;
+        use crate::llm::types::ToolCall;
+
+        struct CtxCapturingTool {
+            captured_tenant: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Tool for CtxCapturingTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "ctx_capture".into(),
+                    description: "Captures the tenant_id from ExecutionContext.".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                let captured = self.captured_tenant.clone();
+                let tenant = ctx.tenant_id.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = tenant;
+                    Ok(ToolOutput::success("ok"))
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let tool = Arc::new(CtxCapturingTool {
+            captured_tenant: captured.clone(),
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .max_turns(1)
+            .tools(vec![tool as Arc<dyn Tool>])
+            .audit_user_context("test-user", "test-tenant")
+            .build()
+            .unwrap();
+
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "ctx_capture".into(),
+            input: serde_json::json!({}),
+        }];
+        let _results = runner.execute_tools_parallel(&calls, 0).await;
+
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("test-tenant"),
+            "tool did not receive the tenant_id from ExecutionContext"
+        );
     }
 }

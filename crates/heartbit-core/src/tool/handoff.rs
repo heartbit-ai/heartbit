@@ -223,10 +223,13 @@ mod tests {
         }]);
 
         let result = tool
-            .execute(json!({
-                "target": "billing",
-                "reason": "User has a billing question"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "target": "billing",
+                    "reason": "User has a billing question"
+                }),
+            )
             .await
             .unwrap();
 
@@ -244,10 +247,13 @@ mod tests {
         }]);
 
         let result = tool
-            .execute(json!({
-                "target": "nonexistent",
-                "reason": "test"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "target": "nonexistent",
+                    "reason": "test"
+                }),
+            )
             .await
             .unwrap();
 
@@ -263,11 +269,14 @@ mod tests {
         }]);
 
         let result = tool
-            .execute(json!({
-                "target": "support",
-                "reason": "needs help",
-                "context_mode": "full"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "target": "support",
+                    "reason": "needs help",
+                    "context_mode": "full"
+                }),
+            )
             .await
             .unwrap();
 
@@ -309,7 +318,12 @@ mod tests {
     #[tokio::test]
     async fn handoff_invalid_json() {
         let tool = HandoffTool::new(vec![]);
-        let result = tool.execute(json!({"wrong": "fields"})).await;
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"wrong": "fields"}),
+            )
+            .await;
         assert!(result.is_err());
     }
 

@@ -366,7 +366,13 @@ impl McpServer {
             .find(|t| t.definition().name == name)
             .ok_or_else(|| Error::Mcp(format!("Tool not found: {name}")))?;
 
-        match tool.execute(arguments).await {
+        // TODO(Task 5): construct ExecutionContext from JSON-RPC request envelope.
+        // Phase 0 placeholder: pass an empty context so the lib compiles. The
+        // MCP server does not yet carry tenant/user identity from JSON-RPC.
+        match tool
+            .execute(&crate::ExecutionContext::default(), arguments)
+            .await
+        {
             Ok(output) => Ok(JsonRpcResponse::success(
                 id.clone(),
                 tool_output_to_mcp(output),

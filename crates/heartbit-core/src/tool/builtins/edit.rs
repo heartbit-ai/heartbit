@@ -228,11 +228,14 @@ mod tests {
 
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "file_path": path.to_str().unwrap(),
-                "old_string": "hello world",
-                "new_string": "hi universe"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello world",
+                    "new_string": "hi universe"
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -251,11 +254,14 @@ mod tests {
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({
-                "file_path": path.to_str().unwrap(),
-                "old_string": "hello",
-                "new_string": "bye"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "bye"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -273,11 +279,14 @@ mod tests {
 
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "file_path": path.to_str().unwrap(),
-                "old_string": "xyz",
-                "new_string": "abc"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "xyz",
+                    "new_string": "abc"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -295,11 +304,14 @@ mod tests {
 
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "file_path": path.to_str().unwrap(),
-                "old_string": "hello",
-                "new_string": "bye"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "bye"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -317,11 +329,14 @@ mod tests {
 
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "file_path": path.to_str().unwrap(),
-                "old_string": "hello",
-                "new_string": "hello"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "hello"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -333,11 +348,14 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "file_path": "/tmp/nonexistent_heartbit_test_12345.txt",
-                "old_string": "a",
-                "new_string": "b"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": "/tmp/nonexistent_heartbit_test_12345.txt",
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -368,11 +386,14 @@ mod tests {
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
         let result = tool
-            .execute(json!({
-                "file_path": target.to_str().unwrap(),
-                "old_string": "hello",
-                "new_string": "bye"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": target.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "bye"
+                }),
+            )
             .await
             .unwrap();
         assert!(
@@ -409,11 +430,14 @@ mod tests {
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
         let result = tool
-            .execute(json!({
-                "file_path": target.to_str().unwrap(),
-                "old_string": "hello world",
-                "new_string": "goodbye world"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": target.to_str().unwrap(),
+                    "old_string": "hello world",
+                    "new_string": "goodbye world"
+                }),
+            )
             .await
             .unwrap();
         assert!(

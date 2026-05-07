@@ -305,16 +305,22 @@ mod tests {
         let read_tool = find_tool(&tools, "shared_memory_read");
 
         let result = write_tool
-            .execute(json!({
-                "content": "Important finding",
-                "category": "fact",
-                "tags": ["important"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Important finding",
+                    "category": "fact",
+                    "tags": ["important"]
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
 
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Important finding"));
         assert!(result.content.contains("agent_a")); // provenance
@@ -325,7 +331,10 @@ mod tests {
         let (_store, tools) = setup();
         let read_tool = find_tool(&tools, "shared_memory_read");
 
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert_eq!(result.content, "No shared memories found.");
     }
 
@@ -338,13 +347,19 @@ mod tests {
         // Agent A writes
         let write_a = find_tool(&tools_a, "shared_memory_write");
         write_a
-            .execute(json!({"content": "shared from A"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "shared from A"}),
+            )
             .await
             .unwrap();
 
         // Agent B can read it
         let read_b = find_tool(&tools_b, "shared_memory_read");
-        let result = read_b.execute(json!({})).await.unwrap();
+        let result = read_b
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.content.contains("shared from A"));
     }
 
@@ -358,17 +373,29 @@ mod tests {
         let write_b = find_tool(&tools_b, "shared_memory_write");
 
         write_a
-            .execute(json!({"content": "data from A"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "data from A"}),
+            )
             .await
             .unwrap();
         write_b
-            .execute(json!({"content": "data from B"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "data from B"}),
+            )
             .await
             .unwrap();
 
         // Filter by agent_a only
         let read_a = find_tool(&tools_a, "shared_memory_read");
-        let result = read_a.execute(json!({"agent": "agent_a"})).await.unwrap();
+        let result = read_a
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"agent": "agent_a"}),
+            )
+            .await
+            .unwrap();
         assert!(result.content.contains("data from A"));
         assert!(!result.content.contains("data from B"));
     }
@@ -381,11 +408,14 @@ mod tests {
         let write_tool = find_tool(&tools, "shared_memory_write");
 
         write_tool
-            .execute(json!({
-                "content": "Rust has zero-cost abstractions",
-                "keywords": ["rust", "performance", "abstractions"],
-                "summary": "Key Rust language feature"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Rust has zero-cost abstractions",
+                    "keywords": ["rust", "performance", "abstractions"],
+                    "summary": "Key Rust language feature"
+                }),
+            )
             .await
             .unwrap();
 
@@ -452,7 +482,10 @@ mod tests {
         let tools = shared_memory_tools(store.clone(), "agent_a", test_scope(), false);
         let read_tool = find_tool(&tools, "shared_memory_read");
 
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(
             !result.content.contains("secret-token"),
             "shared_memory_read must filter Confidential+Restricted; got: {}",

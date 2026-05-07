@@ -212,7 +212,10 @@ mod tests {
     async fn skill_not_found() {
         let tool = SkillTool::new();
         let result = tool
-            .execute(json!({"name": "nonexistent_skill_12345"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "nonexistent_skill_12345"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -224,22 +227,43 @@ mod tests {
         let tool = SkillTool::new();
 
         // Directory traversal
-        let result = tool.execute(json!({"name": "../../etc"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "../../etc"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid skill name"));
 
         // Forward slash
-        let result = tool.execute(json!({"name": "foo/bar"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "foo/bar"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid skill name"));
 
         // Backslash
-        let result = tool.execute(json!({"name": "foo\\bar"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "foo\\bar"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid skill name"));
 
         // Empty
-        let result = tool.execute(json!({"name": ""})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"name": ""}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Invalid skill name"));
     }
@@ -257,7 +281,13 @@ mod tests {
         std::fs::write(skills_dir.join("helper.sh"), "#!/bin/bash\n").unwrap();
 
         let tool = SkillTool::with_search_root(dir.path().to_path_buf());
-        let result = tool.execute(json!({"name": "test-skill"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "test-skill"}),
+            )
+            .await
+            .unwrap();
 
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("Test Skill"));

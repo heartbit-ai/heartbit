@@ -275,7 +275,12 @@ mod tests {
         }
 
         let tool = ImageGenerateTool::new();
-        let result = tool.execute(json!({"prompt": "a cat"})).await;
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"prompt": "a cat"}),
+            )
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("OPENROUTER_API_KEY"), "got: {err}");
@@ -288,7 +293,9 @@ mod tests {
         }
 
         let tool = ImageGenerateTool::new();
-        let result = tool.execute(json!({})).await;
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("prompt is required"), "got: {err}");

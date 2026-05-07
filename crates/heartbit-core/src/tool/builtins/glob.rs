@@ -209,10 +209,13 @@ mod tests {
 
         let tool = GlobTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "*.rs",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "*.rs",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -231,10 +234,13 @@ mod tests {
 
         let tool = GlobTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "**/*.rs",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "**/*.rs",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -249,10 +255,13 @@ mod tests {
 
         let tool = GlobTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "*.xyz",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "*.xyz",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -267,10 +276,13 @@ mod tests {
 
         let tool = GlobTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "*.rs",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "*.rs",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -282,10 +294,13 @@ mod tests {
     async fn glob_nonexistent_path() {
         let tool = GlobTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "*.rs",
-                "path": "/tmp/nonexistent_heartbit_test_dir_12345"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "*.rs",
+                    "path": "/tmp/nonexistent_heartbit_test_dir_12345"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);

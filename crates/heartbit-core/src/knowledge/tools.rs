@@ -192,7 +192,10 @@ mod tests {
 
         let search = find_tool(&tools, "knowledge_search");
         let result = search
-            .execute(json!({"query": "rust memory"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "rust memory"}),
+            )
             .await
             .unwrap();
 
@@ -207,7 +210,10 @@ mod tests {
         let (_kb, tools) = setup();
         let search = find_tool(&tools, "knowledge_search");
         let result = search
-            .execute(json!({"query": "nonexistent topic xyz"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "nonexistent topic xyz"}),
+            )
             .await
             .unwrap();
 
@@ -251,7 +257,10 @@ mod tests {
 
         let search = find_tool(&tools, "knowledge_search");
         let result = search
-            .execute(json!({"query": "rust", "source_filter": "api/"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "rust", "source_filter": "api/"}),
+            )
             .await
             .unwrap();
 
@@ -283,7 +292,10 @@ mod tests {
 
         let search = find_tool(&tools, "knowledge_search");
         let result = search
-            .execute(json!({"query": "rust", "limit": 3}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "rust", "limit": 3}),
+            )
             .await
             .unwrap();
 
@@ -295,7 +307,9 @@ mod tests {
     async fn search_rejects_missing_query() {
         let (_kb, tools) = setup();
         let search = find_tool(&tools, "knowledge_search");
-        let result = search.execute(json!({})).await;
+        let result = search
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err(), "should fail on missing required 'query'");
     }
 
@@ -321,7 +335,13 @@ mod tests {
         }
 
         let search = find_tool(&tools, "knowledge_search");
-        let result = search.execute(json!({"query": "rust"})).await.unwrap();
+        let result = search
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "rust"}),
+            )
+            .await
+            .unwrap();
 
         assert!(!result.is_error);
         assert!(result.content.contains("Found 5 result"));

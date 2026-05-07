@@ -520,7 +520,13 @@ mod tests {
         // No workspace — absolute paths are accepted by resolve_path
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected sandbox violation, got: {:?}",
@@ -559,7 +565,13 @@ mod tests {
         // No workspace — absolute paths are accepted by resolve_path
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             !result.is_error,
             "expected success, got: {:?}",
@@ -582,7 +594,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));
         assert!(result.content.contains("1 addition"));
@@ -606,7 +624,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("has not been read yet"));
     }
@@ -616,7 +640,10 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"patch_text": "no diff here\n"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": "no diff here\n"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -654,7 +681,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -680,7 +713,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -706,7 +745,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected error but got: {}",
@@ -735,7 +780,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected error but got: {}",
@@ -763,7 +814,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(!path.exists());
     }
@@ -827,7 +884,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("2 addition"));
         assert!(result.content.contains("2 removal"));
@@ -858,7 +921,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -885,7 +954,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("2 file(s) changed"));
 
@@ -921,7 +996,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected error but got: {}",
@@ -950,7 +1031,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected error but got: {}",
@@ -981,7 +1068,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.is_error,
             "expected error but got: {}",
@@ -1079,7 +1172,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));
 
@@ -1105,7 +1204,13 @@ mod tests {
         );
 
         let tool = PatchTool::new(tracker, None, Arc::new(Vec::new()));
-        let result = tool.execute(json!({"patch_text": patch})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("1 file(s) changed"));
 

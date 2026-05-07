@@ -381,7 +381,10 @@ mod tests {
     async fn bash_echo() {
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "echo hello"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo hello"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -392,7 +395,13 @@ mod tests {
     #[tokio::test]
     async fn bash_failing_command() {
         let tool = BashTool::new();
-        let result = tool.execute(json!({"command": "exit 42"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "exit 42"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("exit code: 42"));
     }
@@ -403,12 +412,21 @@ mod tests {
         let tool = BashTool::new();
 
         // Change directory
-        tool.execute(json!({"command": format!("cd {}", dir.path().display())}))
-            .await
-            .unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"command": format!("cd {}", dir.path().display())}),
+        )
+        .await
+        .unwrap();
 
         // Verify pwd shows the new directory
-        let result = tool.execute(json!({"command": "pwd"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "pwd"}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.content.contains(&dir.path().display().to_string()),
             "expected cwd to be {}, got: {}",
@@ -421,7 +439,10 @@ mod tests {
     async fn bash_timeout() {
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "sleep 10", "timeout": 500}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "sleep 10", "timeout": 500}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -432,7 +453,10 @@ mod tests {
     async fn bash_captures_stderr() {
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "echo err >&2"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo err >&2"}),
+            )
             .await
             .unwrap();
         assert!(result.content.contains("err"));
@@ -507,10 +531,21 @@ mod tests {
         let tool = BashTool::with_sandbox(ws.clone(), crate::workspace::EnvPolicy::Inherit);
 
         // Try to cd outside workspace
-        tool.execute(json!({"command": "cd /tmp"})).await.unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"command": "cd /tmp"}),
+        )
+        .await
+        .unwrap();
 
         // Verify cwd stayed inside workspace
-        let result = tool.execute(json!({"command": "pwd"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "pwd"}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.content.contains(&ws.display().to_string()),
             "cwd should stay in workspace after cd /tmp, got: {}",
@@ -527,9 +562,20 @@ mod tests {
 
         let tool = BashTool::with_sandbox(ws, crate::workspace::EnvPolicy::Inherit);
 
-        tool.execute(json!({"command": "cd subdir"})).await.unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"command": "cd subdir"}),
+        )
+        .await
+        .unwrap();
 
-        let result = tool.execute(json!({"command": "pwd"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "pwd"}),
+            )
+            .await
+            .unwrap();
         assert!(
             result.content.contains("subdir"),
             "cwd should be in subdir, got: {}",
@@ -541,7 +587,10 @@ mod tests {
     async fn bash_trailing_ampersand_no_syntax_error() {
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "sleep 0.01 &"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "sleep 0.01 &"}),
+            )
             .await
             .unwrap();
         assert!(
@@ -556,7 +605,10 @@ mod tests {
     async fn bash_background_with_foreground() {
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "echo before & echo after"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo before & echo after"}),
+            )
             .await
             .unwrap();
         assert!(
@@ -579,7 +631,10 @@ mod tests {
             EnvPolicy::Allowlist(vec!["PATH".into(), "HOME".into()]),
         );
         let result = tool
-            .execute(json!({"command": "echo $__HEARTBIT_TEST_SECRET"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo $__HEARTBIT_TEST_SECRET"}),
+            )
             .await
             .unwrap();
         // Should NOT contain the secret since it's not in the allowlist
@@ -597,7 +652,10 @@ mod tests {
         unsafe { std::env::set_var("__HEARTBIT_TEST_VAR", "visible_value") };
         let tool = BashTool::new();
         let result = tool
-            .execute(json!({"command": "echo $__HEARTBIT_TEST_VAR"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo $__HEARTBIT_TEST_VAR"}),
+            )
             .await
             .unwrap();
         assert!(result.content.contains("visible_value"));
@@ -626,7 +684,10 @@ mod tests {
         .with_path_policy(policy);
 
         let result = tool
-            .execute(json!({"command": "echo hello"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo hello"}),
+            )
             .await
             .unwrap();
         assert!(
@@ -662,7 +723,10 @@ mod tests {
         .with_path_policy(policy);
 
         let result = tool
-            .execute(json!({"command": "echo hello"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo hello"}),
+            )
             .await
             .unwrap();
         assert!(

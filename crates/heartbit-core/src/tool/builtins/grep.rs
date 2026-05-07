@@ -328,10 +328,13 @@ mod tests {
 
         let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "hello",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "hello",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -347,10 +350,13 @@ mod tests {
 
         let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "xyz_not_here",
-                "path": path.to_str().unwrap()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "xyz_not_here",
+                    "path": path.to_str().unwrap()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -365,11 +371,14 @@ mod tests {
 
         let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "$5.00",
-                "path": path.to_str().unwrap(),
-                "literal": true
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "$5.00",
+                    "path": path.to_str().unwrap(),
+                    "literal": true
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -380,10 +389,13 @@ mod tests {
     async fn grep_nonexistent_path() {
         let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "test",
-                "path": "/tmp/nonexistent_heartbit_test_dir_12345"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "test",
+                    "path": "/tmp/nonexistent_heartbit_test_dir_12345"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -398,11 +410,14 @@ mod tests {
 
         let tool = GrepTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "pattern": "hello",
-                "path": dir.path().to_str().unwrap(),
-                "include": "*.rs"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "hello",
+                    "path": dir.path().to_str().unwrap(),
+                    "include": "*.rs"
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);

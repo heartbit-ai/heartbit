@@ -418,7 +418,10 @@ mod tests {
     async fn webfetch_rejects_file_scheme() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "file:///etc/passwd"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "file:///etc/passwd"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -433,7 +436,10 @@ mod tests {
     async fn webfetch_rejects_ftp_scheme() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "ftp://example.com/file"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "ftp://example.com/file"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -456,7 +462,10 @@ mod tests {
     async fn rejects_uppercase_ftp_scheme() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "FTP://example.com/file"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "FTP://example.com/file"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -471,7 +480,10 @@ mod tests {
     async fn webfetch_rejects_loopback() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "http://127.0.0.1/"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "http://127.0.0.1/"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error, "loopback must be rejected by default");
@@ -486,7 +498,10 @@ mod tests {
     async fn webfetch_rejects_imds() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "http://169.254.169.254/latest/meta-data/"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error, "AWS/GCE IMDS must be rejected");
@@ -496,7 +511,10 @@ mod tests {
     async fn webfetch_rejects_rfc1918() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "http://10.0.0.1/"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "http://10.0.0.1/"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -506,7 +524,10 @@ mod tests {
     async fn webfetch_rejects_localhost_dns() {
         let tool = WebFetchTool::new();
         let result = tool
-            .execute(json!({"url": "http://localhost/"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "http://localhost/"}),
+            )
             .await
             .unwrap();
         assert!(
@@ -524,7 +545,12 @@ mod tests {
         // The request-level failure may surface as either
         // `Ok(ToolOutput::error(..))` or `Err(Error::Agent(..))`; either way
         // the message must NOT contain the private-IP rejection text.
-        let outcome = tool.execute(json!({"url": "http://127.0.0.1:1/"})).await;
+        let outcome = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"url": "http://127.0.0.1:1/"}),
+            )
+            .await;
         let message = match outcome {
             Ok(out) => {
                 assert!(out.is_error, "request to closed port should error");

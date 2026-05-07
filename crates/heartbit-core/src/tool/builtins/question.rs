@@ -195,17 +195,20 @@ mod tests {
 
         let tool = QuestionTool::new(callback);
         let result = tool
-            .execute(json!({
-                "questions": [{
-                    "question": "Which color?",
-                    "header": "Color",
-                    "options": [
-                        {"label": "Red", "description": "A warm color"},
-                        {"label": "Blue", "description": "A cool color"}
-                    ],
-                    "multiple": false
-                }]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "questions": [{
+                        "question": "Which color?",
+                        "header": "Color",
+                        "options": [
+                            {"label": "Red", "description": "A warm color"},
+                            {"label": "Blue", "description": "A cool color"}
+                        ],
+                        "multiple": false
+                    }]
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -218,7 +221,13 @@ mod tests {
             Arc::new(|_| Box::pin(async { Ok(QuestionResponse { answers: vec![] }) }));
 
         let tool = QuestionTool::new(callback);
-        let result = tool.execute(json!({"questions": []})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"questions": []}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("At least one question"));
     }
@@ -232,14 +241,17 @@ mod tests {
 
         // Zero options
         let result = tool
-            .execute(json!({
-                "questions": [{
-                    "question": "Pick one",
-                    "header": "Choice",
-                    "options": [],
-                    "multiple": false
-                }]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "questions": [{
+                        "question": "Pick one",
+                        "header": "Choice",
+                        "options": [],
+                        "multiple": false
+                    }]
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -247,14 +259,17 @@ mod tests {
 
         // One option (also rejected)
         let result = tool
-            .execute(json!({
-                "questions": [{
-                    "question": "Pick one",
-                    "header": "Choice",
-                    "options": [{"label": "Only", "description": "Single option"}],
-                    "multiple": false
-                }]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "questions": [{
+                        "question": "Pick one",
+                        "header": "Choice",
+                        "options": [{"label": "Only", "description": "Single option"}],
+                        "multiple": false
+                    }]
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -274,17 +289,20 @@ mod tests {
 
         let tool = QuestionTool::new(callback);
         let result = tool
-            .execute(json!({
-                "questions": [{
-                    "question": "Pick one",
-                    "header": "Choice",
-                    "options": [
-                        {"label": "A", "description": "Option A"},
-                        {"label": "B", "description": "Option B"}
-                    ],
-                    "multiple": false
-                }]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "questions": [{
+                        "question": "Pick one",
+                        "header": "Choice",
+                        "options": [
+                            {"label": "A", "description": "Option A"},
+                            {"label": "B", "description": "Option B"}
+                        ],
+                        "multiple": false
+                    }]
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -302,17 +320,20 @@ mod tests {
 
         let tool = QuestionTool::new(callback);
         let result = tool
-            .execute(json!({
-                "questions": [{
-                    "question": "Pick one",
-                    "header": "Choice",
-                    "options": [
-                        {"label": "A", "description": "Option A"},
-                        {"label": "B", "description": "Option B"}
-                    ],
-                    "multiple": false
-                }]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "questions": [{
+                        "question": "Pick one",
+                        "header": "Choice",
+                        "options": [
+                            {"label": "A", "description": "Option A"},
+                            {"label": "B", "description": "Option B"}
+                        ],
+                        "multiple": false
+                    }]
+                }),
+            )
             .await
             .unwrap(); // Should not propagate error
         assert!(result.is_error);

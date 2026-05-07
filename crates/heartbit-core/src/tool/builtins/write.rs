@@ -178,7 +178,10 @@ mod tests {
         let tool = WriteTool::new(tracker.clone(), None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "content": "hello world"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "content": "hello world"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -202,7 +205,10 @@ mod tests {
         let tool = WriteTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "content": "nested"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "content": "nested"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -220,7 +226,10 @@ mod tests {
 
         // Try to write without reading first
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "content": "new content"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "content": "new content"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -238,7 +247,10 @@ mod tests {
 
         let tool = WriteTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "content": "same content"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "content": "same content"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -256,7 +268,10 @@ mod tests {
 
         let tool = WriteTool::new(tracker, None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "content": "updated"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "content": "updated"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -282,10 +297,13 @@ mod tests {
 
         let target = outside.path().join("evil.txt");
         let result = tool
-            .execute(serde_json::json!({
-                "file_path": target.to_string_lossy(),
-                "content": "x"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({
+                    "file_path": target.to_string_lossy(),
+                    "content": "x"
+                }),
+            )
             .await
             .unwrap();
         assert!(
@@ -318,10 +336,13 @@ mod tests {
 
         let target = allowed.path().join("ok.txt");
         let result = tool
-            .execute(serde_json::json!({
-                "file_path": target.to_string_lossy(),
-                "content": "x"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({
+                    "file_path": target.to_string_lossy(),
+                    "content": "x"
+                }),
+            )
             .await
             .unwrap();
         assert!(
@@ -371,10 +392,13 @@ mod tests {
         // `Ok(ToolOutput::error)` from the policy reject. Both prove the
         // security invariant; the victim file must remain untouched.
         let outcome = tool
-            .execute(serde_json::json!({
-                "file_path": link.to_string_lossy(),
-                "content": "PWNED"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({
+                    "file_path": link.to_string_lossy(),
+                    "content": "PWNED"
+                }),
+            )
             .await;
         match outcome {
             Ok(r) => assert!(

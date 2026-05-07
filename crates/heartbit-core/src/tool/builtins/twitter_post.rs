@@ -354,7 +354,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_text() {
         let tool = TwitterPostTool::new(test_credentials());
-        let result = tool.execute(json!({"text": ""})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"text": ""}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("must not be empty"));
     }
@@ -363,7 +366,10 @@ mod tests {
     async fn rejects_text_too_long() {
         let tool = TwitterPostTool::new(test_credentials());
         let long = "a".repeat(281);
-        let result = tool.execute(json!({"text": long})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"text": long}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("exceeds 280 characters"));
     }
@@ -371,7 +377,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_text() {
         let tool = TwitterPostTool::new(test_credentials());
-        let result = tool.execute(json!({})).await;
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("text is required"), "got: {err}");
@@ -391,7 +399,9 @@ mod tests {
         // 280 chars should pass validation (will fail at HTTP level, but that's expected)
         let tool = TwitterPostTool::new(test_credentials());
         let text = "a".repeat(280);
-        let result = tool.execute(json!({"text": text})).await;
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"text": text}))
+            .await;
         // Should not be a validation error — will fail at HTTP level
         match result {
             Ok(output) => {

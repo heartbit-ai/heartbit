@@ -277,19 +277,25 @@ mod tests {
 
         // Write some todos
         let result = write_tool
-            .execute(json!({
-                "todos": [
-                    {"content": "Fix bug", "status": "in_progress", "priority": "high"},
-                    {"content": "Write tests", "status": "pending", "priority": "medium"}
-                ]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "todos": [
+                        {"content": "Fix bug", "status": "in_progress", "priority": "high"},
+                        {"content": "Write tests", "status": "pending", "priority": "medium"}
+                    ]
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("2 items"));
 
         // Read them back
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Fix bug"));
         assert!(result.content.contains("[HIGH]"));
@@ -304,12 +310,15 @@ mod tests {
         let write_tool = &tools[0];
 
         let result = write_tool
-            .execute(json!({
-                "todos": [
-                    {"content": "Task 1", "status": "in_progress", "priority": "high"},
-                    {"content": "Task 2", "status": "in_progress", "priority": "high"}
-                ]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "todos": [
+                        {"content": "Task 1", "status": "in_progress", "priority": "high"},
+                        {"content": "Task 2", "status": "in_progress", "priority": "high"}
+                    ]
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -322,7 +331,10 @@ mod tests {
         let tools = todo_tools(store);
         let read_tool = &tools[1];
 
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("No todos"));
     }
@@ -336,19 +348,26 @@ mod tests {
 
         // First write
         write_tool
-            .execute(json!({"todos": [{"content": "Old", "status": "pending", "priority": "low"}]}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"todos": [{"content": "Old", "status": "pending", "priority": "low"}]}),
+            )
             .await
             .unwrap();
 
         // Second write replaces
         write_tool
             .execute(
+                &crate::ExecutionContext::default(),
                 json!({"todos": [{"content": "New", "status": "completed", "priority": "high"}]}),
             )
             .await
             .unwrap();
 
-        let result = read_tool.execute(json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.content.contains("New"));
         assert!(!result.content.contains("Old"));
     }

@@ -672,11 +672,14 @@ mod tests {
         let tool = find_tool(&tools, "memory_store");
 
         let result = tool
-            .execute(json!({
-                "content": "Rust is memory-safe",
-                "category": "fact",
-                "tags": ["rust", "safety"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Rust is memory-safe",
+                    "category": "fact",
+                    "tags": ["rust", "safety"]
+                }),
+            )
             .await
             .unwrap();
 
@@ -707,21 +710,36 @@ mod tests {
 
         // Store some memories
         store_tool
-            .execute(json!({"content": "Rust is fast", "category": "fact"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "Rust is fast", "category": "fact"}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "Python is slow", "category": "observation"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "Python is slow", "category": "observation"}),
+            )
             .await
             .unwrap();
 
         // Recall all
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Found 2 memories"));
 
         // Recall by query
-        let result = recall_tool.execute(json!({"query": "rust"})).await.unwrap();
+        let result = recall_tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "rust"}),
+            )
+            .await
+            .unwrap();
         assert!(result.content.contains("Found 1 memory:"));
         assert!(result.content.contains("Rust is fast"));
     }
@@ -731,7 +749,10 @@ mod tests {
         let (_store, tools) = setup();
         let recall_tool = find_tool(&tools, "memory_recall");
 
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, "No memories found.");
     }
@@ -743,7 +764,10 @@ mod tests {
         let update_tool = find_tool(&tools, "memory_update");
 
         store_tool
-            .execute(json!({"content": "original"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "original"}),
+            )
             .await
             .unwrap();
 
@@ -761,7 +785,10 @@ mod tests {
         let id = &entries[0].id;
 
         let result = update_tool
-            .execute(json!({"id": id, "content": "updated"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"id": id, "content": "updated"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -786,7 +813,10 @@ mod tests {
         let forget_tool = find_tool(&tools, "memory_forget");
 
         store_tool
-            .execute(json!({"content": "to delete"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "to delete"}),
+            )
             .await
             .unwrap();
 
@@ -802,7 +832,10 @@ mod tests {
             .unwrap();
         let id = &entries[0].id;
 
-        let result = forget_tool.execute(json!({"id": id})).await.unwrap();
+        let result = forget_tool
+            .execute(&crate::ExecutionContext::default(), json!({"id": id}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Deleted"));
 
@@ -825,7 +858,10 @@ mod tests {
         let forget_tool = find_tool(&tools, "memory_forget");
 
         let result = forget_tool
-            .execute(json!({"id": "nonexistent"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"id": "nonexistent"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -839,7 +875,12 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({"content": "test"})).await.unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"content": "test"}),
+        )
+        .await
+        .unwrap();
 
         let entries = store
             .recall(
@@ -859,9 +900,12 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({"content": "critical", "importance": 9}))
-            .await
-            .unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"content": "critical", "importance": 9}),
+        )
+        .await
+        .unwrap();
 
         let entries = store
             .recall(
@@ -882,9 +926,12 @@ mod tests {
         let tool = find_tool(&tools, "memory_store");
 
         // Value > 10 should clamp to 10
-        tool.execute(json!({"content": "over", "importance": 15}))
-            .await
-            .unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"content": "over", "importance": 15}),
+        )
+        .await
+        .unwrap();
 
         let entries = store
             .recall(
@@ -908,15 +955,24 @@ mod tests {
         let recall_tool = find_tool(&tools, "memory_recall");
 
         store_tool
-            .execute(json!({"content": "first memory"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "first memory"}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "second memory"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "second memory"}),
+            )
             .await
             .unwrap();
 
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.content.contains("#1"), "should show rank #1");
         assert!(result.content.contains("#2"), "should show rank #2");
     }
@@ -928,11 +984,17 @@ mod tests {
         let recall_tool = find_tool(&tools, "memory_recall");
 
         store_tool
-            .execute(json!({"content": "important thing", "importance": 8}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "important thing", "importance": 8}),
+            )
             .await
             .unwrap();
 
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.content.contains("importance:8"));
     }
 
@@ -945,12 +1007,18 @@ mod tests {
         // Content with multi-byte UTF-8 characters (each emoji is 4 bytes)
         let content = "🦀".repeat(100); // 400 bytes, 100 chars
         store_tool
-            .execute(json!({"content": content}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": content}),
+            )
             .await
             .unwrap();
 
         // Should not panic on non-ASCII content
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Found 1 memory"));
     }
@@ -964,11 +1032,17 @@ mod tests {
         // 500 ASCII chars — should be truncated to 200 + "..."
         let content = "a".repeat(500);
         store_tool
-            .execute(json!({"content": content}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": content}),
+            )
             .await
             .unwrap();
 
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("..."));
         // Should NOT contain all 500 'a's
@@ -984,11 +1058,17 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         store_tool
-            .execute(json!({"content": "fact A"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "fact A"}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "fact B"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "fact B"}),
+            )
             .await
             .unwrap();
 
@@ -1007,11 +1087,14 @@ mod tests {
         let id_b = entries[1].id.clone();
 
         let result = consolidate_tool
-            .execute(json!({
-                "source_ids": [id_a, id_b],
-                "content": "Combined A and B",
-                "category": "fact"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": [id_a, id_b],
+                    "content": "Combined A and B",
+                    "category": "fact"
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -1038,10 +1121,13 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         let result = consolidate_tool
-            .execute(json!({
-                "source_ids": ["only-one"],
-                "content": "merged"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": ["only-one"],
+                    "content": "merged"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -1055,7 +1141,10 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         store_tool
-            .execute(json!({"content": "exists"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "exists"}),
+            )
             .await
             .unwrap();
 
@@ -1072,10 +1161,13 @@ mod tests {
         let real_id = entries[0].id.clone();
 
         let result = consolidate_tool
-            .execute(json!({
-                "source_ids": [real_id, "nonexistent-id"],
-                "content": "partial consolidation"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": [real_id, "nonexistent-id"],
+                    "content": "partial consolidation"
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -1090,10 +1182,13 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         let result = consolidate_tool
-            .execute(json!({
-                "source_ids": ["fake1", "fake2"],
-                "content": "nope"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": ["fake1", "fake2"],
+                    "content": "nope"
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -1124,11 +1219,17 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         store_tool
-            .execute(json!({"content": "a", "importance": 3}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "a", "importance": 3}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "b", "importance": 7}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "b", "importance": 7}),
+            )
             .await
             .unwrap();
 
@@ -1146,11 +1247,14 @@ mod tests {
         let id_b = entries[1].id.clone();
 
         consolidate_tool
-            .execute(json!({
-                "source_ids": [id_a, id_b],
-                "content": "merged",
-                "importance": 9
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": [id_a, id_b],
+                    "content": "merged",
+                    "importance": 9
+                }),
+            )
             .await
             .unwrap();
 
@@ -1173,8 +1277,14 @@ mod tests {
         let store_tool = find_tool(&tools, "memory_store");
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
-        store_tool.execute(json!({"content": "x"})).await.unwrap();
-        store_tool.execute(json!({"content": "y"})).await.unwrap();
+        store_tool
+            .execute(&crate::ExecutionContext::default(), json!({"content": "x"}))
+            .await
+            .unwrap();
+        store_tool
+            .execute(&crate::ExecutionContext::default(), json!({"content": "y"}))
+            .await
+            .unwrap();
 
         let entries = store
             .recall(
@@ -1190,10 +1300,13 @@ mod tests {
         let id_y = entries[1].id.clone();
 
         consolidate_tool
-            .execute(json!({
-                "source_ids": [id_x, id_y],
-                "content": "consolidated"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": [id_x, id_y],
+                    "content": "consolidated"
+                }),
+            )
             .await
             .unwrap();
 
@@ -1217,19 +1330,25 @@ mod tests {
         let consolidate_tool = find_tool(&tools, "memory_consolidate");
 
         store_tool
-            .execute(json!({
-                "content": "first fact",
-                "keywords": ["rust", "performance"],
-                "tags": ["lang"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "first fact",
+                    "keywords": ["rust", "performance"],
+                    "tags": ["lang"]
+                }),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({
-                "content": "second fact",
-                "keywords": ["safety", "rust"],
-                "tags": ["design"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "second fact",
+                    "keywords": ["safety", "rust"],
+                    "tags": ["design"]
+                }),
+            )
             .await
             .unwrap();
 
@@ -1246,11 +1365,14 @@ mod tests {
         let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
 
         consolidate_tool
-            .execute(json!({
-                "source_ids": ids,
-                "content": "merged fact",
-                "tags": ["summary"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": ids,
+                    "content": "merged fact",
+                    "tags": ["summary"]
+                }),
+            )
             .await
             .unwrap();
 
@@ -1286,10 +1408,13 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({
-            "content": "Rust has zero-cost abstractions",
-            "keywords": ["rust", "zero-cost", "abstractions"]
-        }))
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({
+                "content": "Rust has zero-cost abstractions",
+                "keywords": ["rust", "zero-cost", "abstractions"]
+            }),
+        )
         .await
         .unwrap();
 
@@ -1314,10 +1439,13 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({
-            "content": "Detailed technical analysis of Rust ownership model",
-            "summary": "Rust ownership analysis"
-        }))
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({
+                "content": "Detailed technical analysis of Rust ownership model",
+                "summary": "Rust ownership analysis"
+            }),
+        )
         .await
         .unwrap();
 
@@ -1345,16 +1473,22 @@ mod tests {
 
         // Store with keyword "performance" not in content
         store_tool
-            .execute(json!({
-                "content": "Rust is great for systems programming",
-                "keywords": ["performance", "speed", "systems"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Rust is great for systems programming",
+                    "keywords": ["performance", "speed", "systems"]
+                }),
+            )
             .await
             .unwrap();
 
         // Search for "performance" — should find via keyword match
         let result = recall_tool
-            .execute(json!({"query": "performance"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"query": "performance"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -1371,14 +1505,20 @@ mod tests {
         let recall_tool = find_tool(&tools, "memory_recall");
 
         store_tool
-            .execute(json!({
-                "content": "test content",
-                "keywords": ["test-keyword"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "test content",
+                    "keywords": ["test-keyword"]
+                }),
+            )
             .await
             .unwrap();
 
-        let result = recall_tool.execute(json!({})).await.unwrap();
+        let result = recall_tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(
             result.content.contains("test-keyword"),
             "recall output should show keywords"
@@ -1405,7 +1545,10 @@ mod tests {
 
         // Store with importance 10 — should trigger immediately
         let result = store_tool
-            .execute(json!({"content": "very important", "importance": 10}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "very important", "importance": 10}),
+            )
             .await
             .unwrap();
         assert!(
@@ -1420,7 +1563,10 @@ mod tests {
         let store_tool = find_tool(&tools, "memory_store");
 
         let result = store_tool
-            .execute(json!({"content": "minor fact", "importance": 3}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "minor fact", "importance": 3}),
+            )
             .await
             .unwrap();
         assert!(
@@ -1436,13 +1582,19 @@ mod tests {
 
         // importance 5 + 5 = 10, second should trigger
         let r1 = store_tool
-            .execute(json!({"content": "fact A", "importance": 5}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "fact A", "importance": 5}),
+            )
             .await
             .unwrap();
         assert!(!r1.content.contains("Reflection suggested"));
 
         let r2 = store_tool
-            .execute(json!({"content": "fact B", "importance": 5}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "fact B", "importance": 5}),
+            )
             .await
             .unwrap();
         assert!(
@@ -1460,19 +1612,25 @@ mod tests {
 
         // Store first entry with keywords
         store_tool
-            .execute(json!({
-                "content": "Rust is fast",
-                "keywords": ["rust", "performance", "speed"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Rust is fast",
+                    "keywords": ["rust", "performance", "speed"]
+                }),
+            )
             .await
             .unwrap();
 
         // Store second entry with overlapping keywords
         store_tool
-            .execute(json!({
-                "content": "Rust has great perf",
-                "keywords": ["rust", "performance"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "content": "Rust has great perf",
+                    "keywords": ["rust", "performance"]
+                }),
+            )
             .await
             .unwrap();
 
@@ -1502,7 +1660,12 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({"content": "test"})).await.unwrap();
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"content": "test"}),
+        )
+        .await
+        .unwrap();
 
         let entries = store
             .recall(
@@ -1526,10 +1689,13 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({
-            "content": "private note",
-            "confidentiality": "confidential"
-        }))
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({
+                "content": "private note",
+                "confidentiality": "confidential"
+            }),
+        )
         .await
         .unwrap();
 
@@ -1556,10 +1722,13 @@ mod tests {
         let (store, tools) = setup();
         let tool = find_tool(&tools, "memory_store");
 
-        tool.execute(json!({
-            "content": "api_key=sk-12345",
-            "confidentiality": "restricted"
-        }))
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({
+                "content": "api_key=sk-12345",
+                "confidentiality": "restricted"
+            }),
+        )
         .await
         .unwrap();
 
@@ -1588,11 +1757,17 @@ mod tests {
 
         // Store entries with different confidentiality levels
         store_tool
-            .execute(json!({"content": "public fact", "confidentiality": "public"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "public fact", "confidentiality": "public"}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "private note", "confidentiality": "confidential"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "private note", "confidentiality": "confidential"}),
+            )
             .await
             .unwrap();
 
@@ -1609,10 +1784,13 @@ mod tests {
         let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
 
         consolidate_tool
-            .execute(json!({
-                "source_ids": ids,
-                "content": "merged result"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "source_ids": ids,
+                    "content": "merged result"
+                }),
+            )
             .await
             .unwrap();
 
@@ -1640,11 +1818,17 @@ mod tests {
         let store_tool = find_tool(&tools, "memory_store");
 
         store_tool
-            .execute(json!({"content": "no keywords A"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "no keywords A"}),
+            )
             .await
             .unwrap();
         store_tool
-            .execute(json!({"content": "no keywords B"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"content": "no keywords B"}),
+            )
             .await
             .unwrap();
 

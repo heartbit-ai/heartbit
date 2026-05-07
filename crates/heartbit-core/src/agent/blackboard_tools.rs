@@ -251,7 +251,13 @@ mod tests {
             .unwrap();
 
         let read = find_tool(&tools, "blackboard_read");
-        let result = read.execute(json!({"key": "test-key"})).await.unwrap();
+        let result = read
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "test-key"}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("hello"));
     }
@@ -261,7 +267,13 @@ mod tests {
         let (_bb, tools) = setup();
 
         let read = find_tool(&tools, "blackboard_read");
-        let result = read.execute(json!({"key": "missing"})).await.unwrap();
+        let result = read
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "missing"}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("not found"));
     }
@@ -272,7 +284,10 @@ mod tests {
 
         let write = find_tool(&tools, "blackboard_write");
         let result = write
-            .execute(json!({"key": "my-key", "value": {"result": 42}}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "my-key", "value": {"result": 42}}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -296,7 +311,10 @@ mod tests {
         let write = find_tool(&tools, "blackboard_write");
 
         let result = write
-            .execute(json!({"key": "agent:other_worker", "value": "fake_result"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "agent:other_worker", "value": "fake_result"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error, "agent: prefix must be rejected");
@@ -317,7 +335,10 @@ mod tests {
         bb.write("agent:beta", json!("result-b")).await.unwrap();
 
         let list = find_tool(&tools, "blackboard_list");
-        let result = list.execute(json!({})).await.unwrap();
+        let result = list
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("agent:alpha"));
         assert!(result.content.contains("agent:beta"));
@@ -329,7 +350,10 @@ mod tests {
         let (_bb, tools) = setup();
 
         let list = find_tool(&tools, "blackboard_list");
-        let result = list.execute(json!({})).await.unwrap();
+        let result = list
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, "Blackboard is empty.");
     }
@@ -344,7 +368,10 @@ mod tests {
 
         let read = find_tool(&tools, "blackboard_read");
         let result = read
-            .execute(json!({"key": "agent:researcher"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "agent:researcher"}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -360,7 +387,10 @@ mod tests {
             .unwrap();
 
         let read = find_tool(&tools, "blackboard_read");
-        let result = read.execute(json!({"key": "data"})).await.unwrap();
+        let result = read
+            .execute(&crate::ExecutionContext::default(), json!({"key": "data"}))
+            .await
+            .unwrap();
         assert!(!result.is_error);
         // Should be pretty-printed JSON for structured data
         assert!(result.content.contains("\"count\": 42"));
@@ -371,7 +401,9 @@ mod tests {
     async fn read_tool_rejects_missing_key() {
         let (_bb, tools) = setup();
         let read = find_tool(&tools, "blackboard_read");
-        let result = read.execute(json!({})).await;
+        let result = read
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err(), "should fail on missing required 'key'");
     }
 
@@ -381,11 +413,15 @@ mod tests {
         let write = find_tool(&tools, "blackboard_write");
 
         // Missing both key and value
-        let result = write.execute(json!({})).await;
+        let result = write
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err(), "should fail on missing required fields");
 
         // Missing value
-        let result = write.execute(json!({"key": "k"})).await;
+        let result = write
+            .execute(&crate::ExecutionContext::default(), json!({"key": "k"}))
+            .await;
         assert!(result.is_err(), "should fail on missing 'value'");
     }
 

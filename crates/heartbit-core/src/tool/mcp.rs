@@ -3139,7 +3139,10 @@ mod tests {
 
         // execute() should catch the connection error and return ToolOutput::error,
         // not propagate it as Err
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(!result.content.is_empty());
     }
@@ -3980,7 +3983,10 @@ mod tests {
         };
 
         // Execute will fail (nothing listening), but the auth resolver path is exercised
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.is_error);
     }
 
@@ -4005,7 +4011,10 @@ mod tests {
         };
 
         // Execute will fail, but the no-resolver path is exercised
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.is_error);
     }
 

@@ -260,7 +260,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_text() {
         let tool = TtsTool::new();
-        let result = tool.execute(json!({"text": ""})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"text": ""}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("must not be empty"));
     }
@@ -269,7 +272,10 @@ mod tests {
     async fn rejects_text_too_long() {
         let tool = TtsTool::new();
         let long = "a".repeat(MAX_TEXT_LENGTH + 1);
-        let result = tool.execute(json!({"text": long})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"text": long}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("exceeds maximum length"));
     }
@@ -278,7 +284,10 @@ mod tests {
     async fn rejects_invalid_voice() {
         let tool = TtsTool::new();
         let result = tool
-            .execute(json!({"text": "hello", "voice": "invalid"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello", "voice": "invalid"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -289,7 +298,10 @@ mod tests {
     async fn rejects_invalid_model() {
         let tool = TtsTool::new();
         let result = tool
-            .execute(json!({"text": "hello", "model": "gpt-4"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello", "model": "gpt-4"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -300,7 +312,10 @@ mod tests {
     async fn rejects_invalid_format() {
         let tool = TtsTool::new();
         let result = tool
-            .execute(json!({"text": "hello", "format": "wma"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello", "format": "wma"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -311,7 +326,10 @@ mod tests {
     async fn rejects_speed_too_low() {
         let tool = TtsTool::new();
         let result = tool
-            .execute(json!({"text": "hello", "speed": 0.1}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello", "speed": 0.1}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -322,7 +340,10 @@ mod tests {
     async fn rejects_speed_too_high() {
         let tool = TtsTool::new();
         let result = tool
-            .execute(json!({"text": "hello", "speed": 5.0}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello", "speed": 5.0}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -335,7 +356,12 @@ mod tests {
             return; // Can't safely test missing key when it's set
         }
         let tool = TtsTool::new();
-        let result = tool.execute(json!({"text": "hello"})).await;
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"text": "hello"}),
+            )
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("OPENAI_API_KEY"), "got: {err}");
@@ -344,7 +370,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_text() {
         let tool = TtsTool::new();
-        let result = tool.execute(json!({})).await;
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await;
         assert!(result.is_err());
     }
 }

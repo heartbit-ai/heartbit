@@ -258,7 +258,10 @@ mod tests {
         let tool = ReadTool::new(tracker.clone(), None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -287,7 +290,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap(), "offset": 3, "limit": 2}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap(), "offset": 3, "limit": 2}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -303,7 +309,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": "/tmp/nonexistent_heartbit_test_12345.txt"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": "/tmp/nonexistent_heartbit_test_12345.txt"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -317,7 +326,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": dir.path().to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": dir.path().to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -336,7 +348,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new()));
 
         let result = tool
-            .execute(json!({"file_path": path.to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": path.to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -365,7 +380,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
         let result = tool
-            .execute(json!({"file_path": target.to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": target.to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(
@@ -400,7 +418,10 @@ mod tests {
         let tool = ReadTool::new(tracker, None, Arc::new(Vec::new())).with_path_policy(policy);
 
         let result = tool
-            .execute(json!({"file_path": target.to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"file_path": target.to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(

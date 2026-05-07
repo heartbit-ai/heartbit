@@ -241,7 +241,10 @@ mod tests {
 
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"path": dir.path().to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"path": dir.path().to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -261,7 +264,10 @@ mod tests {
 
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"path": dir.path().to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"path": dir.path().to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -279,10 +285,13 @@ mod tests {
 
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({
-                "path": dir.path().to_str().unwrap(),
-                "ignore": ["*.log"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "path": dir.path().to_str().unwrap(),
+                    "ignore": ["*.log"]
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -294,7 +303,10 @@ mod tests {
     async fn list_nonexistent_path() {
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"path": "/tmp/nonexistent_heartbit_test_dir_12345"}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"path": "/tmp/nonexistent_heartbit_test_dir_12345"}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -309,7 +321,10 @@ mod tests {
 
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"path": path.to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"path": path.to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -324,7 +339,10 @@ mod tests {
 
         let tool = ListTool::new(None, Arc::new(Vec::new()));
         let result = tool
-            .execute(json!({"path": dir.path().to_str().unwrap()}))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"path": dir.path().to_str().unwrap()}),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);
