@@ -118,6 +118,7 @@ impl EmbeddingProvider for LocalEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use heartbit_core::auth::tenant::TenantScope;
     use heartbit_core::memory::embedding::EmbeddingMemory;
     use heartbit_core::memory::in_memory::InMemoryStore;
     use heartbit_core::memory::{Confidentiality, Memory, MemoryEntry, MemoryQuery, MemoryType};
@@ -193,18 +194,22 @@ mod tests {
         let provider = LocalEmbeddingProvider::new(None, None).unwrap();
         let em = EmbeddingMemory::new(store.clone(), Arc::new(provider));
 
-        em.store(make_entry(
-            "m1",
-            "the quick brown fox jumps over the lazy dog",
-        ))
+        let scope = TenantScope::default();
+        em.store(
+            &scope,
+            make_entry("m1", "the quick brown fox jumps over the lazy dog"),
+        )
         .await
         .unwrap();
 
         let results = store
-            .recall(MemoryQuery {
-                limit: 10,
-                ..Default::default()
-            })
+            .recall(
+                &scope,
+                MemoryQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);

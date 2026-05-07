@@ -865,12 +865,15 @@ mod tests {
         let tool = TodoManageTool::new(store.clone());
 
         let result = tool
-            .execute(json!({
-                "action": "add",
-                "title": "New task",
-                "priority": "high",
-                "tags": ["test"]
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "add",
+                    "title": "New task",
+                    "priority": "high",
+                    "tags": ["test"]
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -889,7 +892,12 @@ mod tests {
         let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
         let tool = TodoManageTool::new(store);
 
-        let result = tool.execute(json!({"action": "add"})).await;
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"action": "add"}),
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -905,12 +913,15 @@ mod tests {
 
         // Update via tool
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "title": "Updated",
-                "status": "in_progress"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "title": "Updated",
+                    "status": "in_progress"
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -930,10 +941,13 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "remove",
-                "id": id.to_string()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "remove",
+                    "id": id.to_string()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -949,7 +963,13 @@ mod tests {
         store.add(TodoEntry::new("Task 1", "user")).unwrap();
         store.add(TodoEntry::new("Task 2", "user")).unwrap();
 
-        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"action": "list"}),
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Task 1"));
         assert!(result.content.contains("Task 2"));
@@ -961,7 +981,13 @@ mod tests {
         let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
         let tool = TodoManageTool::new(store);
 
-        let result = tool.execute(json!({"action": "invalid"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"action": "invalid"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("Unknown action"));
     }
@@ -976,11 +1002,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "status": "bogus"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "status": "bogus"
+                }),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid status"));
@@ -996,11 +1025,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "priority": "bogus"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "priority": "bogus"
+                }),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid priority"));
@@ -1016,11 +1048,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "due_at": "not-a-date"
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "due_at": "not-a-date"
+                }),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid due_at"));
@@ -1197,10 +1232,13 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "snooze",
-                "id": id.to_string()
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "snooze",
+                    "id": id.to_string()
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -1223,11 +1261,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "snooze",
-                "id": id.to_string(),
-                "hours": 48
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "snooze",
+                    "id": id.to_string(),
+                    "hours": 48
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -1244,7 +1285,12 @@ mod tests {
         let store = std::sync::Arc::new(FileTodoStore::new(dir.path()).unwrap());
         let tool = TodoManageTool::new(store);
 
-        let result = tool.execute(json!({"action": "snooze"})).await;
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"action": "snooze"}),
+            )
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("id is required"));
     }
@@ -1259,11 +1305,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "snooze",
-                "id": id.to_string(),
-                "hours": -5
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "snooze",
+                    "id": id.to_string(),
+                    "hours": -5
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -1280,11 +1329,14 @@ mod tests {
         let id = store.add(entry).unwrap();
 
         let result = tool
-            .execute(json!({
-                "action": "snooze",
-                "id": id.to_string(),
-                "hours": 0
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "snooze",
+                    "id": id.to_string(),
+                    "hours": 0
+                }),
+            )
             .await
             .unwrap();
         assert!(result.is_error);
@@ -1302,11 +1354,14 @@ mod tests {
 
         let snooze_time = "2026-12-31T12:00:00Z";
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "snoozed_until": snooze_time
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "snoozed_until": snooze_time
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
@@ -1329,11 +1384,14 @@ mod tests {
 
         // Clear via null
         let result = tool
-            .execute(json!({
-                "action": "update",
-                "id": id.to_string(),
-                "snoozed_until": null
-            }))
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "action": "update",
+                    "id": id.to_string(),
+                    "snoozed_until": null
+                }),
+            )
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);

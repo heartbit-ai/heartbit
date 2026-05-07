@@ -192,7 +192,11 @@ impl Sensor for McpSensor {
 
                 // Poll the tool if connected.
                 if let Some(ref t) = poll_tool {
-                    match t.execute(self.tool_args.clone()).await {
+                    // MCP sensor polls run without a per-call tenant context — sensors are
+                    // daemon-internal pollers, not user-driven. Use the default (empty)
+                    // ExecutionContext until/unless we plumb sensor-owner identity.
+                    let ctx = heartbit::ExecutionContext::default();
+                    match t.execute(&ctx, self.tool_args.clone()).await {
                         Ok(output) => {
                             if output.is_error {
                                 tracing::warn!(
@@ -234,7 +238,11 @@ impl Sensor for McpSensor {
                                                 let args = serde_json::json!({
                                                     id_param: event.source_id
                                                 });
-                                                match et.execute(args).await {
+                                                // Same rationale as poll_tool: no per-call
+                                                // tenant context flows through enrichment.
+                                                let enrich_ctx =
+                                                    heartbit::ExecutionContext::default();
+                                                match et.execute(&enrich_ctx, args).await {
                                                     Ok(enrich_out) if !enrich_out.is_error => {
                                                         enrich_failures = 0;
                                                         if let Ok(enrichment) =

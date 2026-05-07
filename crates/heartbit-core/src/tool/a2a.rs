@@ -980,12 +980,18 @@ mod tests {
         };
 
         // Empty message
-        let result = tool.execute(json!({"message": ""})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"message": ""}))
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("required"));
 
         // Missing message field
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({}))
+            .await
+            .unwrap();
         assert!(result.is_error);
     }
 
@@ -1010,7 +1016,13 @@ mod tests {
 
         // execute() should catch the connection error and return ToolOutput::error,
         // not propagate it as Err
-        let result = tool.execute(json!({"message": "hello"})).await.unwrap();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"message": "hello"}),
+            )
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(!result.content.is_empty());
     }
