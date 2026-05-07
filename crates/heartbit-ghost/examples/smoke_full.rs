@@ -49,9 +49,9 @@ impl CredentialResolver for EnvResolver {
     ) -> Pin<Box<dyn Future<Output = Result<Secret, heartbit_core::Error>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            std::env::var(&name).map(Secret::new).map_err(|_| {
-                heartbit_core::Error::Agent(format!("env var {name} not set"))
-            })
+            std::env::var(&name)
+                .map(Secret::new)
+                .map_err(|_| heartbit_core::Error::Agent(format!("env var {name} not set")))
         })
     }
 }
@@ -97,10 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ───── 2. twitter_search ───────────────────────────────────────────
     println!("\n══════ 2. twitter_search from:karpathy ══════");
     let res = TwitterSearchTool::new()
-        .execute(
-            &ctx,
-            json!({"query": "from:karpathy", "max_results": 10}),
-        )
+        .execute(&ctx, json!({"query": "from:karpathy", "max_results": 10}))
         .await?;
     if res.is_error {
         eprintln!("FAIL: {}", res.content);

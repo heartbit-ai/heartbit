@@ -46,9 +46,9 @@ impl CredentialResolver for EnvResolver {
     ) -> Pin<Box<dyn Future<Output = Result<Secret, heartbit_core::Error>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            std::env::var(&name).map(Secret::new).map_err(|_| {
-                heartbit_core::Error::Agent(format!("env var {name} not set"))
-            })
+            std::env::var(&name)
+                .map(Secret::new)
+                .map_err(|_| heartbit_core::Error::Agent(format!("env var {name} not set")))
         })
     }
 }
