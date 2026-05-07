@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use heartbit_core::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
 
+pub mod tools;
+
 /// Stable persona identifier — used as the registry key and as the
 /// `recipe = "..."` value in `[[persona]]` config blocks.
 pub const PERSONA_NAME: &str = "heartbit-ghost:x";
