@@ -84,7 +84,7 @@ Tool names are stable. Schemas use JSON Schema (the framework's existing convent
 | `twitter_reply` | `POST /2/tweets` (with `reply.in_reply_to_tweet_id`) | `{text: string (≤280), in_reply_to: string (tweet id)}` | `{tweet_id: string, url: string}` |
 | `twitter_search` | `GET /2/tweets/search/recent` | `{query: string (≤512), max_results?: int (10..=100, default 10), since_id?: string}` | `{tweets: [{id, text, author_id, created_at}], next_token?: string}` |
 | `twitter_mentions` | `GET /2/users/:id/mentions` | `{user_id: string, max_results?: int (5..=100, default 10), since_id?: string}` | `{mentions: [{id, text, author_id, created_at, in_reply_to_user_id?}], next_token?: string}` |
-| `twitter_user` | `GET /2/users/by/username/:handle` | `{handle: string (no leading `@`)}` | `{id, name, handle, description, follower_count, following_count, tweet_count, created_at}` |
+| `twitter_user` | `GET /2/users/by/username/:handle` | `{handle: string (no leading `@`)}` | `{id, name, username, description, public_metrics: {followers_count, following_count, tweet_count}, created_at}` |
 
 **Out of scope for P1.1** (per spec §4 — deferred to P1.4): `twitter_dm`, `twitter_schedule`, `twitter_metrics`.
 

@@ -90,8 +90,8 @@ impl Tool for TwitterUserTool {
             };
             match call_x(&client, &parsed).await {
                 Ok(out) => {
-                    let json = serde_json::to_string(&out)
-                        .unwrap_or_else(|_| "<serialize error>".to_string());
+                    let json =
+                        serde_json::to_string(&out).expect("UserResponse fields are infallible");
                     Ok(ToolOutput::success(json))
                 }
                 Err(e) => Ok(ToolOutput::error(format_error(&e))),
