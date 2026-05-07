@@ -5,9 +5,11 @@
 //! for HTTP, OAuth1 signing, and error mapping.
 
 pub mod client;
+pub mod mentions;
 pub mod search;
 pub mod user;
 
 pub use client::{XApiError, XClient, format_error};
+pub use mentions::TwitterMentionsTool;
 pub use search::TwitterSearchTool;
 pub use user::TwitterUserTool;
