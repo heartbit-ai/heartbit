@@ -14,6 +14,7 @@ pub mod channel;
 pub mod config;
 pub mod error;
 pub mod eval;
+pub mod execution_context;
 pub mod http;
 pub mod knowledge;
 pub mod llm;
@@ -77,6 +78,9 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
 // --- Error re-exports ---
 pub use error::Error;
+
+// --- Execution context re-exports ---
+pub use execution_context::{AuditSink, CredentialResolver, ExecutionContext, Secret};
 
 // --- Eval re-exports ---
 pub use eval::{
