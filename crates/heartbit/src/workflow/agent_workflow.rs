@@ -263,9 +263,15 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         input: input.clone(),
                         timeout_seconds: task.tool_timeout_seconds,
                         max_output_bytes: task.max_tool_output_bytes,
-                        // Identity propagation through Restate is added in a
-                        // follow-up — the workflow currently has no access
-                        // to caller identity. Defaults preserve prior behaviour.
+                        // TODO(phase-1): plumb tenant_id/user_id from AgentTask
+                        // through the workflow into ToolCallRequest. Activity-side
+                        // already constructs ExecutionContext from these fields
+                        // (see workflow/agent_service.rs ~L203-207); caller-side
+                        // currently passes None/None because AgentTask does not
+                        // yet carry caller identity. Phase 1 (heartbit-ghost
+                        // multi-tenant integration) extends AgentTask and threads
+                        // the values from the caller. Defaults preserve prior
+                        // behaviour in the meantime.
                         tenant_id: None,
                         user_id: None,
                     }))

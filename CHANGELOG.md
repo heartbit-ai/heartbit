@@ -52,26 +52,38 @@ personas land in Phase 1), and the `heartbit persona` CLI surface.
   (was `toml::Value`) so a misuse like `overrides = "string"` fails at
   deserialize-time.
 - **`heartbit persona <subcommand>`** CLI surface — functional shells
-  (`list`, `inspect`, `validate`, `expand`) operating against the empty
-  registry. Wires up cleanly so Phase 1 persona crates light up the
-  surface without further CLI work.
+  (`list`, `show`, `run`, `corpus {add, list}`, `profile {rebuild, diff}`,
+  `phase`, `pause`, `resume`, `export-preferences`, `audit`) operating
+  against the empty registry. Wires up cleanly so Phase 1 persona crates
+  light up the surface without further CLI work.
 
 ### Phase 1 follow-ups
 
-Three production sites currently pass `&ExecutionContext::default()` and
-are tagged with `TODO(phase-1):` markers. They have no functional impact
-in Phase 0 (no persona uses tenant-scoped secrets yet) but must be
-addressed when concrete personas land:
+Four production sites currently pass `&ExecutionContext::default()` (or
+hardcode `tenant_id: None, user_id: None`) and are tagged with
+`TODO(phase-1):` markers. They have no functional impact in Phase 0 (no
+persona uses tenant-scoped secrets yet) but must be addressed when
+concrete personas land:
 
-- `crates/heartbit-sensors/src/sources/mcp.rs` — sensor MCP fan-out has
-  no per-tenant request identity to thread.
-- `crates/heartbit-core/src/knowledge/tools.rs` — knowledge-base tool
-  invocations from inside persona pipelines.
-- The startup-time persona expansion site (lands with the first persona
-  crate).
+- `crates/heartbit-core/src/tool/mcp_server.rs` — MCP server tool
+  dispatch; the JSON-RPC envelope doesn't carry tenant identity. Phase 1
+  derives identity from the MCP session / `clientInfo`.
+- `crates/heartbit-sensors/src/sources/mcp.rs` (poll loop) — sensor
+  MCP fan-out has no per-tenant request identity to thread; Phase 1
+  sensor-owner identity work plumbs it through.
+- `crates/heartbit-sensors/src/sources/mcp.rs` (enrich loop) — same
+  rationale as the poll loop.
+- `crates/heartbit/src/workflow/agent_workflow.rs` — Restate workflow
+  caller hardcodes `tenant_id: None, user_id: None` on `ToolCallRequest`
+  because `AgentTask` doesn't yet carry caller identity. Activity-side
+  (`workflow/agent_service.rs`) already constructs `ExecutionContext`
+  from the request fields, so Phase 1 only needs to extend `AgentTask`
+  and thread the values from the caller.
 
-See `tasks/heartbit-foundation-phase-0.md` for the design doc and the
-"Phase 1 follow-ups" section for the full migration plan.
+The canonical table lives in
+`docs/superpowers/specs/2026-05-07-heartbit-foundation-design.md` under
+"Phase 1 follow-ups (`TODO(phase-1)` markers)"; this list mirrors it.
+A workspace-wide `grep -rn "TODO(phase-1)" crates/` finds the full set.
 
 ## [2026.507.2] - 2026-05-07
 

@@ -215,15 +215,16 @@ Each step is a separate commit (or small PR) within one Phase 0 release.
 
 ## Phase 1 follow-ups (`TODO(phase-1)` markers)
 
-Three production-code call sites currently pass `&ExecutionContext::default()` because no per-call tenant identity flows through their context. They are correct for Phase 0 (the contract is "context is threaded; identity may be empty if not available"), but each is a place where Phase 1 will plumb a real identity:
+Four production-code call sites currently pass `&ExecutionContext::default()` (or hardcode `tenant_id: None, user_id: None` on a `ToolCallRequest` struct literal) because no per-call tenant identity flows through their context. They are correct for Phase 0 (the contract is "context is threaded; identity may be empty if not available"), but each is a place where Phase 1 will plumb a real identity:
 
 | Site | File | Why default today | Phase 1 owner |
 |---|---|---|---|
 | MCP server tool dispatch | `crates/heartbit-core/src/tool/mcp_server.rs` | MCP transport doesn't carry tenant identity in the JSON-RPC envelope | `heartbit-ghost` Phase 1: derive from MCP session / clientInfo |
 | MCP sensor poll loop | `crates/heartbit-sensors/src/sources/mcp.rs` | Sensor pollers are daemon-internal, not per-tenant | Phase 1 sensor-owner identity (per-tenant sensors) |
 | MCP sensor enrich loop | `crates/heartbit-sensors/src/sources/mcp.rs` | Same as above | Same |
+| Restate workflow caller | `crates/heartbit/src/workflow/agent_workflow.rs` | `AgentTask` doesn't yet carry caller identity to thread; activity-side already constructs `ExecutionContext` from request fields, so this is purely a caller-side gap | Phase 1: extend `AgentTask` with `tenant_id` / `user_id` when persona / multi-tenant lands |
 
-All three are tagged with `TODO(phase-1):` comments for greppability. A sweep like `grep -rn "TODO.*ExecutionContext\|TODO(phase-1)" crates/` finds the full set. Phase 1 should sweep these as part of multi-tenant integration / sensor-owner work.
+All four are tagged with `TODO(phase-1):` comments for greppability. A sweep like `grep -rn "TODO.*ExecutionContext\|TODO(phase-1)" crates/` finds the full set. Phase 1 should sweep these as part of multi-tenant integration / sensor-owner work.
 
 ## Acceptance criteria
 
