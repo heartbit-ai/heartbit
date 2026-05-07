@@ -14,6 +14,7 @@ use std::sync::Arc;
 use heartbit_core::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
 
 pub mod tools;
+pub mod voice;
 
 /// Stable persona identifier — used as the registry key and as the
 /// `recipe = "..."` value in `[[persona]]` config blocks.
