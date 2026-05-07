@@ -51,10 +51,28 @@ fn populate(store: &InMemoryStore, n: u32, scope: &TenantScope) {
                 3 => "reviewer",
                 _ => "critic",
             };
+            // Distinct vocabulary slice per entry — only ~10% of
+            // entries contain any given selective token, mirroring a
+            // realistic corpus where queries are selective rather
+            // than matching every entry. (See bench `selective_query`
+            // — without this, the inverted-index path can't reject
+            // any candidates.)
+            let topic = match i % 10 {
+                0 => "kafka",
+                1 => "redis",
+                2 => "postgres",
+                3 => "sqlite",
+                4 => "etcd",
+                5 => "grpc",
+                6 => "wasm",
+                7 => "iouring",
+                8 => "mmap",
+                _ => "axum",
+            };
             let content = format!(
-                "this is memory entry {i} about rust performance optimization, async runtimes, and tokio internals"
+                "this is memory entry {i} about rust performance optimization, async runtimes, and tokio internals; topic={topic}"
             );
-            let keywords = ["rust", "performance", "tokio", "async", "memory"];
+            let keywords = ["rust", "performance", "tokio", "async", "memory", topic];
             store
                 .store(scope, make_entry(i, agent, &content, &keywords))
                 .await
@@ -89,6 +107,88 @@ fn bench_recall(c: &mut Criterion) {
                 })
             })
         });
+
+        // Phase 8: opt-in exact-word inverted-index path. Same query,
+        // but `exact_words: true` short-circuits the substring scan.
+        // This query matches every entry (the broad tokens
+        // "performance", "tokio", "async" all appear in every entry's
+        // template content) so the inverted index can't reject any
+        // candidates — the bench measures the *overhead* of the
+        // exact-words path on a worst-case query.
+        group.bench_with_input(
+            BenchmarkId::new("text_query_top10_exact_words_broad", size),
+            &size,
+            |b, _| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let query = MemoryQuery {
+                            text: Some("performance tokio async".into()),
+                            limit: 10,
+                            reinforce: false,
+                            exact_words: true,
+                            ..Default::default()
+                        };
+                        let results = store.recall(&scope, query).await.expect("recall");
+                        black_box(results.len())
+                    })
+                })
+            },
+        );
+
+        // Phase 8 — selective-query variant: query for a token that
+        // only ~10 % of entries contain (one of the per-entry topic
+        // tokens we populate above). The inverted index drops the
+        // candidate set from N to N/10 here, which is the regime
+        // where the opt-in pays off.
+        group.bench_with_input(
+            BenchmarkId::new("text_query_top10_exact_words_selective", size),
+            &size,
+            |b, _| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let query = MemoryQuery {
+                            text: Some("kafka".into()),
+                            limit: 10,
+                            reinforce: false,
+                            exact_words: true,
+                            ..Default::default()
+                        };
+                        let results = store.recall(&scope, query).await.expect("recall");
+                        black_box(results.len())
+                    })
+                })
+            },
+        );
+
+        // The same selective query under the legacy substring path
+        // (default `exact_words: false`) so we have a side-by-side.
+        group.bench_with_input(
+            BenchmarkId::new("text_query_top10_substring_selective", size),
+            &size,
+            |b, _| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let query = MemoryQuery {
+                            text: Some("kafka".into()),
+                            limit: 10,
+                            reinforce: false,
+                            ..Default::default()
+                        };
+                        let results = store.recall(&scope, query).await.expect("recall");
+                        black_box(results.len())
+                    })
+                })
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("agent_filter_top10", size),

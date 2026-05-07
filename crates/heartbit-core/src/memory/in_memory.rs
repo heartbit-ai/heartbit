@@ -1,7 +1,7 @@
 //! In-memory `Memory` implementation backed by a sorted `Vec`.
 
 #![allow(missing_docs)]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -55,6 +55,56 @@ fn build_entry_tokens(entry: &MemoryEntry) -> EntryTokens {
     }
 }
 
+/// Insert `entry_id` into the inverted index under every distinct
+/// `(content_words ∪ lower_keywords)` token from `tokens`. Caller
+/// holds the inverted-index write lock.
+fn index_entry(
+    inverted: &mut HashMap<String, HashSet<String>>,
+    entry_id: &str,
+    tokens: &EntryTokens,
+) {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(tokens.content_words.len());
+    for word in tokens
+        .content_words
+        .iter()
+        .chain(tokens.lower_keywords.iter())
+    {
+        if seen.insert(word.as_str()) {
+            inverted
+                .entry(word.clone())
+                .or_default()
+                .insert(entry_id.to_string());
+        }
+    }
+}
+
+/// Remove `entry_id` from every inverted-index bucket the entry's
+/// `tokens` previously populated. Empty buckets are dropped so the
+/// index doesn't grow unbounded across deletions. Caller holds the
+/// inverted-index write lock.
+fn deindex_entry(
+    inverted: &mut HashMap<String, HashSet<String>>,
+    entry_id: &str,
+    tokens: &EntryTokens,
+) {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(tokens.content_words.len());
+    for word in tokens
+        .content_words
+        .iter()
+        .chain(tokens.lower_keywords.iter())
+    {
+        if !seen.insert(word.as_str()) {
+            continue;
+        }
+        if let Some(bucket) = inverted.get_mut(word) {
+            bucket.remove(entry_id);
+            if bucket.is_empty() {
+                inverted.remove(word);
+            }
+        }
+    }
+}
+
 /// Thread-safe in-memory store for agent memories.
 ///
 /// Backed by `parking_lot::RwLock<HashMap>` (T2 — `tasks/performance-audit-
@@ -67,11 +117,23 @@ fn build_entry_tokens(entry: &MemoryEntry) -> EntryTokens {
 /// lock-step with `entries` on every `store` / `update` / `forget`; the
 /// recall hot path reads from the cache so it never pays the per-entry
 /// `to_lowercase()` + `split_whitespace()` cost again. Locks are always
-/// acquired in the order `entries` → `tokens`; both are
-/// `parking_lot::RwLock` and never held across `.await`.
+/// acquired in the order `entries` → `tokens` → `inverted`; all three
+/// are `parking_lot::RwLock` and never held across `.await`.
+///
+/// Phase 8: also maintains a sibling `inverted` index mapping each
+/// lowercased exact-word token (from content + keywords) to the set of
+/// entry ids that contain it. Used **only** when the caller opts in via
+/// `MemoryQuery::exact_words = true`; default recall behaviour is
+/// substring-based and ignores the index. See
+/// `tasks/perf-audit-v2-2026-05-07.md` for the BM25 design decision.
 pub struct InMemoryStore {
     entries: RwLock<HashMap<String, MemoryEntry>>,
     tokens: RwLock<HashMap<String, EntryTokens>>,
+    /// `lowercased_token → set<entry_id>`. Built from each entry's
+    /// `content_words ∪ lower_keywords` at store time. Reads are
+    /// O(1) per token and reject most of the corpus when callers
+    /// opt in via `MemoryQuery::exact_words`.
+    inverted: RwLock<HashMap<String, HashSet<String>>>,
     scoring_weights: ScoringWeights,
     max_entries: usize,
 }
@@ -81,6 +143,7 @@ impl InMemoryStore {
         Self {
             entries: RwLock::new(HashMap::new()),
             tokens: RwLock::new(HashMap::new()),
+            inverted: RwLock::new(HashMap::new()),
             scoring_weights: ScoringWeights::default(),
             max_entries: IN_MEMORY_STORE_DEFAULT_CAP,
         }
@@ -116,6 +179,7 @@ impl Memory for InMemoryStore {
         Box::pin(async move {
             let mut entries = self.entries.write();
             let mut tokens = self.tokens.write();
+            let mut inverted = self.inverted.write();
             // SECURITY (F-MEM-3): when at capacity, evict the entry with the
             // lowest effective strength (most-decayed, oldest weak memory)
             // before inserting the new one. Without this cap, a hostile or
@@ -144,7 +208,9 @@ impl Memory for InMemoryStore {
                     .map(|e| e.id.clone())
                 {
                     entries.remove(&victim_id);
-                    tokens.remove(&victim_id);
+                    if let Some(victim_tokens) = tokens.remove(&victim_id) {
+                        deindex_entry(&mut inverted, &victim_id, &victim_tokens);
+                    }
                     tracing::warn!(
                         evicted = %victim_id,
                         cap = self.max_entries,
@@ -156,6 +222,12 @@ impl Memory for InMemoryStore {
             // so the recall hot path never pays for it again.
             let entry_tokens = build_entry_tokens(&entry);
             let id = entry.id.clone();
+            // Phase 8: pre-deindex the previous version of this entry
+            // (if any) before re-indexing — `store()` doubles as upsert.
+            if let Some(old_tokens) = tokens.get(&id) {
+                deindex_entry(&mut inverted, &id, old_tokens);
+            }
+            index_entry(&mut inverted, &id, &entry_tokens);
             entries.insert(id.clone(), entry);
             tokens.insert(id, entry_tokens);
             Ok(())
@@ -179,6 +251,10 @@ impl Memory for InMemoryStore {
             // mirroring every writer (`store` / `update` / `forget` /
             // `prune`), so no deadlock is possible.
             let tokens_cache = self.tokens.read();
+            // Phase 8: read-lock the inverted index. Only consulted on
+            // the `exact_words` opt-in path; on the substring path it's
+            // immediately dropped after the early return below.
+            let inverted = self.inverted.read();
 
             let now = Utc::now();
             let query_tokens: Vec<String> = query
@@ -194,6 +270,33 @@ impl Memory for InMemoryStore {
                 })
                 .unwrap_or_default();
 
+            // Phase 8 fast path: when `query.exact_words` is set and
+            // we have at least one query token, look up the candidate
+            // entry-id set in the inverted index and short-circuit the
+            // full-scan filter loop. Drops 10k entries × N substring
+            // checks → O(K) lookups + a per-candidate filter pass on
+            // typically a few hundred entries. The remaining filters
+            // (tenant, agent, category, ...) still run on this smaller
+            // set so semantics for non-text predicates are preserved.
+            //
+            // When the inverted lookup turns up nothing, the result set
+            // is correctly empty (no entry has any query token as an
+            // exact word). When `exact_words` is false (default) or the
+            // query has no text, fall through to the legacy substring
+            // path below.
+            let exact_word_candidate_ids: Option<Vec<String>> =
+                if query.exact_words && !query_tokens.is_empty() {
+                    let mut ids: HashSet<String> = HashSet::new();
+                    for token in &query_tokens {
+                        if let Some(bucket) = inverted.get(token.as_str()) {
+                            ids.extend(bucket.iter().cloned());
+                        }
+                    }
+                    Some(ids.into_iter().collect())
+                } else {
+                    None
+                };
+
             // Each surviving candidate is paired with its cached tokens
             // so the BM25 scoring loop below can call `bm25_score_pre`
             // directly — zero per-entry lowercase + tokenise on the
@@ -202,73 +305,92 @@ impl Memory for InMemoryStore {
             // Filter ordering: cheap field comparisons first, then the
             // text-substring scan last (using the cached `lower_content`
             // and `lower_keywords`).
-            let candidates: Vec<(&MemoryEntry, &EntryTokens)> = entries
-                .values()
-                .filter_map(|e| {
-                    // Tenant isolation first — fastest reject.
-                    if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
-                        return None;
+            //
+            // The two paths share the same inner `filter_logic` closure
+            // so non-text predicates behave identically across modes.
+            let filter_logic = |e: &MemoryEntry| -> bool {
+                // Tenant isolation first — fastest reject.
+                if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
+                    return false;
+                }
+                if let Some(ref agent) = query.agent {
+                    if e.agent != *agent {
+                        return false;
                     }
-                    if let Some(ref agent) = query.agent {
-                        if e.agent != *agent {
+                } else if let Some(ref prefix) = query.agent_prefix
+                    && !e.agent.starts_with(prefix.as_str())
+                {
+                    return false;
+                }
+                if let Some(ref cat) = query.category
+                    && e.category != *cat
+                {
+                    return false;
+                }
+                if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
+                    return false;
+                }
+                if let Some(ref mt) = query.memory_type
+                    && e.memory_type != *mt
+                {
+                    return false;
+                }
+                if let Some(max_conf) = query.max_confidentiality
+                    && e.confidentiality > max_conf
+                {
+                    return false;
+                }
+                if let Some(min_s) = query.min_strength {
+                    let eff =
+                        effective_strength(e.strength, e.last_accessed, now, STRENGTH_DECAY_RATE);
+                    if eff < min_s {
+                        return false;
+                    }
+                }
+                true
+            };
+
+            let candidates: Vec<(&MemoryEntry, &EntryTokens)> = match exact_word_candidate_ids {
+                Some(ids) => ids
+                    .iter()
+                    .filter_map(|id| {
+                        let e = entries.get(id)?;
+                        if !filter_logic(e) {
                             return None;
                         }
-                    } else if let Some(ref prefix) = query.agent_prefix
-                        && !e.agent.starts_with(prefix.as_str())
-                    {
-                        return None;
-                    }
-                    if let Some(ref cat) = query.category
-                        && e.category != *cat
-                    {
-                        return None;
-                    }
-                    if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
-                        return None;
-                    }
-                    if let Some(ref mt) = query.memory_type
-                        && e.memory_type != *mt
-                    {
-                        return None;
-                    }
-                    if let Some(max_conf) = query.max_confidentiality
-                        && e.confidentiality > max_conf
-                    {
-                        return None;
-                    }
-                    if let Some(min_s) = query.min_strength {
-                        let eff = effective_strength(
-                            e.strength,
-                            e.last_accessed,
-                            now,
-                            STRENGTH_DECAY_RATE,
-                        );
-                        if eff < min_s {
+                        let tokens = tokens_cache.get(id)?;
+                        Some((e, tokens))
+                    })
+                    .collect(),
+                None => entries
+                    .values()
+                    .filter_map(|e| {
+                        if !filter_logic(e) {
                             return None;
                         }
-                    }
-                    // Tokens cache must be in lock-step with `entries`;
-                    // any maintenance gap (shouldn't happen with the
-                    // current store/update/forget paths) just rejects
-                    // the entry rather than panicking.
-                    let tokens = tokens_cache.get(&e.id)?;
-                    // Expensive filter (substring scan) last — uses the
-                    // cached lower-cased forms.
-                    if !query_tokens.is_empty() {
-                        let has_match = query_tokens.iter().any(|token| {
-                            tokens.lower_content.contains(token.as_str())
-                                || tokens
-                                    .lower_keywords
-                                    .iter()
-                                    .any(|k| k.contains(token.as_str()))
-                        });
-                        if !has_match {
-                            return None;
+                        // Tokens cache must be in lock-step with `entries`;
+                        // any maintenance gap (shouldn't happen with the
+                        // current store/update/forget paths) just rejects
+                        // the entry rather than panicking.
+                        let tokens = tokens_cache.get(&e.id)?;
+                        // Expensive filter (substring scan) last — uses the
+                        // cached lower-cased forms.
+                        if !query_tokens.is_empty() {
+                            let has_match = query_tokens.iter().any(|token| {
+                                tokens.lower_content.contains(token.as_str())
+                                    || tokens
+                                        .lower_keywords
+                                        .iter()
+                                        .any(|k| k.contains(token.as_str()))
+                            });
+                            if !has_match {
+                                return None;
+                            }
                         }
-                    }
-                    Some((e, tokens))
-                })
-                .collect();
+                        Some((e, tokens))
+                    })
+                    .collect(),
+            };
 
             // Compute average document length for BM25 normalisation.
             // Uses the cached `content_words.len()` — zero new tokenisation.
@@ -475,6 +597,7 @@ impl Memory for InMemoryStore {
             drop(scored);
             drop(candidates);
             drop(tokens_cache);
+            drop(inverted);
 
             // PERF (P-MEM-5): clone only the top-K, after the limit has
             // been applied. Previously the entire filtered set was cloned
@@ -509,13 +632,19 @@ impl Memory for InMemoryStore {
         Box::pin(async move {
             let mut entries = self.entries.write();
             let mut tokens = self.tokens.write();
+            let mut inverted = self.inverted.write();
             match entries.get_mut(&id) {
                 Some(entry) if entry.author_tenant_id.as_deref() == Some(tenant_id.as_str()) => {
                     entry.content = content;
                     entry.last_accessed = Utc::now();
                     // Refresh the side cache so the recall hot path
                     // sees the new content tokenisation immediately.
-                    tokens.insert(id.clone(), build_entry_tokens(entry));
+                    let new_tokens = build_entry_tokens(entry);
+                    if let Some(old_tokens) = tokens.get(&id) {
+                        deindex_entry(&mut inverted, &id, old_tokens);
+                    }
+                    index_entry(&mut inverted, &id, &new_tokens);
+                    tokens.insert(id.clone(), new_tokens);
                     Ok(())
                 }
                 Some(_) => {
@@ -537,6 +666,7 @@ impl Memory for InMemoryStore {
         Box::pin(async move {
             let mut entries = self.entries.write();
             let mut tokens = self.tokens.write();
+            let mut inverted = self.inverted.write();
             // Only remove if the entry belongs to this tenant.
             // Return false for both "not found" and "wrong tenant" to avoid
             // revealing cross-tenant id existence.
@@ -546,7 +676,9 @@ impl Memory for InMemoryStore {
                 .unwrap_or(false);
             if belongs {
                 let removed = entries.remove(&id).is_some();
-                tokens.remove(&id);
+                if let Some(old_tokens) = tokens.remove(&id) {
+                    deindex_entry(&mut inverted, &id, &old_tokens);
+                }
                 Ok(removed)
             } else {
                 Ok(false)
@@ -638,9 +770,12 @@ impl Memory for InMemoryStore {
 
             let count = to_remove.len();
             let mut tokens = self.tokens.write();
+            let mut inverted = self.inverted.write();
             for id in to_remove {
                 entries.remove(&id);
-                tokens.remove(&id);
+                if let Some(old_tokens) = tokens.remove(&id) {
+                    deindex_entry(&mut inverted, &id, &old_tokens);
+                }
             }
             Ok(count)
         })

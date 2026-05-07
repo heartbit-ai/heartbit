@@ -163,6 +163,24 @@ pub struct MemoryQuery {
     /// it above the prune threshold. `last_accessed` and `access_count`
     /// are still updated regardless.
     pub reinforce: bool,
+
+    /// Opt in to **exact-word** text matching instead of the default
+    /// substring (`word.contains(token)`) semantics.
+    ///
+    /// When `true`, `InMemoryStore::recall` short-circuits to entries
+    /// whose lowercased content / keyword tokens **exactly** equal at
+    /// least one query token, looked up via the in-memory inverted
+    /// index built at store time. Estimated gain at N=10k entries:
+    /// 12.69 ms → 1–3 ms text-query recall (Phase 8 in
+    /// `tasks/perf-audit-v2-2026-05-07.md`).
+    ///
+    /// Trade-off: queries whose tokens are *prefixes / substrings*
+    /// of indexed words ("perf" matching "performance") will no
+    /// longer match. Default is `false` — substring semantics
+    /// preserved; opt-in when callers know their queries are full
+    /// words. The Postgres path ignores this flag (it doesn't
+    /// implement substring matching the same way).
+    pub exact_words: bool,
 }
 
 impl Default for MemoryQuery {
@@ -179,6 +197,7 @@ impl Default for MemoryQuery {
             query_embedding: None,
             max_confidentiality: None,
             reinforce: true,
+            exact_words: false,
         }
     }
 }
