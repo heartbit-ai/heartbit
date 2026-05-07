@@ -91,6 +91,12 @@ pub struct ToolCallRequest {
     /// Maximum byte size for tool output. Oversized results are truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_bytes: Option<usize>,
+    /// Optional tenant identifier propagated into `ExecutionContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Optional user identifier propagated into `ExecutionContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// Response from a tool call activity.
@@ -412,6 +418,8 @@ mod tests {
             input: serde_json::json!({"query": "rust"}),
             timeout_seconds: None,
             max_output_bytes: None,
+            tenant_id: None,
+            user_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
@@ -425,10 +433,37 @@ mod tests {
             input: serde_json::json!({}),
             timeout_seconds: Some(30),
             max_output_bytes: Some(4096),
+            tenant_id: None,
+            user_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.max_output_bytes, Some(4096));
+    }
+
+    #[test]
+    fn tool_call_request_tenant_user_roundtrips() {
+        let req = ToolCallRequest {
+            tool_name: "search".into(),
+            input: serde_json::json!({}),
+            timeout_seconds: None,
+            max_output_bytes: None,
+            tenant_id: Some("tenant-1".into()),
+            user_id: Some("user-2".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ToolCallRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
+        assert_eq!(parsed.user_id.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn tool_call_request_tenant_user_default_to_none() {
+        // Backward compatibility: old JSON without tenant_id/user_id still parses.
+        let json = r#"{"tool_name":"search","input":{}}"#;
+        let parsed: ToolCallRequest = serde_json::from_str(json).unwrap();
+        assert!(parsed.tenant_id.is_none());
+        assert!(parsed.user_id.is_none());
     }
 
     #[test]

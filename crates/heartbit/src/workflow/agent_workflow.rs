@@ -263,6 +263,11 @@ impl AgentWorkflow for AgentWorkflowImpl {
                         input: input.clone(),
                         timeout_seconds: task.tool_timeout_seconds,
                         max_output_bytes: task.max_tool_output_bytes,
+                        // Identity propagation through Restate is added in a
+                        // follow-up — the workflow currently has no access
+                        // to caller identity. Defaults preserve prior behaviour.
+                        tenant_id: None,
+                        user_id: None,
                     }))
                     .call()
                     .await?

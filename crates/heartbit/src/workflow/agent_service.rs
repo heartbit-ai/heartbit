@@ -131,11 +131,16 @@ impl AgentService for AgentServiceImpl {
             }));
         }
 
-        let result = match request.timeout_seconds {
+        // Capture name and timeout up-front because the helper consumes `request`.
+        let tool_name = request.tool_name.clone();
+        let timeout_seconds = request.timeout_seconds;
+        let max_output_bytes = request.max_output_bytes;
+
+        let result = match timeout_seconds {
             Some(secs) => {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(secs),
-                    tool.execute(request.input),
+                    tool_call_inner(&self.tools, request),
                 )
                 .await
                 {
@@ -143,20 +148,19 @@ impl AgentService for AgentServiceImpl {
                     Err(_) => {
                         return Ok(Json(ToolCallResponse {
                             content: format!(
-                                "Tool '{}' execution timed out after {secs}s",
-                                request.tool_name
+                                "Tool '{tool_name}' execution timed out after {secs}s"
                             ),
                             is_error: true,
                         }));
                     }
                 }
             }
-            None => tool.execute(request.input).await,
+            None => tool_call_inner(&self.tools, request).await,
         };
 
         match result {
             Ok(output) => {
-                let output = match request.max_output_bytes {
+                let output = match max_output_bytes {
                     Some(max) => output.truncated(max),
                     None => output,
                 };
@@ -166,7 +170,7 @@ impl AgentService for AgentServiceImpl {
                 }))
             }
             Err(e) => Ok(Json(ToolCallResponse {
-                content: format!("Tool '{}' error: {e}", request.tool_name),
+                content: format!("Tool '{tool_name}' error: {e}"),
                 is_error: true,
             })),
         }
@@ -180,6 +184,28 @@ impl AgentService for AgentServiceImpl {
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Json(defs))
     }
+}
+
+/// Dispatch a tool call by constructing an `ExecutionContext` from the
+/// invocation params and delegating to `Tool::execute`.
+///
+/// Looks up the tool in `tools` and returns `Error::Agent` if absent. The
+/// caller (the Restate `tool_call` activity) handles graceful "tool not
+/// found" responses up-front; a not-found here is defensive against drift
+/// between caller checks and the helper.
+async fn tool_call_inner(
+    tools: &HashMap<String, Arc<dyn Tool>>,
+    request: ToolCallRequest,
+) -> Result<crate::tool::ToolOutput, crate::Error> {
+    let tool = tools
+        .get(&request.tool_name)
+        .ok_or_else(|| crate::Error::Agent(format!("tool '{}' not found", request.tool_name)))?;
+    let ctx = heartbit_core::ExecutionContext {
+        tenant_id: request.tenant_id,
+        user_id: request.user_id,
+        ..Default::default()
+    };
+    tool.execute(&ctx, request.input).await
 }
 
 #[cfg(test)]
@@ -225,6 +251,73 @@ mod tests {
             let output = self.output.clone();
             Box::pin(async move { Ok(output) })
         }
+    }
+
+    #[tokio::test]
+    async fn tool_call_activity_constructs_context_from_invocation_params() {
+        use heartbit_core::ExecutionContext;
+        use std::sync::Mutex;
+
+        struct CtxCapture {
+            captured_tenant: Arc<Mutex<Option<String>>>,
+            captured_user: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Tool for CtxCapture {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "ctx_capture".into(),
+                    description: "captures tenant".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
+                let cap_t = self.captured_tenant.clone();
+                let cap_u = self.captured_user.clone();
+                let t = ctx.tenant_id.clone();
+                let u = ctx.user_id.clone();
+                Box::pin(async move {
+                    *cap_t.lock().unwrap() = t;
+                    *cap_u.lock().unwrap() = u;
+                    Ok(ToolOutput::success("ok"))
+                })
+            }
+        }
+
+        let captured_tenant = Arc::new(Mutex::new(None));
+        let captured_user = Arc::new(Mutex::new(None));
+        let tool = Arc::new(CtxCapture {
+            captured_tenant: captured_tenant.clone(),
+            captured_user: captured_user.clone(),
+        });
+        let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+        tools.insert("ctx_capture".into(), tool as Arc<dyn Tool>);
+
+        let request = ToolCallRequest {
+            tool_name: "ctx_capture".into(),
+            input: serde_json::json!({}),
+            timeout_seconds: None,
+            max_output_bytes: None,
+            tenant_id: Some("restate-tenant".into()),
+            user_id: Some("restate-user".into()),
+        };
+
+        let result = tool_call_inner(&tools, request).await.expect("ok result");
+        assert!(!result.is_error);
+
+        assert_eq!(
+            captured_tenant.lock().unwrap().as_deref(),
+            Some("restate-tenant")
+        );
+        assert_eq!(
+            captured_user.lock().unwrap().as_deref(),
+            Some("restate-user")
+        );
     }
 
     #[test]
