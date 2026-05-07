@@ -4,6 +4,7 @@ mod agent;
 mod daemon;
 mod guardrails;
 mod memory;
+mod persona;
 mod provider;
 mod sensor;
 
@@ -26,6 +27,7 @@ pub use memory::{
     EmbeddingConfig, KnowledgeConfig, KnowledgeSourceConfig, LspConfig, MemoryConfig,
     RestateConfig, TelemetryConfig, WorkspaceConfig,
 };
+pub use persona::{PersonaConfig, PersonaPhase};
 pub use provider::{
     CascadeConfig, CascadeGateConfig, CascadeTierConfig, ProviderCircuitConfig, ProviderConfig,
     RetryProviderConfig,
@@ -206,6 +208,11 @@ pub struct HeartbitConfig {
     /// bash subprocess also gets Landlock enforcement.
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    /// Persona instances declared in this config (Phase 0: parsed and
+    /// lexically validated; the registry lookup happens at daemon startup
+    /// once persona crates are loaded).
+    #[serde(default, rename = "persona")]
+    pub personas: Vec<PersonaConfig>,
 }
 
 impl HeartbitConfig {
@@ -726,6 +733,18 @@ impl HeartbitConfig {
                         ));
                     }
                 }
+            }
+        }
+
+        // Persona blocks: lexical validation + duplicate-name check.
+        let mut seen_persona_names = std::collections::HashSet::new();
+        for persona in &self.personas {
+            persona.validate()?;
+            if !seen_persona_names.insert(persona.name.clone()) {
+                return Err(Error::Config(format!(
+                    "duplicate persona name: '{}'",
+                    persona.name
+                )));
             }
         }
 
@@ -1375,6 +1394,45 @@ system_prompt = "Test."
 "#;
         let config = HeartbitConfig::from_toml(toml).unwrap();
         assert!(config.agents[0].response_schema.is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_persona_names() {
+        let toml_text = r#"
+            [provider]
+            name = "anthropic"
+            model = "claude-sonnet-4-20250514"
+
+            [[persona]]
+            name = "x"
+            recipe = "heartbit-ghost:x"
+
+            [[persona]]
+            name = "x"
+            recipe = "heartbit-ghost:x"
+        "#;
+        let err = HeartbitConfig::from_toml(toml_text).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("duplicate persona name"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parses_persona_block_round_trip() {
+        let toml_text = r#"
+            [provider]
+            name = "anthropic"
+            model = "claude-sonnet-4-20250514"
+
+            [[persona]]
+            name = "x"
+            recipe = "heartbit-ghost:x"
+            authorship_mode = "autonomous_undisclosed"
+            phase = "calibration"
+        "#;
+        let config = HeartbitConfig::from_toml(toml_text).expect("parses");
+        assert_eq!(config.personas.len(), 1);
+        assert_eq!(config.personas[0].name, "x");
+        assert_eq!(config.personas[0].recipe, "heartbit-ghost:x");
     }
 
     #[test]
