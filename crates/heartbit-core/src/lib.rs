@@ -178,4 +178,46 @@ pub mod __bench {
         let mut parser = crate::llm::anthropic::SseParser::new();
         parser.feed(chunk).len()
     }
+
+    /// Mock LLM provider that returns the same canned response on every
+    /// call (no draining). Designed for the agent-ReAct-turn bench
+    /// (Bench-NEW-1 in `tasks/perf-audit-v2-bench-gaps.md`) where each
+    /// criterion sample needs a fresh `execute()` against an identical
+    /// provider response — different from the test-only `MockProvider`
+    /// which drains a queue.
+    pub struct BenchMockProvider {
+        response: crate::llm::types::CompletionResponse,
+    }
+
+    impl BenchMockProvider {
+        /// Build a provider that always returns a single text response.
+        pub fn new_text(text: impl Into<String>) -> Self {
+            use crate::llm::types::{CompletionResponse, ContentBlock, StopReason, TokenUsage};
+            Self {
+                response: CompletionResponse {
+                    content: vec![ContentBlock::Text { text: text.into() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 64,
+                        output_tokens: 16,
+                        ..Default::default()
+                    },
+                    model: None,
+                },
+            }
+        }
+    }
+
+    impl crate::llm::LlmProvider for BenchMockProvider {
+        async fn complete(
+            &self,
+            _request: crate::llm::types::CompletionRequest,
+        ) -> Result<crate::llm::types::CompletionResponse, crate::error::Error> {
+            Ok(self.response.clone())
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("bench-mock")
+        }
+    }
 }

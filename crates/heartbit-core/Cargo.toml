@@ -74,3 +74,8 @@ harness = false
 name = "sse_parse"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "agent_react_turn"
+harness = false
+required-features = ["bench-internals"]
