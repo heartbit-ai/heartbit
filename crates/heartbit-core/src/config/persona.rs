@@ -56,17 +56,14 @@ pub struct PersonaConfig {
     /// Initial autonomy phase.
     #[serde(default)]
     pub phase: PersonaPhase,
-    /// Persona-specific overrides (free-form; interpreted by the recipe's `expand()`).
-    #[serde(default = "default_overrides")]
-    pub overrides: toml::Value,
-}
-
-/// Default value for [`PersonaConfig::overrides`] — an empty TOML table.
-///
-/// `toml::Value` does not implement [`Default`], so `#[serde(default)]` and
-/// the `..Default::default()` struct-literal pattern need an explicit helper.
-fn default_overrides() -> toml::Value {
-    toml::Value::Table(toml::map::Map::new())
+    /// Persona-specific overrides (free-form TOML table; interpreted by the
+    /// recipe's `expand()`).
+    ///
+    /// Typed as [`toml::Table`] (not [`toml::Value`]) so a misuse like
+    /// `overrides = "string"` fails at deserialize-time with a clear schema
+    /// error instead of surfacing later as a confusing `expand()` failure.
+    #[serde(default)]
+    pub overrides: toml::Table,
 }
 
 impl PersonaConfig {
@@ -101,7 +98,7 @@ impl Default for PersonaConfig {
             credentials_env: None,
             authorship_mode: AuthorshipMode::default(),
             phase: PersonaPhase::default(),
-            overrides: default_overrides(),
+            overrides: toml::Table::new(),
         }
     }
 }

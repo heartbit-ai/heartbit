@@ -8,26 +8,15 @@ use std::sync::Arc;
 
 /// Per-instance parameters supplied at expansion time. Constructed from the
 /// `[[persona]]` block in `HeartbitConfig`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PersonaParams {
-    /// Persona-specific overrides (free-form TOML; interpreted by `expand()`).
-    pub overrides: toml::Value,
+    /// Persona-specific overrides (free-form TOML table; interpreted by
+    /// `expand()`). An empty [`toml::Table`] is the neutral element.
+    pub overrides: toml::Table,
     /// Glob for environment-variable credential lookup, e.g. `"X_*"`.
     pub credentials_env: Option<String>,
     /// Authorship mode for posts/communications produced by the persona.
     pub authorship_mode: AuthorshipMode,
-}
-
-impl Default for PersonaParams {
-    fn default() -> Self {
-        Self {
-            // `toml::Value` doesn't implement `Default`; an empty table is
-            // the natural neutral element for "no overrides".
-            overrides: toml::Value::Table(toml::map::Map::new()),
-            credentials_env: None,
-            authorship_mode: AuthorshipMode::default(),
-        }
-    }
 }
 
 /// What a persona expands into at startup.
