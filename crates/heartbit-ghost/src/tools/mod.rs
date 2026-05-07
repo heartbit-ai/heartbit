@@ -8,10 +8,12 @@ pub mod client;
 pub mod mentions;
 pub mod reply;
 pub mod search;
+pub mod thread;
 pub mod user;
 
 pub use client::{XApiError, XClient, format_error};
 pub use mentions::TwitterMentionsTool;
 pub use reply::TwitterReplyTool;
 pub use search::TwitterSearchTool;
+pub use thread::TwitterThreadTool;
 pub use user::TwitterUserTool;
