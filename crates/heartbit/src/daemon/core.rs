@@ -774,6 +774,16 @@ impl DaemonCore {
                             let event_producer = self.producer.clone();
                             let events_topic = self.events_topic.clone();
                             let kafka_key: Arc<str> = Arc::from(id.to_string());
+                            // PERF (P-V2-DAEMON-1): per-task `Vec<u8>` pool
+                            // for the JSON serialisation buffer. Without it,
+                            // every emitted event paid a fresh `to_vec`
+                            // alloc + free; at 50–500 events/task that was
+                            // 2.5–100 ms of avoidable allocator traffic on
+                            // the per-event Kafka publish path. The buffer
+                            // is per-task (no cross-task contention) and
+                            // reused via `clear()` + `to_writer()`.
+                            let event_buf: Arc<parking_lot::Mutex<Vec<u8>>> =
+                                Arc::new(parking_lot::Mutex::new(Vec::with_capacity(4096)));
                             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> =
                                 Arc::new(move |event: AgentEvent| {
                                     // PERF (P-V2-DAEMON-7): skip the broadcast
@@ -784,18 +794,28 @@ impl DaemonCore {
                                     if tx.receiver_count() > 0 {
                                         let _ = tx.send(event.clone());
                                     }
-                                    // Fire-and-forget produce to Kafka
-                                    let json = match serde_json::to_vec(&event) {
-                                        Ok(j) => j,
-                                        Err(e) => {
-                                            tracing::error!(error = %e, "failed to serialize agent event for kafka");
-                                            return;
-                                        }
-                                    };
+                                    // Fire-and-forget produce to Kafka. The
+                                    // `payload` slice is held only across
+                                    // the synchronous queue-into-rdkafka
+                                    // call; rdkafka copies the bytes
+                                    // internally before returning, so the
+                                    // pool buffer is free to be reused on
+                                    // the next event.
+                                    let mut buf = event_buf.lock();
+                                    buf.clear();
+                                    if let Err(e) =
+                                        serde_json::to_writer(&mut *buf, &event)
+                                    {
+                                        tracing::error!(
+                                            error = %e,
+                                            "failed to serialize agent event for kafka"
+                                        );
+                                        return;
+                                    }
                                     drop(event_producer.send(
                                         FutureRecord::to(&events_topic)
                                             .key(kafka_key.as_ref())
-                                            .payload(&json),
+                                            .payload(buf.as_slice()),
                                         rdkafka::util::Timeout::Never,
                                     ));
                                 });
