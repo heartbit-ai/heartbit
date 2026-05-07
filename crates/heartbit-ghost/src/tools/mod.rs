@@ -5,5 +5,7 @@
 //! for HTTP, OAuth1 signing, and error mapping.
 
 pub mod client;
+pub mod user;
 
 pub use client::{XApiError, XClient, format_error};
+pub use user::TwitterUserTool;
