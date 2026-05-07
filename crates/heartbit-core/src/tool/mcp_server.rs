@@ -366,9 +366,9 @@ impl McpServer {
             .find(|t| t.definition().name == name)
             .ok_or_else(|| Error::Mcp(format!("Tool not found: {name}")))?;
 
-        // TODO(Task 5): construct ExecutionContext from JSON-RPC request envelope.
-        // Phase 0 placeholder: pass an empty context so the lib compiles. The
-        // MCP server does not yet carry tenant/user identity from JSON-RPC.
+        // TODO: derive ExecutionContext from MCP session / clientInfo when multi-tenant
+        // MCP integration lands (likely heartbit-ghost Phase 1). Default placeholder is
+        // safe: pre-trait-change there was no context at all, so blast radius is unchanged.
         match tool
             .execute(&crate::ExecutionContext::default(), arguments)
             .await
