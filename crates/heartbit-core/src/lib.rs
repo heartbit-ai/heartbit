@@ -20,6 +20,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod lsp;
 pub mod memory;
+pub mod persona;
 pub mod sandbox;
 #[cfg(unix)]
 pub mod signal;
@@ -139,6 +140,12 @@ pub use memory::pruning::{DEFAULT_MIN_STRENGTH, default_min_age, prune_weak_entr
 pub use memory::reflection::ReflectionTracker;
 pub use memory::scoring::ScoringWeights;
 pub use memory::{Memory, MemoryEntry, MemoryQuery, MemoryType};
+
+// --- Persona re-exports ---
+pub use persona::{
+    AuthorshipMode, Persona, PersonaExpansion, PersonaParams, PersonaRegistry, ReviewSpec,
+    TriggerSpec,
+};
 
 // --- Tool re-exports ---
 #[cfg(feature = "a2a")]
