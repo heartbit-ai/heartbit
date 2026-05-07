@@ -169,7 +169,7 @@ impl SensorManager {
                 .as_ref()
                 .map(|s| Duration::from_secs(s.correlation_window_hours * 3600))
                 .unwrap_or(Duration::from_secs(4 * 3600));
-            let correlator = std::sync::Mutex::new(StoryCorrelator::new(correlation_window));
+            let correlator = parking_lot::Mutex::new(StoryCorrelator::new(correlation_window));
 
             tracing::info!(topic = %topic, "starting triage consumer");
 
@@ -424,7 +424,7 @@ impl SensorManager {
 async fn run_triage_consumer(
     consumer: StreamConsumer,
     processor: Box<dyn TriageProcessor>,
-    correlator: &std::sync::Mutex<StoryCorrelator>,
+    correlator: &parking_lot::Mutex<StoryCorrelator>,
     producer: &FutureProducer,
     commands_topic: &str,
     dead_letter_topic: &str,
@@ -539,7 +539,7 @@ async fn run_triage_consumer(
                             extracted_entities.iter().cloned().collect();
 
                         let story_id = {
-                            let mut corr = correlator.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut corr = correlator.lock();
                             let id = corr.correlate_with_links(
                                 &event.id,
                                 &event.sensor_name,

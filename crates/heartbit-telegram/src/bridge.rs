@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::RwLock;
 
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
@@ -85,7 +87,7 @@ impl TelegramBridge {
 
             // Store pending
             {
-                let mut pending = bridge.pending.write().expect("pending lock not poisoned");
+                let mut pending = bridge.pending.write();
                 pending.insert(interaction_id, PendingSender::Approval(tx));
             }
 
@@ -141,13 +143,12 @@ impl TelegramBridge {
                 {
                     let options_per_question: Vec<Vec<String>> =
                         question_data.iter().map(|(_, opts)| opts.clone()).collect();
-                    let mut pending = bridge.pending.write().expect("pending lock not poisoned");
+                    let mut pending = bridge.pending.write();
                     pending.insert(interaction_id, PendingSender::Question(tx));
-                    let mut qo = bridge
+                    bridge
                         .question_options
                         .write()
-                        .expect("question_options lock not poisoned");
-                    qo.insert(interaction_id, options_per_question);
+                        .insert(interaction_id, options_per_question);
                 }
 
                 let buttons = question_buttons(interaction_id, &question_data);
@@ -235,10 +236,7 @@ impl TelegramBridge {
     ) -> Result<(), Error> {
         // Look up stored option labels
         let label = {
-            let qo = self
-                .question_options
-                .read()
-                .map_err(|e| Error::Telegram(format!("lock poisoned: {e}")))?;
+            let qo = self.question_options.read();
             let options = qo.get(&id).ok_or_else(|| {
                 Error::Telegram(format!("no stored question options for interaction {id}"))
             })?;
@@ -354,26 +352,17 @@ impl TelegramBridge {
     }
 
     fn take_pending(&self, id: Uuid) -> Result<PendingSender, Error> {
-        let mut pending = self
-            .pending
-            .write()
-            .map_err(|e| Error::Telegram(format!("lock poisoned: {e}")))?;
+        let mut pending = self.pending.write();
         // Also clean up stored question options
-        if let Ok(mut qo) = self.question_options.write() {
-            qo.remove(&id);
-        }
+        self.question_options.write().remove(&id);
         pending
             .remove(&id)
             .ok_or_else(|| Error::Telegram(format!("no pending interaction with id {id}")))
     }
 
     fn cleanup_pending(&self, id: Uuid) {
-        if let Ok(mut pending) = self.pending.write() {
-            pending.remove(&id);
-        }
-        if let Ok(mut qo) = self.question_options.write() {
-            qo.remove(&id);
-        }
+        self.pending.write().remove(&id);
+        self.question_options.write().remove(&id);
     }
 
     /// Inject a pending approval for testing. Used by adapter tests.
@@ -383,8 +372,7 @@ impl TelegramBridge {
         id: Uuid,
         tx: std::sync::mpsc::Sender<ApprovalDecision>,
     ) {
-        let mut pending = self.pending.write().expect("pending lock not poisoned");
-        pending.insert(id, PendingSender::Approval(tx));
+        self.pending.write().insert(id, PendingSender::Approval(tx));
     }
 
     /// Inject a pending question with stored option labels for testing.
@@ -395,13 +383,8 @@ impl TelegramBridge {
         tx: tokio::sync::oneshot::Sender<Result<QuestionResponse, Error>>,
         options: Vec<Vec<String>>,
     ) {
-        let mut pending = self.pending.write().expect("pending lock not poisoned");
-        pending.insert(id, PendingSender::Question(tx));
-        let mut qo = self
-            .question_options
-            .write()
-            .expect("question_options lock not poisoned");
-        qo.insert(id, options);
+        self.pending.write().insert(id, PendingSender::Question(tx));
+        self.question_options.write().insert(id, options);
     }
 }
 
@@ -468,7 +451,7 @@ mod tests {
 
         // Manually insert a pending approval
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Approval(tx));
         }
 
@@ -487,7 +470,7 @@ mod tests {
 
         // Manually insert a pending question
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
         }
 
@@ -507,7 +490,7 @@ mod tests {
         let (_tx, _rx) = tokio::sync::oneshot::channel::<Result<QuestionResponse, Error>>();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(_tx));
         }
 
@@ -524,7 +507,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Approval(tx));
         }
 
@@ -546,7 +529,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Approval(tx));
         }
 
@@ -583,9 +566,9 @@ mod tests {
 
         // Insert pending question + stored options
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
-            let mut qo = bridge.question_options.write().unwrap();
+            let mut qo = bridge.question_options.write();
             qo.insert(
                 id,
                 vec![vec!["Red".into(), "Blue".into()], vec!["Small".into()]],
@@ -604,9 +587,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
-            let mut qo = bridge.question_options.write().unwrap();
+            let mut qo = bridge.question_options.write();
             qo.insert(id, vec![vec!["A".into()]]);
         }
 
@@ -621,9 +604,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
-            let mut qo = bridge.question_options.write().unwrap();
+            let mut qo = bridge.question_options.write();
             qo.insert(id, vec![vec!["A".into()]]);
         }
 
@@ -638,7 +621,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
             // Deliberately don't insert question_options
         }
@@ -654,9 +637,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
         {
-            let mut pending = bridge.pending.write().unwrap();
+            let mut pending = bridge.pending.write();
             pending.insert(id, PendingSender::Question(tx));
-            let mut qo = bridge.question_options.write().unwrap();
+            let mut qo = bridge.question_options.write();
             qo.insert(id, vec![vec!["A".into()]]);
         }
 
@@ -670,7 +653,7 @@ mod tests {
             )
             .unwrap();
 
-        let qo = bridge.question_options.read().unwrap();
+        let qo = bridge.question_options.read();
         assert!(!qo.contains_key(&id));
     }
 }

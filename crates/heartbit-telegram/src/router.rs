@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 use uuid::Uuid;
 
@@ -30,7 +31,7 @@ pub struct ExpiredSession {
 
 /// Maps Telegram chat IDs to session IDs with inactivity and expiry tracking.
 ///
-/// Uses `std::sync::RwLock` (never held across `.await`) per codebase convention.
+/// Uses `parking_lot::RwLock` (never held across `.await`) per codebase convention.
 pub struct ChatSessionMap {
     map: RwLock<HashMap<i64, ChatState>>,
     inactivity_timeout: Duration,
@@ -55,21 +56,12 @@ impl ChatSessionMap {
         store: &dyn SessionStore,
     ) -> Result<(Uuid, bool), Error> {
         // Fast path: read lock to check existing
-        {
-            let map = self
-                .map
-                .read()
-                .map_err(|e| Error::Telegram(format!("lock poisoned: {e}")))?;
-            if let Some(state) = map.get(&chat_id) {
-                return Ok((state.session_id, false));
-            }
+        if let Some(state) = self.map.read().get(&chat_id) {
+            return Ok((state.session_id, false));
         }
 
         // Slow path: write lock to insert
-        let mut map = self
-            .map
-            .write()
-            .map_err(|e| Error::Telegram(format!("lock poisoned: {e}")))?;
+        let mut map = self.map.write();
 
         // Double-check after acquiring write lock
         if let Some(state) = map.get(&chat_id) {
@@ -92,9 +84,7 @@ impl ChatSessionMap {
 
     /// Update the last activity timestamp for a chat.
     pub fn touch(&self, chat_id: i64) {
-        if let Ok(mut map) = self.map.write()
-            && let Some(state) = map.get_mut(&chat_id)
-        {
+        if let Some(state) = self.map.write().get_mut(&chat_id) {
             state.last_activity = Instant::now();
         }
     }
@@ -102,10 +92,7 @@ impl ChatSessionMap {
     /// Collect sessions that have been inactive longer than `inactivity_timeout`.
     /// Does NOT remove them — the caller should consolidate, then optionally remove.
     pub fn collect_idle(&self) -> Vec<IdleSession> {
-        let map = match self.map.read() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
+        let map = self.map.read();
         let now = Instant::now();
         map.iter()
             .filter(|(_, state)| now.duration_since(state.last_activity) >= self.inactivity_timeout)
@@ -120,10 +107,7 @@ impl ChatSessionMap {
     /// Collect sessions that have exceeded the expiry timeout since creation.
     /// Does NOT remove them — caller should clean up via `remove`.
     pub fn collect_expired(&self) -> Vec<ExpiredSession> {
-        let map = match self.map.read() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
+        let map = self.map.read();
         let now = Instant::now();
         map.iter()
             .filter(|(_, state)| now.duration_since(state.created_at) >= self.expiry_timeout)
@@ -136,14 +120,12 @@ impl ChatSessionMap {
 
     /// Remove a chat from the map.
     pub fn remove(&self, chat_id: i64) {
-        if let Ok(mut map) = self.map.write() {
-            map.remove(&chat_id);
-        }
+        self.map.write().remove(&chat_id);
     }
 
     /// Get the current number of tracked chats.
     pub fn len(&self) -> usize {
-        self.map.read().map(|m| m.len()).unwrap_or(0)
+        self.map.read().len()
     }
 
     /// Check if the map is empty.
