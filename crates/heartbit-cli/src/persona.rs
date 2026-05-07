@@ -119,6 +119,19 @@ pub enum ProfileCommand {
 
 const NO_PERSONAS_REGISTERED: &str = "No personas registered. (heartbit-ghost or another persona crate must be linked into this build.)";
 
+/// Build a human-readable suffix listing available personas (or the
+/// empty-registry hint if none are registered). Used by every error
+/// site so `persona show`, `persona corpus`, and `persona profile`
+/// surface the same set of names that `persona list` prints.
+fn registry_suffix(registry: &PersonaRegistry) -> String {
+    let available = registry.list();
+    if available.is_empty() {
+        NO_PERSONAS_REGISTERED.to_string()
+    } else {
+        format!("Available personas: {}.", available.join(", "))
+    }
+}
+
 /// Dispatch a `persona` subcommand against the registry populated by
 /// linked persona crates (e.g. `heartbit-ghost`).
 pub async fn run(cmd: PersonaCommand) -> Result<()> {
@@ -148,12 +161,7 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
         | PersonaCommand::ExportPreferences { name, .. }
         | PersonaCommand::Audit { name, .. } => {
             if registry.get(&name).is_none() {
-                let available = registry.list();
-                let suffix = if available.is_empty() {
-                    NO_PERSONAS_REGISTERED.to_string()
-                } else {
-                    format!("Available personas: {}.", available.join(", "))
-                };
+                let suffix = registry_suffix(registry);
                 return Err(anyhow!("persona '{name}' not found. {suffix}"));
             }
             // P1.0 ships the registration shell; subcommand bodies land in
@@ -165,12 +173,14 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
         }
         PersonaCommand::Corpus { sub } => match sub {
             CorpusCommand::Add { .. } | CorpusCommand::List { .. } => Err(anyhow!(
-                "corpus management requires a registered persona. {NO_PERSONAS_REGISTERED}"
+                "corpus management requires a registered persona. {}",
+                registry_suffix(registry)
             )),
         },
         PersonaCommand::Profile { sub } => match sub {
             ProfileCommand::Rebuild { .. } | ProfileCommand::Diff { .. } => Err(anyhow!(
-                "profile management requires a registered persona. {NO_PERSONAS_REGISTERED}"
+                "profile management requires a registered persona. {}",
+                registry_suffix(registry)
             )),
         },
     }
@@ -247,6 +257,50 @@ mod tests {
         assert!(msg.contains("persona 'doesnotexist' not found"));
         assert!(msg.contains("Available personas: heartbit-ghost:x"));
         // Must NOT regress to the empty-registry hint when one IS registered.
+        assert!(!msg.contains("No personas registered"));
+    }
+
+    #[tokio::test]
+    async fn corpus_add_with_registered_persona_lists_available() {
+        // When a persona IS registered, corpus management should surface
+        // it instead of regressing to the empty-registry hint.
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let result = dispatch(
+            PersonaCommand::Corpus {
+                sub: CorpusCommand::Add {
+                    writer: "karpathy".into(),
+                    path: std::path::PathBuf::from("/tmp/x.jsonl"),
+                },
+            },
+            &r,
+        )
+        .await;
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("corpus management requires a registered persona"));
+        assert!(msg.contains("Available personas: heartbit-ghost:x"));
+        // Must NOT regress to the empty-registry hint when one IS registered.
+        assert!(!msg.contains("No personas registered"));
+    }
+
+    #[tokio::test]
+    async fn profile_rebuild_with_registered_persona_lists_available() {
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let result = dispatch(
+            PersonaCommand::Profile {
+                sub: ProfileCommand::Rebuild {
+                    name: "doesnotexist".into(),
+                },
+            },
+            &r,
+        )
+        .await;
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("profile management requires a registered persona"));
+        assert!(msg.contains("Available personas: heartbit-ghost:x"));
         assert!(!msg.contains("No personas registered"));
     }
 }
