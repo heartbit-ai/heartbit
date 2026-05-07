@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.507.1] - 2026-05-07
+
+### Performance — Phase 2c (memory subsystem stepping stone)
+
+Continues the perf cycle from `tasks/performance-audit-heartbit-core
+-2026-05-06.md`. Adds the `tokens` side cache to `InMemoryStore` —
+the recall hot path no longer pays the per-entry `to_lowercase()` +
+`split_whitespace()` cost; that work moves to store/update time and
+is reused on every recall.
+
+### Changed
+
+- **`InMemoryStore::tokens` side cache** ([`a528e4c`](https://github.com/heartbit-ai/heartbit/commit/a528e4c)) — sibling
+  `parking_lot::RwLock<HashMap<String, EntryTokens>>` map maintained
+  in lock-step with `entries`. `EntryTokens` carries
+  `lower_content: String`, `content_words: Vec<String>`, and
+  `lower_keywords: Vec<String>`, populated on every `store` / `update`
+  and removed on `forget` / `prune` / cap-eviction. The recall hot
+  path reads from the cache and feeds the new
+  `bm25::bm25_score_pre(&[String], &[String], ...)` directly,
+  eliminating up to ~140k transient `String` allocations per recall
+  at N=10k. Lock order is `entries` → `tokens` everywhere; both are
+  `parking_lot::RwLock` and never held across `.await`.
+
+### Added
+
+- **`bm25::bm25_score_pre(&[String], &[String], &[String], f64, f64,
+  f64)`** — public pre-tokenised variant of `bm25_score`; accepts
+  already-lowercased content words and keywords. The legacy
+  `bm25_score(&str, &[String], ...)` now delegates to this new
+  variant after performing the lowercase + tokenise itself, so all
+  existing callers behave identically.
+
+### Bench deltas (cumulative since the audit baseline)
+
+| Bench | Baseline | This release | Cumulative delta |
+|---|---|---|---|
+| `memory_recall/text_query_top10@10k` | 19.8 ms | **12.69 ms** | **−36%** (−5% vs 506.2) |
+| `memory_recall/text_query_top10@1k` | 1.78 ms | **~0.5 ms** | **−72%** |
+| `memory_recall/agent_filter_top10@10k` | 3.20 ms | **2.02 ms** | **−37%** (−9% vs 506.2) |
+| `memory_recall/agent_filter_top10@1k` | 308 µs | **187 µs** | **−39%** (−10% vs 506.2) |
+| `sse_parse/feed_16kb_one_shot` | 11.3 µs | **7.0 µs** | **−38.5%** (unchanged from 506.2) |
+
+### Notes
+
+- The headline `P-MEM-2` BM25 inverted index (audit-predicted
+  <2 ms text@10k) remains deferred. Reaching it requires switching
+  from substring-match (`word.contains(token)`) to exact-word match
+  so a `HashMap<token, Vec<entry_id>>` index can short-circuit the
+  candidate set — a semantic change beyond this cycle's scope.
+  Preserving substring semantics would need a trigram/suffix index
+  (much larger storage) or an opt-in fallback path.
+- Quality gates: 3669 workspace tests green (incl. 214 memory tests).
+  `cargo fmt -- --check` clean; `cargo clippy --workspace
+  --all-targets --features heartbit-core/bench-internals
+  -- -D warnings` clean.
+- No security regressions: F-* findings from the security cycle
+  remain intact.
+
 ## [2026.506.2] - 2026-05-06
 
 ### Performance — heartbit-core deep perf audit + first remediation cycle
