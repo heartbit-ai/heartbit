@@ -143,6 +143,7 @@ fn expand_heartbit_tool(attr: ToolAttr, func: ItemFn) -> syn::Result<TokenStream
 
             fn execute(
                 &self,
+                _ctx: &::heartbit::ExecutionContext,
                 input: ::serde_json::Value,
             ) -> ::std::pin::Pin<
                 ::std::boxed::Box<
