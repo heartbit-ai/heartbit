@@ -6,10 +6,11 @@
 //! - P1.2d: blend algorithm (BlendRecipe + N profiles → 1 profile)
 //! - P1.2e: CLI bodies for `corpus add/list/remove`, `profile rebuild/diff`
 
+pub mod blend;
 pub mod error;
 pub mod style;
-// pub mod blend;   // uncommented in Task 4
 
+pub use blend::{BlendEntry, BlendRecipe, PartialStyleProfile};
 pub use error::VoiceError;
 pub use style::{
     EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency, HashtagPolicy, LineBreaks,
