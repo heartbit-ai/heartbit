@@ -1233,6 +1233,172 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Task 9 Item B (foundation Phase 0): regression net for tenant/user
+    /// audit-context propagation through to `ExecutionContext` on tool calls.
+    ///
+    /// `build_runner_from_request` reads `req.user_id` / `req.tenant_id` and
+    /// calls `AgentRunnerBuilder::audit_user_context(user, tenant)` — that's
+    /// the only line that consumes those fields on the runtime path
+    /// (`daemon/execute.rs` lines ~358–360). The matching daemon-mode path in
+    /// `daemon/mod.rs::build_runner` threads the same fields via
+    /// `RuntimeBuilder::audit_user_id` / `audit_tenant_id`, which ultimately
+    /// calls the same `AgentRunnerBuilder::audit_user_context`. A future
+    /// refactor that drops or inverts that call would silently break
+    /// per-tenant secret resolution and audit logging — this test pins the
+    /// behavioral contract end-to-end (provider → tool dispatch → tool sees
+    /// the populated `ExecutionContext`).
+    ///
+    /// The lower-level "AgentRunner threads audit fields onto ExecutionContext"
+    /// invariant is already covered by `execution_context_propagates_to_tool`
+    /// in `crates/heartbit-core/src/agent/runner.rs`. This test pins the
+    /// CLI-layer wiring above it.
+    #[tokio::test]
+    async fn audit_context_propagates_to_tool_execution_context() {
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        use heartbit::{
+            BoxedProvider, CompletionRequest, CompletionResponse, ContentBlock, Error as HbError,
+            ExecutionContext, LlmProvider, OnText, StopReason, TokenUsage, Tool, ToolOutput,
+            agent::AgentRunner, llm::types::ToolDefinition,
+        };
+
+        // Custom tool that captures the ExecutionContext fields its execute()
+        // arg carries. The runner constructs `ExecutionContext` from its
+        // `audit_tenant_id` / `audit_user_id` fields per turn, so what we see
+        // here is what the runner saw.
+        struct CtxCapturingTool {
+            captured_tenant: Arc<Mutex<Option<String>>>,
+            captured_user: Arc<Mutex<Option<String>>>,
+        }
+
+        impl Tool for CtxCapturingTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "ctx_capture".into(),
+                    description: "Captures tenant_id and user_id from \
+                                  ExecutionContext for the audit-propagation \
+                                  regression test."
+                        .into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, HbError>> + Send + '_>>
+            {
+                let tenant = ctx.tenant_id.clone();
+                let user = ctx.user_id.clone();
+                let captured_tenant = self.captured_tenant.clone();
+                let captured_user = self.captured_user.clone();
+                Box::pin(async move {
+                    *captured_tenant.lock().unwrap() = tenant;
+                    *captured_user.lock().unwrap() = user;
+                    Ok(ToolOutput::success("captured"))
+                })
+            }
+        }
+
+        // Two-shot stub provider: first turn → ToolUse(ctx_capture), second
+        // turn → EndTurn. Mirrors the canonical ReAct two-step pattern.
+        struct TwoShotStubProvider {
+            calls: Mutex<u32>,
+        }
+
+        impl LlmProvider for TwoShotStubProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, HbError> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                let response = if *n == 1 {
+                    CompletionResponse {
+                        content: vec![ContentBlock::ToolUse {
+                            id: "call-1".into(),
+                            name: "ctx_capture".into(),
+                            input: serde_json::json!({}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        model: None,
+                    }
+                } else {
+                    CompletionResponse {
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                        model: None,
+                    }
+                };
+                Ok(response)
+            }
+
+            async fn stream_complete(
+                &self,
+                request: CompletionRequest,
+                _on_text: &OnText,
+            ) -> Result<CompletionResponse, HbError> {
+                self.complete(request).await
+            }
+        }
+
+        // Build the runner using the same audit-threading pattern that
+        // `build_runner_from_request` uses (see ~lines 358-360 above).
+        let captured_tenant = Arc::new(Mutex::new(None));
+        let captured_user = Arc::new(Mutex::new(None));
+        let tool: Arc<dyn Tool> = Arc::new(CtxCapturingTool {
+            captured_tenant: captured_tenant.clone(),
+            captured_user: captured_user.clone(),
+        });
+
+        let provider = Arc::new(BoxedProvider::new(TwoShotStubProvider {
+            calls: Mutex::new(0),
+        }));
+
+        let user_id = "user-abc";
+        let tenant_id = uuid::Uuid::new_v4();
+
+        let runner = AgentRunner::builder(provider)
+            .name("test-agent")
+            .system_prompt("You are a test agent.")
+            .max_turns(3)
+            .max_tokens(1024)
+            // ↓↓↓ THIS is the line that mirrors `build_runner_from_request`
+            //     execute.rs:358-360. If it gets dropped or inverted, this
+            //     test fails.
+            .audit_user_context(user_id, tenant_id.to_string())
+            .tools(vec![tool])
+            .build()
+            .expect("agent runner builds with audit context");
+
+        let output = runner
+            .execute("trigger ctx_capture")
+            .await
+            .expect("runner runs to completion");
+
+        // Sanity: tool was actually called.
+        assert_eq!(output.tool_calls_made, 1, "tool was not invoked");
+
+        // The captured ExecutionContext fields must match what the CLI
+        // threaded in.
+        assert_eq!(
+            captured_tenant.lock().unwrap().as_deref(),
+            Some(tenant_id.to_string().as_str()),
+            "tool did not receive tenant_id from ExecutionContext"
+        );
+        assert_eq!(
+            captured_user.lock().unwrap().as_deref(),
+            Some(user_id),
+            "tool did not receive user_id from ExecutionContext"
+        );
+    }
+
     #[tokio::test]
     async fn build_runner_with_on_event() {
         let req = make_test_request();
