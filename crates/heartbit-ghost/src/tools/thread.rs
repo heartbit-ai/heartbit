@@ -185,10 +185,15 @@ mod tests {
 
     #[tokio::test]
     async fn thread_three_tweets_chain_correctly() {
+        use wiremock::matchers::body_partial_json;
+
         let server = MockServer::start().await;
-        // First post: no reply field
+        // First post: text "one", NO reply field (impl omits via skip_serializing_if).
+        // body_partial_json with {"text": "one"} verifies the text content; the impl's
+        // skip_serializing_if guarantees no reply key is sent for the root tweet.
         Mock::given(method("POST"))
             .and(wm_path("/2/tweets"))
+            .and(body_partial_json(serde_json::json!({"text": "one"})))
             .respond_with(
                 ResponseTemplate::new(201)
                     .set_body_json(serde_json::json!({"data": {"id": "1001"}})),
@@ -196,9 +201,13 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        // Second post: reply to 1001 → returns 1002
+        // Second post: text "two", reply.in_reply_to_tweet_id = "1001"
         Mock::given(method("POST"))
             .and(wm_path("/2/tweets"))
+            .and(body_partial_json(serde_json::json!({
+                "text": "two",
+                "reply": {"in_reply_to_tweet_id": "1001"}
+            })))
             .respond_with(
                 ResponseTemplate::new(201)
                     .set_body_json(serde_json::json!({"data": {"id": "1002"}})),
@@ -206,9 +215,13 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        // Third post: reply to 1002 → returns 1003
+        // Third post: text "three", reply.in_reply_to_tweet_id = "1002"
         Mock::given(method("POST"))
             .and(wm_path("/2/tweets"))
+            .and(body_partial_json(serde_json::json!({
+                "text": "three",
+                "reply": {"in_reply_to_tweet_id": "1002"}
+            })))
             .respond_with(
                 ResponseTemplate::new(201)
                     .set_body_json(serde_json::json!({"data": {"id": "1003"}})),
