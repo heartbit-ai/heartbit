@@ -14,6 +14,5 @@ pub use error::VoiceError;
 pub use style::{
     EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency, HashtagPolicy, LineBreaks,
     OpeningPattern, PeriodsPolicy, QuotationMarks, SentenceLengthTarget, SpecificityTarget,
-    ThreadRhythm,
+    StyleProfile, ThreadRhythm,
 };
-// (StyleProfile re-export added by Task 3 — leave it out so this compiles)
