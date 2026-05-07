@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — heartbit-ghost P1.1 (X tool family)
+
+The P1.1 increment ships the X (Twitter) tool family on top of the Phase 0
+`ExecutionContext` / `CredentialResolver` foundation. Five new tools live
+in `heartbit-ghost`, plus a backward-compatible media + alt-text extension
+on the existing `heartbit-core` `TwitterPostTool`. All HTTP interaction is
+covered by `wiremock`-stubbed tests; no live network calls in CI.
+
+### Added (heartbit-ghost P1.1)
+
+- `TwitterUserTool` — `GET /2/users/by/username/:handle`. Returns id, name,
+  description, follower/following/tweet counts.
+- `TwitterSearchTool` — `GET /2/tweets/search/recent`. Returns matching
+  tweets + `next_token` for pagination.
+- `TwitterMentionsTool` — `GET /2/users/:id/mentions`. Returns mentions +
+  pagination.
+- `TwitterReplyTool` — `POST /2/tweets` (with `reply.in_reply_to_tweet_id`).
+  Validates ≤280 chars.
+- `TwitterThreadTool` — `POST /2/tweets` ×N, chained via `in_reply_to`.
+  1..=25 entries; fail-fast on first error (X has no rollback API; tweets
+  posted before the failure stay live).
+- Shared `XClient` infrastructure: OAuth1 signing, credential resolution
+  from `ExecutionContext::credentials`, typed `XApiError`, response parsing.
+- Stable credential resolver names: `X_CONSUMER_KEY`, `X_CONSUMER_SECRET`,
+  `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`.
+
+### Changed (heartbit-core)
+
+- `TwitterPostTool` now accepts optional `media_url` (HTTPS, ≤5 MB image)
+  and `media_alt_text` (≤1000 chars). Backward-compatible: text-only
+  callers see no change. Test-only constructor `new_with_base_urls` added
+  for wiremock injection.
+
+### Notes (heartbit-ghost P1.1)
+
+- New tools use the resolver-based credential model (per-tenant ready);
+  existing `twitter_post` keeps construction-time `TwitterCredentials` for
+  backward compatibility. Persona wiring (P1.3) will switch the persona's
+  `twitter_post` instance to the resolver pattern.
+- All new tests use `wiremock` for HTTP stubbing; no live network calls
+  in CI.
+- `twitter_thread` errors do not include partial-thread state in P1.1
+  (e.g., the list of tweets posted before the failure). Operators should
+  inspect the X timeline. A future API-shape extension could surface this
+  for orchestrators that need it.
+
 ## [2026.507.3] - 2026-05-07 — heartbit Foundation Phase 0
 
 The Phase 0 foundation lands the cross-cutting plumbing that the persona
