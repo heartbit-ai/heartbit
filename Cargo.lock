@@ -1824,6 +1824,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "heartbit",
+ "heartbit-ghost",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

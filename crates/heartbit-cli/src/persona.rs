@@ -1,9 +1,10 @@
 //! `heartbit persona <sub>` subcommand surface.
 //!
-//! Functional shells against the (empty in Phase 0) `PersonaRegistry`. Each
-//! subcommand returns a canonical "no personas registered" error. Once
-//! persona crates (e.g. `heartbit-ghost`) register their recipes, these
-//! subcommands light up without any CLI changes.
+//! Functional shells against the `PersonaRegistry` populated at startup by
+//! linked persona crates (e.g. `heartbit-ghost`). Once persona crates
+//! register their recipes, these subcommands light up without any CLI
+//! changes. P1.0 ships the registration shell; subcommand bodies land in
+//! later sub-phases (P1.1–P1.4).
 
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
@@ -118,9 +119,11 @@ pub enum ProfileCommand {
 
 const NO_PERSONAS_REGISTERED: &str = "No personas registered. (heartbit-ghost or another persona crate must be linked into this build.)";
 
-/// Dispatch a `persona` subcommand against the (Phase 0: empty) registry.
+/// Dispatch a `persona` subcommand against the registry populated by
+/// linked persona crates (e.g. `heartbit-ghost`).
 pub async fn run(cmd: PersonaCommand) -> Result<()> {
-    let registry = PersonaRegistry::new();
+    let mut registry = PersonaRegistry::new();
+    heartbit_ghost::register(&mut registry);
     dispatch(cmd, &registry).await
 }
 
@@ -145,13 +148,19 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
         | PersonaCommand::ExportPreferences { name, .. }
         | PersonaCommand::Audit { name, .. } => {
             if registry.get(&name).is_none() {
-                return Err(anyhow!(
-                    "persona '{name}' not found. {NO_PERSONAS_REGISTERED}"
-                ));
+                let available = registry.list();
+                let suffix = if available.is_empty() {
+                    NO_PERSONAS_REGISTERED.to_string()
+                } else {
+                    format!("Available personas: {}.", available.join(", "))
+                };
+                return Err(anyhow!("persona '{name}' not found. {suffix}"));
             }
-            // Bodies for non-empty registry land in Phase 1 alongside concrete persona crates.
+            // P1.0 ships the registration shell; subcommand bodies land in
+            // later sub-phases (P1.1–P1.4) alongside the persona's tools,
+            // voice modeling, and pipeline.
             Err(anyhow!(
-                "persona subcommand bodies are not implemented in Phase 0; this CLI shell ships with the foundation release."
+                "persona '{name}': subcommand body is not yet implemented (P1.0 scaffolding stub). The persona is registered; its tools, voice modeling, and pipeline land in later sub-phases."
             ))
         }
         PersonaCommand::Corpus { sub } => match sub {
@@ -217,5 +226,27 @@ mod tests {
         .await;
         let err = result.unwrap_err();
         assert!(format!("{err}").contains("No personas registered"));
+    }
+
+    #[tokio::test]
+    async fn show_unknown_persona_with_registered_persona_lists_available() {
+        // Manually populate the registry with the heartbit-ghost stub, then
+        // ask for a name that isn't there; the error must surface the
+        // available persona name(s).
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let result = dispatch(
+            PersonaCommand::Show {
+                name: "doesnotexist".into(),
+            },
+            &r,
+        )
+        .await;
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("persona 'doesnotexist' not found"));
+        assert!(msg.contains("Available personas: heartbit-ghost:x"));
+        // Must NOT regress to the empty-registry hint when one IS registered.
+        assert!(!msg.contains("No personas registered"));
     }
 }

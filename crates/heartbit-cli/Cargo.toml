@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 heartbit = { path = "../heartbit", features = ["full"] }
+heartbit-ghost = { path = "../heartbit-ghost" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
