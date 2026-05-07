@@ -45,6 +45,9 @@ impl std::fmt::Debug for TwitterCredentials {
 pub struct TwitterPostTool {
     credentials: TwitterCredentials,
     client: reqwest::Client,
+    tweet_url: String,
+    media_upload_url: String,
+    media_meta_url: String,
 }
 
 impl TwitterPostTool {
@@ -70,7 +73,33 @@ impl TwitterPostTool {
         Ok(Self {
             credentials,
             client,
+            tweet_url: X_API_URL.to_string(),
+            media_upload_url: "https://upload.twitter.com/1.1/media/upload.json".to_string(),
+            media_meta_url: "https://upload.twitter.com/1.1/media/metadata/create.json".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+impl TwitterPostTool {
+    /// Test-only constructor that allows injecting endpoint URLs for wiremock.
+    pub(crate) fn new_with_base_urls(
+        credentials: TwitterCredentials,
+        tweet_url: String,
+        media_upload_url: String,
+        media_meta_url: String,
+    ) -> Self {
+        let client = crate::http::vendor_client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("test client builds");
+        Self {
+            credentials,
+            client,
+            tweet_url,
+            media_upload_url,
+            media_meta_url,
+        }
     }
 }
 
@@ -153,17 +182,143 @@ fn build_oauth_header(
     ))
 }
 
+impl TwitterPostTool {
+    /// Fetch image bytes from `media_url`, upload to X v1.1 media endpoint, and
+    /// (optionally) attach alt text. Returns the `media_id_string` to be referenced
+    /// in the tweet POST.
+    async fn upload_media(
+        &self,
+        media_url: &str,
+        media_alt_text: Option<&str>,
+    ) -> Result<String, Error> {
+        // Step A: Fetch the image bytes (HTTP GET, ≤5 MB)
+        let bytes_resp = self
+            .client
+            .get(media_url)
+            .send()
+            .await
+            .map_err(|e| Error::Agent(format!("media fetch failed: {e}")))?;
+        let status = bytes_resp.status();
+        if !status.is_success() {
+            return Err(Error::Agent(format!(
+                "media fetch returned status {}",
+                status.as_u16()
+            )));
+        }
+        let body = bytes_resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Agent(format!("media body read failed: {e}")))?;
+        if body.len() > 5 * 1024 * 1024 {
+            return Err(Error::Agent(format!(
+                "media exceeds 5 MB limit (got {} bytes)",
+                body.len()
+            )));
+        }
+
+        // Step B: Upload to X v1.1 media endpoint via multipart/form-data
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| Error::Agent(format!("system time error: {e}")))?
+            .as_secs();
+        let nonce = format!("{}{}", timestamp, &timestamp.to_string()[..6]);
+
+        let auth_header = build_oauth_header(
+            &self.media_upload_url,
+            &self.credentials.consumer_key,
+            &self.credentials.consumer_secret,
+            &self.credentials.access_token,
+            &self.credentials.access_token_secret,
+            &nonce,
+            timestamp,
+        )?;
+
+        let form = reqwest::multipart::Form::new().part(
+            "media",
+            reqwest::multipart::Part::bytes(body.to_vec()).file_name("media"),
+        );
+        let response = self
+            .client
+            .post(&self.media_upload_url)
+            .header("Authorization", auth_header)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::Agent(format!("media upload failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Agent(format!(
+                "media upload returned status {}: {body}",
+                status.as_u16()
+            )));
+        }
+        let parsed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| Error::Agent(format!("media upload parse failed: {e}")))?;
+        let media_id_string = parsed
+            .get("media_id_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Agent("media upload returned no media_id_string".into()))?
+            .to_string();
+
+        // Step C (optional): attach alt text via metadata/create
+        if let Some(alt) = media_alt_text {
+            let meta_timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|e| Error::Agent(format!("system time error: {e}")))?
+                .as_secs();
+            let meta_nonce = format!("{}{}", meta_timestamp, &meta_timestamp.to_string()[..6]);
+            let meta_auth = build_oauth_header(
+                &self.media_meta_url,
+                &self.credentials.consumer_key,
+                &self.credentials.consumer_secret,
+                &self.credentials.access_token,
+                &self.credentials.access_token_secret,
+                &meta_nonce,
+                meta_timestamp,
+            )?;
+            let body = json!({
+                "media_id": media_id_string,
+                "alt_text": {"text": alt}
+            });
+            let _ = self
+                .client
+                .post(&self.media_meta_url)
+                .header("Authorization", meta_auth)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| Error::Agent(format!("alt-text attach failed: {e}")))?;
+            // Don't fail if alt-text attach fails — the media itself is already up
+            // and the tweet can still post.
+        }
+
+        Ok(media_id_string)
+    }
+}
+
 impl Tool for TwitterPostTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "twitter_post".into(),
-            description: "Post a tweet to X/Twitter. Maximum 280 characters.".into(),
+            description: "Post a tweet to X/Twitter. Maximum 280 characters. Optionally attaches one image via media_url with an accessibility description via media_alt_text.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
                         "description": "The tweet text to post (max 280 characters)"
+                    },
+                    "media_url": {
+                        "type": "string",
+                        "description": "Optional. Public HTTPS URL of one image to attach (≤5 MB, JPEG/PNG/WebP/GIF)."
+                    },
+                    "media_alt_text": {
+                        "type": "string",
+                        "description": "Optional. Accessibility description for the image (≤1000 chars). Ignored if media_url is absent.",
+                        "maxLength": 1000
                     }
                 },
                 "required": ["text"]
@@ -194,6 +349,19 @@ impl Tool for TwitterPostTool {
                 )));
             }
 
+            // Optional media handling: upload first, then attach to the tweet body.
+            let media_url = input.get("media_url").and_then(|v| v.as_str());
+            let media_alt_text = input.get("media_alt_text").and_then(|v| v.as_str());
+
+            let media_id_string: Option<String> = if let Some(url) = media_url {
+                match self.upload_media(url, media_alt_text).await {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(ToolOutput::error(format!("media upload failed: {e}"))),
+                }
+            } else {
+                None
+            };
+
             // Generate OAuth nonce and timestamp
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -204,7 +372,7 @@ impl Tool for TwitterPostTool {
             let nonce = uuid::Uuid::new_v4().to_string().replace('-', "");
 
             let auth_header = build_oauth_header(
-                X_API_URL,
+                &self.tweet_url,
                 &self.credentials.consumer_key,
                 &self.credentials.consumer_secret,
                 &self.credentials.access_token,
@@ -213,11 +381,18 @@ impl Tool for TwitterPostTool {
                 timestamp,
             )?;
 
-            let body = json!({ "text": text });
+            let body = if let Some(ref id) = media_id_string {
+                json!({
+                    "text": text,
+                    "media": {"media_ids": [id]}
+                })
+            } else {
+                json!({"text": text})
+            };
 
             let response = self
                 .client
-                .post(X_API_URL)
+                .post(&self.tweet_url)
                 .header("Authorization", &auth_header)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -418,5 +593,162 @@ mod tests {
                 // Network error is expected with fake credentials
             }
         }
+    }
+
+    #[tokio::test]
+    async fn post_with_media_url_and_alt_text() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Stub the media bytes URL (the image)
+        Mock::given(method("GET"))
+            .and(wm_path("/test-image.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 1024])
+                    .insert_header("Content-Type", "image/png"),
+            )
+            .mount(&server)
+            .await;
+
+        // Stub the media upload endpoint
+        Mock::given(method("POST"))
+            .and(wm_path("/1.1/media/upload.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "media_id_string": "999888777",
+                "media_id": 999888777u64
+            })))
+            .mount(&server)
+            .await;
+
+        // Stub the metadata/create endpoint (alt text)
+        Mock::given(method("POST"))
+            .and(wm_path("/1.1/media/metadata/create.json"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Stub the tweet POST endpoint
+        Mock::given(method("POST"))
+            .and(wm_path("/2/tweets"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "data": {"id": "5555"}
+            })))
+            .mount(&server)
+            .await;
+
+        let media_url = format!("{}/test-image.png", server.uri());
+        let tool = TwitterPostTool::new_with_base_urls(
+            test_credentials(),
+            format!("{}/2/tweets", server.uri()),
+            format!("{}/1.1/media/upload.json", server.uri()),
+            format!("{}/1.1/media/metadata/create.json", server.uri()),
+        );
+        let ctx = crate::ExecutionContext::default();
+        let input = json!({
+            "text": "look at this",
+            "media_url": media_url,
+            "media_alt_text": "a square of zeros"
+        });
+        let result = tool.execute(&ctx, input).await.expect("ok");
+        assert!(!result.is_error);
+        assert!(result.content.contains("5555"));
+    }
+
+    #[tokio::test]
+    async fn post_text_only_still_works_without_media_fields() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/2/tweets"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"data": {"id": "111"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = TwitterPostTool::new_with_base_urls(
+            test_credentials(),
+            format!("{}/2/tweets", server.uri()),
+            format!("{}/1.1/media/upload.json", server.uri()),
+            format!("{}/1.1/media/metadata/create.json", server.uri()),
+        );
+        let ctx = crate::ExecutionContext::default();
+        let input = json!({"text": "no media"});
+        let result = tool.execute(&ctx, input).await.expect("ok");
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn post_rejects_oversized_media() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/big.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 6 * 1024 * 1024])
+                    .insert_header("Content-Type", "image/png"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = TwitterPostTool::new_with_base_urls(
+            test_credentials(),
+            format!("{}/2/tweets", server.uri()),
+            format!("{}/1.1/media/upload.json", server.uri()),
+            format!("{}/1.1/media/metadata/create.json", server.uri()),
+        );
+        let ctx = crate::ExecutionContext::default();
+        let media_url = format!("{}/big.png", server.uri());
+        let input = json!({
+            "text": "won't fit",
+            "media_url": media_url
+        });
+        let result = tool
+            .execute(&ctx, input)
+            .await
+            .expect("Tool::execute returns Ok");
+        assert!(result.is_error);
+        assert!(result.content.contains("5 MB") || result.content.contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn post_handles_404_on_media_url() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/missing.png"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tool = TwitterPostTool::new_with_base_urls(
+            test_credentials(),
+            format!("{}/2/tweets", server.uri()),
+            format!("{}/1.1/media/upload.json", server.uri()),
+            format!("{}/1.1/media/metadata/create.json", server.uri()),
+        );
+        let ctx = crate::ExecutionContext::default();
+        let media_url = format!("{}/missing.png", server.uri());
+        let input = json!({
+            "text": "broken link",
+            "media_url": media_url
+        });
+        let result = tool
+            .execute(&ctx, input)
+            .await
+            .expect("Tool::execute returns Ok");
+        assert!(result.is_error);
+        assert!(result.content.contains("404") || result.content.contains("media fetch"));
     }
 }
