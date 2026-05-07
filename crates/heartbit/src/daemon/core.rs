@@ -61,7 +61,7 @@ pub struct DaemonHandle {
     producer: Option<FutureProducer>,
     commands_topic: Option<String>,
     store: Arc<dyn TaskStore>,
-    event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
+    event_channels: Arc<parking_lot::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
     pub(crate) tenant_tracker: Option<Arc<TenantTokenTracker>>,
 }
 
@@ -75,7 +75,7 @@ impl DaemonHandle {
             producer: None,
             commands_topic: None,
             store,
-            event_channels: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            event_channels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             tenant_tracker: None,
         }
     }
@@ -376,14 +376,7 @@ impl DaemonHandle {
 
     /// Subscribe to real-time events for a task (for SSE).
     pub fn subscribe_events(&self, id: uuid::Uuid) -> Option<broadcast::Receiver<AgentEvent>> {
-        let channels = match self.event_channels.read() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "event_channels lock poisoned in subscribe_events");
-                return None;
-            }
-        };
-        channels.get(&id).map(|tx| tx.subscribe())
+        self.event_channels.read().get(&id).map(|tx| tx.subscribe())
     }
 
     /// Register a task directly in the store (for non-Kafka execution paths like Telegram/WS).
@@ -481,8 +474,8 @@ pub struct DaemonCore {
     /// Idempotency-key TTL sweep configuration.
     idempotency_config: IdempotencyConfig,
     semaphore: Arc<Semaphore>,
-    event_channels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
-    task_cancels: Arc<std::sync::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
+    event_channels: Arc<parking_lot::RwLock<HashMap<uuid::Uuid, broadcast::Sender<AgentEvent>>>>,
+    task_cancels: Arc<parking_lot::RwLock<HashMap<uuid::Uuid, CancellationToken>>>,
     active_tasks: JoinSet<()>,
     cancel: CancellationToken,
     /// B5b: optional per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
@@ -501,7 +494,7 @@ impl DaemonCore {
             .kafka
             .as_ref()
             .expect("DaemonCore requires [daemon.kafka] config");
-        let event_channels = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let event_channels = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let handle = DaemonHandle {
             producer: Some(producer.clone()),
             commands_topic: Some(kafka_config.commands_topic.clone()),
@@ -521,7 +514,7 @@ impl DaemonCore {
             idempotency_config: config.idempotency.clone(),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
             event_channels,
-            task_cancels: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            task_cancels: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             active_tasks: JoinSet::new(),
             cancel,
             tenant_tracker: None,
@@ -767,22 +760,30 @@ impl DaemonCore {
                             };
 
                             let (tx, _) = broadcast::channel(1024);
-                            if let Ok(mut channels) = self.event_channels.write() {
-                                channels.insert(id, tx.clone());
-                            }
+                            self.event_channels.write().insert(id, tx.clone());
 
                             // Per-task cancellation token
                             let task_cancel = CancellationToken::new();
-                            if let Ok(mut cancels) = self.task_cancels.write() {
-                                cancels.insert(id, task_cancel.clone());
-                            }
+                            self.task_cancels.write().insert(id, task_cancel.clone());
 
-                            // Build on_event that produces to both Kafka and broadcast
+                            // Build on_event that produces to both Kafka and broadcast.
+                            // PERF (P-V2-DAEMON-9): pre-compute the Kafka key
+                            // string once per task instead of on every emitted
+                            // event — UUID → 36-char String repeated dozens
+                            // of times per task otherwise.
                             let event_producer = self.producer.clone();
                             let events_topic = self.events_topic.clone();
+                            let kafka_key: Arc<str> = Arc::from(id.to_string());
                             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> =
                                 Arc::new(move |event: AgentEvent| {
-                                    let _ = tx.send(event.clone());
+                                    // PERF (P-V2-DAEMON-7): skip the broadcast
+                                    // clone+send when no SSE subscribers are
+                                    // attached. The event is still produced
+                                    // to Kafka so downstream consumers get
+                                    // the full event stream.
+                                    if tx.receiver_count() > 0 {
+                                        let _ = tx.send(event.clone());
+                                    }
                                     // Fire-and-forget produce to Kafka
                                     let json = match serde_json::to_vec(&event) {
                                         Ok(j) => j,
@@ -793,7 +794,7 @@ impl DaemonCore {
                                     };
                                     drop(event_producer.send(
                                         FutureRecord::to(&events_topic)
-                                            .key(&id.to_string())
+                                            .key(kafka_key.as_ref())
                                             .payload(&json),
                                         rdkafka::util::Timeout::Never,
                                     ));
@@ -905,20 +906,14 @@ impl DaemonCore {
                                     }
                                 }
 
-                                if let Ok(mut ch) = channels.write() {
-                                    ch.remove(&id);
-                                }
-                                if let Ok(mut tc) = task_cancels.write() {
-                                    tc.remove(&id);
-                                }
+                                channels.write().remove(&id);
+                                task_cancels.write().remove(&id);
                                 drop(permit);
                             });
                         }
                         DaemonCommand::CancelTask { id } => {
                             // Cancel the running task if it exists
-                            if let Ok(cancels) = self.task_cancels.read()
-                                && let Some(token) = cancels.get(&id)
-                            {
+                            if let Some(token) = self.task_cancels.read().get(&id) {
                                 token.cancel();
                             }
                             // If task isn't running, just mark cancelled in store
@@ -932,9 +927,7 @@ impl DaemonCore {
                                     })
                                     .ok();
                             }
-                            if let Ok(mut ch) = self.event_channels.write() {
-                                ch.remove(&id);
-                            }
+                            self.event_channels.write().remove(&id);
                         }
                     }
                 }
@@ -1072,7 +1065,7 @@ mod tests {
 
         // Insert a broadcast channel
         let (tx, _) = broadcast::channel(16);
-        handle.event_channels.write().unwrap().insert(id, tx);
+        handle.event_channels.write().insert(id, tx);
 
         let rx = handle.subscribe_events(id);
         assert!(rx.is_some());

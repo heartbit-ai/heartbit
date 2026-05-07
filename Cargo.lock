@@ -1789,6 +1789,7 @@ dependencies = [
  "heartbit-macro",
  "jsonschema",
  "jsonwebtoken",
+ "parking_lot",
  "petgraph",
  "pgvector",
  "prometheus",

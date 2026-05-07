@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 #[cfg(any(feature = "postgres", test))]
 use chrono::{DateTime, Utc};
@@ -208,9 +209,10 @@ pub trait TaskStore: Send + Sync {
     }
 }
 
-/// In-memory task store backed by `std::sync::RwLock`.
+/// In-memory task store backed by `parking_lot::RwLock` (T2 in
+/// `tasks/performance-audit-v2-2026-05-07.md`).
 ///
-/// Uses `std::sync::RwLock` (not tokio) because locks are never held across
+/// Uses `parking_lot::RwLock` (not tokio) because locks are never held across
 /// `.await` boundaries. A separate `Vec<Uuid>` tracks insertion order.
 pub struct InMemoryTaskStore {
     tasks: RwLock<HashMap<Uuid, DaemonTask>>,
@@ -237,14 +239,8 @@ impl TaskStore for InMemoryTaskStore {
         let id = task.id;
         // Acquire both locks before mutating to keep tasks and order consistent.
         // Lock order: tasks → order (same as list/list_filtered to avoid deadlock).
-        let mut tasks = self
-            .tasks
-            .write()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
-        let mut order = self
-            .order
-            .write()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let mut tasks = self.tasks.write();
+        let mut order = self.order.write();
         if tasks.contains_key(&id) {
             return Err(Error::Daemon(format!("task {id} already exists")));
         }
@@ -270,22 +266,12 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     fn get(&self, id: Uuid) -> Result<Option<DaemonTask>, Error> {
-        let tasks = self
-            .tasks
-            .read()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
-        Ok(tasks.get(&id).cloned())
+        Ok(self.tasks.read().get(&id).cloned())
     }
 
     fn list(&self, limit: usize, offset: usize) -> Result<(Vec<DaemonTask>, usize), Error> {
-        let tasks = self
-            .tasks
-            .read()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
-        let order = self
-            .order
-            .read()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let tasks = self.tasks.read();
+        let order = self.order.read();
         let total = order.len();
         let result: Vec<DaemonTask> = order
             .iter()
@@ -298,10 +284,7 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     fn update(&self, id: Uuid, f: &dyn Fn(&mut DaemonTask)) -> Result<(), Error> {
-        let mut tasks = self
-            .tasks
-            .write()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let mut tasks = self.tasks.write();
         let task = tasks
             .get_mut(&id)
             .ok_or_else(|| Error::Daemon(format!("task {id} not found")))?;
@@ -317,14 +300,8 @@ impl TaskStore for InMemoryTaskStore {
         state: Option<TaskState>,
         tenant_id: Option<&str>,
     ) -> Result<(Vec<DaemonTask>, usize), Error> {
-        let tasks = self
-            .tasks
-            .read()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
-        let order = self
-            .order
-            .read()
-            .map_err(|e| Error::Daemon(e.to_string()))?;
+        let tasks = self.tasks.read();
+        let order = self.order.read();
         let filtered: Vec<DaemonTask> = order
             .iter()
             .rev()
@@ -344,11 +321,9 @@ impl TaskStore for InMemoryTaskStore {
         tenant_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<DaemonTask>, Error> {
-        let guard = self
+        Ok(self
             .tasks
             .read()
-            .map_err(|_| Error::Daemon("task store poisoned".into()))?;
-        Ok(guard
             .values()
             .find(|t| {
                 t.tenant_id.as_deref().unwrap_or("") == tenant_id
@@ -361,10 +336,7 @@ impl TaskStore for InMemoryTaskStore {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize, Error> {
-        let mut guard = self
-            .tasks
-            .write()
-            .map_err(|_| Error::Daemon("task store poisoned".into()))?;
+        let mut guard = self.tasks.write();
         let mut count = 0usize;
         for task in guard.values_mut() {
             if task.idempotency_key.is_some() && task.created_at < cutoff {

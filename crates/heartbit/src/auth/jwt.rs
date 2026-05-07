@@ -1,5 +1,6 @@
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use crate::error::Error;
 /// Client for fetching and caching JWKS (JSON Web Key Sets) from an identity provider.
 ///
 /// Caches the keys with a configurable TTL to avoid hitting the JWKS endpoint on every
-/// request. Thread-safe via `std::sync::RwLock` (never held across `.await`).
+/// request. Thread-safe via `parking_lot::RwLock` (never held across `.await`).
 pub struct JwksClient {
     jwks_url: String,
     client: reqwest::Client,
@@ -75,18 +76,16 @@ impl JwksClient {
         let decoding_key = Self::jwk_to_decoding_key(&key)?;
 
         // Update cache
-        if let Ok(mut cache) = self.cache.write() {
-            *cache = Some(CachedJwks {
-                keys,
-                fetched_at: Instant::now(),
-            });
-        }
+        *self.cache.write() = Some(CachedJwks {
+            keys,
+            fetched_at: Instant::now(),
+        });
 
         Ok(decoding_key)
     }
 
     fn find_in_cache(&self, kid: Option<&str>) -> Option<JwkKey> {
-        let cache = self.cache.read().ok()?;
+        let cache = self.cache.read();
         let cached = cache.as_ref()?;
 
         if cached.fetched_at.elapsed() > self.cache_ttl {

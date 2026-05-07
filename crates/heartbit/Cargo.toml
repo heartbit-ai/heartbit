@@ -31,6 +31,7 @@ walkdir = { workspace = true }
 regex = { workspace = true }
 tokio-util = { workspace = true }
 petgraph = { workspace = true }
+parking_lot = { workspace = true }
 
 # --- Optional (feature-gated) ---
 rdkafka = { workspace = true, optional = true }

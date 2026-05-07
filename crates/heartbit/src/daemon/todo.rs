@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -71,7 +72,7 @@ pub struct TodoList {
 
 /// File-backed persistent todo store.
 ///
-/// Stores entries as `{workspace}/TODO.json`. Uses `std::sync::RwLock`
+/// Stores entries as `{workspace}/TODO.json`. Uses `parking_lot::RwLock`
 /// (not tokio) because locks are never held across `.await` points.
 /// Same pattern as `FileTracker`.
 pub struct FileTodoStore {
@@ -122,13 +123,13 @@ impl FileTodoStore {
 
     /// Get a snapshot of the current todo list.
     pub fn get_list(&self) -> TodoList {
-        self.cache.read().expect("todo store lock poisoned").clone()
+        self.cache.read().clone()
     }
 
     /// Add a new entry. Returns its ID.
     pub fn add(&self, entry: TodoEntry) -> Result<Uuid, Error> {
         let id = entry.id;
-        let mut list = self.cache.write().expect("todo store lock poisoned");
+        let mut list = self.cache.write();
         list.entries.push(entry);
         self.save(&list)?;
         Ok(id)
@@ -136,7 +137,7 @@ impl FileTodoStore {
 
     /// Update an entry by ID. Returns `Err` if not found.
     pub fn update(&self, id: Uuid, updater: impl FnOnce(&mut TodoEntry)) -> Result<(), Error> {
-        let mut list = self.cache.write().expect("todo store lock poisoned");
+        let mut list = self.cache.write();
         let entry = list
             .entries
             .iter_mut()
@@ -150,7 +151,7 @@ impl FileTodoStore {
 
     /// Remove an entry by ID. Returns `Err` if not found.
     pub fn remove(&self, id: Uuid) -> Result<(), Error> {
-        let mut list = self.cache.write().expect("todo store lock poisoned");
+        let mut list = self.cache.write();
         let len_before = list.entries.len();
         list.entries.retain(|e| e.id != id);
         if list.entries.len() == len_before {
@@ -162,7 +163,7 @@ impl FileTodoStore {
 
     /// Mark the list as reviewed now.
     pub fn mark_reviewed(&self) -> Result<(), Error> {
-        let mut list = self.cache.write().expect("todo store lock poisoned");
+        let mut list = self.cache.write();
         list.last_reviewed_at = Some(Utc::now());
         self.save(&list)?;
         Ok(())
@@ -170,7 +171,7 @@ impl FileTodoStore {
 
     /// Format the todo list for inclusion in prompts.
     pub fn format_for_prompt(&self) -> String {
-        let list = self.cache.read().expect("todo store lock poisoned");
+        let list = self.cache.read();
         if list.entries.is_empty() {
             return "No items in the todo list.".into();
         }
@@ -231,7 +232,7 @@ impl FileTodoStore {
     /// - **Snoozed** items: one-line count
     /// - **Terminal** items (Completed/Cancelled): one-line count
     pub fn format_for_pulse_prompt(&self) -> String {
-        let list = self.cache.read().expect("todo store lock poisoned");
+        let list = self.cache.read();
         if list.entries.is_empty() {
             return "No items in the todo list.".into();
         }
