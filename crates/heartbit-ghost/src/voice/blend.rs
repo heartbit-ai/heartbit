@@ -243,11 +243,26 @@ weight = 0.15
 
     #[test]
     fn negative_weight_rejected() {
-        let toml = VALID_BLEND.replace("weight = 0.15", "weight = -0.15"); // matches the first 0.15 occurrence
-        let err = BlendRecipe::from_toml(&toml).unwrap_err();
+        // Weights sum to 1.0 (so the sum-rule passes) but one is outside [0, 1],
+        // forcing the per-weight range check at validate() to fire.
+        let toml = r#"
+version = 1
+
+[[blend]]
+writer = "a"
+weight = 1.5
+
+[[blend]]
+writer = "b"
+weight = -0.5
+"#;
+        let err = BlendRecipe::from_toml(toml).unwrap_err();
         match err {
             VoiceError::Validation(msg) => {
-                assert!(msg.contains("[0, 1]") || msg.contains("blend weight"));
+                assert!(
+                    msg.contains("[0, 1]"),
+                    "expected per-weight range error, got: {msg}"
+                );
             }
             other => panic!("expected Validation, got {other:?}"),
         }
