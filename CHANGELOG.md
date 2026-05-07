@@ -4,7 +4,74 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] — heartbit Foundation Phase 0
+
+The Phase 0 foundation lands the cross-cutting plumbing that the persona
+work (heartbit-ghost, etc.) requires before any concrete persona crate can
+be wired in. Nine tasks, executed on `feat/heartbit-foundation-phase-0`:
+`ExecutionContext` threading through the `Tool` trait, the
+`PersonaRegistry` and `[[persona]]` config block (empty registry — concrete
+personas land in Phase 1), and the `heartbit persona` CLI surface.
+
+### Breaking
+
+- **`Tool::execute` signature change.** `Tool::execute` now takes
+  `&heartbit_core::ExecutionContext` as its first argument, before the
+  existing `serde_json::Value` input. All in-tree tools have been migrated.
+  External consumers implementing `impl Tool` for their own types must add
+  `_ctx: &heartbit_core::ExecutionContext` as the first parameter of their
+  `execute()` method. The `#[heartbit_tool]` proc-macro emits the new
+  signature automatically — no caller changes needed for macro-generated
+  tools.
+
+### Added
+
+- **`heartbit_core::ExecutionContext`** — request-scoped value type carrying
+  per-request `tenant_id`, `user_id`, `workspace`, a `credentials` resolver,
+  and an `audit_sink`. Constructed once per agent turn and passed through
+  to every tool's `execute()` call so multi-tenant secrets and audit
+  logging hang off a single object. `AgentRunnerBuilder::audit_user_context`
+  (and friends on `OrchestratorBuilder`) populate `tenant_id` / `user_id`;
+  the daemon's per-task `build_runner` closure threads request identity
+  through unchanged.
+- **`heartbit_core::CredentialResolver`** trait + `Secret` newtype — the
+  contract for tenant-scoped secret resolution. Phase 0 ships the trait
+  shape; concrete env-glob and KMS resolvers land with their consumers.
+- **`heartbit_core::AuditSink`** trait — per-tool audit logging hook.
+  Phase 0 ships the trait; the existing `audit_trail` plumbing on the
+  agent runner remains the active sink.
+- **`heartbit_core::PersonaRegistry`** + `Persona` trait — registry surface
+  for persona recipes. The registry is **empty in this release**;
+  concrete persona implementations (heartbit-ghost X agent, etc.) land in
+  Phase 1.
+- **`[[persona]]` block on `HeartbitConfig`** — declarative persona
+  instances in `heartbit.toml` / `daemon.toml`. Validation is **lexical
+  only** in Phase 0: `recipe` must parse as `<crate>:<name>` and per-file
+  instance names must be unique. Registry lookup is deferred to daemon
+  startup once persona crates load. Tightened `overrides: toml::Table`
+  (was `toml::Value`) so a misuse like `overrides = "string"` fails at
+  deserialize-time.
+- **`heartbit persona <subcommand>`** CLI surface — functional shells
+  (`list`, `inspect`, `validate`, `expand`) operating against the empty
+  registry. Wires up cleanly so Phase 1 persona crates light up the
+  surface without further CLI work.
+
+### Phase 1 follow-ups
+
+Three production sites currently pass `&ExecutionContext::default()` and
+are tagged with `TODO(phase-1):` markers. They have no functional impact
+in Phase 0 (no persona uses tenant-scoped secrets yet) but must be
+addressed when concrete personas land:
+
+- `crates/heartbit-sensors/src/sources/mcp.rs` — sensor MCP fan-out has
+  no per-tenant request identity to thread.
+- `crates/heartbit-core/src/knowledge/tools.rs` — knowledge-base tool
+  invocations from inside persona pipelines.
+- The startup-time persona expansion site (lands with the first persona
+  crate).
+
+See `tasks/heartbit-foundation-phase-0.md` for the design doc and the
+"Phase 1 follow-ups" section for the full migration plan.
 
 ## [2026.507.2] - 2026-05-07
 
