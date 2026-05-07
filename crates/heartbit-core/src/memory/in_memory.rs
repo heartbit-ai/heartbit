@@ -25,14 +25,53 @@ use super::{Memory, MemoryEntry, MemoryQuery};
 /// (i.e., the weakest, oldest memory) before inserting the new one.
 pub const IN_MEMORY_STORE_DEFAULT_CAP: usize = 100_000;
 
+/// Pre-tokenised, lower-cased view of a `MemoryEntry`'s text fields,
+/// cached for the recall hot path so per-entry lowercase + tokenisation
+/// is paid **once at store time** instead of on every recall (P-MEM-2
+/// stepping stone in `tasks/perf-audit-memory.md`).
+#[derive(Debug, Clone, Default)]
+struct EntryTokens {
+    /// `entry.content.to_lowercase()` — used by the substring text filter
+    /// so semantics match the previous `lower_content.contains(token)`
+    /// pass.
+    lower_content: String,
+    /// `lower_content.split_whitespace().map(String::from).collect()` —
+    /// fed directly to `bm25_score_pre` so BM25 no longer pays its own
+    /// per-call lowercase + split.
+    content_words: Vec<String>,
+    /// `entry.keywords.iter().map(to_lowercase).collect()` — used by both
+    /// the filter (substring match) and BM25 (keyword bonus).
+    lower_keywords: Vec<String>,
+}
+
+fn build_entry_tokens(entry: &MemoryEntry) -> EntryTokens {
+    let lower_content = entry.content.to_lowercase();
+    let content_words: Vec<String> = lower_content.split_whitespace().map(String::from).collect();
+    let lower_keywords: Vec<String> = entry.keywords.iter().map(|k| k.to_lowercase()).collect();
+    EntryTokens {
+        lower_content,
+        content_words,
+        lower_keywords,
+    }
+}
+
 /// Thread-safe in-memory store for agent memories.
 ///
 /// Backed by `parking_lot::RwLock<HashMap>` (T2 — `tasks/performance-audit-
 /// heartbit-core-2026-05-06.md`). Suitable for tests and single-process use.
 /// Uses composite scoring (recency + importance + relevance) for recall
 /// ordering.
+///
+/// Maintains a sibling `tokens` cache of pre-lowercased / pre-tokenised
+/// content + keywords (P-MEM-2 stepping stone). The cache is updated in
+/// lock-step with `entries` on every `store` / `update` / `forget`; the
+/// recall hot path reads from the cache so it never pays the per-entry
+/// `to_lowercase()` + `split_whitespace()` cost again. Locks are always
+/// acquired in the order `entries` → `tokens`; both are
+/// `parking_lot::RwLock` and never held across `.await`.
 pub struct InMemoryStore {
     entries: RwLock<HashMap<String, MemoryEntry>>,
+    tokens: RwLock<HashMap<String, EntryTokens>>,
     scoring_weights: ScoringWeights,
     max_entries: usize,
 }
@@ -41,6 +80,7 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            tokens: RwLock::new(HashMap::new()),
             scoring_weights: ScoringWeights::default(),
             max_entries: IN_MEMORY_STORE_DEFAULT_CAP,
         }
@@ -75,6 +115,7 @@ impl Memory for InMemoryStore {
         entry.author_user_id = scope.user_id.clone();
         Box::pin(async move {
             let mut entries = self.entries.write();
+            let mut tokens = self.tokens.write();
             // SECURITY (F-MEM-3): when at capacity, evict the entry with the
             // lowest effective strength (most-decayed, oldest weak memory)
             // before inserting the new one. Without this cap, a hostile or
@@ -103,6 +144,7 @@ impl Memory for InMemoryStore {
                     .map(|e| e.id.clone())
                 {
                     entries.remove(&victim_id);
+                    tokens.remove(&victim_id);
                     tracing::warn!(
                         evicted = %victim_id,
                         cap = self.max_entries,
@@ -110,7 +152,12 @@ impl Memory for InMemoryStore {
                     );
                 }
             }
-            entries.insert(entry.id.clone(), entry);
+            // PERF (P-MEM-2 stepping stone): tokenise once at store time
+            // so the recall hot path never pays for it again.
+            let entry_tokens = build_entry_tokens(&entry);
+            let id = entry.id.clone();
+            entries.insert(id.clone(), entry);
+            tokens.insert(id, entry_tokens);
             Ok(())
         })
     }
@@ -127,6 +174,11 @@ impl Memory for InMemoryStore {
             // Using one lock avoids a TOCTOU window where concurrent forget()
             // or store() could interleave between filter and access-count update.
             let mut entries = self.entries.write();
+            // P-MEM-2 stepping stone: read-lock the tokens cache for the
+            // duration of the scan. Lock order is `entries` → `tokens`,
+            // mirroring every writer (`store` / `update` / `forget` /
+            // `prune`), so no deadlock is possible.
+            let tokens_cache = self.tokens.read();
 
             let now = Utc::now();
             let query_tokens: Vec<String> = query
@@ -141,50 +193,48 @@ impl Memory for InMemoryStore {
                         .collect()
                 })
                 .unwrap_or_default();
-            let lower_query_tokens_for_filter: Vec<String> = query_tokens.clone();
 
-            // PERF (P-MEM-5): collect candidate entries as references so we
-            // never clone the 10k+ entries that pass the filter — only the
-            // top-K (after limit and graph expansion) ever turn into owned
-            // `MemoryEntry`s, and that final clone happens against
-            // `entries.get_mut(&id)` below.
+            // Each surviving candidate is paired with its cached tokens
+            // so the BM25 scoring loop below can call `bm25_score_pre`
+            // directly — zero per-entry lowercase + tokenise on the
+            // recall hot path.
             //
             // Filter ordering: cheap field comparisons first, then the
-            // text-substring scan last so we don't lowercase content for
-            // entries that fail tenant / agent / category / tag checks.
-            let candidates: Vec<&MemoryEntry> = entries
+            // text-substring scan last (using the cached `lower_content`
+            // and `lower_keywords`).
+            let candidates: Vec<(&MemoryEntry, &EntryTokens)> = entries
                 .values()
-                .filter(|e| {
+                .filter_map(|e| {
                     // Tenant isolation first — fastest reject.
                     if e.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
-                        return false;
+                        return None;
                     }
                     if let Some(ref agent) = query.agent {
                         if e.agent != *agent {
-                            return false;
+                            return None;
                         }
                     } else if let Some(ref prefix) = query.agent_prefix
                         && !e.agent.starts_with(prefix.as_str())
                     {
-                        return false;
+                        return None;
                     }
                     if let Some(ref cat) = query.category
                         && e.category != *cat
                     {
-                        return false;
+                        return None;
                     }
                     if !query.tags.is_empty() && !query.tags.iter().any(|t| e.tags.contains(t)) {
-                        return false;
+                        return None;
                     }
                     if let Some(ref mt) = query.memory_type
                         && e.memory_type != *mt
                     {
-                        return false;
+                        return None;
                     }
                     if let Some(max_conf) = query.max_confidentiality
                         && e.confidentiality > max_conf
                     {
-                        return false;
+                        return None;
                     }
                     if let Some(min_s) = query.min_strength {
                         let eff = effective_strength(
@@ -194,34 +244,39 @@ impl Memory for InMemoryStore {
                             STRENGTH_DECAY_RATE,
                         );
                         if eff < min_s {
-                            return false;
+                            return None;
                         }
                     }
-                    // Expensive filter (tokenisation) last.
-                    if !lower_query_tokens_for_filter.is_empty() {
-                        let lower_content = e.content.to_lowercase();
-                        let lower_keywords: Vec<String> =
-                            e.keywords.iter().map(|k| k.to_lowercase()).collect();
-                        let has_match = lower_query_tokens_for_filter.iter().any(|token| {
-                            lower_content.contains(token.as_str())
-                                || lower_keywords.iter().any(|k| k.contains(token.as_str()))
+                    // Tokens cache must be in lock-step with `entries`;
+                    // any maintenance gap (shouldn't happen with the
+                    // current store/update/forget paths) just rejects
+                    // the entry rather than panicking.
+                    let tokens = tokens_cache.get(&e.id)?;
+                    // Expensive filter (substring scan) last — uses the
+                    // cached lower-cased forms.
+                    if !query_tokens.is_empty() {
+                        let has_match = query_tokens.iter().any(|token| {
+                            tokens.lower_content.contains(token.as_str())
+                                || tokens
+                                    .lower_keywords
+                                    .iter()
+                                    .any(|k| k.contains(token.as_str()))
                         });
                         if !has_match {
-                            return false;
+                            return None;
                         }
                     }
-                    true
+                    Some((e, tokens))
                 })
                 .collect();
 
             // Compute average document length for BM25 normalisation.
+            // Uses the cached `content_words.len()` — zero new tokenisation.
             let avgdl = if candidates.is_empty() {
                 1.0
             } else {
-                let total_words: usize = candidates
-                    .iter()
-                    .map(|e| e.content.split_whitespace().count())
-                    .sum();
+                let total_words: usize =
+                    candidates.iter().map(|(_, t)| t.content_words.len()).sum();
                 (total_words as f64 / candidates.len() as f64).max(1.0)
             };
 
@@ -230,10 +285,10 @@ impl Memory for InMemoryStore {
             // by `candidates` (released before any `get_mut` below).
             let bm25_map: HashMap<&str, f64> = candidates
                 .iter()
-                .map(|e| {
-                    let score = bm25::bm25_score(
-                        &e.content,
-                        &e.keywords,
+                .map(|(e, t)| {
+                    let score = bm25::bm25_score_pre(
+                        &t.content_words,
+                        &t.lower_keywords,
                         &query_tokens,
                         avgdl,
                         bm25::DEFAULT_K1,
@@ -255,7 +310,7 @@ impl Memory for InMemoryStore {
                 // Vector ranked list (cosine similarity, descending)
                 let mut vector_ranked: Vec<(&str, f64)> = candidates
                     .iter()
-                    .filter_map(|e| {
+                    .filter_map(|(e, _)| {
                         e.embedding
                             .as_ref()
                             .map(|emb| (e.id.as_str(), hybrid::cosine_similarity(emb, q_emb)))
@@ -313,8 +368,7 @@ impl Memory for InMemoryStore {
             // at N=10k that's ~280k redundant exp() calls per recall.
             let mut scored: Vec<(&MemoryEntry, f64)> = candidates
                 .iter()
-                .copied()
-                .map(|e| {
+                .map(|(e, _)| {
                     let relevance = relevance_map.get(e.id.as_str()).copied().unwrap_or(0.0);
                     let eff =
                         effective_strength(e.strength, e.last_accessed, now, STRENGTH_DECAY_RATE);
@@ -326,7 +380,7 @@ impl Memory for InMemoryStore {
                         relevance,
                         eff,
                     );
-                    (e, score)
+                    (*e, score)
                 })
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -351,8 +405,15 @@ impl Memory for InMemoryStore {
 
             // Compute BM25 + composite for related entries (still under
             // the same immutable borrow on `entries`) and append to the
-            // scored Vec.
+            // scored Vec. Reuses the cached tokens for related entries
+            // too — graph-expansion never tokenises on the recall path.
             let min_s = query.min_strength.unwrap_or(0.0);
+            // Hoist the normalisation scalar out of the loop.
+            let max_bm25 = bm25_map
+                .values()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max)
+                .max(1.0);
             let mut expanded_added = 0usize;
             for related_id in &to_expand {
                 if let Some(related) = entries.get(related_id) {
@@ -370,21 +431,21 @@ impl Memory for InMemoryStore {
                     if eff < min_s {
                         continue;
                     }
-                    // Score the related entry against the same query.
-                    let relevance = bm25::bm25_score(
-                        &related.content,
-                        &related.keywords,
+                    // Score the related entry against the same query
+                    // using its cached tokens. If somehow the cache is
+                    // out of sync (shouldn't happen — every writer keeps
+                    // both maps locked together) we just skip the entry.
+                    let Some(related_tokens) = tokens_cache.get(related_id) else {
+                        continue;
+                    };
+                    let relevance = bm25::bm25_score_pre(
+                        &related_tokens.content_words,
+                        &related_tokens.lower_keywords,
                         &query_tokens,
                         avgdl,
                         bm25::DEFAULT_K1,
                         bm25::DEFAULT_B,
                     );
-                    // Normalise against the same scale as the top-K.
-                    let max_bm25 = bm25_map
-                        .values()
-                        .copied()
-                        .fold(f64::NEG_INFINITY, f64::max)
-                        .max(1.0);
                     let normalised = relevance / max_bm25;
                     let score = composite_score(
                         &self.scoring_weights,
@@ -406,12 +467,14 @@ impl Memory for InMemoryStore {
                 }
             }
 
-            // Collect top-K ids (owned), drop the immutable borrow on the
-            // entries map so we can call `get_mut` for the access-count
-            // updates and the *single* clone per surviving entry.
+            // Collect top-K ids (owned), drop the immutable borrows on
+            // both the entries and tokens-cache maps so we can call
+            // `get_mut` for the access-count updates and the *single*
+            // clone per surviving entry.
             let top_ids_final: Vec<String> = scored.iter().map(|(e, _)| e.id.clone()).collect();
             drop(scored);
             drop(candidates);
+            drop(tokens_cache);
 
             // PERF (P-MEM-5): clone only the top-K, after the limit has
             // been applied. Previously the entire filtered set was cloned
@@ -445,10 +508,14 @@ impl Memory for InMemoryStore {
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self.entries.write();
+            let mut tokens = self.tokens.write();
             match entries.get_mut(&id) {
                 Some(entry) if entry.author_tenant_id.as_deref() == Some(tenant_id.as_str()) => {
                     entry.content = content;
                     entry.last_accessed = Utc::now();
+                    // Refresh the side cache so the recall hot path
+                    // sees the new content tokenisation immediately.
+                    tokens.insert(id.clone(), build_entry_tokens(entry));
                     Ok(())
                 }
                 Some(_) => {
@@ -469,6 +536,7 @@ impl Memory for InMemoryStore {
         let tenant_id = scope.tenant_id.clone();
         Box::pin(async move {
             let mut entries = self.entries.write();
+            let mut tokens = self.tokens.write();
             // Only remove if the entry belongs to this tenant.
             // Return false for both "not found" and "wrong tenant" to avoid
             // revealing cross-tenant id existence.
@@ -477,7 +545,9 @@ impl Memory for InMemoryStore {
                 .map(|e| e.author_tenant_id.as_deref() == Some(tenant_id.as_str()))
                 .unwrap_or(false);
             if belongs {
-                Ok(entries.remove(&id).is_some())
+                let removed = entries.remove(&id).is_some();
+                tokens.remove(&id);
+                Ok(removed)
             } else {
                 Ok(false)
             }
@@ -567,8 +637,10 @@ impl Memory for InMemoryStore {
                 .collect();
 
             let count = to_remove.len();
+            let mut tokens = self.tokens.write();
             for id in to_remove {
                 entries.remove(&id);
+                tokens.remove(&id);
             }
             Ok(count)
         })

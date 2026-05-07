@@ -28,38 +28,53 @@ pub fn bm25_score(
     if query_terms.is_empty() || avgdl <= 0.0 {
         return 0.0;
     }
-
     let lower_content = content.to_lowercase();
-    let content_words: Vec<&str> = lower_content.split_whitespace().collect();
-    let dl = content_words.len() as f64;
-
+    let content_words: Vec<String> = lower_content.split_whitespace().map(String::from).collect();
     let lower_keywords: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    bm25_score_pre(&content_words, &lower_keywords, query_terms, avgdl, k1, b)
+}
+
+/// Pre-tokenised variant of [`bm25_score`].
+///
+/// `content_words` and `lower_keywords` must already be lowercased so the
+/// caller can amortise the per-entry lowercase + tokenisation cost across
+/// every recall (P-MEM-2 stepping stone — the in-memory store caches both
+/// inputs at store time and reuses them on every recall, eliminating ~10k
+/// `String::to_lowercase()` allocations per recall at N=10k).
+pub fn bm25_score_pre(
+    content_words: &[String],
+    lower_keywords: &[String],
+    query_terms: &[String],
+    avgdl: f64,
+    k1: f64,
+    b: f64,
+) -> f64 {
+    if query_terms.is_empty() || avgdl <= 0.0 {
+        return 0.0;
+    }
+    let dl = content_words.len() as f64;
+    let norm = 1.0 - b + b * (dl / avgdl);
+    let denom_factor = k1 * norm;
 
     let mut score = 0.0;
     for term in query_terms {
+        let term_str = term.as_str();
         // Term frequency in content
         let tf_content = content_words
             .iter()
-            .filter(|w| w.contains(term.as_str()))
+            .filter(|w| w.as_str().contains(term_str))
             .count() as f64;
-
         // Keyword match bonus (binary: 2.0 if any keyword matches, 0.0 otherwise)
-        let keyword_bonus = if lower_keywords.iter().any(|k| k.contains(term.as_str())) {
+        let keyword_bonus = if lower_keywords.iter().any(|k| k.contains(term_str)) {
             2.0
         } else {
             0.0
         };
-
         let tf = tf_content + keyword_bonus;
         if tf <= 0.0 {
             continue;
         }
-
-        // BM25 TF component with length normalization
-        let norm = 1.0 - b + b * (dl / avgdl);
-        let tf_score = (tf * (k1 + 1.0)) / (tf + k1 * norm);
-
-        score += tf_score;
+        score += (tf * (k1 + 1.0)) / (tf + denom_factor);
     }
 
     score
