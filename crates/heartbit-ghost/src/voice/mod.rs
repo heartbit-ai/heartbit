@@ -7,8 +7,13 @@
 //! - P1.2e: CLI bodies for `corpus add/list/remove`, `profile rebuild/diff`
 
 pub mod error;
-// pub mod style;   // uncommented in Task 2
+pub mod style;
 // pub mod blend;   // uncommented in Task 4
 
 pub use error::VoiceError;
-// re-exports from style and blend uncommented in Tasks 2 and 4
+pub use style::{
+    EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency, HashtagPolicy, LineBreaks,
+    OpeningPattern, PeriodsPolicy, QuotationMarks, SentenceLengthTarget, SpecificityTarget,
+    ThreadRhythm,
+};
+// (StyleProfile re-export added by Task 3 — leave it out so this compiles)
