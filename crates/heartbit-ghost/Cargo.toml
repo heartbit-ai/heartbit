@@ -1,0 +1,16 @@
+[package]
+name = "heartbit-ghost"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Best-in-class autonomous X (Twitter) agent persona for the Heartbit runtime."
+keywords = ["agent", "llm", "twitter", "x", "persona"]
+
+[dependencies]
+heartbit-core = { path = "../heartbit-core" }
+
+[dev-dependencies]
+tokio = { workspace = true }

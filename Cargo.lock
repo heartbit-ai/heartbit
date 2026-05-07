@@ -1902,6 +1902,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "heartbit-ghost"
+version = "2026.507.3"
+dependencies = [
+ "heartbit-core",
+ "tokio",
+]
+
+[[package]]
 name = "heartbit-macro"
 version = "2026.507.3"
 dependencies = [
