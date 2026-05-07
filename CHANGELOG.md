@@ -6,6 +6,101 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.507.2] - 2026-05-07
+
+### Performance — perf cycle 2 (full-workspace sweep + BM25 opt-in)
+
+A second-pass perf audit at `tasks/performance-audit-v2-2026-05-07.md`
+(51 perf findings + 14 bench gaps) drove this release. Cycle 2 lands
+five atomic commits: daemon and edge-crate `parking_lot` adoption (T2
+echo from cycle 1's heartbit-core sweep), per-event JSON buffer pool
+on the daemon Kafka publish path, the long-missing agent-ReAct-turn
+benchmark, and the audit's deferred headline `P-MEM-2` BM25 opt-in
+inverted index.
+
+#### New benches
+
+- **`agent_react_turn`** ([`b458016`](https://github.com/heartbit-ai/heartbit/commit/b458016)) — `AgentRunner::execute()` against a
+  mock provider returning a canned `EndTurn` response. The audit's
+  "single most embarrassing" gap is now closed: the per-execute hot
+  path is **measured at 1.88 µs**, providing ground truth for any
+  future P-RUNNER work. Behind the existing `bench-internals` feature.
+
+#### Selective-query speedup (Phase 8 opt-in)
+
+| Bench | Substring (default) | `exact_words: true` | Speedup |
+|---|---|---|---|
+| `memory_recall/.../selective@10k` | 3.43 ms | **0.73 ms** | **4.7×** |
+| `memory_recall/.../selective@1k`  | 295 µs | **65 µs** | **4.6×** |
+
+Broad queries (where every entry contains every query token) incur
+the full BM25 cost on both paths — `exact_words` is opt-in for the
+selective-query regime.
+
+### Added
+
+- **`MemoryQuery::exact_words: bool`** ([`653c076`](https://github.com/heartbit-ai/heartbit/commit/653c076)) — opt-in flag
+  for the BM25 inverted-index fast path on `InMemoryStore`. When
+  `true`, recall reads from a sibling `inverted: HashMap<token,
+  HashSet<entry_id>>` map (built at store time, maintained in
+  lock-step with `entries` and `tokens` on every store / update /
+  forget / prune / cap-eviction). Default is `false`; the legacy
+  substring `word.contains(token)` semantics are preserved unchanged.
+  Trade-off: `exact_words: true` does not match query tokens that
+  are *prefixes* of indexed words (`"perf"` won't match
+  `"performance"`); opt in only when the caller controls the query
+  vocabulary. Field doc-comment calls this out explicitly.
+- **`crates/heartbit-core/benches/agent_react_turn.rs`** ([`b458016`](https://github.com/heartbit-ai/heartbit/commit/b458016)) —
+  end-to-end criterion bench for `AgentRunner::execute()`. Mocked
+  provider lives in `__bench::BenchMockProvider` (always returns the
+  same canned response, no draining unlike the test-only
+  `MockProvider`).
+
+### Changed
+
+- **Daemon `parking_lot::RwLock` adoption** ([`e3f7fe4`](https://github.com/heartbit-ai/heartbit/commit/e3f7fe4)) — `event_channels`
+  + `task_cancels` (`daemon/core.rs`), in-memory task store
+  `tasks` + `order` (`daemon/store.rs`), todo cache
+  (`daemon/todo.rs`), and JWKS cache (`auth/jwt.rs`). Drops 14
+  `expect("...lock poisoned")` chains; `parking_lot` returns guards
+  directly. `parking_lot = { workspace = true }` added to the
+  `heartbit` umbrella's runtime deps.
+- **Daemon per-event JSON buffer pool** ([`193bbd6`](https://github.com/heartbit-ai/heartbit/commit/193bbd6)) — the `on_event`
+  closure now uses a per-task `Mutex<Vec<u8>>` and
+  `serde_json::to_writer` instead of allocating a fresh `Vec` on
+  every emitted agent event. Eliminates 50–500 alloc/free cycles
+  per task (P-V2-DAEMON-1, audit's headline daemon Critical).
+- **Daemon Kafka-key reuse + broadcast gating** ([`e3f7fe4`](https://github.com/heartbit-ai/heartbit/commit/e3f7fe4)) — pre-compute
+  the per-task `Arc<str>` Kafka key once in the consumer loop
+  instead of `id.to_string()` per event (P-V2-DAEMON-9). Skip the
+  broadcast `event.clone()` when no SSE subscribers are attached
+  (P-V2-DAEMON-7); Kafka publish is unaffected.
+- **Sensors / Telegram `parking_lot` adoption** ([`5001d92`](https://github.com/heartbit-ai/heartbit/commit/5001d92)) —
+  `StoryCorrelator` Mutex (sensor triage hot path,
+  P-V2-EDGE-4); Telegram `bridge.rs` double `pending` +
+  `question_options` RwLocks (every callback,
+  P-V2-EDGE-7-Critical); `ChatSessionMap` in
+  `telegram/router.rs`. `parking_lot` added to the
+  `heartbit-sensors` and `heartbit-telegram` deps.
+
+### Notes
+
+- Quality gates throughout: 3669 workspace tests passing,
+  `cargo fmt -- --check` clean, `cargo clippy --workspace
+  --all-targets --features heartbit-core/bench-internals
+  -- -D warnings` clean.
+- No security regressions: F-* findings from the security cycle
+  remain intact. F-AUTH-5 nonce binding on telegram `pending`,
+  F-MEM-3 capacity eviction (now also de-indexes from inverted
+  index on victim removal), JWT cache TTL, sensor correlation
+  semantics — all preserved.
+- Cycle 2 followups still tracked at `tasks/performance-audit-v2
+  -2026-05-07.md`: P-V2-DAEMON-10 rolling stats aggregates,
+  P-V2-DAEMON-11 idempotency secondary index, P-V2-EDGE-2 sensor
+  entity-list `Arc<[String]>`, and the remaining missing benches
+  (MCP roundtrip, daemon Kafka dispatch, channel WebSocket
+  bridge).
+
 ## [2026.507.1] - 2026-05-07
 
 ### Performance — Phase 2c (memory subsystem stepping stone)
