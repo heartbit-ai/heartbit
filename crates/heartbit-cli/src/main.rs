@@ -1,4 +1,5 @@
 mod daemon;
+mod persona;
 mod serve;
 mod submit;
 
@@ -120,6 +121,11 @@ enum Commands {
         /// Print structured agent events to stderr as one-line JSON
         #[arg(long, short)]
         verbose: bool,
+    },
+    /// Manage personas (list, run, configure, audit).
+    Persona {
+        #[command(subcommand)]
+        sub: persona::PersonaCommand,
     },
     /// Manage agent templates
     Templates {
@@ -407,6 +413,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Commands::Persona { sub }) => persona::run(sub).await,
         Some(Commands::Templates { action }) => run_template_command(action),
         Some(Commands::Skills { action }) => run_skill_command(action),
         Some(Commands::Init { template, output }) => run_init_command(&template, output.as_deref()),
