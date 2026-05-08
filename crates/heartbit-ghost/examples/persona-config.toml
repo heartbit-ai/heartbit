@@ -1,0 +1,80 @@
+# Sample persona config for heartbit-ghost.
+#
+# Place at `~/.heartbit/ghost/personas/heartbit-ghost:x.toml`
+# (or anywhere if `HEARTBIT_GHOST_PERSONAS` is set).
+#
+# Setup workflow:
+#   1. heartbit persona corpus add <writer> <path-to-jsonl>   # one per blend entry
+#   2. heartbit persona profile rebuild heartbit-ghost:x      # extracts + blends + applies overrides
+#   3. heartbit persona run heartbit-ghost:x --once "<topic>"
+#
+# Corpus JSONL schema is one tweet per line, minimum: {"id": "...", "post_text": "..."}
+# Optional: posted_at (RFC3339), engagement, tags, embedding.
+
+version = 1
+
+[recipe]
+version = 1
+
+# 1..=10 entries; weights must sum to 1.0 (epsilon 1e-6).
+# `writer` is the corpus filename stem under ~/.heartbit/ghost/corpora/<writer>.jsonl
+[[recipe.blend]]
+writer = "karpathy"
+weight = 0.5
+
+[[recipe.blend]]
+writer = "bcherny"
+weight = 0.5
+
+# Recipe overrides — applied AFTER the LLM blend, BEFORE post-merge validation.
+# Every StyleProfile field is overridable via PartialStyleProfile (see
+# crates/heartbit-ghost/src/voice/blend.rs:53-101). Use this to:
+#   - Pin values that the LLM extractor produces non-deterministically across
+#     rebuilds (voice_traits, ai_tells_to_avoid commonly drift).
+#   - Force a thread length cap independent of source corpora rhythm.
+#   - Hard-ban phrases regardless of whether the extractor flagged them.
+[recipe.overrides]
+# Cap threads at 5 tweets even when the source corpora are mostly
+# short-form (extractor tends to set this to 1-2 for non-thread writers).
+thread_max_length = 5
+
+# Lock these to "never" — the publish_gate doesn't enforce them, but the
+# style_critic does, so an explicit override stops the blend from drifting
+# into "rare_punchline_only" / "rare" via writer-mix changes.
+emoji_policy = "never"
+hashtag_policy = "never"
+
+# Hard ban on common LLM tells. The extractor populates this field on its
+# own, but its picks vary between rebuilds — pin them here for stability.
+ai_tells_to_avoid = [
+  "delve",
+  "leverage",
+  "unlock",
+  "cutting-edge",
+  "revolutionary",
+  "game-changing",
+  "Additionally",
+  "Furthermore",
+  "In conclusion",
+  "I hope this helps",
+]
+
+# Other fields you can override the same way (Option<T>; omit to keep the
+# blended value):
+#   sentence_length_target = "short" | "mixed" | "long"
+#   sentence_length_distribution = [40, 30, 20, 10]   # must sum to 100
+#   fragment_frequency = "rare" | "occasional" | "common"
+#   opening_patterns = ["claim_first", "number_first", ...]   # parallel to weights below
+#   opening_pattern_weights = [0.5, 0.3, 0.2]                  # must sum to 1.0
+#   specificity_target = "low" | "medium" | "high"
+#   thread_rhythm = "linear" | "list_then_payoff" | "punchline_callbacks"
+#   thread_opener_must_hook = true
+#   voice_traits = ["specific", "no_hedging", "concrete"]
+#   topical_obsessions = ["AI", "systems"]
+#   topical_avoidances = ["politics"]
+#   [recipe.overrides.formatting]
+#     lowercase = false
+#     periods = "always" | "optional" | "rare"
+#     em_dashes = "preferred" | "ok" | "forbidden"
+#     quotation_marks = "double" | "single" | "smart"
+#     line_breaks = "single" | "double" | "rhythmic"
