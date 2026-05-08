@@ -668,7 +668,21 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     let image: Option<ImageAttachment> = match image_generator.execute(&image_msg).await {
         Ok(out) => {
             total_usage += out.tokens_used;
-            parse_image_generator_output(&out.result)
+            // P1.3g: prefer the raw `image_generate` tool output (full,
+            // untruncated marker) over the model's text response. The
+            // tool result that re-entered the conversation was redacted
+            // to a placeholder, so falling back to `out.result` would
+            // lose the base64 payload. The fallback is only useful when
+            // the agent declined to call the tool (e.g. "no_image").
+            let raw_tool_output: Option<String> = out
+                .tool_call_results
+                .iter()
+                .find(|r| r.tool_name == "image_generate" && !r.is_error)
+                .map(|r| r.output.clone());
+            match raw_tool_output {
+                Some(raw) => parse_image_generator_output(&raw),
+                None => parse_image_generator_output(&out.result),
+            }
         }
         Err(e) => {
             progress(&format!("image_generator failed (non-blocking): {e}"));

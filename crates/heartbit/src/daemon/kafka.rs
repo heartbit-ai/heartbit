@@ -570,6 +570,8 @@ mod tests {
                         structured: None,
                         estimated_cost_usd: None,
                         model_name: None,
+                        // Test stub: no real tools dispatched in this code path.
+                        tool_call_results: Vec::new(),
                     })
                 }
             };

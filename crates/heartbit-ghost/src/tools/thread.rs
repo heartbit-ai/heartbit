@@ -202,7 +202,7 @@ async fn call_x(client: &XClient, input: &ThreadInput) -> Result<ThreadOutput, X
     let mut head_media_ids: Option<Vec<String>> = None;
     if let Some(b64) = input.head_image_b64.as_ref() {
         let (bytes, mime) = decode_and_validate_head_image(b64).map_err(XApiError::Validation)?;
-        let media_id = client.upload_image_chunked(&bytes, mime).await?;
+        let media_id = client.upload_image(&bytes, mime).await?;
         head_media_ids = Some(vec![media_id]);
     }
 
