@@ -160,6 +160,30 @@ impl BlendRecipe {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// P1.2d — blend algorithm
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Errors raised by [`blend_profiles`].
+#[derive(Debug, thiserror::Error)]
+pub enum BlendError {
+    /// The recipe references a writer handle that is not in the profiles map.
+    #[error("missing profile for writer '{0}'")]
+    MissingProfile(String),
+
+    /// Result of merge + override application failed
+    /// [`crate::voice::StyleProfile::validate`]. `inner` is the underlying
+    /// validation error. Most commonly this surfaces when a user-supplied
+    /// `recipe.overrides` violates a parallel-array length, sum-to-100 /
+    /// sum-to-1.0, or range invariant.
+    #[error("merged profile failed validation: {inner}")]
+    PostMergeValidation {
+        /// The underlying validation error from `StyleProfile::validate`.
+        #[source]
+        inner: VoiceError,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +400,41 @@ line_breaks = "single"
         // Other fields remain None.
         assert!(recipe.overrides.voice_traits.is_none());
         assert!(recipe.overrides.thread_rhythm.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P1.2d — BlendError display
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn missing_profile_error_includes_writer_handle() {
+        let e = BlendError::MissingProfile("karpathy".to_string());
+        let s = format!("{e}");
+        assert!(s.contains("karpathy"), "got: {s}");
+        assert!(s.starts_with("missing profile"), "got: {s}");
+    }
+
+    #[test]
+    fn post_merge_validation_error_renders_inner_message() {
+        let inner = VoiceError::Validation("thread_max_length must be 1..=25 (got 30)".to_string());
+        let e = BlendError::PostMergeValidation { inner };
+        let s = format!("{e}");
+        assert!(
+            s.starts_with("merged profile failed validation:"),
+            "got: {s}"
+        );
+        assert!(s.contains("thread_max_length"), "got: {s}");
+        assert!(s.contains("got 30"), "got: {s}");
+    }
+
+    #[test]
+    fn post_merge_validation_inner_is_reachable() {
+        let inner = VoiceError::Validation("test message".to_string());
+        let e = BlendError::PostMergeValidation { inner };
+        if let BlendError::PostMergeValidation { inner: i } = &e {
+            assert!(matches!(i, VoiceError::Validation(_)));
+        } else {
+            panic!("not PostMergeValidation");
+        }
     }
 }
