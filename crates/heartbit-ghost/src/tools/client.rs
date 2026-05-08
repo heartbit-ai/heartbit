@@ -163,6 +163,110 @@ impl XClient {
         Self::parse_response(response).await
     }
 
+    /// Upload an image to X via the v2 chunked media upload endpoint.
+    /// Returns the `media_id` to attach to a subsequent `POST /2/tweets`.
+    ///
+    /// Implements INIT → APPEND → FINALIZE for a single segment. One
+    /// segment is sufficient for any image we'd reasonably attach
+    /// (X's per-image limit is 5 MiB, validated by the caller before
+    /// invoking this method).
+    // P1.3f Task 1 lands this method ahead of its first caller (Task 2 wires
+    // it into `TwitterThreadTool::call_x`); allow `dead_code` on this commit
+    // boundary.
+    #[allow(dead_code)]
+    pub(crate) async fn upload_image_chunked(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+    ) -> Result<String, XApiError> {
+        // 1. INIT — declare intent + size, get a media_id back.
+        let init_url = format!("{}/2/media/upload", self.base_url);
+        let total_bytes = bytes.len().to_string();
+        let init_form = reqwest::multipart::Form::new()
+            .text("command", "INIT")
+            .text("media_type", mime_type.to_string())
+            .text("total_bytes", total_bytes)
+            .text("media_category", "tweet_image");
+        let init_resp: InitResponse = self.post_multipart(&init_url, init_form).await?;
+        let media_id = init_resp.data.id;
+
+        // 2. APPEND — single segment.
+        let append_url = format!("{}/2/media/upload", self.base_url);
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name("image")
+            .mime_str(mime_type)
+            .map_err(|e| XApiError::Network(format!("invalid mime_type '{mime_type}': {e}")))?;
+        let append_form = reqwest::multipart::Form::new()
+            .text("command", "APPEND")
+            .text("media_id", media_id.clone())
+            .text("segment_index", "0")
+            .part("media", part);
+        // APPEND returns no significant body; just check status.
+        self.post_multipart_no_body(&append_url, append_form)
+            .await?;
+
+        // 3. FINALIZE — completes synchronously for tweet_image.
+        let finalize_url = format!("{}/2/media/upload", self.base_url);
+        let finalize_form = reqwest::multipart::Form::new()
+            .text("command", "FINALIZE")
+            .text("media_id", media_id.clone());
+        let _finalize_resp: FinalizeResponse =
+            self.post_multipart(&finalize_url, finalize_form).await?;
+
+        Ok(media_id)
+    }
+
+    /// POST a multipart form, sign via OAuth1 (URL + method only — multipart
+    /// bodies aren't included in the OAuth signature base string per
+    /// RFC 5849 §3.4.1.3.1), parse the JSON response.
+    #[allow(dead_code)]
+    async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<T, XApiError> {
+        let auth_header = self.sign("POST", url, &[])?;
+        let response = self
+            .http
+            .post(url)
+            .header("Authorization", auth_header)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| XApiError::Network(e.to_string()))?;
+        Self::parse_response(response).await
+    }
+
+    /// Like `post_multipart` but discards the response body — used for
+    /// APPEND which returns 2xx with no body fields we need.
+    #[allow(dead_code)]
+    async fn post_multipart_no_body(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<(), XApiError> {
+        let auth_header = self.sign("POST", url, &[])?;
+        let response = self
+            .http
+            .post(url)
+            .header("Authorization", auth_header)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| XApiError::Network(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let message =
+                extract_x_error_message(&body).unwrap_or_else(|| body.chars().take(200).collect());
+            return Err(XApiError::ApiError {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        Ok(())
+    }
+
     fn sign(&self, method: &str, url: &str, query: &[(&str, &str)]) -> Result<String, XApiError> {
         oauth1_signing::build_authorization_header(
             method,
@@ -208,6 +312,34 @@ impl XClient {
             }
         }
     }
+}
+
+// --- Response types for chunked media upload (`upload_image_chunked`). ---
+// These mirror the X v2 media upload contract; fields we don't read are kept
+// (with `#[allow(dead_code)]`) to document the schema and prevent surprise on
+// future contract changes.
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct InitResponse {
+    data: InitData,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct InitData {
+    id: String,
+    #[serde(default)]
+    media_key: Option<String>,
+    #[serde(default)]
+    expires_after_secs: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+struct FinalizeResponse {
+    #[serde(default)]
+    data: serde_json::Value,
 }
 
 /// Helper: resolve a single credential name, mapping the error variant.
@@ -454,6 +586,18 @@ mod tests {
     use wiremock::matchers::{header_exists, method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Byte-level "body contains" matcher. Unlike wiremock's
+    /// `body_string_contains`, this works on raw bytes and so doesn't reject
+    /// multipart bodies that include non-UTF-8 image payloads (the APPEND
+    /// step).
+    fn body_bytes_contains(needle: &'static [u8]) -> impl Fn(&wiremock::Request) -> bool {
+        move |req| {
+            req.body
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+    }
+
     #[derive(Debug, Deserialize, PartialEq)]
     struct TestResponse {
         ok: bool,
@@ -671,5 +815,105 @@ mod tests {
             .await
             .expect("happy path");
         assert_eq!(result, TestResponse { ok: true });
+    }
+
+    // --- upload_image_chunked tests (P1.3f) ---
+
+    #[tokio::test]
+    async fn upload_image_chunked_happy_path_returns_media_id() {
+        let server = MockServer::start().await;
+        let media_id = "1234567890";
+        // INIT
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "data": {"id": media_id, "media_key": "mk_x", "expires_after_secs": 86400}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // APPEND — body contains binary PNG bytes, so we use byte-level
+        // matching instead of `body_string_contains` (which requires UTF-8).
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nAPPEND"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // FINALIZE
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nFINALIZE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"id": media_id, "processing_info": {"state": "succeeded"}}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let bytes = b"\x89PNG\r\n\x1a\nfake_png_payload";
+        let id = client
+            .upload_image_chunked(bytes, "image/png")
+            .await
+            .expect("happy path");
+        assert_eq!(id, media_id);
+    }
+
+    #[tokio::test]
+    async fn upload_image_chunked_init_4xx_surfaces_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_string(r#"{"errors":[{"message":"Unauthorized"}]}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri());
+        let bytes = b"\x89PNG\r\n";
+        let err = client
+            .upload_image_chunked(bytes, "image/png")
+            .await
+            .unwrap_err();
+        match err {
+            XApiError::Unauthenticated(msg) => {
+                assert!(msg.contains("Unauthorized"), "got: {msg}");
+            }
+            other => panic!("expected Unauthenticated, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_image_chunked_append_5xx_surfaces_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "data": {"id": "id_x"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/2/media/upload"))
+            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nAPPEND"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+        let client = test_client(&server.uri());
+        let err = client
+            .upload_image_chunked(b"\x89PNG", "image/png")
+            .await
+            .unwrap_err();
+        match err {
+            XApiError::ApiError { status, .. } => assert_eq!(status, 503),
+            other => panic!("expected ApiError(503), got: {other:?}"),
+        }
     }
 }
