@@ -140,27 +140,29 @@ Env override: `HEARTBIT_GHOST_PROFILES`. Falls back to `$HOME/.heartbit/ghost/pr
 # v3.toml (or latest.toml — same content)
 [meta]
 version = 3                          # snapshot version, NOT StyleProfile version
-hash = "f3a8c1...abc12345"           # sha256 of the body (after [meta]) for integrity
+hash = "f3a8c1...abc12345"           # sha256 of the [profile] body for integrity
 recipe_hash = "9b2d44...def67890"    # sha256 of the recipe TOML for reproducibility
 generated_at = "2026-05-08T18:42:00Z"
 
-# StyleProfile body — same as P1.2a's serialization, no changes
-version = 1
+[profile]
+version = 1                          # StyleProfile schema version (see P1.2a)
 sentence_length_target = "short"
 sentence_length_distribution = [40, 30, 20, 10]
 fragment_frequency = "common"
 opening_patterns = ["claim_first", "number_first"]
 opening_pattern_weights = [0.6, 0.4]
 
-[formatting]
+[profile.formatting]
 lowercase = true
 periods = "optional"
 em_dashes = "forbidden"
 quotation_marks = "double"
 line_breaks = "single"
 
-# ... rest of StyleProfile fields ...
+# ... rest of StyleProfile fields under [profile] / [profile.formatting] ...
 ```
+
+The profile is nested under `[profile]` (NOT `#[serde(flatten)]`) to avoid a key collision: both `SnapshotMeta` and `StyleProfile` declare a `version` field, so flattening would emit two `version =` keys at the same level — invalid TOML, ambiguous parse. Nesting under `[profile]` makes the two version fields cleanly distinguishable as `meta.version` (snapshot) and `profile.version` (StyleProfile schema).
 
 **Rust types**:
 
@@ -169,8 +171,7 @@ line_breaks = "single"
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub meta: SnapshotMeta,
-    #[serde(flatten)]
-    pub profile: StyleProfile,
+    pub profile: StyleProfile,    // nested as [profile] in TOML (see §4 note)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,7 +199,7 @@ impl SnapshotStore {
 pub fn default_profiles_dir() -> Result<PathBuf, SnapshotError>;
 ```
 
-**`#[serde(flatten)]`** on `Snapshot.profile` puts the StyleProfile fields at the top level of the TOML (alongside `[meta]`), not nested under `[profile]`. Cleaner human-readable file.
+**No `#[serde(flatten)]`** on `Snapshot.profile` — see §4 note. The profile is nested under `[profile]` to avoid the `version`-field collision with `SnapshotMeta`.
 
 **Atomic save (`save_new`)**:
 
@@ -500,7 +501,7 @@ Workspace test count: 3899 → ~3925.
 
 **AD-2 — Numbered snapshot versions** (`v1`, `v2`, `v3`, ... + `latest.toml`). Auto-incrementing version names map directly to CLI args (`profile diff x v3 v4`); no hash-typing burden. `latest.toml` is a copy (not symlink, for cross-OS portability) of the highest version. Content-addressing was rejected because the CLI ergonomics are terrible for content hashes.
 
-**AD-3 — Snapshot file format with `[meta]` header + flattened StyleProfile body**. Single TOML file per snapshot; readable; parseable as one `Snapshot` struct via `#[serde(flatten)]`. Hash + recipe_hash + generated_at in `[meta]` enables integrity checks and reproducibility tracking.
+**AD-3 — Snapshot file format with `[meta]` + `[profile]` tables**. Single TOML file per snapshot; readable; parseable as one `Snapshot` struct. Profile is nested under `[profile]` (not `#[serde(flatten)]`) to avoid the `version`-key collision between `SnapshotMeta` and `StyleProfile`. Hash + recipe_hash + generated_at in `[meta]` enables integrity checks and reproducibility tracking.
 
 **AD-4 — `corpus list <persona>` lists writers from the recipe with corpus stats**, not all writers on disk. The most actionable interpretation: shows which writers the persona references AND which have corpus data, signaling "rebuild will fail until you add this writer" without running rebuild.
 
