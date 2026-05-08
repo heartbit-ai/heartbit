@@ -54,6 +54,10 @@ pub enum XApiError {
     /// Response parsing failed (unexpected payload shape).
     #[error("response parse error: {0}")]
     ParseError(String),
+    /// Caller-side validation failed before any HTTP call (e.g., invalid
+    /// base64, image too large).
+    #[error("validation: {0}")]
+    Validation(String),
 }
 
 /// Map `XApiError` to a user-friendly tool error message.
@@ -68,6 +72,7 @@ pub fn format_error(err: &XApiError) -> String {
         XApiError::ApiError { status, message } => format!("X API error ({status}): {message}"),
         XApiError::Network(msg) => format!("network error: {msg}"),
         XApiError::ParseError(msg) => format!("X response parse error: {msg}"),
+        XApiError::Validation(msg) => msg.clone(),
     }
 }
 
@@ -170,48 +175,44 @@ impl XClient {
     /// segment is sufficient for any image we'd reasonably attach
     /// (X's per-image limit is 5 MiB, validated by the caller before
     /// invoking this method).
-    // P1.3f Task 1 lands this method ahead of its first caller (Task 2 wires
-    // it into `TwitterThreadTool::call_x`); allow `dead_code` on this commit
-    // boundary.
-    #[allow(dead_code)]
     pub(crate) async fn upload_image_chunked(
         &self,
         bytes: &[u8],
         mime_type: &str,
     ) -> Result<String, XApiError> {
+        let media_upload_url = format!("{}/2/media/upload", self.base_url);
+
         // 1. INIT — declare intent + size, get a media_id back.
-        let init_url = format!("{}/2/media/upload", self.base_url);
         let total_bytes = bytes.len().to_string();
         let init_form = reqwest::multipart::Form::new()
             .text("command", "INIT")
             .text("media_type", mime_type.to_string())
             .text("total_bytes", total_bytes)
             .text("media_category", "tweet_image");
-        let init_resp: InitResponse = self.post_multipart(&init_url, init_form).await?;
+        let init_resp: InitResponse = self.post_multipart(&media_upload_url, init_form).await?;
         let media_id = init_resp.data.id;
 
         // 2. APPEND — single segment.
-        let append_url = format!("{}/2/media/upload", self.base_url);
         let part = reqwest::multipart::Part::bytes(bytes.to_vec())
             .file_name("image")
             .mime_str(mime_type)
-            .map_err(|e| XApiError::Network(format!("invalid mime_type '{mime_type}': {e}")))?;
+            .map_err(|e| XApiError::Validation(format!("invalid mime_type '{mime_type}': {e}")))?;
         let append_form = reqwest::multipart::Form::new()
             .text("command", "APPEND")
             .text("media_id", media_id.clone())
             .text("segment_index", "0")
             .part("media", part);
         // APPEND returns no significant body; just check status.
-        self.post_multipart_no_body(&append_url, append_form)
+        self.post_multipart_no_body(&media_upload_url, append_form)
             .await?;
 
         // 3. FINALIZE — completes synchronously for tweet_image.
-        let finalize_url = format!("{}/2/media/upload", self.base_url);
         let finalize_form = reqwest::multipart::Form::new()
             .text("command", "FINALIZE")
             .text("media_id", media_id.clone());
-        let _finalize_resp: FinalizeResponse =
-            self.post_multipart(&finalize_url, finalize_form).await?;
+        let _finalize_resp: FinalizeResponse = self
+            .post_multipart(&media_upload_url, finalize_form)
+            .await?;
 
         Ok(media_id)
     }
@@ -219,7 +220,6 @@ impl XClient {
     /// POST a multipart form, sign via OAuth1 (URL + method only — multipart
     /// bodies aren't included in the OAuth signature base string per
     /// RFC 5849 §3.4.1.3.1), parse the JSON response.
-    #[allow(dead_code)]
     async fn post_multipart<T: DeserializeOwned>(
         &self,
         url: &str,
@@ -239,7 +239,6 @@ impl XClient {
 
     /// Like `post_multipart` but discards the response body — used for
     /// APPEND which returns 2xx with no body fields we need.
-    #[allow(dead_code)]
     async fn post_multipart_no_body(
         &self,
         url: &str,
@@ -255,16 +254,20 @@ impl XClient {
             .await
             .map_err(|e| XApiError::Network(e.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let message =
-                extract_x_error_message(&body).unwrap_or_else(|| body.chars().take(200).collect());
-            return Err(XApiError::ApiError {
-                status: status.as_u16(),
-                message,
-            });
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(())
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let body_text = response.text().await.unwrap_or_default();
+        Err(classify_error_status(
+            status.as_u16(),
+            retry_after,
+            &body_text,
+        ))
     }
 
     fn sign(&self, method: &str, url: &str, query: &[(&str, &str)]) -> Result<String, XApiError> {
@@ -297,19 +300,26 @@ impl XClient {
             .and_then(|s| s.parse::<u64>().ok());
         let status_code = status.as_u16();
         let body_text = response.text().await.unwrap_or_default();
-        match status_code {
-            401 => Err(XApiError::Unauthenticated(body_text)),
-            429 => Err(XApiError::RateLimited {
-                retry_after_secs: retry_after.unwrap_or(60),
-            }),
-            _ => {
-                let message =
-                    extract_x_error_message(&body_text).unwrap_or_else(|| body_text.clone());
-                Err(XApiError::ApiError {
-                    status: status_code,
-                    message,
-                })
-            }
+        Err(classify_error_status(status_code, retry_after, &body_text))
+    }
+}
+
+/// Classify a non-success HTTP status into an `XApiError` variant.
+///
+/// Shared by `parse_response` (JSON paths) and `post_multipart_no_body`
+/// (APPEND path). Keeps 401 → `Unauthenticated`, 429 → `RateLimited`
+/// (with `Retry-After` parsed by the caller), else → `ApiError`
+/// classification consistent across both code paths.
+fn classify_error_status(status: u16, retry_after_secs: Option<u64>, body_text: &str) -> XApiError {
+    match status {
+        401 => XApiError::Unauthenticated(body_text.to_string()),
+        429 => XApiError::RateLimited {
+            retry_after_secs: retry_after_secs.unwrap_or(60),
+        },
+        _ => {
+            let message = extract_x_error_message(body_text)
+                .unwrap_or_else(|| body_text.chars().take(200).collect());
+            XApiError::ApiError { status, message }
         }
     }
 }
@@ -319,25 +329,25 @@ impl XClient {
 // (with `#[allow(dead_code)]`) to document the schema and prevent surprise on
 // future contract changes.
 
-#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct InitResponse {
     data: InitData,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct InitData {
     id: String,
+    #[allow(dead_code)]
     #[serde(default)]
     media_key: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     expires_after_secs: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 struct FinalizeResponse {
+    #[allow(dead_code)]
     #[serde(default)]
     data: serde_json::Value,
 }
@@ -864,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_image_chunked_init_4xx_surfaces_api_error() {
+    async fn upload_image_chunked_init_401_surfaces_unauthenticated() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wm_path("/2/media/upload"))
