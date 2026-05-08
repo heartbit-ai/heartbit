@@ -11,8 +11,9 @@
 //! └── swyx.jsonl
 //! ```
 
+pub mod entry;
 pub mod error;
-// pub mod entry;   // uncommented in Task 2
 // pub mod store;   // uncommented in Task 3
 
+pub use entry::{CorpusEntry, Engagement};
 pub use error::CorpusError;
