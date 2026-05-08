@@ -182,16 +182,28 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 corpora_root: &corpora_root,
                 profiles_root: &profiles_root,
                 on_progress: Some(on_progress),
+                candidates_per_draft: 3,
             };
 
+            let n_requested = cfg.candidates_per_draft;
             let output = heartbit_ghost::pipeline::run_pipeline(cfg)
                 .await
                 .map_err(|e| anyhow!("pipeline: {e}"))?;
 
             // run_pipeline already printed final_draft to stdout.
             eprintln!(
-                "> ok: revise iterations={}, style match={:.2}, fact check={:?}",
-                output.revise_iterations, output.style_match_score, output.fact_check_verdict
+                "> ok: candidates={}/{}, chosen={}, revise iterations={}, style match={:.2}, fact check={:?}, image={}",
+                output.candidates.len(),
+                n_requested,
+                output.chosen_index,
+                output.revise_iterations,
+                output.style_match_score,
+                output.fact_check_verdict,
+                output
+                    .image
+                    .as_ref()
+                    .map(|i| i.url.as_str())
+                    .unwrap_or("none"),
             );
             Ok(())
         }
