@@ -8,10 +8,12 @@
 
 pub mod blend;
 pub mod error;
+pub mod extractor;
 pub mod style;
 
 pub use blend::{BlendEntry, BlendRecipe, PartialStyleProfile};
 pub use error::VoiceError;
+pub use extractor::ExtractError;
 pub use style::{
     EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency, HashtagPolicy, LineBreaks,
     OpeningPattern, PeriodsPolicy, QuotationMarks, SentenceLengthTarget, SpecificityTarget,
