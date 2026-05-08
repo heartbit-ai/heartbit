@@ -157,22 +157,61 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
             }
             Ok(())
         }
+        PersonaCommand::Run { name, once } => {
+            if registry.get(&name).is_none() {
+                return Err(anyhow!(
+                    "persona '{name}' not found. {}",
+                    registry_suffix(registry)
+                ));
+            }
+
+            let provider =
+                build_provider_from_env(None).map_err(|e| anyhow!("build llm provider: {e}"))?;
+            let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+            let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+
+            let on_progress: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                std::sync::Arc::new(|s: &str| eprintln!("> {s}"));
+
+            let cfg = heartbit_ghost::pipeline::PipelineConfig {
+                persona_name: &name,
+                topic: &once,
+                provider,
+                corpora_root: &corpora_root,
+                profiles_root: &profiles_root,
+                on_progress: Some(on_progress),
+            };
+
+            let output = heartbit_ghost::pipeline::run_pipeline(cfg)
+                .await
+                .map_err(|e| anyhow!("pipeline: {e}"))?;
+
+            // run_pipeline already printed final_draft to stdout.
+            eprintln!(
+                "> ok: revise iterations={}, style match={:.2}, fact check={:?}",
+                output.revise_iterations, output.style_match_score, output.fact_check_verdict
+            );
+            Ok(())
+        }
         PersonaCommand::Show { name }
-        | PersonaCommand::Run { name, .. }
         | PersonaCommand::Phase { name, .. }
         | PersonaCommand::Pause { name }
         | PersonaCommand::Resume { name }
         | PersonaCommand::ExportPreferences { name, .. }
         | PersonaCommand::Audit { name, .. } => {
             if registry.get(&name).is_none() {
-                let suffix = registry_suffix(registry);
-                return Err(anyhow!("persona '{name}' not found. {suffix}"));
+                return Err(anyhow!(
+                    "persona '{name}' not found. {}",
+                    registry_suffix(registry)
+                ));
             }
-            // P1.0 ships the registration shell; subcommand bodies land in
-            // later sub-phases (P1.1–P1.4) alongside the persona's tools,
-            // voice modeling, and pipeline.
+            // Other subcommands land in P1.4.
             Err(anyhow!(
-                "persona '{name}': subcommand body is not yet implemented (P1.0 scaffolding stub). The persona is registered; its tools, voice modeling, and pipeline land in later sub-phases."
+                "persona '{name}': subcommand body is not yet implemented. \
+                 Use `heartbit persona run` for one-off generation; other \
+                 subcommands land in P1.4."
             ))
         }
         PersonaCommand::Corpus { sub } => match sub {
@@ -528,6 +567,38 @@ mod tests {
                 v1: "v1".to_string(),
                 v2: "v2".to_string(),
             },
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+        assert!(
+            msg.contains("Available personas: heartbit-ghost:x"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("No personas registered"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn run_persona_not_found_returns_error() {
+        let r = PersonaRegistry::new();
+        let cmd = PersonaCommand::Run {
+            name: "no-such-persona".to_string(),
+            once: "topic".to_string(),
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn run_unknown_persona_with_registered_persona_lists_available() {
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let cmd = PersonaCommand::Run {
+            name: "no-such-persona".to_string(),
+            once: "topic".to_string(),
         };
         let result = dispatch(cmd, &r).await;
         assert!(result.is_err());
