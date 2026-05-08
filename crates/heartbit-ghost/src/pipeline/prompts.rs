@@ -1,9 +1,5 @@
 //! User-message builders for each pipeline stage. Pure string composition;
 //! tested indirectly via the integration tests in `pipeline::tests`.
-//!
-//! These helpers are wired into the orchestrator body in Task 2/3; until
-//! then the dead-code lint would fire crate-wide.
-#![allow(dead_code)]
 
 /// Construct the writer's user message.
 ///
