@@ -154,13 +154,27 @@ pub(crate) fn parse_twitter_thread_output(content: &str) -> (Vec<String>, String
 /// Extract the base64 image data from `image_generator`'s output.
 ///
 /// `ImageGenerateTool` emits matched output with the prefix
-/// `[IMAGE:base64:` and a closing `]`. Returns `None` when:
+/// `[IMAGE:base64:` and a closing `]`. The body inside the brackets
+/// can be one of three shapes (see `crates/heartbit-core/src/tool/builtins/image_generate.rs`):
+///
+/// 1. data-URL fragment: `image/png;base64,iVBOR...` (the `images[]`
+///    and `image_url` paths)
+/// 2. mime-prefixed without `base64,`: `image/png;iVBOR...` (the
+///    `inline_data` fallback path)
+/// 3. pure base64: `iVBOR...` (synthetic / future paths)
+///
+/// This helper strips any `mime[;base64],` prefix and returns the bare
+/// base64 string for downstream decoding.
+///
+/// Returns `None` when:
 /// - the marker is absent
 /// - the recipe returned the literal `"no_image"` (case-insensitive)
 /// - input is empty / whitespace
+/// - the body between brackets is empty after prefix stripping
 ///
-/// Base64 alphabet excludes `]`, so `find(']')` after the prefix is
-/// safe.
+/// Neither base64 alphabet (`A–Z a–z 0–9 + / =`) nor the data-URL
+/// prefix (`mime/subtype;base64,`) contains `]`, so `find(']')` after
+/// the prefix is safe.
 pub(crate) fn extract_image_marker(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -173,7 +187,19 @@ pub(crate) fn extract_image_marker(raw: &str) -> Option<String> {
     let start = trimmed.find(prefix)?;
     let after_prefix = &trimmed[start + prefix.len()..];
     let end = after_prefix.find(']')?;
-    let b64 = &after_prefix[..end];
+    let body = &after_prefix[..end];
+    if body.is_empty() {
+        return None;
+    }
+    // Normalize to pure base64. Strip any leading `mime[;base64],` or
+    // `mime;` prefix; otherwise return body as-is.
+    let b64 = if let Some((_, rest)) = body.split_once(";base64,") {
+        rest
+    } else if let Some((_, rest)) = body.split_once(';') {
+        rest
+    } else {
+        body
+    };
     if b64.is_empty() {
         return None;
     }
@@ -958,6 +984,30 @@ mod tests {
         assert!(extract_image_marker("[IMAGE:base64:abc").is_none());
         // Empty body between brackets → None.
         assert!(extract_image_marker("[IMAGE:base64:]").is_none());
+    }
+
+    #[test]
+    fn extract_image_marker_strips_data_url_prefix() {
+        // Production marker format from ImageGenerateTool's `images[]` /
+        // `image_url` paths (data: prefix already stripped by the tool):
+        // body = "image/png;base64,iVBOR..."
+        let raw = "[IMAGE:base64:image/png;base64,iVBORw0KGgo=]\n\nGenerated image for: test";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn extract_image_marker_strips_mime_only_prefix() {
+        // Production marker format from ImageGenerateTool's `inline_data`
+        // fallback path: body = "image/png;iVBOR..." (no `base64,` separator).
+        let raw = "[IMAGE:base64:image/png;iVBORw0KGgo=]";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn extract_image_marker_leaves_pure_base64_unchanged() {
+        // Already-canonical body (no mime prefix).
+        let raw = "[IMAGE:base64:iVBORw0KGgo=]";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
     }
 
     // --- P1.3f: integration tests covering image_generator flow ---
