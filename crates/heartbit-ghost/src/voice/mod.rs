@@ -11,7 +11,7 @@ pub mod error;
 pub mod extractor;
 pub mod style;
 
-pub use blend::{BlendEntry, BlendError, BlendRecipe, PartialStyleProfile};
+pub use blend::{BlendEntry, BlendError, BlendRecipe, PartialStyleProfile, blend_profiles};
 pub use error::VoiceError;
 pub use extractor::{ExtractError, StyleExtractor, StyleExtractorBuilder, default_system_prompt};
 pub use style::{
