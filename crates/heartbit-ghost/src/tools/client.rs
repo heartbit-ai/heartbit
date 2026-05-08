@@ -686,6 +686,16 @@ mod tests {
         assert!(msg.contains("ExecutionContext::credentials"));
     }
 
+    #[test]
+    fn format_error_validation_returns_inner_message_only() {
+        let err = XApiError::Validation("head image exceeds 5 MiB".to_string());
+        // Must NOT prepend "validation:" — that prefix is only for the
+        // Display impl via thiserror's #[error("validation: {0}")];
+        // format_error is the path used by tool error output, where we
+        // want the bare message.
+        assert_eq!(format_error(&err), "head image exceeds 5 MiB");
+    }
+
     // --- from_context tests ---
 
     #[tokio::test]

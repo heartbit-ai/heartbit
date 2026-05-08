@@ -443,4 +443,23 @@ mod tests {
         let err = decode_and_validate_head_image(&b64).unwrap_err();
         assert!(err.contains("exceeds 5 MiB"), "got: {err}");
     }
+
+    #[test]
+    fn decode_and_validate_head_image_rejects_invalid_base64() {
+        let err = decode_and_validate_head_image("not!valid!base64!").unwrap_err();
+        assert!(
+            err.contains("invalid head_image_b64"),
+            "expected 'invalid head_image_b64' in: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_and_validate_head_image_rejects_zero_bytes() {
+        // Empty base64 string decodes to 0 bytes.
+        let err = decode_and_validate_head_image("").unwrap_err();
+        assert!(
+            err.contains("zero bytes"),
+            "expected 'zero bytes' in: {err}"
+        );
+    }
 }
