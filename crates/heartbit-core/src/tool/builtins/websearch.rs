@@ -292,6 +292,12 @@ impl WebSearchTool {
     }
 }
 
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct SearchResult {
     title: String,
     url: String,

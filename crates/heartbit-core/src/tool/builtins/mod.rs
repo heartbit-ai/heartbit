@@ -143,11 +143,14 @@ pub fn floor_char_boundary(text: &str, target: usize) -> usize {
 }
 
 pub use file_tracker::FileTracker;
+pub use image_generate::ImageGenerateTool;
 pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
 pub use todo::{TodoPriority, TodoStatus, TodoStore};
 pub use twitter_post::TwitterCredentials;
+pub use webfetch::WebFetchTool;
+pub use websearch::WebSearchTool;
 
 /// Risk classification for builtin tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

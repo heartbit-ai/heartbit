@@ -45,6 +45,12 @@ impl ImageGenerateTool {
     }
 }
 
+impl Default for ImageGenerateTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tool for ImageGenerateTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
