@@ -36,7 +36,7 @@ pub struct XGhostPersona {
 }
 
 impl XGhostPersona {
-    /// Create a new stub instance.
+    /// Construct a new instance of the persona.
     pub fn new() -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION"),
