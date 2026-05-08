@@ -184,6 +184,48 @@ pub enum BlendError {
     },
 }
 
+/// Hare quota (largest-remainder method): distribute `total` units across
+/// 4 buckets according to f64 weights, producing 4 integer values that
+/// sum to exactly `total`.
+///
+/// Algorithm:
+/// 1. Floor each weighted f64 to u32, accumulate `assigned`.
+/// 2. residual = total - assigned (in 0..4).
+/// 3. Sort buckets by (frac DESC, declaration index ASC).
+/// 4. Add 1 to each of the first `residual` buckets in that order.
+#[allow(dead_code)] // wired in by Task 3's blend_profiles
+fn distribute_largest_remainder(weighted: [f64; 4], total: u32) -> [u8; 4] {
+    let floors: [u32; 4] = [
+        weighted[0] as u32,
+        weighted[1] as u32,
+        weighted[2] as u32,
+        weighted[3] as u32,
+    ];
+    let assigned: u32 = floors[0] + floors[1] + floors[2] + floors[3];
+    let residual = total.saturating_sub(assigned);
+
+    let mut fracs: [(usize, f64); 4] = [(0, 0.0); 4];
+    for i in 0..4 {
+        fracs[i] = (i, weighted[i] - floors[i] as f64);
+    }
+    // Sort: largest fractional remainder first; declaration-order tiebreak.
+    fracs.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    let mut out: [u8; 4] = [0; 4];
+    for i in 0..4 {
+        out[i] = floors[i].min(255) as u8;
+    }
+    let extras = (residual as usize).min(4);
+    for (idx, _frac) in fracs.iter().take(extras) {
+        out[*idx] = out[*idx].saturating_add(1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +478,28 @@ line_breaks = "single"
         } else {
             panic!("not PostMergeValidation");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P1.2d — distribute_largest_remainder (Hare quota)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn distribute_largest_remainder_already_summing_to_total_is_identity() {
+        // 0.6 × [40, 30, 20, 10] + 0.4 × [20, 30, 30, 20] = [32.0, 30.0, 24.0, 14.0]
+        // Floors sum to 100, residual is 0, no redistribution needed.
+        let result = distribute_largest_remainder([32.0, 30.0, 24.0, 14.0], 100);
+        assert_eq!(result, [32, 30, 24, 14]);
+        assert_eq!(result.iter().map(|&x| x as u32).sum::<u32>(), 100);
+    }
+
+    #[test]
+    fn distribute_largest_remainder_residual_uses_declaration_order_tiebreak() {
+        // Weighted: [33.5, 33.0, 33.0, 0.5] — floors [33, 33, 33, 0] sum 99,
+        // residual 1. Fractional parts: 0.5, 0.0, 0.0, 0.5 — buckets 0 and 3
+        // tie at 0.5. Declaration-order tiebreak: bucket 0 wins, gets the +1.
+        let result = distribute_largest_remainder([33.5, 33.0, 33.0, 0.5], 100);
+        assert_eq!(result, [34, 33, 33, 0]);
+        assert_eq!(result.iter().map(|&x| x as u32).sum::<u32>(), 100);
     }
 }
