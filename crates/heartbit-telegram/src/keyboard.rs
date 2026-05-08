@@ -2,6 +2,15 @@ use uuid::Uuid;
 
 use heartbit::Error;
 
+/// Pick choice from a persona-review inline keyboard.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickChoice {
+    /// User picked a specific candidate by 0-based index.
+    Index(usize),
+    /// User pressed Skip.
+    Skip,
+}
+
 /// Parsed callback data from an inline keyboard button press.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallbackAction {
@@ -15,6 +24,14 @@ pub enum CallbackAction {
         interaction_id: Uuid,
         question_idx: usize,
         option_idx: usize,
+    },
+    /// Persona-review pick: `p:{uuid}:{choice}` where choice is a 0-based
+    /// index digit `0..9` or the literal string `skip`.
+    PersonaPick {
+        /// Correlates back to the original review message.
+        interaction_id: Uuid,
+        /// User's pick or skip.
+        choice: PickChoice,
     },
 }
 
@@ -44,6 +61,27 @@ pub fn question_buttons(
             buttons.push((label.clone(), format!("q:{id}:{q_idx}:{o_idx}")));
         }
     }
+    buttons
+}
+
+/// Build inline keyboard markup for a persona-review prompt.
+///
+/// Produces N buttons labelled `1` … `N` (1-based for users) plus a
+/// trailing `Skip` button. Returns `Vec<(label, callback_data)>` pairs.
+///
+/// Panics if `n == 0` or `n > 9` — the callback format encodes index as
+/// a single decimal digit, and an empty review has no candidates to pick.
+pub fn persona_pick_buttons(interaction_id: Uuid, n: usize) -> Vec<(String, String)> {
+    assert!(
+        (1..=9).contains(&n),
+        "persona_pick_buttons: n must be in 1..=9 (got {n})"
+    );
+    let id = interaction_id.to_string();
+    let mut buttons = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        buttons.push((format!("{}", i + 1), format!("p:{id}:{i}")));
+    }
+    buttons.push(("Skip".into(), format!("p:{id}:skip")));
     buttons
 }
 
@@ -84,6 +122,29 @@ pub fn parse_callback_data(data: &str) -> Result<CallbackAction, Error> {
                 interaction_id,
                 question_idx,
                 option_idx,
+            })
+        }
+        Some(&"p") => {
+            if parts.len() != 3 {
+                return Err(Error::Telegram(format!(
+                    "invalid persona-pick callback: expected 3 parts, got {}",
+                    parts.len()
+                )));
+            }
+            let interaction_id = Uuid::parse_str(parts[1])
+                .map_err(|e| Error::Telegram(format!("invalid UUID in callback: {e}")))?;
+            let choice = match parts[2] {
+                "skip" => PickChoice::Skip,
+                other => {
+                    let idx: usize = other.parse().map_err(|e| {
+                        Error::Telegram(format!("invalid pick index '{other}': {e}"))
+                    })?;
+                    PickChoice::Index(idx)
+                }
+            };
+            Ok(CallbackAction::PersonaPick {
+                interaction_id,
+                choice,
             })
         }
         _ => Err(Error::Telegram(format!("unknown callback prefix: {data}"))),
@@ -232,5 +293,73 @@ mod tests {
         let buttons = question_buttons(id, &questions);
         assert_eq!(buttons.len(), 1);
         assert_eq!(buttons[0].0, "Only");
+    }
+
+    #[test]
+    fn persona_pick_buttons_three_candidates_produces_four_buttons() {
+        let id = Uuid::new_v4();
+        let buttons = persona_pick_buttons(id, 3);
+        assert_eq!(buttons.len(), 4);
+        assert_eq!(buttons[0].0, "1");
+        assert_eq!(buttons[0].1, format!("p:{id}:0"));
+        assert_eq!(buttons[1].0, "2");
+        assert_eq!(buttons[1].1, format!("p:{id}:1"));
+        assert_eq!(buttons[2].0, "3");
+        assert_eq!(buttons[2].1, format!("p:{id}:2"));
+        assert_eq!(buttons[3].0, "Skip");
+        assert_eq!(buttons[3].1, format!("p:{id}:skip"));
+    }
+
+    #[test]
+    fn persona_pick_buttons_single_candidate_produces_two_buttons() {
+        let id = Uuid::new_v4();
+        let buttons = persona_pick_buttons(id, 1);
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0].0, "1");
+        assert_eq!(buttons[1].0, "Skip");
+    }
+
+    #[test]
+    #[should_panic(expected = "persona_pick_buttons: n must be in 1..=9")]
+    fn persona_pick_buttons_zero_candidates_panics() {
+        let id = Uuid::new_v4();
+        let _ = persona_pick_buttons(id, 0);
+    }
+
+    #[test]
+    fn parse_callback_data_persona_pick_index_round_trip() {
+        let id = Uuid::new_v4();
+        let buttons = persona_pick_buttons(id, 3);
+        // Pick the [2] button (idx 1 → label "2", callback "p:{id}:1").
+        let action = parse_callback_data(&buttons[1].1).unwrap();
+        assert_eq!(
+            action,
+            CallbackAction::PersonaPick {
+                interaction_id: id,
+                choice: PickChoice::Index(1),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_callback_data_persona_pick_skip_round_trip() {
+        let id = Uuid::new_v4();
+        let data = format!("p:{id}:skip");
+        let action = parse_callback_data(&data).unwrap();
+        assert_eq!(
+            action,
+            CallbackAction::PersonaPick {
+                interaction_id: id,
+                choice: PickChoice::Skip,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_callback_data_persona_pick_invalid_choice_returns_err() {
+        let id = Uuid::new_v4();
+        let data = format!("p:{id}:not-a-number");
+        let err = parse_callback_data(&data).unwrap_err();
+        assert!(err.to_string().contains("invalid pick index"), "got: {err}");
     }
 }
