@@ -175,46 +175,33 @@ impl XClient {
     /// segment is sufficient for any image we'd reasonably attach
     /// (X's per-image limit is 5 MiB, validated by the caller before
     /// invoking this method).
-    pub(crate) async fn upload_image_chunked(
+    /// Upload an image to X via the v2 media upload endpoint.
+    /// Returns the `media_id` for use in `POST /2/tweets`'s `media.media_ids`.
+    ///
+    /// Single-shot multipart POST — the v2 endpoint is NOT chunked
+    /// (despite older v1.1 documentation). The schema accepts:
+    /// - `media`: binary part (required)
+    /// - `media_category`: text part (optional; "tweet_image" for static images)
+    ///
+    /// Image size cap on the X side is currently 5 MiB (validated by the
+    /// caller before invoking this method).
+    pub(crate) async fn upload_image(
         &self,
         bytes: &[u8],
         mime_type: &str,
     ) -> Result<String, XApiError> {
         let media_upload_url = format!("{}/2/media/upload", self.base_url);
 
-        // 1. INIT — declare intent + size, get a media_id back.
-        let total_bytes = bytes.len().to_string();
-        let init_form = reqwest::multipart::Form::new()
-            .text("command", "INIT")
-            .text("media_type", mime_type.to_string())
-            .text("total_bytes", total_bytes)
-            .text("media_category", "tweet_image");
-        let init_resp: InitResponse = self.post_multipart(&media_upload_url, init_form).await?;
-        let media_id = init_resp.data.id;
-
-        // 2. APPEND — single segment.
         let part = reqwest::multipart::Part::bytes(bytes.to_vec())
             .file_name("image")
             .mime_str(mime_type)
             .map_err(|e| XApiError::Validation(format!("invalid mime_type '{mime_type}': {e}")))?;
-        let append_form = reqwest::multipart::Form::new()
-            .text("command", "APPEND")
-            .text("media_id", media_id.clone())
-            .text("segment_index", "0")
-            .part("media", part);
-        // APPEND returns no significant body; just check status.
-        self.post_multipart_no_body(&media_upload_url, append_form)
-            .await?;
+        let form = reqwest::multipart::Form::new()
+            .part("media", part)
+            .text("media_category", "tweet_image");
 
-        // 3. FINALIZE — completes synchronously for tweet_image.
-        let finalize_form = reqwest::multipart::Form::new()
-            .text("command", "FINALIZE")
-            .text("media_id", media_id.clone());
-        let _finalize_resp: FinalizeResponse = self
-            .post_multipart(&media_upload_url, finalize_form)
-            .await?;
-
-        Ok(media_id)
+        let resp: InitResponse = self.post_multipart(&media_upload_url, form).await?;
+        Ok(resp.data.id)
     }
 
     /// POST a multipart form, sign via OAuth1 (URL + method only — multipart
@@ -235,39 +222,6 @@ impl XClient {
             .await
             .map_err(|e| XApiError::Network(e.to_string()))?;
         Self::parse_response(response).await
-    }
-
-    /// Like `post_multipart` but discards the response body — used for
-    /// APPEND which returns 2xx with no body fields we need.
-    async fn post_multipart_no_body(
-        &self,
-        url: &str,
-        form: reqwest::multipart::Form,
-    ) -> Result<(), XApiError> {
-        let auth_header = self.sign("POST", url, &[])?;
-        let response = self
-            .http
-            .post(url)
-            .header("Authorization", auth_header)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| XApiError::Network(e.to_string()))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let body_text = response.text().await.unwrap_or_default();
-        Err(classify_error_status(
-            status.as_u16(),
-            retry_after,
-            &body_text,
-        ))
     }
 
     fn sign(&self, method: &str, url: &str, query: &[(&str, &str)]) -> Result<String, XApiError> {
@@ -306,7 +260,7 @@ impl XClient {
 
 /// Classify a non-success HTTP status into an `XApiError` variant.
 ///
-/// Shared by `parse_response` (JSON paths) and `post_multipart_no_body`
+/// Shared by `parse_response` (JSON paths)
 /// (APPEND path). Keeps 401 → `Unauthenticated`, 429 → `RateLimited`
 /// (with `Retry-After` parsed by the caller), else → `ApiError`
 /// classification consistent across both code paths.
@@ -324,8 +278,8 @@ fn classify_error_status(status: u16, retry_after_secs: Option<u64>, body_text: 
     }
 }
 
-// --- Response types for chunked media upload (`upload_image_chunked`). ---
-// These mirror the X v2 media upload contract; fields we don't read are kept
+// --- Response type for the v2 media upload endpoint. ---
+// Mirrors the X v2 media upload contract; fields we don't read are kept
 // (with `#[allow(dead_code)]`) to document the schema and prevent surprise on
 // future contract changes.
 
@@ -343,13 +297,6 @@ struct InitData {
     #[allow(dead_code)]
     #[serde(default)]
     expires_after_secs: Option<u64>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct FinalizeResponse {
-    #[allow(dead_code)]
-    #[serde(default)]
-    data: serde_json::Value,
 }
 
 /// Helper: resolve a single credential name, mapping the error variant.
@@ -837,38 +784,23 @@ mod tests {
         assert_eq!(result, TestResponse { ok: true });
     }
 
-    // --- upload_image_chunked tests (P1.3f) ---
+    // --- upload_image tests (P1.3f / P1.3g) ---
+    // The v2 endpoint is single-shot (NOT chunked despite older v1.1
+    // documentation): one multipart POST with `media` (binary part) +
+    // optional `media_category`.
 
     #[tokio::test]
-    async fn upload_image_chunked_happy_path_returns_media_id() {
+    async fn upload_image_happy_path_returns_media_id() {
         let server = MockServer::start().await;
         let media_id = "1234567890";
-        // INIT
         Mock::given(method("POST"))
             .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
+            .and(body_bytes_contains(
+                b"name=\"media_category\"\r\n\r\ntweet_image",
+            ))
             .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
-                "data": {"id": media_id, "media_key": "mk_x", "expires_after_secs": 86400}
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // APPEND — body contains binary PNG bytes, so we use byte-level
-        // matching instead of `body_string_contains` (which requires UTF-8).
-        Mock::given(method("POST"))
-            .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nAPPEND"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // FINALIZE
-        Mock::given(method("POST"))
-            .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nFINALIZE"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"id": media_id, "processing_info": {"state": "succeeded"}}
+                "data": {"id": media_id, "media_key": "mk_x", "expires_after_secs": 86400}
             })))
             .expect(1)
             .mount(&server)
@@ -877,18 +809,17 @@ mod tests {
         let client = test_client(&server.uri());
         let bytes = b"\x89PNG\r\n\x1a\nfake_png_payload";
         let id = client
-            .upload_image_chunked(bytes, "image/png")
+            .upload_image(bytes, "image/png")
             .await
             .expect("happy path");
         assert_eq!(id, media_id);
     }
 
     #[tokio::test]
-    async fn upload_image_chunked_init_401_surfaces_unauthenticated() {
+    async fn upload_image_401_surfaces_unauthenticated() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
             .respond_with(
                 ResponseTemplate::new(401)
                     .set_body_string(r#"{"errors":[{"message":"Unauthorized"}]}"#),
@@ -897,10 +828,7 @@ mod tests {
             .await;
         let client = test_client(&server.uri());
         let bytes = b"\x89PNG\r\n";
-        let err = client
-            .upload_image_chunked(bytes, "image/png")
-            .await
-            .unwrap_err();
+        let err = client.upload_image(bytes, "image/png").await.unwrap_err();
         match err {
             XApiError::Unauthenticated(msg) => {
                 assert!(msg.contains("Unauthorized"), "got: {msg}");
@@ -910,25 +838,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_image_chunked_append_5xx_surfaces_api_error() {
+    async fn upload_image_5xx_surfaces_api_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nINIT"))
-            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
-                "data": {"id": "id_x"}
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(wm_path("/2/media/upload"))
-            .and(body_bytes_contains(b"name=\"command\"\r\n\r\nAPPEND"))
             .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
             .mount(&server)
             .await;
         let client = test_client(&server.uri());
         let err = client
-            .upload_image_chunked(b"\x89PNG", "image/png")
+            .upload_image(b"\x89PNG", "image/png")
             .await
             .unwrap_err();
         match err {
