@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::voice::SnapshotError;
 
+pub mod dedup;
 pub mod prompts;
 pub mod publish_gate;
 pub mod style_render;
@@ -23,19 +24,54 @@ pub mod verdicts;
 
 pub use publish_gate::{PublishGateError, check_publish_gate};
 pub use style_render::render_style_profile_as_english;
-pub use verdicts::{FactVerdict, StyleVerdict, parse_critic_verdict, parse_fact_verdict};
+pub use verdicts::{
+    FactVerdict, JudgeVerdict, StyleVerdict, VerdictParseError, parse_critic_verdict,
+    parse_fact_verdict, parse_judge_verdict,
+};
+
+/// One candidate draft produced by the writer→critic→fact_check chain.
+#[derive(Debug, Clone)]
+pub struct CandidateRecord {
+    /// 0-based generation slot. Preserved across parallel scheduling so the
+    /// caller can correlate with the order they were requested in. After
+    /// dedup, indices in `PipelineOutput.candidates` are NOT contiguous —
+    /// the `variant_index` field tells you the original generation slot.
+    pub variant_index: usize,
+    /// The draft text.
+    pub draft: String,
+    /// Style critic's score on the accepted draft (post-revise loop).
+    pub style_match_score: f64,
+    /// Number of revise iterations until pass (1..=3).
+    pub revise_iterations: usize,
+    /// Fact-check verdict on the draft.
+    pub fact_check_verdict: FactVerdict,
+    /// Tokens used by this candidate's writer + critic + fact_check chain.
+    /// `run_pipeline` sums these across all candidates into
+    /// `PipelineOutput.usage_summary`.
+    pub usage: TokenUsage,
+}
+
+/// Optional image attached to the chosen candidate by `image_generator`.
+#[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    /// Image URL returned by the `image_generate` tool.
+    pub url: String,
+    /// Optional alt text for accessibility.
+    pub alt_text: Option<String>,
+}
 
 /// Progress callback type — invoked with a short status string at each
 /// pipeline stage start. Used by `PipelineConfig::on_progress`.
 pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Configuration for one pipeline run.
+#[derive(Clone)]
 pub struct PipelineConfig<'a> {
     /// Persona instance name (used to load the StyleProfile snapshot).
     pub persona_name: &'a str,
     /// Topic / prompt for this run.
     pub topic: &'a str,
-    /// LLM provider (shared across all 4 sub-agents).
+    /// LLM provider (shared across all sub-agents).
     pub provider: Arc<BoxedProvider>,
     /// Corpora root (currently unused; reserved for P1.3e few-shot retrieval).
     pub corpora_root: &'a Path,
@@ -44,23 +80,42 @@ pub struct PipelineConfig<'a> {
     /// Optional progress callback. Called with a short status string at each
     /// pipeline stage start.
     pub on_progress: Option<ProgressCallback>,
+    /// Number of distinct candidate drafts to generate. Default: 3.
+    /// Validated `1..=10` at the start of `run_pipeline`. Set to 1 to
+    /// recover the P1.3b single-candidate behavior (judge skipped).
+    pub candidates_per_draft: usize,
 }
 
 /// Output of a successful pipeline run.
 #[derive(Debug, Clone)]
 pub struct PipelineOutput {
     /// The final post draft (single tweet or `\n\n`-separated thread).
+    /// Equals `candidates[chosen_index].draft`.
     pub final_draft: String,
     /// Researcher's digest text.
     pub research_digest: String,
-    /// `style_match_score` from the critic on the accepted draft.
+    /// `style_match_score` from the critic on the chosen draft.
+    /// Equals `candidates[chosen_index].style_match_score`.
     pub style_match_score: f64,
-    /// Number of writer iterations until pass (1..=3).
+    /// Number of writer iterations until pass on the chosen draft (1..=3).
+    /// Equals `candidates[chosen_index].revise_iterations`.
     pub revise_iterations: usize,
-    /// Fact-check verdict on the final draft.
+    /// Fact-check verdict on the chosen draft. Equals
+    /// `candidates[chosen_index].fact_check_verdict`.
     pub fact_check_verdict: FactVerdict,
-    /// Accumulated token usage across all 4 agent calls.
+    /// Accumulated token usage across all sub-agent calls.
     pub usage_summary: TokenUsage,
+    /// All distinct candidate drafts (1..=`candidates_per_draft` after dedup).
+    pub candidates: Vec<CandidateRecord>,
+    /// Index into `candidates` of the chosen draft. Validated `0..len`.
+    pub chosen_index: usize,
+    /// Judge's reasoning string. Empty when only one candidate was ranked
+    /// (judge skipped — see AD-8).
+    pub judge_reasoning: String,
+    /// Image attached to the chosen draft, if `image_generator` decided
+    /// to generate one. `None` when the recipe returned `"no_image"` or
+    /// when the call failed (failures are non-blocking).
+    pub image: Option<ImageAttachment>,
 }
 
 /// Errors raised by [`run_pipeline`].
@@ -102,27 +157,31 @@ pub enum PipelineError {
         source: CoreError,
     },
 
-    /// style_critic returned a malformed verdict.
+    /// `style_critic` returned a malformed verdict.
     #[error("style_critic verdict parse: {source}")]
     CriticParseFailed {
-        /// The underlying serde_json error.
+        /// The wrapped verdict-parse error (carries `raw` internally).
         #[source]
-        source: serde_json::Error,
-        /// The raw critic output that failed to parse.
-        raw: String,
+        source: VerdictParseError,
     },
 
-    /// fact_check returned a malformed verdict.
+    /// `fact_check` returned a malformed verdict.
     #[error("fact_check verdict parse: {source}")]
     FactCheckParseFailed {
-        /// The underlying serde_json error.
+        /// The wrapped verdict-parse error (carries `raw` internally).
         #[source]
-        source: serde_json::Error,
-        /// The raw fact_check output that failed to parse.
-        raw: String,
+        source: VerdictParseError,
     },
 
-    /// style_critic returned `Reject` — draft is fundamentally off.
+    /// `judge` returned a malformed verdict or out-of-range `chosen_index`.
+    #[error("judge verdict parse: {source}")]
+    JudgeParseFailed {
+        /// The wrapped verdict-parse error (carries `raw` internally).
+        #[source]
+        source: VerdictParseError,
+    },
+
+    /// `style_critic` returned `Reject` — draft is fundamentally off.
     #[error("style_critic rejected the draft: {reason}")]
     Rejected {
         /// Reason from the critic.
@@ -144,9 +203,22 @@ pub enum PipelineError {
         last_score: f64,
     },
 
-    /// publish_gate rejected the final draft.
+    /// `publish_gate` rejected the chosen draft.
     #[error("publish_gate: {0}")]
     PublishGate(#[from] PublishGateError),
+
+    /// All N candidate generation tasks failed.
+    #[error("all {n} candidates failed: {errors:?}")]
+    AllCandidatesFailed {
+        /// Per-candidate errors collected from the JoinSet.
+        errors: Vec<PipelineError>,
+        /// Number of candidates attempted.
+        n: usize,
+    },
+
+    /// `PipelineConfig` validation failed at run start.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Build an [`AgentRunner`] from a P1.3a [`AgentConfig`] recipe and a
@@ -295,12 +367,8 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
                 source: e,
             })?;
         total_usage += critic_out.tokens_used;
-        let verdict = parse_critic_verdict(&critic_out.result).map_err(|e| {
-            PipelineError::CriticParseFailed {
-                source: e,
-                raw: critic_out.result.clone(),
-            }
-        })?;
+        let verdict = parse_critic_verdict(&critic_out.result)
+            .map_err(|source| PipelineError::CriticParseFailed { source })?;
         last_score = verdict.score();
 
         match verdict {
@@ -342,11 +410,8 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
             source: e,
         })?;
     total_usage += fact_out.tokens_used;
-    let fact_verdict =
-        parse_fact_verdict(&fact_out.result).map_err(|e| PipelineError::FactCheckParseFailed {
-            source: e,
-            raw: fact_out.result.clone(),
-        })?;
+    let fact_verdict = parse_fact_verdict(&fact_out.result)
+        .map_err(|source| PipelineError::FactCheckParseFailed { source })?;
     if let FactVerdict::Unverifiable { ref reason } = fact_verdict {
         progress(&format!("fact_check unverifiable: {reason}"));
     }
@@ -358,6 +423,14 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     // 8. Print + return.
     println!("{final_draft}");
     progress("Done.");
+    let candidate = CandidateRecord {
+        variant_index: 0,
+        draft: final_draft.clone(),
+        style_match_score: score,
+        revise_iterations: iterations,
+        fact_check_verdict: fact_verdict.clone(),
+        usage: total_usage,
+    };
     Ok(PipelineOutput {
         final_draft,
         research_digest,
@@ -365,6 +438,10 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
         revise_iterations: iterations,
         fact_check_verdict: fact_verdict,
         usage_summary: total_usage,
+        candidates: vec![candidate],
+        chosen_index: 0,
+        judge_reasoning: String::new(),
+        image: None,
     })
 }
 
@@ -564,6 +641,7 @@ mod tests {
             corpora_root: &corpora,
             profiles_root: &profiles_root,
             on_progress: None,
+            candidates_per_draft: 1,
         };
         let out = run_pipeline(cfg).await.expect("happy path");
         assert_eq!(out.final_draft, "concrete short post");
@@ -590,6 +668,7 @@ mod tests {
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
             on_progress: None,
+            candidates_per_draft: 1,
         };
         let out = run_pipeline(cfg).await.expect("revise then pass");
         assert_eq!(out.final_draft, "second draft, no em-dashes");
@@ -615,6 +694,7 @@ mod tests {
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
             on_progress: None,
+            candidates_per_draft: 1,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -648,6 +728,7 @@ mod tests {
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
             on_progress: None,
+            candidates_per_draft: 1,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -672,6 +753,7 @@ mod tests {
             corpora_root: &root,
             profiles_root: &root,
             on_progress: None,
+            candidates_per_draft: 1,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
