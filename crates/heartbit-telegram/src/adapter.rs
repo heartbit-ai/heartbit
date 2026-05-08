@@ -326,6 +326,11 @@ impl TelegramAdapter {
                 question_idx,
                 option_idx,
             } => bridge.resolve_question_by_index(interaction_id, question_idx, option_idx),
+            CallbackAction::PersonaPick { .. } => Err(Error::Telegram(
+                "persona-pick callback received on bridge dispatch path; \
+                 reviews are routed via ReviewDelivery (Task 3)"
+                    .to_string(),
+            )),
         }
     }
 

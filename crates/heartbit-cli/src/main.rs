@@ -1,5 +1,6 @@
 mod daemon;
 mod persona;
+mod persona_review;
 mod serve;
 mod submit;
 

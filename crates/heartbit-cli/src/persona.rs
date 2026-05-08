@@ -33,6 +33,10 @@ pub enum PersonaCommand {
         /// Run a single dry-run prompt without posting.
         #[arg(long, value_name = "PROMPT")]
         once: String,
+        /// Send candidates to Telegram for review and post on user pick.
+        /// Without this flag: runs P1.3c direct mode (judge picks; stdout only).
+        #[arg(long, default_value = "false")]
+        review: bool,
     },
 
     /// Manage the persona's reference corpus.
@@ -157,7 +161,7 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
             }
             Ok(())
         }
-        PersonaCommand::Run { name, once } => {
+        PersonaCommand::Run { name, once, review } => {
             if registry.get(&name).is_none() {
                 return Err(anyhow!(
                     "persona '{name}' not found. {}",
@@ -175,37 +179,66 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
             let on_progress: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
                 std::sync::Arc::new(|s: &str| eprintln!("> {s}"));
 
-            let cfg = heartbit_ghost::pipeline::PipelineConfig {
-                persona_name: &name,
-                topic: &once,
-                provider,
-                corpora_root: &corpora_root,
-                profiles_root: &profiles_root,
-                on_progress: Some(on_progress),
-                candidates_per_draft: 3,
-            };
-
-            let n_requested = cfg.candidates_per_draft;
-            let output = heartbit_ghost::pipeline::run_pipeline(cfg)
+            if review {
+                // P1.3d review mode: Telegram + post.
+                let cfg = crate::persona_review::review_config_from_env(
+                    &name,
+                    &once,
+                    3,
+                    provider,
+                    &corpora_root,
+                    &profiles_root,
+                    Some(on_progress),
+                )
                 .await
-                .map_err(|e| anyhow!("pipeline: {e}"))?;
+                .map_err(|e| anyhow!("review config: {e}"))?;
 
-            // run_pipeline already printed final_draft to stdout.
-            eprintln!(
-                "> ok: candidates={}/{}, chosen={}, revise iterations={}, style match={:.2}, fact check={:?}, image={}",
-                output.candidates.len(),
-                n_requested,
-                output.chosen_index,
-                output.revise_iterations,
-                output.style_match_score,
-                output.fact_check_verdict,
-                output
-                    .image
-                    .as_ref()
-                    .map(|i| i.url.as_str())
-                    .unwrap_or("none"),
-            );
-            Ok(())
+                let n_requested = cfg.candidates_per_draft;
+                let output = heartbit_ghost::review::run_review_pipeline(cfg)
+                    .await
+                    .map_err(|e| anyhow!("review pipeline: {e}"))?;
+
+                eprintln!(
+                    "> ok: candidates={}/{}, outcome={:?}",
+                    output.candidates.len(),
+                    n_requested,
+                    output.outcome,
+                );
+                Ok(())
+            } else {
+                // P1.3c direct mode (unchanged).
+                let cfg = heartbit_ghost::pipeline::PipelineConfig {
+                    persona_name: &name,
+                    topic: &once,
+                    provider,
+                    corpora_root: &corpora_root,
+                    profiles_root: &profiles_root,
+                    on_progress: Some(on_progress),
+                    candidates_per_draft: 3,
+                };
+
+                let n_requested = cfg.candidates_per_draft;
+                let output = heartbit_ghost::pipeline::run_pipeline(cfg)
+                    .await
+                    .map_err(|e| anyhow!("pipeline: {e}"))?;
+
+                // run_pipeline already printed final_draft to stdout.
+                eprintln!(
+                    "> ok: candidates={}/{}, chosen={}, revise iterations={}, style match={:.2}, fact check={:?}, image={}",
+                    output.candidates.len(),
+                    n_requested,
+                    output.chosen_index,
+                    output.revise_iterations,
+                    output.style_match_score,
+                    output.fact_check_verdict,
+                    output
+                        .image
+                        .as_ref()
+                        .map(|i| i.url.as_str())
+                        .unwrap_or("none"),
+                );
+                Ok(())
+            }
         }
         PersonaCommand::Show { name }
         | PersonaCommand::Phase { name, .. }
@@ -597,6 +630,7 @@ mod tests {
         let cmd = PersonaCommand::Run {
             name: "no-such-persona".to_string(),
             once: "topic".to_string(),
+            review: false,
         };
         let result = dispatch(cmd, &r).await;
         assert!(result.is_err());
@@ -611,6 +645,7 @@ mod tests {
         let cmd = PersonaCommand::Run {
             name: "no-such-persona".to_string(),
             once: "topic".to_string(),
+            review: false,
         };
         let result = dispatch(cmd, &r).await;
         assert!(result.is_err());
