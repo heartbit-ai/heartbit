@@ -207,7 +207,11 @@ pub enum PipelineError {
     #[error("publish_gate: {0}")]
     PublishGate(#[from] PublishGateError),
 
-    /// All N candidate generation tasks failed.
+    /// Two or more candidate generation tasks collected errors and zero
+    /// candidates survived. Single-error collapses (typical of
+    /// `candidates_per_draft: 1`) surface the underlying error directly
+    /// instead — see the `errors.swap_remove(0)` shortcut at the top of
+    /// the JoinSet collection path in `run_pipeline`.
     #[error("all {n} candidates failed: {errors:?}")]
     AllCandidatesFailed {
         /// Per-candidate errors collected from the JoinSet.
