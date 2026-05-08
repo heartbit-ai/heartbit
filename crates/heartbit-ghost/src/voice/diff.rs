@@ -10,6 +10,18 @@ use std::fmt::Write as _;
 use crate::voice::snapshot::SnapshotMeta;
 use crate::voice::style::{Formatting, OpeningPattern, StyleProfile};
 
+/// Render a serde-serializable value as its canonical snake_case wire
+/// format. The closed-vocab enums in [`crate::voice::style`] all derive
+/// `#[serde(rename_all = "snake_case")]`, so this produces the same
+/// strings the user sees in TOML/JSON output (e.g., `rare_punchline_only`,
+/// not the Debug-derived `RarePunchlineOnly`).
+fn enum_as_snake_case<T: serde::Serialize>(val: &T) -> String {
+    serde_json::to_string(val)
+        .ok()
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_default()
+}
+
 /// Structured difference between two [`StyleProfile`] values. Captures
 /// only the fields that changed; identical fields are omitted.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -85,8 +97,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "sentence_length_target".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.sentence_length_target).to_lowercase(),
-                    new: format!("{:?}", new.sentence_length_target).to_lowercase(),
+                    old: enum_as_snake_case(&old.sentence_length_target),
+                    new: enum_as_snake_case(&new.sentence_length_target),
                 },
             });
         }
@@ -103,8 +115,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "fragment_frequency".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.fragment_frequency).to_lowercase(),
-                    new: format!("{:?}", new.fragment_frequency).to_lowercase(),
+                    old: enum_as_snake_case(&old.fragment_frequency),
+                    new: enum_as_snake_case(&new.fragment_frequency),
                 },
             });
         }
@@ -131,8 +143,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "emoji_policy".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.emoji_policy).to_lowercase(),
-                    new: format!("{:?}", new.emoji_policy).to_lowercase(),
+                    old: enum_as_snake_case(&old.emoji_policy),
+                    new: enum_as_snake_case(&new.emoji_policy),
                 },
             });
         }
@@ -140,8 +152,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "hashtag_policy".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.hashtag_policy).to_lowercase(),
-                    new: format!("{:?}", new.hashtag_policy).to_lowercase(),
+                    old: enum_as_snake_case(&old.hashtag_policy),
+                    new: enum_as_snake_case(&new.hashtag_policy),
                 },
             });
         }
@@ -149,8 +161,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "specificity_target".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.specificity_target).to_lowercase(),
-                    new: format!("{:?}", new.specificity_target).to_lowercase(),
+                    old: enum_as_snake_case(&old.specificity_target),
+                    new: enum_as_snake_case(&new.specificity_target),
                 },
             });
         }
@@ -170,8 +182,8 @@ impl ProfileDiff {
             changes.push(FieldChange {
                 field: "thread_rhythm".to_string(),
                 kind: ChangeKind::Scalar {
-                    old: format!("{:?}", old.thread_rhythm).to_lowercase(),
-                    new: format!("{:?}", new.thread_rhythm).to_lowercase(),
+                    old: enum_as_snake_case(&old.thread_rhythm),
+                    new: enum_as_snake_case(&new.thread_rhythm),
                 },
             });
         }
@@ -238,13 +250,13 @@ fn weighted_list_diff(
     let mut entries: Vec<WeightedEntry> = Vec::new();
     for (pat, w) in old_pats.iter().zip(old_weights.iter()) {
         entries.push(WeightedEntry {
-            item: format!("{pat:?}").to_lowercase(),
+            item: enum_as_snake_case(pat),
             old_weight: Some(*w),
             new_weight: None,
         });
     }
     for (pat, w) in new_pats.iter().zip(new_weights.iter()) {
-        let item = format!("{pat:?}").to_lowercase();
+        let item = enum_as_snake_case(pat);
         if let Some(existing) = entries.iter_mut().find(|e| e.item == item) {
             existing.new_weight = Some(*w);
         } else {
@@ -272,8 +284,8 @@ fn push_formatting_changes(changes: &mut Vec<FieldChange>, old: &Formatting, new
         changes.push(FieldChange {
             field: "formatting.periods".to_string(),
             kind: ChangeKind::Scalar {
-                old: format!("{:?}", old.periods).to_lowercase(),
-                new: format!("{:?}", new.periods).to_lowercase(),
+                old: enum_as_snake_case(&old.periods),
+                new: enum_as_snake_case(&new.periods),
             },
         });
     }
@@ -281,8 +293,8 @@ fn push_formatting_changes(changes: &mut Vec<FieldChange>, old: &Formatting, new
         changes.push(FieldChange {
             field: "formatting.em_dashes".to_string(),
             kind: ChangeKind::Scalar {
-                old: format!("{:?}", old.em_dashes).to_lowercase(),
-                new: format!("{:?}", new.em_dashes).to_lowercase(),
+                old: enum_as_snake_case(&old.em_dashes),
+                new: enum_as_snake_case(&new.em_dashes),
             },
         });
     }
@@ -290,8 +302,8 @@ fn push_formatting_changes(changes: &mut Vec<FieldChange>, old: &Formatting, new
         changes.push(FieldChange {
             field: "formatting.quotation_marks".to_string(),
             kind: ChangeKind::Scalar {
-                old: format!("{:?}", old.quotation_marks).to_lowercase(),
-                new: format!("{:?}", new.quotation_marks).to_lowercase(),
+                old: enum_as_snake_case(&old.quotation_marks),
+                new: enum_as_snake_case(&new.quotation_marks),
             },
         });
     }
@@ -299,8 +311,8 @@ fn push_formatting_changes(changes: &mut Vec<FieldChange>, old: &Formatting, new
         changes.push(FieldChange {
             field: "formatting.line_breaks".to_string(),
             kind: ChangeKind::Scalar {
-                old: format!("{:?}", old.line_breaks).to_lowercase(),
-                new: format!("{:?}", new.line_breaks).to_lowercase(),
+                old: enum_as_snake_case(&old.line_breaks),
+                new: enum_as_snake_case(&new.line_breaks),
             },
         });
     }
@@ -440,7 +452,7 @@ mod tests {
         assert_eq!(diff.changes[0].field, "emoji_policy");
         match &diff.changes[0].kind {
             ChangeKind::Scalar { old, new } => {
-                assert_eq!(old, "rarepunchlineonly");
+                assert_eq!(old, "rare_punchline_only");
                 assert_eq!(new, "never");
             }
             other => panic!("expected Scalar, got {other:?}"),
@@ -501,13 +513,13 @@ mod tests {
             .expect("present");
         match &change.kind {
             ChangeKind::WeightedList { entries } => {
-                let claim = entries.iter().find(|e| e.item == "claimfirst").unwrap();
+                let claim = entries.iter().find(|e| e.item == "claim_first").unwrap();
                 assert_eq!(claim.old_weight, Some(0.6));
                 assert_eq!(claim.new_weight, Some(0.5));
-                let number = entries.iter().find(|e| e.item == "numberfirst").unwrap();
+                let number = entries.iter().find(|e| e.item == "number_first").unwrap();
                 assert_eq!(number.old_weight, Some(0.4));
                 assert_eq!(number.new_weight, None);
-                let scene = entries.iter().find(|e| e.item == "scenefirst").unwrap();
+                let scene = entries.iter().find(|e| e.item == "scene_first").unwrap();
                 assert_eq!(scene.old_weight, None);
                 assert_eq!(scene.new_weight, Some(0.5));
             }
@@ -538,5 +550,23 @@ mod tests {
         let out = render_profile_diff(&diff, &m1, &m2);
         assert!(out.contains("recipe changed"), "got: {out}");
         assert!(out.contains("thread_max_length: 10 → 7"), "got: {out}");
+    }
+
+    #[test]
+    fn render_emits_canonical_snake_case_for_enum_variants() {
+        let old = mk_profile(); // emoji_policy: RarePunchlineOnly
+        let mut new = old.clone();
+        new.emoji_policy = EmojiPolicy::Never;
+        let diff = ProfileDiff::compute(&old, &new);
+        let m1 = mk_meta(3, &"a".repeat(64));
+        let m2 = mk_meta(4, &"a".repeat(64));
+        let out = render_profile_diff(&diff, &m1, &m2);
+        // The canonical snake_case form, NOT the Debug-derived form.
+        assert!(
+            out.contains("emoji_policy: rare_punchline_only → never"),
+            "got: {out}"
+        );
+        // Negative assertion: the broken Debug-derived form must NOT appear.
+        assert!(!out.contains("rarepunchlineonly"), "got: {out}");
     }
 }
