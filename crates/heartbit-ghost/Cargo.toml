@@ -10,17 +10,19 @@ description = "Best-in-class autonomous X (Twitter) agent persona for the Heartb
 keywords = ["agent", "llm", "twitter", "x", "persona"]
 
 [dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
 heartbit-core = { path = "../heartbit-core" }
+hmac = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha1 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-hmac = { workspace = true }
-sha1 = { workspace = true }
-base64 = { workspace = true }
-rand = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true }
 wiremock = "0.6"

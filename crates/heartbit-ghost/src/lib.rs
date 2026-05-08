@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use heartbit_core::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
 
+pub mod corpus;
 pub mod tools;
 pub mod voice;
 
