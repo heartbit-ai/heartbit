@@ -109,8 +109,10 @@ pub struct PipelineOutput {
     pub candidates: Vec<CandidateRecord>,
     /// Index into `candidates` of the chosen draft. Validated `0..len`.
     pub chosen_index: usize,
-    /// Judge's reasoning string. Empty when only one candidate was ranked
-    /// (judge skipped — see AD-8).
+    /// Judge's reasoning string. The literal sentinel
+    /// `"single candidate, no ranking needed"` when only one candidate was
+    /// ranked (judge skipped — see AD-8). Otherwise the judge's free-form
+    /// explanation of why the chosen candidate beats the others.
     pub judge_reasoning: String,
     /// Image attached to the chosen draft, if `image_generator` decided
     /// to generate one. `None` when the recipe returned `"no_image"` or
