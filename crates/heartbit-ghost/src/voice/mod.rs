@@ -7,6 +7,7 @@
 //! - P1.2e: CLI bodies for `corpus add/list/remove`, `profile rebuild/diff`
 
 pub mod blend;
+pub mod diff;
 pub mod error;
 pub mod extractor;
 pub mod persona_config;
@@ -14,6 +15,7 @@ pub mod snapshot;
 pub mod style;
 
 pub use blend::{BlendEntry, BlendError, BlendRecipe, PartialStyleProfile, blend_profiles};
+pub use diff::{ChangeKind, FieldChange, ProfileDiff, WeightedEntry, render_profile_diff};
 pub use error::VoiceError;
 pub use extractor::{ExtractError, StyleExtractor, StyleExtractorBuilder, default_system_prompt};
 pub use persona_config::{PersonaConfig, PersonaConfigError};
