@@ -66,6 +66,12 @@ pub struct ReviewOutput {
     pub usage_summary: TokenUsage,
     /// What happened.
     pub outcome: ReviewOutcome,
+    /// Whether `image_generator` produced an image that was attached to
+    /// the head tweet. `false` when the recipe returned `"no_image"`,
+    /// when the call failed, when the marker was absent, or when the
+    /// outcome was Skipped/TimedOut/GateRejected/PublishFailed (i.e.,
+    /// no post happened).
+    pub head_image_attached: bool,
 }
 
 /// Outcome of the review interaction.
@@ -143,6 +149,61 @@ pub(crate) fn parse_twitter_thread_output(content: &str) -> (Vec<String>, String
         }
         Err(_) => (Vec::new(), "<unknown>".to_string()),
     }
+}
+
+/// Extract the base64 image data from `image_generator`'s output.
+///
+/// `ImageGenerateTool` emits matched output with the prefix
+/// `[IMAGE:base64:` and a closing `]`. The body inside the brackets
+/// can be one of three shapes (see `crates/heartbit-core/src/tool/builtins/image_generate.rs`):
+///
+/// 1. data-URL fragment: `image/png;base64,iVBOR...` (the `images[]`
+///    and `image_url` paths)
+/// 2. mime-prefixed without `base64,`: `image/png;iVBOR...` (the
+///    `inline_data` fallback path)
+/// 3. pure base64: `iVBOR...` (synthetic / future paths)
+///
+/// This helper strips any `mime[;base64],` prefix and returns the bare
+/// base64 string for downstream decoding.
+///
+/// Returns `None` when:
+/// - the marker is absent
+/// - the recipe returned the literal `"no_image"` (case-insensitive)
+/// - input is empty / whitespace
+/// - the body between brackets is empty after prefix stripping
+///
+/// Neither base64 alphabet (`A–Z a–z 0–9 + / =`) nor the data-URL
+/// prefix (`mime/subtype;base64,`) contains `]`, so `find(']')` after
+/// the prefix is safe.
+pub(crate) fn extract_image_marker(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("no_image") {
+        return None;
+    }
+    let prefix = "[IMAGE:base64:";
+    let start = trimmed.find(prefix)?;
+    let after_prefix = &trimmed[start + prefix.len()..];
+    let end = after_prefix.find(']')?;
+    let body = &after_prefix[..end];
+    if body.is_empty() {
+        return None;
+    }
+    // Normalize to pure base64. Strip any leading `mime[;base64],` or
+    // `mime;` prefix; otherwise return body as-is.
+    let b64 = if let Some((_, rest)) = body.split_once(";base64,") {
+        rest
+    } else if let Some((_, rest)) = body.split_once(';') {
+        rest
+    } else {
+        body
+    };
+    if b64.is_empty() {
+        return None;
+    }
+    Some(b64.to_string())
 }
 
 /// Execute one review-mode pipeline run.
@@ -321,14 +382,14 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     let delivered = cfg.delivery.deliver_and_await(&review_msg).await?;
 
     // 10. Branch on outcome.
-    let (outcome, report) = match delivered.outcome {
+    let (outcome, report, head_image_attached) = match delivered.outcome {
         DeliveryOutcome::Skip => {
             progress("User skipped.");
-            (ReviewOutcome::Skipped, ReportableOutcome::Skipped)
+            (ReviewOutcome::Skipped, ReportableOutcome::Skipped, false)
         }
         DeliveryOutcome::TimedOut => {
             progress("Review timed out.");
-            (ReviewOutcome::TimedOut, ReportableOutcome::TimedOut)
+            (ReviewOutcome::TimedOut, ReportableOutcome::TimedOut, false)
         }
         DeliveryOutcome::Pick(chosen_index) => {
             if chosen_index >= candidates.len() {
@@ -354,18 +415,69 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                             chosen_index,
                             reason,
                         },
+                        false,
                     )
                 }
                 Ok(()) => {
-                    // 10b. Post via twitter_tool.
+                    // 10b. NEW (P1.3f): run image_generator on the
+                    // chosen draft. Failure is non-blocking — text-only
+                    // post on any error.
+                    progress("Generating optional image...");
+                    let head_image_b64: Option<String> = {
+                        let recipe = crate::agents::image_generator_recipe();
+                        let image_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+                            heartbit_core::tool::builtins::ImageGenerateTool::new(),
+                        )];
+                        match crate::pipeline::runner_from_recipe(
+                            cfg.provider.clone(),
+                            recipe,
+                            image_tools,
+                        ) {
+                            Ok(image_runner) => {
+                                let voice =
+                                    crate::pipeline::render_style_profile_as_english(&profile);
+                                let msg = format!(
+                                    "Approved draft:\n{}\n\n{}\n\n\
+                                     Decide whether to attach an image. \
+                                     If no, output the literal string \"no_image\". \
+                                     If yes, call image_generate with a concise visual prompt and return the result.",
+                                    chosen.draft, voice,
+                                );
+                                match image_runner.execute(&msg).await {
+                                    Ok(out) => {
+                                        total_usage += out.tokens_used;
+                                        extract_image_marker(&out.result)
+                                    }
+                                    Err(e) => {
+                                        progress(&format!(
+                                            "image_generator failed (non-blocking): {e}"
+                                        ));
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                progress(&format!(
+                                    "image_generator builder failed (non-blocking): {e}"
+                                ));
+                                None
+                            }
+                        }
+                    };
+                    let head_image_attached = head_image_b64.is_some();
+
+                    // 10c. Post via twitter_tool (with optional head image).
                     progress(&format!("Posting candidate {chosen_index}..."));
                     let tweets = parse_thread_tweets(&chosen.draft);
                     let exec_ctx = heartbit_core::ExecutionContext {
                         credentials: Some(cfg.credentials.clone()),
                         ..Default::default()
                     };
-                    let input = serde_json::json!({"tweets": tweets});
-                    match cfg.twitter_tool.execute(&exec_ctx, input).await {
+                    let mut input = serde_json::json!({"tweets": tweets});
+                    if let Some(b64) = head_image_b64.as_ref() {
+                        input["head_image_b64"] = serde_json::Value::String(b64.clone());
+                    }
+                    let post_outcome = match cfg.twitter_tool.execute(&exec_ctx, input).await {
                         Err(e) => {
                             let reason = format!("{e}");
                             progress(&format!("twitter_tool errored: {reason}"));
@@ -378,6 +490,7 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                                     chosen_index,
                                     reason,
                                 },
+                                false, // head_image_attached
                             )
                         }
                         Ok(tool_out) if tool_out.is_error => {
@@ -392,6 +505,7 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                                     chosen_index,
                                     reason,
                                 },
+                                false,
                             )
                         }
                         Ok(tool_out) => {
@@ -407,9 +521,11 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                                     chosen_index,
                                     tweet_url,
                                 },
+                                head_image_attached, // true iff image actually generated AND post succeeded
                             )
                         }
-                    }
+                    };
+                    (post_outcome.0, post_outcome.1, post_outcome.2)
                 }
             }
         }
@@ -426,6 +542,7 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
         research_digest,
         usage_summary: total_usage,
         outcome,
+        head_image_attached,
     })
 }
 
@@ -525,18 +642,22 @@ mod tests {
     }
 
     impl MockTwitterTool {
-        fn success(thread_json: &str) -> Arc<dyn Tool> {
+        fn success(thread_json: &str) -> Arc<Self> {
             Arc::new(MockTwitterTool {
                 canned: Mutex::new(Some(ToolOutput::success(thread_json))),
                 last_input: Mutex::new(None),
             })
         }
 
-        fn errored(reason: &str) -> Arc<dyn Tool> {
+        fn errored(reason: &str) -> Arc<Self> {
             Arc::new(MockTwitterTool {
                 canned: Mutex::new(Some(ToolOutput::error(reason))),
                 last_input: Mutex::new(None),
             })
+        }
+
+        pub fn last_input(&self) -> Option<serde_json::Value> {
+            self.last_input.lock().unwrap().clone()
         }
     }
 
@@ -707,9 +828,10 @@ mod tests {
             "concrete short post",                   // writer iter 1
             r#"{"verdict": "pass", "style_match_score": 0.92}"#, // critic
             r#"{"verdict": "verified"}"#,            // fact_check
+            "no_image",                              // image_generator (P1.3f)
         ]);
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
-        let twitter_tool = MockTwitterTool::success(
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::success(
             r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
         );
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
@@ -740,7 +862,7 @@ mod tests {
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Skip);
         // twitter_tool should never be called — set it up to return an
         // error so we'd notice if it was invoked.
-        let twitter_tool = MockTwitterTool::errored("should not be called");
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::errored("should not be called");
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         let out = run_review_pipeline(cfg).await.expect("skip is success");
         assert!(matches!(out.outcome, ReviewOutcome::Skipped));
@@ -756,7 +878,7 @@ mod tests {
             r#"{"verdict": "verified"}"#,
         ]);
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::TimedOut);
-        let twitter_tool = MockTwitterTool::errored("should not be called");
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::errored("should not be called");
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         let out = run_review_pipeline(cfg).await.expect("timeout is success");
         assert!(matches!(out.outcome, ReviewOutcome::TimedOut));
@@ -773,7 +895,7 @@ mod tests {
             r#"{"verdict": "verified"}"#,
         ]);
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
-        let twitter_tool = MockTwitterTool::errored("should not be called");
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::errored("should not be called");
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         let out = run_review_pipeline(cfg)
             .await
@@ -798,9 +920,11 @@ mod tests {
             "short post",
             r#"{"verdict": "pass", "style_match_score": 0.9}"#,
             r#"{"verdict": "verified"}"#,
+            "no_image", // image_generator (P1.3f)
         ]);
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
-        let twitter_tool = MockTwitterTool::errored("X auth failed (401): Unauthorized");
+        let twitter_tool: Arc<dyn Tool> =
+            MockTwitterTool::errored("X auth failed (401): Unauthorized");
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         let out = run_review_pipeline(cfg)
             .await
@@ -823,7 +947,7 @@ mod tests {
         let (_dir, profiles_root) = seed_snapshot("x");
         let provider = MockProvider::arc(vec![]);
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Skip);
-        let twitter_tool = MockTwitterTool::errored("never called");
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::errored("never called");
         let mut cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         cfg.candidates_per_draft = 0;
         let err = run_review_pipeline(cfg).await.unwrap_err();
@@ -834,5 +958,130 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    // --- P1.3f: extract_image_marker unit tests ---
+
+    #[test]
+    fn extract_image_marker_happy_path() {
+        let raw = "preamble [IMAGE:base64:iVBORw0KGgo=] suffix";
+        let out = extract_image_marker(raw);
+        assert_eq!(out.as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn extract_image_marker_no_image_returns_none() {
+        assert!(extract_image_marker("no_image").is_none());
+        assert!(extract_image_marker("NO_IMAGE").is_none());
+        assert!(extract_image_marker("  no_image  ").is_none());
+    }
+
+    #[test]
+    fn extract_image_marker_absent_marker_returns_none() {
+        assert!(extract_image_marker("just some text").is_none());
+        assert!(extract_image_marker("").is_none());
+        // Marker prefix without closing bracket → None.
+        assert!(extract_image_marker("[IMAGE:base64:abc").is_none());
+        // Empty body between brackets → None.
+        assert!(extract_image_marker("[IMAGE:base64:]").is_none());
+    }
+
+    #[test]
+    fn extract_image_marker_strips_data_url_prefix() {
+        // Production marker format from ImageGenerateTool's `images[]` /
+        // `image_url` paths (data: prefix already stripped by the tool):
+        // body = "image/png;base64,iVBOR..."
+        let raw = "[IMAGE:base64:image/png;base64,iVBORw0KGgo=]\n\nGenerated image for: test";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn extract_image_marker_strips_mime_only_prefix() {
+        // Production marker format from ImageGenerateTool's `inline_data`
+        // fallback path: body = "image/png;iVBOR..." (no `base64,` separator).
+        let raw = "[IMAGE:base64:image/png;iVBORw0KGgo=]";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn extract_image_marker_leaves_pure_base64_unchanged() {
+        // Already-canonical body (no mime prefix).
+        let raw = "[IMAGE:base64:iVBORw0KGgo=]";
+        assert_eq!(extract_image_marker(raw).as_deref(), Some("iVBORw0KGgo="));
+    }
+
+    // --- P1.3f: integration tests covering image_generator flow ---
+
+    #[tokio::test]
+    async fn run_review_pipeline_pick_with_image_generator_attaches_head_image() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Response queue: researcher, writer, critic, fact_check, then
+        // image_generator (returns base64 marker), then... twitter_tool
+        // (mocked separately, doesn't consume from the LLM queue).
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- AI is moving fast", // researcher
+            "concrete short post",                   // writer iter 1
+            r#"{"verdict": "pass", "style_match_score": 0.92}"#, // critic iter 1
+            r#"{"verdict": "verified"}"#,            // fact_check
+            "[IMAGE:base64:iVBORw0KGgo=]",           // image_generator
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+        let cfg = mk_review_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+        );
+        let out = run_review_pipeline(cfg)
+            .await
+            .expect("happy path with image");
+        assert!(matches!(out.outcome, ReviewOutcome::Posted { .. }));
+        assert!(
+            out.head_image_attached,
+            "image_generator returned a marker; head_image_attached must be true"
+        );
+        // Assert the twitter_tool received head_image_b64 in its input.
+        let last_input = twitter_tool.last_input().expect("twitter_tool was called");
+        assert_eq!(
+            last_input.get("head_image_b64").and_then(|v| v.as_str()),
+            Some("iVBORw0KGgo="),
+            "twitter_tool input did not carry head_image_b64; got: {last_input}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_review_pipeline_pick_image_generator_no_image_posts_text_only() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- notes",
+            "draft text",
+            r#"{"verdict": "pass", "style_match_score": 0.9}"#,
+            r#"{"verdict": "verified"}"#,
+            "no_image", // image_generator opts out
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"456","tweet_ids":["456"],"urls":["https://twitter.com/i/web/status/456"]}"#,
+        );
+        let cfg = mk_review_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+        );
+        let out = run_review_pipeline(cfg).await.expect("no_image path");
+        assert!(matches!(out.outcome, ReviewOutcome::Posted { .. }));
+        assert!(
+            !out.head_image_attached,
+            "image_generator returned no_image; head_image_attached must be false"
+        );
+        let last_input = twitter_tool.last_input().expect("twitter_tool was called");
+        assert!(
+            last_input.get("head_image_b64").is_none(),
+            "no_image path must NOT pass head_image_b64; got: {last_input}"
+        );
     }
 }
