@@ -13,7 +13,8 @@
 
 pub mod entry;
 pub mod error;
-// pub mod store;   // uncommented in Task 3
+pub mod store;
 
 pub use entry::{CorpusEntry, Engagement};
 pub use error::CorpusError;
+pub use store::{AppendStats, Corpus, default_corpora_dir};
