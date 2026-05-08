@@ -53,7 +53,7 @@ impl Persona for XGhostPersona {
     }
 
     fn description(&self) -> &str {
-        "Best-in-class autonomous X (Twitter) agent. Scaffolding stub — Phase 1 P1.0."
+        "Best-in-class autonomous X (Twitter) agent. P1.3a: 7 sub-agents wired; pipeline orchestration lands in P1.3b."
     }
 
     fn version(&self) -> &str {
@@ -61,9 +61,26 @@ impl Persona for XGhostPersona {
     }
 
     fn expand(&self, _params: &PersonaParams) -> Result<PersonaExpansion, heartbit_core::Error> {
-        // P1.0 stub: empty expansion. P1.1+ fills this with the real persona
-        // (sub-agent recipes, X tool family, triggers, Telegram review).
-        Ok(PersonaExpansion::default())
+        let agents = vec![
+            agents::researcher_recipe(),
+            agents::writer_recipe(),
+            agents::style_critic_recipe(),
+            agents::judge_recipe(),
+            agents::fact_check_recipe(),
+            agents::image_generator_recipe(),
+            agents::publisher_recipe(),
+        ];
+
+        let tools = agents::tools_for_persona();
+
+        Ok(PersonaExpansion {
+            agents,
+            tools,
+            // P1.3b populates orchestrator.
+            // P1.3d populates review.
+            // P1.4 populates triggers.
+            ..PersonaExpansion::default()
+        })
     }
 }
 
@@ -89,11 +106,14 @@ mod tests {
     }
 
     #[test]
-    fn stub_description_is_non_empty_and_marks_p1_0() {
+    fn description_is_non_empty_and_marks_current_phase() {
         let p = XGhostPersona::new();
         let desc = p.description();
         assert!(!desc.is_empty());
-        assert!(desc.contains("P1.0") || desc.contains("Scaffolding") || desc.contains("stub"));
+        assert!(
+            desc.contains("P1.3") || desc.contains("sub-agent"),
+            "description should reflect the current phase; got: {desc}"
+        );
     }
 
     #[test]
@@ -103,12 +123,40 @@ mod tests {
     }
 
     #[test]
-    fn stub_expand_returns_empty_expansion() {
+    fn expand_returns_seven_agents_and_five_tools_in_declared_order() {
         let p = XGhostPersona::new();
         let params = PersonaParams::default();
         let exp = p.expand(&params).expect("expand returns Ok");
-        assert!(exp.agents.is_empty());
-        assert!(exp.tools.is_empty());
+        assert_eq!(exp.agents.len(), 7);
+        assert_eq!(exp.tools.len(), 5);
+
+        let agent_names: Vec<&str> = exp.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            agent_names,
+            vec![
+                "researcher",
+                "writer",
+                "style_critic",
+                "judge",
+                "fact_check",
+                "image_generator",
+                "publisher",
+            ]
+        );
+
+        let tool_names: Vec<String> = exp.tools.iter().map(|t| t.definition().name).collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                "websearch".to_string(),
+                "webfetch".to_string(),
+                "image_generate".to_string(),
+                "twitter_thread".to_string(),
+                "twitter_reply".to_string(),
+            ]
+        );
+
+        // Triggers and review remain default (P1.3d / P1.4).
         assert!(exp.triggers.is_empty());
         assert!(exp.review.is_none());
     }
