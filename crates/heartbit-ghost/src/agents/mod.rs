@@ -37,13 +37,18 @@ pub use researcher::researcher_recipe;
 pub use style_critic::style_critic_recipe;
 pub use writer::writer_recipe;
 
-/// Build a stub [`AgentConfig`] with only `name` set.
+/// Build a minimal `AgentConfig` with only the `name` field set; all other
+/// fields are at their type defaults (`None` / empty / `false` / `Default::default()`).
 ///
-/// `AgentConfig` does not implement `Default` (the upstream struct
-/// intentionally omits the derive — see `clone_config` in
-/// `heartbit_core::config::agent`), so we enumerate every field
-/// explicitly. Task 2 will replace each recipe body with prompts
-/// and per-recipe knobs; this helper is a temporary scaffold.
+/// Used as the `..super::stub_recipe("<name>")` fallback inside each
+/// `<name>_recipe()` constructor — every recipe sets 5-7 fields explicitly
+/// (name, description, system_prompt, max_turns, max_tokens, etc.) and lets
+/// the remaining ~28 fields fall through to this helper's defaults.
+///
+/// Permanent internal helper. `AgentConfig` does not derive `Default` (the
+/// omission is intentional — see `clone_config` in `heartbit_core::config::agent`),
+/// so this helper is the canonical way to construct a baseline `AgentConfig`
+/// inside this crate.
 pub(crate) fn stub_recipe(name: &str) -> AgentConfig {
     AgentConfig {
         name: name.to_string(),
