@@ -327,6 +327,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "persona_pick_buttons: n must be in 1..=9")]
+    fn persona_pick_buttons_ten_candidates_panics() {
+        let id = Uuid::new_v4();
+        let _ = persona_pick_buttons(id, 10);
+    }
+
+    #[test]
     fn parse_callback_data_persona_pick_index_round_trip() {
         let id = Uuid::new_v4();
         let buttons = persona_pick_buttons(id, 3);

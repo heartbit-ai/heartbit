@@ -316,7 +316,7 @@ pub(crate) fn parse_image_generator_output(raw: &str) -> Option<ImageAttachment>
 
 /// Drop near-duplicate candidates per `LEVENSHTEIN_DUPLICATE_THRESHOLD`.
 /// Lower variant_index wins on collision (declaration-order tiebreak).
-fn dedup_candidates(candidates: Vec<CandidateRecord>) -> Vec<CandidateRecord> {
+pub(crate) fn dedup_candidates(candidates: Vec<CandidateRecord>) -> Vec<CandidateRecord> {
     if candidates.len() <= 1 {
         return candidates;
     }
@@ -331,7 +331,7 @@ fn dedup_candidates(candidates: Vec<CandidateRecord>) -> Vec<CandidateRecord> {
 /// (Task 3). For Task 2's intermediate state, `run_pipeline` calls this
 /// once with `(0, 1)` to preserve P1.3b single-candidate behavior.
 #[allow(clippy::too_many_arguments)]
-async fn generate_candidate(
+pub(crate) async fn generate_candidate(
     variant_idx: usize,
     total_variants: usize,
     topic: &str,
