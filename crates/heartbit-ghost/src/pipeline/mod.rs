@@ -262,6 +262,111 @@ pub(crate) fn runner_from_recipe(
     builder.build()
 }
 
+/// Run one writer→style_critic (revise loop, max 3 iters)→fact_check
+/// chain, producing one [`CandidateRecord`]. Each call is independent;
+/// `run_pipeline` spawns N of these in parallel via `tokio::JoinSet`
+/// (Task 3). For Task 2's intermediate state, `run_pipeline` calls this
+/// once with `(0, 1)` to preserve P1.3b single-candidate behavior.
+#[allow(clippy::too_many_arguments)]
+async fn generate_candidate(
+    variant_idx: usize,
+    total_variants: usize,
+    topic: &str,
+    research_digest: &str,
+    voice_guidelines: &str,
+    writer: &AgentRunner<BoxedProvider>,
+    critic: &AgentRunner<BoxedProvider>,
+    fact: &AgentRunner<BoxedProvider>,
+) -> Result<CandidateRecord, PipelineError> {
+    // Revise loop.
+    let mut prev_revision: Option<(String, String)> = None;
+    let mut final_state: Option<(String, f64, usize)> = None;
+    let mut last_score: f64 = 0.0;
+    let mut total_usage = TokenUsage::default();
+
+    for iter in 1..=3usize {
+        let writer_msg = prompts::build_writer_user_message(
+            topic,
+            research_digest,
+            voice_guidelines,
+            prev_revision.as_ref(),
+            variant_idx,
+            total_variants,
+        );
+        let writer_out = writer
+            .execute(&writer_msg)
+            .await
+            .map_err(|e| PipelineError::Agent {
+                stage: format!("writer (variant {variant_idx}, iter {iter})"),
+                source: e,
+            })?;
+        let draft = writer_out.result.clone();
+        total_usage += writer_out.tokens_used;
+
+        let critic_msg = prompts::build_critic_user_message(&draft, voice_guidelines);
+        let critic_out = critic
+            .execute(&critic_msg)
+            .await
+            .map_err(|e| PipelineError::Agent {
+                stage: format!("style_critic (variant {variant_idx}, iter {iter})"),
+                source: e,
+            })?;
+        total_usage += critic_out.tokens_used;
+        let verdict = parse_critic_verdict(&critic_out.result)
+            .map_err(|source| PipelineError::CriticParseFailed { source })?;
+        last_score = verdict.score();
+
+        match verdict {
+            StyleVerdict::Pass { score } => {
+                final_state = Some((draft, score, iter));
+                break;
+            }
+            StyleVerdict::Reject { reason, score } => {
+                return Err(PipelineError::Rejected { reason, score });
+            }
+            StyleVerdict::Revise { reason, .. } => {
+                prev_revision = Some((draft, reason));
+                continue;
+            }
+        }
+    }
+
+    let (draft, style_match_score, revise_iterations) = match final_state {
+        Some(v) => v,
+        None => {
+            let (last_draft, last_reason) = prev_revision.unwrap_or_default();
+            return Err(PipelineError::MaxRevisionsExceeded {
+                iterations: 3,
+                last_draft,
+                last_reason,
+                last_score,
+            });
+        }
+    };
+
+    // Fact-check (non-blocking on Unverifiable).
+    let fact_msg = prompts::build_fact_user_message(&draft, research_digest);
+    let fact_out = fact
+        .execute(&fact_msg)
+        .await
+        .map_err(|e| PipelineError::Agent {
+            stage: format!("fact_check (variant {variant_idx})"),
+            source: e,
+        })?;
+    total_usage += fact_out.tokens_used;
+    let fact_check_verdict = parse_fact_verdict(&fact_out.result)
+        .map_err(|source| PipelineError::FactCheckParseFailed { source })?;
+
+    Ok(CandidateRecord {
+        variant_index: variant_idx,
+        draft,
+        style_match_score,
+        revise_iterations,
+        fact_check_verdict,
+        usage: total_usage,
+    })
+}
+
 /// Execute one generation pipeline run: research → write → critic
 /// (with revise loop, max 3) → fact_check → publish_gate → stdout.
 pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, PipelineError> {
@@ -281,6 +386,15 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
             profiles_dir: cfg.profiles_root.join(cfg.persona_name),
         })?;
     let profile = snapshot.profile;
+
+    // Validate config (after snapshot load so missing snapshot reports
+    // `NoProfileSnapshot` first, not `InvalidConfig`).
+    if !(1..=10).contains(&cfg.candidates_per_draft) {
+        return Err(PipelineError::InvalidConfig(format!(
+            "candidates_per_draft must be in 1..=10 (got {})",
+            cfg.candidates_per_draft,
+        )));
+    }
 
     // 2. Build the 4 AgentRunner instances from P1.3a recipes.
     use crate::agents::{fact_check_recipe, researcher_recipe, style_critic_recipe, writer_recipe};
@@ -334,109 +448,44 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     // 4. Render voice guidelines.
     let voice_guidelines = render_style_profile_as_english(&profile);
 
-    // 5. Revise loop.
-    let mut prev_revision: Option<(String, String)> = None;
-    let mut final_state: Option<(String, f64, usize)> = None;
-    let mut last_score: f64 = 0.0;
+    // 5. Generate one candidate (variant 0 of N — single-candidate path
+    //    in Task 2; Task 3 spawns N of these in parallel).
+    progress("Generating candidate...");
+    let candidate = generate_candidate(
+        0,
+        cfg.candidates_per_draft,
+        cfg.topic,
+        &research_digest,
+        &voice_guidelines,
+        &writer,
+        &critic,
+        &fact,
+    )
+    .await?;
+    total_usage += candidate.usage;
 
-    for iter in 1..=3usize {
-        progress(&format!("Drafting (iter {iter})..."));
-        let writer_msg = prompts::build_writer_user_message(
-            cfg.topic,
-            &research_digest,
-            &voice_guidelines,
-            prev_revision.as_ref(),
-        );
-        let writer_out = writer
-            .execute(&writer_msg)
-            .await
-            .map_err(|e| PipelineError::Agent {
-                stage: format!("writer (iter {iter})"),
-                source: e,
-            })?;
-        let draft = writer_out.result.clone();
-        total_usage += writer_out.tokens_used;
+    let final_draft = candidate.draft.clone();
+    let style_match_score = candidate.style_match_score;
+    let revise_iterations = candidate.revise_iterations;
+    let fact_check_verdict = candidate.fact_check_verdict.clone();
 
-        progress(&format!("Style-checking (iter {iter})..."));
-        let critic_msg = prompts::build_critic_user_message(&draft, &voice_guidelines);
-        let critic_out = critic
-            .execute(&critic_msg)
-            .await
-            .map_err(|e| PipelineError::Agent {
-                stage: format!("style_critic (iter {iter})"),
-                source: e,
-            })?;
-        total_usage += critic_out.tokens_used;
-        let verdict = parse_critic_verdict(&critic_out.result)
-            .map_err(|source| PipelineError::CriticParseFailed { source })?;
-        last_score = verdict.score();
-
-        match verdict {
-            StyleVerdict::Pass { score } => {
-                final_state = Some((draft, score, iter));
-                break;
-            }
-            StyleVerdict::Reject { reason, score } => {
-                return Err(PipelineError::Rejected { reason, score });
-            }
-            StyleVerdict::Revise { reason, .. } => {
-                prev_revision = Some((draft, reason));
-                continue;
-            }
-        }
-    }
-
-    let (final_draft, score, iterations) = match final_state {
-        Some(v) => v,
-        None => {
-            let (last_draft, last_reason) = prev_revision.unwrap_or_default();
-            return Err(PipelineError::MaxRevisionsExceeded {
-                iterations: 3,
-                last_draft,
-                last_reason,
-                last_score,
-            });
-        }
-    };
-
-    // 6. fact_check (non-blocking on Unverifiable).
-    progress("Fact-checking...");
-    let fact_msg = prompts::build_fact_user_message(&final_draft, &research_digest);
-    let fact_out = fact
-        .execute(&fact_msg)
-        .await
-        .map_err(|e| PipelineError::Agent {
-            stage: "fact_check".to_string(),
-            source: e,
-        })?;
-    total_usage += fact_out.tokens_used;
-    let fact_verdict = parse_fact_verdict(&fact_out.result)
-        .map_err(|source| PipelineError::FactCheckParseFailed { source })?;
-    if let FactVerdict::Unverifiable { ref reason } = fact_verdict {
+    if let FactVerdict::Unverifiable { ref reason } = fact_check_verdict {
         progress(&format!("fact_check unverifiable: {reason}"));
     }
 
-    // 7. publish_gate.
+    // 6. publish_gate.
     progress("Running publish_gate...");
     check_publish_gate(&final_draft, &profile)?;
 
-    // 8. Print + return.
+    // 7. Print + return.
     println!("{final_draft}");
     progress("Done.");
-    let candidate = CandidateRecord {
-        variant_index: 0,
-        draft: final_draft.clone(),
-        style_match_score: score,
-        revise_iterations: iterations,
-        fact_check_verdict: fact_verdict.clone(),
-        usage: total_usage,
-    };
     Ok(PipelineOutput {
         final_draft,
         research_digest,
-        style_match_score: score,
-        revise_iterations: iterations,
-        fact_check_verdict: fact_verdict,
+        style_match_score,
+        revise_iterations,
+        fact_check_verdict,
         usage_summary: total_usage,
         candidates: vec![candidate],
         chosen_index: 0,

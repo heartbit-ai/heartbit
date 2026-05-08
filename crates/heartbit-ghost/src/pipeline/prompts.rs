@@ -6,11 +6,16 @@
 /// On the first iteration (no `prev_revision`), only includes topic +
 /// research digest + voice guidelines. On revision, also includes the
 /// previous draft and the critic's feedback.
+///
+/// When `total_variants > 1`, appends a "you are generating variant X
+/// of N" line to encourage diversity across parallel candidate slots.
 pub(crate) fn build_writer_user_message(
     topic: &str,
     research_digest: &str,
     voice_guidelines: &str,
     prev_revision: Option<&(String, String)>,
+    variant_index: usize,
+    total_variants: usize,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("Topic: {topic}\n\n"));
@@ -31,6 +36,16 @@ pub(crate) fn build_writer_user_message(
         );
     } else {
         out.push_str("\nProduce one draft. Output the post text only.\n");
+    }
+
+    if total_variants > 1 {
+        out.push_str(&format!(
+            "\nYou are generating variant {} of {}. Pursue a distinct angle \
+             from the other variants — emphasize different aspects, examples, \
+             or framing.\n",
+            variant_index + 1,
+            total_variants,
+        ));
     }
 
     out
