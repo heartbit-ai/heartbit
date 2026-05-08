@@ -134,6 +134,8 @@ impl<P: LlmProvider + 'static> DebateAgent<P> {
             structured: judge_output.structured,
             estimated_cost_usd: total_cost,
             model_name: judge_output.model_name,
+            // Composite agents don't track per-sub-agent tool calls in this aggregate output.
+            tool_call_results: Vec::new(),
         })
     }
 }

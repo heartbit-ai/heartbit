@@ -113,6 +113,21 @@ pub trait Tool: Send + Sync {
         ctx: &crate::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>>;
+
+    /// Optional override: produce a compact version of the tool output
+    /// suitable for inclusion in conversation history sent to subsequent
+    /// LLM turns. The default implementation returns the input verbatim.
+    ///
+    /// Tools that emit large blobs (e.g., base64 image data) should
+    /// override this to strip or replace the blob with a small
+    /// placeholder. This prevents conversation-history bloat that can
+    /// trip per-model context limits (e.g., Anthropic's 200k token cap).
+    ///
+    /// The full, unredacted output is preserved on
+    /// `AgentOutput.tool_call_results` for the caller's use.
+    fn redact_for_history(&self, output: &str) -> String {
+        output.to_string()
+    }
 }
 
 /// Validate tool input against the tool's declared JSON Schema.
@@ -270,6 +285,39 @@ mod tests {
         let input = json!({"anything": true});
         // Should not fail even though schema is invalid — skips validation
         assert!(validate_tool_input(&schema, &input).is_ok());
+    }
+
+    #[test]
+    fn redact_for_history_default_is_identity() {
+        // A tool with no override should return the output verbatim.
+        struct NoopTool;
+        impl Tool for NoopTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "noop".into(),
+                    input_schema: json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ToolOutput, crate::error::Error>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let tool = NoopTool;
+        let raw = "anything goes here, including [IMAGE:base64:abc]";
+        assert_eq!(tool.redact_for_history(raw), raw);
     }
 
     #[test]

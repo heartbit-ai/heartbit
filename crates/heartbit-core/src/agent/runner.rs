@@ -46,6 +46,33 @@ Before claiming you cannot do something or lack access to a tool:\n\
 - Try alternative approaches when the first attempt fails.\n\
 Never say \"I don't have access\" or \"I can't\" without evidence. Investigate first.";
 
+/// One tool execution record. Captures the full input + untruncated output
+/// of a single tool call.
+///
+/// Populated by [`AgentRunner`] as tools execute; read via
+/// [`AgentOutput::tool_call_results`]. The output here is the raw
+/// post-guardrail content, BEFORE [`Tool::redact_for_history`] is applied
+/// for conversation-history inclusion. Callers that need the original
+/// (e.g., to extract a base64 image marker) should read this field rather
+/// than rely on the agent's textual `result`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// Name of the tool that was invoked.
+    pub tool_name: String,
+    /// Tool-call identifier issued by the LLM (used for tool-result pairing).
+    pub tool_call_id: String,
+    /// Raw input arguments passed to the tool.
+    pub input: serde_json::Value,
+    /// FULL, untruncated output content. May be large (base64 images,
+    /// research dumps). Use [`Tool::redact_for_history`] to get the
+    /// conversation-safe variant.
+    pub output: String,
+    /// Whether the tool produced an error.
+    pub is_error: bool,
+    /// Wall-clock duration of the tool's `execute` call.
+    pub duration_ms: u64,
+}
+
 /// Output of a completed agent run.
 ///
 /// Returned by [`AgentRunner::execute`] on success. Contains the agent's
@@ -69,6 +96,14 @@ pub struct AgentOutput {
     /// last model that produced a response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
+    /// Per-tool-call records with full input + untruncated output. Empty
+    /// when no tools were called or for composite agents that don't track
+    /// per-tool detail. Order matches dispatch order (which may differ
+    /// from completion order due to parallel execution). Counts only
+    /// tools that were actually executed — denied/blocked calls do not
+    /// appear here.
+    #[serde(default)]
+    pub tool_call_results: Vec<ToolCallRecord>,
 }
 
 impl AgentOutput {
@@ -503,6 +538,11 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut ctx = initial_ctx;
 
             let mut total_tool_calls = 0usize;
+            // P1.3g: per-tool-call records (full input/output) accumulated
+            // across all turns; moved into AgentOutput.tool_call_results on
+            // run completion. Only includes tools that actually executed —
+            // not denied/permission-rejected calls.
+            let mut tool_call_records: Vec<ToolCallRecord> = Vec::new();
             let mut total_usage = TokenUsage::default();
             // Accumulate cost per-turn for accurate cascade pricing.
             let mut total_cost: f64 = 0.0;
@@ -1116,6 +1156,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                             self.estimate_cost(&total_usage)
                         },
                         model_name: last_model_name.clone(),
+                        tool_call_results: std::mem::take(&mut tool_call_records),
                     });
                 }
 
@@ -1195,6 +1236,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                             self.estimate_cost(&total_usage)
                         },
                         model_name: last_model_name.clone(),
+                        tool_call_results: std::mem::take(&mut tool_call_records),
                     });
                 }
 
@@ -1507,10 +1549,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     turn = ctx.current_turn(),
                     tool_count = allowed_calls.len(),
                 );
-                let mut results = self
+                let (mut results, batch_records) = self
                     .execute_tools_parallel(&allowed_calls, ctx.current_turn())
                     .instrument(tool_batch_span)
                     .await;
+                tool_call_records.extend(batch_records);
                 results.extend(denied_results);
                 results.extend(permission_denied_results);
 
@@ -2018,7 +2061,11 @@ impl<P: LlmProvider> AgentRunner<P> {
     ///
     /// Panicked tasks produce an error `ToolResult` so the LLM always gets a
     /// result for every `tool_use_id` it sent.
-    async fn execute_tools_parallel(&self, calls: &[ToolCall], turn: usize) -> Vec<ToolResult> {
+    async fn execute_tools_parallel(
+        &self,
+        calls: &[ToolCall],
+        turn: usize,
+    ) -> (Vec<ToolResult>, Vec<ToolCallRecord>) {
         let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
         let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         let mut join_set = tokio::task::JoinSet::new();
@@ -2136,6 +2183,7 @@ impl<P: LlmProvider> AgentRunner<P> {
 
         // Apply post_tool guardrails and convert to ToolResult
         let mut results_vec = Vec::with_capacity(calls.len());
+        let mut records_vec: Vec<ToolCallRecord> = Vec::with_capacity(calls.len());
         for (idx, slot) in outputs.into_iter().enumerate() {
             let (mut output, duration_ms) = slot
                 .unwrap_or_else(|| (ToolOutput::error("Tool execution panicked".to_string()), 0));
@@ -2206,10 +2254,42 @@ impl<P: LlmProvider> AgentRunner<P> {
                 delegation_chain: self.audit_delegation_chain.clone(),
             })
             .await;
-            results_vec.push(tool_output_to_result(call_ids[idx].clone(), output));
+
+            // Capture FULL post-guardrail content for AgentOutput.tool_call_results.
+            // This is the raw output as the caller would expect to see it; the
+            // redacted variant below is only what gets fed back to the LLM.
+            records_vec.push(ToolCallRecord {
+                tool_name: call_names[idx].clone(),
+                tool_call_id: call_ids[idx].clone(),
+                input: calls[idx].input.clone(),
+                output: output.content.clone(),
+                is_error,
+                duration_ms,
+            });
+
+            // Compute the conversation-history-safe variant via the tool's
+            // optional `redact_for_history` override. Tools without an
+            // override return the content verbatim. Re-look-up by name —
+            // the original `Arc<dyn Tool>` was moved into the JoinSet
+            // earlier and is no longer in scope here. On miss (which can
+            // happen for "Tool not found" stub outputs), fall through to
+            // the original content.
+            let redacted_content = match self.tools.get(&calls[idx].name) {
+                Some(t) => t.redact_for_history(&output.content),
+                None => output.content.clone(),
+            };
+            let redacted_output = if is_error {
+                ToolOutput::error(redacted_content)
+            } else {
+                ToolOutput::success(redacted_content)
+            };
+            results_vec.push(tool_output_to_result(
+                call_ids[idx].clone(),
+                redacted_output,
+            ));
         }
 
-        results_vec
+        (results_vec, records_vec)
     }
 }
 
@@ -2416,12 +2496,143 @@ mod tests {
             name: "ctx_capture".into(),
             input: serde_json::json!({}),
         }];
-        let _results = runner.execute_tools_parallel(&calls, 0).await;
+        let (_results, _records) = runner.execute_tools_parallel(&calls, 0).await;
 
         assert_eq!(
             captured.lock().unwrap().as_deref(),
             Some("test-tenant"),
             "tool did not receive the tenant_id from ExecutionContext"
+        );
+    }
+
+    /// P1.3g: a single-tool agent run populates `AgentOutput.tool_call_results`
+    /// with one record carrying the right tool_name, input, and output.
+    #[tokio::test]
+    async fn agent_output_tool_call_results_populated_after_tool_call() {
+        // Turn 1: LLM asks for `noop` tool. Turn 2: LLM returns final text.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_response(10, 20),
+            MockProvider::text_response("done", 5, 5),
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .max_turns(2)
+            .tool(Arc::new(NoopTool))
+            .build()
+            .unwrap();
+        let output = runner.execute("hello").await.unwrap();
+
+        assert_eq!(output.tool_call_results.len(), 1, "expected one record");
+        let rec = &output.tool_call_results[0];
+        assert_eq!(rec.tool_name, "noop");
+        assert_eq!(rec.tool_call_id, "call-1");
+        assert_eq!(rec.input, serde_json::json!({}));
+        assert_eq!(rec.output, "ok");
+        assert!(!rec.is_error);
+    }
+
+    /// P1.3g: when a tool overrides `redact_for_history`, `tool_call_results`
+    /// must contain the FULL untruncated output, while the conversation
+    /// history sent to the next LLM turn carries the redacted variant.
+    #[tokio::test]
+    async fn agent_output_tool_call_results_uses_full_output_not_redacted() {
+        use crate::llm::types::Role;
+
+        /// Tool that returns a long output and redacts to "REDACTED".
+        struct BlobTool;
+        impl Tool for BlobTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "blob".into(),
+                    description: "Returns a large blob.".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                Box::pin(async { Ok(ToolOutput::success("FULL_BLOB_DATA_XYZ".to_string())) })
+            }
+
+            fn redact_for_history(&self, _output: &str) -> String {
+                "REDACTED".to_string()
+            }
+        }
+
+        // Turn 1: LLM calls `blob`. Turn 2: LLM returns final text.
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-blob".into(),
+                    name: "blob".into(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            MockProvider::text_response("done", 5, 5),
+        ]));
+
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("test")
+            .max_turns(2)
+            .tool(Arc::new(BlobTool))
+            .build()
+            .unwrap();
+        let output = runner.execute("hello").await.unwrap();
+
+        // 1) AgentOutput records the FULL untruncated output.
+        assert_eq!(output.tool_call_results.len(), 1);
+        assert_eq!(output.tool_call_results[0].output, "FULL_BLOB_DATA_XYZ");
+        assert!(!output.tool_call_results[0].output.contains("REDACTED"));
+
+        // 2) The conversation history sent on turn 2 contains the REDACTED
+        //    variant in the ContentBlock::ToolResult fed back to the LLM.
+        let captured = provider
+            .captured_requests
+            .lock()
+            .expect("capture lock poisoned");
+        assert!(
+            captured.len() >= 2,
+            "expected at least 2 LLM calls, got {}",
+            captured.len()
+        );
+        let turn2 = &captured[1];
+        let mut found_redacted = false;
+        let mut found_full = false;
+        for msg in &turn2.messages {
+            if msg.role == Role::User {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult { content, .. } = block {
+                        if content.contains("REDACTED") {
+                            found_redacted = true;
+                        }
+                        if content.contains("FULL_BLOB_DATA_XYZ") {
+                            found_full = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_redacted,
+            "expected REDACTED tool result in turn-2 conversation history"
+        );
+        assert!(
+            !found_full,
+            "FULL_BLOB_DATA_XYZ should NOT be in conversation history sent to LLM"
         );
     }
 }

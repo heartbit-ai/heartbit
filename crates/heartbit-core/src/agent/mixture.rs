@@ -124,6 +124,8 @@ impl<P: LlmProvider + 'static> MixtureOfAgentsAgent<P> {
             structured: last_structured,
             estimated_cost_usd: total_cost,
             model_name: last_model_name,
+            // Composite agents don't track per-sub-agent tool calls in this aggregate output.
+            tool_call_results: Vec::new(),
         })
     }
 }
