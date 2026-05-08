@@ -408,11 +408,10 @@ mod tests {
         assert!(s.contains("still off-voice"), "got: {s}");
     }
 
-    use heartbit_core::error::Error as CoreError;
+    use heartbit_core::llm::LlmProvider;
     use heartbit_core::llm::types::{
-        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason,
     };
-    use heartbit_core::llm::{BoxedProvider, LlmProvider};
     use std::future::Future;
     use std::sync::Mutex;
     use tempfile::TempDir;
