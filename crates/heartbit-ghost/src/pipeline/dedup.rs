@@ -1,9 +1,5 @@
 //! Levenshtein-based candidate dedup. Pure functions; no I/O.
 
-// Task 1 introduces these helpers; Task 3 wires them into run_pipeline.
-// Remove this attribute once distinct_indices is called from mod.rs.
-#![allow(dead_code)]
-
 /// Drafts with Levenshtein ratio above this threshold are considered
 /// near-duplicates and one of the pair is dropped per umbrella spec §6.1.
 pub(crate) const LEVENSHTEIN_DUPLICATE_THRESHOLD: f64 = 0.85;

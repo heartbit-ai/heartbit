@@ -66,3 +66,41 @@ pub(crate) fn build_fact_user_message(draft: &str, research_digest: &str) -> Str
          Verify and return your verdict as JSON per the schema.\n"
     )
 }
+
+/// Construct the judge's user message. Numbered candidate list with
+/// voice guidelines and topic context.
+pub(crate) fn build_judge_user_message(
+    topic: &str,
+    voice_guidelines: &str,
+    candidates: &[crate::pipeline::CandidateRecord],
+) -> String {
+    let mut msg = format!("Topic: {topic}\n\n");
+    msg.push_str(voice_guidelines);
+    msg.push_str("\n\n");
+    msg.push_str(&format!(
+        "You have {} candidate drafts to choose from. Pick the best one.\n\n",
+        candidates.len(),
+    ));
+    msg.push_str("CANDIDATES\n\n");
+    for (i, c) in candidates.iter().enumerate() {
+        msg.push_str(&format!("[{i}]\n{}\n\n", c.draft));
+    }
+    msg.push_str(&format!(
+        "Return your verdict as JSON per the schema. The chosen_index must be in [0, {}].\n",
+        candidates.len() - 1,
+    ));
+    msg
+}
+
+/// Construct the image_generator's user message.
+pub(crate) fn build_image_generator_user_message(
+    chosen_draft: &str,
+    voice_guidelines: &str,
+) -> String {
+    format!(
+        "Approved draft:\n{chosen_draft}\n\n{voice_guidelines}\n\n\
+         Decide whether to attach an image. If no, output the literal \
+         string \"no_image\". If yes, call image_generate with a concise \
+         visual prompt and return its output.\n"
+    )
+}

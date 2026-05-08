@@ -262,6 +262,63 @@ pub(crate) fn runner_from_recipe(
     builder.build()
 }
 
+/// Parse the image_generator's output. Returns `None` for `"no_image"` or
+/// when no URL is recoverable. Tries JSON first, falls back to extracting
+/// the first http(s):// URL substring.
+pub(crate) fn parse_image_generator_output(raw: &str) -> Option<ImageAttachment> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("no_image") {
+        return None;
+    }
+    // Try JSON shape first: {"url": "...", "alt_text": "..."}.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let url = value.get("url").and_then(|v| v.as_str()).map(String::from);
+        let alt_text = value
+            .get("alt_text")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(url) = url {
+            return Some(ImageAttachment { url, alt_text });
+        }
+    }
+    // Fallback: extract first http(s):// URL.
+    let lower = trimmed.to_lowercase();
+    let http_idx = lower.find("http://");
+    let https_idx = lower.find("https://");
+    let start = match (http_idx, https_idx) {
+        (Some(h), Some(s)) => Some(h.min(s)),
+        (Some(h), None) => Some(h),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }?;
+    let rest = &trimmed[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',', ';']).to_string();
+    let surrounding = trimmed.replacen(&url, "", 1).trim().to_string();
+    Some(ImageAttachment {
+        url,
+        alt_text: if surrounding.is_empty() {
+            None
+        } else {
+            Some(surrounding)
+        },
+    })
+}
+
+/// Drop near-duplicate candidates per `LEVENSHTEIN_DUPLICATE_THRESHOLD`.
+/// Lower variant_index wins on collision (declaration-order tiebreak).
+fn dedup_candidates(candidates: Vec<CandidateRecord>) -> Vec<CandidateRecord> {
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+    let drafts: Vec<&str> = candidates.iter().map(|c| c.draft.as_str()).collect();
+    let kept = dedup::distinct_indices(&drafts, dedup::LEVENSHTEIN_DUPLICATE_THRESHOLD);
+    kept.into_iter().map(|i| candidates[i].clone()).collect()
+}
+
 /// Run one writer→style_critic (revise loop, max 3 iters)→fact_check
 /// chain, producing one [`CandidateRecord`]. Each call is independent;
 /// `run_pipeline` spawns N of these in parallel via `tokio::JoinSet`
@@ -396,9 +453,12 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
         )));
     }
 
-    // 2. Build the 4 AgentRunner instances from P1.3a recipes.
-    use crate::agents::{fact_check_recipe, researcher_recipe, style_critic_recipe, writer_recipe};
-    use heartbit_core::tool::builtins::{WebFetchTool, WebSearchTool};
+    // 2. Build the 6 AgentRunner instances from P1.3a recipes.
+    use crate::agents::{
+        fact_check_recipe, image_generator_recipe, judge_recipe, researcher_recipe,
+        style_critic_recipe, writer_recipe,
+    };
+    use heartbit_core::tool::builtins::{ImageGenerateTool, WebFetchTool, WebSearchTool};
 
     let researcher_tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(WebSearchTool::new()),
@@ -430,6 +490,23 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
                 source: e,
             }
         })?;
+    let judge =
+        runner_from_recipe(cfg.provider.clone(), judge_recipe(), Vec::new()).map_err(|e| {
+            PipelineError::Builder {
+                stage: "judge".to_string(),
+                source: e,
+            }
+        })?;
+    let image_gen_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ImageGenerateTool::new())];
+    let image_generator = runner_from_recipe(
+        cfg.provider.clone(),
+        image_generator_recipe(),
+        image_gen_tools,
+    )
+    .map_err(|e| PipelineError::Builder {
+        stage: "image_generator".to_string(),
+        source: e,
+    })?;
 
     let mut total_usage = TokenUsage::default();
 
@@ -448,36 +525,156 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     // 4. Render voice guidelines.
     let voice_guidelines = render_style_profile_as_english(&profile);
 
-    // 5. Generate one candidate (variant 0 of N — single-candidate path
-    //    in Task 2; Task 3 spawns N of these in parallel).
-    progress("Generating candidate...");
-    let candidate = generate_candidate(
-        0,
-        cfg.candidates_per_draft,
-        cfg.topic,
-        &research_digest,
-        &voice_guidelines,
-        &writer,
-        &critic,
-        &fact,
-    )
-    .await?;
-    total_usage += candidate.usage;
+    // 5. Parallel candidate generation (N tasks via tokio::JoinSet).
+    let n = cfg.candidates_per_draft;
+    progress(&format!("Generating {n} candidate(s) in parallel..."));
 
-    let final_draft = candidate.draft.clone();
-    let style_match_score = candidate.style_match_score;
-    let revise_iterations = candidate.revise_iterations;
-    let fact_check_verdict = candidate.fact_check_verdict.clone();
+    // Wrap shared state for spawn closures (Send + 'static requirements).
+    let writer = std::sync::Arc::new(writer);
+    let critic = std::sync::Arc::new(critic);
+    let fact = std::sync::Arc::new(fact);
+    let topic_owned: String = cfg.topic.to_string();
+    let digest_owned = std::sync::Arc::new(research_digest.clone());
+    let voice_owned = std::sync::Arc::new(voice_guidelines.clone());
+
+    let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
+        tokio::task::JoinSet::new();
+    for i in 0..n {
+        let writer = writer.clone();
+        let critic = critic.clone();
+        let fact = fact.clone();
+        let topic = topic_owned.clone();
+        let digest = digest_owned.clone();
+        let voice = voice_owned.clone();
+        joinset.spawn(async move {
+            generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+        });
+    }
+
+    let mut candidates: Vec<CandidateRecord> = Vec::with_capacity(n);
+    let mut errors: Vec<PipelineError> = Vec::new();
+    while let Some(res) = joinset.join_next().await {
+        match res {
+            Ok(Ok(rec)) => candidates.push(rec),
+            Ok(Err(e)) => {
+                progress(&format!("candidate failed: {e}"));
+                errors.push(e);
+            }
+            Err(joinerr) => progress(&format!("candidate task panicked: {joinerr}")),
+        }
+    }
+    candidates.sort_by_key(|c| c.variant_index);
+
+    if candidates.is_empty() {
+        // For N=1 (P1.3b back-compat) or any case that collapses to a
+        // single error, surface the underlying PipelineError directly.
+        // AllCandidatesFailed is reserved for the genuine N>1 collapse.
+        if errors.len() == 1 {
+            return Err(errors.swap_remove(0));
+        }
+        return Err(PipelineError::AllCandidatesFailed { errors, n });
+    }
+
+    // 6. Dedup + retry-once on collapse.
+    let mut survivors = dedup_candidates(candidates);
+    if survivors.len() < n {
+        let missing = n - survivors.len();
+        progress(&format!(
+            "candidates collapsed ({missing} duplicates) — refilling once"
+        ));
+        let next_idx = survivors.iter().map(|c| c.variant_index).max().unwrap_or(0) + 1;
+
+        let mut joinset2: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
+            tokio::task::JoinSet::new();
+        for offset in 0..missing {
+            let i = next_idx + offset;
+            let writer = writer.clone();
+            let critic = critic.clone();
+            let fact = fact.clone();
+            let topic = topic_owned.clone();
+            let digest = digest_owned.clone();
+            let voice = voice_owned.clone();
+            joinset2.spawn(async move {
+                generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+            });
+        }
+        while let Some(res) = joinset2.join_next().await {
+            if let Ok(Ok(rec)) = res {
+                survivors.push(rec);
+            }
+            // Retry failures are silent — we already have `survivors.len() >= 1`,
+            // so ship-with-fewer is acceptable.
+        }
+        survivors.sort_by_key(|c| c.variant_index);
+        survivors = dedup_candidates(survivors);
+
+        if survivors.len() < n {
+            progress(&format!(
+                "ship-with-fewer: {} of {} distinct candidates after retry",
+                survivors.len(),
+                n,
+            ));
+        }
+    }
+
+    // Sum per-candidate usage into total.
+    for c in &survivors {
+        total_usage += c.usage;
+    }
+
+    // 7. Judge (skipped when N=1).
+    let chosen_index: usize;
+    let judge_reasoning: String;
+    if survivors.len() == 1 {
+        chosen_index = 0;
+        judge_reasoning = "single candidate, no ranking needed".to_string();
+        progress("Single candidate — judge skipped.");
+    } else {
+        progress("Judging candidates...");
+        let judge_msg = prompts::build_judge_user_message(cfg.topic, &voice_guidelines, &survivors);
+        let judge_out = judge
+            .execute(&judge_msg)
+            .await
+            .map_err(|e| PipelineError::Agent {
+                stage: "judge".to_string(),
+                source: e,
+            })?;
+        total_usage += judge_out.tokens_used;
+        let verdict = parse_judge_verdict(&judge_out.result, survivors.len())
+            .map_err(|source| PipelineError::JudgeParseFailed { source })?;
+        chosen_index = verdict.chosen_index;
+        judge_reasoning = verdict.reasoning;
+    }
+
+    let chosen = &survivors[chosen_index];
+    let final_draft = chosen.draft.clone();
+    let style_match_score = chosen.style_match_score;
+    let revise_iterations = chosen.revise_iterations;
+    let fact_check_verdict = chosen.fact_check_verdict.clone();
 
     if let FactVerdict::Unverifiable { ref reason } = fact_check_verdict {
         progress(&format!("fact_check unverifiable: {reason}"));
     }
 
-    // 6. publish_gate.
+    // 8. image_generator on chosen draft (always runs; recipe decides "no_image").
+    progress("Generating optional image...");
+    let image_msg = prompts::build_image_generator_user_message(&final_draft, &voice_guidelines);
+    let image: Option<ImageAttachment> = match image_generator.execute(&image_msg).await {
+        Ok(out) => {
+            total_usage += out.tokens_used;
+            parse_image_generator_output(&out.result)
+        }
+        Err(e) => {
+            progress(&format!("image_generator failed (non-blocking): {e}"));
+            None
+        }
+    };
+
+    // 9. publish_gate on chosen draft.
     progress("Running publish_gate...");
     check_publish_gate(&final_draft, &profile)?;
 
-    // 7. Print + return.
+    // 10. Print + return.
     println!("{final_draft}");
     progress("Done.");
     Ok(PipelineOutput {
@@ -487,10 +684,10 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
         revise_iterations,
         fact_check_verdict,
         usage_summary: total_usage,
-        candidates: vec![candidate],
-        chosen_index: 0,
-        judge_reasoning: String::new(),
-        image: None,
+        candidates: survivors,
+        chosen_index,
+        judge_reasoning,
+        image,
     })
 }
 
@@ -542,18 +739,44 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// MockProvider returns a queue of canned responses, one per `complete()` call.
-    /// Calls past the queue's end return `Error::Agent("mock exhausted")`.
+    /// MockProvider with per-agent routing. Responses are keyed by a
+    /// substring that uniquely identifies the requester (matched against
+    /// the system prompt). First non-empty key with a substring match
+    /// wins; the empty `""` key is the wildcard fallback for back-compat
+    /// with single-queue callers.
+    ///
+    /// Per-route queues let parallel sub-agents (e.g. 3 writers spawned
+    /// concurrently via `tokio::JoinSet`) all draw from the same
+    /// "writer" queue without interleaving with the critic / fact_check
+    /// / judge / image_generator queues.
     struct MockProvider {
-        responses: Mutex<std::collections::VecDeque<String>>,
+        routes: Mutex<Vec<(String, std::collections::VecDeque<String>)>>,
     }
 
     impl MockProvider {
-        fn arc(responses: Vec<&str>) -> Arc<BoxedProvider> {
+        /// Construct with explicit per-route queues. Each route is a
+        /// `(substring_key, responses)` pair. The substring is matched
+        /// against the request's system prompt.
+        fn route(routes: Vec<(&str, Vec<&str>)>) -> Arc<BoxedProvider> {
+            let mapped: Vec<(String, std::collections::VecDeque<String>)> = routes
+                .into_iter()
+                .map(|(key, responses)| {
+                    (
+                        key.to_string(),
+                        responses.into_iter().map(String::from).collect(),
+                    )
+                })
+                .collect();
             let p = MockProvider {
-                responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+                routes: Mutex::new(mapped),
             };
             Arc::new(BoxedProvider::new(p))
+        }
+
+        /// Backward-compat helper: single-queue version. Internally
+        /// routes everything to the wildcard `""` key.
+        fn arc(responses: Vec<&str>) -> Arc<BoxedProvider> {
+            Self::route(vec![("", responses)])
         }
     }
 
@@ -562,11 +785,27 @@ mod tests {
             &self,
             request: CompletionRequest,
         ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
-            let response = self.responses.lock().unwrap().pop_front();
+            // Find which route this request belongs to by matching the
+            // system prompt against route keys. First non-empty key with
+            // a substring match wins; "" key is the wildcard fallback.
+            let system = request.system.as_str();
+            let mut routes = self.routes.lock().unwrap();
+            let chosen_idx = routes
+                .iter()
+                .position(|(key, _)| !key.is_empty() && system.contains(key.as_str()))
+                .or_else(|| routes.iter().position(|(key, _)| key.is_empty()));
+
+            let response = chosen_idx.and_then(|i| routes[i].1.pop_front());
+            // Drop the lock before constructing the future.
+            drop(routes);
+
             // If the runner injected the synthetic `__respond__` tool (i.e. the
             // recipe set `response_schema`), the structured-output guard
             // requires a `ToolUse` block; otherwise plain `Text` is fine.
-            let has_respond = request.tools.iter().any(|t| t.name == "__respond__");
+            let has_respond = request
+                .tools
+                .iter()
+                .any(|t| t.name == heartbit_core::llm::types::RESPOND_TOOL_NAME);
             async move {
                 let text =
                     response.ok_or_else(|| CoreError::Agent("mock exhausted".to_string()))?;
@@ -681,6 +920,7 @@ mod tests {
             "concrete short post",                   // writer iter 1
             r#"{"verdict": "pass", "style_match_score": 0.92}"#, // critic iter 1
             r#"{"verdict": "verified"}"#,            // fact_check
+            "no_image", // image_generator (single-candidate path still calls it)
         ]);
         let corpora = profiles_root.clone();
         let cfg = PipelineConfig {
@@ -697,6 +937,10 @@ mod tests {
         assert_eq!(out.revise_iterations, 1);
         assert!((out.style_match_score - 0.92).abs() < 1e-9);
         assert_eq!(out.fact_check_verdict, FactVerdict::Verified);
+        assert_eq!(out.candidates.len(), 1, "single-candidate path");
+        assert_eq!(out.chosen_index, 0);
+        assert_eq!(out.judge_reasoning, "single candidate, no ranking needed");
+        assert!(out.image.is_none(), "image_generator returned no_image");
     }
 
     #[tokio::test]
@@ -709,6 +953,7 @@ mod tests {
             "second draft, no em-dashes", // writer iter 2
             r#"{"verdict": "pass", "style_match_score": 0.91}"#, // critic iter 2
             r#"{"verdict": "verified"}"#, // fact_check
+            "no_image",                   // image_generator
         ]);
         let cfg = PipelineConfig {
             persona_name: "x",
@@ -811,5 +1056,226 @@ mod tests {
             }
             other => panic!("expected NoProfileSnapshot, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_three_candidates_judge_picks_index_1() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Per-agent routing avoids cross-agent FIFO interleaving across the
+        // 3 parallel writer/critic/fact pipelines. Note: writer responses
+        // are still consumed in queue order regardless of which variant
+        // pops them — completion order across the 3 spawned tasks is
+        // non-deterministic, so the variant→draft binding is non-deterministic.
+        // We assert chosen_index (deterministic from the judge's canned
+        // response) and `image.is_some()`, but accept ANY of the 3 drafts
+        // as final_draft.
+        let provider = MockProvider::route(vec![
+            ("research analyst", vec!["Research digest:\n- topic notes"]),
+            (
+                "social media writer",
+                vec![
+                    "draft alpha distinct content",
+                    "draft bravo with totally different framing",
+                    "draft charlie via yet another angle",
+                ],
+            ),
+            (
+                "score how well a draft post",
+                vec![
+                    r#"{"verdict": "pass", "style_match_score": 0.80}"#,
+                    r#"{"verdict": "pass", "style_match_score": 0.92}"#,
+                    r#"{"verdict": "pass", "style_match_score": 0.85}"#,
+                ],
+            ),
+            (
+                "verify the factual claims",
+                vec![
+                    r#"{"verdict": "verified"}"#,
+                    r#"{"verdict": "verified"}"#,
+                    r#"{"verdict": "verified"}"#,
+                ],
+            ),
+            (
+                "rank N candidate drafts",
+                vec![r#"{"chosen_index": 1, "reasoning": "bravo has more specific examples"}"#],
+            ),
+            (
+                "produce an image to accompany",
+                vec![r#"{"url": "https://example.com/img.png", "alt_text": "abstract"}"#],
+            ),
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "diversity test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 3,
+        };
+        let out = run_pipeline(cfg).await.expect("3-candidate happy path");
+        assert_eq!(out.candidates.len(), 3);
+        assert_eq!(out.chosen_index, 1);
+        assert!(
+            [
+                "draft alpha distinct content",
+                "draft bravo with totally different framing",
+                "draft charlie via yet another angle",
+            ]
+            .contains(&out.final_draft.as_str()),
+            "final_draft must be one of the canned writer responses, got: {}",
+            out.final_draft,
+        );
+        assert!(out.judge_reasoning.contains("bravo"));
+        assert!(out.image.is_some());
+        let image = out.image.as_ref().unwrap();
+        assert_eq!(image.url, "https://example.com/img.png");
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_collapse_then_refill_succeeds() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Variants 0 and 1 produce IDENTICAL drafts (collapse). Variant 2
+        // is distinct. After dedup we have 2 distinct candidates. Refill
+        // spawns 1 task for the missing slot; that task produces a 3rd
+        // distinct draft. We use per-agent routing because the 3 parallel
+        // critic / fact_check calls would otherwise pop responses in
+        // non-deterministic order from a shared FIFO queue.
+        let provider = MockProvider::route(vec![
+            ("research analyst", vec!["Research digest:\n- topic notes"]),
+            (
+                "social media writer",
+                vec![
+                    // Variants 0 and 1 produce the same draft (collapse).
+                    "duplicate draft text",
+                    "duplicate draft text",
+                    // Variant 2 distinct.
+                    "completely different distinct draft",
+                    // Refill produces a 3rd distinct draft.
+                    "third distinct draft from refill",
+                ],
+            ),
+            (
+                "score how well a draft post",
+                vec![
+                    r#"{"verdict": "pass", "style_match_score": 0.80}"#,
+                    r#"{"verdict": "pass", "style_match_score": 0.85}"#,
+                    r#"{"verdict": "pass", "style_match_score": 0.90}"#,
+                    r#"{"verdict": "pass", "style_match_score": 0.88}"#,
+                ],
+            ),
+            (
+                "verify the factual claims",
+                vec![
+                    r#"{"verdict": "verified"}"#,
+                    r#"{"verdict": "verified"}"#,
+                    r#"{"verdict": "verified"}"#,
+                    r#"{"verdict": "verified"}"#,
+                ],
+            ),
+            (
+                "rank N candidate drafts",
+                vec![r#"{"chosen_index": 0, "reasoning": "first one"}"#],
+            ),
+            ("produce an image to accompany", vec!["no_image"]),
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "collapse test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 3,
+        };
+        let out = run_pipeline(cfg).await.expect("collapse+refill succeeds");
+        assert_eq!(
+            out.candidates.len(),
+            3,
+            "after refill we should have 3 distinct candidates"
+        );
+        assert!(out.image.is_none(), "no_image should produce None");
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_all_candidates_fail_returns_error() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // All 3 candidates fail at the writer stage (mock exhausts after
+        // researcher). The pipeline must return AllCandidatesFailed with
+        // n=3 and at least one collected error.
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- topic notes",
+            // Mock exhausts here. All 3 candidate writer.execute() calls fail
+            // with Error::Agent("mock exhausted").
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "fail test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 3,
+        };
+        let err = run_pipeline(cfg).await.unwrap_err();
+        match err {
+            PipelineError::AllCandidatesFailed { n, errors } => {
+                assert_eq!(n, 3);
+                assert!(!errors.is_empty(), "expected at least one collected error");
+            }
+            other => panic!("expected AllCandidatesFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_invalid_candidates_per_draft_rejected() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![]); // never reached
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "config test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 0, // invalid
+        };
+        let err = run_pipeline(cfg).await.unwrap_err();
+        match err {
+            PipelineError::InvalidConfig(msg) => {
+                assert!(msg.contains("candidates_per_draft"), "msg: {msg}");
+                assert!(msg.contains("1..=10"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidConfig, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_image_generator_no_image_yields_none() {
+        // Single candidate path so the test sequence is short. image_generator
+        // returns "no_image"; PipelineOutput.image must be None and judge is
+        // skipped (N=1).
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- notes",
+            "concrete post",
+            r#"{"verdict": "pass", "style_match_score": 0.92}"#,
+            r#"{"verdict": "verified"}"#,
+            "no_image",
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "image-skip test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 1,
+        };
+        let out = run_pipeline(cfg).await.expect("happy path with no_image");
+        assert_eq!(out.candidates.len(), 1);
+        assert!(out.image.is_none());
+        // Sanity: judge was skipped because N=1.
+        assert_eq!(out.judge_reasoning, "single candidate, no ranking needed");
     }
 }
