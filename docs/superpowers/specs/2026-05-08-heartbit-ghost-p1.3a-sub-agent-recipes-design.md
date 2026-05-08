@@ -41,9 +41,11 @@ pub fn <name>_recipe() -> AgentConfig { ... }
 - 3 partially reusable: `style_critic`, `fact_check`, `image_generator` — generic prompts; might be tuned per-platform later.
 - 1 Twitter-specific: `publisher` — explicitly references X conventions and uses X tools.
 
-**No new dependencies.** All 6 tools already exist:
-- `WebSearchTool`, `WebFetchTool`, `ImageGenerateTool`, `TwitterPostTool` in `heartbit_core::tool::builtins::`
-- `TwitterThreadTool`, `TwitterReplyTool` in `heartbit_ghost::tools::` (P1.1)
+**No new dependencies and no new tools.** Tool sources:
+- `WebSearchTool`, `WebFetchTool`, `ImageGenerateTool` from `heartbit_core::tool::builtins::` — no-arg `::new()` constructors that fit the persona-expansion pattern.
+- `TwitterThreadTool`, `TwitterReplyTool` from `heartbit_ghost::tools::` (P1.1) — unit structs with no-arg `::new()`; resolve OAuth1 credentials from `ExecutionContext` at `execute()` time via `XClient::from_context`.
+
+**Why not `twitter_post`** (a deliberate scope cut): the pre-existing `heartbit_core::tool::builtins::TwitterPostTool` requires `TwitterCredentials` at construction time (older P1.0 pattern, incompatible with persona expansion since credentials aren't known at startup). Adding a heartbit-ghost-native equivalent (~200 LOC of OAuth1 + media-upload code + ~12 tests adapted from the heartbit-core version) is out of scope for P1.3a. **Workaround**: the publisher recipe uses `twitter_thread` for single tweets too (thread of length 1; the X API treats a thread-of-1 as a regular tweet without `reply_to`). Media-attached single posts are NOT supported in P1.3a — when that becomes a real requirement (likely P1.3b or P1.4), a small follow-up adds the heartbit-ghost-native `TwitterPostTool`.
 
 ## 3. Recipes
 
@@ -57,7 +59,7 @@ Per-recipe knobs (the spec pins these contracts; exact prompt text lives in the 
 | `judge` | none | 1 | 512 | `medium` | structured: `chosen_index: 0..N` + `reasoning: String` | reusable |
 | `fact_check` | none | 1 | 1024 | `medium` | structured: `verdict: "verified"` \| `"unverifiable: <reason>"` | reusable |
 | `image_generator` | `image_generate` | 2 | 1024 | `low` | None (image url + alt text via tool output) | reusable |
-| `publisher` | `twitter_post`, `twitter_thread`, `twitter_reply` | 2 | 512 | `low` | None (final tool output is the tweet id) | Twitter-only |
+| `publisher` | `twitter_thread`, `twitter_reply` | 2 | 512 | `low` | None (final tool output is the tweet id) | Twitter-only |
 
 **Why these knobs:**
 
@@ -75,7 +77,9 @@ P1.3b's orchestrator wraps this at runtime by appending the rendered style profi
 
 **`publisher.rs` system prompt is the only one that mentions X/Twitter:**
 
-> *"You publish a finalized social post to X (Twitter). Choose the right tool: `twitter_post` for a single tweet, `twitter_thread` for a chained sequence, `twitter_reply` when replying to a specific tweet id. The post text is approved — do not modify it. Return the final tool output (the tweet id) without commentary."*
+> *"You publish a finalized social post to X (Twitter). Choose the right tool: `twitter_thread` for any post that's not a reply (single tweet → pass a single-element array; chained sequence → pass the full thread), `twitter_reply` when replying to a specific tweet id. The post text is approved — do not modify it. Return the final tool output (the tweet id) without commentary."*
+
+(Note: `twitter_post` for media-attached single posts is intentionally absent — see §2 scope cut. When media support becomes a requirement, a heartbit-ghost-native `TwitterPostTool` lands in a follow-up phase and the publisher prompt is updated.)
 
 ## 4. `XGhostPersona::expand()` rewrite
 
@@ -112,23 +116,20 @@ impl Persona for XGhostPersona {
 
 ```rust
 pub fn tools_for_persona() -> Vec<Arc<dyn Tool>> {
-    use heartbit_core::tool::builtins::{
-        ImageGenerateTool, TwitterPostTool, WebFetchTool, WebSearchTool,
-    };
+    use heartbit_core::tool::builtins::{ImageGenerateTool, WebFetchTool, WebSearchTool};
     use crate::tools::{TwitterReplyTool, TwitterThreadTool};
 
     vec![
         Arc::new(WebSearchTool::new()),
         Arc::new(WebFetchTool::new()),
         Arc::new(ImageGenerateTool::new()),
-        Arc::new(TwitterPostTool::new()),
         Arc::new(TwitterThreadTool::new()),
         Arc::new(TwitterReplyTool::new()),
     ]
 }
 ```
 
-Exact tool constructor names verified during implementation. If any tool's `::new()` is fallible (returns `Result`), wrap with `?` and propagate from `expand()`. The plan calls these out explicitly.
+`heartbit_core::tool::builtins::{WebSearchTool, WebFetchTool, ImageGenerateTool}` all have no-arg `::new()` (verified — they internally panic on TLS init failure, not a runtime concern). 5 tools total in P1.3a's persona expansion. (`twitter_post` deferred — see §2.)
 
 **`PersonaParams::credentials_env`** is unused at expand-time — credentials are resolved per-call by `ExecutionContext::credentials` (the `EnvResolver` pattern from the P1.1 smoke examples). The persona just declares the tools; execution-context wiring is a daemon/CLI concern.
 
@@ -157,9 +158,9 @@ Leaving them out of P1.3a's `tools_for_persona()` is deliberate. Including them 
 
 **Twitter-specific recipe test (1):** `publisher_prompt_mentions_x_and_uses_twitter_tools` — assert the lowercased system prompt DOES contain `twitter` or `x ` or `(twitter)`.
 
-**`tools_for_persona()` test (1):** `tools_for_persona_returns_six_distinct_tools_in_declared_order` — assert `tools.len() == 6` and the names match the spec order: `websearch, webfetch, image_generate, twitter_post, twitter_thread, twitter_reply`.
+**`tools_for_persona()` test (1):** `tools_for_persona_returns_five_distinct_tools_in_declared_order` — assert `tools.len() == 5` and the names match the spec order: `websearch, webfetch, image_generate, twitter_thread, twitter_reply`.
 
-**`expand()` integration test (1, replaces the deleted P1.0 stub test):** `expand_returns_seven_agents_and_six_tools_in_declared_order` — assert `exp.agents.len() == 7` and `exp.tools.len() == 6`, with exact agent names in declared order.
+**`expand()` integration test (1, replaces the deleted P1.0 stub test):** `expand_returns_seven_agents_and_five_tools_in_declared_order` — assert `exp.agents.len() == 7` and `exp.tools.len() == 5`, with exact agent names in declared order.
 
 **Existing P1.0 test `stub_expand_returns_empty_expansion` is deleted** — it asserts the empty default that's no longer the behavior.
 
@@ -197,7 +198,7 @@ P1.3a is done when:
 - `cargo fmt -- --check && cargo clippy --workspace --all-features -- -D warnings && cargo test --workspace --all-features` all green
 - ~16 net new tests pass; coverage spans every recipe's structural contract, the reusability boundary on the 3 platform-agnostic recipes, the Twitter-specific publisher, the `tools_for_persona()` order, and the `expand()` integration
 - `heartbit_ghost::agents::{researcher_recipe, writer_recipe, style_critic_recipe, judge_recipe, fact_check_recipe, image_generator_recipe, publisher_recipe, tools_for_persona}` are reachable as public surface
-- `XGhostPersona::expand(&PersonaParams::default())` returns a `PersonaExpansion` with 7 agents (in declared order) and 6 tools (in declared order)
+- `XGhostPersona::expand(&PersonaParams::default())` returns a `PersonaExpansion` with 7 agents (in declared order) and 5 tools (in declared order)
 
 ## 9. Out of scope (re-stated)
 
