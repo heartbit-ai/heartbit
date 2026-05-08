@@ -1,11 +1,12 @@
 //! `heartbit-ghost` — best-in-class autonomous X (Twitter) agent persona.
 //!
-//! P1.0 (this release) ships a scaffolding stub: the persona registers itself
-//! into `heartbit_core::PersonaRegistry` so the CLI surface lights up, but
-//! `expand()` returns an empty `PersonaExpansion` (no agents, no tools, no
-//! triggers, no review channel). Real bodies land in P1.1 (X tool family),
-//! P1.2 (voice modeling), P1.3 (generation pipeline + Telegram review), and
-//! P1.4 (autonomy phases + audit + dataset export).
+//! P1.3a wires 7 sub-agent recipes (`researcher`, `writer`, `style_critic`,
+//! `judge`, `fact_check`, `image_generator`, `publisher`) plus 5 tool
+//! instances (`websearch`, `webfetch`, `image_generate`, `twitter_thread`,
+//! `twitter_reply`) into `XGhostPersona::expand()`. The pipeline
+//! orchestrator that chains these agents lands in P1.3b; the Telegram
+//! review channel in P1.3d; trigger specs (cron / mention polling) and
+//! audit log integration in P1.4.
 
 #![deny(missing_docs)]
 
@@ -22,10 +23,12 @@ pub mod voice;
 /// `recipe = "..."` value in `[[persona]]` config blocks.
 pub const PERSONA_NAME: &str = "heartbit-ghost:x";
 
-/// Scaffolding stub for the X (Twitter) ghost persona.
+/// The X (Twitter) ghost persona.
 ///
-/// In P1.0 this expands to an empty `PersonaExpansion`. Real expansion
-/// (sub-agents, tools, triggers, review spec) lands in P1.1+.
+/// As of P1.3a, [`XGhostPersona::expand`] returns a [`PersonaExpansion`]
+/// with 7 sub-agent recipes and 5 tool instances (see the module-level
+/// docs). Pipeline orchestration, Telegram review, triggers, and audit
+/// log integration land in P1.3b/d and P1.4.
 pub struct XGhostPersona {
     /// Persona version string, derived at compile time from the workspace
     /// `Cargo.toml`.
