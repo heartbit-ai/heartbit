@@ -116,9 +116,10 @@ impl Corpus {
 
     /// Append every entry from `path` (a JSONL file) into the corpus,
     /// deduping by `id` (existing entries win). On success, persists to
-    /// disk via [`Corpus::save`] before returning. On parse failure on any
-    /// line, returns the error and leaves both the in-memory entries and
-    /// the on-disk file unchanged.
+    /// disk via [`Corpus::save`] before returning. On any failure (parse
+    /// error on any input line, or save error from the underlying
+    /// filesystem), returns the error and leaves both the in-memory
+    /// entries and the on-disk file unchanged.
     pub fn append_from_jsonl(&mut self, path: &Path) -> Result<AppendStats, CorpusError> {
         let file = File::open(path)?;
         let new_entries = parse_jsonl(BufReader::new(file))?;
