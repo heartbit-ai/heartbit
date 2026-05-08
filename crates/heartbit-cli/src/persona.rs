@@ -477,4 +477,66 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("vfoo"), "got: {msg}");
     }
+
+    #[tokio::test]
+    async fn corpus_list_unknown_persona_with_registered_persona_lists_available() {
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let cmd = PersonaCommand::Corpus {
+            sub: CorpusCommand::List {
+                name: "no-such-persona".to_string(),
+            },
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+        assert!(
+            msg.contains("Available personas: heartbit-ghost:x"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("No personas registered"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn profile_rebuild_unknown_persona_with_registered_persona_lists_available() {
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let cmd = PersonaCommand::Profile {
+            sub: ProfileCommand::Rebuild {
+                name: "no-such-persona".to_string(),
+            },
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+        assert!(
+            msg.contains("Available personas: heartbit-ghost:x"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("No personas registered"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn profile_diff_unknown_persona_with_registered_persona_lists_available() {
+        let mut r = PersonaRegistry::new();
+        heartbit_ghost::register(&mut r);
+        let cmd = PersonaCommand::Profile {
+            sub: ProfileCommand::Diff {
+                name: "no-such-persona".to_string(),
+                v1: "v1".to_string(),
+                v2: "v2".to_string(),
+            },
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+        assert!(
+            msg.contains("Available personas: heartbit-ghost:x"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("No personas registered"), "got: {msg}");
+    }
 }
