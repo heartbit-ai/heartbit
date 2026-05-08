@@ -2014,7 +2014,9 @@ pub(crate) async fn load_a2a_tools(
 ///
 /// Reads `HEARTBIT_PROVIDER` (default: auto-detect from available API keys),
 /// `HEARTBIT_MODEL`, and `HEARTBIT_PROMPT_CACHING`. Always wraps with retry.
-fn build_provider_from_env(on_retry: Option<Arc<OnRetry>>) -> Result<Arc<BoxedProvider>> {
+pub(crate) fn build_provider_from_env(
+    on_retry: Option<Arc<OnRetry>>,
+) -> Result<Arc<BoxedProvider>> {
     let provider_name = std::env::var("HEARTBIT_PROVIDER").unwrap_or_else(|_| {
         // Auto-detect from available API keys
         if let Some((name, _)) = heartbit::detect_available_provider() {

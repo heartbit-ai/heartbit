@@ -6,10 +6,14 @@
 //! changes. P1.0 ships the registration shell; subcommand bodies land in
 //! later sub-phases (P1.1–P1.4).
 
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
 
 use heartbit::PersonaRegistry;
+
+use crate::build_provider_from_env;
 
 #[derive(Debug, Subcommand)]
 pub enum PersonaCommand {
@@ -172,18 +176,163 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
             ))
         }
         PersonaCommand::Corpus { sub } => match sub {
-            CorpusCommand::Add { .. } | CorpusCommand::List { .. } => Err(anyhow!(
-                "corpus management requires a registered persona. {}",
-                registry_suffix(registry)
-            )),
+            CorpusCommand::Add { writer, path } => {
+                if registry.is_empty() {
+                    return Err(anyhow!("{}", NO_PERSONAS_REGISTERED));
+                }
+                let root = heartbit_ghost::corpus::default_corpora_dir()
+                    .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+                let mut corpus = heartbit_ghost::corpus::Corpus::open_or_create(&root, &writer)
+                    .map_err(|e| anyhow!("open corpus for '{writer}': {e}"))?;
+                let stats = corpus.append_from_jsonl(&path).map_err(|e| {
+                    anyhow!("import {} into corpus '{writer}': {e}", path.display())
+                })?;
+                println!(
+                    "ok: added {} new ({} deduped); total {} for writer '{}'",
+                    stats.added, stats.deduped, stats.total_after, writer
+                );
+                Ok(())
+            }
+            CorpusCommand::List { name: persona_name } => {
+                if registry.get(&persona_name).is_none() {
+                    return Err(anyhow!(
+                        "persona '{persona_name}' not found. {}",
+                        registry_suffix(registry)
+                    ));
+                }
+                let config = heartbit_ghost::voice::PersonaConfig::load(&persona_name)
+                    .map_err(|e| anyhow!("load persona config for '{persona_name}': {e}"))?;
+                let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                    .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+                println!(
+                    "Persona '{}': {} writer(s)",
+                    persona_name,
+                    config.recipe.blend.len()
+                );
+                for entry in &config.recipe.blend {
+                    match heartbit_ghost::corpus::Corpus::open_or_create(
+                        &corpora_root,
+                        &entry.writer,
+                    ) {
+                        Ok(c) if c.is_empty() => {
+                            println!(
+                                "  {} (weight {:.2}) — MISSING (no corpus on disk)",
+                                entry.writer, entry.weight
+                            );
+                        }
+                        Ok(c) => {
+                            println!(
+                                "  {} (weight {:.2}) — {} posts",
+                                entry.writer,
+                                entry.weight,
+                                c.len()
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {} (weight {:.2}) — ERROR: {e}",
+                                entry.writer, entry.weight
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
         },
         PersonaCommand::Profile { sub } => match sub {
-            ProfileCommand::Rebuild { .. } | ProfileCommand::Diff { .. } => Err(anyhow!(
-                "profile management requires a registered persona. {}",
-                registry_suffix(registry)
-            )),
+            ProfileCommand::Rebuild { name: persona_name } => {
+                if registry.get(&persona_name).is_none() {
+                    return Err(anyhow!(
+                        "persona '{persona_name}' not found. {}",
+                        registry_suffix(registry)
+                    ));
+                }
+                let config = heartbit_ghost::voice::PersonaConfig::load(&persona_name)
+                    .map_err(|e| anyhow!("load persona config: {e}"))?;
+                config
+                    .recipe
+                    .validate()
+                    .map_err(|e| anyhow!("invalid recipe in persona config: {e}"))?;
+
+                let provider = build_provider_from_env(None)
+                    .map_err(|e| anyhow!("build llm provider: {e}"))?;
+                let extractor = heartbit_ghost::voice::StyleExtractor::builder(provider).build();
+                let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                    .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+
+                let mut profiles: HashMap<String, heartbit_ghost::voice::StyleProfile> =
+                    HashMap::new();
+                for entry in &config.recipe.blend {
+                    println!(
+                        "extracting profile for '{}' (weight {:.2})...",
+                        entry.writer, entry.weight
+                    );
+                    let corpus = heartbit_ghost::corpus::Corpus::open_or_create(
+                        &corpora_root,
+                        &entry.writer,
+                    )
+                    .map_err(|e| anyhow!("open corpus for '{}': {e}", entry.writer))?;
+                    let profile = extractor
+                        .extract(&corpus)
+                        .await
+                        .map_err(|e| anyhow!("extract profile for '{}': {e}", entry.writer))?;
+                    profiles.insert(entry.writer.clone(), profile);
+                }
+
+                let merged = heartbit_ghost::voice::blend_profiles(&config.recipe, &profiles)
+                    .map_err(|e| anyhow!("blend profiles: {e}"))?;
+
+                let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                    .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+                let store =
+                    heartbit_ghost::voice::SnapshotStore::open(&profiles_root, &persona_name)
+                        .map_err(|e| anyhow!("open snapshot store: {e}"))?;
+                let new_version = store
+                    .save_new(merged, &config.recipe)
+                    .map_err(|e| anyhow!("save snapshot: {e}"))?;
+
+                println!("ok: persona '{}' rebuilt as v{}", persona_name, new_version);
+                Ok(())
+            }
+            ProfileCommand::Diff {
+                name: persona_name,
+                v1,
+                v2,
+            } => {
+                if registry.get(&persona_name).is_none() {
+                    return Err(anyhow!(
+                        "persona '{persona_name}' not found. {}",
+                        registry_suffix(registry)
+                    ));
+                }
+                let v1_n = parse_version(&v1)?;
+                let v2_n = parse_version(&v2)?;
+
+                let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                    .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+                let store =
+                    heartbit_ghost::voice::SnapshotStore::open(&profiles_root, &persona_name)
+                        .map_err(|e| anyhow!("open snapshot store: {e}"))?;
+                let s1 = store.load(v1_n).map_err(|e| anyhow!("load v{v1_n}: {e}"))?;
+                let s2 = store.load(v2_n).map_err(|e| anyhow!("load v{v2_n}: {e}"))?;
+
+                let diff = heartbit_ghost::voice::ProfileDiff::compute(&s1.profile, &s2.profile);
+                println!(
+                    "{}",
+                    heartbit_ghost::voice::render_profile_diff(&diff, &s1.meta, &s2.meta)
+                );
+                Ok(())
+            }
         },
     }
+}
+
+/// Parse a `vN` or `N` argument as a u32.
+fn parse_version(arg: &str) -> Result<u32> {
+    arg.strip_prefix('v')
+        .unwrap_or(arg)
+        .parse::<u32>()
+        .map_err(|_| anyhow!("expected version like 'v3' or '3', got '{arg}'"))
 }
 
 #[cfg(test)]
@@ -261,46 +410,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corpus_add_with_registered_persona_lists_available() {
-        // When a persona IS registered, corpus management should surface
-        // it instead of regressing to the empty-registry hint.
-        let mut r = PersonaRegistry::new();
-        heartbit_ghost::register(&mut r);
-        let result = dispatch(
-            PersonaCommand::Corpus {
-                sub: CorpusCommand::Add {
-                    writer: "karpathy".into(),
-                    path: std::path::PathBuf::from("/tmp/x.jsonl"),
-                },
+    async fn corpus_list_persona_not_found_returns_error() {
+        let r = PersonaRegistry::new();
+        let cmd = PersonaCommand::Corpus {
+            sub: CorpusCommand::List {
+                name: "no-such-persona".to_string(),
             },
-            &r,
-        )
-        .await;
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("corpus management requires a registered persona"));
-        assert!(msg.contains("Available personas: heartbit-ghost:x"));
-        // Must NOT regress to the empty-registry hint when one IS registered.
-        assert!(!msg.contains("No personas registered"));
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err(), "should error on missing persona");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
     }
 
     #[tokio::test]
-    async fn profile_rebuild_with_registered_persona_lists_available() {
-        let mut r = PersonaRegistry::new();
-        heartbit_ghost::register(&mut r);
-        let result = dispatch(
-            PersonaCommand::Profile {
-                sub: ProfileCommand::Rebuild {
-                    name: "doesnotexist".into(),
-                },
+    async fn profile_rebuild_persona_not_found_returns_error() {
+        let r = PersonaRegistry::new();
+        let cmd = PersonaCommand::Profile {
+            sub: ProfileCommand::Rebuild {
+                name: "no-such-persona".to_string(),
             },
-            &r,
-        )
-        .await;
-        let err = result.unwrap_err();
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn profile_diff_persona_not_found_returns_error() {
+        let r = PersonaRegistry::new();
+        let cmd = PersonaCommand::Profile {
+            sub: ProfileCommand::Diff {
+                name: "no-such-persona".to_string(),
+                v1: "v1".to_string(),
+                v2: "v2".to_string(),
+            },
+        };
+        let result = dispatch(cmd, &r).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no-such-persona"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_version_accepts_v_prefix() {
+        assert_eq!(parse_version("v3").unwrap(), 3);
+        assert_eq!(parse_version("v0").unwrap(), 0);
+        assert_eq!(parse_version("v100").unwrap(), 100);
+    }
+
+    #[test]
+    fn parse_version_accepts_bare_number() {
+        assert_eq!(parse_version("3").unwrap(), 3);
+        assert_eq!(parse_version("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_version_rejects_garbage() {
+        let err = parse_version("not-a-version").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("profile management requires a registered persona"));
-        assert!(msg.contains("Available personas: heartbit-ghost:x"));
-        assert!(!msg.contains("No personas registered"));
+        assert!(msg.contains("expected version"), "got: {msg}");
+        assert!(msg.contains("not-a-version"), "got: {msg}");
+
+        let err = parse_version("vfoo").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("vfoo"), "got: {msg}");
     }
 }
