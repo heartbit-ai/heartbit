@@ -13,7 +13,7 @@ pub mod style;
 
 pub use blend::{BlendEntry, BlendRecipe, PartialStyleProfile};
 pub use error::VoiceError;
-pub use extractor::ExtractError;
+pub use extractor::{ExtractError, StyleExtractor, StyleExtractorBuilder, default_system_prompt};
 pub use style::{
     EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency, HashtagPolicy, LineBreaks,
     OpeningPattern, PeriodsPolicy, QuotationMarks, SentenceLengthTarget, SpecificityTarget,
