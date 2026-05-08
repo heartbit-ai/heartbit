@@ -80,6 +80,39 @@ impl Tool for ImageGenerateTool {
         }
     }
 
+    fn redact_for_history(&self, output: &str) -> String {
+        // Replace the [IMAGE:base64:<huge_data>] marker body with a tiny
+        // placeholder. Keep the bracket structure so any naïve parser
+        // doesn't break, and append a SHA-256 short hash so different
+        // images produce different placeholder strings (debugging).
+        //
+        // Without this, the ~600 KB base64 payload re-enters the
+        // conversation on the next LLM turn and trips Anthropic's
+        // 200k-token context cap. The full marker is preserved on
+        // `AgentOutput.tool_call_results` for the caller (e.g. a
+        // pipeline that needs to attach the image to a tweet).
+        if let Some(start) = output.find(IMAGE_MARKER_PREFIX) {
+            let after_prefix = &output[start + IMAGE_MARKER_PREFIX.len()..];
+            if let Some(end) = after_prefix.find(']') {
+                let body = &after_prefix[..end];
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(body.as_bytes());
+                let hex = format!("{:x}", hasher.finalize());
+                let short = &hex[..12];
+                let placeholder = format!("[IMAGE:redacted:{short}]");
+                let mut redacted =
+                    String::with_capacity(output.len() - body.len() + placeholder.len());
+                redacted.push_str(&output[..start]);
+                redacted.push_str(&placeholder);
+                redacted.push_str(&after_prefix[end + 1..]);
+                return redacted;
+            }
+        }
+        // No marker found — return verbatim.
+        output.to_string()
+    }
+
     fn execute(
         &self,
         _ctx: &crate::ExecutionContext,
@@ -412,6 +445,28 @@ mod tests {
         let result = extract_image_from_response(&response, "cat").unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("No image data found"));
+    }
+
+    #[test]
+    fn redact_for_history_replaces_marker_body_with_short_hash() {
+        let tool = ImageGenerateTool::new();
+        let raw =
+            "[IMAGE:base64:image/png;base64,iVBORw0KGgo=AAAAAAAAA]\n\nGenerated image for: test";
+        let redacted = tool.redact_for_history(raw);
+        assert!(redacted.starts_with("[IMAGE:redacted:"));
+        assert!(redacted.contains("]\n\nGenerated image for: test"));
+        assert!(!redacted.contains("iVBORw0KGgo"));
+        // Same input → same hash → idempotent.
+        assert_eq!(tool.redact_for_history(raw), redacted);
+    }
+
+    #[test]
+    fn redact_for_history_passes_through_when_no_marker() {
+        let tool = ImageGenerateTool::new();
+        assert_eq!(
+            tool.redact_for_history("plain text without marker"),
+            "plain text without marker"
+        );
     }
 
     #[test]

@@ -446,7 +446,27 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                                 match image_runner.execute(&msg).await {
                                     Ok(out) => {
                                         total_usage += out.tokens_used;
-                                        extract_image_marker(&out.result)
+                                        // P1.3g: prefer the raw `image_generate`
+                                        // tool output (full marker, untruncated)
+                                        // over the model's text response. The
+                                        // tool result that re-entered the
+                                        // conversation was redacted to a tiny
+                                        // placeholder, so `out.result` would not
+                                        // recover the base64 payload. The
+                                        // fallback to `out.result` covers the
+                                        // case where the agent decided
+                                        // "no_image" without calling the tool.
+                                        let raw_tool_output: Option<String> = out
+                                            .tool_call_results
+                                            .iter()
+                                            .find(|r| {
+                                                r.tool_name == "image_generate" && !r.is_error
+                                            })
+                                            .map(|r| r.output.clone());
+                                        match raw_tool_output {
+                                            Some(raw) => extract_image_marker(&raw),
+                                            None => extract_image_marker(&out.result),
+                                        }
                                     }
                                     Err(e) => {
                                         progress(&format!(
