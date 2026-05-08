@@ -25,7 +25,7 @@ pub fn researcher_recipe() -> AgentConfig {
         name: "researcher".to_string(),
         description: "Find substance: facts, sources, quotable specifics on a topic.".to_string(),
         system_prompt: RESEARCHER_SYSTEM_PROMPT.to_string(),
-        max_turns: Some(8),
+        max_turns: Some(20),
         max_tokens: Some(4096),
         reasoning_effort: Some("medium".to_string()),
         ..super::stub_recipe("researcher")
@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(cfg.name, "researcher");
         assert!(!cfg.description.is_empty());
         assert!(!cfg.system_prompt.is_empty());
-        assert_eq!(cfg.max_turns, Some(8));
+        assert_eq!(cfg.max_turns, Some(20));
         assert_eq!(cfg.max_tokens, Some(4096));
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
         assert!(
