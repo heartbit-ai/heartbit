@@ -135,8 +135,12 @@ impl Corpus {
                 to_append.push(entry);
             }
         }
+        let prev_len = self.entries.len();
         self.entries.extend(to_append);
-        self.save()?;
+        if let Err(e) = self.save() {
+            self.entries.truncate(prev_len);
+            return Err(e);
+        }
         Ok(AppendStats {
             added,
             deduped,
@@ -407,6 +411,42 @@ mod tests {
     }
 
     // ---- save round-trips, atomic write ---------------------------------
+
+    #[test]
+    fn append_from_jsonl_rolls_back_in_memory_on_save_failure() {
+        let dir = TempDir::new().unwrap();
+        // Open the (empty) corpus first — open_or_create reads the file if it
+        // exists, so we must do this BEFORE planting the blocking directory
+        // (File::open on a directory succeeds on Linux, but reading lines
+        // then fails with IsADirectory before we'd ever reach append).
+        let mut c = Corpus::open_or_create(dir.path(), "karpathy").unwrap();
+        assert!(c.is_empty());
+
+        // Now pre-create a *directory* at the corpus path so the final
+        // fs::rename in save() fails (cross-platform: rename(file,
+        // non-empty-dir) errors on Linux, macOS, and Windows).
+        let corpus_path = dir.path().join("karpathy.jsonl");
+        std::fs::create_dir(&corpus_path).unwrap();
+        // Drop a sentinel file inside the directory so it's non-empty —
+        // some platforms allow rename over an empty directory.
+        std::fs::write(corpus_path.join("sentinel"), b"keep me").unwrap();
+
+        let src = dir.path().join("import.jsonl");
+        write_jsonl(&src, &[&minimal("1", "a"), &minimal("2", "b")]);
+
+        let err = c.append_from_jsonl(&src).unwrap_err();
+        assert!(
+            matches!(err, CorpusError::Io(_)),
+            "expected Io, got {err:?}"
+        );
+
+        // Critical assertion: in-memory entries rolled back to pre-call state.
+        assert!(
+            c.is_empty(),
+            "rollback failed — in-memory has {} entries after save error",
+            c.len()
+        );
+    }
 
     #[test]
     fn save_round_trips_via_open_or_create() {
