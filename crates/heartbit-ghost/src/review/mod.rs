@@ -2,7 +2,7 @@
 //! [`ReviewDelivery`] (Telegram in production), awaits the user's pick,
 //! then posts the chosen draft to X via the `twitter_thread` tool.
 //!
-//! Public entry: [`run_review_pipeline`] (lands in Task 2).
+//! Public entry: [`run_review_pipeline`].
 
 use std::path::Path;
 use std::sync::Arc;
