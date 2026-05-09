@@ -40,18 +40,28 @@ impl RepoInspectTool {
     /// Build the tool, anchoring it at the canonicalized `repo_root` and
     /// scoping reads/greps to `crates/heartbit-core` and `crates/heartbit-cli`.
     ///
-    /// Returns an error if `repo_root` cannot be canonicalized.
+    /// Returns an error if `repo_root` or either allowed prefix cannot be
+    /// canonicalized (e.g. the directory does not exist). Both sides are
+    /// canonicalized so `starts_with` comparisons remain correct in the
+    /// presence of symlinks anywhere in the path.
     pub fn new(repo_root: impl Into<PathBuf>) -> Result<Self, Error> {
         let repo_root = repo_root
             .into()
             .canonicalize()
             .map_err(|e| Error::Agent(format!("repo_root canonicalize: {e}")))?;
+        let allowed_prefixes = vec![
+            repo_root.join("crates/heartbit-core"),
+            repo_root.join("crates/heartbit-cli"),
+        ]
+        .into_iter()
+        .map(|p| {
+            p.canonicalize()
+                .map_err(|e| Error::Agent(format!("allowed prefix canonicalize: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            allowed_prefixes: vec![
-                repo_root.join("crates/heartbit-core"),
-                repo_root.join("crates/heartbit-cli"),
-            ],
             repo_root,
+            allowed_prefixes,
             max_file_lines: 1000,
             max_grep_hits: 100,
         })
@@ -183,23 +193,38 @@ impl RepoInspectTool {
             .output()
             .await
             .map_err(|e| Error::Agent(format!("git grep: {e}")))?;
-        // git grep returns 1 on no-match — treat as empty result, not error.
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        if stdout.is_empty() {
-            return Ok(ToolOutput::success(format!("(no matches for {pattern})")));
+        // git grep exit codes: 0 = matches found, 1 = no matches, anything
+        // else (typically 128) = hard error such as bad regex, not a git
+        // repo, or invalid pathspec — those also produce empty stdout, so
+        // distinguishing on exit code is required to avoid silently
+        // masking real failures as "no matches".
+        match output.status.code() {
+            Some(0) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let total_lines = stdout.lines().count();
+                let lines: Vec<&str> = stdout.lines().take(self.max_grep_hits).collect();
+                let truncated = total_lines > self.max_grep_hits;
+                let mut out = lines.join("\n");
+                if truncated {
+                    out.push_str(&format!(
+                        "\n... ({} more hits truncated; cap is {})",
+                        total_lines - self.max_grep_hits,
+                        self.max_grep_hits
+                    ));
+                }
+                Ok(ToolOutput::success(out))
+            }
+            Some(1) => Ok(ToolOutput::success(format!("(no matches for {pattern})"))),
+            other => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let code = other
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into());
+                Ok(ToolOutput::error(format!(
+                    "git grep failed (exit {code}): {stderr}"
+                )))
+            }
         }
-        let total_lines = stdout.lines().count();
-        let lines: Vec<&str> = stdout.lines().take(self.max_grep_hits).collect();
-        let truncated = total_lines > self.max_grep_hits;
-        let mut out = lines.join("\n");
-        if truncated {
-            out.push_str(&format!(
-                "\n... ({} more hits truncated; cap is {})",
-                total_lines - self.max_grep_hits,
-                self.max_grep_hits
-            ));
-        }
-        Ok(ToolOutput::success(out))
     }
 }
 
@@ -308,6 +333,37 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_request_exceeding_max_file_lines() {
+        let tmp = fixture_repo();
+        // Write a large (>1000-line) source file inside an allowed prefix
+        // so the requested span actually exceeds max_file_lines (the read
+        // path clamps `end` to the file length, so a tiny file would just
+        // be returned in full).
+        let big_path = tmp.path().join("crates/heartbit-core/src/big.rs");
+        let big_contents: String = (0..1500).map(|i| format!("// line {i}\n")).collect();
+        std::fs::write(&big_path, &big_contents).unwrap();
+
+        let tool = RepoInspectTool::new(tmp.path()).unwrap();
+        let out = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({
+                    "op": "read_file",
+                    "path": "crates/heartbit-core/src/big.rs",
+                    "range": [1, 1001]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "expected is_error=true, got: {}", out.content);
+        assert!(
+            out.content.contains("max is 1000") || out.content.contains("explicit range"),
+            "unexpected error message: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
