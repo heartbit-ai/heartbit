@@ -953,9 +953,11 @@ impl DaemonCore {
                             tracing::warn!(
                                 persona = %persona,
                                 user_id = %user_id,
-                                "MentionPoll dispatched but handler is not yet wired (P1.5c task 10)"
+                                // TODO(P1.5c task 10b): wire MentionPollScheduler from DaemonCore::run_*
+                                // and call handle_mention_poll() with the per-persona MentionStore +
+                                // SpamGuard resolved from DaemonCore fields.
+                                "MentionPoll received — real handler not yet wired (P1.5c task 10b)"
                             );
-                            // No-op for now — task 10 implements the real handler.
                         }
                         DaemonCommand::ReplyDraft { persona, mention, parent: _, mentioner_context: _ } => {
                             tracing::warn!(
@@ -1005,6 +1007,7 @@ mod tests {
             memory: crate::config::DaemonMemoryConfig::default(),
             audit: crate::config::DaemonAuditConfig::default(),
             idempotency: crate::config::IdempotencyConfig::default(),
+            persona_mentions: vec![],
         }
     }
 

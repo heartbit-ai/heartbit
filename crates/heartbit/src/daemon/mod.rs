@@ -7,6 +7,8 @@ pub mod core;
 pub mod cron;
 pub mod heartbit_pulse;
 pub mod kafka;
+pub mod mention_poll;
+pub mod mention_poll_handler;
 pub mod metrics;
 pub mod notify;
 pub mod openai_compat;
@@ -19,6 +21,8 @@ pub use self::core::{DaemonCore, DaemonHandle};
 pub use cron::CronScheduler;
 pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
+pub use mention_poll::MentionPollScheduler;
+pub use mention_poll_handler::{MentionPollDeps, handle_mention_poll};
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
 pub use openai_compat::{

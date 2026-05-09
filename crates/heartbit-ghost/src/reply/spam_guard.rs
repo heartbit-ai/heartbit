@@ -66,6 +66,12 @@ impl SpamGuard {
         Self { cfg }
     }
 
+    /// Read-only access to the underlying config (e.g. to compute the
+    /// per-author rate-limit window in the mention-poll handler).
+    pub fn config(&self) -> &SpamGuardConfig {
+        &self.cfg
+    }
+
     /// Returns `Some(reason)` if the mention should be skipped, `None`
     /// to proceed. Evaluates rules in fail-fast order: SelfReply,
     /// StaleParent, LowEffortSpam, PerAuthorRateLimit, TooShortToEngage.

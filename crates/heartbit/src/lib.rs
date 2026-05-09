@@ -115,12 +115,12 @@ pub use config::{
     DaemonMcpServerConfig, DispatchMode, EmbeddingConfig, GuardrailsConfig, HeartbitConfig,
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KNOWN_BUILTINS, KafkaConfig,
     KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry,
-    MemoryConfig, MetricsConfig, OrchestratorConfig, PiiConfig, RetryProviderConfig,
-    SalienceConfig, SandboxConfig, ScheduleEntry, SecretPatternConfig, SecretScanConfig,
-    SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml,
-    SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
-    ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig, WsConfig, parse_reasoning_effort,
-    parse_tool_profile, parse_workflow_type,
+    MemoryConfig, MetricsConfig, OrchestratorConfig, PersonaMentionsConfig, PiiConfig,
+    RetryProviderConfig, SalienceConfig, SandboxConfig, ScheduleEntry, SecretPatternConfig,
+    SecretScanConfig, SensorConfig, SensorModality, SensorRoutingConfig, SensorSourceConfig,
+    SessionPruneConfigToml, SpawnConfig, StoryCorrelationConfig, TokenBudgetConfig,
+    TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig,
+    WsConfig, parse_reasoning_effort, parse_tool_profile, parse_workflow_type,
 };
 
 // --- Auth re-exports ---
@@ -139,14 +139,15 @@ pub use daemon::openai_compat;
 pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, FileTodoStore,
-    HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer, OnTaskComplete,
-    RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse,
-    RuntimeEvalSseEvent, RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig,
-    RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest,
-    RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent,
-    RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge,
-    RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
+    HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer, MentionPollDeps,
+    MentionPollScheduler, OnTaskComplete, RuntimeAdvancedConfig, RuntimeAgentConfig,
+    RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent, RuntimeGuardrailConfig,
+    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
+    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig,
+    RuntimeSseEvent, RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig,
+    RuntimeWorkflowEdge, RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore,
+    TodoEntry, TodoList, TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext,
+    format_notification, handle_mention_poll,
 };
 
 // --- Eval re-exports ---

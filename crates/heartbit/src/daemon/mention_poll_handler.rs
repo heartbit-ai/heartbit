@@ -1,0 +1,627 @@
+//! Free-function handler for [`DaemonCommand::MentionPoll`].
+//!
+//! Reads `since_id` from the [`MentionStore`], calls the
+//! [`heartbit_ghost::tools::TwitterMentionsTool`] via
+//! `Tool::execute`, parses mentions, runs early [`SpamGuard`] checks,
+//! dispatches [`DaemonCommand::ReplyDraft`] for survivors, and bumps
+//! `since_id` monotonically. Mentioner enrichment and parent-tweet lookup
+//! are deferred to the ReplyDraft handler (P1.5c task 11).
+
+use chrono::{Duration, Utc};
+use heartbit_core::{ExecutionContext, Tool};
+use heartbit_ghost::reply::{MentionStore, SpamGuard};
+use serde::Deserialize;
+
+use crate::Error;
+
+use super::CommandProducer;
+use super::types::DaemonCommand;
+
+// Local mirror of the tool's output shape (internal to mentions.rs, not pub).
+#[derive(Debug, Deserialize)]
+struct ToolMention {
+    id: String,
+    text: String,
+    author_id: Option<String>,
+    created_at: Option<String>,
+    #[allow(dead_code)]
+    in_reply_to_user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMentionsOutput {
+    #[serde(default)]
+    mentions: Vec<ToolMention>,
+}
+
+/// Dependencies for [`handle_mention_poll`].
+///
+/// Groups the >7 parameters to satisfy Clippy's `too_many_arguments` lint.
+pub struct MentionPollDeps<'a> {
+    /// Persona slug (e.g. `"heartbit-ghost"`).
+    pub persona: &'a str,
+    /// X user id of the operator account.
+    pub user_id: &'a str,
+    /// The `twitter_mentions` tool implementation.
+    pub mentions_tool: &'a dyn Tool,
+    /// Execution context carrying credentials.
+    pub exec_ctx: &'a ExecutionContext,
+    /// Mention store for `since_id` and rate-limit state.
+    pub store: &'a dyn MentionStore,
+    /// Early-exit spam rules (self-reply, rate-limit, too-short).
+    pub spam_guard: &'a SpamGuard,
+    /// Command producer for dispatching `ReplyDraft`.
+    pub producer: &'a dyn CommandProducer,
+    /// Topic to publish `ReplyDraft` commands to.
+    pub commands_topic: &'a str,
+    /// Max mentions to fetch per poll (passed to the tool).
+    pub max_results: u32,
+}
+
+/// Handle one [`DaemonCommand::MentionPoll`] tick.
+pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error> {
+    let MentionPollDeps {
+        persona,
+        user_id,
+        mentions_tool,
+        exec_ctx,
+        store,
+        spam_guard,
+        producer,
+        commands_topic,
+        max_results,
+    } = deps;
+    // 1. Read current since_id.
+    let since_id = store
+        .since_id_for(persona, user_id)
+        .await
+        .map_err(|e| Error::Daemon(format!("failed to read since_id: {e}")))?;
+
+    // 2. Call the twitter_mentions tool.
+    let input = {
+        let mut v = serde_json::json!({
+            "user_id": user_id,
+            "max_results": max_results,
+        });
+        if let Some(ref sid) = since_id {
+            v["since_id"] = serde_json::Value::String(sid.clone());
+        }
+        v
+    };
+
+    let output = mentions_tool
+        .execute(exec_ctx, input)
+        .await
+        .map_err(|e| Error::Daemon(format!("twitter_mentions tool error: {e}")))?;
+
+    if output.is_error {
+        return Err(Error::Daemon(format!(
+            "twitter_mentions returned error: {}",
+            output.content
+        )));
+    }
+
+    // 3. Parse the JSON output.
+    let parsed: ToolMentionsOutput = serde_json::from_str(&output.content)
+        .map_err(|e| Error::Daemon(format!("failed to parse twitter_mentions output: {e}")))?;
+
+    if parsed.mentions.is_empty() {
+        tracing::debug!(persona, user_id, "mention-poll: no new mentions");
+        return Ok(());
+    }
+
+    // 4. Determine max id for monotonic bump after the loop.
+    // Twitter returns newest-first; track max lexicographically (tweet ids are
+    // ordered by creation time when compared as strings).
+    let mut max_id: Option<String> = None;
+
+    let cfg = spam_guard.config();
+    let now = Utc::now();
+    let rate_window_start = now - Duration::hours(cfg.per_author_window_hours);
+
+    for tool_m in &parsed.mentions {
+        // Update max_id tracker.
+        let id_str = tool_m.id.as_str();
+        if max_id.as_deref().is_none_or(|cur| id_str > cur) {
+            max_id = Some(tool_m.id.clone());
+        }
+
+        // Skip mentions with no author_id — can't attribute or guard.
+        let Some(ref author_id) = tool_m.author_id else {
+            tracing::warn!(mention_id = %tool_m.id, "mention has no author_id, skipping");
+            continue;
+        };
+
+        // Build a heartbit-ghost Mention. V1 limitation: `author_handle` and
+        // `in_reply_to_tweet_id` are not returned by the tool — use empty/None.
+        let posted_at = tool_m
+            .created_at
+            .as_deref()
+            .and_then(|s| s.parse::<chrono::DateTime<Utc>>().ok())
+            .unwrap_or(now);
+
+        let mention = heartbit_ghost::reply::Mention {
+            id: tool_m.id.clone(),
+            text: tool_m.text.clone(),
+            author_id: author_id.clone(),
+            author_handle: String::new(), // not provided by twitter_mentions V1
+            posted_at,
+            in_reply_to_tweet_id: None, // in_reply_to_user_id ≠ tweet_id; deferred
+        };
+
+        // 5. Early-exit spam checks (SelfReply, PerAuthorRateLimit, TooShortToEngage).
+        let replies_recent = store
+            .replies_to_author_since(author_id, rate_window_start)
+            .await
+            .map_err(|e| Error::Daemon(format!("failed to query replies_to_author_since: {e}")))?;
+
+        if let Some(reason) = spam_guard.should_skip(&mention, None, None, replies_recent, now) {
+            tracing::debug!(
+                mention_id = %mention.id,
+                author_id,
+                reason = ?reason,
+                "mention skipped"
+            );
+            // Mark as replied so we don't re-process on the next poll.
+            if let Err(e) = store.mark_replied(&mention.id).await {
+                tracing::warn!(mention_id = %mention.id, error = %e, "failed to mark skipped mention as replied");
+            }
+            continue;
+        }
+
+        // 6. Defensive dedup — skip if already replied.
+        if store
+            .was_replied(&mention.id)
+            .await
+            .map_err(|e| Error::Daemon(format!("failed to query was_replied: {e}")))?
+        {
+            tracing::debug!(mention_id = %mention.id, "mention already replied, skipping");
+            continue;
+        }
+
+        // 7. Dispatch ReplyDraft.
+        let cmd = DaemonCommand::ReplyDraft {
+            persona: persona.to_string(),
+            mention: mention.clone(),
+            parent: None,            // parent lookup deferred to P1.5c task 11
+            mentioner_context: None, // mentioner enrichment deferred to P1.5c task 11
+        };
+        let key = format!("reply-draft:{}:{}", persona, mention.id);
+        let payload = serde_json::to_vec(&cmd)
+            .map_err(|e| Error::Daemon(format!("failed to serialize ReplyDraft: {e}")))?;
+        if let Err(e) = producer.send_command(commands_topic, &key, &payload).await {
+            tracing::error!(
+                persona,
+                mention_id = %mention.id,
+                error = %e,
+                "failed to dispatch ReplyDraft"
+            );
+            // Don't mark as replied — will retry on next poll.
+            continue;
+        }
+
+        // 8. Mark as replied so we don't dispatch a second time.
+        if let Err(e) = store.mark_replied(&mention.id).await {
+            tracing::warn!(mention_id = %mention.id, error = %e, "failed to mark mention as replied");
+        }
+        // Track per-author rate-limit.
+        if let Err(e) = store.record_reply_to_author(author_id, now).await {
+            tracing::warn!(author_id, error = %e, "failed to record reply to author");
+        }
+    }
+
+    // 9. Bump since_id monotonically (one write after dispatch loop).
+    if let Some(ref new_id) = max_id
+        && let Err(e) = store.bump_since_id(persona, user_id, new_id).await
+    {
+        tracing::warn!(persona, user_id, new_id, error = %e, "failed to bump since_id");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use heartbit_core::llm::types::ToolDefinition;
+    use heartbit_core::{ExecutionContext, Tool, ToolOutput};
+    use heartbit_ghost::reply::{InMemoryMentionStore, SpamGuard, SpamGuardConfig};
+
+    use super::super::ChannelCommandProducer;
+    use super::super::types::DaemonCommand;
+    use super::*;
+
+    // ─── Helpers ────────────────────────────────────────────────────────────
+
+    type MockProducerHandle = (
+        Arc<dyn CommandProducer>,
+        tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    );
+
+    fn mock_producer() -> MockProducerHandle {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(ChannelCommandProducer { tx }), rx)
+    }
+
+    fn default_guard() -> SpamGuard {
+        SpamGuard::new(SpamGuardConfig::defaults_for("op"))
+    }
+
+    fn default_store() -> InMemoryMentionStore {
+        InMemoryMentionStore::new()
+    }
+
+    /// A stub tool that returns a fixed JSON string as `ToolOutput::success`.
+    struct StubMentionsTool {
+        output: String,
+        is_error: bool,
+    }
+
+    impl StubMentionsTool {
+        fn ok(json: &str) -> Self {
+            Self {
+                output: json.to_string(),
+                is_error: false,
+            }
+        }
+        fn err(msg: &str) -> Self {
+            Self {
+                output: msg.to_string(),
+                is_error: true,
+            }
+        }
+    }
+
+    impl Tool for StubMentionsTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "twitter_mentions".into(),
+                description: "stub".into(),
+                input_schema: serde_json::json!({}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, heartbit_core::Error>> + Send + '_>>
+        {
+            let output = self.output.clone();
+            let is_error = self.is_error;
+            Box::pin(async move {
+                if is_error {
+                    Ok(ToolOutput::error(output))
+                } else {
+                    Ok(ToolOutput::success(output))
+                }
+            })
+        }
+    }
+
+    fn one_mention_json(id: &str, author_id: &str, text: &str) -> String {
+        format!(
+            r#"{{"mentions":[{{"id":"{id}","text":"{text}","author_id":"{author_id}","created_at":"2026-01-01T00:00:00Z"}}]}}"#
+        )
+    }
+
+    // ─── Helper to build deps ────────────────────────────────────────────────
+
+    fn deps_for<'a>(
+        persona: &'a str,
+        user_id: &'a str,
+        tool: &'a dyn Tool,
+        store: &'a dyn MentionStore,
+        guard: &'a SpamGuard,
+        producer: &'a dyn CommandProducer,
+        ctx: &'a ExecutionContext,
+    ) -> MentionPollDeps<'a> {
+        MentionPollDeps {
+            persona,
+            user_id,
+            mentions_tool: tool,
+            exec_ctx: ctx,
+            store,
+            spam_guard: guard,
+            producer,
+            commands_topic: "test.commands",
+            max_results: 10,
+        }
+    }
+
+    // ─── Tests ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_mentions_returns_ok_no_dispatch() {
+        let tool = StubMentionsTool::ok(r#"{"mentions":[]}"#);
+        let store = default_store();
+        let guard = default_guard();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .expect("empty mentions should succeed");
+
+        assert!(rx.try_recv().is_err(), "no ReplyDraft should be dispatched");
+    }
+
+    #[tokio::test]
+    async fn tool_error_returns_err() {
+        let tool = StubMentionsTool::err("rate limited");
+        let store = default_store();
+        let guard = default_guard();
+        let (producer, _rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        let result = handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await;
+
+        assert!(result.is_err(), "tool error should propagate as Err");
+        assert!(result.unwrap_err().to_string().contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn self_reply_skipped_and_marked_replied() {
+        // operator_user_id = "op-id"; author of the mention = "op-id" → SelfReply.
+        let guard = SpamGuard::new(SpamGuardConfig::defaults_for("op-id"));
+        let tool = StubMentionsTool::ok(&one_mention_json("m1", "op-id", "hello"));
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op-id",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        // No ReplyDraft dispatched.
+        assert!(
+            rx.try_recv().is_err(),
+            "self-reply must not dispatch ReplyDraft"
+        );
+
+        // Mention is marked as replied so it won't be re-processed.
+        let was = store.was_replied("m1").await.unwrap();
+        assert!(was, "self-reply should be marked as replied");
+    }
+
+    #[tokio::test]
+    async fn too_short_skipped_and_marked_replied() {
+        let guard = default_guard();
+        // Only emoji — TooShortToEngage (0 alphanumeric chars).
+        let tool = StubMentionsTool::ok(&one_mention_json("m2", "user1", "👍"));
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "too-short must not dispatch ReplyDraft"
+        );
+        assert!(store.was_replied("m2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn per_author_rate_limit_skipped() {
+        let guard = SpamGuard::new(SpamGuardConfig {
+            operator_user_id: "op".into(),
+            stale_parent_after_days: 7,
+            low_follower_threshold: 5,
+            low_effort_short_text_chars: 30,
+            per_author_window_hours: 24,
+            per_author_max_replies: 1, // max 1 reply per 24h
+            min_engagement_chars: 3,
+        });
+        let tool = StubMentionsTool::ok(&one_mention_json(
+            "m3",
+            "user2",
+            "this is a real question about the framework",
+        ));
+        let store = default_store();
+        // Pre-record a reply from this author within the window.
+        store
+            .record_reply_to_author("user2", Utc::now())
+            .await
+            .unwrap();
+
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "rate-limited mention must not dispatch ReplyDraft"
+        );
+    }
+
+    #[tokio::test]
+    async fn happy_path_dispatches_reply_draft_and_bumps_since_id() {
+        let guard = default_guard();
+        let tool = StubMentionsTool::ok(&one_mention_json(
+            "m9001",
+            "user3",
+            "what do you think about async Rust",
+        ));
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        // Should have dispatched one ReplyDraft.
+        let (key, payload) = rx.try_recv().expect("expected a ReplyDraft command");
+        assert!(
+            key.starts_with("reply-draft:ghost:"),
+            "unexpected key: {key}"
+        );
+        let cmd: DaemonCommand = serde_json::from_slice(&payload).unwrap();
+        match cmd {
+            DaemonCommand::ReplyDraft {
+                persona, mention, ..
+            } => {
+                assert_eq!(persona, "ghost");
+                assert_eq!(mention.id, "m9001");
+            }
+            other => panic!("expected ReplyDraft, got {other:?}"),
+        }
+
+        // since_id should have been bumped.
+        let since = store.since_id_for("ghost", "op").await.unwrap();
+        assert_eq!(since.as_deref(), Some("m9001"));
+
+        // mention should be marked as replied.
+        assert!(store.was_replied("m9001").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_replied_mention_not_dispatched_again() {
+        let guard = default_guard();
+        let tool = StubMentionsTool::ok(&one_mention_json(
+            "m500",
+            "user4",
+            "is this already handled",
+        ));
+        let store = default_store();
+        // Pre-mark as replied.
+        store.mark_replied("m500").await.unwrap();
+
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "already-replied mention must not dispatch a second ReplyDraft"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_with_no_author_id_skipped_gracefully() {
+        let guard = default_guard();
+        let json = r#"{"mentions":[{"id":"m42","text":"hello from unknown"}]}"#;
+        let tool = StubMentionsTool::ok(json);
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "mention without author_id should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_id_bumped_to_max_across_multiple_mentions() {
+        let guard = default_guard();
+        // Two valid mentions — ids "100" and "200".
+        let json = serde_json::json!({
+            "mentions": [
+                {"id": "200", "text": "second question about Rust", "author_id": "a1", "created_at": "2026-01-01T00:00:00Z"},
+                {"id": "100", "text": "first question about Rust", "author_id": "a2", "created_at": "2026-01-01T00:00:00Z"}
+            ]
+        })
+        .to_string();
+        let tool = StubMentionsTool::ok(&json);
+        let store = default_store();
+        let (producer, _rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        let since = store.since_id_for("ghost", "op").await.unwrap();
+        assert_eq!(since.as_deref(), Some("200"), "since_id should be max id");
+    }
+}
