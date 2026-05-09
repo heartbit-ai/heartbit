@@ -58,14 +58,17 @@ A future generalized `code_search` builtin in `heartbit-core` is conceivable but
 
 | Path | Action | Purpose |
 |------|--------|---------|
-| `crates/heartbit-ghost/src/tools/repo_inspect.rs` | NEW | `RepoInspectTool` with 4 ops; ~8 wiremock-free unit tests using `tempfile`. |
+| `crates/heartbit-ghost/src/tools/repo_inspect.rs` | NEW | `RepoInspectTool` with 4 ops; ~8 unit tests using `tempfile` (no wiremock). |
 | `crates/heartbit-ghost/src/tools/mod.rs` | MODIFY | Re-export `RepoInspectTool`. |
 | `crates/heartbit-ghost/src/agents/repo_researcher.rs` | NEW | `repo_researcher_recipe()` returning `AgentConfig`; ~3 unit tests. |
-| `crates/heartbit-ghost/src/agents/mod.rs` | MODIFY | Register `repo_researcher` recipe; resolve `researcher_agent` field at expand. |
-| `crates/heartbit-ghost/data/heartbit-rs-features.toml` | NEW | Curated feature menu (~18 entries). |
-| `crates/heartbit-ghost/src/persona/recipe.rs` (or wherever `Recipe` lives) | MODIFY | Add `researcher_agent: Option<String>` and `system_prompt_addendum: Option<String>` fields with `#[serde(default)]`. |
-| `crates/heartbit-ghost/src/persona/mod.rs` | MODIFY | `expand()` honors the two new fields. |
-| `~/.heartbit/ghost/personas/heartbit-rs:x.toml` | NEW (user-side) | Persona instance config. |
+| `crates/heartbit-ghost/src/agents/mod.rs` | MODIFY | Re-export `repo_researcher_recipe`. New `tools_for_heartbit_rs()` adds `RepoInspectTool` to the existing five. |
+| `crates/heartbit-ghost/data/heartbit-rs-features.toml` | NEW | Curated feature menu (~18 entries). Embedded with `include_str!`. |
+| `crates/heartbit-ghost/src/heartbit_rs.rs` | NEW | `XHeartbitRsPersona` typed persona — `expand()` returns 7 recipes (with `repo_researcher` instead of `researcher`); supplies the evangelism addendum string. |
+| `crates/heartbit-ghost/src/lib.rs` | MODIFY | Add `mod heartbit_rs;` and `register()` registers both `XGhostPersona` and `XHeartbitRsPersona`. |
+| `crates/heartbit-ghost/src/pipeline/prompts.rs` | MODIFY | `build_writer_user_message`, `build_critic_user_message`, `build_publisher_user_message` (and any other voice-aware builders) gain a `mode_addendum: Option<&str>` parameter that is appended after `voice_guidelines` when `Some`. |
+| `crates/heartbit-ghost/src/pipeline/mod.rs` + `crates/heartbit-ghost/src/review/mod.rs` | MODIFY | Plumb `mode_addendum: Option<&str>` from the persona expansion through to the prompt builders. New field on `PipelineConfig` / `ReviewConfig` with `#[serde(default)]` and a `pub fn with_mode_addendum(...)` builder method. |
+| `crates/heartbit-cli/src/persona.rs` (or wherever the CLI dispatches `persona run`) | MODIFY | When the resolved persona is `XHeartbitRsPersona`, pull the addendum from the persona expansion and pass it to `run_pipeline` / `run_review_pipeline`. |
+| `~/.heartbit/ghost/personas/heartbit-rs:x.toml` | NEW (user-side) | Persona instance config — blend + overrides only. **No new TOML fields.** |
 | `~/.heartbit/ghost/corpora/burntsushi.jsonl` | NEW (user-side) | Ingested corpus. |
 | `~/.heartbit/ghost/corpora/simonw.jsonl` | NEW (user-side) | Ingested corpus. |
 
@@ -189,9 +192,11 @@ Do NOT write the post. The writer composes. Do NOT speculate beyond what
 the files show.
 ```
 
-## 6. Writer prompt addendum (persona-level)
+## 6. Writer user-message addendum (persona-level)
 
-The persona's TOML adds a `[recipe.overrides] system_prompt_addendum` (multiline TOML string) that the writer's expand step appends to the blended prompt:
+The writer's `system_prompt` is intentionally platform/persona-agnostic — voice guidelines and runtime context flow via the **user message** at pipeline time, built by `crates/heartbit-ghost/src/pipeline/prompts.rs::build_writer_user_message(...)`. This persona's evangelism framing therefore ships as a `&'static str` constant carried by `XHeartbitRsPersona`, surfaced via `XHeartbitRsPersona::mode_addendum() -> &'static str`. The pipeline's prompt builders gain a `mode_addendum: Option<&str>` parameter that, when `Some`, is appended after the `voice_guidelines` block in the user message. `XGhostPersona` returns `None` (or its expansion's `mode_addendum` field is `None`), preserving its existing user-message shape verbatim.
+
+The addendum text (heartbit-rs:x):
 
 ```
 EVANGELISM MODE — heartbit-rs:x
@@ -229,47 +234,131 @@ NEVER
   and unreadable on mobile).
 ```
 
-## 7. Config plumbing
+## 7. Pipeline plumbing
 
-Two new fields on the persona's `Recipe` (or whatever the existing serde struct is called):
+No changes to the user-side TOML schema. `PersonaConfig` (in `voice/persona_config.rs`) is unchanged — heartbit-rs:x parses with the same struct as heartbit-ghost:x. The persona-specific differences live entirely in Rust.
+
+### 7.1 New typed persona
+
+A new file `crates/heartbit-ghost/src/heartbit_rs.rs` defines `XHeartbitRsPersona` mirroring `XGhostPersona`:
 
 ```rust
-#[derive(Deserialize, Serialize)]
-pub struct RecipeConfig {
-    // ... existing fields ...
-    #[serde(default)]
-    pub researcher_agent: Option<String>,  // None → "researcher" (default); Some("repo_researcher") for heartbit-rs:x
-    // ... existing fields ...
+use std::sync::Arc;
+use heartbit_core::persona::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
+
+pub const PERSONA_NAME: &str = "heartbit-rs:x";
+
+pub const MODE_ADDENDUM: &str = r#"EVANGELISM MODE — heartbit-rs:x
+...
+(see §6)
+"#;
+
+pub struct XHeartbitRsPersona {
+    version: &'static str,
 }
 
-#[derive(Deserialize, Serialize)]
-pub struct RecipeOverrides {
-    // ... existing fields ...
-    #[serde(default)]
-    pub system_prompt_addendum: Option<String>,
+impl Persona for XHeartbitRsPersona {
+    fn name(&self) -> &str { PERSONA_NAME }
+    fn description(&self) -> &str {
+        "Demonstrates heartbit-core / heartbit-cli features by example. Pure on-demand."
+    }
+    fn version(&self) -> &str { self.version }
+
+    fn expand(&self, _params: &PersonaParams) -> Result<PersonaExpansion, heartbit_core::Error> {
+        let agents = vec![
+            crate::agents::repo_researcher_recipe(),  // <— differs
+            crate::agents::writer_recipe(),
+            crate::agents::style_critic_recipe(),
+            crate::agents::judge_recipe(),
+            crate::agents::fact_check_recipe(),
+            crate::agents::image_generator_recipe(),
+            crate::agents::publisher_recipe(),
+        ];
+        let tools = crate::agents::tools_for_heartbit_rs();  // <— differs (adds RepoInspectTool)
+        Ok(PersonaExpansion {
+            agents,
+            tools,
+            mode_addendum: Some(MODE_ADDENDUM),  // <— NEW field on PersonaExpansion
+            ..PersonaExpansion::default()
+        })
+    }
 }
 ```
 
-### 7.1 `expand()` changes
+### 7.2 `PersonaExpansion::mode_addendum`
 
-Two changes to the persona's `expand()` (which builds the `AgentConfig` set):
+`heartbit-core`'s `PersonaExpansion` struct gains an optional field:
 
-1. The researcher slot resolves via `match recipe.researcher_agent.as_deref() { Some("repo_researcher") => repo_researcher_recipe(), _ => researcher_recipe() }`. Unknown values produce a clear error at expand-time, not at runtime. (Eventually this could become a registry; for now a single match arm is fine.)
+```rust
+pub struct PersonaExpansion {
+    pub agents: Vec<AgentConfig>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub mode_addendum: Option<&'static str>,  // NEW
+    // ... existing orchestrator/review/triggers fields ...
+}
+```
 
-2. The writer's system prompt is `format!("{}\n\n{}", blended_prompt, addendum)` when `addendum` is `Some`.
+`XGhostPersona::expand()` leaves it unset (default `None`). `XHeartbitRsPersona::expand()` sets it to `Some(MODE_ADDENDUM)`. Backward-compatible because `Default` returns `None` and existing call sites that don't use it are unaffected.
 
-Both fields are `#[serde(default)]` so existing personas (heartbit-ghost:x) still parse and behave unchanged.
+### 7.3 Pipeline prompt builders
+
+`crates/heartbit-ghost/src/pipeline/prompts.rs` — three (or more) builders gain a `mode_addendum: Option<&str>` parameter:
+
+```rust
+pub fn build_writer_user_message(
+    topic_or_digest: &str,
+    voice_guidelines: &str,
+    exemplars: &[String],
+    mode_addendum: Option<&str>,  // NEW
+) -> String {
+    let mut out = String::new();
+    out.push_str("Topic / digest:\n");
+    out.push_str(topic_or_digest);
+    out.push_str("\n\nVoice guidelines:\n");
+    out.push_str(voice_guidelines);
+    if let Some(addendum) = mode_addendum {
+        out.push_str("\n\n");
+        out.push_str(addendum);
+    }
+    if !exemplars.is_empty() {
+        out.push_str("\n\nExemplars:\n");
+        for ex in exemplars { out.push_str("- "); out.push_str(ex); out.push('\n'); }
+    }
+    out
+}
+```
+
+`build_critic_user_message`, `build_publisher_user_message` (and any other voice-aware builder) receive the same parameter. Critic and publisher addendum surfacing is OPTIONAL for V1 — pass `None` if not yet wired; they still work. Only the writer must surface it for evangelism mode to land.
+
+### 7.4 Plumbing through the pipeline
+
+`PipelineConfig` and `ReviewConfig` (in `crates/heartbit-ghost/src/pipeline/mod.rs` and `crates/heartbit-ghost/src/review/mod.rs`) gain:
+
+```rust
+pub struct PipelineConfig<'a> {
+    // ... existing fields ...
+    pub mode_addendum: Option<&'a str>,
+}
+```
+
+The CLI dispatcher (in `crates/heartbit-cli/src/persona.rs` or wherever `persona run` is implemented) reads `expansion.mode_addendum` after `persona.expand()` and threads it into the config:
+
+```rust
+let expansion = persona.expand(&params)?;
+let cfg = PipelineConfig { /* ... */, mode_addendum: expansion.mode_addendum };
+```
+
+For heartbit-ghost:x this is `None` (no behavior change). For heartbit-rs:x this is `Some(MODE_ADDENDUM)`.
 
 ## 8. Persona instance TOML
 
-`~/.heartbit/ghost/personas/heartbit-rs:x.toml`:
+`~/.heartbit/ghost/personas/heartbit-rs:x.toml` — same schema as ghost:x, no new fields:
 
 ```toml
 version = 1
 
 [recipe]
 version = 1
-researcher_agent = "repo_researcher"
 
 [[recipe.blend]]
 writer = "burntsushi"
@@ -291,16 +380,9 @@ em_dashes = "forbidden"
 periods = "always"
 quotation_marks = "double"
 line_breaks = "single"
-
-[recipe.overrides.system_prompt_addendum]
-# multiline string — see §6 for full text
-text = """
-EVANGELISM MODE — heartbit-rs:x
-...
-"""
 ```
 
-(Exact TOML shape for `system_prompt_addendum` may need adjustment — TOML multiline-string-as-leaf vs `text = """..."""` table-of-one-key. Plan task verifies.)
+The evangelism addendum is **not** in this TOML — it lives in `crates/heartbit-ghost/src/heartbit_rs.rs::MODE_ADDENDUM`. The TOML controls voice-blend + style overrides only, identical to ghost:x's TOML semantics.
 
 ## 9. Corpus ingestion
 
@@ -327,11 +409,13 @@ heartbit persona profile rebuild heartbit-rs:x
 |-------|-------|----------------|
 | `repo_inspect` unit | 8 | path canonicalization, allowed_prefix enforcement, range bounds, file-too-big, glob filter, list_features deserializes from real fixture, feature_demo lookup, missing-feature error |
 | `repo_researcher` unit | 3 | recipe shape (name/max_turns/max_tokens), system prompt mentions repo_inspect, system prompt explicitly forbids websearch as primary substance |
-| `Recipe` config | 2 | `researcher_agent` parses with `#[serde(default)]`, `system_prompt_addendum` is appended in `expand()` |
-| Integration | 1 | `expand("heartbit-rs:x")` returns AgentConfig set with `repo_researcher` in researcher slot and addendum applied to writer prompt |
+| `XHeartbitRsPersona` unit | 3 | `name() == "heartbit-rs:x"`, `expand()` puts `repo_researcher` in slot 0 of `agents`, `expand().mode_addendum == Some(MODE_ADDENDUM)` |
+| Pipeline prompt builder | 2 | `build_writer_user_message` with `mode_addendum: Some(...)` emits the addendum after voice_guidelines; with `None` emits unchanged output |
+| Integration | 1 | `register()` registers both personas; `tools_for_heartbit_rs()` includes `repo_inspect` (and the existing five) |
+| Features menu CI | 1 | every `canonical_file` in `heartbit-rs-features.toml` exists on disk (catches stale entries) |
 | Live (manual) | 1 | end-to-end `heartbit persona run heartbit-rs:x --review --once "show what the Tool trait gives you"` produces a thread referencing `crates/heartbit-core/src/tool/mod.rs` and at least one of `Tool`, `ToolDefinition`, `ToolOutput` |
 
-Total: ~14 new automated tests + 1 manual live test.
+Total: ~18 new automated tests + 1 manual live test.
 
 ## 11. Out of scope (explicitly deferred)
 
@@ -380,7 +464,7 @@ Drawn from `MEMORY.md` and `CHANGELOG.md`. Each entry needs: `name` (snake_case 
 
 ---
 
-**Self-review notes (to fix during plan-writing if any):**
-- Spec covers the 11 design decisions made in brainstorming: name (D), corpus (D), scope (B), researcher backend (B+websearch), repo_inspect surface (B), framing (demonstrate-by-example), cadence (A), X account (A), persona name (D), reuse model (share most + new researcher + writer addendum), out-of-scope items.
-- One ambiguity: TOML shape for `system_prompt_addendum` — leaf string vs table-with-`text` field. Plan task #1 verifies and picks one.
+**Self-review notes (post-revision 2026-05-09):**
+- Spec covers the 11 design decisions made in brainstorming: name (D), corpus (D), scope (B), researcher backend (B+websearch), repo_inspect surface (B), framing (demonstrate-by-example), cadence (A), X account (A), persona name (D), reuse model (B = new typed persona + pipeline addendum param), out-of-scope items.
+- **Architecture revision (2026-05-09 post-approval):** the original spec proposed `system_prompt_addendum` and `researcher_agent` fields on the user-side `PersonaConfig` TOML, with a corresponding refactor of `expand()`. Reading the code revealed that (a) the writer's `system_prompt` is platform-agnostic by design — voice flows via the user message, not the system prompt; (b) `expand()` is a typed-persona method with no hook for user-side TOML. The spec was revised to "new typed persona `XHeartbitRsPersona` + `mode_addendum: Option<&'static str>` parameter on the pipeline prompt builders" — same end behavior, but cleanly aligned with the existing pattern. User reapproved this pivot before plan-writing.
 - One TBD-equivalent: Appendix A's `canonical_file` paths for ~6 features marked "verify path". This is intentional — the implementation plan task that builds `features.toml` is the right place to do that grep, not this design doc.
