@@ -110,17 +110,63 @@ mod tests {
     }
 
     #[test]
-    fn expand_puts_repo_researcher_first_and_carries_addendum() {
-        // We don't call expand() here because it invokes tools_for_heartbit_rs()
-        // which depends on process env. Instead we verify the building blocks:
-        // - The first recipe in the canonical agent vec matches repo_researcher.
-        // - MODE_ADDENDUM is non-empty and contains the expected sections.
-        // expand()'s full output is exercised in the lib.rs integration test
-        // (Task 8) which can supply a known repo root.
-        let first_recipe = crate::agents::repo_researcher_recipe();
-        assert_eq!(first_recipe.name, "repo_researcher");
+    fn expand_components_match_expected_shape() {
+        // Don't call expand() directly — it invokes the env-var path
+        // which is unsafe to mutate in tests. Instead build the same
+        // pieces expand() composes and assert their shape.
+
+        // 1. Agent slots in declared order (slot 0 differs from ghost).
+        let agents = [
+            crate::agents::repo_researcher_recipe(),
+            crate::agents::writer_recipe(),
+            crate::agents::style_critic_recipe(),
+            crate::agents::judge_recipe(),
+            crate::agents::fact_check_recipe(),
+            crate::agents::image_generator_recipe(),
+            crate::agents::publisher_recipe(),
+        ];
+        assert_eq!(agents.len(), 7, "expected 7 sub-agent recipes");
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "repo_researcher", // differs from ghost (was researcher)
+                "writer",
+                "style_critic",
+                "judge",
+                "fact_check",
+                "image_generator",
+                "publisher",
+            ]
+        );
+
+        // 2. Tool list in declared order — env-free path via _with_root.
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tools = crate::agents::tools_for_heartbit_rs_with_root(repo_root);
+        let tool_names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                "websearch".to_string(),
+                "webfetch".to_string(),
+                "image_generate".to_string(),
+                "twitter_thread".to_string(),
+                "twitter_reply".to_string(),
+                "repo_inspect".to_string(),
+            ]
+        );
+
+        // 3. The MODE_ADDENDUM constant is non-empty and covers the
+        // four required sections.
         assert!(!MODE_ADDENDUM.is_empty());
         assert!(MODE_ADDENDUM.contains("EVANGELISM MODE"));
         assert!(MODE_ADDENDUM.contains("hook → demo → payoff"));
+        assert!(MODE_ADDENDUM.contains("GROUND TRUTH"));
+        assert!(MODE_ADDENDUM.contains("NEVER"));
     }
 }
