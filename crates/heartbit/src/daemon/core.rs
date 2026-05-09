@@ -963,9 +963,16 @@ impl DaemonCore {
                             tracing::warn!(
                                 persona = %persona,
                                 mention_id = %mention.id,
-                                "ReplyDraft dispatched but handler is not yet wired (P1.5c task 11)"
+                                // TODO(P1.5c task 11b): wire daemon-lifecycle wiring for ReplyDraft.
+                                // handle_reply_draft is implemented as a free function in
+                                // daemon::reply_draft_handler — instantiate registries, providers,
+                                // deliveries at DaemonCore startup and thread them into this arm in a
+                                // follow-up commit (mirrors Task 10's lifecycle pattern for MentionPoll).
+                                "ReplyDraft dispatched but daemon-lifecycle wiring not yet \
+                                 in place. handle_reply_draft is implemented as a free \
+                                 function in daemon::reply_draft_handler — wire it from \
+                                 DaemonCore startup in a follow-up commit."
                             );
-                            // No-op for now — task 11 implements the real handler.
                         }
                     }
                 }

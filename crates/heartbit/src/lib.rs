@@ -140,14 +140,15 @@ pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, FileTodoStore,
     HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer, MentionPollDeps,
-    MentionPollScheduler, OnTaskComplete, RuntimeAdvancedConfig, RuntimeAgentConfig,
-    RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent, RuntimeGuardrailConfig,
-    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
-    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig,
-    RuntimeSseEvent, RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig,
-    RuntimeWorkflowEdge, RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore,
-    TodoEntry, TodoList, TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext,
-    format_notification, handle_mention_poll,
+    MentionPollScheduler, OnTaskComplete, ReplyDraftDeps, RuntimeAdvancedConfig,
+    RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent,
+    RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig,
+    RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest, RuntimeResponse,
+    RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent, RuntimeSubAgentConfig,
+    RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge, RuntimeWorkflowNode,
+    TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList, TodoManageTool,
+    UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification, handle_mention_poll,
+    handle_reply_draft,
 };
 
 // --- Eval re-exports ---
