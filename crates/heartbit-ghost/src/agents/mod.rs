@@ -110,15 +110,12 @@ pub fn tools_for_persona() -> Vec<Arc<dyn Tool>> {
 }
 
 /// Tool set for the heartbit-rs:x persona — the existing five plus
-/// `RepoInspectTool` rooted at the workspace root (resolved via the
-/// `HEARTBIT_REPO_ROOT` env var if set, falling back to `cwd()`).
-pub fn tools_for_heartbit_rs() -> Vec<Arc<dyn Tool>> {
+/// `RepoInspectTool` rooted at the supplied path. Crate-private; the
+/// public [`tools_for_heartbit_rs`] resolves the root from environment
+/// then delegates here.
+pub(crate) fn tools_for_heartbit_rs_with_root(repo_root: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
     use crate::tools::{RepoInspectTool, TwitterReplyTool, TwitterThreadTool};
     use heartbit_core::tool::builtins::{ImageGenerateTool, WebFetchTool, WebSearchTool};
-
-    let repo_root = std::env::var("HEARTBIT_REPO_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().expect("cwd resolvable"));
 
     let repo_inspect: Arc<dyn Tool> = match RepoInspectTool::new(&repo_root) {
         Ok(t) => Arc::new(t),
@@ -126,7 +123,10 @@ pub fn tools_for_heartbit_rs() -> Vec<Arc<dyn Tool>> {
             // If we can't construct repo_inspect at startup, the persona
             // is unusable. Fail loudly rather than silently shipping a
             // crippled tool set.
-            panic!("failed to construct RepoInspectTool from {repo_root:?}: {e}");
+            panic!(
+                "failed to construct RepoInspectTool from {repo_root:?}: {e} \
+                 (set HEARTBIT_REPO_ROOT to the workspace root)"
+            );
         }
     };
 
@@ -138,6 +138,19 @@ pub fn tools_for_heartbit_rs() -> Vec<Arc<dyn Tool>> {
         Arc::new(TwitterReplyTool::new()),
         repo_inspect,
     ]
+}
+
+/// Tool set for the heartbit-rs:x persona — same as
+/// [`tools_for_heartbit_rs_with_root`] but resolves the repo root from
+/// the `HEARTBIT_REPO_ROOT` env var (or `cwd()`).
+pub fn tools_for_heartbit_rs() -> Vec<Arc<dyn Tool>> {
+    let repo_root = std::env::var("HEARTBIT_REPO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .expect("current_dir() failed; set HEARTBIT_REPO_ROOT explicitly")
+        });
+    tools_for_heartbit_rs_with_root(repo_root)
 }
 
 #[cfg(test)]
@@ -163,23 +176,13 @@ mod tests {
 
     #[test]
     fn tools_for_heartbit_rs_returns_six_tools_including_repo_inspect() {
-        // Set CWD-equivalent env so RepoInspectTool::new succeeds even
-        // when tests run from a worktree that mirrors the repo layout.
-        // SAFETY: edition 2024 marks `set_var` unsafe due to its non-thread-safe
-        // semantics on some platforms. Acceptable here because `HEARTBIT_REPO_ROOT`
-        // is read only by `tools_for_heartbit_rs` and only inside this single test
-        // (verified via `grep -rn HEARTBIT_REPO_ROOT crates/`).
-        unsafe {
-            std::env::set_var(
-                "HEARTBIT_REPO_ROOT",
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap(),
-            );
-        }
-        let tools = tools_for_heartbit_rs();
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tools = tools_for_heartbit_rs_with_root(repo_root);
         let names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
         assert!(
             names.iter().any(|n| n == "repo_inspect"),
