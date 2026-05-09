@@ -18,6 +18,7 @@ pub mod agents;
 pub mod corpus;
 pub mod heartbit_rs;
 pub mod pipeline;
+pub mod reply;
 pub mod review;
 pub mod tools;
 pub mod voice;
