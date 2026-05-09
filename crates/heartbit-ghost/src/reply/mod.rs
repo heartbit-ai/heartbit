@@ -1,9 +1,9 @@
 //! Reply pipeline — drafts a single short reply to a specific mention,
 //! routes to Telegram for review, posts via `twitter_reply` on user pick.
 //!
-//! See spec §2/§5 for the architecture; this file holds the value types
-//! and the public surface. The runtime lives in [`run_reply_pipeline`]
-//! once Task 5 lands it.
+//! See spec §2/§5 for the architecture. The runtime is
+//! [`run_reply_pipeline`]; helper types and the [`ReplyReviewDelivery`]
+//! trait live here too.
 
 use chrono::{DateTime, Utc};
 
@@ -622,7 +622,7 @@ mod tests {
     }
 
     impl MockReplyReviewDelivery {
-        fn arc(outcome: crate::review::DeliveryOutcome) -> Arc<dyn ReplyReviewDelivery> {
+        fn arc(outcome: crate::review::DeliveryOutcome) -> Arc<MockReplyReviewDelivery> {
             Arc::new(MockReplyReviewDelivery {
                 outcome: Some(outcome),
                 error_msg: None,
@@ -630,7 +630,7 @@ mod tests {
             })
         }
 
-        fn errored(reason: &str) -> Arc<dyn ReplyReviewDelivery> {
+        fn errored(reason: &str) -> Arc<MockReplyReviewDelivery> {
             Arc::new(MockReplyReviewDelivery {
                 outcome: None,
                 error_msg: Some(reason.to_string()),
@@ -891,14 +891,16 @@ mod tests {
             r#"{"verdict":"pass","style_match_score":0.92}"#,
             r#"{"verdict":"verified"}"#,
         ]);
-        let delivery = MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Pick(0));
+        let delivery_concrete =
+            MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Pick(0));
+        let delivery_trait: Arc<dyn ReplyReviewDelivery> = delivery_concrete.clone();
         let twitter_tool = MockReplyTool::success(
             r#"{"tweet_id":"reply123","url":"https://x.com/i/web/status/reply123"}"#,
         );
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery_trait,
             twitter_tool.clone() as Arc<dyn Tool>,
             1,
             fixture_mention(),
@@ -918,6 +920,14 @@ mod tests {
         }
         assert_eq!(out.candidates.len(), 1);
         assert_eq!(out.mention_id, "mention_1");
+
+        // Verify delivery.report() was called with the Posted outcome (spec step 12).
+        let reports = delivery_concrete.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "report() should be called exactly once");
+        match &reports[0] {
+            ReplyOutcome::Posted { chosen_index, .. } => assert_eq!(*chosen_index, 0),
+            other => panic!("expected report() to receive Posted, got {other:?}"),
+        }
     }
 
     // --- Test 2: two candidates, judge picks index 1 ---
@@ -944,7 +954,7 @@ mod tests {
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery as Arc<dyn ReplyReviewDelivery>,
             twitter_tool.clone() as Arc<dyn Tool>,
             2,
             fixture_mention(),
@@ -974,7 +984,7 @@ mod tests {
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery as Arc<dyn ReplyReviewDelivery>,
             twitter_tool.clone() as Arc<dyn Tool>,
             1,
             fixture_mention(),
@@ -1013,7 +1023,7 @@ mod tests {
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery as Arc<dyn ReplyReviewDelivery>,
             twitter_tool.clone() as Arc<dyn Tool>,
             1,
             fixture_mention(),
@@ -1053,7 +1063,7 @@ mod tests {
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery as Arc<dyn ReplyReviewDelivery>,
             twitter_tool.clone() as Arc<dyn Tool>,
             1,
             fixture_mention(),
@@ -1086,7 +1096,7 @@ mod tests {
         let cfg = mk_reply_cfg(
             &profiles_root,
             provider,
-            delivery,
+            delivery as Arc<dyn ReplyReviewDelivery>,
             twitter_tool.clone() as Arc<dyn Tool>,
             1,
             fixture_mention(),
