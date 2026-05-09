@@ -38,7 +38,7 @@ payoff = "one binary serves agents over Kafka, HTTP API, SSE stream, and webhook
 [[feature]]
 name = "doom_loop_detection"
 description = "Hash tool-call batches per turn; abort on repetition"
-canonical_file = "crates/heartbit-core/src/agent/doom_loop.rs"
+canonical_file = "crates/heartbit-core/src/agent/builder.rs"
 key_types = ["AgentRunnerBuilder::max_identical_tool_calls"]
 payoff = "catch agents stuck in a tight loop early instead of burning tokens"
 
