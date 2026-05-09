@@ -7,6 +7,8 @@
 
 use chrono::{DateTime, Utc};
 
+pub mod prompts;
+
 /// A mention of the operator's account fetched from `twitter_mentions`.
 #[derive(Debug, Clone)]
 pub struct Mention {
