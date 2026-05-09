@@ -1,0 +1,134 @@
+version = 1
+
+# Curated feature menu for the heartbit-rs:x persona. Each entry maps
+# a demonstrable framework feature to its canonical source file, key
+# types, and a one-line payoff. Order: alphabetical by name.
+#
+# When adding a feature: ensure the canonical_file path is correct
+# (`tests/features_menu_paths_exist.rs` will catch stale entries).
+
+[[feature]]
+name = "agent_runner"
+description = "Standalone agent loop with tokio::JoinSet for parallel tool execution"
+canonical_file = "crates/heartbit-core/src/agent/runner.rs"
+key_types = ["AgentRunner", "AgentRunnerBuilder", "AgentOutput"]
+payoff = "single-process agent loop, no Restate / no daemon — drop into any tokio app"
+
+[[feature]]
+name = "auto_compaction"
+description = "AgentRunner detects ContextOverflow errors, summarizes the conversation, and retries automatically — no public toggle, just built-in behavior"
+canonical_file = "crates/heartbit-core/src/agent/runner.rs"
+key_types = ["AgentRunner"]
+payoff = "hit the 200k Anthropic limit and recover automatically; no manual summarization scripts"
+
+[[feature]]
+name = "cascading_provider"
+description = "Try cheapest model first, escalate on rejection"
+canonical_file = "crates/heartbit-core/src/llm/cascade.rs"
+key_types = ["CascadingProvider", "ConfidenceGate", "HeuristicGate"]
+payoff = "run a cheap local model 80% of the time, escalate to GPT-4 only when needed"
+
+[[feature]]
+name = "daemon_mode"
+description = "Kafka consumer + Axum HTTP + SSE for server deployments"
+canonical_file = "crates/heartbit/src/daemon/core.rs"
+key_types = ["DaemonCore", "DaemonConfig"]
+payoff = "one binary serves agents over Kafka, HTTP API, SSE stream, and webhooks"
+
+[[feature]]
+name = "doom_loop_detection"
+description = "Hash tool-call batches per turn; abort on repetition"
+canonical_file = "crates/heartbit-core/src/agent/builder.rs"
+key_types = ["AgentRunnerBuilder::max_identical_tool_calls"]
+payoff = "catch agents stuck in a tight loop early instead of burning tokens"
+
+[[feature]]
+name = "guardrails"
+description = "Guardrail trait with 4 hooks for safety policies"
+canonical_file = "crates/heartbit-core/src/agent/guardrails/mod.rs"
+key_types = ["Guardrail", "ApprovalDecision"]
+payoff = "inject pre/post hooks for tool calls and LLM responses without modifying agent code"
+
+[[feature]]
+name = "llm_judge"
+description = "LlmJudgeGuardrail uses a cheap model to vet outputs"
+canonical_file = "crates/heartbit-core/src/agent/guardrails/llm_judge.rs"
+key_types = ["LlmJudgeGuardrail", "LlmJudgeGuardrailBuilder"]
+payoff = "wire a 0.1¢/call judge to veto unsafe outputs from your main agent"
+
+[[feature]]
+name = "mcp_client"
+description = "MCP Streamable HTTP client"
+canonical_file = "crates/heartbit-core/src/tool/mcp.rs"
+key_types = ["McpClient", "McpTransportPool"]
+payoff = "connect any MCP-compatible tool server (e.g. agentgateway) over HTTP without writing a transport"
+
+[[feature]]
+name = "memory_bm25"
+description = "Optional BM25 inverted index for memory recall"
+canonical_file = "crates/heartbit-core/src/memory/bm25.rs"
+key_types = ["MemoryQuery::exact_words"]
+payoff = "exact-keyword recall on top of vector recall, with one query method, no infra"
+
+[[feature]]
+name = "memory_trait"
+description = "Memory trait with 6 methods: store / recall / update / forget / add_link / prune"
+canonical_file = "crates/heartbit-core/src/memory/mod.rs"
+key_types = ["Memory", "MemoryEntry", "MemoryQuery"]
+payoff = "swap InMemory for Postgres without touching agent code; SOTA recall built in"
+
+[[feature]]
+name = "orchestrator"
+description = "Multi-agent dispatch via DelegateTaskTool / FormSquadTool"
+canonical_file = "crates/heartbit-core/src/agent/orchestrator.rs"
+key_types = ["Orchestrator", "OrchestratorBuilder", "DelegateTaskTool"]
+payoff = "spin up a parallel squad of sub-agents in one method call; orchestrator handles fan-out/fan-in"
+
+[[feature]]
+name = "prompt_caching"
+description = "3 cache breakpoints for Anthropic provider — system prompt, last tool def, second-to-last user message"
+canonical_file = "crates/heartbit-core/src/llm/anthropic.rs"
+key_types = ["AnthropicProvider::with_prompt_caching"]
+payoff = "cut input token cost 80%+ on long-running agents with one builder method"
+
+[[feature]]
+name = "restate_workflows"
+description = "Durable agent execution with replay"
+canonical_file = "crates/heartbit/src/workflow/agent_workflow.rs"
+key_types = ["AgentWorkflowImpl"]
+payoff = "resume an agent run after process crash; Restate stores every LLM call and tool result"
+
+[[feature]]
+name = "retrying_provider"
+description = "Wraps any LlmProvider with retry logic"
+canonical_file = "crates/heartbit-core/src/llm/retry.rs"
+key_types = ["RetryingProvider"]
+payoff = "wrap any provider in 1 line; handles 429, 5xx, network errors with exponential backoff"
+
+[[feature]]
+name = "tool_profiles"
+description = "ToolProfile::Conversational/Standard/Full to reduce input tokens"
+canonical_file = "crates/heartbit-core/src/agent/tool_filter.rs"
+key_types = ["ToolProfile", "AgentRunnerBuilder::tool_profile"]
+payoff = "drop input tokens 60% by classifying user queries and filtering tools per turn"
+
+[[feature]]
+name = "tool_redaction"
+description = "Tool::redact_for_history strips large blobs from conversation history"
+canonical_file = "crates/heartbit-core/src/tool/mod.rs"
+key_types = ["Tool::redact_for_history"]
+payoff = "image-generation tools or large file readers don't blow up your context"
+
+[[feature]]
+name = "tool_trait"
+description = "The Tool trait — definition() + execute() — that powers everything in heartbit-core"
+canonical_file = "crates/heartbit-core/src/tool/mod.rs"
+key_types = ["Tool", "ToolDefinition", "ToolOutput"]
+payoff = "implement two methods, get a fully-wired tool with retry, guardrails, telemetry"
+
+[[feature]]
+name = "workflow_agents"
+description = "Sequential / Parallel / Loop deterministic orchestration agents"
+canonical_file = "crates/heartbit-core/src/agent/workflow.rs"
+key_types = ["SequentialAgent", "ParallelAgent", "LoopAgent"]
+payoff = "chain agents like Unix pipelines, no LLM cost — pure deterministic dispatch"

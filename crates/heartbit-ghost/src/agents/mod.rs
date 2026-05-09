@@ -25,6 +25,7 @@ pub mod fact_check;
 pub mod image_generator;
 pub mod judge;
 pub mod publisher;
+pub mod repo_researcher;
 pub mod researcher;
 pub mod style_critic;
 pub mod writer;
@@ -33,6 +34,7 @@ pub use fact_check::fact_check_recipe;
 pub use image_generator::image_generator_recipe;
 pub use judge::judge_recipe;
 pub use publisher::publisher_recipe;
+pub use repo_researcher::repo_researcher_recipe;
 pub use researcher::researcher_recipe;
 pub use style_critic::style_critic_recipe;
 pub use writer::writer_recipe;
@@ -107,6 +109,55 @@ pub fn tools_for_persona() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
+/// Tool set for the heartbit-rs:x persona — the existing five plus
+/// `RepoInspectTool` rooted at the supplied path. Crate-private; the
+/// public [`tools_for_heartbit_rs`] resolves the root from environment
+/// then delegates here.
+pub(crate) fn tools_for_heartbit_rs_with_root(repo_root: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
+    use crate::tools::{RepoInspectTool, TwitterReplyTool, TwitterThreadTool};
+    use heartbit_core::tool::builtins::ImageGenerateTool;
+
+    let repo_inspect: Arc<dyn Tool> = match RepoInspectTool::new(&repo_root) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            // If we can't construct repo_inspect at startup, the persona
+            // is unusable. Fail loudly rather than silently shipping a
+            // crippled tool set.
+            panic!(
+                "failed to construct RepoInspectTool from {repo_root:?}: {e} \
+                 (set HEARTBIT_REPO_ROOT to the workspace root)"
+            );
+        }
+    };
+
+    // websearch / webfetch are deliberately omitted: the persona's
+    // contract is "every claim grounded in the local repo", and giving
+    // the researcher access to web tools causes it to default to
+    // websearch (finding unrelated public Rust crates) instead of
+    // calling repo_inspect on the local source. If external context is
+    // ever needed for adjacent topics, add a separate per-agent tool
+    // whitelist mechanism upstream rather than re-adding the temptation.
+    vec![
+        repo_inspect,
+        Arc::new(ImageGenerateTool::new()),
+        Arc::new(TwitterThreadTool::new()),
+        Arc::new(TwitterReplyTool::new()),
+    ]
+}
+
+/// Tool set for the heartbit-rs:x persona — same as
+/// [`tools_for_heartbit_rs_with_root`] but resolves the repo root from
+/// the `HEARTBIT_REPO_ROOT` env var (or `cwd()`).
+pub fn tools_for_heartbit_rs() -> Vec<Arc<dyn Tool>> {
+    let repo_root = std::env::var("HEARTBIT_REPO_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .expect("current_dir() failed; set HEARTBIT_REPO_ROOT explicitly")
+        });
+    tools_for_heartbit_rs_with_root(repo_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +176,33 @@ mod tests {
                 "twitter_thread".to_string(),
                 "twitter_reply".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn tools_for_heartbit_rs_returns_four_tools_including_repo_inspect() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tools = tools_for_heartbit_rs_with_root(repo_root);
+        let names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
+        assert!(
+            names.iter().any(|n| n == "repo_inspect"),
+            "repo_inspect must be in the tool list; got: {names:?}"
+        );
+        // websearch + webfetch are deliberately excluded so the
+        // researcher can't default to web lookups and skip repo_inspect.
+        assert!(
+            !names.iter().any(|n| n == "websearch" || n == "webfetch"),
+            "websearch / webfetch must not be present; got: {names:?}"
+        );
+        assert_eq!(
+            tools.len(),
+            4,
+            "expected repo_inspect + image_generate + twitter_thread + twitter_reply"
         );
     }
 }

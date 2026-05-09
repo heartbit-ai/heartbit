@@ -16,6 +16,7 @@ use heartbit_core::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
 
 pub mod agents;
 pub mod corpus;
+pub mod heartbit_rs;
 pub mod pipeline;
 pub mod review;
 pub mod tools;
@@ -97,6 +98,7 @@ impl Persona for XGhostPersona {
 /// dispatch / daemon dispatch / etc.
 pub fn register(registry: &mut PersonaRegistry) {
     registry.register(Arc::new(XGhostPersona::new()));
+    heartbit_rs::register(registry);
 }
 
 #[cfg(test)]
@@ -167,23 +169,27 @@ mod tests {
     }
 
     #[test]
-    fn register_adds_persona_to_empty_registry() {
+    fn register_adds_personas_to_empty_registry() {
         let mut r = PersonaRegistry::new();
         assert!(r.is_empty());
         register(&mut r);
-        assert_eq!(r.len(), 1);
+        assert_eq!(r.len(), 2);
         assert!(r.get(PERSONA_NAME).is_some());
-        assert_eq!(r.list(), vec!["heartbit-ghost:x"]);
+        assert!(r.get(crate::heartbit_rs::PERSONA_NAME).is_some());
+        let mut names = r.list();
+        names.sort();
+        assert_eq!(names, vec!["heartbit-ghost:x", "heartbit-rs:x"]);
     }
 
     #[test]
     fn register_twice_is_idempotent() {
         // PersonaRegistry::register is last-write-wins, so calling register()
-        // twice should leave exactly one entry under the same key.
+        // twice should leave exactly one entry per key (two personas total).
         let mut r = PersonaRegistry::new();
         register(&mut r);
         register(&mut r);
-        assert_eq!(r.len(), 1);
+        assert_eq!(r.len(), 2);
         assert!(r.get(PERSONA_NAME).is_some());
+        assert!(r.get(crate::heartbit_rs::PERSONA_NAME).is_some());
     }
 }

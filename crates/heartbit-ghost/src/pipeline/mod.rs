@@ -64,6 +64,13 @@ pub struct ImageAttachment {
 /// pipeline stage start. Used by `PipelineConfig::on_progress`.
 pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Researcher override — `(recipe, tools)` pair that, when supplied,
+/// replaces the pipeline's default `researcher_recipe()` +
+/// `[WebSearchTool, WebFetchTool]`. The `Arc<AgentConfig>` is required
+/// because `AgentConfig` does not derive `Clone` while
+/// `PipelineConfig` does.
+pub type ResearcherOverride = (Arc<AgentConfig>, Vec<Arc<dyn Tool>>);
+
 /// Configuration for one pipeline run.
 #[derive(Clone)]
 pub struct PipelineConfig<'a> {
@@ -84,6 +91,17 @@ pub struct PipelineConfig<'a> {
     /// Validated `1..=10` at the start of `run_pipeline`. Set to 1 to
     /// recover the P1.3b single-candidate behavior (judge skipped).
     pub candidates_per_draft: usize,
+    /// Persona-specific mode addendum surfaced in the writer's user
+    /// message after voice_guidelines. None for personas that don't
+    /// have one (heartbit-ghost:x).
+    pub mode_addendum: Option<&'a str>,
+    /// Override the default researcher (recipe + tools). When `Some`,
+    /// the pipeline uses these instead of the legacy
+    /// `researcher_recipe()` plus `WebSearchTool`+`WebFetchTool`.
+    /// heartbit-rs:x supplies its `repo_researcher_recipe()` plus
+    /// `RepoInspectTool` here so the agent is forced to read the local
+    /// repo instead of the public web.
+    pub researcher_override: Option<ResearcherOverride>,
 }
 
 /// Output of a successful pipeline run.
@@ -340,6 +358,7 @@ pub(crate) async fn generate_candidate(
     writer: &AgentRunner<BoxedProvider>,
     critic: &AgentRunner<BoxedProvider>,
     fact: &AgentRunner<BoxedProvider>,
+    mode_addendum: Option<&str>,
 ) -> Result<CandidateRecord, PipelineError> {
     // Revise loop.
     let mut prev_revision: Option<(String, String)> = None;
@@ -355,6 +374,7 @@ pub(crate) async fn generate_candidate(
             prev_revision.as_ref(),
             variant_idx,
             total_variants,
+            mode_addendum,
         );
         let writer_out = writer
             .execute(&writer_msg)
@@ -466,17 +486,29 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     };
     use heartbit_core::tool::builtins::{ImageGenerateTool, WebFetchTool, WebSearchTool};
 
-    let researcher_tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(WebSearchTool::new()),
-        Arc::new(WebFetchTool::new()),
-    ];
-    let researcher =
-        runner_from_recipe(cfg.provider.clone(), researcher_recipe(), researcher_tools).map_err(
-            |e| PipelineError::Builder {
-                stage: "researcher".to_string(),
-                source: e,
-            },
-        )?;
+    // The researcher is the only agent that varies by persona today.
+    // heartbit-ghost:x → default researcher_recipe() + [websearch, webfetch].
+    // heartbit-rs:x   → repo_researcher_recipe() + [repo_inspect] (via override).
+    let (researcher_recipe_used, researcher_tools): (AgentConfig, Vec<Arc<dyn Tool>>) =
+        match cfg.researcher_override.as_ref() {
+            Some((recipe, tools)) => ((**recipe).clone_config(), tools.clone()),
+            None => (
+                researcher_recipe(),
+                vec![
+                    Arc::new(WebSearchTool::new()),
+                    Arc::new(WebFetchTool::new()),
+                ],
+            ),
+        };
+    let researcher = runner_from_recipe(
+        cfg.provider.clone(),
+        researcher_recipe_used,
+        researcher_tools,
+    )
+    .map_err(|e| PipelineError::Builder {
+        stage: "researcher".to_string(),
+        source: e,
+    })?;
     let writer =
         runner_from_recipe(cfg.provider.clone(), writer_recipe(), Vec::new()).map_err(|e| {
             PipelineError::Builder {
@@ -542,6 +574,9 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     let topic_owned: String = cfg.topic.to_string();
     let digest_owned = std::sync::Arc::new(research_digest.clone());
     let voice_owned = std::sync::Arc::new(voice_guidelines.clone());
+    // Convert to owned Arc<str> so the spawn closures are 'static.
+    let mode_addendum_owned: Option<std::sync::Arc<str>> =
+        cfg.mode_addendum.map(std::sync::Arc::from);
 
     let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
         tokio::task::JoinSet::new();
@@ -552,8 +587,20 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
         let topic = topic_owned.clone();
         let digest = digest_owned.clone();
         let voice = voice_owned.clone();
+        let mode_addendum = mode_addendum_owned.clone();
         joinset.spawn(async move {
-            generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+            generate_candidate(
+                i,
+                n,
+                &topic,
+                &digest,
+                &voice,
+                &writer,
+                &critic,
+                &fact,
+                mode_addendum.as_deref(),
+            )
+            .await
         });
     }
 
@@ -600,8 +647,20 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
             let topic = topic_owned.clone();
             let digest = digest_owned.clone();
             let voice = voice_owned.clone();
+            let mode_addendum = mode_addendum_owned.clone();
             joinset2.spawn(async move {
-                generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+                generate_candidate(
+                    i,
+                    n,
+                    &topic,
+                    &digest,
+                    &voice,
+                    &writer,
+                    &critic,
+                    &fact,
+                    mode_addendum.as_deref(),
+                )
+                .await
             });
         }
         while let Some(res) = joinset2.join_next().await {
@@ -753,7 +812,7 @@ mod tests {
 
     use heartbit_core::llm::LlmProvider;
     use heartbit_core::llm::types::{
-        CompletionRequest, CompletionResponse, ContentBlock, StopReason,
+        CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason,
     };
     use std::future::Future;
     use std::sync::Mutex;
@@ -769,8 +828,13 @@ mod tests {
     /// concurrently via `tokio::JoinSet`) all draw from the same
     /// "writer" queue without interleaving with the critic / fact_check
     /// / judge / image_generator queues.
+    ///
+    /// The optional `recorded_user_messages` field captures the first
+    /// user-message text from every `complete()` call. Used by tests that
+    /// need to verify what the LLM actually received.
     struct MockProvider {
         routes: Mutex<Vec<(String, std::collections::VecDeque<String>)>>,
+        recorded_user_messages: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockProvider {
@@ -778,6 +842,15 @@ mod tests {
         /// `(substring_key, responses)` pair. The substring is matched
         /// against the request's system prompt.
         fn route(routes: Vec<(&str, Vec<&str>)>) -> Arc<BoxedProvider> {
+            let (provider, _) = Self::route_with_recorder(routes);
+            provider
+        }
+
+        /// Like `route`, but also returns the recorder so the caller can
+        /// inspect what user messages were received by the mock.
+        fn route_with_recorder(
+            routes: Vec<(&str, Vec<&str>)>,
+        ) -> (Arc<BoxedProvider>, Arc<Mutex<Vec<String>>>) {
             let mapped: Vec<(String, std::collections::VecDeque<String>)> = routes
                 .into_iter()
                 .map(|(key, responses)| {
@@ -787,10 +860,12 @@ mod tests {
                     )
                 })
                 .collect();
+            let recorder: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let p = MockProvider {
                 routes: Mutex::new(mapped),
+                recorded_user_messages: Arc::clone(&recorder),
             };
-            Arc::new(BoxedProvider::new(p))
+            (Arc::new(BoxedProvider::new(p)), recorder)
         }
 
         /// Backward-compat helper: single-queue version. Internally
@@ -805,6 +880,20 @@ mod tests {
             &self,
             request: CompletionRequest,
         ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
+            // Record the first user-message text for assertion in tests that
+            // use `route_with_recorder`.
+            let user_text = request
+                .messages
+                .iter()
+                .find(|m| m.role == Role::User)
+                .and_then(|m| m.content.first())
+                .and_then(|c| match c {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.recorded_user_messages.lock().unwrap().push(user_text);
+
             // Find which route this request belongs to by matching the
             // system prompt against route keys. First non-empty key with
             // a substring match wins; "" key is the wildcard fallback.
@@ -932,6 +1021,96 @@ mod tests {
         }
     }
 
+    /// Drive `run_pipeline` with `mode_addendum = Some("FRAMEWORK_DEMO_FIXTURE")` and
+    /// assert the writer's LLM call actually receives that string in its user message.
+    ///
+    /// This exercises the full threading path:
+    ///   PipelineConfig.mode_addendum
+    ///   → spawn-loop Arc<str> conversion (mode_addendum_owned.as_deref())
+    ///   → generate_candidate(mode_addendum)
+    ///   → build_writer_user_message(mode_addendum)
+    ///   → CompletionRequest.messages[0] received by the mock.
+    ///
+    /// A regression at any link (field dropped, Arc deref wrong, param ignored,
+    /// builder omitted) causes the assertion to fail.
+    #[tokio::test]
+    async fn mode_addendum_some_value_appears_in_writer_user_message() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let (provider, recorder) = MockProvider::route_with_recorder(vec![
+            ("research analyst", vec!["Research digest:\n- AI notes"]),
+            ("social media writer", vec!["concrete short post"]),
+            (
+                "score how well a draft post",
+                vec![r#"{"verdict": "pass", "style_match_score": 0.92}"#],
+            ),
+            (
+                "verify the factual claims",
+                vec![r#"{"verdict": "verified"}"#],
+            ),
+            ("produce an image to accompany", vec!["no_image"]),
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "addendum test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 1,
+            mode_addendum: Some("FRAMEWORK_DEMO_FIXTURE"),
+            researcher_override: None,
+        };
+        run_pipeline(cfg).await.expect("pipeline should succeed");
+        let received = recorder.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .any(|msg| msg.contains("FRAMEWORK_DEMO_FIXTURE")),
+            "expected at least one LLM call to contain 'FRAMEWORK_DEMO_FIXTURE'; \
+             recorded messages: {received:#?}",
+        );
+    }
+
+    /// Complementary sanity check: when `mode_addendum` is `None` the fixture
+    /// string must NOT appear anywhere in the received messages.
+    #[tokio::test]
+    async fn mode_addendum_none_omits_addendum_from_writer_user_message() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let (provider, recorder) = MockProvider::route_with_recorder(vec![
+            ("research analyst", vec!["Research digest:\n- AI notes"]),
+            ("social media writer", vec!["concrete short post"]),
+            (
+                "score how well a draft post",
+                vec![r#"{"verdict": "pass", "style_match_score": 0.92}"#],
+            ),
+            (
+                "verify the factual claims",
+                vec![r#"{"verdict": "verified"}"#],
+            ),
+            ("produce an image to accompany", vec!["no_image"]),
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "addendum test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
+        };
+        run_pipeline(cfg).await.expect("pipeline should succeed");
+        let received = recorder.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .all(|msg| !msg.contains("FRAMEWORK_DEMO_FIXTURE")),
+            "expected no LLM call to contain 'FRAMEWORK_DEMO_FIXTURE' when addendum is None; \
+             recorded messages: {received:#?}",
+        );
+    }
+
     #[tokio::test]
     async fn run_pipeline_happy_path_single_iteration() {
         let (_dir, profiles_root) = seed_snapshot("x");
@@ -951,6 +1130,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path");
         assert_eq!(out.final_draft, "concrete short post");
@@ -983,6 +1164,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("revise then pass");
         assert_eq!(out.final_draft, "second draft, no em-dashes");
@@ -1009,6 +1192,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1043,6 +1228,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1068,6 +1255,8 @@ mod tests {
             profiles_root: &root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1132,6 +1321,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("3-candidate happy path");
         assert_eq!(out.candidates.len(), 3);
@@ -1207,6 +1398,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("collapse+refill succeeds");
         assert_eq!(
@@ -1236,6 +1429,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1259,6 +1454,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 0, // invalid
+            mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1291,6 +1488,8 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path with no_image");
         assert_eq!(out.candidates.len(), 1);

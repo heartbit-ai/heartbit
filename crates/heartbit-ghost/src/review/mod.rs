@@ -13,7 +13,7 @@ use heartbit_core::llm::types::TokenUsage;
 use heartbit_core::tool::Tool;
 use thiserror::Error;
 
-use crate::pipeline::{CandidateRecord, PipelineError, ProgressCallback};
+use crate::pipeline::{CandidateRecord, PipelineError, ProgressCallback, ResearcherOverride};
 
 pub mod delivery;
 pub mod prompts;
@@ -53,6 +53,14 @@ pub struct ReviewConfig<'a> {
     /// Credential resolver for `twitter_tool`. Threaded into
     /// `ExecutionContext::credentials` at execute-time.
     pub credentials: Arc<dyn CredentialResolver>,
+    /// Persona-specific mode addendum surfaced in the writer's user
+    /// message after voice_guidelines. None for personas that don't
+    /// have one (heartbit-ghost:x).
+    pub mode_addendum: Option<&'a str>,
+    /// Override the default researcher (recipe + tools). Mirrors
+    /// `PipelineConfig::researcher_override`. None for heartbit-ghost:x;
+    /// `Some((repo_researcher_recipe, [repo_inspect]))` for heartbit-rs:x.
+    pub researcher_override: Option<ResearcherOverride>,
 }
 
 /// Output of a successful review-mode run.
@@ -252,13 +260,24 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     use crate::agents::{fact_check_recipe, researcher_recipe, style_critic_recipe, writer_recipe};
     use heartbit_core::tool::builtins::{WebFetchTool, WebSearchTool};
 
-    let researcher_tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(WebSearchTool::new()),
-        Arc::new(WebFetchTool::new()),
-    ];
+    // Mirror PipelineConfig::researcher_override semantics — see
+    // pipeline/mod.rs::run_pipeline for rationale.
+    let (researcher_recipe_used, researcher_tools): (
+        heartbit_core::config::AgentConfig,
+        Vec<Arc<dyn Tool>>,
+    ) = match cfg.researcher_override.as_ref() {
+        Some((recipe, tools)) => ((**recipe).clone_config(), tools.clone()),
+        None => (
+            researcher_recipe(),
+            vec![
+                Arc::new(WebSearchTool::new()),
+                Arc::new(WebFetchTool::new()),
+            ],
+        ),
+    };
     let researcher = crate::pipeline::runner_from_recipe(
         cfg.provider.clone(),
-        researcher_recipe(),
+        researcher_recipe_used,
         researcher_tools,
     )
     .map_err(|e| PipelineError::Builder {
@@ -314,6 +333,9 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     let topic_owned: String = cfg.topic.to_string();
     let digest_owned = std::sync::Arc::new(research_digest.clone());
     let voice_owned = std::sync::Arc::new(voice_guidelines.clone());
+    // Convert to owned Arc<str> so the spawn closures are 'static.
+    let mode_addendum_owned: Option<std::sync::Arc<str>> =
+        cfg.mode_addendum.map(std::sync::Arc::from);
 
     let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
         tokio::task::JoinSet::new();
@@ -324,9 +346,18 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
         let topic = topic_owned.clone();
         let digest = digest_owned.clone();
         let voice = voice_owned.clone();
+        let mode_addendum = mode_addendum_owned.clone();
         joinset.spawn(async move {
             crate::pipeline::generate_candidate(
-                i, n, &topic, &digest, &voice, &writer, &critic, &fact,
+                i,
+                n,
+                &topic,
+                &digest,
+                &voice,
+                &writer,
+                &critic,
+                &fact,
+                mode_addendum.as_deref(),
             )
             .await
         });
@@ -837,6 +868,8 @@ mod tests {
             delivery,
             twitter_tool,
             credentials: Arc::new(StubCredentialResolver),
+            mode_addendum: None,
+            researcher_override: None,
         }
     }
 

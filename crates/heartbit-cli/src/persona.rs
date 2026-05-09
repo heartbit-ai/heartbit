@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
 
-use heartbit::PersonaRegistry;
+use heartbit::{PersonaParams, PersonaRegistry};
 
 use crate::build_provider_from_env;
 
@@ -162,12 +162,32 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
             Ok(())
         }
         PersonaCommand::Run { name, once, review } => {
-            if registry.get(&name).is_none() {
-                return Err(anyhow!(
-                    "persona '{name}' not found. {}",
-                    registry_suffix(registry)
-                ));
-            }
+            let persona = registry.get(&name).ok_or_else(|| {
+                anyhow!("persona '{name}' not found. {}", registry_suffix(registry))
+            })?;
+            let expansion = persona
+                .expand(&PersonaParams::default())
+                .map_err(|e| anyhow!("expand persona '{name}': {e}"))?;
+
+            // If the persona declares a non-default researcher (currently
+            // only `repo_researcher` for heartbit-rs:x), pull it out of
+            // the expansion's agent vec along with the matching tools
+            // (filtered to research-relevant ones) so the pipeline uses
+            // it instead of the legacy `researcher_recipe()`.
+            let researcher_override = expansion
+                .agents
+                .iter()
+                .find(|a| a.name == "repo_researcher")
+                .map(|recipe| {
+                    let recipe = std::sync::Arc::new(recipe.clone_config());
+                    let tools: Vec<std::sync::Arc<dyn heartbit_core::Tool>> = expansion
+                        .tools
+                        .iter()
+                        .filter(|t| t.definition().name == "repo_inspect")
+                        .cloned()
+                        .collect();
+                    (recipe, tools)
+                });
 
             let provider =
                 build_provider_from_env(None).map_err(|e| anyhow!("build llm provider: {e}"))?;
@@ -189,6 +209,8 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                     &corpora_root,
                     &profiles_root,
                     Some(on_progress),
+                    expansion.mode_addendum,
+                    researcher_override.clone(),
                 )
                 .await
                 .map_err(|e| anyhow!("review config: {e}"))?;
@@ -215,6 +237,8 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                     profiles_root: &profiles_root,
                     on_progress: Some(on_progress),
                     candidates_per_draft: 3,
+                    mode_addendum: expansion.mode_addendum,
+                    researcher_override,
                 };
 
                 let n_requested = cfg.candidates_per_draft;
@@ -488,7 +512,8 @@ mod tests {
         let err = result.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("persona 'doesnotexist' not found"));
-        assert!(msg.contains("Available personas: heartbit-ghost:x"));
+        assert!(msg.contains("Available personas"), "got: {msg}");
+        assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         // Must NOT regress to the empty-registry hint when one IS registered.
         assert!(!msg.contains("No personas registered"));
     }
@@ -575,10 +600,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("no-such-persona"), "got: {msg}");
-        assert!(
-            msg.contains("Available personas: heartbit-ghost:x"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Available personas"), "got: {msg}");
+        assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         assert!(!msg.contains("No personas registered"), "got: {msg}");
     }
 
@@ -595,10 +618,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("no-such-persona"), "got: {msg}");
-        assert!(
-            msg.contains("Available personas: heartbit-ghost:x"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Available personas"), "got: {msg}");
+        assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         assert!(!msg.contains("No personas registered"), "got: {msg}");
     }
 
@@ -617,10 +638,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("no-such-persona"), "got: {msg}");
-        assert!(
-            msg.contains("Available personas: heartbit-ghost:x"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Available personas"), "got: {msg}");
+        assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         assert!(!msg.contains("No personas registered"), "got: {msg}");
     }
 
@@ -651,10 +670,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("no-such-persona"), "got: {msg}");
-        assert!(
-            msg.contains("Available personas: heartbit-ghost:x"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Available personas"), "got: {msg}");
+        assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         assert!(!msg.contains("No personas registered"), "got: {msg}");
     }
 }
