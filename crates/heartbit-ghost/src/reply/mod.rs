@@ -223,6 +223,331 @@ pub struct ReplyReviewMessage {
     pub interaction_timeout_seconds: u64,
 }
 
+/// Execute one reply pipeline. Returns when the user picks (and the
+/// reply posts), skips, times out, or all candidates return "no_reply".
+pub async fn run_reply_pipeline(cfg: ReplyConfig<'_>) -> Result<ReplyOutput, ReplyError> {
+    use crate::agents::{
+        fact_check_recipe, judge_recipe, reply_writer_recipe, researcher_recipe,
+        style_critic_recipe,
+    };
+    use heartbit_core::llm::types::TokenUsage;
+
+    // 1. Validate.
+    if !(1..=3).contains(&cfg.candidates_per_reply) {
+        return Err(ReplyError::InvalidConfig(format!(
+            "candidates_per_reply must be in 1..=3 (got {})",
+            cfg.candidates_per_reply,
+        )));
+    }
+
+    let progress = |s: &str| {
+        if let Some(cb) = cfg.on_progress.as_ref() {
+            cb(s);
+        }
+    };
+
+    // 2. Load profile snapshot.
+    progress("Loading profile snapshot...");
+    let store = crate::voice::SnapshotStore::open(cfg.profiles_root, cfg.persona_name)
+        .map_err(PipelineError::from)?;
+    let snapshot = store
+        .load_latest()
+        .map_err(PipelineError::from)?
+        .ok_or_else(|| PipelineError::NoProfileSnapshot {
+            persona: cfg.persona_name.to_string(),
+            profiles_dir: cfg.profiles_root.join(cfg.persona_name),
+        })?;
+    let profile = snapshot.profile;
+
+    // 3. Build the 5 sub-agent runners.
+    let (researcher_recipe_used, researcher_tools): (
+        heartbit_core::config::AgentConfig,
+        Vec<Arc<dyn Tool>>,
+    ) = match cfg.researcher_override.as_ref() {
+        Some((recipe, tools)) => ((**recipe).clone_config(), tools.clone()),
+        None => (
+            researcher_recipe(),
+            // Replies do NOT need web search by default — context comes from
+            // the parent + mentioner_context already passed into the user
+            // message. Empty tool set keeps the researcher focused.
+            Vec::new(),
+        ),
+    };
+    let researcher = crate::pipeline::runner_from_recipe(
+        cfg.provider.clone(),
+        researcher_recipe_used,
+        researcher_tools,
+    )
+    .map_err(|source| PipelineError::Builder {
+        stage: "researcher".to_string(),
+        source,
+    })?;
+    let writer = crate::pipeline::runner_from_recipe(
+        cfg.provider.clone(),
+        reply_writer_recipe(),
+        Vec::new(),
+    )
+    .map_err(|source| PipelineError::Builder {
+        stage: "reply_writer".to_string(),
+        source,
+    })?;
+    let critic = crate::pipeline::runner_from_recipe(
+        cfg.provider.clone(),
+        style_critic_recipe(),
+        Vec::new(),
+    )
+    .map_err(|source| PipelineError::Builder {
+        stage: "style_critic".to_string(),
+        source,
+    })?;
+    let fact =
+        crate::pipeline::runner_from_recipe(cfg.provider.clone(), fact_check_recipe(), Vec::new())
+            .map_err(|source| PipelineError::Builder {
+                stage: "fact_check".to_string(),
+                source,
+            })?;
+    let judge = if cfg.candidates_per_reply > 1 {
+        Some(
+            crate::pipeline::runner_from_recipe(cfg.provider.clone(), judge_recipe(), Vec::new())
+                .map_err(|source| PipelineError::Builder {
+                stage: "judge".to_string(),
+                source,
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut total_usage = TokenUsage::default();
+    let voice_guidelines = crate::pipeline::render_style_profile_as_english(&profile);
+
+    // 4. Run researcher.
+    progress("Researching mention...");
+    let research_msg = prompts::build_reply_research_user_message(
+        &cfg.mention,
+        cfg.parent.as_ref(),
+        cfg.mentioner_context.as_ref(),
+    );
+    let researcher_out =
+        researcher
+            .execute(&research_msg)
+            .await
+            .map_err(|source| PipelineError::Agent {
+                stage: "researcher".to_string(),
+                source,
+            })?;
+    let digest = researcher_out.result.clone();
+    total_usage += researcher_out.tokens_used;
+
+    // 5. Generate N reply candidates in parallel via tokio::JoinSet.
+    progress(&format!(
+        "Generating {} candidate(s) in parallel...",
+        cfg.candidates_per_reply
+    ));
+    let writer = Arc::new(writer);
+    let critic = Arc::new(critic);
+    let fact = Arc::new(fact);
+    let voice_owned: Arc<str> = voice_guidelines.clone().into();
+    let digest_owned: Arc<str> = digest.clone().into();
+    let mode_owned: Option<Arc<str>> = cfg.mode_addendum.map(Arc::from);
+
+    let mut joinset: tokio::task::JoinSet<
+        Result<(String, f32, String, TokenUsage), heartbit_core::error::Error>,
+    > = tokio::task::JoinSet::new();
+    for _ in 0..cfg.candidates_per_reply {
+        let writer = writer.clone();
+        let critic = critic.clone();
+        let fact = fact.clone();
+        let voice = voice_owned.clone();
+        let digest = digest_owned.clone();
+        let mode = mode_owned.clone();
+        joinset.spawn(async move {
+            let writer_msg =
+                prompts::build_reply_writer_user_message(&digest, &voice, mode.as_deref());
+            let writer_out = writer.execute(&writer_msg).await?;
+            let draft = writer_out.result.trim().to_string();
+            // Writer-driven no_reply short-circuit.
+            if draft.eq_ignore_ascii_case("no_reply") {
+                return Ok((
+                    draft,
+                    0.0_f32,
+                    "no_reply".to_string(),
+                    writer_out.tokens_used,
+                ));
+            }
+            // Style critic.
+            let critic_msg = prompts::build_reply_critic_user_message(&draft, &voice);
+            let critic_out = critic.execute(&critic_msg).await?;
+            let style_score = parse_style_match_score(&critic_out.result).unwrap_or(0.5);
+            // Fact check.
+            let fact_msg = prompts::build_reply_fact_user_message(&draft, &digest);
+            let fact_out = fact.execute(&fact_msg).await?;
+            let fact_verdict = fact_out.result.clone();
+            let mut usage = writer_out.tokens_used;
+            usage += critic_out.tokens_used;
+            usage += fact_out.tokens_used;
+            Ok((draft, style_score, fact_verdict, usage))
+        });
+    }
+    let mut survivors: Vec<ReplyCandidateRecord> = Vec::new();
+    while let Some(handle) = joinset.join_next().await {
+        let (draft, style_score, fact_verdict, usage) = handle
+            .map_err(|e| PipelineError::Agent {
+                stage: "candidate".to_string(),
+                source: heartbit_core::error::Error::Agent(format!("join: {e}")),
+            })?
+            .map_err(|source| PipelineError::Agent {
+                stage: "candidate".to_string(),
+                source,
+            })?;
+        total_usage += usage;
+        if !draft.eq_ignore_ascii_case("no_reply") {
+            survivors.push(ReplyCandidateRecord {
+                draft,
+                style_match_score: style_score,
+                fact_check_verdict: fact_verdict,
+            });
+        }
+    }
+
+    // 6. If all candidates were no_reply, return early without delivery.
+    if survivors.is_empty() {
+        return Ok(ReplyOutput {
+            mention_id: cfg.mention.id.clone(),
+            candidates: Vec::new(),
+            usage_summary: total_usage,
+            outcome: ReplyOutcome::NoReply,
+        });
+    }
+
+    // 7. Judge if multiple survivors (skip when 1).
+    let chosen_index: usize = if let (Some(judge), true) = (judge.as_ref(), survivors.len() > 1) {
+        progress("Judging candidates...");
+        let judge_msg = format!(
+            "{voice_guidelines}\n\nCandidate replies for the mention from @{}:\n\n{}\n\nReturn your verdict as JSON per the schema.\n",
+            cfg.mention.author_handle,
+            survivors
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("[{i}]\n{}\n", c.draft))
+                .collect::<String>(),
+        );
+        let judge_out = judge
+            .execute(&judge_msg)
+            .await
+            .map_err(|source| PipelineError::Agent {
+                stage: "judge".to_string(),
+                source,
+            })?;
+        total_usage += judge_out.tokens_used;
+        parse_judge_index(&judge_out.result, survivors.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let chosen_draft = survivors[chosen_index].draft.clone();
+
+    // 8. Publish gate — hard 280-char cap.
+    if chosen_draft.chars().count() > 280 {
+        return Ok(ReplyOutput {
+            mention_id: cfg.mention.id.clone(),
+            candidates: survivors,
+            usage_summary: total_usage,
+            outcome: ReplyOutcome::GateRejected {
+                chosen_index,
+                reason: format!(
+                    "draft exceeds 280 chars (got {})",
+                    chosen_draft.chars().count(),
+                ),
+            },
+        });
+    }
+
+    // 9. Telegram review delivery.
+    progress("Sending review to user...");
+    let drafts_for_review: Vec<String> = survivors.iter().map(|c| c.draft.clone()).collect();
+    let msg = ReplyReviewMessage {
+        mention: cfg.mention.clone(),
+        parent: cfg.parent.clone(),
+        mentioner_context: cfg.mentioner_context.clone(),
+        candidates: drafts_for_review,
+        interaction_timeout_seconds: 300,
+    };
+    let delivered = cfg.delivery.deliver(msg).await?;
+    let outcome = match delivered.outcome {
+        crate::review::DeliveryOutcome::Pick(idx) if idx < survivors.len() => {
+            // 10. twitter_reply tool call.
+            progress(&format!("Posting candidate {idx}..."));
+            let exec_ctx = heartbit_core::ExecutionContext {
+                credentials: Some(cfg.credentials.clone()),
+                ..Default::default()
+            };
+            let tool_input = serde_json::json!({
+                "text": survivors[idx].draft,
+                "in_reply_to": cfg.mention.id,
+            });
+            match cfg.twitter_tool.execute(&exec_ctx, tool_input).await {
+                Ok(out) if !out.is_error => {
+                    let (tweet_id, url) = parse_reply_tool_output(&out.content);
+                    ReplyOutcome::Posted {
+                        chosen_index: idx,
+                        reply_tweet_id: tweet_id,
+                        reply_url: url,
+                    }
+                }
+                Ok(out) => ReplyOutcome::PublishFailed {
+                    chosen_index: idx,
+                    reason: out.content,
+                },
+                Err(e) => ReplyOutcome::PublishFailed {
+                    chosen_index: idx,
+                    reason: format!("{e}"),
+                },
+            }
+        }
+        crate::review::DeliveryOutcome::Pick(_) => ReplyOutcome::Skipped, // unreachable
+        crate::review::DeliveryOutcome::Skip => ReplyOutcome::Skipped,
+        crate::review::DeliveryOutcome::TimedOut => ReplyOutcome::TimedOut,
+    };
+
+    // 11. Optional report-back to delivery (non-fatal).
+    let _ = cfg
+        .delivery
+        .report(delivered.receipt, outcome.clone())
+        .await;
+
+    Ok(ReplyOutput {
+        mention_id: cfg.mention.id.clone(),
+        candidates: survivors,
+        usage_summary: total_usage,
+        outcome,
+    })
+}
+
+// Helpers — pure parse functions ----------------------------------------
+
+fn parse_style_match_score(raw: &str) -> Option<f32> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    v.get("style_match_score")?.as_f64().map(|x| x as f32)
+}
+
+fn parse_judge_index(raw: &str, n: usize) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let idx = v.get("chosen_index")?.as_u64()? as usize;
+    if idx < n { Some(idx) } else { None }
+}
+
+fn parse_reply_tool_output(content: &str) -> (String, String) {
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        tweet_id: String,
+        url: String,
+    }
+    serde_json::from_str::<Parsed>(content)
+        .map(|p| (p.tweet_id, p.url))
+        .unwrap_or_else(|_| (String::new(), "<unknown>".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +590,522 @@ mod tests {
     fn reply_error_display_round_trips() {
         let e = ReplyError::InvalidConfig("test".to_string());
         assert!(format!("{e}").contains("invalid config"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests for run_reply_pipeline
+    // -----------------------------------------------------------------------
+
+    use heartbit_core::ExecutionContext;
+    use heartbit_core::error::Error as CoreError;
+    use heartbit_core::execution_context::CredentialResolver as CredentialResolverTrait;
+    use heartbit_core::execution_context::Secret;
+    use heartbit_core::llm::types::ToolDefinition;
+    use heartbit_core::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+    };
+    use heartbit_core::llm::{BoxedProvider, LlmProvider};
+    use heartbit_core::tool::ToolOutput;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// MockReplyReviewDelivery — returns a pre-canned outcome. An optional
+    /// error mode simulates delivery failure (used to assert delivery is
+    /// never called in no_reply / gate-reject tests).
+    struct MockReplyReviewDelivery {
+        outcome: Option<crate::review::DeliveryOutcome>,
+        error_msg: Option<String>,
+        reports: Mutex<Vec<ReplyOutcome>>,
+    }
+
+    impl MockReplyReviewDelivery {
+        fn arc(outcome: crate::review::DeliveryOutcome) -> Arc<dyn ReplyReviewDelivery> {
+            Arc::new(MockReplyReviewDelivery {
+                outcome: Some(outcome),
+                error_msg: None,
+                reports: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn errored(reason: &str) -> Arc<dyn ReplyReviewDelivery> {
+            Arc::new(MockReplyReviewDelivery {
+                outcome: None,
+                error_msg: Some(reason.to_string()),
+                reports: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ReplyReviewDelivery for MockReplyReviewDelivery {
+        fn deliver<'a>(
+            &'a self,
+            _msg: ReplyReviewMessage,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::review::DeliveredReview,
+                            crate::review::ReviewDeliveryError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let outcome = self.outcome.clone();
+            let error_msg = self.error_msg.clone();
+            Box::pin(async move {
+                if let Some(msg) = error_msg {
+                    return Err(crate::review::ReviewDeliveryError::Transport(msg));
+                }
+                Ok(crate::review::DeliveredReview {
+                    outcome: outcome.expect("either outcome or error_msg must be set"),
+                    receipt: crate::review::DeliveryReceipt {
+                        data: serde_json::Value::Null,
+                    },
+                })
+            })
+        }
+
+        fn report<'a>(
+            &'a self,
+            _receipt: crate::review::DeliveryReceipt,
+            outcome: ReplyOutcome,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::review::ReviewDeliveryError>> + Send + 'a>>
+        {
+            self.reports.lock().unwrap().push(outcome);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// MockReplyTool — same shape as MockTwitterTool in review/mod.rs.
+    struct MockReplyTool {
+        canned: Mutex<Option<ToolOutput>>,
+        last_input: Mutex<Option<serde_json::Value>>,
+    }
+
+    impl MockReplyTool {
+        fn success(body: &str) -> Arc<Self> {
+            Arc::new(MockReplyTool {
+                canned: Mutex::new(Some(ToolOutput::success(body))),
+                last_input: Mutex::new(None),
+            })
+        }
+
+        fn errored(reason: &str) -> Arc<Self> {
+            Arc::new(MockReplyTool {
+                canned: Mutex::new(Some(ToolOutput::error(reason))),
+                last_input: Mutex::new(None),
+            })
+        }
+
+        fn last_input(&self) -> Option<serde_json::Value> {
+            self.last_input.lock().unwrap().clone()
+        }
+    }
+
+    impl Tool for MockReplyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "twitter_reply".to_string(),
+                description: "mock".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, CoreError>> + Send + '_>> {
+            *self.last_input.lock().unwrap() = Some(input);
+            let canned = self.canned.lock().unwrap().take();
+            Box::pin(async move {
+                canned.ok_or_else(|| CoreError::Agent("mock reply tool exhausted".into()))
+            })
+        }
+    }
+
+    /// MockProvider — same shape as review/mod.rs::tests::MockProvider.
+    struct MockProvider {
+        responses: Mutex<VecDeque<String>>,
+    }
+
+    impl MockProvider {
+        fn arc(responses: Vec<&str>) -> Arc<BoxedProvider> {
+            let p = MockProvider {
+                responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+            };
+            Arc::new(BoxedProvider::new(p))
+        }
+    }
+
+    impl LlmProvider for MockProvider {
+        fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
+            let response = self.responses.lock().unwrap().pop_front();
+            let has_respond = request
+                .tools
+                .iter()
+                .any(|t| t.name == heartbit_core::llm::types::RESPOND_TOOL_NAME);
+            async move {
+                let text =
+                    response.ok_or_else(|| CoreError::Agent("mock exhausted".to_string()))?;
+                let content = if has_respond {
+                    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                        CoreError::Agent(format!("mock: canned response is not valid JSON: {e}"))
+                    })?;
+                    vec![ContentBlock::ToolUse {
+                        id: "respond_1".to_string(),
+                        name: "__respond__".to_string(),
+                        input: value,
+                    }]
+                } else {
+                    vec![ContentBlock::Text { text }]
+                };
+                Ok(CompletionResponse {
+                    content,
+                    usage: TokenUsage::default(),
+                    stop_reason: if has_respond {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    },
+                    model: None,
+                })
+            }
+        }
+    }
+
+    /// Stub credential resolver — never invoked in mock tests.
+    struct StubCredentialResolver;
+
+    impl CredentialResolverTrait for StubCredentialResolver {
+        fn resolve(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Secret, CoreError>> + Send + '_>> {
+            Box::pin(async move { Ok(Secret::new("stub")) })
+        }
+    }
+
+    /// Snapshot fixture — mirrors review/mod.rs::tests::seed_snapshot.
+    fn seed_snapshot(persona: &str) -> (TempDir, std::path::PathBuf) {
+        use crate::voice::{
+            BlendEntry, BlendRecipe, EmDashPolicy, EmojiPolicy, Formatting, FragmentFrequency,
+            HashtagPolicy, LineBreaks, OpeningPattern, PartialStyleProfile, PeriodsPolicy,
+            QuotationMarks, SentenceLengthTarget, SnapshotStore, SpecificityTarget, StyleProfile,
+            ThreadRhythm,
+        };
+        let dir = TempDir::new().unwrap();
+        let profile = StyleProfile {
+            version: 1,
+            sentence_length_target: SentenceLengthTarget::Short,
+            sentence_length_distribution: [40, 30, 20, 10],
+            fragment_frequency: FragmentFrequency::Common,
+            opening_patterns: vec![OpeningPattern::ClaimFirst],
+            opening_pattern_weights: vec![1.0],
+            formatting: Formatting {
+                lowercase: true,
+                periods: PeriodsPolicy::Optional,
+                em_dashes: EmDashPolicy::Forbidden,
+                quotation_marks: QuotationMarks::Double,
+                line_breaks: LineBreaks::Single,
+            },
+            emoji_policy: EmojiPolicy::Never,
+            hashtag_policy: HashtagPolicy::Never,
+            specificity_target: SpecificityTarget::High,
+            voice_traits: vec!["specific".to_string()],
+            ai_tells_to_avoid: vec!["delve".to_string()],
+            thread_rhythm: ThreadRhythm::Linear,
+            thread_max_length: 5,
+            thread_opener_must_hook: false,
+            topical_obsessions: vec!["AI".to_string()],
+            topical_avoidances: vec!["politics".to_string()],
+        };
+        let recipe = BlendRecipe {
+            version: 1,
+            blend: vec![BlendEntry {
+                writer: "k".to_string(),
+                weight: 1.0,
+            }],
+            overrides: PartialStyleProfile::default(),
+        };
+        let store = SnapshotStore::open(dir.path(), persona).unwrap();
+        store.save_new(profile, &recipe).unwrap();
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    /// Fixture mention.
+    fn fixture_mention() -> Mention {
+        Mention {
+            id: "mention_1".into(),
+            text: "how does heartbit compare to rig-rs?".into(),
+            author_id: "999".into(),
+            author_handle: "grumpy_dev".into(),
+            posted_at: chrono::Utc::now(),
+            in_reply_to_tweet_id: None,
+        }
+    }
+
+    /// Boilerplate builder for ReplyConfig.
+    fn mk_reply_cfg<'a>(
+        profiles_root: &'a std::path::Path,
+        provider: Arc<BoxedProvider>,
+        delivery: Arc<dyn ReplyReviewDelivery>,
+        twitter_tool: Arc<dyn Tool>,
+        candidates_per_reply: usize,
+        mention: Mention,
+    ) -> ReplyConfig<'a> {
+        ReplyConfig {
+            persona_name: "x",
+            provider,
+            corpora_root: profiles_root,
+            profiles_root,
+            on_progress: None,
+            mention,
+            parent: None,
+            mentioner_context: None,
+            candidates_per_reply,
+            mode_addendum: None,
+            researcher_override: None,
+            delivery,
+            twitter_tool,
+            credentials: Arc::new(StubCredentialResolver),
+        }
+    }
+
+    // --- Test 1: single candidate, happy path ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_single_candidate_happy_path() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            "concrete short reply",
+            r#"{"verdict":"pass","style_match_score":0.92}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Pick(0));
+        let twitter_tool = MockReplyTool::success(
+            r#"{"tweet_id":"reply123","url":"https://x.com/i/web/status/reply123"}"#,
+        );
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg).await.expect("happy path");
+        match out.outcome {
+            ReplyOutcome::Posted {
+                chosen_index,
+                reply_tweet_id,
+                reply_url,
+            } => {
+                assert_eq!(chosen_index, 0);
+                assert_eq!(reply_tweet_id, "reply123");
+                assert_eq!(reply_url, "https://x.com/i/web/status/reply123");
+            }
+            other => panic!("expected Posted, got {other:?}"),
+        }
+        assert_eq!(out.candidates.len(), 1);
+        assert_eq!(out.mention_id, "mention_1");
+    }
+
+    // --- Test 2: two candidates, judge picks index 1 ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_two_candidates_judge_picks() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Two parallel candidates + 1 judge = 1 + (writer+critic+fact)×2 + 1 = 8 responses.
+        // Identical writer/critic/fact responses so JoinSet ordering doesn't matter.
+        let provider = MockProvider::arc(vec![
+            "research digest",                               // researcher
+            "good reply text",                               // writer (slot 0 or 1)
+            r#"{"verdict":"pass","style_match_score":0.8}"#, // critic
+            r#"{"verdict":"verified"}"#,                     // fact
+            "good reply text",                               // writer (slot 1 or 0)
+            r#"{"verdict":"pass","style_match_score":0.8}"#, // critic
+            r#"{"verdict":"verified"}"#,                     // fact
+            r#"{"chosen_index":1,"reasoning":"second candidate is more specific"}"#, // judge
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Pick(1));
+        let twitter_tool = MockReplyTool::success(
+            r#"{"tweet_id":"reply456","url":"https://x.com/i/web/status/reply456"}"#,
+        );
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            2,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg).await.expect("two candidates");
+        match out.outcome {
+            ReplyOutcome::Posted { chosen_index, .. } => {
+                assert_eq!(chosen_index, 1);
+            }
+            other => panic!("expected Posted, got {other:?}"),
+        }
+        assert_eq!(out.candidates.len(), 2);
+    }
+
+    // --- Test 3: writer returns no_reply — NoReply outcome, delivery not called ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_writer_no_reply_returns_no_reply_outcome() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "research digest", // researcher
+            "no_reply",        // writer short-circuits; critic+fact not called
+        ]);
+        // Delivery should NEVER be called — set it to error if it is.
+        let delivery = MockReplyReviewDelivery::errored("delivery must not be called");
+        let twitter_tool = MockReplyTool::errored("twitter must not be called");
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg).await.expect("no_reply is success");
+        assert!(
+            matches!(out.outcome, ReplyOutcome::NoReply),
+            "expected NoReply, got {:?}",
+            out.outcome
+        );
+        assert!(
+            out.candidates.is_empty(),
+            "no candidates when writer says no_reply"
+        );
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be called"
+        );
+    }
+
+    // --- Test 4: 281-char draft rejected by publish gate before delivery ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_publish_gate_rejects_281_chars() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let too_long = "x".repeat(281);
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            too_long.as_str(),
+            r#"{"verdict":"pass","style_match_score":0.9}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        // Gate rejects BEFORE delivery — errored delivery should never fire.
+        let delivery = MockReplyReviewDelivery::errored("delivery must not be called");
+        let twitter_tool = MockReplyTool::errored("twitter must not be called");
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg)
+            .await
+            .expect("gate rejection is success");
+        match out.outcome {
+            ReplyOutcome::GateRejected {
+                chosen_index,
+                reason,
+            } => {
+                assert_eq!(chosen_index, 0);
+                assert!(reason.contains("exceeds 280 chars"), "got: {reason}");
+            }
+            other => panic!("expected GateRejected, got {other:?}"),
+        }
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be called on gate rejection"
+        );
+    }
+
+    // --- Test 5: user presses Skip ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_user_skip_returns_skipped() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            "short reply candidate",
+            r#"{"verdict":"pass","style_match_score":0.85}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Skip);
+        let twitter_tool = MockReplyTool::errored("twitter must not be called on skip");
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg).await.expect("skip is success");
+        assert!(
+            matches!(out.outcome, ReplyOutcome::Skipped),
+            "expected Skipped, got {:?}",
+            out.outcome
+        );
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be called on skip"
+        );
+    }
+
+    // --- Test 6: Twitter API error returns PublishFailed ---
+
+    #[tokio::test]
+    async fn run_reply_pipeline_twitter_api_error_returns_publish_failed() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            "short reply candidate",
+            r#"{"verdict":"pass","style_match_score":0.85}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(crate::review::DeliveryOutcome::Pick(0));
+        let twitter_tool = MockReplyTool::errored("rate limited (429)");
+        let cfg = mk_reply_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_mention(),
+        );
+        let out = run_reply_pipeline(cfg)
+            .await
+            .expect("publish failure is success");
+        match out.outcome {
+            ReplyOutcome::PublishFailed {
+                chosen_index,
+                reason,
+            } => {
+                assert_eq!(chosen_index, 0);
+                assert!(
+                    reason.contains("rate limited") || reason.contains("429"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected PublishFailed, got {other:?}"),
+        }
     }
 }

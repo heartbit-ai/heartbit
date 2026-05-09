@@ -5,7 +5,6 @@ use super::{Mention, MentionerContext, TweetSnapshot};
 
 /// Build the mini-researcher's user message: the parent tweet (if any),
 /// the mention itself, and abridged context about the mentioner.
-#[allow(dead_code)]
 pub(crate) fn build_reply_research_user_message(
     mention: &Mention,
     parent: Option<&TweetSnapshot>,
@@ -52,7 +51,6 @@ pub(crate) fn build_reply_research_user_message(
 /// Build the writer's user message — the digest from the researcher,
 /// then voice guidelines, optional mode_addendum, and a clear final
 /// instruction.
-#[allow(dead_code)]
 pub(crate) fn build_reply_writer_user_message(
     digest: &str,
     voice_guidelines: &str,
@@ -74,7 +72,6 @@ pub(crate) fn build_reply_writer_user_message(
 }
 
 /// Build the style critic's user message for a reply candidate.
-#[allow(dead_code)]
 pub(crate) fn build_reply_critic_user_message(draft: &str, voice_guidelines: &str) -> String {
     format!(
         "Reply draft to evaluate:\n{draft}\n\n{voice_guidelines}\n\
@@ -83,7 +80,6 @@ pub(crate) fn build_reply_critic_user_message(draft: &str, voice_guidelines: &st
 }
 
 /// Build the fact-check's user message for a reply.
-#[allow(dead_code)]
 pub(crate) fn build_reply_fact_user_message(draft: &str, digest: &str) -> String {
     format!(
         "Reply draft to verify:\n{draft}\n\nResearch digest (only source of truth):\n{digest}\n\
