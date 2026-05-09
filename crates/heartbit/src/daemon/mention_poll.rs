@@ -130,7 +130,7 @@ mod tests {
             poll_interval_seconds: interval,
             user_id: "x".into(),
             candidates_per_reply: 5,
-            mention_store: "memory".into(),
+            mention_store: "in_memory".into(),
             mention_store_path: None,
         }
     }

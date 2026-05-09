@@ -591,6 +591,14 @@ mod tests {
             rx.try_recv().is_err(),
             "mention without author_id should be skipped"
         );
+
+        // since_id should still be bumped (handler updates it before the author_id guard).
+        let since = store.since_id_for("ghost", "op").await.unwrap();
+        assert_eq!(
+            since.as_deref(),
+            Some("m42"),
+            "since_id should be bumped even though mention was skipped"
+        );
     }
 
     #[tokio::test]
@@ -623,5 +631,82 @@ mod tests {
 
         let since = store.since_id_for("ghost", "op").await.unwrap();
         assert_eq!(since.as_deref(), Some("200"), "since_id should be max id");
+    }
+
+    #[tokio::test]
+    async fn three_mention_composite_dispatches_one_reply_draft() {
+        // Composite test from spec: 3 mentions (1 self-reply, 1 too-short, 1 normal).
+        // Verify: 1 ReplyDraft on the channel, all 3 mention IDs marked replied,
+        // since_id bumped to the max of the 3 ids.
+        let guard = SpamGuard::new(SpamGuardConfig::defaults_for("op-id"));
+        let json = serde_json::json!({
+            "mentions": [
+                {"id": "m300", "text": "self-reply from op", "author_id": "op-id", "created_at": "2026-01-01T00:00:00Z"},
+                {"id": "m200", "text": "👍", "author_id": "user-a", "created_at": "2026-01-01T00:01:00Z"},
+                {"id": "m100", "text": "this is a great framework for building agents", "author_id": "user-b", "created_at": "2026-01-01T00:02:00Z"}
+            ]
+        })
+        .to_string();
+        let tool = StubMentionsTool::ok(&json);
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op-id",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        // Exactly 1 ReplyDraft dispatched (the normal mention m100).
+        let (key, payload) = rx.try_recv().expect("expected one ReplyDraft command");
+        assert!(
+            key.starts_with("reply-draft:ghost:"),
+            "unexpected key: {key}"
+        );
+        let cmd: DaemonCommand = serde_json::from_slice(&payload).unwrap();
+        match cmd {
+            DaemonCommand::ReplyDraft {
+                persona, mention, ..
+            } => {
+                assert_eq!(persona, "ghost");
+                assert_eq!(mention.id, "m100");
+            }
+            other => panic!("expected ReplyDraft, got {other:?}"),
+        }
+
+        // No more commands.
+        assert!(
+            rx.try_recv().is_err(),
+            "only one ReplyDraft should have been dispatched"
+        );
+
+        // All 3 mentions marked as replied.
+        assert!(
+            store.was_replied("m300").await.unwrap(),
+            "self-reply m300 should be marked replied"
+        );
+        assert!(
+            store.was_replied("m200").await.unwrap(),
+            "too-short m200 should be marked replied"
+        );
+        assert!(
+            store.was_replied("m100").await.unwrap(),
+            "normal m100 should be marked replied"
+        );
+
+        // since_id bumped to max of all 3.
+        let since = store.since_id_for("ghost", "op-id").await.unwrap();
+        assert_eq!(
+            since.as_deref(),
+            Some("m300"),
+            "since_id should be bumped to max (m300 > m200 > m100 lexicographically)"
+        );
     }
 }

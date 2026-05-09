@@ -116,7 +116,7 @@ pub struct PersonaMentionsConfig {
     /// Enable mention polling for this persona. Defaults to `true`.
     #[serde(default = "super::default_true")]
     pub enabled: bool,
-    /// Seconds between mention polls. Defaults to 60.
+    /// Seconds between mention polls. Defaults to 300 (5 minutes, X API rate-limit-safe).
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
     /// X/Twitter user-id to poll mentions for (e.g. `"100"`).
@@ -124,8 +124,8 @@ pub struct PersonaMentionsConfig {
     /// Maximum candidates to generate replies for per poll cycle. Defaults to 5.
     #[serde(default = "default_candidates_per_reply")]
     pub candidates_per_reply: usize,
-    /// Which mention store backend to use: `"memory"` or `"jsonl"`.
-    /// Defaults to `"memory"`.
+    /// Which mention store backend to use: `"in_memory"` or `"jsonl"`.
+    /// Defaults to `"in_memory"`.
     #[serde(default = "default_mention_store")]
     pub mention_store: String,
     /// File path for the JSONL mention store (only used when
@@ -136,15 +136,15 @@ pub struct PersonaMentionsConfig {
 }
 
 fn default_poll_interval_seconds() -> u64 {
-    60
+    300
 }
 
 fn default_candidates_per_reply() -> usize {
-    5
+    2
 }
 
 fn default_mention_store() -> String {
-    "memory".into()
+    "in_memory".into()
 }
 
 /// Memory access control configuration for the daemon.
