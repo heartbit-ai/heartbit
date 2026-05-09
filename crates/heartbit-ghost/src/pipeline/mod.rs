@@ -786,7 +786,7 @@ mod tests {
 
     use heartbit_core::llm::LlmProvider;
     use heartbit_core::llm::types::{
-        CompletionRequest, CompletionResponse, ContentBlock, StopReason,
+        CompletionRequest, CompletionResponse, ContentBlock, Role, StopReason,
     };
     use std::future::Future;
     use std::sync::Mutex;
@@ -802,8 +802,13 @@ mod tests {
     /// concurrently via `tokio::JoinSet`) all draw from the same
     /// "writer" queue without interleaving with the critic / fact_check
     /// / judge / image_generator queues.
+    ///
+    /// The optional `recorded_user_messages` field captures the first
+    /// user-message text from every `complete()` call. Used by tests that
+    /// need to verify what the LLM actually received.
     struct MockProvider {
         routes: Mutex<Vec<(String, std::collections::VecDeque<String>)>>,
+        recorded_user_messages: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockProvider {
@@ -811,6 +816,15 @@ mod tests {
         /// `(substring_key, responses)` pair. The substring is matched
         /// against the request's system prompt.
         fn route(routes: Vec<(&str, Vec<&str>)>) -> Arc<BoxedProvider> {
+            let (provider, _) = Self::route_with_recorder(routes);
+            provider
+        }
+
+        /// Like `route`, but also returns the recorder so the caller can
+        /// inspect what user messages were received by the mock.
+        fn route_with_recorder(
+            routes: Vec<(&str, Vec<&str>)>,
+        ) -> (Arc<BoxedProvider>, Arc<Mutex<Vec<String>>>) {
             let mapped: Vec<(String, std::collections::VecDeque<String>)> = routes
                 .into_iter()
                 .map(|(key, responses)| {
@@ -820,10 +834,12 @@ mod tests {
                     )
                 })
                 .collect();
+            let recorder: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
             let p = MockProvider {
                 routes: Mutex::new(mapped),
+                recorded_user_messages: Arc::clone(&recorder),
             };
-            Arc::new(BoxedProvider::new(p))
+            (Arc::new(BoxedProvider::new(p)), recorder)
         }
 
         /// Backward-compat helper: single-queue version. Internally
@@ -838,6 +854,20 @@ mod tests {
             &self,
             request: CompletionRequest,
         ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
+            // Record the first user-message text for assertion in tests that
+            // use `route_with_recorder`.
+            let user_text = request
+                .messages
+                .iter()
+                .find(|m| m.role == Role::User)
+                .and_then(|m| m.content.first())
+                .and_then(|c| match c {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.recorded_user_messages.lock().unwrap().push(user_text);
+
             // Find which route this request belongs to by matching the
             // system prompt against route keys. First non-empty key with
             // a substring match wins; "" key is the wildcard fallback.
@@ -965,13 +995,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pipeline_config_carries_mode_addendum() {
+    /// Drive `run_pipeline` with `mode_addendum = Some("FRAMEWORK_DEMO_FIXTURE")` and
+    /// assert the writer's LLM call actually receives that string in its user message.
+    ///
+    /// This exercises the full threading path:
+    ///   PipelineConfig.mode_addendum
+    ///   → spawn-loop Arc<str> conversion (mode_addendum_owned.as_deref())
+    ///   → generate_candidate(mode_addendum)
+    ///   → build_writer_user_message(mode_addendum)
+    ///   → CompletionRequest.messages[0] received by the mock.
+    ///
+    /// A regression at any link (field dropped, Arc deref wrong, param ignored,
+    /// builder omitted) causes the assertion to fail.
+    #[tokio::test]
+    async fn mode_addendum_some_value_appears_in_writer_user_message() {
         let (_dir, profiles_root) = seed_snapshot("x");
-        let provider = MockProvider::arc(vec![]);
+        let (provider, recorder) = MockProvider::route_with_recorder(vec![
+            ("research analyst", vec!["Research digest:\n- AI notes"]),
+            ("social media writer", vec!["concrete short post"]),
+            (
+                "score how well a draft post",
+                vec![r#"{"verdict": "pass", "style_match_score": 0.92}"#],
+            ),
+            (
+                "verify the factual claims",
+                vec![r#"{"verdict": "verified"}"#],
+            ),
+            ("produce an image to accompany", vec!["no_image"]),
+        ]);
         let cfg = PipelineConfig {
             persona_name: "x",
-            topic: "test",
+            topic: "addendum test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 1,
+            mode_addendum: Some("FRAMEWORK_DEMO_FIXTURE"),
+        };
+        run_pipeline(cfg).await.expect("pipeline should succeed");
+        let received = recorder.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .any(|msg| msg.contains("FRAMEWORK_DEMO_FIXTURE")),
+            "expected at least one LLM call to contain 'FRAMEWORK_DEMO_FIXTURE'; \
+             recorded messages: {received:#?}",
+        );
+    }
+
+    /// Complementary sanity check: when `mode_addendum` is `None` the fixture
+    /// string must NOT appear anywhere in the received messages.
+    #[tokio::test]
+    async fn mode_addendum_none_omits_addendum_from_writer_user_message() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let (provider, recorder) = MockProvider::route_with_recorder(vec![
+            ("research analyst", vec!["Research digest:\n- AI notes"]),
+            ("social media writer", vec!["concrete short post"]),
+            (
+                "score how well a draft post",
+                vec![r#"{"verdict": "pass", "style_match_score": 0.92}"#],
+            ),
+            (
+                "verify the factual claims",
+                vec![r#"{"verdict": "verified"}"#],
+            ),
+            ("produce an image to accompany", vec!["no_image"]),
+        ]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "addendum test",
             provider,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
@@ -979,7 +1072,15 @@ mod tests {
             candidates_per_draft: 1,
             mode_addendum: None,
         };
-        assert!(cfg.mode_addendum.is_none());
+        run_pipeline(cfg).await.expect("pipeline should succeed");
+        let received = recorder.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .all(|msg| !msg.contains("FRAMEWORK_DEMO_FIXTURE")),
+            "expected no LLM call to contain 'FRAMEWORK_DEMO_FIXTURE' when addendum is None; \
+             recorded messages: {received:#?}",
+        );
     }
 
     #[tokio::test]
