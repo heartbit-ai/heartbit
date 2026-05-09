@@ -64,6 +64,13 @@ pub struct ImageAttachment {
 /// pipeline stage start. Used by `PipelineConfig::on_progress`.
 pub type ProgressCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Researcher override — `(recipe, tools)` pair that, when supplied,
+/// replaces the pipeline's default `researcher_recipe()` +
+/// `[WebSearchTool, WebFetchTool]`. The `Arc<AgentConfig>` is required
+/// because `AgentConfig` does not derive `Clone` while
+/// `PipelineConfig` does.
+pub type ResearcherOverride = (Arc<AgentConfig>, Vec<Arc<dyn Tool>>);
+
 /// Configuration for one pipeline run.
 #[derive(Clone)]
 pub struct PipelineConfig<'a> {
@@ -88,6 +95,13 @@ pub struct PipelineConfig<'a> {
     /// message after voice_guidelines. None for personas that don't
     /// have one (heartbit-ghost:x).
     pub mode_addendum: Option<&'a str>,
+    /// Override the default researcher (recipe + tools). When `Some`,
+    /// the pipeline uses these instead of the legacy
+    /// `researcher_recipe()` plus `WebSearchTool`+`WebFetchTool`.
+    /// heartbit-rs:x supplies its `repo_researcher_recipe()` plus
+    /// `RepoInspectTool` here so the agent is forced to read the local
+    /// repo instead of the public web.
+    pub researcher_override: Option<ResearcherOverride>,
 }
 
 /// Output of a successful pipeline run.
@@ -472,17 +486,29 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     };
     use heartbit_core::tool::builtins::{ImageGenerateTool, WebFetchTool, WebSearchTool};
 
-    let researcher_tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(WebSearchTool::new()),
-        Arc::new(WebFetchTool::new()),
-    ];
-    let researcher =
-        runner_from_recipe(cfg.provider.clone(), researcher_recipe(), researcher_tools).map_err(
-            |e| PipelineError::Builder {
-                stage: "researcher".to_string(),
-                source: e,
-            },
-        )?;
+    // The researcher is the only agent that varies by persona today.
+    // heartbit-ghost:x → default researcher_recipe() + [websearch, webfetch].
+    // heartbit-rs:x   → repo_researcher_recipe() + [repo_inspect] (via override).
+    let (researcher_recipe_used, researcher_tools): (AgentConfig, Vec<Arc<dyn Tool>>) =
+        match cfg.researcher_override.as_ref() {
+            Some((recipe, tools)) => ((**recipe).clone_config(), tools.clone()),
+            None => (
+                researcher_recipe(),
+                vec![
+                    Arc::new(WebSearchTool::new()),
+                    Arc::new(WebFetchTool::new()),
+                ],
+            ),
+        };
+    let researcher = runner_from_recipe(
+        cfg.provider.clone(),
+        researcher_recipe_used,
+        researcher_tools,
+    )
+    .map_err(|e| PipelineError::Builder {
+        stage: "researcher".to_string(),
+        source: e,
+    })?;
     let writer =
         runner_from_recipe(cfg.provider.clone(), writer_recipe(), Vec::new()).map_err(|e| {
             PipelineError::Builder {
@@ -1032,6 +1058,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: Some("FRAMEWORK_DEMO_FIXTURE"),
+            researcher_override: None,
         };
         run_pipeline(cfg).await.expect("pipeline should succeed");
         let received = recorder.lock().unwrap();
@@ -1071,6 +1098,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         run_pipeline(cfg).await.expect("pipeline should succeed");
         let received = recorder.lock().unwrap();
@@ -1103,6 +1131,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path");
         assert_eq!(out.final_draft, "concrete short post");
@@ -1136,6 +1165,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("revise then pass");
         assert_eq!(out.final_draft, "second draft, no em-dashes");
@@ -1163,6 +1193,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1198,6 +1229,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1224,6 +1256,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1289,6 +1322,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 3,
             mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("3-candidate happy path");
         assert_eq!(out.candidates.len(), 3);
@@ -1365,6 +1399,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 3,
             mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("collapse+refill succeeds");
         assert_eq!(
@@ -1395,6 +1430,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 3,
             mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1419,6 +1455,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 0, // invalid
             mode_addendum: None,
+            researcher_override: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1452,6 +1489,7 @@ mod tests {
             on_progress: None,
             candidates_per_draft: 1,
             mode_addendum: None,
+            researcher_override: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path with no_image");
         assert_eq!(out.candidates.len(), 1);

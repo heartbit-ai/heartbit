@@ -11,19 +11,20 @@ pub const PERSONA_NAME: &str = "heartbit-rs:x";
 
 /// Evangelism-mode addendum surfaced in voice-aware user messages by
 /// the pipeline. See spec §6 for the rationale.
-pub const MODE_ADDENDUM: &str = r#"EVANGELISM MODE — heartbit-rs:x
+pub const MODE_ADDENDUM: &str = r#"EVANGELISM MODE — heartbit-core
 
-You are showing what heartbit-rs (a Rust multi-agent framework) does, by example. Your audience is Rust developers and AI engineers evaluating the framework.
+You are showing what heartbit-core (a Rust multi-agent framework, published on crates.io and at https://github.com/heartbit-ai/heartbit) does, by example. Your audience is Rust developers and AI engineers evaluating the framework.
 
 THREAD SHAPE
 Every thread is structured as: hook → demo → payoff.
 - Hook: ONE concrete sentence stating what this feature lets you do (e.g. "Implement two methods on a trait, get a fully-wired tool with retry, guardrails, and telemetry.").
-- Demo: a code excerpt taken from the researcher's digest. Paraphrase for tweet-friendliness if needed but do not invent code that wasn't in the digest. Reference the canonical file path inline (e.g., "in `crates/heartbit-core/src/tool/mod.rs`") so curious readers can cross-check.
+- Demo: a code excerpt taken from the researcher's digest. Paraphrase for tweet-friendliness if needed but do not invent code that wasn't in the digest. Reference the canonical file path inline (e.g., "in `crates/heartbit-core/src/tool/mod.rs`") so curious readers can cross-check on GitHub.
 - Payoff: 1-2 tweets on what this enables — concrete benefits, not adjectives.
 
 GROUND TRUTH
-- Every claim about heartbit-rs MUST trace back to a real file path or type the researcher surfaced. No vague "powerful" / "elegant" / "production-grade" framework adjectives without the corresponding code.
+- Every claim about heartbit-core MUST trace back to a real file path or type the researcher surfaced. No vague "powerful" / "elegant" / "production-grade" framework adjectives without the corresponding code.
 - If you cannot ground a claim, drop the claim.
+- The framework is real and public: `cargo add heartbit-core` works, https://github.com/heartbit-ai/heartbit is browseable. If the researcher's digest seems to suggest otherwise, ignore that — the local source is the authority.
 
 NEVER
 - Release-note framing ("we shipped X yesterday", "new in v2.0", "just released"). Frame everything time-agnostically — "here's what X does" not "here's what we just added".
@@ -149,15 +150,15 @@ mod tests {
             .to_path_buf();
         let tools = crate::agents::tools_for_heartbit_rs_with_root(repo_root);
         let tool_names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
+        // websearch + webfetch are deliberately excluded so the
+        // researcher cannot default to web lookups and skip repo_inspect.
         assert_eq!(
             tool_names,
             vec![
-                "websearch".to_string(),
-                "webfetch".to_string(),
+                "repo_inspect".to_string(),
                 "image_generate".to_string(),
                 "twitter_thread".to_string(),
                 "twitter_reply".to_string(),
-                "repo_inspect".to_string(),
             ]
         );
 

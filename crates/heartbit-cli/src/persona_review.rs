@@ -204,6 +204,7 @@ pub async fn review_config_from_env<'a>(
     profiles_root: &'a std::path::Path,
     on_progress: Option<heartbit_ghost::pipeline::ProgressCallback>,
     mode_addendum: Option<&'static str>,
+    researcher_override: Option<heartbit_ghost::pipeline::ResearcherOverride>,
 ) -> Result<heartbit_ghost::review::ReviewConfig<'a>> {
     let delivery: Arc<dyn ReviewDelivery> =
         Arc::new(TelegramReviewDelivery::from_env().context("construct TelegramReviewDelivery")?);
@@ -222,6 +223,7 @@ pub async fn review_config_from_env<'a>(
         twitter_tool,
         credentials,
         mode_addendum,
+        researcher_override,
     })
 }
 

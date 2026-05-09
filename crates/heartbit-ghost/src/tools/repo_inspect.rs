@@ -135,8 +135,16 @@ impl Tool for RepoInspectTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "repo_inspect".into(),
-            description: "Read or grep files inside the heartbit repo, restricted to \
-                          crates/heartbit-core and crates/heartbit-cli."
+            description: "PRIMARY tool for researching the heartbit-core / \
+                          heartbit-cli Rust framework. Reads and greps files in \
+                          the local heartbit workspace (the source of truth — \
+                          fresher than crates.io / docs.rs / GitHub). Always \
+                          prefer this over websearch when the topic involves \
+                          heartbit-core internals, Tool trait, AgentRunner, \
+                          Memory, Guardrails, or any framework feature. Ops: \
+                          list_features (curated menu), feature_demo (lookup), \
+                          read_file, grep_repo. Restricted to crates/heartbit-core \
+                          and crates/heartbit-cli."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
