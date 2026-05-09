@@ -8,7 +8,9 @@
 use chrono::{DateTime, Utc};
 
 pub mod prompts;
+pub mod spam_guard;
 pub mod storage;
+pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
 
 /// A mention of the operator's account fetched from `twitter_mentions`.
