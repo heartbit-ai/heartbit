@@ -22,6 +22,14 @@ fn every_canonical_file_in_feature_menu_exists() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/heartbit-rs-features.toml");
     let text = std::fs::read_to_string(&menu_path).expect("menu file readable");
     let menu: FeatureMenu = toml::from_str(&text).expect("menu parses");
+    // Floor check: catch wholesale TOML wipes (e.g. bad merge) — must run
+    // BEFORE the path loop so a 0-entry menu fails with the right message
+    // instead of silently passing the staleness check.
+    assert!(
+        menu.feature.len() >= 18,
+        "feature menu shrank below 18 entries (got {}); restore missing entries",
+        menu.feature.len()
+    );
     // Resolve relative to workspace root (one level up from crate dir).
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

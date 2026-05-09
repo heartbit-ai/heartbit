@@ -16,9 +16,9 @@ payoff = "single-process agent loop, no Restate / no daemon — drop into any to
 
 [[feature]]
 name = "auto_compaction"
-description = "On context overflow, summarize and retry — agent stays in flow"
+description = "AgentRunner detects ContextOverflow errors, summarizes the conversation, and retries automatically — no public toggle, just built-in behavior"
 canonical_file = "crates/heartbit-core/src/agent/runner.rs"
-key_types = ["inject_summary"]
+key_types = ["AgentRunner"]
 payoff = "hit the 200k Anthropic limit and recover automatically; no manual summarization scripts"
 
 [[feature]]
@@ -39,7 +39,7 @@ payoff = "one binary serves agents over Kafka, HTTP API, SSE stream, and webhook
 name = "doom_loop_detection"
 description = "Hash tool-call batches per turn; abort on repetition"
 canonical_file = "crates/heartbit-core/src/agent/doom_loop.rs"
-key_types = ["DoomLoopTracker", "AgentRunnerBuilder::max_identical_tool_calls"]
+key_types = ["AgentRunnerBuilder::max_identical_tool_calls"]
 payoff = "catch agents stuck in a tight loop early instead of burning tokens"
 
 [[feature]]
@@ -95,7 +95,7 @@ payoff = "cut input token cost 80%+ on long-running agents with one builder meth
 name = "restate_workflows"
 description = "Durable agent execution with replay"
 canonical_file = "crates/heartbit/src/workflow/agent_workflow.rs"
-key_types = ["AgentWorkflowImpl", "AgentServiceImpl"]
+key_types = ["AgentWorkflowImpl"]
 payoff = "resume an agent run after process crash; Restate stores every LLM call and tool result"
 
 [[feature]]
