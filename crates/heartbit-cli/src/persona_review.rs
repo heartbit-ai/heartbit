@@ -606,6 +606,132 @@ pub async fn fetch_mention_one_off(
     })
 }
 
+/// Identity of the X account behind the configured OAuth1 access token.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedUser {
+    /// Numeric user id (e.g. `"1635952730853310464"`).
+    pub id: String,
+    /// Public handle (without `@`).
+    pub username: String,
+    /// Display name.
+    pub name: String,
+}
+
+/// Resolve the authenticated X user via `GET /2/users/me`. Used by
+/// `persona mentions` when no `--user-id` is supplied.
+pub async fn fetch_authenticated_user() -> anyhow::Result<AuthenticatedUser> {
+    use anyhow::Context;
+    use heartbit_core::ExecutionContext;
+    use heartbit_ghost::tools::XClient;
+
+    let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+        std::sync::Arc::new(EnvCredentialResolver);
+    let ctx = ExecutionContext {
+        credentials: Some(credentials),
+        ..Default::default()
+    };
+    let client = XClient::from_context(&ctx)
+        .await
+        .with_context(|| "build XClient from env credentials")?;
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Data,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        id: String,
+        username: String,
+        name: String,
+    }
+
+    let resp: Resp = client
+        .get_json("/2/users/me", &[])
+        .await
+        .with_context(|| "GET /2/users/me")?;
+
+    Ok(AuthenticatedUser {
+        id: resp.data.id,
+        username: resp.data.username,
+        name: resp.data.name,
+    })
+}
+
+/// One row from the `persona mentions` listing.
+#[derive(Debug, Clone)]
+pub struct MentionSummary {
+    /// X tweet id of the mention.
+    pub id: String,
+    /// Plain text.
+    pub text: String,
+    /// Author's user id, when available.
+    pub author_id: Option<String>,
+    /// RFC3339 creation timestamp, when available.
+    pub created_at: Option<String>,
+}
+
+/// Fetch up to `limit` recent mentions of `user_id`. Optionally constrain to
+/// mentions newer than `since_id`.
+pub async fn list_recent_mentions(
+    user_id: &str,
+    limit: u32,
+    since_id: Option<&str>,
+) -> anyhow::Result<Vec<MentionSummary>> {
+    use anyhow::Context;
+    use heartbit_core::ExecutionContext;
+    use heartbit_ghost::tools::XClient;
+
+    let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+        std::sync::Arc::new(EnvCredentialResolver);
+    let ctx = ExecutionContext {
+        credentials: Some(credentials),
+        ..Default::default()
+    };
+    let client = XClient::from_context(&ctx)
+        .await
+        .with_context(|| "build XClient from env credentials")?;
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        data: Vec<Mention>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Mention {
+        id: String,
+        text: String,
+        #[serde(default)]
+        author_id: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+    }
+
+    let max_results = limit.clamp(5, 100).to_string();
+    let path = format!("/2/users/{user_id}/mentions");
+    let mut query: Vec<(&str, &str)> = vec![
+        ("max_results", &max_results),
+        ("tweet.fields", "author_id,created_at"),
+    ];
+    if let Some(s) = since_id {
+        query.push(("since_id", s));
+    }
+    let resp: Resp = client
+        .get_json(&path, &query)
+        .await
+        .with_context(|| format!("GET /2/users/{user_id}/mentions"))?;
+
+    Ok(resp
+        .data
+        .into_iter()
+        .map(|m| MentionSummary {
+            id: m.id,
+            text: m.text,
+            author_id: m.author_id,
+            created_at: m.created_at,
+        })
+        .collect())
+}
+
 /// Construct a [`heartbit_ghost::reply::ReplyConfig`] from environment
 /// variables for the on-demand `persona reply` CLI subcommand. Uses
 /// [`TelegramReplyReviewDelivery`] when Telegram env vars are set;

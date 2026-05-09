@@ -75,6 +75,24 @@ pub enum PersonaCommand {
         candidates: usize,
     },
 
+    /// List recent mentions of the operator's X account.
+    /// Use the printed mention id with `persona reply --mention-id <id>`.
+    Mentions {
+        /// Persona instance name (currently unused; reserved for per-persona
+        /// X account scoping in the future).
+        name: String,
+        /// Maximum number of mentions to return (5..=100).
+        #[arg(long, default_value = "10")]
+        limit: u32,
+        /// Only return mentions newer than this id.
+        #[arg(long)]
+        since_id: Option<String>,
+        /// Operator X user_id. Defaults to whoever the OAuth1 creds resolve
+        /// via `GET /2/users/me`.
+        #[arg(long)]
+        user_id: Option<String>,
+    },
+
     /// Halt this persona on a running daemon.
     Pause {
         /// Persona instance name.
@@ -350,6 +368,46 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 output.candidates.len(),
                 output.outcome,
             );
+            Ok(())
+        }
+        PersonaCommand::Mentions {
+            name: _,
+            limit,
+            since_id,
+            user_id,
+        } => {
+            let resolved_user_id = match user_id {
+                Some(id) => id,
+                None => {
+                    let me = crate::persona_review::fetch_authenticated_user()
+                        .await
+                        .map_err(|e| anyhow!("resolve operator user_id: {e}"))?;
+                    eprintln!(
+                        "> Authenticated as @{} ({}) — user_id={}",
+                        me.username, me.name, me.id,
+                    );
+                    me.id
+                }
+            };
+            let mentions = crate::persona_review::list_recent_mentions(
+                &resolved_user_id,
+                limit,
+                since_id.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow!("list mentions: {e}"))?;
+            if mentions.is_empty() {
+                println!("(no mentions)");
+                return Ok(());
+            }
+            println!("Recent mentions ({}):", mentions.len());
+            for (i, m) in mentions.iter().enumerate() {
+                let author = m.author_id.as_deref().unwrap_or("?");
+                let when = m.created_at.as_deref().unwrap_or("?");
+                let preview: String = m.text.chars().take(140).collect();
+                println!("  [{i}] id={} author_id={author} at={when}", m.id);
+                println!("      {preview}");
+            }
             Ok(())
         }
         PersonaCommand::Show { name }
