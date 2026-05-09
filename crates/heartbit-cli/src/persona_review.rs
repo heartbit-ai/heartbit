@@ -219,6 +219,7 @@ pub async fn review_config_from_env<'a>(
         delivery,
         twitter_tool,
         credentials,
+        mode_addendum: None,
     })
 }
 

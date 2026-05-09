@@ -84,6 +84,10 @@ pub struct PipelineConfig<'a> {
     /// Validated `1..=10` at the start of `run_pipeline`. Set to 1 to
     /// recover the P1.3b single-candidate behavior (judge skipped).
     pub candidates_per_draft: usize,
+    /// Persona-specific mode addendum surfaced in the writer's user
+    /// message after voice_guidelines. None for personas that don't
+    /// have one (heartbit-ghost:x).
+    pub mode_addendum: Option<&'a str>,
 }
 
 /// Output of a successful pipeline run.
@@ -340,6 +344,7 @@ pub(crate) async fn generate_candidate(
     writer: &AgentRunner<BoxedProvider>,
     critic: &AgentRunner<BoxedProvider>,
     fact: &AgentRunner<BoxedProvider>,
+    mode_addendum: Option<&str>,
 ) -> Result<CandidateRecord, PipelineError> {
     // Revise loop.
     let mut prev_revision: Option<(String, String)> = None;
@@ -355,7 +360,7 @@ pub(crate) async fn generate_candidate(
             prev_revision.as_ref(),
             variant_idx,
             total_variants,
-            None,
+            mode_addendum,
         );
         let writer_out = writer
             .execute(&writer_msg)
@@ -543,6 +548,9 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
     let topic_owned: String = cfg.topic.to_string();
     let digest_owned = std::sync::Arc::new(research_digest.clone());
     let voice_owned = std::sync::Arc::new(voice_guidelines.clone());
+    // Convert to owned Arc<str> so the spawn closures are 'static.
+    let mode_addendum_owned: Option<std::sync::Arc<str>> =
+        cfg.mode_addendum.map(std::sync::Arc::from);
 
     let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
         tokio::task::JoinSet::new();
@@ -553,8 +561,20 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
         let topic = topic_owned.clone();
         let digest = digest_owned.clone();
         let voice = voice_owned.clone();
+        let mode_addendum = mode_addendum_owned.clone();
         joinset.spawn(async move {
-            generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+            generate_candidate(
+                i,
+                n,
+                &topic,
+                &digest,
+                &voice,
+                &writer,
+                &critic,
+                &fact,
+                mode_addendum.as_deref(),
+            )
+            .await
         });
     }
 
@@ -601,8 +621,20 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
             let topic = topic_owned.clone();
             let digest = digest_owned.clone();
             let voice = voice_owned.clone();
+            let mode_addendum = mode_addendum_owned.clone();
             joinset2.spawn(async move {
-                generate_candidate(i, n, &topic, &digest, &voice, &writer, &critic, &fact).await
+                generate_candidate(
+                    i,
+                    n,
+                    &topic,
+                    &digest,
+                    &voice,
+                    &writer,
+                    &critic,
+                    &fact,
+                    mode_addendum.as_deref(),
+                )
+                .await
             });
         }
         while let Some(res) = joinset2.join_next().await {
@@ -933,6 +965,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pipeline_config_carries_mode_addendum() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        let provider = MockProvider::arc(vec![]);
+        let cfg = PipelineConfig {
+            persona_name: "x",
+            topic: "test",
+            provider,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            on_progress: None,
+            candidates_per_draft: 1,
+            mode_addendum: None,
+        };
+        assert!(cfg.mode_addendum.is_none());
+    }
+
     #[tokio::test]
     async fn run_pipeline_happy_path_single_iteration() {
         let (_dir, profiles_root) = seed_snapshot("x");
@@ -952,6 +1001,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path");
         assert_eq!(out.final_draft, "concrete short post");
@@ -984,6 +1034,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let out = run_pipeline(cfg).await.expect("revise then pass");
         assert_eq!(out.final_draft, "second draft, no em-dashes");
@@ -1010,6 +1061,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1044,6 +1096,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1069,6 +1122,7 @@ mod tests {
             profiles_root: &root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1133,6 +1187,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
         };
         let out = run_pipeline(cfg).await.expect("3-candidate happy path");
         assert_eq!(out.candidates.len(), 3);
@@ -1208,6 +1263,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
         };
         let out = run_pipeline(cfg).await.expect("collapse+refill succeeds");
         assert_eq!(
@@ -1237,6 +1293,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 3,
+            mode_addendum: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1260,6 +1317,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 0, // invalid
+            mode_addendum: None,
         };
         let err = run_pipeline(cfg).await.unwrap_err();
         match err {
@@ -1292,6 +1350,7 @@ mod tests {
             profiles_root: &profiles_root,
             on_progress: None,
             candidates_per_draft: 1,
+            mode_addendum: None,
         };
         let out = run_pipeline(cfg).await.expect("happy path with no_image");
         assert_eq!(out.candidates.len(), 1);

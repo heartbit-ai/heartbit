@@ -53,6 +53,10 @@ pub struct ReviewConfig<'a> {
     /// Credential resolver for `twitter_tool`. Threaded into
     /// `ExecutionContext::credentials` at execute-time.
     pub credentials: Arc<dyn CredentialResolver>,
+    /// Persona-specific mode addendum surfaced in the writer's user
+    /// message after voice_guidelines. None for personas that don't
+    /// have one (heartbit-ghost:x).
+    pub mode_addendum: Option<&'a str>,
 }
 
 /// Output of a successful review-mode run.
@@ -314,6 +318,9 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     let topic_owned: String = cfg.topic.to_string();
     let digest_owned = std::sync::Arc::new(research_digest.clone());
     let voice_owned = std::sync::Arc::new(voice_guidelines.clone());
+    // Convert to owned Arc<str> so the spawn closures are 'static.
+    let mode_addendum_owned: Option<std::sync::Arc<str>> =
+        cfg.mode_addendum.map(std::sync::Arc::from);
 
     let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
         tokio::task::JoinSet::new();
@@ -324,9 +331,18 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
         let topic = topic_owned.clone();
         let digest = digest_owned.clone();
         let voice = voice_owned.clone();
+        let mode_addendum = mode_addendum_owned.clone();
         joinset.spawn(async move {
             crate::pipeline::generate_candidate(
-                i, n, &topic, &digest, &voice, &writer, &critic, &fact,
+                i,
+                n,
+                &topic,
+                &digest,
+                &voice,
+                &writer,
+                &critic,
+                &fact,
+                mode_addendum.as_deref(),
             )
             .await
         });
@@ -837,6 +853,7 @@ mod tests {
             delivery,
             twitter_tool,
             credentials: Arc::new(StubCredentialResolver),
+            mode_addendum: None,
         }
     }
 

@@ -215,6 +215,7 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                     profiles_root: &profiles_root,
                     on_progress: Some(on_progress),
                     candidates_per_draft: 3,
+                    mode_addendum: None,
                 };
 
                 let n_requested = cfg.candidates_per_draft;
