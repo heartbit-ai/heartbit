@@ -60,6 +60,21 @@ pub enum PersonaCommand {
         set: String,
     },
 
+    /// Reply to a single mention on demand (no daemon needed).
+    /// Fetches the mention via the X API, runs the reply pipeline,
+    /// sends candidate drafts to Telegram for review, posts the chosen
+    /// draft. Useful for testing the reply flow without the cron.
+    Reply {
+        /// Persona instance name.
+        name: String,
+        /// X tweet ID of the mention to reply to.
+        #[arg(long)]
+        mention_id: String,
+        /// Number of distinct candidate replies to generate (1..=3).
+        #[arg(long, default_value = "2")]
+        candidates: usize,
+    },
+
     /// Halt this persona on a running daemon.
     Pause {
         /// Persona instance name.
@@ -263,6 +278,79 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 );
                 Ok(())
             }
+        }
+        PersonaCommand::Reply {
+            name,
+            mention_id,
+            candidates,
+        } => {
+            let persona = registry.get(&name).ok_or_else(|| {
+                anyhow!("persona '{name}' not found. {}", registry_suffix(registry))
+            })?;
+            let expansion = persona
+                .expand(&PersonaParams::default())
+                .map_err(|e| anyhow!("expand persona '{name}': {e}"))?;
+
+            // Researcher override (heartbit-rs:x uses repo_researcher).
+            let researcher_override = expansion
+                .agents
+                .iter()
+                .find(|a| a.name == "repo_researcher")
+                .map(|recipe| {
+                    let recipe = std::sync::Arc::new(recipe.clone_config());
+                    let tools: Vec<std::sync::Arc<dyn heartbit_core::Tool>> = expansion
+                        .tools
+                        .iter()
+                        .filter(|t| t.definition().name == "repo_inspect")
+                        .cloned()
+                        .collect();
+                    (recipe, tools)
+                });
+
+            let provider =
+                build_provider_from_env(None).map_err(|e| anyhow!("build llm provider: {e}"))?;
+            let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+            let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+
+            eprintln!("> Fetching mention {mention_id}...");
+            let mention = crate::persona_review::fetch_mention_one_off(&mention_id)
+                .await
+                .map_err(|e| anyhow!("fetch mention: {e}"))?;
+            eprintln!(
+                "> Mention from @{} (author_id={}): {}",
+                mention.author_handle, mention.author_id, mention.text,
+            );
+
+            let on_progress: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                std::sync::Arc::new(|s: &str| eprintln!("> {s}"));
+
+            let cfg = crate::persona_review::reply_config_from_env(
+                &name,
+                provider,
+                &corpora_root,
+                &profiles_root,
+                Some(on_progress),
+                mention,
+                None, // parent — V1: not fetched (would need a second X API call)
+                None, // mentioner_context — V1: not fetched
+                candidates,
+                expansion.mode_addendum,
+                researcher_override,
+            )
+            .await
+            .map_err(|e| anyhow!("reply config: {e}"))?;
+
+            let output = heartbit_ghost::reply::run_reply_pipeline(cfg)
+                .await
+                .map_err(|e| anyhow!("reply pipeline: {e}"))?;
+            eprintln!(
+                "> ok: candidates={}, outcome={:?}",
+                output.candidates.len(),
+                output.outcome,
+            );
+            Ok(())
         }
         PersonaCommand::Show { name }
         | PersonaCommand::Phase { name, .. }

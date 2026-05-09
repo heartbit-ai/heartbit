@@ -242,9 +242,12 @@ impl ReviewDelivery for TelegramReviewDelivery {
 ///
 /// Shares the same process-global pending map and dispatcher as
 /// `TelegramReviewDelivery` — only one Telegram dispatcher runs per process.
-// Allow dead_code: not yet wired into a CLI subcommand (lifecycle wiring
-// deferred to the P1.5c follow-up integration step).
-#[allow(dead_code)]
+/// Telegram-backed delivery for the reply pipeline. Renders a
+/// parent-quoted message + drafts + [1]…[N] [Skip] inline keyboard,
+/// awaits the user's pick, returns the outcome.
+///
+/// Shares the same process-global pending map and dispatcher as
+/// `TelegramReviewDelivery` — only one Telegram dispatcher runs per process.
 pub struct TelegramReplyReviewDelivery {
     bot: Bot,
     chat_id: ChatId,
@@ -253,7 +256,6 @@ pub struct TelegramReplyReviewDelivery {
     pending: PendingMap,
 }
 
-#[allow(dead_code)]
 impl TelegramReplyReviewDelivery {
     /// Construct from environment variables and eagerly spawn the
     /// callback dispatcher (shared with `TelegramReviewDelivery`).
@@ -509,6 +511,145 @@ pub async fn review_config_from_env<'a>(
         credentials,
         mode_addendum,
         researcher_override,
+    })
+}
+
+/// Fetch a single tweet (mention) from the X API and convert it into
+/// a [`heartbit_ghost::reply::Mention`]. Used by `persona reply`
+/// for on-demand testing without going through the daemon's cron.
+///
+/// Required env vars (read by [`EnvCredentialResolver`] inside `XClient`):
+/// `X_CONSUMER_KEY`, `X_CONSUMER_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`.
+pub async fn fetch_mention_one_off(
+    mention_id: &str,
+) -> anyhow::Result<heartbit_ghost::reply::Mention> {
+    use anyhow::Context as _;
+    use heartbit_core::ExecutionContext;
+    use heartbit_ghost::tools::XClient;
+
+    let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+        std::sync::Arc::new(EnvCredentialResolver);
+    let ctx = ExecutionContext {
+        credentials: Some(credentials),
+        ..ExecutionContext::default()
+    };
+    let client = XClient::from_context(&ctx)
+        .await
+        .with_context(|| "build XClient from env credentials")?;
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: TweetData,
+        #[serde(default)]
+        includes: Option<Includes>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TweetData {
+        id: String,
+        text: String,
+        #[serde(default)]
+        author_id: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct Includes {
+        #[serde(default)]
+        users: Vec<UserInclude>,
+    }
+    #[derive(serde::Deserialize)]
+    struct UserInclude {
+        id: String,
+        username: String,
+    }
+
+    let path = format!("/2/tweets/{mention_id}");
+    let resp: Resp = client
+        .get_json(
+            &path,
+            &[
+                ("tweet.fields", "author_id,created_at"),
+                ("expansions", "author_id"),
+                ("user.fields", "username"),
+            ],
+        )
+        .await
+        .with_context(|| format!("GET /2/tweets/{mention_id}"))?;
+
+    let author_id = resp.data.author_id.clone().unwrap_or_default();
+    let author_handle = resp
+        .includes
+        .as_ref()
+        .and_then(|inc| {
+            inc.users
+                .iter()
+                .find(|u| u.id == author_id)
+                .map(|u| u.username.clone())
+        })
+        .unwrap_or_default();
+
+    let posted_at = resp
+        .data
+        .created_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+
+    Ok(heartbit_ghost::reply::Mention {
+        id: resp.data.id,
+        text: resp.data.text,
+        author_id,
+        author_handle,
+        posted_at,
+        in_reply_to_tweet_id: None, // not requested in this fetch — daemon path also defaults to None
+    })
+}
+
+/// Construct a [`heartbit_ghost::reply::ReplyConfig`] from environment
+/// variables for the on-demand `persona reply` CLI subcommand. Uses
+/// [`TelegramReplyReviewDelivery`] when Telegram env vars are set;
+/// otherwise surfaces a clear error (the CLI one-off requires Telegram
+/// for the review step — there is no auto-pick fallback in calibration mode).
+#[allow(clippy::too_many_arguments)]
+pub async fn reply_config_from_env<'a>(
+    persona_name: &'a str,
+    provider: std::sync::Arc<heartbit_core::llm::BoxedProvider>,
+    corpora_root: &'a std::path::Path,
+    profiles_root: &'a std::path::Path,
+    on_progress: Option<heartbit_ghost::pipeline::ProgressCallback>,
+    mention: heartbit_ghost::reply::Mention,
+    parent: Option<heartbit_ghost::reply::TweetSnapshot>,
+    mentioner_context: Option<heartbit_ghost::reply::MentionerContext>,
+    candidates_per_reply: usize,
+    mode_addendum: Option<&'static str>,
+    researcher_override: Option<heartbit_ghost::pipeline::ResearcherOverride>,
+) -> anyhow::Result<heartbit_ghost::reply::ReplyConfig<'a>> {
+    use anyhow::Context as _;
+    let delivery: std::sync::Arc<dyn heartbit_ghost::reply::ReplyReviewDelivery> =
+        std::sync::Arc::new(TelegramReplyReviewDelivery::from_env().context(
+            "construct TelegramReplyReviewDelivery \
+                 (set HEARTBIT_TELEGRAM_TOKEN + HEARTBIT_TELEGRAM_REVIEW_CHAT_ID)",
+        )?);
+    let twitter_tool: std::sync::Arc<dyn heartbit_core::Tool> =
+        std::sync::Arc::new(heartbit_ghost::tools::TwitterReplyTool::new());
+    let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+        std::sync::Arc::new(EnvCredentialResolver);
+    Ok(heartbit_ghost::reply::ReplyConfig {
+        persona_name,
+        provider,
+        corpora_root,
+        profiles_root,
+        on_progress,
+        mention,
+        parent,
+        mentioner_context,
+        candidates_per_reply,
+        mode_addendum,
+        researcher_override,
+        delivery,
+        twitter_tool,
+        credentials,
     })
 }
 
