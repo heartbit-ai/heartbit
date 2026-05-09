@@ -16,6 +16,7 @@ pub(crate) fn build_writer_user_message(
     prev_revision: Option<&(String, String)>,
     variant_index: usize,
     total_variants: usize,
+    mode_addendum: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("Topic: {topic}\n\n"));
@@ -24,6 +25,12 @@ pub(crate) fn build_writer_user_message(
     out.push_str("\n\n");
     out.push_str(voice_guidelines);
     out.push('\n');
+
+    if let Some(addendum) = mode_addendum {
+        out.push('\n');
+        out.push_str(addendum);
+        out.push('\n');
+    }
 
     if let Some((prev_draft, critic_reason)) = prev_revision {
         out.push_str("\nPREVIOUS DRAFT:\n");
@@ -103,4 +110,36 @@ pub(crate) fn build_image_generator_user_message(
          string \"no_image\". If yes, call image_generate with a concise \
          visual prompt and return its output.\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_user_message_appends_addendum_after_voice_guidelines() {
+        let msg = build_writer_user_message(
+            "topic",
+            "digest",
+            "VOICE GUIDELINES",
+            None,
+            0,
+            1,
+            Some("EVANGELISM MODE \u{2014} fixture"),
+        );
+        let voice_pos = msg.find("VOICE GUIDELINES").expect("voice present");
+        let add_pos = msg
+            .find("EVANGELISM MODE \u{2014} fixture")
+            .expect("addendum present");
+        assert!(
+            voice_pos < add_pos,
+            "addendum must follow voice guidelines (voice@{voice_pos}, addendum@{add_pos})"
+        );
+    }
+
+    #[test]
+    fn writer_user_message_without_addendum_is_unchanged_baseline() {
+        let msg = build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None);
+        assert!(!msg.contains("EVANGELISM"));
+    }
 }

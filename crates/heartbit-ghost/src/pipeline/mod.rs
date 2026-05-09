@@ -355,6 +355,7 @@ pub(crate) async fn generate_candidate(
             prev_revision.as_ref(),
             variant_idx,
             total_variants,
+            None,
         );
         let writer_out = writer
             .execute(&writer_msg)
