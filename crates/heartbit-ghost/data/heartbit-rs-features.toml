@@ -1,0 +1,22 @@
+version = 1
+
+[[feature]]
+name = "tool_trait"
+description = "The Tool trait — definition() + execute() — that powers everything in heartbit-core"
+canonical_file = "crates/heartbit-core/src/tool/mod.rs"
+key_types = ["Tool", "ToolDefinition", "ToolOutput"]
+payoff = "implement two methods, get a fully-wired tool with retry, guardrails, telemetry"
+
+[[feature]]
+name = "agent_runner"
+description = "Standalone agent loop with tokio::JoinSet for parallel tool execution"
+canonical_file = "crates/heartbit-core/src/agent/runner.rs"
+key_types = ["AgentRunner", "AgentRunnerBuilder", "AgentOutput"]
+payoff = "single-process agent loop, no Restate / no daemon — drop into any tokio app"
+
+[[feature]]
+name = "memory_trait"
+description = "Memory trait with 6 methods: store / recall / update / forget / add_link / prune"
+canonical_file = "crates/heartbit-core/src/memory/mod.rs"
+key_types = ["Memory", "MemoryEntry", "MemoryQuery"]
+payoff = "swap InMemory for Postgres without touching agent code; SOTA recall built in"
