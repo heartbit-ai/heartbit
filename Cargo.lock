@@ -1814,6 +1814,7 @@ dependencies = [
  "futures",
  "glob",
  "heartbit-core",
+ "heartbit-ghost",
  "heartbit-macro",
  "jsonschema",
  "jsonwebtoken",

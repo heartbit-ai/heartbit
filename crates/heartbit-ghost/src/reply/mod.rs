@@ -14,7 +14,7 @@ pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
 
 /// A mention of the operator's account fetched from `twitter_mentions`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mention {
     /// X tweet ID of the mention itself.
     pub id: String,
@@ -33,7 +33,7 @@ pub struct Mention {
 
 /// A small snapshot of a tweet (text + timing). Used as a parent-tweet
 /// context for the reply researcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TweetSnapshot {
     /// X tweet ID.
     pub id: String,
@@ -45,7 +45,7 @@ pub struct TweetSnapshot {
 
 /// Tone-calibration context about the mentioner. None of these are
 /// strictly required; the writer degrades gracefully if missing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MentionerContext {
     /// Public handle of the mentioner (sans `@`).
     pub handle: String,

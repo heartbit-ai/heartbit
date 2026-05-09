@@ -50,6 +50,34 @@ pub enum DaemonCommand {
     CancelTask {
         id: Uuid,
     },
+    /// Cron-driven: poll for new mentions for this persona's
+    /// configured operator account, dispatch one ReplyDraft per
+    /// surviving mention. Fired by the CronScheduler at the
+    /// `[daemon.persona.<name>.mentions] poll_interval_seconds`
+    /// cadence. Free-tier safe: one twitter_mentions read per poll.
+    MentionPoll {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+        /// X user ID of the operator account.
+        user_id: String,
+    },
+    /// Per-mention: run the reply pipeline (research → draft →
+    /// review → post). Fired by the MentionPoll handler for each
+    /// mention that survives the spam guards. Carries the full
+    /// mention payload so the dispatcher doesn't need to refetch.
+    ReplyDraft {
+        /// Persona name.
+        persona: String,
+        /// The mention being replied to.
+        mention: heartbit_ghost::reply::Mention,
+        /// Optional parent tweet (when the mention is a reply on
+        /// the operator's own tweet).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<heartbit_ghost::reply::TweetSnapshot>,
+        /// Optional context for tone calibration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mentioner_context: Option<heartbit_ghost::reply::MentionerContext>,
+    },
 }
 
 /// State machine for daemon task lifecycle.
@@ -998,6 +1026,59 @@ mod tests {
         assert!(json.contains("idempotency_key"));
         let back: DaemonTask = serde_json::from_str(&json).unwrap();
         assert_eq!(back.idempotency_key.as_deref(), Some("idem-abc-123"));
+    }
+
+    #[test]
+    fn daemon_command_mention_poll_serde_round_trips() {
+        let cmd = DaemonCommand::MentionPoll {
+            persona: "heartbit-ghost:x".into(),
+            user_id: "12345".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::MentionPoll { persona, user_id } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+                assert_eq!(user_id, "12345");
+            }
+            other => panic!("expected MentionPoll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_command_reply_draft_serde_round_trips() {
+        use chrono::Utc;
+        let mention = heartbit_ghost::reply::Mention {
+            id: "abc".into(),
+            text: "how does it compare?".into(),
+            author_id: "777".into(),
+            author_handle: "user".into(),
+            posted_at: Utc::now(),
+            in_reply_to_tweet_id: Some("parent".into()),
+        };
+        let cmd = DaemonCommand::ReplyDraft {
+            persona: "heartbit-ghost:x".into(),
+            mention: mention.clone(),
+            parent: None,
+            mentioner_context: None,
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::ReplyDraft {
+                persona,
+                mention: m,
+                parent,
+                mentioner_context,
+            } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+                assert_eq!(m.id, mention.id);
+                assert_eq!(m.author_handle, mention.author_handle);
+                assert!(parent.is_none());
+                assert!(mentioner_context.is_none());
+            }
+            other => panic!("expected ReplyDraft, got {other:?}"),
+        }
     }
 
     #[test]

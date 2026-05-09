@@ -949,6 +949,22 @@ impl DaemonCore {
                             }
                             self.event_channels.write().remove(&id);
                         }
+                        DaemonCommand::MentionPoll { persona, user_id } => {
+                            tracing::warn!(
+                                persona = %persona,
+                                user_id = %user_id,
+                                "MentionPoll dispatched but handler is not yet wired (P1.5c task 10)"
+                            );
+                            // No-op for now — task 10 implements the real handler.
+                        }
+                        DaemonCommand::ReplyDraft { persona, mention, parent: _, mentioner_context: _ } => {
+                            tracing::warn!(
+                                persona = %persona,
+                                mention_id = %mention.id,
+                                "ReplyDraft dispatched but handler is not yet wired (P1.5c task 11)"
+                            );
+                            // No-op for now — task 11 implements the real handler.
+                        }
                     }
                 }
                 Some(result) = self.active_tasks.join_next() => {
