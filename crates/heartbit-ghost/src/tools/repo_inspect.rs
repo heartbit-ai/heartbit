@@ -32,14 +32,7 @@ enum Op {
 
 #[derive(Debug, Deserialize, Clone)]
 struct FeatureMenu {
-    #[serde(default = "default_menu_version")]
-    #[allow(dead_code)]
-    pub version: u32,
     pub feature: Vec<FeatureEntry>,
-}
-
-fn default_menu_version() -> u32 {
-    1
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -52,10 +45,24 @@ struct FeatureEntry {
 }
 
 impl FeatureMenu {
+    /// Load the feature menu from the canonical path under `repo_root`.
+    ///
+    /// Returns `None` when the file is absent OR when it fails to parse.
+    /// Parse errors are logged to stderr so a corrupt menu (e.g. merge
+    /// conflict marker, truncated write) shows up loudly rather than
+    /// being silently treated as "missing". The unused `version = 1`
+    /// line in the TOML is silently ignored by serde — present for
+    /// future schema versioning, no field needed yet.
     fn load(repo_root: &Path) -> Option<Self> {
         let path = repo_root.join("crates/heartbit-ghost/data/heartbit-rs-features.toml");
         let text = std::fs::read_to_string(&path).ok()?;
-        toml::from_str(&text).ok()
+        match toml::from_str::<Self>(&text) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("heartbit-ghost: failed to parse heartbit-rs-features.toml: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -272,7 +279,7 @@ impl RepoInspectTool {
             None => {
                 return Ok(ToolOutput::error(
                     "feature menu not loaded — \
-                     crates/heartbit-ghost/data/heartbit-rs-features.toml is missing"
+                     crates/heartbit-ghost/data/heartbit-rs-features.toml is missing or malformed"
                         .to_string(),
                 ));
             }
@@ -289,7 +296,8 @@ impl RepoInspectTool {
             Some(m) => m,
             None => {
                 return Ok(ToolOutput::error(
-                    "feature menu not loaded — heartbit-rs-features.toml is missing".to_string(),
+                    "feature menu not loaded — heartbit-rs-features.toml is missing or malformed"
+                        .to_string(),
                 ));
             }
         };
@@ -530,6 +538,33 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.contains("crates/heartbit-core/src/tool/mod.rs"));
         assert!(out.content.contains("ToolDefinition"));
+    }
+
+    #[tokio::test]
+    async fn list_features_returns_error_when_menu_absent() {
+        let tmp = fixture_repo();
+        let tool = RepoInspectTool::new(tmp.path()).unwrap();
+        let out = tool
+            .execute(&ExecutionContext::default(), json!({"op": "list_features"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn feature_demo_returns_error_when_menu_absent() {
+        let tmp = fixture_repo();
+        let tool = RepoInspectTool::new(tmp.path()).unwrap();
+        let out = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({"op": "feature_demo", "name": "tool_trait"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("missing"));
     }
 
     #[tokio::test]
