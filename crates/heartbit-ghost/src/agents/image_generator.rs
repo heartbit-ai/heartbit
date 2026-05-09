@@ -5,10 +5,11 @@ use heartbit_core::config::AgentConfig;
 
 /// System prompt for the image_generator.
 ///
-/// Engineered around Google's published guidance for Gemini Flash Image
-/// (Nano Banana lineage): medium-tag-first, 5-slot template, positive
-/// framing, tangible-scene translation. Pushes the model away from its
-/// default "glowing-node tech diagram" output toward figurative imagery.
+/// Tuned for **abstract black-and-white engraving / etching / lithograph**
+/// aesthetics. The image may be conceptual and need not literally depict
+/// the post's subject — visual mood and composition matter more than
+/// narrative fit. Built on Google's Gemini Flash Image guidance
+/// (medium-tag-first, 5-slot template, positive framing).
 pub const IMAGE_GENERATOR_SYSTEM_PROMPT: &str = r#"You produce an image to accompany a social media post when one would meaningfully add to it.
 
 INPUT
@@ -18,30 +19,34 @@ DECISION
 Does this post benefit from an image at all? If the post is purely textual / aphoristic / a quoted reply, output the literal string "no_image" (lowercase, no quotes, no punctuation) and stop.
 
 VISUAL DIRECTION
-Invent a *figurative scene* that stands in for the topic — never describe the topic itself in abstract terms. Concept-led prompts default to glowing-node tech diagrams; subject-led prompts produce real images. Translate the topic into a tangible tableau:
-- "AI safety research" → a watchmaker inspecting a brass mechanism through a glass loupe on a sunlit oak bench.
-- "agent harnesses turn agents into bureaucrats" → rows of identical clerks at wooden desks under fluorescent light, each with the same stack of paper.
-- "compounding capabilities" → a single sapling growing through cracked concrete beside older trees with thicker trunks.
+The image is a **black-and-white engraving / etching / wood-engraving / lithograph** — abstract or conceptual, not a literal illustration of the post. Think 19th-century scientific engravings, Gustave Doré's hatched lines, M. C. Escher's geometric impossibilities, Franz Masereel's silent novels, Albrecht Dürer's fine cross-hatching.
+
+The image does NOT need to depict the post's subject. It can be a tangentially-related metaphor (a single mechanical part, a celestial map, an architectural fragment, a hand, a fold of cloth, a knot, an empty interior, a horizon line) or a purely abstract composition (geometric impossibility, tessellation, radiating lines, layered isobars). Mood and texture beat literal narrative fit.
 
 PROMPT TEMPLATE (mandatory, 5 slots, in order)
-[Medium] [Subject] + [Action] + [Location/context] + [Composition] + [Style/lighting/mood, plus "16:9"]
+[Medium tag] [Subject] + [Action or arrangement] + [Location/context, OPTIONAL for purely abstract] + [Composition] + [Style/light/mood, always including "black and white" and "16:9"]
 
-The first 1-3 words MUST be a concrete medium tag — pick one that fits the post:
-- "Photorealistic medium shot of …" / "Documentary photograph of …"
-- "Editorial illustration of …" / "Gouache and ink illustration of …"
-- "Oil painting of …" / "Pen-and-ink drawing of …"
-- "Hand-drawn schematic in the style of a 19th-century engineering manual of …" (only when a diagrammatic feel is genuinely warranted)
+The first 2-4 words MUST be one of these medium tags (engraving family ONLY):
+- "Black-and-white wood engraving of …"
+- "Black-and-white copper-plate etching of …"
+- "Black-and-white pen-and-ink engraving in the style of a 19th-century scientific atlas, depicting …"
+- "Black-and-white lithograph of …"
+- "Black-and-white scratchboard illustration of …"
 
-Worked example:
-"Editorial illustration of a watchmaker hunched over a workbench, inspecting a brass mechanism through a glass loupe, in a sunlit workshop with hand-tools hanging on the wall, medium close-up centered on the hands, gouache and ink with a limited warm palette, 16:9."
+Worked examples:
+- "Black-and-white wood engraving of a single brass key floating in front of an empty doorway, the door's wood-grain rendered in tight parallel hatching, sharp white edges on a deep ink-black background, 16:9."
+- "Black-and-white copper-plate etching in the style of a 19th-century scientific atlas, depicting a tessellation of overlapping hexagonal mechanical parts, fine cross-hatched shading, centered composition, museum-engraving aesthetic, 16:9."
+- "Black-and-white scratchboard illustration of a knotted rope hanging in empty space, white lines on solid black, dramatic chiaroscuro, minimalist composition, 16:9."
 
 RULES
 - Two sentences maximum for the visual prompt.
-- Use POSITIVE framing only — describe what the scene IS, not what it isn't ("an empty street at dawn", not "a street with no cars"). Negation tokens still activate the concept.
-- Avoid these tokens unless the post is genuinely about them: network, node, neural, data, glowing, holographic, cyber, futuristic, interface, UI, dashboard, mesh.
-- No real people's likenesses (no "a photo of @karpathy") — use abstracted or anonymous figures.
+- Black and white ONLY. No color tokens (sepia, ochre, blue, etc.). If a token of color slips in, the image will return color.
+- Always include the literal phrase "black and white" in the prompt — Gemini honors it best when explicit.
+- Use POSITIVE framing — describe what the image IS, not what it isn't. Negation tokens still activate the concept.
+- Avoid these tokens unless the post is genuinely about them: network, node, neural, data, glowing, holographic, cyber, futuristic, interface, UI, dashboard, mesh, photorealistic, photograph, watercolor, pastel, gouache.
+- No real people's likenesses (no "a portrait of @karpathy") — anonymous figures only, faces partially obscured if at all.
 - No brand logos.
-- No text overlays that duplicate the post text.
+- No text overlays. Captions and labels in scientific-atlas-style images are fine if generic ("Fig. 1", "Plate IV") and never reproduce the post text.
 
 Call `image_generate` with the resulting prompt, then return its output (URL + alt text) as your final answer."#;
 
@@ -78,17 +83,34 @@ mod tests {
     }
 
     #[test]
-    fn image_generator_prompt_mandates_medium_tag() {
-        // The figurative-output guidance hinges on a concrete medium tag
-        // appearing in the first 1-3 words of the visual prompt.
+    fn image_generator_prompt_mandates_engraving_medium_tag() {
+        // The visual style must be locked to the engraving family — the
+        // prompt forces a `Black-and-white <engraving variant>` opener.
         let p = IMAGE_GENERATOR_SYSTEM_PROMPT;
         assert!(p.contains("medium tag"), "prompt must call out medium tag");
         assert!(
-            p.contains("Photorealistic")
-                && p.contains("Editorial illustration")
-                && p.contains("Oil painting"),
-            "prompt must enumerate concrete medium options"
+            p.contains("wood engraving")
+                && p.contains("copper-plate etching")
+                && p.contains("lithograph"),
+            "prompt must enumerate engraving-family medium options"
         );
+        assert!(
+            p.contains("black and white"),
+            "prompt must mandate the literal 'black and white' phrase"
+        );
+        // Forbidden color / non-engraving mediums must NOT appear as
+        // recommendations — they were the old figurative-prompt set.
+        for forbidden in [
+            "Photorealistic medium shot",
+            "Editorial illustration of",
+            "Oil painting of",
+            "Gouache and ink illustration",
+        ] {
+            assert!(
+                !p.contains(forbidden),
+                "engraving prompt must drop the figurative medium tag {forbidden:?}"
+            );
+        }
     }
 
     #[test]
@@ -109,13 +131,18 @@ mod tests {
     }
 
     #[test]
-    fn image_generator_prompt_translates_topic_to_scene() {
-        // The agent must be told to invent a figurative tableau rather
-        // than describe the abstract topic itself.
+    fn image_generator_prompt_allows_abstract_or_tangential_subject() {
+        // The new direction explicitly RELAXES the literal-illustration
+        // mandate. Abstract / conceptual / tangentially-related images
+        // are allowed — mood and texture beat narrative fit.
         let p = IMAGE_GENERATOR_SYSTEM_PROMPT;
         assert!(
-            p.contains("figurative scene") && p.contains("tangible tableau"),
-            "prompt must direct topic-to-scene translation"
+            p.contains("abstract") || p.contains("conceptual"),
+            "prompt must allow abstract / conceptual imagery"
+        );
+        assert!(
+            p.contains("does NOT need to depict") || p.contains("not a literal illustration"),
+            "prompt must say the image need not literally depict the post"
         );
     }
 
