@@ -56,6 +56,7 @@ impl SpamGuardConfig {
 }
 
 /// Stateless evaluator that decides whether a mention should be skipped.
+#[derive(Clone)]
 pub struct SpamGuard {
     cfg: SpamGuardConfig,
 }

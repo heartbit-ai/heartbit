@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 use heartbit::daemon::kafka;
 use heartbit::{
     AgentEvent, AgentOutput, DaemonCore, DaemonMetrics, Error as HeartbitError, HeartbitConfig,
-    InMemoryTaskStore, JwtValidator, Memory, PostgresStore,
+    InMemoryTaskStore, JwtValidator, Memory, MentionContext, PersonaMentionEntry, PostgresStore,
+    ReplySharedContext,
 };
 
 use crate::{build_on_retry, build_provider_from_config, init_tracing_from_config};
@@ -161,10 +162,31 @@ pub async fn run_daemon(
         } else {
             core
         };
+
+        // P1.5 Task 13: wire MentionPollScheduler + real handler dispatch.
+        // Build MentionContext from enabled persona_mentions entries when present.
+        let core = match build_mention_context(&config, &daemon_config).await {
+            Ok(Some(mc)) => core.with_mention_context(Arc::new(mc)),
+            Ok(None) => core,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build MentionContext, continuing without mention polling"
+                );
+                core
+            }
+        };
+
         tracing::info!("Kafka consumer/producer initialized");
         (Some(core), handle)
     } else {
         tracing::info!("no [daemon.kafka] configured — running in HTTP-only mode");
+        if daemon_config.persona_mentions.iter().any(|e| e.enabled) {
+            tracing::warn!(
+                "[[daemon.persona_mentions]] entries are configured but [daemon.kafka] is absent \
+                 — mention polling requires Kafka and will NOT run in HTTP-only mode"
+            );
+        }
         let handle = heartbit::DaemonHandle::http_only(store);
         (None, handle)
     };
@@ -807,4 +829,175 @@ pub async fn run_daemon(
 
     tracing::info!("runtime shut down gracefully");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P1.5 Task 13: Build MentionContext from [[daemon.persona_mentions]] config.
+// Returns `Ok(None)` when there are no enabled entries.
+// Returns `Ok(Some(mc))` when at least one entry is wired up successfully.
+// Returns `Err(...)` only on a hard configuration failure (missing env vars,
+// bad paths) that should abort the mention-polling path gracefully.
+// ---------------------------------------------------------------------------
+async fn build_mention_context(
+    config: &HeartbitConfig,
+    daemon_config: &heartbit::DaemonConfig,
+) -> Result<Option<MentionContext>> {
+    let enabled_entries: Vec<&heartbit::PersonaMentionsConfig> = daemon_config
+        .persona_mentions
+        .iter()
+        .filter(|e| e.enabled)
+        .collect();
+
+    if enabled_entries.is_empty() {
+        return Ok(None);
+    }
+
+    // Resolve corpora/profiles root dirs.
+    let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+        .context("failed to resolve corpora root for mention context")?;
+    let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+        .context("failed to resolve profiles root for mention context")?;
+
+    // Shared credential resolver (env-based).
+    let credentials: Arc<dyn heartbit_core::CredentialResolver> =
+        Arc::new(crate::persona_review::EnvCredentialResolver);
+
+    // Build LLM provider for the reply pipeline (no retry event callback needed here).
+    let provider = build_provider_from_config(config, None)
+        .context("failed to build provider for mention context")?;
+
+    // Build persona registry.
+    let mut registry = heartbit::PersonaRegistry::new();
+    heartbit_ghost::register(&mut registry);
+
+    // Build twitter_reply tool.
+    let twitter_reply_tool: Arc<dyn heartbit::tool::Tool> =
+        Arc::new(heartbit_ghost::tools::TwitterReplyTool);
+
+    // Build twitter_mentions tool (shared across entries).
+    let mentions_tool: Arc<dyn heartbit::tool::Tool> =
+        Arc::new(heartbit_ghost::tools::TwitterMentionsTool);
+
+    // Build ReplyReviewDelivery — Telegram if env vars are present, else log-only stub.
+    let delivery: Arc<dyn heartbit_ghost::reply::ReplyReviewDelivery> =
+        match crate::persona_review::TelegramReplyReviewDelivery::from_env() {
+            Ok(d) => {
+                tracing::info!("mention context: Telegram review delivery configured");
+                Arc::new(d)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Telegram review delivery not configured (HEARTBIT_TELEGRAM_TOKEN / HEARTBIT_TELEGRAM_REVIEW_CHAT_ID unset), \
+                     falling back to log-only delivery"
+                );
+                Arc::new(LogOnlyReplyDelivery)
+            }
+        };
+
+    let reply_ctx = ReplySharedContext {
+        registry: Arc::new(registry),
+        provider,
+        delivery,
+        twitter_tool: twitter_reply_tool,
+        credentials: credentials.clone(),
+        corpora_root,
+        profiles_root,
+    };
+
+    // Build one PersonaMentionEntry per enabled config entry.
+    let mut entries = Vec::with_capacity(enabled_entries.len());
+    for cfg in enabled_entries {
+        // Resolve mention store backend.
+        let store: Arc<dyn heartbit_ghost::reply::MentionStore> = match cfg.mention_store.as_str() {
+            "jsonl" => {
+                let path = cfg
+                    .mention_store_path
+                    .clone()
+                    .unwrap_or_else(|| format!(".heartbit/mentions/{}.jsonl", cfg.persona));
+                match heartbit_ghost::reply::JsonlMentionStore::open(&path).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            persona = %cfg.persona,
+                            path,
+                            error = %e,
+                            "failed to open JSONL mention store, falling back to in-memory"
+                        );
+                        Arc::new(heartbit_ghost::reply::InMemoryMentionStore::new())
+                    }
+                }
+            }
+            _ => Arc::new(heartbit_ghost::reply::InMemoryMentionStore::new()),
+        };
+
+        entries.push(PersonaMentionEntry::new(
+            &cfg.persona,
+            &cfg.user_id,
+            cfg.poll_interval_seconds,
+            cfg.candidates_per_reply,
+            store,
+            credentials.clone(),
+            10, // max_results default
+        ));
+    }
+
+    tracing::info!(
+        entries = entries.len(),
+        "MentionContext built with persona mention entries"
+    );
+
+    Ok(Some(MentionContext::new(entries, reply_ctx, mentions_tool)))
+}
+
+// ---------------------------------------------------------------------------
+// Log-only ReplyReviewDelivery — used when Telegram is not configured.
+// Logs the review message and auto-approves the first candidate.
+// ---------------------------------------------------------------------------
+struct LogOnlyReplyDelivery;
+
+impl heartbit_ghost::reply::ReplyReviewDelivery for LogOnlyReplyDelivery {
+    fn deliver<'a>(
+        &'a self,
+        msg: heartbit_ghost::reply::ReplyReviewMessage,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        heartbit_ghost::review::DeliveredReview,
+                        heartbit_ghost::review::ReviewDeliveryError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            tracing::info!(
+                mention_id = %msg.mention.id,
+                candidates = msg.candidates.len(),
+                "LogOnlyReplyDelivery: auto-approving first candidate (no Telegram configured)"
+            );
+            Ok(heartbit_ghost::review::DeliveredReview {
+                outcome: heartbit_ghost::review::DeliveryOutcome::Pick(0),
+                receipt: heartbit_ghost::review::DeliveryReceipt {
+                    data: serde_json::Value::Null,
+                },
+            })
+        })
+    }
+
+    fn report<'a>(
+        &'a self,
+        _receipt: heartbit_ghost::review::DeliveryReceipt,
+        _outcome: heartbit_ghost::reply::ReplyOutcome,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), heartbit_ghost::review::ReviewDeliveryError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(()) })
+    }
 }

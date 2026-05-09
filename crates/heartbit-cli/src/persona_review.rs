@@ -514,7 +514,7 @@ pub async fn review_config_from_env<'a>(
 
 /// Env-only credential resolver — reads `name` from `std::env`, wraps
 /// in `Secret`. Error if env var unset.
-struct EnvCredentialResolver;
+pub struct EnvCredentialResolver;
 
 impl heartbit_core::CredentialResolver for EnvCredentialResolver {
     fn resolve(
