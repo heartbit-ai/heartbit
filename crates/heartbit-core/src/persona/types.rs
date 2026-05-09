@@ -32,6 +32,11 @@ pub struct PersonaExpansion {
     pub triggers: Vec<TriggerSpec>,
     /// Optional review channel spec. None in Phase 0.
     pub review: Option<ReviewSpec>,
+    /// Persona-specific mode addendum, appended to voice-aware user
+    /// messages by the pipeline. Carries persona-design constants
+    /// (e.g. evangelism framing) without coupling them to user TOML.
+    /// `None` for personas that don't need one.
+    pub mode_addendum: Option<&'static str>,
 }
 
 impl std::fmt::Debug for PersonaExpansion {
@@ -41,6 +46,7 @@ impl std::fmt::Debug for PersonaExpansion {
             .field("tools", &self.tools.len())
             .field("triggers", &self.triggers.len())
             .field("review", &self.review.is_some())
+            .field("mode_addendum", &self.mode_addendum.is_some())
             .finish()
     }
 }
@@ -104,5 +110,21 @@ mod tests {
         assert!(e.tools.is_empty());
         assert!(e.triggers.is_empty());
         assert!(e.review.is_none());
+    }
+
+    #[test]
+    fn persona_expansion_default_mode_addendum_is_none() {
+        let e = PersonaExpansion::default();
+        assert!(e.mode_addendum.is_none());
+    }
+
+    #[test]
+    fn persona_expansion_carries_static_mode_addendum() {
+        const ADDENDUM: &str = "EVANGELISM MODE — test fixture";
+        let e = PersonaExpansion {
+            mode_addendum: Some(ADDENDUM),
+            ..PersonaExpansion::default()
+        };
+        assert_eq!(e.mode_addendum, Some(ADDENDUM));
     }
 }
