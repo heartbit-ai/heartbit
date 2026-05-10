@@ -61,6 +61,13 @@ pub struct MentionerContext {
     pub recent_tweets: Vec<TweetSnapshot>,
     /// Follower count of the mentioner, if available.
     pub follower_count: Option<u64>,
+    /// Following count of the mentioner, if available. Used by the
+    /// bot-heuristic guard (P1.7) for the follower/following ratio
+    /// signal.
+    pub following_count: Option<u64>,
+    /// When the mentioner's account was created. Used by the
+    /// bot-heuristic guard (P1.7) for the account-age signal.
+    pub account_created_at: Option<DateTime<Utc>>,
 }
 
 use std::future::Future;
@@ -586,6 +593,13 @@ mod tests {
         assert!(m.bio.is_none());
         assert!(m.recent_tweets.is_empty());
         assert!(m.follower_count.is_none());
+    }
+
+    #[test]
+    fn mentioner_context_default_has_none_for_new_fields() {
+        let m = MentionerContext::default();
+        assert!(m.following_count.is_none());
+        assert!(m.account_created_at.is_none());
     }
 
     #[test]

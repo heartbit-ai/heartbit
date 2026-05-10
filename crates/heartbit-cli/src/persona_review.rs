@@ -836,6 +836,8 @@ mod reply_review_render_tests {
                 bio: None,
                 recent_tweets: vec![],
                 follower_count: Some(1234),
+                following_count: None,
+                account_created_at: None,
             }),
             candidates: candidates.into_iter().map(String::from).collect(),
             interaction_timeout_seconds: 300,

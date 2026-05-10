@@ -138,6 +138,8 @@ mod tests {
             bio: None,
             recent_tweets: vec![],
             follower_count: Some(followers),
+            following_count: None,
+            account_created_at: None,
         }
     }
 
