@@ -1805,6 +1805,7 @@ name = "heartbit"
 version = "2026.507.3"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "argon2",
  "base64 0.22.1",
  "bytes",
@@ -1814,6 +1815,7 @@ dependencies = [
  "futures",
  "glob",
  "heartbit-core",
+ "heartbit-ghost",
  "heartbit-macro",
  "jsonschema",
  "jsonwebtoken",

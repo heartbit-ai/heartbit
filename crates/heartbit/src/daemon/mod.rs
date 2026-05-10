@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod notify;
 pub mod openai_compat;
 pub mod persona_post;
+pub mod persona_post_handler;
 pub mod runtime_types;
 pub mod store;
 pub mod todo;
@@ -28,6 +29,7 @@ pub use openai_compat::{
     extract_system_prompt, extract_task,
 };
 pub use persona_post::PersonaPostScheduler;
+pub use persona_post_handler::{PersonaPostDeps, handle_persona_post};
 pub use runtime_types::{
     EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, RuntimeAdvancedConfig,
     RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent,

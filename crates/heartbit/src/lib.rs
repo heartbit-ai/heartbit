@@ -140,13 +140,14 @@ pub use daemon::{
     CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
     DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, FileTodoStore,
     HeartbitPulseScheduler, InMemoryTaskStore, KafkaCommandProducer, OnTaskComplete,
-    PersonaPostScheduler, RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeEvalRequest,
-    RuntimeEvalResponse, RuntimeEvalSseEvent, RuntimeGuardrailConfig, RuntimeMcpServer,
-    RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType,
-    RuntimeRequest, RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent,
-    RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge,
-    RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
+    PersonaPostDeps, PersonaPostScheduler, RuntimeAdvancedConfig, RuntimeAgentConfig,
+    RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent, RuntimeGuardrailConfig,
+    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
+    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig,
+    RuntimeSseEvent, RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig,
+    RuntimeWorkflowEdge, RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore,
+    TodoEntry, TodoList, TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext,
+    format_notification, handle_persona_post,
 };
 
 // --- Eval re-exports ---
