@@ -15,6 +15,7 @@ categories = ["development-tools", "asynchronous"]
 [dependencies]
 # Empirical-deps pattern: add a dep here only when a subsequent move-task's
 # `cargo check -p heartbit-core` fails with "unresolved import". Start minimal.
+anyhow = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

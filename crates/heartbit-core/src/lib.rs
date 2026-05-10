@@ -144,7 +144,7 @@ pub use memory::{Memory, MemoryEntry, MemoryQuery, MemoryType};
 // --- Persona re-exports ---
 pub use persona::{
     AuthorshipMode, Persona, PersonaExpansion, PersonaParams, PersonaRegistry, ReviewSpec,
-    TriggerSpec,
+    TopicContextProvider, TriggerSpec,
 };
 
 // --- Tool re-exports ---

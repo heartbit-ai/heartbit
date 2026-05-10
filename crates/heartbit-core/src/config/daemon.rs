@@ -40,6 +40,10 @@ pub struct DaemonConfig {
     /// Idempotency-key TTL sweep configuration.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
+    /// Per-persona proactive-posting configuration. One entry per
+    /// persona that has proactive posting enabled.
+    #[serde(default)]
+    pub persona_posts: Vec<PersonaPostsConfig>,
 }
 
 /// MCP server configuration for the daemon.
@@ -237,6 +241,68 @@ fn parse_hhmm(s: &str) -> Result<(u32, u32), Error> {
     Ok((hour, minute))
 }
 
+/// Per-persona proactive-posting configuration.
+///
+/// When present, the daemon registers a `PersonaPostScheduler` that
+/// fires `DaemonCommand::PersonaPost` on the configured cadence
+/// (gated by `active_hours`). The handler runs the topic generator,
+/// drafts candidate threads via the existing review pipeline, sends
+/// them to Telegram for review, posts the chosen draft.
+///
+/// Configured under `[[daemon.persona_posts]]` blocks.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaPostsConfig {
+    /// Persona registry name (e.g. `"heartbit-ghost:x"`).
+    pub persona: String,
+    /// Whether this poster is enabled.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// Posting interval, in seconds. Default 14400 (4 hours).
+    /// Validation: must be ≥60 (rejected at config load otherwise).
+    #[serde(default = "default_post_interval_seconds")]
+    pub post_interval_seconds: u64,
+    /// Optional `"HH:MM-HH:MM"` window during which posts are allowed.
+    /// Outside this window, the scheduler tick is a no-op. When absent,
+    /// posting is allowed 24/7.
+    #[serde(default)]
+    pub active_hours: Option<ActiveHoursConfig>,
+    /// Number of candidate threads to draft per tick (1..=10).
+    /// Default 3.
+    #[serde(default = "default_post_candidates")]
+    pub candidates_per_draft: usize,
+    /// Backend for the post history store: `"in_memory"` or `"jsonl"`.
+    #[serde(default = "default_post_history_store")]
+    pub post_history_store: String,
+    /// Path to the JSONL store file (only used when
+    /// `post_history_store == "jsonl"`). Tilde expansion happens at
+    /// store-construction time.
+    #[serde(default)]
+    pub post_history_path: Option<String>,
+    /// How far back to check for topic duplicates. Default 30 days.
+    #[serde(default = "default_post_history_lookback_days")]
+    pub post_history_lookback_days: i64,
+    /// Optional fallback brief used when the persona declares no
+    /// topic-context provider, or appended to the provider's output.
+    #[serde(default)]
+    pub topic_brief: Option<String>,
+}
+
+fn default_post_interval_seconds() -> u64 {
+    14400
+}
+
+fn default_post_candidates() -> usize {
+    3
+}
+
+fn default_post_history_store() -> String {
+    "in_memory".into()
+}
+
+fn default_post_history_lookback_days() -> i64 {
+    30
+}
+
 /// WebSocket configuration for bidirectional user↔agent communication.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsConfig {
@@ -319,4 +385,73 @@ fn default_events_topic() -> String {
 
 fn default_dead_letter_topic() -> String {
     "heartbit.dead-letter".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persona_posts_config_parses_with_defaults() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.persona_posts.len(), 1);
+        let p = &cfg.persona_posts[0];
+        assert_eq!(p.persona, "heartbit-ghost:x");
+        assert!(p.enabled);
+        assert_eq!(p.post_interval_seconds, 14400);
+        assert_eq!(p.candidates_per_draft, 3);
+        assert_eq!(p.post_history_store, "in_memory");
+        assert_eq!(p.post_history_lookback_days, 30);
+        assert!(p.active_hours.is_none());
+        assert!(p.topic_brief.is_none());
+        assert!(p.post_history_path.is_none());
+    }
+
+    #[test]
+    fn persona_posts_config_parses_full() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+enabled = true
+post_interval_seconds = 7200
+candidates_per_draft = 5
+post_history_store = "jsonl"
+post_history_path = "~/.heartbit/posts.jsonl"
+post_history_lookback_days = 14
+topic_brief = "agents, Rust, LLMs"
+
+[persona_posts.active_hours]
+start = "09:00"
+end = "22:00"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let p = &cfg.persona_posts[0];
+        assert_eq!(p.persona, "heartbit-ghost:x");
+        assert!(p.enabled);
+        assert_eq!(p.post_interval_seconds, 7200);
+        assert_eq!(p.candidates_per_draft, 5);
+        assert_eq!(p.post_history_store, "jsonl");
+        assert_eq!(
+            p.post_history_path.as_deref(),
+            Some("~/.heartbit/posts.jsonl")
+        );
+        assert_eq!(p.post_history_lookback_days, 14);
+        assert_eq!(p.topic_brief.as_deref(), Some("agents, Rust, LLMs"));
+        assert!(p.active_hours.is_some());
+        let h = p.active_hours.as_ref().unwrap();
+        assert_eq!(h.start, "09:00");
+        assert_eq!(h.end, "22:00");
+    }
 }

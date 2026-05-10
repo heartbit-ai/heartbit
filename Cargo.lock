@@ -1805,6 +1805,7 @@ name = "heartbit"
 version = "2026.507.3"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "argon2",
  "base64 0.22.1",
  "bytes",
@@ -1814,6 +1815,7 @@ dependencies = [
  "futures",
  "glob",
  "heartbit-core",
+ "heartbit-ghost",
  "heartbit-macro",
  "jsonschema",
  "jsonwebtoken",
@@ -1881,6 +1883,7 @@ name = "heartbit-core"
 version = "2026.507.3"
 dependencies = [
  "a2a-sdk",
+ "anyhow",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -1939,6 +1942,7 @@ dependencies = [
 name = "heartbit-ghost"
 version = "2026.507.3"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "chrono",
  "heartbit-core",
@@ -1953,6 +1957,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tracing",
  "uuid",
  "wiremock",
 ]

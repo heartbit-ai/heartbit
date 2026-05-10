@@ -28,6 +28,7 @@ pub mod publisher;
 pub mod repo_researcher;
 pub mod researcher;
 pub mod style_critic;
+pub mod topic_generator;
 pub mod writer;
 
 pub use fact_check::fact_check_recipe;
@@ -37,6 +38,7 @@ pub use publisher::publisher_recipe;
 pub use repo_researcher::repo_researcher_recipe;
 pub use researcher::researcher_recipe;
 pub use style_critic::style_critic_recipe;
+pub use topic_generator::topic_generator_recipe;
 pub use writer::writer_recipe;
 
 /// Build a minimal `AgentConfig` with only the `name` field set; all other

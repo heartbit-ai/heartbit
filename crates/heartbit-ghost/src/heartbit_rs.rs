@@ -79,10 +79,22 @@ impl Persona for XHeartbitRsPersona {
         ];
         let tools = crate::agents::tools_for_heartbit_rs(); // <— differs
 
+        let repo_root = match std::env::var("HEARTBIT_REPO_ROOT") {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => std::env::current_dir().map_err(|e| {
+                heartbit_core::Error::Config(format!(
+                    "HEARTBIT_REPO_ROOT not set and current_dir() failed: {e}"
+                ))
+            })?,
+        };
+
         Ok(PersonaExpansion {
             agents,
             tools,
             mode_addendum: Some(MODE_ADDENDUM),
+            topic_context_provider: Some(std::sync::Arc::new(
+                crate::posts::HeartbitRsXTopicContext::new(repo_root),
+            )),
             ..PersonaExpansion::default()
         })
     }
@@ -169,5 +181,27 @@ mod tests {
         assert!(MODE_ADDENDUM.contains("hook → demo → payoff"));
         assert!(MODE_ADDENDUM.contains("GROUND TRUTH"));
         assert!(MODE_ADDENDUM.contains("NEVER"));
+    }
+
+    #[test]
+    fn expand_populates_topic_context_provider() {
+        // Set the workspace root so expand() doesn't depend on cwd.
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        unsafe {
+            std::env::set_var("HEARTBIT_REPO_ROOT", &repo_root);
+        }
+        let p = XHeartbitRsPersona::new();
+        let exp = p
+            .expand(&heartbit_core::PersonaParams::default())
+            .expect("expand() should succeed with explicit HEARTBIT_REPO_ROOT");
+        assert!(
+            exp.topic_context_provider.is_some(),
+            "HeartbitRs should populate topic_context_provider"
+        );
     }
 }

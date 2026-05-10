@@ -257,7 +257,7 @@ pub enum PipelineError {
 // (summarize_threshold, tool_profile, max_identical_tool_calls, etc.) are
 // intentionally ignored for the single-candidate pipeline. P1.3c+ may
 // extend this if needed.
-pub(crate) fn runner_from_recipe(
+pub fn runner_from_recipe(
     provider: Arc<BoxedProvider>,
     recipe: AgentConfig,
     tools: Vec<Arc<dyn Tool>>,

@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 use clap::Subcommand;
 
 use heartbit::{PersonaParams, PersonaRegistry};
+use heartbit_ghost::posts::PostHistoryStore as _;
 
 use crate::build_provider_from_env;
 
@@ -37,6 +38,37 @@ pub enum PersonaCommand {
         /// Without this flag: runs P1.3c direct mode (judge picks; stdout only).
         #[arg(long, default_value = "false")]
         review: bool,
+    },
+
+    /// Post a proactive thread on demand (no daemon needed).
+    ///
+    /// Without `--topic`: invokes the full topic-generator pipeline and
+    /// requires `HEARTBIT_GHOST_OPERATOR_USER_ID` to be set.
+    ///
+    /// With `--topic`: skips the topic generator and calls the review
+    /// pipeline directly (equivalent to `persona run --review`).
+    Post {
+        /// Persona instance name.
+        name: String,
+        /// Override the topic; skips the topic generator.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Override the candidate count (defaults to 3).
+        #[arg(long)]
+        candidates: Option<usize>,
+    },
+
+    /// List recent post history for a persona (reads the JSONL store).
+    Posts {
+        /// Persona instance name.
+        name: String,
+        /// Maximum number of entries to return.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Path to the JSONL post history file.
+        /// Defaults to `~/.heartbit/ghost/posts/<persona>.jsonl`.
+        #[arg(long)]
+        history_path: Option<String>,
     },
 
     /// Manage the persona's reference corpus.
@@ -263,6 +295,157 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 );
                 Ok(())
             }
+        }
+        PersonaCommand::Post {
+            name,
+            topic,
+            candidates,
+        } => {
+            let persona = registry.get(&name).ok_or_else(|| {
+                anyhow!("persona '{name}' not found. {}", registry_suffix(registry))
+            })?;
+            let expansion = persona
+                .expand(&PersonaParams::default())
+                .map_err(|e| anyhow!("expand persona '{name}': {e}"))?;
+
+            // Researcher override (heartbit-rs:x uses repo_researcher).
+            let researcher_override = expansion
+                .agents
+                .iter()
+                .find(|a| a.name == "repo_researcher")
+                .map(|recipe| {
+                    let recipe = std::sync::Arc::new(recipe.clone_config());
+                    let tools: Vec<std::sync::Arc<dyn heartbit_core::Tool>> = expansion
+                        .tools
+                        .iter()
+                        .filter(|t| t.definition().name == "repo_inspect")
+                        .cloned()
+                        .collect();
+                    (recipe, tools)
+                });
+
+            let provider =
+                build_provider_from_env(None).map_err(|e| anyhow!("build llm provider: {e}"))?;
+            let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+            let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+
+            let on_progress: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                std::sync::Arc::new(|s: &str| eprintln!("> {s}"));
+
+            // With --topic: skip the topic generator and call the review
+            // pipeline directly (mirrors `persona run --review`).
+            if let Some(t) = topic {
+                let cfg = crate::persona_review::review_config_from_env(
+                    &name,
+                    &t,
+                    candidates.unwrap_or(3),
+                    provider,
+                    &corpora_root,
+                    &profiles_root,
+                    Some(on_progress),
+                    expansion.mode_addendum,
+                    researcher_override,
+                )
+                .await
+                .map_err(|e| anyhow!("review config: {e}"))?;
+                let n_requested = cfg.candidates_per_draft;
+                let output = heartbit_ghost::review::run_review_pipeline(cfg)
+                    .await
+                    .map_err(|e| anyhow!("review pipeline: {e}"))?;
+                eprintln!(
+                    "> ok: candidates={}/{}, outcome={:?}",
+                    output.candidates.len(),
+                    n_requested,
+                    output.outcome,
+                );
+                return Ok(());
+            }
+
+            // Without --topic: invoke handle_persona_post with an ephemeral
+            // in-memory post history store (daemon uses a persistent JSONL
+            // store; CLI is for one-off testing).
+            let operator_user_id = std::env::var("HEARTBIT_GHOST_OPERATOR_USER_ID")
+                .map_err(|_| anyhow!(
+                    "HEARTBIT_GHOST_OPERATOR_USER_ID must be set for `persona post` without --topic"
+                ))?;
+            let history: std::sync::Arc<dyn heartbit_ghost::posts::PostHistoryStore> =
+                std::sync::Arc::new(heartbit_ghost::posts::InMemoryPostHistoryStore::new());
+            let delivery: std::sync::Arc<dyn heartbit_ghost::review::ReviewDelivery> =
+                std::sync::Arc::new(
+                    crate::persona_review::TelegramReviewDelivery::from_env()
+                        .map_err(|e| anyhow!("construct TelegramReviewDelivery: {e}"))?,
+                );
+            let twitter_tool: std::sync::Arc<dyn heartbit_core::Tool> =
+                std::sync::Arc::new(heartbit_ghost::tools::TwitterThreadTool::new());
+            let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+                std::sync::Arc::new(crate::persona_review::EnvCredentialResolver);
+            let deps = heartbit::PersonaPostDeps {
+                persona_name: &name,
+                registry,
+                history: &*history,
+                history_lookback: chrono::Duration::days(30),
+                topic_brief: None,
+                operator_user_id: &operator_user_id,
+                provider,
+                delivery,
+                twitter_tool,
+                credentials,
+                candidates_per_draft: candidates.unwrap_or(3),
+                corpora_root: &corpora_root,
+                profiles_root: &profiles_root,
+            };
+            let outcome = heartbit::handle_persona_post(deps)
+                .await
+                .map_err(|e| anyhow!("persona post: {e}"))?;
+            eprintln!("> ok: outcome={outcome:?}");
+            Ok(())
+        }
+        PersonaCommand::Posts {
+            name,
+            limit,
+            history_path,
+        } => {
+            let path = match history_path {
+                Some(p) => crate::persona_review::expand_tilde_str(&p)?,
+                None => {
+                    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+                    std::path::PathBuf::from(home)
+                        .join(".heartbit/ghost/posts")
+                        .join(format!("{name}.jsonl"))
+                }
+            };
+            if !path.exists() {
+                println!("(no history at {})", path.display());
+                return Ok(());
+            }
+            let store = heartbit_ghost::posts::JsonlPostHistoryStore::open(&path)
+                .await
+                .map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+            let recent = store
+                .recent(&name, limit)
+                .await
+                .map_err(|e| anyhow!("recent: {e}"))?;
+            if recent.is_empty() {
+                println!("(no entries for persona '{name}')");
+                return Ok(());
+            }
+            println!("Recent posts for {name} ({}):", recent.len());
+            for (i, e) in recent.iter().enumerate() {
+                let when = e.posted_at.format("%Y-%m-%d %H:%M");
+                let tweet = e.tweet_id.as_deref().unwrap_or("-");
+                let topic_display = if e.topic.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    e.topic.clone()
+                };
+                println!(
+                    "  [{i}] {when} tweet={tweet}\n      topic: {topic_display}\n      outcome: {:?}",
+                    e.outcome,
+                );
+            }
+            Ok(())
         }
         PersonaCommand::Show { name }
         | PersonaCommand::Phase { name, .. }

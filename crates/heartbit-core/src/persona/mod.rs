@@ -2,11 +2,13 @@
 //! (e.g. `heartbit-ghost`) plug in identically. Empty in Phase 0;
 //! concrete personas land in Phase 1.
 
+pub mod topic_context;
 pub mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub use topic_context::TopicContextProvider;
 pub use types::{AuthorshipMode, PersonaExpansion, PersonaParams, ReviewSpec, TriggerSpec};
 
 use crate::error::Error;

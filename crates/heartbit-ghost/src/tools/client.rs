@@ -12,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 /// X API base URL — overridden in tests via `XClient::new()`.
-const X_API_BASE_URL: &str = "https://api.twitter.com";
+pub(crate) const X_API_BASE_URL: &str = "https://api.twitter.com";
 
 /// Strongly typed errors from X API calls.
 #[derive(Debug, Error)]
