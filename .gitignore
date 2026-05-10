@@ -33,3 +33,6 @@ probe.txt
 summary.txt
 test3-hello.txt
 rust_version.txt
+
+# Claude Code local session metadata
+.claude/

@@ -7,12 +7,16 @@ pub mod core;
 pub mod cron;
 pub mod heartbit_pulse;
 pub mod kafka;
+pub mod mention_context;
+pub mod mention_poll;
+pub mod mention_poll_handler;
 pub mod metrics;
 pub mod notify;
 pub mod openai_compat;
 pub mod persona_post;
 pub mod persona_post_handler;
 pub mod posts_context;
+pub mod reply_draft_handler;
 pub mod runtime_types;
 pub mod store;
 pub mod todo;
@@ -22,6 +26,9 @@ pub use self::core::{DaemonCore, DaemonHandle};
 pub use cron::CronScheduler;
 pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
+pub use mention_context::{MentionContext, PersonaMentionEntry, ReplySharedContext};
+pub use mention_poll::MentionPollScheduler;
+pub use mention_poll_handler::{MentionPollDeps, handle_mention_poll};
 pub use metrics::DaemonMetrics;
 pub use notify::{OnTaskComplete, TaskOutcome, format_notification};
 pub use openai_compat::{
@@ -32,6 +39,7 @@ pub use openai_compat::{
 pub use persona_post::PersonaPostScheduler;
 pub use persona_post_handler::{PersonaPostDeps, handle_persona_post};
 pub use posts_context::{PersonaPostEntry, PostsContext};
+pub use reply_draft_handler::{ReplyDraftDeps, handle_reply_draft};
 pub use runtime_types::{
     EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, RuntimeAdvancedConfig,
     RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent,

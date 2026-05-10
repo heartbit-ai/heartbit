@@ -92,6 +92,39 @@ pub enum PersonaCommand {
         set: String,
     },
 
+    /// Reply to a single mention on demand (no daemon needed).
+    /// Fetches the mention via the X API, runs the reply pipeline,
+    /// sends candidate drafts to Telegram for review, posts the chosen
+    /// draft. Useful for testing the reply flow without the cron.
+    Reply {
+        /// Persona instance name.
+        name: String,
+        /// X tweet ID of the mention to reply to.
+        #[arg(long)]
+        mention_id: String,
+        /// Number of distinct candidate replies to generate (1..=3).
+        #[arg(long, default_value = "2")]
+        candidates: usize,
+    },
+
+    /// List recent mentions of the operator's X account.
+    /// Use the printed mention id with `persona reply --mention-id <id>`.
+    Mentions {
+        /// Persona instance name (currently unused; reserved for per-persona
+        /// X account scoping in the future).
+        name: String,
+        /// Maximum number of mentions to return (5..=100).
+        #[arg(long, default_value = "10")]
+        limit: u32,
+        /// Only return mentions newer than this id.
+        #[arg(long)]
+        since_id: Option<String>,
+        /// Operator X user_id. Defaults to whoever the OAuth1 creds resolve
+        /// via `GET /2/users/me`.
+        #[arg(long)]
+        user_id: Option<String>,
+    },
+
     /// Halt this persona on a running daemon.
     Pause {
         /// Persona instance name.
@@ -444,6 +477,119 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                     "  [{i}] {when} tweet={tweet}\n      topic: {topic_display}\n      outcome: {:?}",
                     e.outcome,
                 );
+            }
+            Ok(())
+        }
+        PersonaCommand::Reply {
+            name,
+            mention_id,
+            candidates,
+        } => {
+            let persona = registry.get(&name).ok_or_else(|| {
+                anyhow!("persona '{name}' not found. {}", registry_suffix(registry))
+            })?;
+            let expansion = persona
+                .expand(&PersonaParams::default())
+                .map_err(|e| anyhow!("expand persona '{name}': {e}"))?;
+
+            // Researcher override (heartbit-rs:x uses repo_researcher).
+            let researcher_override = expansion
+                .agents
+                .iter()
+                .find(|a| a.name == "repo_researcher")
+                .map(|recipe| {
+                    let recipe = std::sync::Arc::new(recipe.clone_config());
+                    let tools: Vec<std::sync::Arc<dyn heartbit_core::Tool>> = expansion
+                        .tools
+                        .iter()
+                        .filter(|t| t.definition().name == "repo_inspect")
+                        .cloned()
+                        .collect();
+                    (recipe, tools)
+                });
+
+            let provider =
+                build_provider_from_env(None).map_err(|e| anyhow!("build llm provider: {e}"))?;
+            let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                .map_err(|e| anyhow!("resolve corpora dir: {e}"))?;
+            let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                .map_err(|e| anyhow!("resolve profiles dir: {e}"))?;
+
+            eprintln!("> Fetching mention {mention_id}...");
+            let mention = crate::persona_review::fetch_mention_one_off(&mention_id)
+                .await
+                .map_err(|e| anyhow!("fetch mention: {e}"))?;
+            eprintln!(
+                "> Mention from @{} (author_id={}): {}",
+                mention.author_handle, mention.author_id, mention.text,
+            );
+
+            let on_progress: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                std::sync::Arc::new(|s: &str| eprintln!("> {s}"));
+
+            let cfg = crate::persona_review::reply_config_from_env(
+                &name,
+                provider,
+                &corpora_root,
+                &profiles_root,
+                Some(on_progress),
+                mention,
+                None, // parent — V1: not fetched (would need a second X API call)
+                None, // mentioner_context — V1: not fetched
+                candidates,
+                expansion.mode_addendum,
+                researcher_override,
+            )
+            .await
+            .map_err(|e| anyhow!("reply config: {e}"))?;
+
+            let output = heartbit_ghost::reply::run_reply_pipeline(cfg)
+                .await
+                .map_err(|e| anyhow!("reply pipeline: {e}"))?;
+            eprintln!(
+                "> ok: candidates={}, outcome={:?}",
+                output.candidates.len(),
+                output.outcome,
+            );
+            Ok(())
+        }
+        PersonaCommand::Mentions {
+            name: _,
+            limit,
+            since_id,
+            user_id,
+        } => {
+            let resolved_user_id = match user_id {
+                Some(id) => id,
+                None => {
+                    let me = crate::persona_review::fetch_authenticated_user()
+                        .await
+                        .map_err(|e| anyhow!("resolve operator user_id: {e}"))?;
+                    eprintln!(
+                        "> Authenticated as @{} ({}) — user_id={}",
+                        me.username, me.name, me.id,
+                    );
+                    me.id
+                }
+            };
+            let mentions = crate::persona_review::list_recent_mentions(
+                &resolved_user_id,
+                limit,
+                since_id.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow!("list mentions: {e}"))?;
+            if mentions.is_empty() {
+                println!("(no mentions)");
+                return Ok(());
+            }
+            println!("Recent mentions ({}):", mentions.len());
+            for (i, m) in mentions.iter().enumerate() {
+                let author = m.author_id.as_deref().unwrap_or("?");
+                let when = m.created_at.as_deref().unwrap_or("?");
+                let preview: String = m.text.chars().take(140).collect();
+                println!("  [{i}] id={} author_id={author} at={when}", m.id);
+                println!("      {preview}");
             }
             Ok(())
         }

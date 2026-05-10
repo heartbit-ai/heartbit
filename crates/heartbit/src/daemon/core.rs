@@ -481,12 +481,16 @@ pub struct DaemonCore {
     /// B5b: optional per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
     tenant_tracker: Option<Arc<TenantTokenTracker>>,
     /// Kafka commands topic — used to dispatch follow-up commands
-    /// (e.g. `PersonaPost` from the scheduler).
+    /// (e.g. `PersonaPost` / `MentionPoll` from the schedulers).
     commands_topic: String,
     /// Optional proactive-posts context. When set, `run()` spawns one
     /// `PersonaPostScheduler` per persona at startup and dispatches
     /// `DaemonCommand::PersonaPost` to `handle_persona_post`.
     posts_context: Option<Arc<crate::daemon::PostsContext>>,
+    /// Persona mention context — when set, one `MentionPollScheduler` is spawned per
+    /// `persona_mentions` entry, and `MentionPoll` / `ReplyDraft` commands are dispatched
+    /// to the real free-function handlers.
+    mention_context: Option<Arc<super::mention_context::MentionContext>>,
 }
 
 impl DaemonCore {
@@ -527,6 +531,7 @@ impl DaemonCore {
             tenant_tracker: None,
             commands_topic: kafka_config.commands_topic.clone(),
             posts_context: None,
+            mention_context: None,
         };
         (core, handle)
     }
@@ -564,6 +569,18 @@ impl DaemonCore {
     /// dispatches `PersonaPost` commands to the real handler.
     pub fn with_posts_context(mut self, ctx: Arc<crate::daemon::PostsContext>) -> Self {
         self.posts_context = Some(ctx);
+        self
+    }
+
+    /// Attach persona mention context. When set, one [`super::mention_poll::MentionPollScheduler`]
+    /// is spawned per `persona_mentions` entry at the start of `run()`, and
+    /// `DaemonCommand::MentionPoll` / `DaemonCommand::ReplyDraft` commands are dispatched to
+    /// the real free-function handlers.
+    pub fn with_mention_context(
+        mut self,
+        ctx: Arc<super::mention_context::MentionContext>,
+    ) -> Self {
+        self.mention_context = Some(ctx);
         self
     }
 
@@ -722,6 +739,47 @@ impl DaemonCore {
                 let cancel = self.cancel.clone();
                 tokio::spawn(scheduler.run(cancel));
                 tracing::info!(persona = %persona, "post scheduler spawned");
+            }
+        }
+
+        // Spawn one MentionPollScheduler per enabled persona_mentions entry.
+        if let Some(ref mc) = self.mention_context {
+            let commands_topic = self.commands_topic.clone();
+            let producer: Arc<dyn super::CommandProducer> = Arc::new(
+                super::kafka::KafkaCommandProducer::new(self.producer.clone()),
+            );
+            for entry in &mc.entries {
+                let cfg = crate::config::PersonaMentionsConfig {
+                    persona: entry.persona.clone(),
+                    enabled: true,
+                    poll_interval_seconds: entry.poll_interval_seconds,
+                    user_id: entry.user_id.clone(),
+                    candidates_per_reply: entry.candidates_per_reply,
+                    mention_store: String::new(),
+                    mention_store_path: None,
+                };
+                match super::mention_poll::MentionPollScheduler::new(
+                    &cfg,
+                    producer.clone(),
+                    &commands_topic,
+                ) {
+                    Ok(scheduler) => {
+                        let cancel = self.cancel.clone();
+                        tokio::spawn(async move { scheduler.run(cancel).await });
+                        tracing::info!(
+                            persona = %entry.persona,
+                            interval_secs = entry.poll_interval_seconds,
+                            "MentionPollScheduler spawned"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            persona = %entry.persona,
+                            error = %e,
+                            "failed to create MentionPollScheduler, skipping entry"
+                        );
+                    }
+                }
             }
         }
 
@@ -991,6 +1049,126 @@ impl DaemonCore {
                             }
                             self.event_channels.write().remove(&id);
                         }
+                        DaemonCommand::MentionPoll { persona, user_id } => {
+                            if let Some(ref mc) = self.mention_context {
+                                // Find the matching entry by persona + user_id.
+                                let entry = mc.entries.iter().find(|e| {
+                                    e.persona == persona && e.user_id == user_id
+                                });
+                                if let Some(entry) = entry {
+                                    let store = entry.store.clone();
+                                    let spam_guard = entry.spam_guard.clone();
+                                    let exec_ctx = entry.exec_ctx.clone();
+                                    let max_results = entry.max_results;
+                                    let mentions_tool = mc.mentions_tool.clone();
+                                    let producer: Arc<dyn super::CommandProducer> = Arc::new(
+                                        super::kafka::KafkaCommandProducer::new(self.producer.clone()),
+                                    );
+                                    let commands_topic = self.commands_topic.clone();
+                                    tokio::spawn(async move {
+                                        let deps =
+                                            super::mention_poll_handler::MentionPollDeps {
+                                                persona: &persona,
+                                                user_id: &user_id,
+                                                mentions_tool: mentions_tool.as_ref(),
+                                                exec_ctx: &exec_ctx,
+                                                store: store.as_ref(),
+                                                spam_guard: &spam_guard,
+                                                producer: producer.as_ref(),
+                                                commands_topic: &commands_topic,
+                                                max_results,
+                                            };
+                                        if let Err(e) =
+                                            super::mention_poll_handler::handle_mention_poll(deps)
+                                                .await
+                                        {
+                                            tracing::error!(
+                                                persona,
+                                                user_id,
+                                                error = %e,
+                                                "handle_mention_poll failed"
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    tracing::warn!(
+                                        persona,
+                                        user_id,
+                                        "MentionPoll received but no matching persona entry in context"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    persona,
+                                    user_id,
+                                    "MentionPoll received but no MentionContext configured"
+                                );
+                            }
+                        }
+                        DaemonCommand::ReplyDraft {
+                            persona,
+                            mention,
+                            parent,
+                            mentioner_context,
+                        } => {
+                            if let Some(ref mc) = self.mention_context {
+                                // Find the matching entry for store + candidates_per_reply.
+                                let entry =
+                                    mc.entries.iter().find(|e| e.persona == persona);
+                                if let Some(entry) = entry {
+                                    let store = entry.store.clone();
+                                    let candidates_per_reply = entry.candidates_per_reply;
+                                    let registry = mc.reply.registry.clone();
+                                    let provider = mc.reply.provider.clone();
+                                    let delivery = mc.reply.delivery.clone();
+                                    let twitter_tool = mc.reply.twitter_tool.clone();
+                                    let credentials = mc.reply.credentials.clone();
+                                    let corpora_root = mc.reply.corpora_root.clone();
+                                    let profiles_root = mc.reply.profiles_root.clone();
+                                    tokio::spawn(async move {
+                                        let deps = super::reply_draft_handler::ReplyDraftDeps {
+                                            registry: &registry,
+                                            store: store.as_ref(),
+                                            provider,
+                                            delivery,
+                                            twitter_tool,
+                                            credentials,
+                                            candidates_per_reply,
+                                            corpora_root: &corpora_root,
+                                            profiles_root: &profiles_root,
+                                        };
+                                        if let Err(e) =
+                                            super::reply_draft_handler::handle_reply_draft(
+                                                deps,
+                                                &persona,
+                                                mention,
+                                                parent,
+                                                mentioner_context,
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                persona,
+                                                error = %e,
+                                                "handle_reply_draft failed"
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    tracing::warn!(
+                                        persona,
+                                        mention_id = %mention.id,
+                                        "ReplyDraft received but no matching persona entry in context"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    persona,
+                                    mention_id = %mention.id,
+                                    "ReplyDraft received but no MentionContext configured"
+                                );
+                            }
+                        }
                         DaemonCommand::PersonaPost { persona } => {
                             let Some(ctx) = self.posts_context.clone() else {
                                 tracing::warn!(
@@ -1086,6 +1264,7 @@ mod tests {
             memory: crate::config::DaemonMemoryConfig::default(),
             audit: crate::config::DaemonAuditConfig::default(),
             idempotency: crate::config::IdempotencyConfig::default(),
+            persona_mentions: vec![],
             persona_posts: vec![],
         }
     }
@@ -1689,5 +1868,126 @@ mod tests {
         assert!(task.user_id.is_none());
         assert!(task.tenant_id.is_none());
         assert_eq!(task.idempotency_key.as_deref(), Some("k"));
+    }
+
+    // --- P1.5 Task 13: mention context wiring tests ---
+
+    /// `with_mention_context` stores the Arc in `DaemonCore.mention_context`.
+    /// Uses an empty-entries context to keep this a pure builder-pattern unit test.
+    #[tokio::test]
+    async fn daemon_core_with_mention_context_stores_context() {
+        use heartbit_core::error::Error as CoreError;
+        use heartbit_core::execution_context::{CredentialResolver as CredResolverTrait, Secret};
+        use heartbit_core::llm::types::{CompletionRequest, CompletionResponse, ToolDefinition};
+        use heartbit_core::llm::{BoxedProvider, LlmProvider};
+        use heartbit_core::tool::ToolOutput;
+        use heartbit_core::{ExecutionContext, Tool};
+        use heartbit_ghost::reply::{ReplyOutcome, ReplyReviewDelivery, ReplyReviewMessage};
+        use heartbit_ghost::review::{
+            DeliveredReview, DeliveryOutcome, DeliveryReceipt, ReviewDeliveryError,
+        };
+
+        use crate::daemon::mention_context::{MentionContext, ReplySharedContext};
+
+        struct NopProvider;
+        impl LlmProvider for NopProvider {
+            async fn complete(
+                &self,
+                _: CompletionRequest,
+            ) -> Result<CompletionResponse, CoreError> {
+                Err(CoreError::Daemon("nop".into()))
+            }
+        }
+        struct NopTool;
+        impl Tool for NopTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "nop".into(),
+                    description: "nop".into(),
+                    input_schema: serde_json::json!({}),
+                }
+            }
+            fn execute(
+                &self,
+                _: &ExecutionContext,
+                _: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, CoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(ToolOutput::success(String::new())) })
+            }
+        }
+        struct NopDelivery;
+        impl ReplyReviewDelivery for NopDelivery {
+            fn deliver<'a>(
+                &'a self,
+                _: ReplyReviewMessage,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<DeliveredReview, ReviewDeliveryError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(DeliveredReview {
+                        outcome: DeliveryOutcome::Pick(0),
+                        receipt: DeliveryReceipt {
+                            data: serde_json::Value::Null,
+                        },
+                    })
+                })
+            }
+            fn report<'a>(
+                &'a self,
+                _: DeliveryReceipt,
+                _: ReplyOutcome,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), ReviewDeliveryError>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        struct NopCreds;
+        impl CredResolverTrait for NopCreds {
+            fn resolve(
+                &self,
+                _: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Secret, CoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Err(CoreError::Daemon("nop".into())) })
+            }
+        }
+
+        let config = test_config();
+        let kafka = config.kafka.as_ref().unwrap();
+        let producer = test_producer();
+        let consumer = crate::daemon::kafka::create_commands_consumer(kafka).unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+        let cancel = CancellationToken::new();
+
+        let (core, _handle) = DaemonCore::new(&config, consumer, producer, store, cancel);
+        assert!(core.mention_context.is_none(), "initially None");
+
+        let ctx = Arc::new(MentionContext {
+            entries: vec![],
+            reply: ReplySharedContext {
+                registry: Arc::new(crate::persona::PersonaRegistry::new()),
+                provider: Arc::new(BoxedProvider::new(NopProvider)),
+                delivery: Arc::new(NopDelivery),
+                twitter_tool: Arc::new(NopTool),
+                credentials: Arc::new(NopCreds),
+                corpora_root: std::path::PathBuf::from("/tmp"),
+                profiles_root: std::path::PathBuf::from("/tmp"),
+            },
+            mentions_tool: Arc::new(NopTool),
+        });
+
+        let core = core.with_mention_context(ctx);
+        assert!(
+            core.mention_context.is_some(),
+            "mention_context must be Some after with_mention_context()"
+        );
     }
 }

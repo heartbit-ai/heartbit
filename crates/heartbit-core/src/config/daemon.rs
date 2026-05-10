@@ -40,6 +40,11 @@ pub struct DaemonConfig {
     /// Idempotency-key TTL sweep configuration.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
+    /// Per-persona X/Twitter mention-poll configurations.
+    /// Each entry launches a `MentionPollScheduler` that fires
+    /// `DaemonCommand::MentionPoll` on its configured interval.
+    #[serde(default)]
+    pub persona_mentions: Vec<PersonaMentionsConfig>,
     /// Per-persona proactive-posting configuration. One entry per
     /// persona that has proactive posting enabled.
     #[serde(default)]
@@ -100,6 +105,50 @@ pub struct IdempotencyConfig {
     /// How often the sweep runs, in minutes. Default 60.
     #[serde(default)]
     pub sweep_interval_minutes: Option<u32>,
+}
+
+/// Per-persona X/Twitter mention-poll configuration.
+///
+/// Each entry in `[[daemon.persona_mentions]]` configures one persona's
+/// periodic mention polling loop. When `enabled = true`, the daemon spawns
+/// a `MentionPollScheduler` for each entry that fires a
+/// `DaemonCommand::MentionPoll` on the configured interval.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaMentionsConfig {
+    /// Persona slug (must match a loaded persona file, e.g. `"heartbit-ghost"`).
+    pub persona: String,
+    /// Enable mention polling for this persona. Defaults to `true`.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// Seconds between mention polls. Defaults to 300 (5 minutes, X API rate-limit-safe).
+    #[serde(default = "default_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// X/Twitter user-id to poll mentions for (e.g. `"100"`).
+    pub user_id: String,
+    /// Maximum candidates to generate replies for per poll cycle. Defaults to 5.
+    #[serde(default = "default_candidates_per_reply")]
+    pub candidates_per_reply: usize,
+    /// Which mention store backend to use: `"in_memory"` or `"jsonl"`.
+    /// Defaults to `"in_memory"`.
+    #[serde(default = "default_mention_store")]
+    pub mention_store: String,
+    /// File path for the JSONL mention store (only used when
+    /// `mention_store = "jsonl"`). When absent, a per-persona default path is
+    /// derived from the persona slug.
+    #[serde(default)]
+    pub mention_store_path: Option<String>,
+}
+
+fn default_poll_interval_seconds() -> u64 {
+    300
+}
+
+fn default_candidates_per_reply() -> usize {
+    2
+}
+
+fn default_mention_store() -> String {
+    "in_memory".into()
 }
 
 /// Memory access control configuration for the daemon.
