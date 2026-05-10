@@ -11,6 +11,7 @@ pub mod repo_inspect;
 pub mod search;
 pub mod thread;
 pub mod user;
+pub mod user_tweets;
 
 pub use client::{XApiError, XClient, format_error};
 pub use mentions::TwitterMentionsTool;
@@ -19,3 +20,4 @@ pub use repo_inspect::RepoInspectTool;
 pub use search::TwitterSearchTool;
 pub use thread::TwitterThreadTool;
 pub use user::TwitterUserTool;
+pub use user_tweets::TwitterUserTweetsTool;
