@@ -64,6 +64,21 @@ pub trait MentionStore: Send + Sync {
         author_id: &'a str,
         ts: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>>;
+
+    /// Number of replies we've already sent in `conversation_id`.
+    /// Used by the conversation-depth guard (P1.7).
+    fn replies_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, StoreError>> + Send + 'a>>;
+
+    /// Record that we just sent a reply in `conversation_id`.
+    /// Called from the daemon's ReplyDraft handler after a successful
+    /// `Posted` outcome.
+    fn record_reply_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>>;
 }
 
 // In-memory impl —————————————————————————————————————
@@ -81,6 +96,8 @@ struct InMemoryInner {
     replied: std::collections::HashSet<String>,
     /// (author_id, ts) — append log for rate-limit queries.
     author_replies: Vec<(String, DateTime<Utc>)>,
+    /// conversation_id → reply count (P1.7).
+    convo_replies: std::collections::HashMap<String, usize>,
 }
 
 impl Default for InMemoryMentionStore {
@@ -180,6 +197,38 @@ impl MentionStore for InMemoryMentionStore {
             Ok(())
         })
     }
+
+    fn replies_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .inner
+                .read()
+                .await
+                .convo_replies
+                .get(conversation_id)
+                .copied()
+                .unwrap_or(0))
+        })
+    }
+
+    fn record_reply_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            *self
+                .inner
+                .write()
+                .await
+                .convo_replies
+                .entry(conversation_id.to_string())
+                .or_insert(0) += 1;
+            Ok(())
+        })
+    }
 }
 
 // JSONL-backed impl ——————————————————————————————————
@@ -198,6 +247,9 @@ enum StoreEvent {
     AuthorReply {
         author_id: String,
         ts: DateTime<Utc>,
+    },
+    ConversationReply {
+        conversation_id: String,
     },
 }
 
@@ -251,6 +303,9 @@ impl JsonlMentionStore {
                 }
                 StoreEvent::AuthorReply { author_id, ts } => {
                     g.author_replies.push((author_id, ts));
+                }
+                StoreEvent::ConversationReply { conversation_id } => {
+                    *g.convo_replies.entry(conversation_id).or_insert(0) += 1;
                 }
             }
         }
@@ -378,6 +433,42 @@ impl MentionStore for JsonlMentionStore {
             Ok(())
         })
     }
+
+    fn replies_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .inner
+                .read()
+                .await
+                .convo_replies
+                .get(conversation_id)
+                .copied()
+                .unwrap_or(0))
+        })
+    }
+
+    fn record_reply_in_conversation<'a>(
+        &'a self,
+        conversation_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.append(&StoreEvent::ConversationReply {
+                conversation_id: conversation_id.to_string(),
+            })
+            .await?;
+            *self
+                .inner
+                .write()
+                .await
+                .convo_replies
+                .entry(conversation_id.to_string())
+                .or_insert(0) += 1;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +553,33 @@ mod tests {
         let s = JsonlMentionStore::open(&path).await.unwrap();
         assert_eq!(s.since_id_for("p", "u").await.unwrap(), None);
         assert!(!s.was_replied("m1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn in_memory_record_then_count_in_conversation_round_trip() {
+        let store = InMemoryMentionStore::new();
+        assert_eq!(store.replies_in_conversation("c1").await.unwrap(), 0);
+        store.record_reply_in_conversation("c1").await.unwrap();
+        store.record_reply_in_conversation("c1").await.unwrap();
+        store.record_reply_in_conversation("c2").await.unwrap();
+        assert_eq!(store.replies_in_conversation("c1").await.unwrap(), 2);
+        assert_eq!(store.replies_in_conversation("c2").await.unwrap(), 1);
+        assert_eq!(
+            store.replies_in_conversation("nonexistent").await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_conversation_replies_persist_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv.jsonl");
+        {
+            let s1 = JsonlMentionStore::open(&path).await.unwrap();
+            s1.record_reply_in_conversation("c1").await.unwrap();
+            s1.record_reply_in_conversation("c1").await.unwrap();
+        }
+        let s2 = JsonlMentionStore::open(&path).await.unwrap();
+        assert_eq!(s2.replies_in_conversation("c1").await.unwrap(), 2);
     }
 }
