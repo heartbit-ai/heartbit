@@ -249,6 +249,12 @@ pub async fn run_daemon(
                         cfg.persona
                     )
                 })?;
+            if entries.contains_key(&cfg.persona) {
+                anyhow::bail!(
+                    "duplicate [[daemon.persona_posts]] entry for persona '{}'",
+                    cfg.persona
+                );
+            }
             entries.insert(
                 cfg.persona.clone(),
                 heartbit::PersonaPostEntry {
