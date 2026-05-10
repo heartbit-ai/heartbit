@@ -10,8 +10,10 @@ use chrono::{DateTime, Utc};
 pub mod prompts;
 pub mod spam_guard;
 pub mod storage;
+pub mod thread_guard;
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
+pub use thread_guard::ThreadDepthGuard;
 
 /// A mention of the operator's account fetched from `twitter_mentions`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
