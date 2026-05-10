@@ -29,6 +29,12 @@ pub struct Mention {
     /// Tweet ID this mention is replying to (None when it's a top-level
     /// `@operator …` mention rather than a reply on an operator's tweet).
     pub in_reply_to_tweet_id: Option<String>,
+    /// X conversation_id (the root tweet of the thread tree). Used by
+    /// the conversation-depth guard (P1.7) to cap reply count per
+    /// conversation. `#[serde(default)]` for backward compatibility
+    /// with stores written before P1.7.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// A small snapshot of a tweet (text + timing). Used as a parent-tweet
@@ -565,6 +571,7 @@ mod tests {
             author_handle: "alice".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: Some("99".into()),
+            conversation_id: None,
         };
         let copy = m.clone();
         assert_eq!(copy.id, m.id);
@@ -854,6 +861,7 @@ mod tests {
             author_handle: "grumpy_dev".into(),
             posted_at: chrono::Utc::now(),
             in_reply_to_tweet_id: None,
+            conversation_id: None,
         }
     }
 
@@ -1121,5 +1129,36 @@ mod tests {
             }
             other => panic!("expected PublishFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mention_deserializes_without_conversation_id_field() {
+        // Backward compat: old stores wrote Mention without the field.
+        let json = r#"{
+            "id": "1",
+            "text": "hi",
+            "author_id": "12",
+            "author_handle": "alice",
+            "posted_at": "2026-05-08T11:02:00Z",
+            "in_reply_to_tweet_id": null
+        }"#;
+        let m: Mention = serde_json::from_str(json).expect("backward compat");
+        assert!(m.conversation_id.is_none());
+    }
+
+    #[test]
+    fn mention_round_trips_conversation_id() {
+        let m = Mention {
+            id: "1".into(),
+            text: "hi".into(),
+            author_id: "12".into(),
+            author_handle: "alice".into(),
+            posted_at: Utc::now(),
+            in_reply_to_tweet_id: Some("99".into()),
+            conversation_id: Some("conv-123".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let parsed: Mention = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.conversation_id.as_deref(), Some("conv-123"));
     }
 }

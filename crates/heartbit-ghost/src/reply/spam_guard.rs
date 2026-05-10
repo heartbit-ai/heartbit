@@ -128,6 +128,7 @@ mod tests {
             author_handle: "x".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: Some("p1".into()),
+            conversation_id: None,
         }
     }
 

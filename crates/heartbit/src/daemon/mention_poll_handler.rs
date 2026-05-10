@@ -147,6 +147,7 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             author_handle: String::new(), // not provided by twitter_mentions V1
             posted_at,
             in_reply_to_tweet_id: None, // in_reply_to_user_id ≠ tweet_id; deferred
+            conversation_id: None,
         };
 
         // 5. Early-exit spam checks (SelfReply, PerAuthorRateLimit, TooShortToEngage).

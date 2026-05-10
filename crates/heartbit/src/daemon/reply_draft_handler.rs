@@ -425,6 +425,7 @@ mod tests {
             author_handle: "curious_dev".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: None,
+            conversation_id: None,
         }
     }
 

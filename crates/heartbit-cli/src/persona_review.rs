@@ -613,6 +613,7 @@ pub async fn fetch_mention_one_off(
         author_handle,
         posted_at,
         in_reply_to_tweet_id: None, // not requested in this fetch — daemon path also defaults to None
+        conversation_id: None,
     })
 }
 
@@ -823,6 +824,7 @@ mod reply_review_render_tests {
                 author_handle: "curious_dev".into(),
                 posted_at: chrono::Utc::now(),
                 in_reply_to_tweet_id: None,
+                conversation_id: None,
             },
             parent: parent_text.map(|t| heartbit_ghost::reply::TweetSnapshot {
                 id: "parent1".into(),
