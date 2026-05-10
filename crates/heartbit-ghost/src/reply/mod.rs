@@ -8,11 +8,13 @@
 use chrono::{DateTime, Utc};
 
 pub mod bot_guard;
+pub mod conversation_guard;
 pub mod prompts;
 pub mod spam_guard;
 pub mod storage;
 pub mod thread_guard;
 pub use bot_guard::{BotHeuristicConfig, BotHeuristicGuard};
+pub use conversation_guard::ConversationDepthGuard;
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
 pub use thread_guard::ThreadDepthGuard;
