@@ -132,6 +132,17 @@ mod tests {
             candidates_per_reply: 5,
             mention_store: "in_memory".into(),
             mention_store_path: None,
+            // P1.7 guard defaults for test scaffolding.
+            enable_thread_depth_guard: true,
+            enable_bot_heuristic_guard: true,
+            suspicious_handle_patterns: vec![],
+            min_follower_following_ratio: 0.05,
+            min_account_age_days: 7,
+            bot_heuristic_threshold: 2,
+            per_conversation_max_replies: 2,
+            daily_token_budget: None,
+            budget_store: "in_memory".into(),
+            budget_path: None,
         }
     }
 

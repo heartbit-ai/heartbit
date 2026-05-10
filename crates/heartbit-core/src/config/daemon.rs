@@ -137,6 +137,44 @@ pub struct PersonaMentionsConfig {
     /// derived from the persona slug.
     #[serde(default)]
     pub mention_store_path: Option<String>,
+
+    // ── P1.7 loop-protection guards ─────────────────────────────────────────
+    /// Enable the thread-depth guard (skips mentions whose parent tweet was
+    /// already replied to by this persona). Defaults to `true`.
+    #[serde(default = "super::default_true")]
+    pub enable_thread_depth_guard: bool,
+    /// Enable the bot-heuristic guard. Defaults to `true`.
+    #[serde(default = "super::default_true")]
+    pub enable_bot_heuristic_guard: bool,
+    /// Extra substrings that flag a handle as suspicious (supplements
+    /// built-in defaults when non-empty). Defaults to `[]` (use built-ins).
+    #[serde(default)]
+    pub suspicious_handle_patterns: Vec<String>,
+    /// Minimum follower/following ratio; below this is one bot signal.
+    /// Defaults to 0.05.
+    #[serde(default = "default_min_follower_following_ratio")]
+    pub min_follower_following_ratio: f32,
+    /// Minimum account age in days; younger accounts trigger one bot signal.
+    /// Defaults to 7.
+    #[serde(default = "default_min_account_age_days")]
+    pub min_account_age_days: i64,
+    /// Number of bot signals required to skip a mention. Defaults to 2.
+    #[serde(default = "default_bot_heuristic_threshold")]
+    pub bot_heuristic_threshold: usize,
+    /// Maximum replies per unique conversation. Defaults to 2.
+    #[serde(default = "default_per_conversation_max_replies")]
+    pub per_conversation_max_replies: usize,
+    /// Daily LLM token budget per persona. `null` (default) disables the cap.
+    #[serde(default)]
+    pub daily_token_budget: Option<u64>,
+    /// Budget tracker backend: `"in_memory"` or `"jsonl"`. Defaults to
+    /// `"in_memory"`.
+    #[serde(default = "default_p1_7_budget_store")]
+    pub budget_store: String,
+    /// File path for the JSONL budget store (only used when
+    /// `budget_store = "jsonl"`). Required when `budget_store = "jsonl"`.
+    #[serde(default)]
+    pub budget_path: Option<String>,
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -148,6 +186,26 @@ fn default_candidates_per_reply() -> usize {
 }
 
 fn default_mention_store() -> String {
+    "in_memory".into()
+}
+
+fn default_min_follower_following_ratio() -> f32 {
+    0.05
+}
+
+fn default_min_account_age_days() -> i64 {
+    7
+}
+
+fn default_bot_heuristic_threshold() -> usize {
+    2
+}
+
+fn default_per_conversation_max_replies() -> usize {
+    2
+}
+
+fn default_p1_7_budget_store() -> String {
     "in_memory".into()
 }
 

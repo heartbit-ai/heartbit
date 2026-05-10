@@ -21,8 +21,8 @@ use heartbit_core::Tool;
 use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
 use heartbit_ghost::reply::{
-    Mention, MentionStore, MentionerContext, ReplyConfig, ReplyError, ReplyOutcome,
-    ReplyReviewDelivery, TweetSnapshot, run_reply_pipeline,
+    DailyTokenBudget, Mention, MentionStore, MentionerContext, ReplyConfig, ReplyError,
+    ReplyOutcome, ReplyReviewDelivery, TweetSnapshot, run_reply_pipeline,
 };
 
 use crate::Error;
@@ -50,6 +50,8 @@ pub struct ReplyDraftDeps<'a> {
     pub corpora_root: &'a Path,
     /// Root directory containing per-persona style profiles.
     pub profiles_root: &'a Path,
+    /// Daily token-budget tracker — updated after every pipeline run.
+    pub budget_tracker: Arc<dyn DailyTokenBudget>,
 }
 
 /// Run one `ReplyDraft` handler invocation.
@@ -94,6 +96,7 @@ pub async fn handle_reply_draft<'a>(
     // Clone ids before mention is moved into cfg.
     let mention_id = mention.id.clone();
     let author_id = mention.author_id.clone();
+    let conversation_id_opt = mention.conversation_id.clone();
     let now = chrono::Utc::now();
 
     let cfg = ReplyConfig {
@@ -135,6 +138,37 @@ pub async fn handle_reply_draft<'a>(
         );
     }
 
+    // On a Posted outcome, update conversation-depth accounting so the
+    // ConversationDepthGuard can cap future replies in the same thread.
+    if matches!(output.outcome, ReplyOutcome::Posted { .. })
+        && let Some(ref conv_id) = conversation_id_opt
+        && let Err(e) = deps.store.record_reply_in_conversation(conv_id).await
+    {
+        tracing::warn!(
+            conversation_id = %conv_id,
+            error = %e,
+            "record_reply_in_conversation failed (best-effort)"
+        );
+    }
+
+    // Record token usage against the daily budget regardless of outcome
+    // (tokens were consumed by the LLM even for Skipped/GateRejected runs).
+    let total_tokens = output.usage_summary.input_tokens as u64
+        + output.usage_summary.output_tokens as u64
+        + output.usage_summary.reasoning_tokens as u64;
+    if total_tokens > 0
+        && let Err(e) = deps
+            .budget_tracker
+            .record_usage(persona_name, total_tokens)
+            .await
+    {
+        tracing::warn!(
+            persona_name,
+            error = %e,
+            "budget record_usage failed (best-effort)"
+        );
+    }
+
     Ok(output.outcome)
 }
 
@@ -162,7 +196,8 @@ mod tests {
     use heartbit_core::tool::ToolOutput;
     use heartbit_core::{ExecutionContext, Tool};
     use heartbit_ghost::reply::{
-        InMemoryMentionStore, MentionStore, ReplyOutcome, ReplyReviewDelivery, ReplyReviewMessage,
+        InMemoryDailyBudget, InMemoryMentionStore, MentionStore, ReplyOutcome, ReplyReviewDelivery,
+        ReplyReviewMessage,
     };
     use heartbit_ghost::review::{DeliveredReview, DeliveryOutcome, DeliveryReceipt};
     use tempfile::TempDir;
@@ -449,6 +484,7 @@ mod tests {
             candidates_per_reply: 1,
             corpora_root: profiles_root,
             profiles_root,
+            budget_tracker: Arc::new(InMemoryDailyBudget::new()),
         }
     }
 
