@@ -170,6 +170,12 @@ mod tests {
         // Triggers and review remain default (P1.3d / P1.4).
         assert!(exp.triggers.is_empty());
         assert!(exp.review.is_none());
+
+        // topic_context_provider should be populated.
+        assert!(
+            exp.topic_context_provider.is_some(),
+            "XGhost should populate topic_context_provider"
+        );
     }
 
     #[test]
