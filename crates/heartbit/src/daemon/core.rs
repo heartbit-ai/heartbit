@@ -949,6 +949,12 @@ impl DaemonCore {
                             }
                             self.event_channels.write().remove(&id);
                         }
+                        DaemonCommand::PersonaPost { persona } => {
+                            tracing::warn!(
+                                persona = %persona,
+                                "PersonaPost dispatched but handler is not yet wired (P1.6c task 11)"
+                            );
+                        }
                     }
                 }
                 Some(result) = self.active_tasks.join_next() => {

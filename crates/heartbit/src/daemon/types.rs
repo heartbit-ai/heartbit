@@ -50,6 +50,13 @@ pub enum DaemonCommand {
     CancelTask {
         id: Uuid,
     },
+    /// Cron-driven: generate one proactive post for `persona`. Fired
+    /// by `PersonaPostScheduler` on the configured cadence (gated by
+    /// active_hours). Handler in task 11.
+    PersonaPost {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+    },
 }
 
 /// State machine for daemon task lifecycle.
@@ -1020,5 +1027,20 @@ mod tests {
         }"#;
         let task: DaemonTask = serde_json::from_str(legacy).unwrap();
         assert!(task.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn daemon_command_persona_post_serde_round_trips() {
+        let cmd = DaemonCommand::PersonaPost {
+            persona: "heartbit-ghost:x".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::PersonaPost { persona } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+            }
+            other => panic!("expected PersonaPost, got {other:?}"),
+        }
     }
 }
