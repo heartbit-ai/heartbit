@@ -29,6 +29,8 @@ struct Mention {
     author_id: Option<String>,
     created_at: Option<String>,
     in_reply_to_user_id: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,7 +130,10 @@ async fn call_x(client: &XClient, input: &MentionsInput) -> Result<MentionsOutpu
     let max_str = input.max_results.to_string();
     let mut query: Vec<(&str, &str)> = vec![
         ("max_results", &max_str),
-        ("tweet.fields", "author_id,created_at,in_reply_to_user_id"),
+        (
+            "tweet.fields",
+            "author_id,created_at,in_reply_to_user_id,conversation_id",
+        ),
     ];
     if let Some(since) = input.since_id.as_deref() {
         query.push(("since_id", since));
@@ -171,7 +176,8 @@ mod tests {
                         "text": "hey @user",
                         "author_id": "200",
                         "created_at": "2026-01-01T00:00:00.000Z",
-                        "in_reply_to_user_id": "100"
+                        "in_reply_to_user_id": "100",
+                        "conversation_id": "conv-root-1"
                     }
                 ],
                 "meta": {"next_token": "next-mentions-1"}
@@ -191,6 +197,10 @@ mod tests {
         assert_eq!(
             result.mentions[0].in_reply_to_user_id.as_deref(),
             Some("100")
+        );
+        assert_eq!(
+            result.mentions[0].conversation_id.as_deref(),
+            Some("conv-root-1")
         );
     }
 
@@ -252,5 +262,44 @@ mod tests {
     async fn definition_has_stable_name() {
         let tool = TwitterMentionsTool::new();
         assert_eq!(tool.definition().name, "twitter_mentions");
+    }
+
+    #[tokio::test]
+    async fn mentions_includes_conversation_id_in_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/2/users/100/mentions"))
+            .and(query_param(
+                "tweet.fields",
+                "author_id,created_at,in_reply_to_user_id,conversation_id",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "9001",
+                        "text": "hey @user",
+                        "author_id": "200",
+                        "created_at": "2026-01-01T00:00:00.000Z",
+                        "in_reply_to_user_id": "100",
+                        "conversation_id": "conv-root-1"
+                    }
+                ],
+                "meta": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let input = MentionsInput {
+            user_id: "100".into(),
+            max_results: 10,
+            since_id: None,
+        };
+        let result = call_x(&client, &input).await.expect("happy path");
+        assert_eq!(result.mentions.len(), 1);
+        assert_eq!(
+            result.mentions[0].conversation_id.as_deref(),
+            Some("conv-root-1")
+        );
     }
 }
