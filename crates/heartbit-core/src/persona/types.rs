@@ -37,6 +37,13 @@ pub struct PersonaExpansion {
     /// (e.g. evangelism framing) without coupling them to user TOML.
     /// `None` for personas that don't need one.
     pub mode_addendum: Option<&'static str>,
+    /// Optional persona-specific topic context provider for proactive
+    /// posting. When present, `handle_persona_post` calls
+    /// [`crate::persona::TopicContextProvider::build_context`] before
+    /// invoking the topic generator. When absent, the handler injects
+    /// only the post history + topic_brief from config. See heartbit-ghost
+    /// P1.6 spec §5 for the rationale.
+    pub topic_context_provider: Option<std::sync::Arc<dyn crate::persona::TopicContextProvider>>,
 }
 
 impl std::fmt::Debug for PersonaExpansion {
@@ -47,6 +54,10 @@ impl std::fmt::Debug for PersonaExpansion {
             .field("triggers", &self.triggers.len())
             .field("review", &self.review.is_some())
             .field("mode_addendum", &self.mode_addendum.is_some())
+            .field(
+                "topic_context_provider",
+                &self.topic_context_provider.is_some(),
+            )
             .finish()
     }
 }

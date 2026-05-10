@@ -79,10 +79,20 @@ impl Persona for XHeartbitRsPersona {
         ];
         let tools = crate::agents::tools_for_heartbit_rs(); // <— differs
 
+        let repo_root = std::env::var("HEARTBIT_REPO_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .expect("current_dir() failed; set HEARTBIT_REPO_ROOT explicitly")
+            });
+
         Ok(PersonaExpansion {
             agents,
             tools,
             mode_addendum: Some(MODE_ADDENDUM),
+            topic_context_provider: Some(std::sync::Arc::new(
+                crate::posts::HeartbitRsXTopicContext::new(repo_root),
+            )),
             ..PersonaExpansion::default()
         })
     }

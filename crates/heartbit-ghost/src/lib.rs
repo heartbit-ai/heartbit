@@ -83,6 +83,9 @@ impl Persona for XGhostPersona {
         Ok(PersonaExpansion {
             agents,
             tools,
+            topic_context_provider: Some(std::sync::Arc::new(
+                crate::posts::XGhostTopicContext::new(),
+            )),
             // P1.3b populates orchestrator.
             // P1.3d populates review.
             // P1.4 populates triggers.
