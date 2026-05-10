@@ -445,10 +445,10 @@ mod tests {
             producer,
             commands_topic: "test.commands",
             max_results: 10,
-            thread_depth_guard: &*THREAD_GUARD_DISABLED,
+            thread_depth_guard: &THREAD_GUARD_DISABLED,
             bot_heuristic: None,
-            conversation_depth_guard: &*CONV_GUARD_ZERO,
-            daily_budget_guard: &*BUDGET_GUARD_NONE,
+            conversation_depth_guard: &CONV_GUARD_ZERO,
+            daily_budget_guard: &BUDGET_GUARD_NONE,
             budget_tracker: &*BUDGET_TRACKER_NOP,
         }
     }
