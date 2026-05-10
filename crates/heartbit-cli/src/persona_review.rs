@@ -227,6 +227,16 @@ pub async fn review_config_from_env<'a>(
     })
 }
 
+/// Expand a leading `~/` to `$HOME` in a path string.
+pub fn expand_tilde_str(s: &str) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
+        Ok(std::path::PathBuf::from(home).join(rest))
+    } else {
+        Ok(std::path::PathBuf::from(s))
+    }
+}
+
 /// Env-only credential resolver — reads `name` from `std::env`, wraps
 /// in `Secret`. Error if env var unset.
 pub(crate) struct EnvCredentialResolver;
