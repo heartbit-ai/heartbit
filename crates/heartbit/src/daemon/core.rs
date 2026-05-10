@@ -480,6 +480,13 @@ pub struct DaemonCore {
     cancel: CancellationToken,
     /// B5b: optional per-tenant token tracker for admission-gate checks in the Kafka consumer loop.
     tenant_tracker: Option<Arc<TenantTokenTracker>>,
+    /// Kafka commands topic — used to dispatch follow-up commands
+    /// (e.g. `PersonaPost` from the scheduler).
+    commands_topic: String,
+    /// Optional proactive-posts context. When set, `run()` spawns one
+    /// `PersonaPostScheduler` per persona at startup and dispatches
+    /// `DaemonCommand::PersonaPost` to `handle_persona_post`.
+    posts_context: Option<Arc<crate::daemon::PostsContext>>,
 }
 
 impl DaemonCore {
@@ -518,6 +525,8 @@ impl DaemonCore {
             active_tasks: JoinSet::new(),
             cancel,
             tenant_tracker: None,
+            commands_topic: kafka_config.commands_topic.clone(),
+            posts_context: None,
         };
         (core, handle)
     }
@@ -547,6 +556,14 @@ impl DaemonCore {
     /// successful processing). Tracked as a follow-up.
     pub fn with_tenant_tracker(mut self, tracker: Arc<TenantTokenTracker>) -> Self {
         self.tenant_tracker = Some(tracker);
+        self
+    }
+
+    /// Attach a proactive-posts context. After this is set, `run()`
+    /// spawns `PersonaPostScheduler` instances for each entry and
+    /// dispatches `PersonaPost` commands to the real handler.
+    pub fn with_posts_context(mut self, ctx: Arc<crate::daemon::PostsContext>) -> Self {
+        self.posts_context = Some(ctx);
         self
     }
 
@@ -681,6 +698,31 @@ impl DaemonCore {
                 interval_minutes = interval_min,
                 "idempotency key TTL sweep task spawned"
             );
+        }
+
+        // --- Spawn PersonaPostScheduler instances per configured persona ---
+        if let Some(ctx) = self.posts_context.as_ref() {
+            for (persona, entry) in ctx.entries.iter() {
+                let cfg = heartbit_core::config::PersonaPostsConfig {
+                    persona: persona.clone(),
+                    enabled: true,
+                    post_interval_seconds: entry.interval.as_secs(),
+                    active_hours: entry.active_hours.clone(),
+                    candidates_per_draft: entry.candidates_per_draft,
+                    post_history_store: "in_memory".into(),
+                    post_history_path: None,
+                    post_history_lookback_days: entry.history_lookback.num_days(),
+                    topic_brief: entry.topic_brief.clone(),
+                };
+                let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
+                    crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
+                );
+                let scheduler =
+                    crate::daemon::PersonaPostScheduler::new(&cfg, producer, &self.commands_topic);
+                let cancel = self.cancel.clone();
+                tokio::spawn(scheduler.run(cancel));
+                tracing::info!(persona = %persona, "post scheduler spawned");
+            }
         }
 
         use futures::StreamExt;
@@ -950,10 +992,59 @@ impl DaemonCore {
                             self.event_channels.write().remove(&id);
                         }
                         DaemonCommand::PersonaPost { persona } => {
-                            tracing::warn!(
-                                persona = %persona,
-                                "PersonaPost dispatched but handler is not yet wired (P1.6c task 11)"
-                            );
+                            let Some(ctx) = self.posts_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "PersonaPost received but no posts_context configured"
+                                );
+                                continue;
+                            };
+                            let Some(entry) = ctx.entries.get(&persona) else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "PersonaPost for unknown persona"
+                                );
+                                continue;
+                            };
+                            let history = entry.history.clone();
+                            let topic_brief = entry.topic_brief.clone();
+                            let candidates_per_draft = entry.candidates_per_draft;
+                            let history_lookback = entry.history_lookback;
+                            let operator_user_id = entry.operator_user_id.clone();
+                            let registry = ctx.registry.clone();
+                            let provider = ctx.provider.clone();
+                            let delivery = ctx.delivery.clone();
+                            let twitter_thread = ctx.twitter_thread.clone();
+                            let credentials = ctx.credentials.clone();
+                            let corpora_root = ctx.corpora_root.clone();
+                            let profiles_root = ctx.profiles_root.clone();
+                            let persona_owned = persona.clone();
+                            tokio::spawn(async move {
+                                let deps = crate::daemon::PersonaPostDeps {
+                                    persona_name: &persona_owned,
+                                    registry: &registry,
+                                    history: history.as_ref(),
+                                    history_lookback,
+                                    topic_brief: topic_brief.as_deref(),
+                                    operator_user_id: &operator_user_id,
+                                    provider,
+                                    delivery,
+                                    twitter_tool: twitter_thread,
+                                    credentials,
+                                    candidates_per_draft,
+                                    corpora_root: &corpora_root,
+                                    profiles_root: &profiles_root,
+                                };
+                                if let Err(e) =
+                                    crate::daemon::handle_persona_post(deps).await
+                                {
+                                    tracing::error!(
+                                        persona = %persona_owned,
+                                        error = %e,
+                                        "persona post handler failed"
+                                    );
+                                }
+                            });
                         }
                     }
                 }

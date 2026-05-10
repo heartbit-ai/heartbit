@@ -176,6 +176,123 @@ pub async fn run_daemon(
         handle
     };
 
+    // --- Build PostsContext from daemon_config.persona_posts ---
+    let core = if !daemon_config.persona_posts.is_empty() && daemon_config.kafka.is_some() {
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        heartbit_ghost::register(&mut registry);
+
+        let provider = crate::build_provider_from_config(&config, None)
+            .map_err(|e| anyhow::anyhow!("build llm provider for posts context: {e}"))?;
+
+        let delivery: std::sync::Arc<dyn heartbit_ghost::review::ReviewDelivery> =
+            std::sync::Arc::new(
+                crate::persona_review::TelegramReviewDelivery::from_env()
+                    .context("construct TelegramReviewDelivery for posts context")?,
+            );
+
+        let twitter_thread: std::sync::Arc<dyn heartbit_core::Tool> =
+            std::sync::Arc::new(heartbit_ghost::tools::TwitterThreadTool::new());
+
+        let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+            std::sync::Arc::new(crate::persona_review::EnvCredentialResolver);
+
+        let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+            .map_err(|e| anyhow::anyhow!("resolve corpora dir: {e}"))?;
+        let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+            .map_err(|e| anyhow::anyhow!("resolve profiles dir: {e}"))?;
+
+        let mut entries: std::collections::HashMap<String, heartbit::PersonaPostEntry> =
+            std::collections::HashMap::new();
+        for cfg in &daemon_config.persona_posts {
+            if !cfg.enabled {
+                continue;
+            }
+            if cfg.post_interval_seconds < 60 {
+                anyhow::bail!(
+                    "[[daemon.persona_posts]] persona='{}': post_interval_seconds must be \u{2265}60",
+                    cfg.persona
+                );
+            }
+            let history: std::sync::Arc<dyn heartbit_ghost::posts::PostHistoryStore> =
+                match cfg.post_history_store.as_str() {
+                    "in_memory" => {
+                        std::sync::Arc::new(heartbit_ghost::posts::InMemoryPostHistoryStore::new())
+                    }
+                    "jsonl" => {
+                        let raw_path = cfg.post_history_path.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "persona_posts persona='{}' uses jsonl but no post_history_path set",
+                            cfg.persona
+                        )
+                    })?;
+                        let path = expand_tilde(raw_path)?;
+                        std::sync::Arc::new(
+                            heartbit_ghost::posts::JsonlPostHistoryStore::open(&path)
+                                .await
+                                .with_context(|| {
+                                    format!("open jsonl post history at {}", path.display())
+                                })?,
+                        )
+                    }
+                    other => anyhow::bail!(
+                        "unknown post_history_store backend '{other}' for persona '{}' \
+                         (expected 'in_memory' or 'jsonl')",
+                        cfg.persona
+                    ),
+                };
+            // V1: operator user_id comes from env. Once P1.5 merges, this can be
+            // cross-referenced from persona_mentions config.
+            let operator_user_id =
+                std::env::var("HEARTBIT_GHOST_OPERATOR_USER_ID").map_err(|_| {
+                    anyhow::anyhow!(
+                        "persona_posts persona='{}': HEARTBIT_GHOST_OPERATOR_USER_ID must be set",
+                        cfg.persona
+                    )
+                })?;
+            entries.insert(
+                cfg.persona.clone(),
+                heartbit::PersonaPostEntry {
+                    history,
+                    interval: std::time::Duration::from_secs(cfg.post_interval_seconds),
+                    active_hours: cfg.active_hours.clone(),
+                    candidates_per_draft: cfg.candidates_per_draft,
+                    history_lookback: chrono::Duration::days(cfg.post_history_lookback_days),
+                    topic_brief: cfg.topic_brief.clone(),
+                    operator_user_id,
+                },
+            );
+        }
+
+        if entries.is_empty() {
+            // All entries were disabled.
+            core
+        } else {
+            let posts_ctx = std::sync::Arc::new(heartbit::PostsContext {
+                registry: std::sync::Arc::new(registry),
+                provider,
+                delivery,
+                twitter_thread,
+                credentials,
+                corpora_root,
+                profiles_root,
+                entries,
+            });
+            tracing::info!(
+                personas = ?posts_ctx.entries.keys().collect::<Vec<_>>(),
+                "posts context configured"
+            );
+            core.map(|c| c.with_posts_context(posts_ctx))
+        }
+    } else if !daemon_config.persona_posts.is_empty() {
+        tracing::warn!(
+            "persona_posts entries configured but [daemon.kafka] is absent; \
+             posts pipeline requires Kafka mode and will be skipped"
+        );
+        core
+    } else {
+        core
+    };
+
     // Create shared memory store (one store for all execution paths)
     let shared_memory: Option<Arc<dyn Memory>> = if let Some(ref mem_config) = config.memory {
         match crate::create_memory_store(mem_config).await {
@@ -807,4 +924,16 @@ pub async fn run_daemon(
 
     tracing::info!("runtime shut down gracefully");
     Ok(())
+}
+
+/// Expand a leading `~/` to `$HOME/`. Returns an error if `$HOME` is
+/// unset. Paths without a tilde prefix are returned unchanged.
+fn expand_tilde(s: &str) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").context("$HOME not set")?;
+        Ok(std::path::PathBuf::from(home).join(rest))
+    } else {
+        Ok(std::path::PathBuf::from(s))
+    }
 }
