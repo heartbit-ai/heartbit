@@ -1098,6 +1098,7 @@ impl DaemonCore {
                                         );
                                     let budget_tracker = entry.budget_tracker.clone();
                                     let x_enricher = mc.enricher.clone();
+                                    let enrichment_cache = mc.enrichment_cache.clone();
                                     tokio::spawn(async move {
                                         let deps =
                                             super::mention_poll_handler::MentionPollDeps {
@@ -1116,6 +1117,7 @@ impl DaemonCore {
                                                 daily_budget_guard: &daily_budget_guard,
                                                 budget_tracker: &*budget_tracker,
                                                 enricher: x_enricher.as_deref(),
+                                                enrichment_cache: enrichment_cache.as_deref(),
                                             };
                                         if let Err(e) =
                                             super::mention_poll_handler::handle_mention_poll(deps)
@@ -2027,6 +2029,7 @@ mod tests {
             },
             mentions_tool: Arc::new(NopTool),
             enricher: None,
+            enrichment_cache: None,
         });
 
         let core = core.with_mention_context(ctx);

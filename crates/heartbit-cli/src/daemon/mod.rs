@@ -1158,7 +1158,14 @@ async fn build_mention_context(
             tracing::info!(
                 "mention context: X enrichment enabled (bot guard live, parent fetch on)"
             );
+            // Attach a shared in-memory enrichment cache: dedups repeated
+            // /2/users/:id (24h TTL) and /2/tweets/:id (indefinite, immutable)
+            // calls across the daemon's lifetime. Cuts X API spend on
+            // recurring authors and shared parent tweets.
+            let cache = Arc::new(heartbit_ghost::reply::EnrichmentCache::new());
+            tracing::info!("mention context: enrichment cache attached (24h user TTL)");
             mc.with_enricher(Arc::new(client))
+                .with_enrichment_cache(cache)
         }
         Err(e) => {
             tracing::warn!(

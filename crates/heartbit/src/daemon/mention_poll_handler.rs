@@ -10,8 +10,8 @@
 use chrono::{Duration, Utc};
 use heartbit_core::{ExecutionContext, Tool};
 use heartbit_ghost::reply::{
-    BotHeuristicGuard, ConversationDepthGuard, DailyBudgetGuard, DailyTokenBudget, MentionStore,
-    SpamGuard, ThreadDepthGuard, enrich_mentioner, fetch_parent_tweet,
+    BotHeuristicGuard, ConversationDepthGuard, DailyBudgetGuard, DailyTokenBudget, EnrichmentCache,
+    MentionStore, SpamGuard, ThreadDepthGuard, enrich_mentioner, fetch_parent_tweet,
 };
 use heartbit_ghost::tools::client::XClient;
 use serde::Deserialize;
@@ -87,6 +87,11 @@ pub struct MentionPollDeps<'a> {
     /// `author_handle`, `mentioner_context: None`, `parent: None`. The
     /// bot-heuristic guard is structurally inert in that mode.
     pub enricher: Option<&'a XClient>,
+    /// Optional in-memory cache wrapping the enrichment calls. When set,
+    /// repeated `enrich_mentioner` / `fetch_parent_tweet` calls for the
+    /// same id are served from memory (24h TTL for users, indefinite for
+    /// the immutable tweet text). `None` makes every call direct.
+    pub enrichment_cache: Option<&'a EnrichmentCache>,
 }
 
 /// Handle one [`DaemonCommand::MentionPoll`] tick.
@@ -107,6 +112,7 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
         daily_budget_guard,
         budget_tracker,
         enricher,
+        enrichment_cache,
     } = deps;
     // 1. Read current since_id.
     let since_id = store
@@ -256,12 +262,18 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             }
         }
 
-        // 5b-bis. Enrich the mentioner (one X API call). Cost only on
-        // mentions that passed cheap guards. Failure degrades to no-context:
-        // bot heuristic will run with `None` (V1 behavior), but other guards
+        // 5b-bis. Enrich the mentioner (one X API call, dedup'd via
+        // EnrichmentCache when configured — repeat lookups of the same
+        // author_id hit memory instead of the API). Cost only on mentions
+        // that passed cheap guards. Failure degrades to no-context: bot
+        // heuristic will run with `None` (V1 behavior), but other guards
         // and the pipeline still execute.
         let mentioner_context = if let Some(client) = enricher {
-            match enrich_mentioner(client, author_id).await {
+            let fetch = match enrichment_cache {
+                Some(cache) => cache.enrich_mentioner(client, author_id).await,
+                None => enrich_mentioner(client, author_id).await,
+            };
+            match fetch {
                 Ok(ctx) => {
                     // Populate the mention's author_handle so downstream
                     // (bot heuristic, prompts) can use it.
@@ -351,23 +363,30 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             continue;
         }
 
-        // 6b. Fetch the parent tweet for threaded replies. One X API call,
-        // only when the mention is a reply (in_reply_to_tweet_id is Some)
-        // AND enrichment is wired. Failure degrades to `parent: None` — the
-        // writer falls back to its no-context prompt.
+        // 6b. Fetch the parent tweet for threaded replies. One X API call
+        // (dedup'd via cache when configured — tweets are immutable, so
+        // every same-id lookup after the first is free). Only when the
+        // mention is a reply (in_reply_to_tweet_id is Some) AND enrichment
+        // is wired. Failure degrades to `parent: None`.
         let parent = match (&mention.in_reply_to_tweet_id, enricher) {
-            (Some(parent_id), Some(client)) => match fetch_parent_tweet(client, parent_id).await {
-                Ok(snap) => Some(snap),
-                Err(e) => {
-                    tracing::warn!(
-                        mention_id = %mention.id,
-                        parent_id = %parent_id,
-                        error = %e,
-                        "fetch_parent_tweet failed, degrading to no parent context"
-                    );
-                    None
+            (Some(parent_id), Some(client)) => {
+                let fetch = match enrichment_cache {
+                    Some(cache) => cache.fetch_parent_tweet(client, parent_id).await,
+                    None => fetch_parent_tweet(client, parent_id).await,
+                };
+                match fetch {
+                    Ok(snap) => Some(snap),
+                    Err(e) => {
+                        tracing::warn!(
+                            mention_id = %mention.id,
+                            parent_id = %parent_id,
+                            error = %e,
+                            "fetch_parent_tweet failed, degrading to no parent context"
+                        );
+                        None
+                    }
                 }
-            },
+            }
             _ => None,
         };
 
@@ -552,6 +571,7 @@ mod tests {
             // The dedicated enrichment test below builds its own deps with
             // an `XClient` pointing at a wiremock server.
             enricher: None,
+            enrichment_cache: None,
         }
     }
 
@@ -1008,6 +1028,7 @@ mod tests {
             daily_budget_guard: &budget_guard,
             budget_tracker: &budget_tracker,
             enricher: None,
+            enrichment_cache: None,
         };
 
         handle_mention_poll(deps).await.unwrap();
@@ -1091,6 +1112,7 @@ mod tests {
             daily_budget_guard: &budget_guard,
             budget_tracker: &budget_tracker,
             enricher: None,
+            enrichment_cache: None,
         };
 
         handle_mention_poll(deps).await.unwrap();
@@ -1274,6 +1296,116 @@ mod tests {
             }
             other => panic!("expected ReplyDraft, got {other:?}"),
         }
+    }
+
+    /// When an `EnrichmentCache` is attached, repeat lookups of the same
+    /// author across separate poll cycles MUST hit the cache instead of
+    /// re-calling `/2/users/:id`. Same for parent-tweet fetches across
+    /// mentions in the same conversation thread.
+    #[tokio::test]
+    async fn enrichment_cache_dedups_across_two_poll_cycles() {
+        use heartbit_core::Secret;
+        use heartbit_ghost::reply::EnrichmentCache;
+        use heartbit_ghost::tools::client::XClient;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let guard = default_guard();
+        let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
+
+        // Wiremock: expect EXACTLY ONE call to /2/users/repeat_author across
+        // the entire test. If the cache fails, the assertion below will
+        // fail with "Expected 1 call, received N".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/2/users/repeat_author"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "repeat_author",
+                    "name": "Repeat Person",
+                    "username": "repeat_person",
+                    "public_metrics": {
+                        "followers_count": 1000,
+                        "following_count": 500,
+                        "tweet_count": 200
+                    },
+                    "created_at": "2020-01-01T00:00:00.000Z"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = XClient::new(
+            server.uri(),
+            Secret::new("ck"),
+            Secret::new("cs"),
+            Secret::new("at"),
+            Secret::new("ats"),
+        )
+        .unwrap();
+        let cache = EnrichmentCache::new();
+        let ctx = ExecutionContext::default();
+
+        // First poll cycle: returns 1 mention from repeat_author.
+        let json1 = serde_json::json!({
+            "mentions": [{
+                "id": "m1",
+                "text": "interesting take on async runtimes",
+                "author_id": "repeat_author",
+                "created_at": "2026-05-01T00:00:00Z"
+            }]
+        })
+        .to_string();
+        let tool1 = StubMentionsTool::ok(&json1);
+        let (producer1, mut rx1) = mock_producer();
+        let mut deps1 = deps_for(
+            "ghost",
+            "op",
+            &tool1,
+            &store,
+            &guard,
+            producer1.as_ref(),
+            &ctx,
+        );
+        deps1.enricher = Some(&client);
+        deps1.enrichment_cache = Some(&cache);
+        handle_mention_poll(deps1).await.unwrap();
+        let _ = rx1.try_recv().expect("first cycle dispatches");
+
+        // Second poll cycle: another mention from THE SAME author, higher id.
+        // Without cache: this would trigger a second /2/users/repeat_author
+        // call. With cache: served from memory.
+        let json2 = serde_json::json!({
+            "mentions": [{
+                "id": "m2",
+                "text": "and what about io_uring?",
+                "author_id": "repeat_author",
+                "created_at": "2026-05-01T00:01:00Z"
+            }]
+        })
+        .to_string();
+        let tool2 = StubMentionsTool::ok(&json2);
+        let (producer2, mut rx2) = mock_producer();
+        let mut deps2 = deps_for(
+            "ghost",
+            "op",
+            &tool2,
+            &store,
+            &guard,
+            producer2.as_ref(),
+            &ctx,
+        );
+        deps2.enricher = Some(&client);
+        deps2.enrichment_cache = Some(&cache);
+        handle_mention_poll(deps2).await.unwrap();
+        let _ = rx2.try_recv().expect("second cycle dispatches");
+
+        // Both cycles dispatched and the cache shows 1 stored user.
+        assert_eq!(cache.stats().users_size, 1);
+        // wiremock .expect(1) verifies on Drop that only one HTTP call was
+        // made — that's the load-bearing assertion.
     }
 
     /// With enrichment wired, the bot heuristic guard now fires on a suspicious

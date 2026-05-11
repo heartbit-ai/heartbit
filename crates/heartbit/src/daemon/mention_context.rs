@@ -16,8 +16,8 @@ use heartbit_core::Tool;
 use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
 use heartbit_ghost::reply::{
-    BotHeuristicConfig, DailyTokenBudget, InMemoryDailyBudget, MentionStore, ReplyReviewDelivery,
-    ScamJudge, SpamGuard, SpamGuardConfig,
+    BotHeuristicConfig, DailyTokenBudget, EnrichmentCache, InMemoryDailyBudget, MentionStore,
+    ReplyReviewDelivery, ScamJudge, SpamGuard, SpamGuardConfig,
 };
 use heartbit_ghost::tools::client::XClient;
 
@@ -133,6 +133,11 @@ pub struct MentionContext {
     /// (gives the reply writer real thread context). `None` preserves
     /// V1 behavior (no enrichment, bot guard inert).
     pub enricher: Option<Arc<XClient>>,
+    /// Shared in-memory cache for enrichment calls. Dedups repeated
+    /// `GET /2/users/:id` lookups (same author mentioning multiple times)
+    /// and `GET /2/tweets/:id` parent fetches (replies in the same
+    /// thread). `None` makes every enrichment call hit the API.
+    pub enrichment_cache: Option<Arc<EnrichmentCache>>,
 }
 
 impl MentionContext {
@@ -146,12 +151,19 @@ impl MentionContext {
             reply,
             mentions_tool,
             enricher: None,
+            enrichment_cache: None,
         }
     }
 
     /// Attach a shared X API client used for per-mention enrichment.
     pub fn with_enricher(mut self, enricher: Arc<XClient>) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// Attach a shared in-memory cache for enrichment dedup.
+    pub fn with_enrichment_cache(mut self, cache: Arc<EnrichmentCache>) -> Self {
+        self.enrichment_cache = Some(cache);
         self
     }
 }

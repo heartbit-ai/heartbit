@@ -21,7 +21,7 @@ pub use bot_guard::{BotHeuristicConfig, BotHeuristicGuard};
 pub use budget::{BudgetError, DailyTokenBudget, InMemoryDailyBudget, JsonlDailyBudget};
 pub use budget_guard::DailyBudgetGuard;
 pub use conversation_guard::ConversationDepthGuard;
-pub use enrichment::{enrich_mentioner, fetch_parent_tweet};
+pub use enrichment::{EnrichmentCache, EnrichmentCacheStats, enrich_mentioner, fetch_parent_tweet};
 pub use scam_judge::{ScamJudge, ScamVerdict};
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
