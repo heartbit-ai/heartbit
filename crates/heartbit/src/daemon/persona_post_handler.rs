@@ -16,7 +16,8 @@ use heartbit_core::persona::{PersonaParams, PersonaRegistry};
 
 use heartbit_ghost::posts::{PostHistoryEntry, PostHistoryStore, PostOutcome};
 use heartbit_ghost::review::{
-    ReviewConfig, ReviewDelivery, ReviewError, ReviewOutcome, run_review_pipeline,
+    ReviewConfig, ReviewDelivery, ReviewError, ReviewOutcome, parse_thread_tweets,
+    run_review_pipeline,
 };
 
 /// Dependencies for one `handle_persona_post` invocation.
@@ -199,14 +200,23 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         ReviewOutcome::Posted { tweet_ids, .. } => tweet_ids.first().cloned(),
         _ => None,
     };
+    // On the Posted path, capture the first tweet's text so future runs of
+    // TopPostsProvider can render exemplars without round-tripping the X API.
+    // Non-Posted outcomes (Skipped/TimedOut/GateRejected/PublishFailed) leave
+    // `text` as None.
+    let text = match &review_out.outcome {
+        ReviewOutcome::Posted { chosen_index, .. } => review_out
+            .candidates
+            .get(*chosen_index)
+            .and_then(|c| parse_thread_tweets(&c.draft).into_iter().next()),
+        _ => None,
+    };
     let entry = PostHistoryEntry {
         posted_at: chrono::Utc::now(),
         topic: topic.clone(),
         outcome: post_outcome.clone(),
         tweet_id,
-        // Task 4 will populate this from the first tweet's text on the
-        // Posted path; Task 2 keeps it None to focus on the API helper.
-        text: None,
+        text,
     };
     if let Err(e) = deps.history.record(deps.persona_name, entry).await {
         tracing::warn!(error = %e, "history.record (terminal) failed");
@@ -784,5 +794,66 @@ mod tests {
         // Store should be empty — no recording on persona lookup failure.
         let recent = history.recent("missing-persona", 5).await.unwrap();
         assert!(recent.is_empty());
+    }
+
+    // ─── Test 6: Posted entry records first-tweet text (Task 4) ──────────────
+
+    #[tokio::test]
+    async fn happy_path_records_text_on_posted_entry() {
+        let persona_name = "test-persona";
+        let (_dir, profiles_root) = seed_snapshot(persona_name);
+
+        // Provider canned: topic_generator first, then review pipeline.
+        // The writer's draft is the source of the first-tweet text exemplar.
+        let provider = MockProvider::arc(vec![
+            "calibrated abstention",                         // topic_generator
+            "Research digest:\n- AI",                        // researcher
+            "concrete short post",                           // writer iter 1
+            r#"{"verdict":"pass","style_match_score":0.9}"#, // critic
+            r#"{"verdict":"verified"}"#,                     // fact_check
+            "no_image",                                      // image_generator
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+
+        let history = InMemoryPostHistoryStore::new();
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(StubCredentialResolver);
+
+        let mut registry = PersonaRegistry::new();
+        registry.register(Arc::new(StubTestPersona::new(persona_name)));
+
+        let deps = PersonaPostDeps {
+            persona_name,
+            registry: &registry,
+            history: &history,
+            history_lookback: Duration::days(30),
+            topic_brief: None,
+            operator_user_id: "12345",
+            provider,
+            delivery,
+            twitter_tool,
+            credentials,
+            candidates_per_draft: 1,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+        };
+
+        let outcome = handle_persona_post(deps).await.expect("happy path");
+        assert!(matches!(outcome, PostOutcome::Posted { .. }));
+
+        let recent = history.recent(persona_name, 5).await.unwrap();
+        let posted = recent
+            .iter()
+            .find(|e| matches!(e.outcome, PostOutcome::Posted { .. }))
+            .expect("one Posted entry");
+        assert!(
+            posted.text.is_some(),
+            "Posted entry must carry the first-tweet text"
+        );
+        // Writer emitted a single-tweet draft "concrete short post", which
+        // is the first (and only) tweet of the chosen thread.
+        assert_eq!(posted.text.as_deref(), Some("concrete short post"));
     }
 }
