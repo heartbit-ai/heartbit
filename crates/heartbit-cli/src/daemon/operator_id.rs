@@ -14,14 +14,12 @@ use heartbit::PersonaMentionsConfig;
 /// Source from which an operator user-id was resolved. Used by callers for
 /// logging — the resolved id itself is the primary return value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum OperatorIdSource {
     PersonaMentions,
     EnvVar,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum OperatorIdError {
     #[error(
         "no operator user-id for persona '{persona}': set HEARTBIT_GHOST_OPERATOR_USER_ID \
@@ -35,7 +33,6 @@ pub enum OperatorIdError {
 ///
 /// `env_lookup` is an injectable hook so tests don't need to mutate
 /// real `std::env`. Production callers pass `|k| std::env::var(k).ok()`.
-#[allow(dead_code)]
 pub fn resolve_operator_user_id(
     persona_slug: &str,
     persona_mentions: &[PersonaMentionsConfig],

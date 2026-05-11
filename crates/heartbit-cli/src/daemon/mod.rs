@@ -263,15 +263,33 @@ pub async fn run_daemon(
                         cfg.persona
                     ),
                 };
-            // V1: operator user_id comes from env. Once P1.5 merges, this can be
-            // cross-referenced from persona_mentions config.
-            let operator_user_id =
-                std::env::var("HEARTBIT_GHOST_OPERATOR_USER_ID").map_err(|_| {
-                    anyhow::anyhow!(
-                        "persona_posts persona='{}': HEARTBIT_GHOST_OPERATOR_USER_ID must be set",
-                        cfg.persona
-                    )
-                })?;
+            let operator_user_id = match operator_id::resolve_operator_user_id(
+                &cfg.persona,
+                &daemon_config.persona_mentions,
+                |k| std::env::var(k).ok(),
+            ) {
+                Ok((id, source)) => {
+                    tracing::info!(
+                        persona = %cfg.persona,
+                        source = ?source,
+                        "resolved operator_user_id for persona_posts entry"
+                    );
+                    id
+                }
+                Err(e) => {
+                    // Loud banner: this is strictly worse for ops than a
+                    // crash-loop if it goes unnoticed, so log at error level
+                    // and bump a metric. Daemon stays up; other personas run.
+                    tracing::error!(
+                        persona = %cfg.persona,
+                        "SKIPPING [[daemon.persona_posts]] entry: {e}"
+                    );
+                    if let Some(ref m) = metrics {
+                        m.inc_persona_posts_skipped(&cfg.persona, "missing_operator_user_id");
+                    }
+                    continue;
+                }
+            };
             if entries.contains_key(&cfg.persona) {
                 anyhow::bail!(
                     "duplicate [[daemon.persona_posts]] entry for persona '{}'",
