@@ -67,10 +67,8 @@ impl std::fmt::Debug for PersonaPostEntry {
             .field("operator_user_id", &self.operator_user_id)
             .field("engagement_refresh", &self.engagement_refresh)
             .field("engagement_jitter_pct", &self.engagement_jitter_pct)
-            .field(
-                "engagement_store_set",
-                &(Arc::strong_count(&self.engagement_store) > 0),
-            )
+            // `engagement_store` is always present (non-Option), so a *_set
+            // boolean would always be true and carry no signal. Skip it.
             .field("engagement_min_age_hours", &self.engagement_min_age_hours)
             .field("engagement_max_age_days", &self.engagement_max_age_days)
             .field("engagement_top_n", &self.engagement_top_n)

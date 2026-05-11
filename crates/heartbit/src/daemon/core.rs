@@ -1308,14 +1308,14 @@ impl DaemonCore {
                             let Some(ref mc) = self.mention_context else {
                                 tracing::warn!(
                                     persona = %persona,
-                                    "EngagementRefresh: no mention_context (no XClient available)"
+                                    "EngagementRefresh dropped: no mention_context. Engagement collection reuses the OAuth1 XClient from [[daemon.persona_mentions]]; add a matching mention entry or drop engagement_top_n=0 to silence this."
                                 );
                                 continue;
                             };
                             let Some(client_arc) = mc.enricher.clone() else {
                                 tracing::warn!(
                                     persona = %persona,
-                                    "EngagementRefresh: mention_context has no XClient enricher"
+                                    "EngagementRefresh dropped: mention_context has no XClient (X_CONSUMER_KEY/SECRET + X_ACCESS_TOKEN/SECRET likely missing in env). Engagement collection cannot run without OAuth1 user-context credentials."
                                 );
                                 continue;
                             };
