@@ -145,6 +145,7 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
             topic: String::new(),
             outcome: PostOutcome::NoTopic,
             tweet_id: None,
+            text: None,
         };
         if let Err(e) = deps.history.record(deps.persona_name, entry).await {
             tracing::warn!(error = %e, "history.record (NoTopic) failed");
@@ -165,6 +166,7 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
             topic: topic.clone(),
             outcome: PostOutcome::SkippedDuplicate,
             tweet_id: None,
+            text: None,
         };
         if let Err(e) = deps.history.record(deps.persona_name, entry).await {
             tracing::warn!(error = %e, "history.record (SkippedDuplicate) failed");
@@ -202,6 +204,9 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         topic: topic.clone(),
         outcome: post_outcome.clone(),
         tweet_id,
+        // Task 4 will populate this from the first tweet's text on the
+        // Posted path; Task 2 keeps it None to focus on the API helper.
+        text: None,
     };
     if let Err(e) = deps.history.record(deps.persona_name, entry).await {
         tracing::warn!(error = %e, "history.record (terminal) failed");
@@ -651,6 +656,7 @@ mod tests {
                         url: "https://x.com/i/web/status/100".into(),
                     },
                     tweet_id: Some("100".into()),
+                    text: None,
                 },
             )
             .await

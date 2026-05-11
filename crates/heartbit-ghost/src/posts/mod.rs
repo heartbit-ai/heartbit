@@ -32,6 +32,12 @@ pub struct PostHistoryEntry {
     pub outcome: PostOutcome,
     /// Tweet id when `outcome` is `Posted`; else `None`.
     pub tweet_id: Option<String>,
+    /// First tweet of the thread (or single tweet) text. Captured at
+    /// post time so `TopPostsProvider` doesn't need to round-trip the
+    /// X API to render exemplars. `#[serde(default)]` for backward
+    /// compatibility with entries written before P2.0.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// What happened in one persona-post tick.
@@ -90,11 +96,23 @@ mod tests {
                 url: "https://x.com/i/web/status/123".into(),
             },
             tweet_id: Some("123".into()),
+            text: Some("first tweet text".into()),
         };
         let s = serde_json::to_string(&entry).unwrap();
         let parsed: PostHistoryEntry = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.topic, entry.topic);
         assert_eq!(parsed.tweet_id, entry.tweet_id);
         assert_eq!(parsed.outcome, entry.outcome);
+        assert_eq!(parsed.text, entry.text);
+    }
+
+    #[test]
+    fn post_history_entry_parses_legacy_without_text() {
+        // Backward-compat: an entry serialized before `text` was added
+        // (no `text` key) must still parse — `#[serde(default)]` → None.
+        let line = r#"{"posted_at":"2026-05-01T00:00:00Z","topic":"legacy","outcome":{"kind":"posted","chosen_index":0,"url":"https://x.com/i/web/status/77"},"tweet_id":"77"}"#;
+        let parsed: PostHistoryEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed.topic, "legacy");
+        assert_eq!(parsed.text, None);
     }
 }

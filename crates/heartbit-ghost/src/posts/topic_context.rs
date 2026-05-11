@@ -482,6 +482,7 @@ mod tests {
                 url: "https://x.com/i/web/status/100".into(),
             },
             tweet_id: Some("100".into()),
+            text: None,
         }];
         let deps = TopicContextDeps {
             credentials: creds,

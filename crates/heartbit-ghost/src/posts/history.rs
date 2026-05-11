@@ -270,6 +270,7 @@ mod tests {
                 url: "https://x.com/i/web/status/123".into(),
             },
             tweet_id: Some("123".into()),
+            text: None,
         }
     }
 
