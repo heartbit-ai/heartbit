@@ -55,7 +55,7 @@ heartbit-macro = { path = "../heartbit-macro", optional = true }
 default = ["core"]
 core = []
 kafka = ["dep:rdkafka"]
-daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken"]
+daemon = ["kafka", "dep:cron", "dep:prometheus", "dep:jsonwebtoken", "dep:rand"]
 restate = ["dep:restate-sdk"]
 postgres = ["dep:sqlx", "dep:pgvector"]
 a2a = ["heartbit-core/a2a"]

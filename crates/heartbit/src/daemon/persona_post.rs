@@ -17,9 +17,15 @@ use super::types::DaemonCommand;
 
 /// One scheduled poster. Fires a `PersonaPost` command every
 /// `interval` (gated by `active_hours` when set) via the producer.
+///
+/// `jitter_pct` (0..=50) randomizes each tick by `±jitter_pct/100` of
+/// `interval` — a 4h base with 25% jitter fires somewhere in [3h, 5h]
+/// per tick. Without this, post times line up on a perfectly predictable
+/// clock, which is a textbook automation signal on X.
 pub struct PersonaPostScheduler {
     persona: String,
     interval: Duration,
+    jitter_pct: u32,
     active_hours: Option<ActiveHoursConfig>,
     producer: Arc<dyn CommandProducer>,
     commands_topic: String,
@@ -30,6 +36,7 @@ impl std::fmt::Debug for PersonaPostScheduler {
         f.debug_struct("PersonaPostScheduler")
             .field("persona", &self.persona)
             .field("interval", &self.interval)
+            .field("jitter_pct", &self.jitter_pct)
             .field("active_hours_set", &self.active_hours.is_some())
             .field("commands_topic", &self.commands_topic)
             .finish()
@@ -49,10 +56,30 @@ impl PersonaPostScheduler {
         Self {
             persona: cfg.persona.clone(),
             interval: Duration::from_secs(cfg.post_interval_seconds.max(60)),
+            // Clamp to a sane band — `0` is "no jitter" (deterministic tests);
+            // above `50` produces wild swings that can stretch one tick into
+            // half a day, which defeats the active-hours window.
+            jitter_pct: cfg.interval_jitter_pct.min(50),
             active_hours: cfg.active_hours.clone(),
             producer,
             commands_topic: commands_topic.into(),
         }
+    }
+
+    /// Compute the next sleep duration, randomized within
+    /// `±jitter_pct%` of `interval`. Returns `interval` unchanged when
+    /// jitter is 0. Floor is 60s — even with extreme jitter we never
+    /// hammer the post pipeline faster than once a minute.
+    fn jittered_interval(&self) -> Duration {
+        if self.jitter_pct == 0 {
+            return self.interval;
+        }
+        let base = self.interval.as_secs_f64();
+        let pct = self.jitter_pct as f64 / 100.0;
+        // Uniform on [-pct, +pct].
+        let factor = 1.0 + (rand::random::<f64>() * 2.0 - 1.0) * pct;
+        let next = (base * factor).max(60.0);
+        Duration::from_secs_f64(next)
     }
 
     /// Run the scheduler loop until `cancel` fires.
@@ -62,12 +89,20 @@ impl PersonaPostScheduler {
     /// `active_hours` window (or unconditionally when no window is set).
     pub async fn run(self, cancel: CancellationToken) {
         loop {
+            // Re-roll each iteration so the cadence drifts over time
+            // instead of staying offset-locked to boot time.
+            let next = self.jittered_interval();
+            tracing::debug!(
+                persona = %self.persona,
+                next_sleep_secs = next.as_secs(),
+                "post scheduler: sleeping until next tick"
+            );
             tokio::select! {
                 _ = cancel.cancelled() => {
                     tracing::info!(persona = %self.persona, "post scheduler shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(self.interval) => {
+                _ = tokio::time::sleep(next) => {
                     if !self.is_within_active_hours() {
                         tracing::debug!(
                             persona = %self.persona,
@@ -148,6 +183,9 @@ mod tests {
             persona: "heartbit-ghost:x".into(),
             enabled: true,
             post_interval_seconds: interval,
+            // Tests need deterministic timing — disable jitter unless the test
+            // exercises the jitter logic explicitly.
+            interval_jitter_pct: 0,
             active_hours: None,
             candidates_per_draft: 3,
             post_history_store: "in_memory".into(),
@@ -213,6 +251,69 @@ mod tests {
         ));
         // No active_hours → always allowed
         assert!(PersonaPostScheduler::check_active_hours(&None, 0));
+    }
+
+    /// Jitter must produce intervals strictly within `±jitter_pct%` of the
+    /// base, never below the 60s safety floor, and vary across calls (so
+    /// the daemon doesn't lock onto a single offset for its whole lifetime).
+    #[tokio::test]
+    async fn jittered_interval_stays_in_bounds_and_varies() {
+        let mut cfg = cfg_with_interval(14400); // 4h base
+        cfg.interval_jitter_pct = 25; // ±25% → [3h, 5h]
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        let producer: Arc<dyn CommandProducer> = Arc::new(ChannelCommandProducer { tx });
+        let scheduler = PersonaPostScheduler::new(&cfg, producer, "test");
+
+        let mut samples = Vec::with_capacity(50);
+        for _ in 0..50 {
+            samples.push(scheduler.jittered_interval().as_secs());
+        }
+
+        // In-band: every sample in [3h, 5h] = [10800, 18000].
+        for s in &samples {
+            assert!(
+                (10_800..=18_000).contains(s),
+                "jittered sample {s}s out of [10800, 18000]"
+            );
+        }
+        // Varies: across 50 random samples we expect to see at least 25
+        // distinct values; "all 50 the same" would mean the rng is dead.
+        let distinct: std::collections::HashSet<_> = samples.iter().collect();
+        assert!(
+            distinct.len() >= 25,
+            "expected ≥25 distinct samples in 50 draws, got {}",
+            distinct.len()
+        );
+    }
+
+    /// Jitter=0 returns the exact base interval — used by tests that need
+    /// deterministic timing.
+    #[test]
+    fn jittered_interval_is_deterministic_when_pct_is_zero() {
+        let cfg = cfg_with_interval(14400);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        let producer: Arc<dyn CommandProducer> = Arc::new(ChannelCommandProducer { tx });
+        let scheduler = PersonaPostScheduler::new(&cfg, producer, "test");
+        for _ in 0..20 {
+            assert_eq!(scheduler.jittered_interval().as_secs(), 14400);
+        }
+    }
+
+    /// Jitter > 50 is clamped at construction time — protects against
+    /// pathological config where one tick could stretch into days.
+    #[test]
+    fn jitter_pct_is_clamped_at_50() {
+        let mut cfg = cfg_with_interval(3600);
+        cfg.interval_jitter_pct = 200;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+        let producer: Arc<dyn CommandProducer> = Arc::new(ChannelCommandProducer { tx });
+        let scheduler = PersonaPostScheduler::new(&cfg, producer, "test");
+        // 50% of 3600 = 1800; samples in [1800, 5400].
+        for _ in 0..20 {
+            let s = scheduler.jittered_interval().as_secs();
+            assert!((1_800..=5_400).contains(&s), "clamped jitter sample {s}s");
+        }
     }
 
     #[tokio::test(start_paused = true)]

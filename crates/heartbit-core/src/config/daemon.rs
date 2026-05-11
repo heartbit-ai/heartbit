@@ -368,6 +368,13 @@ pub struct PersonaPostsConfig {
     /// Validation: must be ≥60 (rejected at config load otherwise).
     #[serde(default = "default_post_interval_seconds")]
     pub post_interval_seconds: u64,
+    /// Randomness applied to each `post_interval_seconds` tick, as a
+    /// percentage (`0`–`50`). Default `25` = ±25%, so a base 4h interval
+    /// fires somewhere in [3h, 5h]. Prevents the daemon from posting
+    /// on a perfectly predictable cadence — that's a textbook bot
+    /// signature on X. `0` disables jitter (use only for tests).
+    #[serde(default = "default_post_interval_jitter_pct")]
+    pub interval_jitter_pct: u32,
     /// Optional `"HH:MM-HH:MM"` window during which posts are allowed.
     /// Outside this window, the scheduler tick is a no-op. When absent,
     /// posting is allowed 24/7.
@@ -396,6 +403,10 @@ pub struct PersonaPostsConfig {
 
 fn default_post_interval_seconds() -> u64 {
     14400
+}
+
+fn default_post_interval_jitter_pct() -> u32 {
+    25
 }
 
 fn default_post_candidates() -> usize {

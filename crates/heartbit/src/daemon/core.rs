@@ -724,6 +724,7 @@ impl DaemonCore {
                     persona: persona.clone(),
                     enabled: true,
                     post_interval_seconds: entry.interval.as_secs(),
+                    interval_jitter_pct: entry.interval_jitter_pct,
                     active_hours: entry.active_hours.clone(),
                     candidates_per_draft: entry.candidates_per_draft,
                     post_history_store: "in_memory".into(),

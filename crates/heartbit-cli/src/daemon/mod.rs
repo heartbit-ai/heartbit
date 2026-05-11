@@ -282,6 +282,7 @@ pub async fn run_daemon(
                 heartbit::PersonaPostEntry {
                     history,
                     interval: std::time::Duration::from_secs(cfg.post_interval_seconds),
+                    interval_jitter_pct: cfg.interval_jitter_pct,
                     active_hours: cfg.active_hours.clone(),
                     candidates_per_draft: cfg.candidates_per_draft,
                     history_lookback: chrono::Duration::days(cfg.post_history_lookback_days),

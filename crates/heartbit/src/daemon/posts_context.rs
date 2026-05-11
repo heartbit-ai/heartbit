@@ -23,6 +23,10 @@ pub struct PersonaPostEntry {
     pub history: Arc<dyn PostHistoryStore>,
     /// Polling interval (used by the scheduler at startup).
     pub interval: Duration,
+    /// `±jitter_pct%` randomization applied to each scheduler tick.
+    /// 0 = deterministic clock (use only for tests). 25 = ±25% (default
+    /// when loaded from config).
+    pub interval_jitter_pct: u32,
     /// Optional active-hours window.
     pub active_hours: Option<ActiveHoursConfig>,
     /// Number of candidate threads per tick.
