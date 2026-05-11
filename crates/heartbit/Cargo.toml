@@ -70,3 +70,4 @@ full = ["daemon", "restate", "postgres", "a2a", "discord", "slack", "vault"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+wiremock = "0.6"

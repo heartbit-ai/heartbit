@@ -19,6 +19,7 @@ use heartbit_ghost::reply::{
     BotHeuristicConfig, DailyTokenBudget, InMemoryDailyBudget, MentionStore, ReplyReviewDelivery,
     SpamGuard, SpamGuardConfig,
 };
+use heartbit_ghost::tools::client::XClient;
 
 /// All dependencies resolved for a single `[[daemon.persona_mentions]]` entry.
 ///
@@ -121,6 +122,12 @@ pub struct MentionContext {
     pub reply: ReplySharedContext,
     /// `twitter_mentions` tool shared across all entries.
     pub mentions_tool: Arc<dyn Tool>,
+    /// Shared X API client used by the poll handler to enrich each
+    /// surviving mention with `author_handle` + `MentionerContext`
+    /// (activates the bot-heuristic guard) and the parent tweet text
+    /// (gives the reply writer real thread context). `None` preserves
+    /// V1 behavior (no enrichment, bot guard inert).
+    pub enricher: Option<Arc<XClient>>,
 }
 
 impl MentionContext {
@@ -133,7 +140,14 @@ impl MentionContext {
             entries,
             reply,
             mentions_tool,
+            enricher: None,
         }
+    }
+
+    /// Attach a shared X API client used for per-mention enrichment.
+    pub fn with_enricher(mut self, enricher: Arc<XClient>) -> Self {
+        self.enricher = Some(enricher);
+        self
     }
 }
 

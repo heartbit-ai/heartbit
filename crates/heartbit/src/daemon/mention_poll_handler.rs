@@ -11,8 +11,9 @@ use chrono::{Duration, Utc};
 use heartbit_core::{ExecutionContext, Tool};
 use heartbit_ghost::reply::{
     BotHeuristicGuard, ConversationDepthGuard, DailyBudgetGuard, DailyTokenBudget, MentionStore,
-    SpamGuard, ThreadDepthGuard,
+    SpamGuard, ThreadDepthGuard, enrich_mentioner, fetch_parent_tweet,
 };
+use heartbit_ghost::tools::client::XClient;
 use serde::Deserialize;
 
 use crate::Error;
@@ -77,6 +78,15 @@ pub struct MentionPollDeps<'a> {
     pub daily_budget_guard: &'a DailyBudgetGuard,
     /// Budget tracker used by the daily-budget guard.
     pub budget_tracker: &'a dyn DailyTokenBudget,
+    /// Optional X API client used to enrich each surviving mention with
+    /// the author's handle, follower/following counts, and account age
+    /// (activating the bot-heuristic guard) and with the parent tweet
+    /// text (giving the reply-writer real thread context).
+    ///
+    /// `None` preserves V1 behavior: dispatch carries empty
+    /// `author_handle`, `mentioner_context: None`, `parent: None`. The
+    /// bot-heuristic guard is structurally inert in that mode.
+    pub enricher: Option<&'a XClient>,
 }
 
 /// Handle one [`DaemonCommand::MentionPoll`] tick.
@@ -96,6 +106,7 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
         conversation_depth_guard,
         daily_budget_guard,
         budget_tracker,
+        enricher,
     } = deps;
     // 1. Read current since_id.
     let since_id = store
@@ -186,20 +197,21 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             continue;
         };
 
-        // Build a heartbit-ghost Mention. V1 limitation: `author_handle` is
-        // not returned by the tool — use empty string. `in_reply_to_tweet_id`
-        // and `conversation_id` are populated when present in the tool output.
+        // Build a heartbit-ghost Mention. `author_handle` is populated below
+        // via enrichment (when enabled); `in_reply_to_tweet_id` and
+        // `conversation_id` are populated when present in the tool output.
         let posted_at = tool_m
             .created_at
             .as_deref()
             .and_then(|s| s.parse::<chrono::DateTime<Utc>>().ok())
             .unwrap_or(now);
 
-        let mention = heartbit_ghost::reply::Mention {
+        let mut mention = heartbit_ghost::reply::Mention {
             id: tool_m.id.clone(),
             text: tool_m.text.clone(),
             author_id: author_id.clone(),
-            author_handle: String::new(), // not provided by twitter_mentions V1
+            // Filled in by the enrichment block below when `enricher` is Some.
+            author_handle: String::new(),
             posted_at,
             in_reply_to_tweet_id: tool_m.in_reply_to_tweet_id.clone(),
             conversation_id: tool_m.conversation_id.clone(),
@@ -244,12 +256,41 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             }
         }
 
+        // 5b-bis. Enrich the mentioner (one X API call). Cost only on
+        // mentions that passed cheap guards. Failure degrades to no-context:
+        // bot heuristic will run with `None` (V1 behavior), but other guards
+        // and the pipeline still execute.
+        let mentioner_context = if let Some(client) = enricher {
+            match enrich_mentioner(client, author_id).await {
+                Ok(ctx) => {
+                    // Populate the mention's author_handle so downstream
+                    // (bot heuristic, prompts) can use it.
+                    mention.author_handle = ctx.handle.clone();
+                    Some(ctx)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mention_id = %mention.id,
+                        author_id,
+                        error = %e,
+                        "enrich_mentioner failed, degrading to no MentionerContext"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // 5c. Bot-heuristic guard — skip if enough signals match.
+        // With enrichment wired, the guard now sees real handle + follower/age
+        // signals instead of always-empty defaults.
         if let Some(bot_guard) = bot_heuristic
-            && let Some(reason) = bot_guard.should_skip(&mention, None, now)
+            && let Some(reason) = bot_guard.should_skip(&mention, mentioner_context.as_ref(), now)
         {
             tracing::debug!(
                 mention_id = %mention.id,
+                author_handle = %mention.author_handle,
                 reason = ?reason,
                 "mention skipped by bot-heuristic guard"
             );
@@ -310,12 +351,32 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
             continue;
         }
 
+        // 6b. Fetch the parent tweet for threaded replies. One X API call,
+        // only when the mention is a reply (in_reply_to_tweet_id is Some)
+        // AND enrichment is wired. Failure degrades to `parent: None` — the
+        // writer falls back to its no-context prompt.
+        let parent = match (&mention.in_reply_to_tweet_id, enricher) {
+            (Some(parent_id), Some(client)) => match fetch_parent_tweet(client, parent_id).await {
+                Ok(snap) => Some(snap),
+                Err(e) => {
+                    tracing::warn!(
+                        mention_id = %mention.id,
+                        parent_id = %parent_id,
+                        error = %e,
+                        "fetch_parent_tweet failed, degrading to no parent context"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+
         // 7. Dispatch ReplyDraft.
         let cmd = DaemonCommand::ReplyDraft {
             persona: persona.to_string(),
             mention: mention.clone(),
-            parent: None,            // parent lookup deferred to P1.5c task 11
-            mentioner_context: None, // mentioner enrichment deferred to P1.5c task 11
+            parent,
+            mentioner_context: mentioner_context.clone(),
         };
         let key = format!("reply-draft:{}:{}", persona, mention.id);
         let payload = serde_json::to_vec(&cmd)
@@ -486,6 +547,11 @@ mod tests {
             conversation_depth_guard: &CONV_GUARD_ZERO,
             daily_budget_guard: &BUDGET_GUARD_NONE,
             budget_tracker: &*BUDGET_TRACKER_NOP,
+            // Existing tests run in the no-enrichment path: dispatch carries
+            // empty `author_handle`, `mentioner_context: None`, `parent: None`.
+            // The dedicated enrichment test below builds its own deps with
+            // an `XClient` pointing at a wiremock server.
+            enricher: None,
         }
     }
 
@@ -941,6 +1007,7 @@ mod tests {
             conversation_depth_guard: &conv_guard,
             daily_budget_guard: &budget_guard,
             budget_tracker: &budget_tracker,
+            enricher: None,
         };
 
         handle_mention_poll(deps).await.unwrap();
@@ -1023,6 +1090,7 @@ mod tests {
             conversation_depth_guard: &conv_guard,
             daily_budget_guard: &budget_guard,
             budget_tracker: &budget_tracker,
+            enricher: None,
         };
 
         handle_mention_poll(deps).await.unwrap();
@@ -1090,6 +1158,213 @@ mod tests {
         assert!(!store.was_replied("300").await.unwrap());
         assert!(!store.was_replied("200").await.unwrap());
         assert!(!store.was_replied("100").await.unwrap());
+    }
+
+    /// End-to-end enrichment path: with an `XClient` wired up, the dispatched
+    /// `ReplyDraft` carries the real `author_handle` (from `/2/users/:id`)
+    /// and the parent tweet text (from `/2/tweets/:id`). This activates the
+    /// bot-heuristic guard (previously inert because `author_handle` was
+    /// always empty) and gives the reply writer real thread context.
+    #[tokio::test]
+    async fn enrichment_populates_handle_and_parent_in_dispatch() {
+        use heartbit_core::Secret;
+        use heartbit_ghost::tools::client::XClient;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let guard = default_guard();
+        // Mention is a REPLY (has in_reply_to_tweet_id) — exercises parent fetch.
+        let json = serde_json::json!({
+            "mentions": [{
+                "id": "m_e2e",
+                "text": "agree, but how does this scale?",
+                "author_id": "user_e2e",
+                "created_at": "2026-05-01T00:00:00Z",
+                "in_reply_to_tweet_id": "parent_tweet_777"
+            }]
+        })
+        .to_string();
+        let tool = StubMentionsTool::ok(&json);
+        let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        // Wiremock the two enrichment endpoints.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/2/users/user_e2e"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "user_e2e",
+                    "name": "Real Engineer",
+                    "username": "real_engineer",
+                    "description": "writing systems software",
+                    "public_metrics": {
+                        "followers_count": 2500,
+                        "following_count": 800,
+                        "tweet_count": 4000
+                    },
+                    "created_at": "2020-01-01T00:00:00.000Z"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/2/tweets/parent_tweet_777"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "parent_tweet_777",
+                    "text": "the original tweet about distributed systems scaling",
+                    "created_at": "2026-04-30T00:00:00.000Z"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = XClient::new(
+            server.uri(),
+            Secret::new("ck"),
+            Secret::new("cs"),
+            Secret::new("at"),
+            Secret::new("ats"),
+        )
+        .unwrap();
+
+        let mut deps = deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        );
+        deps.enricher = Some(&client);
+
+        handle_mention_poll(deps).await.unwrap();
+
+        // Verify the dispatched ReplyDraft carries enriched data.
+        let (_key, payload) = rx
+            .try_recv()
+            .expect("enriched mention should still dispatch");
+        let cmd: DaemonCommand = serde_json::from_slice(&payload).unwrap();
+        match cmd {
+            DaemonCommand::ReplyDraft {
+                mention,
+                parent,
+                mentioner_context,
+                ..
+            } => {
+                assert_eq!(
+                    mention.author_handle, "real_engineer",
+                    "author_handle must be populated from enrichment"
+                );
+                let ctx = mentioner_context.expect("mentioner_context must be Some");
+                assert_eq!(ctx.handle, "real_engineer");
+                assert_eq!(ctx.follower_count, Some(2500));
+                assert_eq!(ctx.following_count, Some(800));
+                assert!(ctx.account_created_at.is_some());
+                let p = parent.expect("parent must be Some for a reply mention");
+                assert_eq!(p.id, "parent_tweet_777");
+                assert_eq!(
+                    p.text,
+                    "the original tweet about distributed systems scaling"
+                );
+            }
+            other => panic!("expected ReplyDraft, got {other:?}"),
+        }
+    }
+
+    /// With enrichment wired, the bot heuristic guard now fires on a suspicious
+    /// handle pattern (the core gap reported by the operator: crypto scammers
+    /// slipping past the V1 guards because the bot guard was structurally
+    /// inert).
+    #[tokio::test]
+    async fn enrichment_activates_bot_guard_on_suspicious_handle() {
+        use heartbit_core::Secret;
+        use heartbit_ghost::reply::{BotHeuristicConfig, BotHeuristicGuard};
+        use heartbit_ghost::tools::client::XClient;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let guard = default_guard();
+        let json = serde_json::json!({
+            "mentions": [{
+                "id": "m_scam",
+                "text": "yo check out our new token, 100x guaranteed, DM for details",
+                "author_id": "user_scam",
+                "created_at": "2026-05-01T00:00:00Z"
+            }]
+        })
+        .to_string();
+        let tool = StubMentionsTool::ok(&json);
+        let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/2/users/user_scam"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "user_scam",
+                    "name": "Crypto Pump",
+                    "username": "Crypto_Pump_69",  // matches "_pump_" handle pattern
+                    "description": "to the moon 🚀",
+                    "public_metrics": {
+                        "followers_count": 50,
+                        "following_count": 4900,    // ratio 0.01, below 0.05 default
+                        "tweet_count": 250
+                    },
+                    // Very young account.
+                    "created_at": "2026-05-08T00:00:00.000Z"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = XClient::new(
+            server.uri(),
+            Secret::new("ck"),
+            Secret::new("cs"),
+            Secret::new("at"),
+            Secret::new("ats"),
+        )
+        .unwrap();
+
+        // Bot guard with default config + threshold 2 (handle pattern + ratio
+        // would both fire — comfortably >= threshold).
+        let bot_cfg = BotHeuristicConfig {
+            suspicious_handle_patterns: vec!["_pump_".to_string(), "_bot_".to_string()],
+            min_follower_following_ratio: 0.05,
+            min_account_age_days: 7,
+            threshold: 2,
+        };
+        let bot_guard = BotHeuristicGuard::new(bot_cfg);
+
+        let mut deps = deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        );
+        deps.bot_heuristic = Some(&bot_guard);
+        deps.enricher = Some(&client);
+
+        handle_mention_poll(deps).await.unwrap();
+
+        // No ReplyDraft — bot guard fired AFTER enrichment populated the
+        // signals it needs.
+        assert!(
+            rx.try_recv().is_err(),
+            "bot heuristic must fire on enriched suspicious handle, suppressing dispatch"
+        );
+        // And the mention is marked replied so we don't retry on next poll.
+        assert!(store.was_replied("m_scam").await.unwrap());
     }
 
     /// Steady-state after bootstrap: a second poll with a higher mention id

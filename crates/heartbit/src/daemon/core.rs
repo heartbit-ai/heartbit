@@ -1097,6 +1097,7 @@ impl DaemonCore {
                                             entry.daily_token_budget,
                                         );
                                     let budget_tracker = entry.budget_tracker.clone();
+                                    let x_enricher = mc.enricher.clone();
                                     tokio::spawn(async move {
                                         let deps =
                                             super::mention_poll_handler::MentionPollDeps {
@@ -1114,6 +1115,7 @@ impl DaemonCore {
                                                 conversation_depth_guard: &conversation_depth_guard,
                                                 daily_budget_guard: &daily_budget_guard,
                                                 budget_tracker: &*budget_tracker,
+                                                enricher: x_enricher.as_deref(),
                                             };
                                         if let Err(e) =
                                             super::mention_poll_handler::handle_mention_poll(deps)
@@ -2021,6 +2023,7 @@ mod tests {
                 profiles_root: std::path::PathBuf::from("/tmp"),
             },
             mentions_tool: Arc::new(NopTool),
+            enricher: None,
         });
 
         let core = core.with_mention_context(ctx);

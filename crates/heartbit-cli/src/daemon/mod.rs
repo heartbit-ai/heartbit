@@ -1132,7 +1132,32 @@ async fn build_mention_context(
         "MentionContext built with persona mention entries"
     );
 
-    Ok(Some(MentionContext::new(entries, reply_ctx, mentions_tool)))
+    // Build a shared XClient for per-mention enrichment (author handle +
+    // parent tweet). Failure here is non-fatal — degrade to V1 (bot guard
+    // inert, no parent context) and warn-log so the operator can fix the
+    // credentials. The credentials come from the same EnvCredentialResolver
+    // already used by other tools.
+    let synthetic_ctx = heartbit_core::ExecutionContext {
+        credentials: Some(credentials.clone()),
+        ..heartbit_core::ExecutionContext::default()
+    };
+    let mc = MentionContext::new(entries, reply_ctx, mentions_tool);
+    let mc = match heartbit_ghost::tools::client::XClient::from_context(&synthetic_ctx).await {
+        Ok(client) => {
+            tracing::info!(
+                "mention context: X enrichment enabled (bot guard live, parent fetch on)"
+            );
+            mc.with_enricher(Arc::new(client))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "X enrichment disabled (bot guard inert, no parent context) — check X_CONSUMER_KEY/SECRET + X_ACCESS_TOKEN/SECRET"
+            );
+            mc
+        }
+    };
+    Ok(Some(mc))
 }
 
 // ---------------------------------------------------------------------------
