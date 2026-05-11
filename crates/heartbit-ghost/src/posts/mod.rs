@@ -7,9 +7,14 @@
 
 use chrono::{DateTime, Utc};
 
+pub mod engagement;
 pub mod history;
 pub mod topic_context;
 
+pub use engagement::{
+    EngagementSnapshot, EngagementStore, EngagementStoreError, InMemoryEngagementStore,
+    JsonlEngagementStore,
+};
 pub use history::{InMemoryPostHistoryStore, JsonlPostHistoryStore, PostHistoryStore, StoreError};
 pub use topic_context::{
     HeartbitRsXTopicContext, TopicContextDeps, TopicContextProvider, XGhostTopicContext,
