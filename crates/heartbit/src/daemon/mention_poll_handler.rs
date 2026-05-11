@@ -136,6 +136,34 @@ pub async fn handle_mention_poll(deps: MentionPollDeps<'_>) -> Result<(), Error>
         return Ok(());
     }
 
+    // 3b. Bootstrap protection: on the first poll for this (persona, user_id),
+    // `since_id` is None and the X API returns ALL recent mentions (up to
+    // `max_results`). Processing them in parallel produces a thundering herd of
+    // expensive LLM pipeline runs and Telegram review messages. Instead, bump
+    // `since_id` to the highest fetched id and skip dispatch. Real replies start
+    // on the *next* poll, for mentions newer than this watermark.
+    if since_id.is_none() {
+        let max_id = parsed
+            .mentions
+            .iter()
+            .map(|m| m.id.as_str())
+            .max()
+            .map(str::to_string);
+        if let Some(ref new_id) = max_id {
+            if let Err(e) = store.bump_since_id(persona, user_id, new_id).await {
+                tracing::warn!(persona, user_id, new_id, error = %e, "bootstrap bump_since_id failed");
+            }
+            tracing::info!(
+                persona,
+                user_id,
+                fetched = parsed.mentions.len(),
+                new_since_id = %new_id,
+                "mention store bootstrapped — skipping backfill (first poll); real replies start on next tick"
+            );
+        }
+        return Ok(());
+    }
+
     // 4. Determine max id for monotonic bump after the loop.
     // Twitter returns newest-first; track max lexicographically (tweet ids are
     // ordered by creation time when compared as strings).
@@ -361,6 +389,14 @@ mod tests {
         InMemoryMentionStore::new()
     }
 
+    /// Pre-seed `since_id` so the handler takes the steady-state dispatch
+    /// path instead of the bootstrap-skip path. Use in tests that exercise
+    /// dispatch / guard / mark-replied behavior. The bootstrap-specific test
+    /// uses an unseeded store.
+    async fn seed_since_id(store: &InMemoryMentionStore, persona: &str, user_id: &str) {
+        store.bump_since_id(persona, user_id, "0").await.unwrap();
+    }
+
     /// A stub tool that returns a fixed JSON string as `ToolOutput::success`.
     struct StubMentionsTool {
         output: String,
@@ -507,6 +543,7 @@ mod tests {
         let guard = SpamGuard::new(SpamGuardConfig::defaults_for("op-id"));
         let tool = StubMentionsTool::ok(&one_mention_json("m1", "op-id", "hello"));
         let store = default_store();
+        seed_since_id(&store, "ghost", "op-id").await;
         let (producer, mut rx) = mock_producer();
         let ctx = ExecutionContext::default();
 
@@ -539,6 +576,7 @@ mod tests {
         // Only emoji — TooShortToEngage (0 alphanumeric chars).
         let tool = StubMentionsTool::ok(&one_mention_json("m2", "user1", "👍"));
         let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
         let (producer, mut rx) = mock_producer();
         let ctx = ExecutionContext::default();
 
@@ -578,6 +616,7 @@ mod tests {
             "this is a real question about the framework",
         ));
         let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
         // Pre-record a reply from this author within the window.
         store
             .record_reply_to_author("user2", Utc::now())
@@ -614,6 +653,7 @@ mod tests {
             "what do you think about async Rust",
         ));
         let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
         let (producer, mut rx) = mock_producer();
         let ctx = ExecutionContext::default();
 
@@ -663,6 +703,7 @@ mod tests {
             "is this already handled",
         ));
         let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
         // Pre-mark as replied.
         store.mark_replied("m500").await.unwrap();
 
@@ -770,6 +811,7 @@ mod tests {
         .to_string();
         let tool = StubMentionsTool::ok(&json);
         let store = default_store();
+        seed_since_id(&store, "ghost", "op-id").await;
         let (producer, mut rx) = mock_producer();
         let ctx = ExecutionContext::default();
 
@@ -869,6 +911,7 @@ mod tests {
         .to_string();
         let tool = StubMentionsTool::ok(&json);
         let store = default_store();
+        seed_since_id(&store, "ghost", "op").await;
         // Pre-populate state required by the guards.
         store.mark_replied("parent_t1").await.unwrap(); // ThreadDepthGuard needs this
         store.record_reply_in_conversation("conv_a").await.unwrap(); // push conv_a to cap (2)
@@ -987,5 +1030,122 @@ mod tests {
         // In V1, author_handle is always empty string from the tool, so the
         // bot guard doesn't fire — mention should be dispatched.
         let _ = rx.try_recv(); // may or may not dispatch, just check it doesn't panic
+    }
+
+    /// First-poll bootstrap protection: when the store has no since_id and
+    /// the tool returns a backlog of mentions, the handler MUST bump
+    /// `since_id` to the highest fetched id and dispatch NOTHING. Real
+    /// replies start on the next tick.
+    ///
+    /// Rationale: without this, every fresh persona deployment triggers
+    /// `N`-way parallel reply pipelines on first boot — a thundering herd
+    /// of expensive LLM calls and Telegram review messages for mentions
+    /// that may be days old. Found during the production-daemon smoke test
+    /// on 2026-05-11 (10 backfilled mentions kicked off 10 pipelines).
+    #[tokio::test]
+    async fn bootstrap_skips_dispatch_and_bumps_since_id() {
+        let guard = default_guard();
+        let json = serde_json::json!({
+            "mentions": [
+                {"id": "300", "text": "old mention from days ago", "author_id": "u1", "created_at": "2026-01-01T00:00:00Z"},
+                {"id": "200", "text": "even older mention", "author_id": "u2", "created_at": "2026-01-01T00:00:00Z"},
+                {"id": "100", "text": "ancient mention", "author_id": "u3", "created_at": "2026-01-01T00:00:00Z"}
+            ]
+        })
+        .to_string();
+        let tool = StubMentionsTool::ok(&json);
+        // Empty store — first poll, no since_id seeded.
+        let store = default_store();
+        let (producer, mut rx) = mock_producer();
+        let ctx = ExecutionContext::default();
+
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool,
+            &store,
+            &guard,
+            producer.as_ref(),
+            &ctx,
+        ))
+        .await
+        .expect("bootstrap path must return Ok");
+
+        // No ReplyDraft dispatched for ANY of the backfilled mentions.
+        assert!(
+            rx.try_recv().is_err(),
+            "bootstrap poll must not dispatch any ReplyDraft"
+        );
+
+        // since_id is bumped to the highest fetched id ("300").
+        let new_since = store.since_id_for("ghost", "op").await.unwrap();
+        assert_eq!(
+            new_since.as_deref(),
+            Some("300"),
+            "bootstrap must bump since_id to max fetched id"
+        );
+
+        // No mentions were marked replied (we want subsequent polls to act on
+        // mentions newer than the bootstrap watermark only).
+        assert!(!store.was_replied("300").await.unwrap());
+        assert!(!store.was_replied("200").await.unwrap());
+        assert!(!store.was_replied("100").await.unwrap());
+    }
+
+    /// Steady-state after bootstrap: a second poll with a higher mention id
+    /// dispatches normally.
+    #[tokio::test]
+    async fn second_poll_after_bootstrap_dispatches_new_mention() {
+        let guard = default_guard();
+        let store = default_store();
+
+        // First poll — bootstrap.
+        let json1 = serde_json::json!({
+            "mentions": [
+                {"id": "100", "text": "old mention", "author_id": "u1", "created_at": "2026-01-01T00:00:00Z"}
+            ]
+        })
+        .to_string();
+        let tool1 = StubMentionsTool::ok(&json1);
+        let (producer1, mut rx1) = mock_producer();
+        let ctx = ExecutionContext::default();
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool1,
+            &store,
+            &guard,
+            producer1.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+        assert!(rx1.try_recv().is_err(), "bootstrap dispatches nothing");
+
+        // Second poll — a new mention with a higher id arrives.
+        let json2 = serde_json::json!({
+            "mentions": [
+                {"id": "200", "text": "fresh mention worth replying to", "author_id": "u9", "created_at": "2026-01-01T00:00:00Z"}
+            ]
+        })
+        .to_string();
+        let tool2 = StubMentionsTool::ok(&json2);
+        let (producer2, mut rx2) = mock_producer();
+        handle_mention_poll(deps_for(
+            "ghost",
+            "op",
+            &tool2,
+            &store,
+            &guard,
+            producer2.as_ref(),
+            &ctx,
+        ))
+        .await
+        .unwrap();
+
+        let (key, _payload) = rx2
+            .try_recv()
+            .expect("second poll must dispatch the new mention");
+        assert!(key.starts_with("reply-draft:ghost:"));
     }
 }

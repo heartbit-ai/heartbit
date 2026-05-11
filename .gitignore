@@ -21,6 +21,9 @@ daemon-crm.toml
 telegram-test.toml
 gateway/config.yaml
 
+# Runtime state: persona mention/budget/post JSONL stores
+.heartbit/
+
 # Model cache (fastembed ONNX models)
 .fastembed_cache/
 
