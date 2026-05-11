@@ -50,6 +50,26 @@ pub trait MentionStore: Send + Sync {
         mention_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>>;
 
+    /// Mark `mention_id` as having reached a `Posted` outcome (a real
+    /// X reply was published). Used by the reply handler to dedupe
+    /// Kafka redeliveries (default `enable.auto.commit=true` has a ~5s
+    /// window where a crashed daemon will re-consume the same
+    /// `ReplyDraft` and re-run the pipeline). Distinct from
+    /// [`Self::mark_replied`], which is also called on Skip / TimedOut /
+    /// GateRejected outcomes purely to prevent re-dispatch on the next
+    /// poll.
+    fn mark_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>>;
+
+    /// Whether `mention_id` was previously marked as Posted. See
+    /// [`Self::mark_posted`] for the redelivery-dedup rationale.
+    fn was_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>>;
+
     /// Number of replies sent to `author_id` since `since`. Used by the
     /// per-author rate limit (default: max 3 / 24h).
     fn replies_to_author_since<'a>(
@@ -92,8 +112,12 @@ pub struct InMemoryMentionStore {
 struct InMemoryInner {
     /// (persona, user_id) → since_id
     since: std::collections::HashMap<(String, String), String>,
-    /// mention_id → ()
+    /// mention_id → () — set on any pipeline outcome (defensive re-dispatch guard).
     replied: std::collections::HashSet<String>,
+    /// mention_id → () — set ONLY when the pipeline returned Posted (real X
+    /// reply published). Used by the reply handler to short-circuit Kafka
+    /// redeliveries.
+    posted: std::collections::HashSet<String>,
     /// (author_id, ts) — append log for rate-limit queries.
     author_replies: Vec<(String, DateTime<Utc>)>,
     /// conversation_id → reply count (P1.7).
@@ -167,6 +191,27 @@ impl MentionStore for InMemoryMentionStore {
         mention_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
         Box::pin(async move { Ok(self.inner.read().await.replied.contains(mention_id)) })
+    }
+
+    fn mark_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.inner
+                .write()
+                .await
+                .posted
+                .insert(mention_id.to_string());
+            Ok(())
+        })
+    }
+
+    fn was_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.inner.read().await.posted.contains(mention_id)) })
     }
 
     fn replies_to_author_since<'a>(
@@ -244,6 +289,12 @@ enum StoreEvent {
     Replied {
         mention_id: String,
     },
+    /// A `Posted` outcome — used by the reply handler to dedupe Kafka
+    /// redeliveries. Distinct from `Replied`, which is written on any
+    /// terminal outcome.
+    Posted {
+        mention_id: String,
+    },
     AuthorReply {
         author_id: String,
         ts: DateTime<Utc>,
@@ -300,6 +351,9 @@ impl JsonlMentionStore {
                 }
                 StoreEvent::Replied { mention_id } => {
                     g.replied.insert(mention_id);
+                }
+                StoreEvent::Posted { mention_id } => {
+                    g.posted.insert(mention_id);
                 }
                 StoreEvent::AuthorReply { author_id, ts } => {
                     g.author_replies.push((author_id, ts));
@@ -398,6 +452,31 @@ impl MentionStore for JsonlMentionStore {
         mention_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
         Box::pin(async move { Ok(self.inner.read().await.replied.contains(mention_id)) })
+    }
+
+    fn mark_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.append(&StoreEvent::Posted {
+                mention_id: mention_id.to_string(),
+            })
+            .await?;
+            self.inner
+                .write()
+                .await
+                .posted
+                .insert(mention_id.to_string());
+            Ok(())
+        })
+    }
+
+    fn was_posted<'a>(
+        &'a self,
+        mention_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.inner.read().await.posted.contains(mention_id)) })
     }
 
     fn replies_to_author_since<'a>(
@@ -581,5 +660,48 @@ mod tests {
         }
         let s2 = JsonlMentionStore::open(&path).await.unwrap();
         assert_eq!(s2.replies_in_conversation("c1").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn in_memory_posted_flag_is_distinct_from_replied() {
+        let store = InMemoryMentionStore::new();
+        // Marking replied should NOT mark posted (replied is set on Skip / Timeout / Posted alike).
+        store.mark_replied("m1").await.unwrap();
+        assert!(store.was_replied("m1").await.unwrap());
+        assert!(
+            !store.was_posted("m1").await.unwrap(),
+            "mark_replied must not implicitly mark posted"
+        );
+
+        // Marking posted should NOT mark replied either — orthogonal flags.
+        store.mark_posted("m2").await.unwrap();
+        assert!(store.was_posted("m2").await.unwrap());
+        assert!(
+            !store.was_replied("m2").await.unwrap(),
+            "mark_posted must not implicitly mark replied"
+        );
+
+        // Setting both works.
+        store.mark_replied("m3").await.unwrap();
+        store.mark_posted("m3").await.unwrap();
+        assert!(store.was_replied("m3").await.unwrap());
+        assert!(store.was_posted("m3").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn jsonl_posted_flag_persists_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("posted.jsonl");
+        {
+            let s1 = JsonlMentionStore::open(&path).await.unwrap();
+            s1.mark_posted("m1").await.unwrap();
+            s1.mark_replied("m2").await.unwrap();
+        }
+        // Reload from disk — `posted` is its own flag, separate from `replied`.
+        let s2 = JsonlMentionStore::open(&path).await.unwrap();
+        assert!(s2.was_posted("m1").await.unwrap());
+        assert!(!s2.was_replied("m1").await.unwrap()); // posted only, not replied
+        assert!(s2.was_replied("m2").await.unwrap());
+        assert!(!s2.was_posted("m2").await.unwrap()); // replied only, not posted
     }
 }

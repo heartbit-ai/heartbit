@@ -67,6 +67,20 @@ pub async fn handle_reply_draft<'a>(
     parent: Option<TweetSnapshot>,
     mentioner_context: Option<MentionerContext>,
 ) -> Result<ReplyOutcome, Error> {
+    // Kafka redelivery dedup: with `enable.auto.commit=true`, a crash in the
+    // ~5s window after a Posted outcome but before the offset commits causes
+    // the broker to redeliver the same `ReplyDraft`. Without this check, the
+    // handler would re-run the full pipeline → second Telegram review → if
+    // operator clicks approve again, duplicate X post. Filed in task #41.
+    if deps.store.was_posted(&mention.id).await.unwrap_or(false) {
+        tracing::info!(
+            persona_name,
+            mention_id = %mention.id,
+            "reply skipped — mention already posted (Kafka redelivery dedup)"
+        );
+        return Ok(ReplyOutcome::Skipped);
+    }
+
     let persona = deps
         .registry
         .get(persona_name)
@@ -138,17 +152,27 @@ pub async fn handle_reply_draft<'a>(
         );
     }
 
-    // On a Posted outcome, update conversation-depth accounting so the
-    // ConversationDepthGuard can cap future replies in the same thread.
-    if matches!(output.outcome, ReplyOutcome::Posted { .. })
-        && let Some(ref conv_id) = conversation_id_opt
-        && let Err(e) = deps.store.record_reply_in_conversation(conv_id).await
-    {
-        tracing::warn!(
-            conversation_id = %conv_id,
-            error = %e,
-            "record_reply_in_conversation failed (best-effort)"
-        );
+    // On a Posted outcome, mark the mention so a Kafka redelivery short-circuits
+    // (paired with the early `was_posted` check above), and update
+    // conversation-depth accounting so the ConversationDepthGuard can cap future
+    // replies in the same thread.
+    if matches!(output.outcome, ReplyOutcome::Posted { .. }) {
+        if let Err(e) = deps.store.mark_posted(&mention_id).await {
+            tracing::warn!(
+                mention_id,
+                error = %e,
+                "mark_posted failed (Kafka redelivery dedup will not protect this mention)"
+            );
+        }
+        if let Some(ref conv_id) = conversation_id_opt
+            && let Err(e) = deps.store.record_reply_in_conversation(conv_id).await
+        {
+            tracing::warn!(
+                conversation_id = %conv_id,
+                error = %e,
+                "record_reply_in_conversation failed (best-effort)"
+            );
+        }
     }
 
     // Record token usage against the daily budget regardless of outcome
@@ -675,6 +699,141 @@ mod tests {
         assert!(
             !store.was_replied(&mention_id).await.unwrap(),
             "mention must NOT be marked replied when the pipeline fails"
+        );
+    }
+
+    // ─── Test 5: posted-mention redelivery is skipped without pipeline ──────
+    //
+    // Kafka uses `enable.auto.commit=true` (~5s interval). A daemon crash
+    // after a Posted outcome but before the offset commits causes the
+    // broker to redeliver the same `ReplyDraft`. The handler must check
+    // `was_posted` at the start and short-circuit; otherwise the pipeline
+    // re-runs → second Telegram review → potential duplicate X post.
+    #[tokio::test]
+    async fn already_posted_mention_skips_pipeline_on_redelivery() {
+        let persona_key = "stub:x";
+        let (_dir, profiles_root) = seed_snapshot(persona_key);
+        let store = InMemoryMentionStore::new();
+
+        let mention = fixture_mention();
+        let mention_id = mention.id.clone();
+
+        // Simulate a prior successful run: the mention is already marked posted.
+        store.mark_posted(&mention_id).await.unwrap();
+
+        // Failing provider — if the handler runs ANY part of the pipeline,
+        // it'll exhaust the mock and the test will fail with a non-Ok result.
+        let provider = MockProvider::failing();
+        let delivery = MockReplyReviewDelivery::arc(DeliveryOutcome::Skip);
+        let twitter_tool = MockTwitterTool::success(r#"{"tweet_id":"unused","url":"unused"}"#);
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        registry.register(StubPersona::ok(persona_key));
+
+        let deps = build_deps(
+            &registry,
+            &store,
+            provider,
+            delivery as Arc<dyn ReplyReviewDelivery>,
+            twitter_tool as Arc<dyn Tool>,
+            &profiles_root,
+        );
+
+        let outcome = handle_reply_draft(deps, persona_key, mention, None, None)
+            .await
+            .expect("redelivery must short-circuit successfully, not error");
+
+        assert!(
+            matches!(outcome, ReplyOutcome::Skipped),
+            "redelivered already-posted mention should return Skipped, got {outcome:?}"
+        );
+    }
+
+    // ─── Test 6: happy path now also marks the mention as posted ────────────
+    //
+    // Sibling to Test 1 (happy_path_…). Test 1 already exists and verifies
+    // `mark_replied` + `record_reply_to_author`; this one verifies the
+    // additional `mark_posted` call introduced for redelivery dedup.
+    #[tokio::test]
+    async fn posted_outcome_sets_was_posted_flag() {
+        let persona_key = "stub:x";
+        let (_dir, profiles_root) = seed_snapshot(persona_key);
+        let store = InMemoryMentionStore::new();
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            "short concrete reply",
+            r#"{"verdict":"pass","style_match_score":0.90}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"tweet_id":"reply1","url":"https://x.com/i/web/status/reply1"}"#,
+        );
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        registry.register(StubPersona::ok(persona_key));
+
+        let mention = fixture_mention();
+        let mention_id = mention.id.clone();
+
+        let deps = build_deps(
+            &registry,
+            &store,
+            provider,
+            delivery as Arc<dyn ReplyReviewDelivery>,
+            twitter_tool as Arc<dyn Tool>,
+            &profiles_root,
+        );
+
+        let outcome = handle_reply_draft(deps, persona_key, mention, None, None)
+            .await
+            .expect("happy path should succeed");
+
+        assert!(matches!(outcome, ReplyOutcome::Posted { .. }));
+        assert!(
+            store.was_posted(&mention_id).await.unwrap(),
+            "Posted outcome must set was_posted for redelivery dedup"
+        );
+    }
+
+    // ─── Test 7: Skipped outcome does NOT set was_posted ───────────────────
+    #[tokio::test]
+    async fn skipped_outcome_does_not_set_was_posted() {
+        let persona_key = "stub:x";
+        let (_dir, profiles_root) = seed_snapshot(persona_key);
+        let store = InMemoryMentionStore::new();
+        let provider = MockProvider::arc(vec![
+            "research digest",
+            "short reply candidate",
+            r#"{"verdict":"pass","style_match_score":0.85}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(DeliveryOutcome::Skip);
+        let twitter_tool = MockTwitterTool::success(r#"{"tweet_id":"unused","url":"unused"}"#);
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        registry.register(StubPersona::ok(persona_key));
+
+        let mention = fixture_mention();
+        let mention_id = mention.id.clone();
+
+        let deps = build_deps(
+            &registry,
+            &store,
+            provider,
+            delivery as Arc<dyn ReplyReviewDelivery>,
+            twitter_tool as Arc<dyn Tool>,
+            &profiles_root,
+        );
+
+        let outcome = handle_reply_draft(deps, persona_key, mention, None, None)
+            .await
+            .expect("skip is a valid outcome");
+        assert!(matches!(outcome, ReplyOutcome::Skipped));
+
+        // was_replied is set (existing behavior — prevents re-poll-dispatch).
+        assert!(store.was_replied(&mention_id).await.unwrap());
+        // was_posted is NOT set — nothing was actually posted to X.
+        assert!(
+            !store.was_posted(&mention_id).await.unwrap(),
+            "Skipped outcome must not mark posted — only real X posts do"
         );
     }
 }
