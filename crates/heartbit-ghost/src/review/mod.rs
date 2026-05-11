@@ -61,6 +61,12 @@ pub struct ReviewConfig<'a> {
     /// `PipelineConfig::researcher_override`. None for heartbit-ghost:x;
     /// `Some((repo_researcher_recipe, [repo_inspect]))` for heartbit-rs:x.
     pub researcher_override: Option<ResearcherOverride>,
+    /// Pre-rendered EXEMPLARS — block prepended to the writer's user
+    /// message. Built once per tick from [`heartbit_ghost::posts::TopPostsProvider`]
+    /// by the daemon's persona-post handler. `None` (or `Some("")`) means
+    /// no injection — the writer runs unchanged. Kept as `Option<&str>`
+    /// so we can borrow the handler's owned String without cloning.
+    pub exemplar_block: Option<&'a str>,
 }
 
 /// Output of a successful review-mode run.
@@ -336,6 +342,12 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     // Convert to owned Arc<str> so the spawn closures are 'static.
     let mode_addendum_owned: Option<std::sync::Arc<str>> =
         cfg.mode_addendum.map(std::sync::Arc::from);
+    // Same trick for the exemplar block — borrowed from the handler's
+    // owned String, but spawn closures must be 'static.
+    let exemplar_owned: Option<std::sync::Arc<str>> = cfg
+        .exemplar_block
+        .filter(|s| !s.is_empty())
+        .map(std::sync::Arc::from);
 
     let mut joinset: tokio::task::JoinSet<Result<CandidateRecord, PipelineError>> =
         tokio::task::JoinSet::new();
@@ -347,6 +359,7 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
         let digest = digest_owned.clone();
         let voice = voice_owned.clone();
         let mode_addendum = mode_addendum_owned.clone();
+        let exemplar = exemplar_owned.clone();
         joinset.spawn(async move {
             crate::pipeline::generate_candidate(
                 i,
@@ -358,6 +371,7 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                 &critic,
                 &fact,
                 mode_addendum.as_deref(),
+                exemplar.as_deref(),
             )
             .await
         });
@@ -870,6 +884,7 @@ mod tests {
             credentials: Arc::new(StubCredentialResolver),
             mode_addendum: None,
             researcher_override: None,
+            exemplar_block: None,
         }
     }
 

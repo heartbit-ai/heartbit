@@ -13,7 +13,8 @@ pub mod topic_context;
 
 pub use engagement::{
     EngagementSnapshot, EngagementStore, EngagementStoreError, InMemoryEngagementStore,
-    JsonlEngagementStore, RefreshError, RefreshOutcome, refresh_engagement,
+    JoinedTopPostsProvider, JsonlEngagementStore, RefreshError, RefreshOutcome, TopPost,
+    TopPostsProvider, refresh_engagement,
 };
 pub use history::{InMemoryPostHistoryStore, JsonlPostHistoryStore, PostHistoryStore, StoreError};
 pub use topic_context::{

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -401,6 +402,133 @@ pub async fn refresh_engagement(
     })
 }
 
+// ─── TopPost + TopPostsProvider ────────────────────────────────────────────
+
+/// One ranked post returned by [`TopPostsProvider`]. Sufficient to render
+/// as a writer-prompt exemplar without further lookups.
+#[derive(Debug, Clone)]
+pub struct TopPost {
+    /// X tweet ID of the exemplar.
+    pub tweet_id: String,
+    /// Text of the first tweet (captured in `PostHistoryEntry.text` at
+    /// post time).
+    pub text: String,
+    /// When the original post was published.
+    pub posted_at: DateTime<Utc>,
+    /// Composite engagement score (see `composite_score` in this module).
+    pub engagement_score: f64,
+}
+
+/// Boxed future returned by [`TopPostsProvider::top_n`]. Aliased to keep
+/// the trait signature readable (and clippy quiet on `type_complexity`).
+pub type TopPostsFut<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<TopPost>, EngagementStoreError>> + Send + 'a>>;
+
+/// Rank a persona's recent `Posted` history by composite engagement score.
+///
+/// Implementations join an in-memory or JSONL [`EngagementStore`] against
+/// a [`PostHistoryStore`] for the same persona. Returns the top `n`
+/// exemplars (recency wins on ties).
+pub trait TopPostsProvider: Send + Sync {
+    /// Return the top `n` engagement exemplars. `n == 0` always yields
+    /// the empty vec (no I/O).
+    fn top_n<'a>(&'a self, n: usize) -> TopPostsFut<'a>;
+}
+
+/// Standard impl: joins `PostHistoryStore::recent` (for text + posted_at)
+/// against `EngagementStore::latest_per_tweet` (for metrics).
+pub struct JoinedTopPostsProvider {
+    history: Arc<dyn PostHistoryStore>,
+    engagement: Arc<dyn EngagementStore>,
+    persona: String,
+}
+
+impl JoinedTopPostsProvider {
+    /// Build a new provider for `persona`. The `history` and `engagement`
+    /// stores must be the same ones the daemon writes into; otherwise the
+    /// join silently returns empty.
+    pub fn new(
+        history: Arc<dyn PostHistoryStore>,
+        engagement: Arc<dyn EngagementStore>,
+        persona: String,
+    ) -> Self {
+        Self {
+            history,
+            engagement,
+            persona,
+        }
+    }
+}
+
+/// Composite engagement score per the design spec (P2.0 §4):
+///
+/// ```text
+/// likes + 3*replies + 2*retweets + 2*quotes + 0.0001 * impressions
+/// ```
+///
+/// Replies are weighted 3x because depth > breadth — a reply usually
+/// implies more conviction than a like. Impressions are heavily
+/// dampened because they're driven by reach (the algorithm's choice),
+/// not engagement quality. Missing impressions count as 0.
+fn composite_score(snap: &EngagementSnapshot) -> f64 {
+    let base = snap.likes as f64
+        + 3.0 * (snap.replies as f64)
+        + 2.0 * (snap.retweets as f64)
+        + 2.0 * (snap.quotes as f64);
+    base + snap.impressions.map(|i| 0.0001 * (i as f64)).unwrap_or(0.0)
+}
+
+impl TopPostsProvider for JoinedTopPostsProvider {
+    fn top_n<'a>(&'a self, n: usize) -> TopPostsFut<'a> {
+        Box::pin(async move {
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            // Pull a generous slice of history; we filter to Posted-with-text below.
+            let history_entries = self
+                .history
+                .recent(&self.persona, 1_000)
+                .await
+                .map_err(|e| EngagementStoreError::Parse(format!("history: {e}")))?;
+            let mut text_by_id: HashMap<String, (String, DateTime<Utc>)> = HashMap::new();
+            for entry in history_entries {
+                if !matches!(entry.outcome, PostOutcome::Posted { .. }) {
+                    continue;
+                }
+                let (Some(id), Some(text)) = (entry.tweet_id, entry.text) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                text_by_id.insert(id, (text, entry.posted_at));
+            }
+
+            let snapshots = self.engagement.latest_per_tweet().await?;
+            let mut ranked: Vec<TopPost> = snapshots
+                .into_iter()
+                .filter_map(|(id, snap)| {
+                    let (text, posted_at) = text_by_id.remove(&id)?;
+                    Some(TopPost {
+                        tweet_id: id,
+                        text,
+                        posted_at,
+                        engagement_score: composite_score(&snap),
+                    })
+                })
+                .collect();
+            ranked.sort_by(|a, b| {
+                b.engagement_score
+                    .partial_cmp(&a.engagement_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.posted_at.cmp(&a.posted_at)) // tie: recency wins
+            });
+            ranked.truncate(n);
+            Ok(ranked)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +809,144 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.queried, 0);
         assert_eq!(outcome.refreshed, 0);
+    }
+
+    // ─── TopPostsProvider / JoinedTopPostsProvider ─────────────────────
+
+    fn snap_with(
+        tweet_id: &str,
+        likes: u64,
+        replies: u64,
+        retweets: u64,
+        quotes: u64,
+        impressions: Option<u64>,
+    ) -> EngagementSnapshot {
+        EngagementSnapshot {
+            tweet_id: tweet_id.into(),
+            captured_at: Utc::now(),
+            likes,
+            replies,
+            retweets,
+            quotes,
+            bookmarks: 0,
+            impressions,
+        }
+    }
+
+    #[tokio::test]
+    async fn top_n_orders_by_composite_score_descending() {
+        let history = InMemoryPostHistoryStore::new();
+        for id in ["a", "b", "c"] {
+            history
+                .record(
+                    "p",
+                    PostHistoryEntry {
+                        posted_at: Utc::now() - Duration::hours(48),
+                        topic: id.into(),
+                        outcome: PostOutcome::Posted {
+                            chosen_index: 0,
+                            url: format!("u/{id}"),
+                        },
+                        tweet_id: Some(id.into()),
+                        text: Some(format!("text_{id}")),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let store = InMemoryEngagementStore::new();
+        // a: 10 + 0 + 0 + 0 = 10
+        // b: 5 + 3*5 + 0 + 0 = 20  (replies-heavy)
+        // c: 100 + 0 + 0 + 0 = 100 (likes-heavy)
+        store
+            .record(snap_with("a", 10, 0, 0, 0, None))
+            .await
+            .unwrap();
+        store
+            .record(snap_with("b", 5, 5, 0, 0, None))
+            .await
+            .unwrap();
+        store
+            .record(snap_with("c", 100, 0, 0, 0, None))
+            .await
+            .unwrap();
+
+        let provider =
+            JoinedTopPostsProvider::new(Arc::new(history), Arc::new(store), "p".to_string());
+        let top = provider.top_n(3).await.unwrap();
+        let ids: Vec<&str> = top.iter().map(|p| p.tweet_id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+    }
+
+    #[tokio::test]
+    async fn top_n_skips_entries_without_text() {
+        let history = InMemoryPostHistoryStore::new();
+        // Entry "no_text" has tweet_id but no text — must be skipped.
+        history
+            .record(
+                "p",
+                PostHistoryEntry {
+                    posted_at: Utc::now() - Duration::hours(48),
+                    topic: "x".into(),
+                    outcome: PostOutcome::Posted {
+                        chosen_index: 0,
+                        url: "u/x".into(),
+                    },
+                    tweet_id: Some("no_text".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        history
+            .record(
+                "p",
+                PostHistoryEntry {
+                    posted_at: Utc::now() - Duration::hours(48),
+                    topic: "y".into(),
+                    outcome: PostOutcome::Posted {
+                        chosen_index: 0,
+                        url: "u/y".into(),
+                    },
+                    tweet_id: Some("with_text".into()),
+                    text: Some("hello".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let store = InMemoryEngagementStore::new();
+        store
+            .record(snap_with("no_text", 100, 0, 0, 0, None))
+            .await
+            .unwrap();
+        store
+            .record(snap_with("with_text", 5, 0, 0, 0, None))
+            .await
+            .unwrap();
+
+        let provider =
+            JoinedTopPostsProvider::new(Arc::new(history), Arc::new(store), "p".to_string());
+        let top = provider.top_n(5).await.unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].tweet_id, "with_text");
+    }
+
+    #[tokio::test]
+    async fn top_n_returns_empty_on_no_engagement_data() {
+        let history = InMemoryPostHistoryStore::new();
+        let store = InMemoryEngagementStore::new();
+        let provider =
+            JoinedTopPostsProvider::new(Arc::new(history), Arc::new(store), "p".to_string());
+        assert!(provider.top_n(5).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn top_n_zero_returns_empty_without_io() {
+        // n == 0 short-circuits — no store reads, no errors even on empty stores.
+        let history = InMemoryPostHistoryStore::new();
+        let store = InMemoryEngagementStore::new();
+        let provider =
+            JoinedTopPostsProvider::new(Arc::new(history), Arc::new(store), "p".to_string());
+        assert!(provider.top_n(0).await.unwrap().is_empty());
     }
 }

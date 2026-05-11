@@ -277,13 +277,36 @@ pub async fn run_daemon(
                     cfg.persona
                 );
             }
-            // Engagement-feedback wiring (Task 3 of the engagement loop):
-            // sensible defaults shared by every persona for now — Task 5
-            // surfaces these as `[[daemon.persona_posts.engagement]]`
-            // config fields. The in-memory store is volatile; persona
-            // restarts lose state. JSONL plumbing lands with Task 5.
+            // Engagement-feedback wiring (P2.0 final). The engagement store
+            // is co-located with the post history: when `post_history_store`
+            // is "jsonl", we open a JSONL engagement store under
+            // `.heartbit/engagement/{persona}.jsonl`; otherwise in-memory.
+            // `JoinedTopPostsProvider` joins the two stores at writer-time
+            // to surface top-engaged posts as few-shot exemplars.
             let engagement_store: std::sync::Arc<dyn heartbit_ghost::posts::EngagementStore> =
-                std::sync::Arc::new(heartbit_ghost::posts::InMemoryEngagementStore::new());
+                match cfg.post_history_store.as_str() {
+                    "jsonl" => {
+                        let raw_path = format!(
+                            ".heartbit/engagement/{}.jsonl",
+                            cfg.persona.replace(':', "-")
+                        );
+                        let path = expand_tilde(&raw_path)?;
+                        std::sync::Arc::new(
+                            heartbit_ghost::posts::JsonlEngagementStore::open(&path)
+                                .await
+                                .with_context(|| {
+                                    format!("open engagement jsonl at {}", path.display())
+                                })?,
+                        )
+                    }
+                    _ => std::sync::Arc::new(heartbit_ghost::posts::InMemoryEngagementStore::new()),
+                };
+            let top_posts_provider: std::sync::Arc<dyn heartbit_ghost::posts::TopPostsProvider> =
+                std::sync::Arc::new(heartbit_ghost::posts::JoinedTopPostsProvider::new(
+                    history.clone(),
+                    engagement_store.clone(),
+                    cfg.persona.clone(),
+                ));
             entries.insert(
                 cfg.persona.clone(),
                 heartbit::PersonaPostEntry {
@@ -295,12 +318,17 @@ pub async fn run_daemon(
                     history_lookback: chrono::Duration::days(cfg.post_history_lookback_days),
                     topic_brief: cfg.topic_brief.clone(),
                     operator_user_id,
-                    engagement_refresh: std::time::Duration::from_secs(6 * 3600),
-                    engagement_jitter_pct: 25,
+                    engagement_refresh: std::time::Duration::from_secs(
+                        cfg.engagement_refresh_seconds,
+                    ),
+                    // Reuse the post-jitter pct — engagement cadence has the
+                    // same "don't look like a bot" concern as posting.
+                    engagement_jitter_pct: cfg.interval_jitter_pct,
                     engagement_store,
-                    engagement_min_age_hours: 24,
-                    engagement_max_age_days: 30,
-                    engagement_top_n: 5,
+                    engagement_min_age_hours: cfg.engagement_min_age_hours,
+                    engagement_max_age_days: cfg.engagement_max_age_days,
+                    engagement_top_n: cfg.engagement_top_n,
+                    top_posts_provider: Some(top_posts_provider),
                 },
             );
         }

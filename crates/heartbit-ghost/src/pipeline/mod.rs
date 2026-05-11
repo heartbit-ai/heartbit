@@ -359,6 +359,7 @@ pub(crate) async fn generate_candidate(
     critic: &AgentRunner<BoxedProvider>,
     fact: &AgentRunner<BoxedProvider>,
     mode_addendum: Option<&str>,
+    exemplar_block: Option<&str>,
 ) -> Result<CandidateRecord, PipelineError> {
     // Revise loop.
     let mut prev_revision: Option<(String, String)> = None;
@@ -375,6 +376,7 @@ pub(crate) async fn generate_candidate(
             variant_idx,
             total_variants,
             mode_addendum,
+            exemplar_block,
         );
         let writer_out = writer
             .execute(&writer_msg)
@@ -599,6 +601,7 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
                 &critic,
                 &fact,
                 mode_addendum.as_deref(),
+                None, // standalone path: no engagement-driven exemplar block
             )
             .await
         });
@@ -659,6 +662,7 @@ pub async fn run_pipeline(cfg: PipelineConfig<'_>) -> Result<PipelineOutput, Pip
                     &critic,
                     &fact,
                     mode_addendum.as_deref(),
+                    None, // standalone path: no engagement-driven exemplar block
                 )
                 .await
             });

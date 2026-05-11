@@ -14,7 +14,7 @@ use heartbit_core::Tool;
 use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::{PersonaParams, PersonaRegistry};
 
-use heartbit_ghost::posts::{PostHistoryEntry, PostHistoryStore, PostOutcome};
+use heartbit_ghost::posts::{PostHistoryEntry, PostHistoryStore, PostOutcome, TopPostsProvider};
 use heartbit_ghost::review::{
     ReviewConfig, ReviewDelivery, ReviewError, ReviewOutcome, parse_thread_tweets,
     run_review_pipeline,
@@ -51,6 +51,15 @@ pub struct PersonaPostDeps<'a> {
     pub corpora_root: &'a Path,
     /// Root directory containing per-persona style profiles.
     pub profiles_root: &'a Path,
+    /// Optional ranker for top-engaged posts. When `Some` and `top_n > 0`
+    /// and the ranker returns ≥3 exemplars, an `EXEMPLARS —` block is
+    /// prepended to the writer's user_message. Cold start (<3 exemplars)
+    /// silently no-injects so pre-P2.0 behavior is preserved.
+    pub top_posts_provider: Option<&'a dyn TopPostsProvider>,
+    /// How many exemplars to request from `top_posts_provider`. `0`
+    /// disables injection. The min-3 threshold is applied inside the
+    /// handler, not here.
+    pub top_n: usize,
 }
 
 /// Run one `PersonaPost` handler invocation.
@@ -175,7 +184,12 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         return Ok(PostOutcome::SkippedDuplicate);
     }
 
-    // 5. Run the review pipeline.
+    // 5. Build the engagement few-shot block (P2.0). Cold start (<3
+    // exemplars) silently no-injects so pre-P2.0 behavior is preserved.
+    let exemplar_block =
+        build_exemplar_block(deps.top_posts_provider, deps.top_n, chrono::Utc::now()).await;
+
+    // 6. Run the review pipeline.
     let cfg = ReviewConfig {
         persona_name: deps.persona_name,
         topic: &topic,
@@ -189,6 +203,11 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         credentials: deps.credentials.clone(),
         mode_addendum: expansion.mode_addendum,
         researcher_override,
+        exemplar_block: if exemplar_block.is_empty() {
+            None
+        } else {
+            Some(exemplar_block.as_str())
+        },
     };
     let review_out = run_review_pipeline(cfg)
         .await
@@ -222,6 +241,53 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         tracing::warn!(error = %e, "history.record (terminal) failed");
     }
     Ok(post_outcome)
+}
+
+/// Build the writer-prompt EXEMPLARS block from the `TopPostsProvider`.
+///
+/// Returns an empty string when:
+/// - no provider is configured;
+/// - `top_n == 0` (operator disabled the feature);
+/// - the provider call fails (warn-logged, fail-open);
+/// - fewer than 3 exemplars are available (cold start — silent no-op).
+///
+/// The em dash in `EXEMPLARS \u{2014}` is intentional — it matches the
+/// spec and is asserted byte-for-byte in the integration tests.
+async fn build_exemplar_block(
+    provider: Option<&dyn TopPostsProvider>,
+    top_n: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let Some(provider) = provider else {
+        return String::new();
+    };
+    if top_n == 0 {
+        return String::new();
+    }
+    let top = match provider.top_n(top_n).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "top_posts_provider failed; skipping exemplar injection");
+            return String::new();
+        }
+    };
+    if top.len() < 3 {
+        // Cold-start: too few exemplars to be useful as few-shot signal.
+        return String::new();
+    }
+    let mut s = String::from(
+        "EXEMPLARS \u{2014} your highest-engaged posts from the last 30 days.\n\
+         Study the voice, structure, and angle. Do NOT copy literally.\n\n",
+    );
+    for p in &top {
+        let age = (now - p.posted_at).num_days();
+        s.push_str(&format!(
+            "[{} days ago, engagement score {:.0}]\n{}\n\n",
+            age, p.engagement_score, p.text
+        ));
+    }
+    s.push_str("---\n\n");
+    s
 }
 
 fn map_review_outcome(o: &ReviewOutcome) -> PostOutcome {
@@ -429,16 +495,37 @@ mod tests {
 
     // ─── MockProvider ─────────────────────────────────────────────────────────
 
+    /// Mock LlmProvider that pops canned response strings off a VecDeque
+    /// and (when constructed via [`MockProvider::arc_capturing`]) records
+    /// every [`CompletionRequest`] it sees. The captured requests are
+    /// what the engagement-injection integration tests assert against.
     struct MockProvider {
         responses: Mutex<VecDeque<String>>,
+        /// `Some` when callers want to inspect what was sent to the LLM.
+        /// Populated by `complete()` in arrival order.
+        captured: Option<Arc<Mutex<Vec<CompletionRequest>>>>,
     }
 
     impl MockProvider {
         fn arc(responses: Vec<&str>) -> Arc<BoxedProvider> {
             let p = MockProvider {
                 responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+                captured: None,
             };
             Arc::new(BoxedProvider::new(p))
+        }
+
+        /// Same as [`MockProvider::arc`] but returns a handle the caller
+        /// can read after the run to inspect every request that was sent.
+        fn arc_capturing(
+            responses: Vec<&str>,
+        ) -> (Arc<BoxedProvider>, Arc<Mutex<Vec<CompletionRequest>>>) {
+            let captured: Arc<Mutex<Vec<CompletionRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let p = MockProvider {
+                responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+                captured: Some(captured.clone()),
+            };
+            (Arc::new(BoxedProvider::new(p)), captured)
         }
     }
 
@@ -447,6 +534,9 @@ mod tests {
             &self,
             request: CompletionRequest,
         ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
+            if let Some(captured) = self.captured.as_ref() {
+                captured.lock().unwrap().push(request.clone());
+            }
             let response = self.responses.lock().unwrap().pop_front();
             let has_respond = request
                 .tools
@@ -585,6 +675,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -635,6 +727,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let outcome = handle_persona_post(deps).await.expect("no_topic");
@@ -695,6 +789,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let outcome = handle_persona_post(deps).await.expect("dup");
@@ -744,6 +840,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let outcome = handle_persona_post(deps).await.expect("skip");
@@ -781,6 +879,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let err = handle_persona_post(deps)
@@ -838,6 +938,8 @@ mod tests {
             candidates_per_draft: 1,
             corpora_root: &profiles_root,
             profiles_root: &profiles_root,
+            top_posts_provider: None,
+            top_n: 0,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -855,5 +957,301 @@ mod tests {
         // Writer emitted a single-tweet draft "concrete short post", which
         // is the first (and only) tweet of the chosen thread.
         assert_eq!(posted.text.as_deref(), Some("concrete short post"));
+    }
+
+    // ─── Engagement injection (P2.0 Task 5) ──────────────────────────────────
+
+    use heartbit_core::llm::types::Role;
+    use heartbit_ghost::posts::{
+        EngagementSnapshot, EngagementStore, InMemoryEngagementStore, JoinedTopPostsProvider,
+    };
+
+    /// Pull every user_message text the writer agent saw. The writer is
+    /// identified by its message prefix: `Topic: ` on its own, or
+    /// `EXEMPLARS \u{2014}` when the engagement block was prepended.
+    /// All other pipeline stages (researcher/critic/fact_check) start
+    /// with different prefixes.
+    fn writer_user_messages(captured: &[CompletionRequest]) -> Vec<String> {
+        captured
+            .iter()
+            .filter_map(|req| {
+                // The user_message lives on the LAST user-role Message in
+                // the conversation (the model's prior turns and tool
+                // results may precede it).
+                let last_user = req.messages.iter().rev().find(|m| m.role == Role::User)?;
+                let text: String = last_user
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if text.starts_with("Topic: ") || text.starts_with("EXEMPLARS \u{2014}") {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Seed `n` Posted entries + matching engagement snapshots so the
+    /// provider returns `n` exemplars. Returns the provider Arc.
+    async fn seed_engagement(
+        persona: &str,
+        history: Arc<heartbit_ghost::posts::InMemoryPostHistoryStore>,
+        engagement: Arc<InMemoryEngagementStore>,
+        count: usize,
+    ) -> Arc<dyn heartbit_ghost::posts::TopPostsProvider> {
+        for i in 0..count {
+            let id = format!("tw_{i}");
+            history
+                .record(
+                    persona,
+                    PostHistoryEntry {
+                        posted_at: chrono::Utc::now() - chrono::Duration::hours(48 + i as i64),
+                        topic: format!("topic_{i}"),
+                        outcome: PostOutcome::Posted {
+                            chosen_index: 0,
+                            url: format!("https://x.com/i/web/status/{id}"),
+                        },
+                        tweet_id: Some(id.clone()),
+                        text: Some(format!("exemplar_text_{i}")),
+                    },
+                )
+                .await
+                .unwrap();
+            engagement
+                .record(EngagementSnapshot {
+                    tweet_id: id,
+                    captured_at: chrono::Utc::now(),
+                    // Distinct scores so ordering is deterministic.
+                    likes: (10 + i * 10) as u64,
+                    replies: 0,
+                    retweets: 0,
+                    quotes: 0,
+                    bookmarks: 0,
+                    impressions: None,
+                })
+                .await
+                .unwrap();
+        }
+        Arc::new(JoinedTopPostsProvider::new(
+            history,
+            engagement,
+            persona.to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn writer_receives_exemplar_block_when_top_posts_present() {
+        let persona_name = "test-persona";
+        let (_dir, profiles_root) = seed_snapshot(persona_name);
+
+        // Capturing provider — 6 canned responses, same as happy path.
+        let (provider, captured) = MockProvider::arc_capturing(vec![
+            "calibrated abstention",                         // topic_generator
+            "Research digest:\n- AI",                        // researcher
+            "concrete short post",                           // writer iter 1
+            r#"{"verdict":"pass","style_match_score":0.9}"#, // critic
+            r#"{"verdict":"verified"}"#,                     // fact_check
+            "no_image",                                      // image_generator
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+
+        // Use Arc<InMemoryPostHistoryStore> so we can both seed it AND pass
+        // it to the provider (which needs Arc<dyn PostHistoryStore>).
+        let history = Arc::new(heartbit_ghost::posts::InMemoryPostHistoryStore::new());
+        let engagement = Arc::new(InMemoryEngagementStore::new());
+        let top_provider = seed_engagement(persona_name, history.clone(), engagement, 3).await;
+
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(StubCredentialResolver);
+        let mut registry = PersonaRegistry::new();
+        registry.register(Arc::new(StubTestPersona::new(persona_name)));
+
+        let deps = PersonaPostDeps {
+            persona_name,
+            registry: &registry,
+            history: history.as_ref(),
+            history_lookback: Duration::days(30),
+            topic_brief: None,
+            operator_user_id: "12345",
+            provider,
+            delivery,
+            twitter_tool,
+            credentials,
+            candidates_per_draft: 1,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            top_posts_provider: Some(top_provider.as_ref()),
+            top_n: 5,
+        };
+
+        let outcome = handle_persona_post(deps).await.expect("happy path");
+        assert!(matches!(outcome, PostOutcome::Posted { .. }));
+
+        let requests = captured.lock().unwrap().clone();
+        let writer_msgs = writer_user_messages(&requests);
+        assert!(
+            !writer_msgs.is_empty(),
+            "writer must have been invoked at least once; got {} captured requests",
+            requests.len()
+        );
+        let writer_msg = &writer_msgs[0];
+        assert!(
+            writer_msg.starts_with("EXEMPLARS \u{2014}"),
+            "writer message must be prefixed with the em-dash EXEMPLARS block; \
+             got first 200 chars: {:?}",
+            &writer_msg[..writer_msg.len().min(200)]
+        );
+        // The exemplar text from seed_engagement must appear verbatim.
+        assert!(
+            writer_msg.contains("exemplar_text_"),
+            "writer message must contain the exemplar text bodies"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_unaffected_when_fewer_than_three_exemplars() {
+        let persona_name = "test-persona";
+        let (_dir, profiles_root) = seed_snapshot(persona_name);
+
+        let (provider, captured) = MockProvider::arc_capturing(vec![
+            "calibrated abstention",
+            "Research digest:\n- AI",
+            "concrete short post",
+            r#"{"verdict":"pass","style_match_score":0.9}"#,
+            r#"{"verdict":"verified"}"#,
+            "no_image",
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+
+        let history = Arc::new(heartbit_ghost::posts::InMemoryPostHistoryStore::new());
+        let engagement = Arc::new(InMemoryEngagementStore::new());
+        // Only 1 exemplar — below the 3-min threshold → no injection.
+        let top_provider = seed_engagement(persona_name, history.clone(), engagement, 1).await;
+
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(StubCredentialResolver);
+        let mut registry = PersonaRegistry::new();
+        registry.register(Arc::new(StubTestPersona::new(persona_name)));
+
+        let deps = PersonaPostDeps {
+            persona_name,
+            registry: &registry,
+            history: history.as_ref(),
+            history_lookback: Duration::days(30),
+            topic_brief: None,
+            operator_user_id: "12345",
+            provider,
+            delivery,
+            twitter_tool,
+            credentials,
+            candidates_per_draft: 1,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            top_posts_provider: Some(top_provider.as_ref()),
+            top_n: 5,
+        };
+
+        let outcome = handle_persona_post(deps).await.expect("cold start");
+        assert!(matches!(outcome, PostOutcome::Posted { .. }));
+
+        let requests = captured.lock().unwrap().clone();
+        // No request anywhere should contain "EXEMPLARS" — cold start
+        // means no injection, full stop.
+        for req in &requests {
+            let text: String = req
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.content.iter().filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            assert!(
+                !text.contains("EXEMPLARS"),
+                "no EXEMPLARS expected on cold start, but found one. Message: {:?}",
+                &text[..text.len().min(200)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_unaffected_when_top_n_is_zero() {
+        // Even when the provider would return >=3, top_n = 0 disables
+        // injection. This is the operator's "kill switch".
+        let persona_name = "test-persona";
+        let (_dir, profiles_root) = seed_snapshot(persona_name);
+
+        let (provider, captured) = MockProvider::arc_capturing(vec![
+            "calibrated abstention",
+            "Research digest:\n- AI",
+            "concrete short post",
+            r#"{"verdict":"pass","style_match_score":0.9}"#,
+            r#"{"verdict":"verified"}"#,
+            "no_image",
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+
+        let history = Arc::new(heartbit_ghost::posts::InMemoryPostHistoryStore::new());
+        let engagement = Arc::new(InMemoryEngagementStore::new());
+        // 5 exemplars available — yet top_n=0 must block injection.
+        let top_provider = seed_engagement(persona_name, history.clone(), engagement, 5).await;
+
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(StubCredentialResolver);
+        let mut registry = PersonaRegistry::new();
+        registry.register(Arc::new(StubTestPersona::new(persona_name)));
+
+        let deps = PersonaPostDeps {
+            persona_name,
+            registry: &registry,
+            history: history.as_ref(),
+            history_lookback: Duration::days(30),
+            topic_brief: None,
+            operator_user_id: "12345",
+            provider,
+            delivery,
+            twitter_tool,
+            credentials,
+            candidates_per_draft: 1,
+            corpora_root: &profiles_root,
+            profiles_root: &profiles_root,
+            top_posts_provider: Some(top_provider.as_ref()),
+            top_n: 0,
+        };
+
+        let outcome = handle_persona_post(deps).await.expect("disabled");
+        assert!(matches!(outcome, PostOutcome::Posted { .. }));
+
+        let requests = captured.lock().unwrap().clone();
+        for req in &requests {
+            let text: String = req
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.content.iter().filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            assert!(
+                !text.contains("EXEMPLARS"),
+                "top_n=0 must block injection, but found one. Message: {:?}",
+                &text[..text.len().min(200)]
+            );
+        }
     }
 }

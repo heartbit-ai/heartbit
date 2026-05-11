@@ -731,6 +731,10 @@ impl DaemonCore {
                     post_history_path: None,
                     post_history_lookback_days: entry.history_lookback.num_days(),
                     topic_brief: entry.topic_brief.clone(),
+                    engagement_refresh_seconds: entry.engagement_refresh.as_secs(),
+                    engagement_top_n: entry.engagement_top_n,
+                    engagement_max_age_days: entry.engagement_max_age_days,
+                    engagement_min_age_hours: entry.engagement_min_age_hours,
                 };
                 let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
                     crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
@@ -1251,6 +1255,8 @@ impl DaemonCore {
                             let candidates_per_draft = entry.candidates_per_draft;
                             let history_lookback = entry.history_lookback;
                             let operator_user_id = entry.operator_user_id.clone();
+                            let top_posts_provider = entry.top_posts_provider.clone();
+                            let top_n = entry.engagement_top_n;
                             let registry = ctx.registry.clone();
                             let provider = ctx.provider.clone();
                             let delivery = ctx.delivery.clone();
@@ -1274,6 +1280,9 @@ impl DaemonCore {
                                     candidates_per_draft,
                                     corpora_root: &corpora_root,
                                     profiles_root: &profiles_root,
+                                    top_posts_provider: top_posts_provider
+                                        .as_deref(),
+                                    top_n,
                                 };
                                 if let Err(e) =
                                     crate::daemon::handle_persona_post(deps).await

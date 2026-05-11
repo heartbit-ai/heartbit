@@ -399,6 +399,26 @@ pub struct PersonaPostsConfig {
     /// topic-context provider, or appended to the provider's output.
     #[serde(default)]
     pub topic_brief: Option<String>,
+
+    // --- Engagement feedback (P2.0) ---
+    /// Engagement-collector tick interval, in seconds. Default 21600 = 6h.
+    /// Each tick batch-refreshes every eligible Posted tweet's metrics
+    /// from the X API and writes a fresh [`EngagementSnapshot`].
+    #[serde(default = "default_engagement_refresh_seconds")]
+    pub engagement_refresh_seconds: u64,
+    /// How many top-engaged posts to inject as writer few-shot exemplars.
+    /// Default 5. Set to `0` to disable injection — the writer then runs
+    /// without exemplars, matching pre-P2.0 behavior.
+    #[serde(default = "default_engagement_top_n")]
+    pub engagement_top_n: usize,
+    /// Ignore tweets older than this many days when refreshing engagement.
+    /// Default 30 — older tweets rarely accrue new engagement.
+    #[serde(default = "default_engagement_max_age_days")]
+    pub engagement_max_age_days: i64,
+    /// Ignore tweets younger than this many hours when refreshing
+    /// engagement. Default 24 — gives the algorithm time to fan out.
+    #[serde(default = "default_engagement_min_age_hours")]
+    pub engagement_min_age_hours: i64,
 }
 
 fn default_post_interval_seconds() -> u64 {
@@ -419,6 +439,22 @@ fn default_post_history_store() -> String {
 
 fn default_post_history_lookback_days() -> i64 {
     30
+}
+
+fn default_engagement_refresh_seconds() -> u64 {
+    21600
+}
+
+fn default_engagement_top_n() -> usize {
+    5
+}
+
+fn default_engagement_max_age_days() -> i64 {
+    30
+}
+
+fn default_engagement_min_age_hours() -> i64 {
+    24
 }
 
 /// WebSocket configuration for bidirectional user↔agent communication.
@@ -531,6 +567,33 @@ persona = "heartbit-ghost:x"
         assert!(p.active_hours.is_none());
         assert!(p.topic_brief.is_none());
         assert!(p.post_history_path.is_none());
+        // Engagement defaults (P2.0).
+        assert_eq!(p.engagement_refresh_seconds, 21600);
+        assert_eq!(p.engagement_top_n, 5);
+        assert_eq!(p.engagement_max_age_days, 30);
+        assert_eq!(p.engagement_min_age_hours, 24);
+    }
+
+    #[test]
+    fn persona_posts_config_parses_engagement_overrides() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+engagement_refresh_seconds = 3600
+engagement_top_n = 0
+engagement_max_age_days = 7
+engagement_min_age_hours = 6
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let p = &cfg.persona_posts[0];
+        assert_eq!(p.engagement_refresh_seconds, 3600);
+        assert_eq!(p.engagement_top_n, 0);
+        assert_eq!(p.engagement_max_age_days, 7);
+        assert_eq!(p.engagement_min_age_hours, 6);
     }
 
     #[test]

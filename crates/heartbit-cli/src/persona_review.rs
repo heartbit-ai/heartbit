@@ -511,6 +511,8 @@ pub async fn review_config_from_env<'a>(
         credentials,
         mode_addendum,
         researcher_override,
+        // One-shot CLI invocations don't wire the engagement loop.
+        exemplar_block: None,
     })
 }
 

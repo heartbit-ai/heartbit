@@ -9,6 +9,13 @@
 ///
 /// When `total_variants > 1`, appends a "you are generating variant X
 /// of N" line to encourage diversity across parallel candidate slots.
+///
+/// When `exemplar_block` is `Some(non-empty)`, the block is prepended
+/// VERBATIM at the top of the message. The handler builds the block
+/// from [`heartbit_ghost::posts::TopPostsProvider`] (≥3 exemplars
+/// required). Critical: the block goes in the user message — NOT the
+/// system prompt — so the system-prompt cache breakpoint stays warm.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_writer_user_message(
     topic: &str,
     research_digest: &str,
@@ -17,8 +24,14 @@ pub(crate) fn build_writer_user_message(
     variant_index: usize,
     total_variants: usize,
     mode_addendum: Option<&str>,
+    exemplar_block: Option<&str>,
 ) -> String {
     let mut out = String::new();
+    if let Some(block) = exemplar_block
+        && !block.is_empty()
+    {
+        out.push_str(block);
+    }
     out.push_str(&format!("Topic: {topic}\n\n"));
     out.push_str("Research digest:\n");
     out.push_str(research_digest);
@@ -126,6 +139,7 @@ mod tests {
             0,
             1,
             Some("EVANGELISM MODE \u{2014} fixture"),
+            None,
         );
         let voice_pos = msg.find("VOICE GUIDELINES").expect("voice present");
         let add_pos = msg
@@ -139,7 +153,30 @@ mod tests {
 
     #[test]
     fn writer_user_message_without_addendum_is_unchanged_baseline() {
-        let msg = build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None);
+        let msg = build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None, None);
         assert!(!msg.contains("EVANGELISM"));
+    }
+
+    #[test]
+    fn writer_user_message_prepends_exemplar_block_verbatim() {
+        let block = "EXEMPLARS \u{2014} prepended\nfoo\n\n---\n\n";
+        let msg =
+            build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None, Some(block));
+        assert!(
+            msg.starts_with(block),
+            "exemplar block must be the message prefix; got: {msg:?}"
+        );
+        assert!(msg.contains("Topic: topic"));
+    }
+
+    #[test]
+    fn writer_user_message_empty_exemplar_block_is_noop() {
+        // An empty Some("") must NOT inject anything — the user_message
+        // is byte-identical to the None case.
+        let baseline =
+            build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None, None);
+        let with_empty =
+            build_writer_user_message("topic", "digest", "VOICE", None, 0, 1, None, Some(""));
+        assert_eq!(baseline, with_empty);
     }
 }

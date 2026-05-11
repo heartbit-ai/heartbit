@@ -428,6 +428,11 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 candidates_per_draft: candidates.unwrap_or(3),
                 corpora_root: &corpora_root,
                 profiles_root: &profiles_root,
+                // One-shot CLI invocation: no engagement provider wired in
+                // here (no history backing store to join against). Cold-start
+                // semantics — exactly the same as a fresh daemon run.
+                top_posts_provider: None,
+                top_n: 0,
             };
             let outcome = heartbit::handle_persona_post(deps)
                 .await

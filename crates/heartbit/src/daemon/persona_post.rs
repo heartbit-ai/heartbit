@@ -192,6 +192,10 @@ mod tests {
             post_history_path: None,
             post_history_lookback_days: 30,
             topic_brief: None,
+            engagement_refresh_seconds: 21600,
+            engagement_top_n: 5,
+            engagement_max_age_days: 30,
+            engagement_min_age_hours: 24,
         }
     }
 
