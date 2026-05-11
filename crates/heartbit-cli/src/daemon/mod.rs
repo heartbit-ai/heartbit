@@ -1030,6 +1030,16 @@ async fn build_mention_context(
             }
         };
 
+    // Build a content-aware scam judge using the same provider. Runs ONE
+    // cheap LLM call per surviving mention BEFORE the multi-agent pipeline,
+    // catching crypto pumps / spam / ads that the structural guards miss.
+    // Fail-open: judge errors degrade to OK so legit traffic is never
+    // silently suppressed.
+    let scam_judge: Option<Arc<heartbit_ghost::reply::ScamJudge>> = Some(Arc::new(
+        heartbit_ghost::reply::ScamJudge::new(provider.clone()),
+    ));
+    tracing::info!("mention context: scam-judge pre-pipeline filter enabled");
+
     let reply_ctx = ReplySharedContext {
         registry: Arc::new(registry),
         provider,
@@ -1038,6 +1048,7 @@ async fn build_mention_context(
         credentials: credentials.clone(),
         corpora_root,
         profiles_root,
+        scam_judge,
     };
 
     // Build one PersonaMentionEntry per enabled config entry.

@@ -17,7 +17,7 @@ use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
 use heartbit_ghost::reply::{
     BotHeuristicConfig, DailyTokenBudget, InMemoryDailyBudget, MentionStore, ReplyReviewDelivery,
-    SpamGuard, SpamGuardConfig,
+    ScamJudge, SpamGuard, SpamGuardConfig,
 };
 use heartbit_ghost::tools::client::XClient;
 
@@ -111,6 +111,11 @@ pub struct ReplySharedContext {
     pub corpora_root: PathBuf,
     /// Root directory containing per-persona style profiles.
     pub profiles_root: PathBuf,
+    /// Optional content-aware scam/spam/ad classifier. When present, the
+    /// reply handler runs this BEFORE the multi-agent pipeline; a non-OK
+    /// verdict short-circuits to `ReplyOutcome::Skipped`. Single shared
+    /// instance reused across all persona entries.
+    pub scam_judge: Option<Arc<ScamJudge>>,
 }
 
 /// Bundle of all mention-polling context, passed to
@@ -269,6 +274,7 @@ mod tests {
             credentials: Arc::new(NopCreds),
             corpora_root: std::path::PathBuf::from("/tmp"),
             profiles_root: std::path::PathBuf::from("/tmp"),
+            scam_judge: None,
         };
 
         let mc = MentionContext::new(vec![], reply, mentions_tool);

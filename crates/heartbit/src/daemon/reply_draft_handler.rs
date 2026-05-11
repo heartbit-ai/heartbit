@@ -22,7 +22,7 @@ use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
 use heartbit_ghost::reply::{
     DailyTokenBudget, Mention, MentionStore, MentionerContext, ReplyConfig, ReplyError,
-    ReplyOutcome, ReplyReviewDelivery, TweetSnapshot, run_reply_pipeline,
+    ReplyOutcome, ReplyReviewDelivery, ScamJudge, TweetSnapshot, run_reply_pipeline,
 };
 
 use crate::Error;
@@ -52,6 +52,13 @@ pub struct ReplyDraftDeps<'a> {
     pub profiles_root: &'a Path,
     /// Daily token-budget tracker — updated after every pipeline run.
     pub budget_tracker: Arc<dyn DailyTokenBudget>,
+    /// Optional content-aware LLM scam judge. Runs after the
+    /// Kafka-redelivery dedup and before the full reply pipeline. A
+    /// non-OK verdict marks the mention replied and returns `Skipped`,
+    /// short-circuiting expensive multi-agent generation for crypto
+    /// scams / spam / ads that the structural guards can't catch.
+    /// `None` skips this stage entirely (preserves V1 behavior).
+    pub scam_judge: Option<Arc<ScamJudge>>,
 }
 
 /// Run one `ReplyDraft` handler invocation.
@@ -79,6 +86,33 @@ pub async fn handle_reply_draft<'a>(
             "reply skipped — mention already posted (Kafka redelivery dedup)"
         );
         return Ok(ReplyOutcome::Skipped);
+    }
+
+    // Content-aware scam/spam/ad filter. Runs ONE cheap LLM call before
+    // the multi-agent pipeline. Fail-open: a judge error is treated as OK.
+    // The structural guards catch handle patterns; this catches the
+    // content patterns they miss (crypto pumps with clean-looking handles,
+    // engagement farming with normal account age, etc.).
+    if let Some(ref judge) = deps.scam_judge {
+        let verdict = judge.evaluate(&mention.text, &mention.author_handle).await;
+        if !verdict.is_ok() {
+            tracing::info!(
+                persona_name,
+                mention_id = %mention.id,
+                author_handle = %mention.author_handle,
+                verdict = verdict.label(),
+                reason = verdict.reason().unwrap_or(""),
+                "reply skipped by scam judge"
+            );
+            if let Err(e) = deps.store.mark_replied(&mention.id).await {
+                tracing::warn!(
+                    mention_id = %mention.id,
+                    error = %e,
+                    "mark_replied failed after scam-judge skip (best-effort)"
+                );
+            }
+            return Ok(ReplyOutcome::Skipped);
+        }
     }
 
     let persona = deps
@@ -509,6 +543,8 @@ mod tests {
             corpora_root: profiles_root,
             profiles_root,
             budget_tracker: Arc::new(InMemoryDailyBudget::new()),
+            // Most tests don't exercise the judge — leave it off.
+            scam_judge: None,
         }
     }
 
@@ -792,6 +828,108 @@ mod tests {
             store.was_posted(&mention_id).await.unwrap(),
             "Posted outcome must set was_posted for redelivery dedup"
         );
+    }
+
+    // ─── Test 8: scam judge short-circuits before the pipeline ────────────
+    //
+    // The scam judge runs after the Kafka-redelivery dedup and before the
+    // multi-agent pipeline. A non-OK verdict marks the mention replied
+    // and returns Skipped without burning any pipeline tokens.
+    //
+    // This is the operator's gap from the smoke-test review: structural
+    // guards let through crypto-pump mentions with clean handles; the
+    // judge catches them on content alone.
+    #[tokio::test]
+    async fn scam_judge_skips_classified_scam_without_running_pipeline() {
+        let persona_key = "stub:x";
+        let (_dir, profiles_root) = seed_snapshot(persona_key);
+        let store = InMemoryMentionStore::new();
+        // Provider for the JUDGE — returns one verdict, then is exhausted.
+        let judge_provider = MockProvider::arc(vec!["VERDICT: SCAM: crypto pump bait"]);
+        // Provider for the PIPELINE — exhausted from the start. If the
+        // pipeline runs at all, it'll fail with "mock exhausted" and the
+        // handler will return Err. Test asserts handler returns Ok(Skipped),
+        // proving the pipeline did NOT run.
+        let pipeline_provider = MockProvider::failing();
+        let delivery = MockReplyReviewDelivery::arc(DeliveryOutcome::Skip);
+        let twitter_tool = MockTwitterTool::success(r#"{"tweet_id":"unused","url":"unused"}"#);
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        registry.register(StubPersona::ok(persona_key));
+
+        let mention = fixture_mention();
+        let mention_id = mention.id.clone();
+
+        let mut deps = build_deps(
+            &registry,
+            &store,
+            pipeline_provider,
+            delivery as Arc<dyn ReplyReviewDelivery>,
+            twitter_tool as Arc<dyn Tool>,
+            &profiles_root,
+        );
+        deps.scam_judge = Some(Arc::new(heartbit_ghost::reply::ScamJudge::new(
+            judge_provider,
+        )));
+
+        let outcome = handle_reply_draft(deps, persona_key, mention, None, None)
+            .await
+            .expect("scam-judge short-circuit must return Ok(Skipped), not Err");
+
+        assert!(
+            matches!(outcome, ReplyOutcome::Skipped),
+            "non-OK verdict must return Skipped, got {outcome:?}"
+        );
+
+        // Mention is marked replied so the next poll doesn't retry.
+        assert!(store.was_replied(&mention_id).await.unwrap());
+        // was_posted is NOT set — nothing reached the X API.
+        assert!(!store.was_posted(&mention_id).await.unwrap());
+    }
+
+    // ─── Test 9: scam judge OK verdict lets the pipeline proceed ──────────
+    #[tokio::test]
+    async fn scam_judge_ok_verdict_runs_pipeline_normally() {
+        let persona_key = "stub:x";
+        let (_dir, profiles_root) = seed_snapshot(persona_key);
+        let store = InMemoryMentionStore::new();
+        let judge_provider = MockProvider::arc(vec!["VERDICT: OK"]);
+        // Pipeline provider: full happy-path canned responses.
+        let pipeline_provider = MockProvider::arc(vec![
+            "research digest",
+            "short concrete reply",
+            r#"{"verdict":"pass","style_match_score":0.90}"#,
+            r#"{"verdict":"verified"}"#,
+        ]);
+        let delivery = MockReplyReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool =
+            MockTwitterTool::success(r#"{"tweet_id":"r1","url":"https://x.com/i/web/status/r1"}"#);
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        registry.register(StubPersona::ok(persona_key));
+
+        let mention = fixture_mention();
+        let mention_id = mention.id.clone();
+
+        let mut deps = build_deps(
+            &registry,
+            &store,
+            pipeline_provider,
+            delivery as Arc<dyn ReplyReviewDelivery>,
+            twitter_tool as Arc<dyn Tool>,
+            &profiles_root,
+        );
+        deps.scam_judge = Some(Arc::new(heartbit_ghost::reply::ScamJudge::new(
+            judge_provider,
+        )));
+
+        let outcome = handle_reply_draft(deps, persona_key, mention, None, None)
+            .await
+            .expect("OK verdict + happy pipeline should produce a Posted outcome");
+
+        assert!(
+            matches!(outcome, ReplyOutcome::Posted { .. }),
+            "OK verdict must NOT block the pipeline, got {outcome:?}"
+        );
+        assert!(store.was_posted(&mention_id).await.unwrap());
     }
 
     // ─── Test 7: Skipped outcome does NOT set was_posted ───────────────────

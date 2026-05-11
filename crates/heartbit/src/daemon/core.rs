@@ -1165,6 +1165,7 @@ impl DaemonCore {
                                     let corpora_root = mc.reply.corpora_root.clone();
                                     let profiles_root = mc.reply.profiles_root.clone();
                                     let budget_tracker = entry.budget_tracker.clone();
+                                    let scam_judge = mc.reply.scam_judge.clone();
                                     tokio::spawn(async move {
                                         let deps = super::reply_draft_handler::ReplyDraftDeps {
                                             registry: &registry,
@@ -1177,6 +1178,7 @@ impl DaemonCore {
                                             corpora_root: &corpora_root,
                                             profiles_root: &profiles_root,
                                             budget_tracker,
+                                            scam_judge,
                                         };
                                         if let Err(e) =
                                             super::reply_draft_handler::handle_reply_draft(
@@ -2021,6 +2023,7 @@ mod tests {
                 credentials: Arc::new(NopCreds),
                 corpora_root: std::path::PathBuf::from("/tmp"),
                 profiles_root: std::path::PathBuf::from("/tmp"),
+                scam_judge: None,
             },
             mentions_tool: Arc::new(NopTool),
             enricher: None,

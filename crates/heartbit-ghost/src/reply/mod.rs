@@ -13,6 +13,7 @@ pub mod budget_guard;
 pub mod conversation_guard;
 pub mod enrichment;
 pub mod prompts;
+pub mod scam_judge;
 pub mod spam_guard;
 pub mod storage;
 pub mod thread_guard;
@@ -21,6 +22,7 @@ pub use budget::{BudgetError, DailyTokenBudget, InMemoryDailyBudget, JsonlDailyB
 pub use budget_guard::DailyBudgetGuard;
 pub use conversation_guard::ConversationDepthGuard;
 pub use enrichment::{enrich_mentioner, fetch_parent_tweet};
+pub use scam_judge::{ScamJudge, ScamVerdict};
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
 pub use thread_guard::ThreadDepthGuard;
