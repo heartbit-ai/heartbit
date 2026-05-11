@@ -5,6 +5,8 @@ use crate::Error;
 
 pub mod core;
 pub mod cron;
+pub mod engagement_collector;
+pub mod engagement_refresh_handler;
 pub mod heartbit_pulse;
 pub mod kafka;
 pub mod mention_context;
@@ -24,6 +26,8 @@ pub mod types;
 
 pub use self::core::{DaemonCore, DaemonHandle};
 pub use cron::CronScheduler;
+pub use engagement_collector::EngagementCollectorScheduler;
+pub use engagement_refresh_handler::{EngagementRefreshDeps, handle_engagement_refresh};
 pub use heartbit_pulse::HeartbitPulseScheduler;
 pub use kafka::KafkaCommandProducer;
 pub use mention_context::{MentionContext, PersonaMentionEntry, ReplySharedContext};

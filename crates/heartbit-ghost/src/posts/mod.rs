@@ -13,7 +13,7 @@ pub mod topic_context;
 
 pub use engagement::{
     EngagementSnapshot, EngagementStore, EngagementStoreError, InMemoryEngagementStore,
-    JsonlEngagementStore,
+    JsonlEngagementStore, RefreshError, RefreshOutcome, refresh_engagement,
 };
 pub use history::{InMemoryPostHistoryStore, JsonlPostHistoryStore, PostHistoryStore, StoreError};
 pub use topic_context::{

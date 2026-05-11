@@ -14,7 +14,7 @@ use heartbit_core::config::ActiveHoursConfig;
 use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
 
-use heartbit_ghost::posts::PostHistoryStore;
+use heartbit_ghost::posts::{EngagementStore, PostHistoryStore};
 use heartbit_ghost::review::ReviewDelivery;
 
 /// Per-persona state for one `[[daemon.persona_posts]]` entry.
@@ -37,6 +37,23 @@ pub struct PersonaPostEntry {
     pub topic_brief: Option<String>,
     /// Operator's X user_id.
     pub operator_user_id: String,
+
+    // --- Engagement-feedback wiring (Task 3 of the engagement loop) ---
+    /// Engagement collector interval (default 6h).
+    pub engagement_refresh: Duration,
+    /// `±jitter_pct%` applied to the engagement collector cadence.
+    /// Clamped to `0..=50` by the scheduler.
+    pub engagement_jitter_pct: u32,
+    /// Engagement snapshot store (JSONL or in-memory).
+    pub engagement_store: Arc<dyn EngagementStore>,
+    /// Skip tweets younger than this when refreshing. Default 24h.
+    pub engagement_min_age_hours: i64,
+    /// Skip tweets older than this when refreshing. Default 30d.
+    pub engagement_max_age_days: i64,
+    /// How many top-engaged posts to inject as few-shot exemplars when
+    /// the writer agent runs. Default 5. `0` disables injection.
+    /// Wired into the post pipeline in Task 5.
+    pub engagement_top_n: usize,
 }
 
 impl std::fmt::Debug for PersonaPostEntry {
@@ -48,6 +65,15 @@ impl std::fmt::Debug for PersonaPostEntry {
             .field("history_lookback", &self.history_lookback)
             .field("topic_brief_set", &self.topic_brief.is_some())
             .field("operator_user_id", &self.operator_user_id)
+            .field("engagement_refresh", &self.engagement_refresh)
+            .field("engagement_jitter_pct", &self.engagement_jitter_pct)
+            .field(
+                "engagement_store_set",
+                &(Arc::strong_count(&self.engagement_store) > 0),
+            )
+            .field("engagement_min_age_hours", &self.engagement_min_age_hours)
+            .field("engagement_max_age_days", &self.engagement_max_age_days)
+            .field("engagement_top_n", &self.engagement_top_n)
             .finish()
     }
 }

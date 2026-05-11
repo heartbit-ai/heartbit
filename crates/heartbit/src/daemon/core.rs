@@ -740,6 +740,22 @@ impl DaemonCore {
                 let cancel = self.cancel.clone();
                 tokio::spawn(scheduler.run(cancel));
                 tracing::info!(persona = %persona, "post scheduler spawned");
+
+                // EngagementCollectorScheduler co-spawned per persona —
+                // fires `EngagementRefresh` on a separate jittered cadence.
+                let engagement_producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
+                    crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
+                );
+                let engagement_scheduler = crate::daemon::EngagementCollectorScheduler::new(
+                    persona.clone(),
+                    entry.engagement_refresh,
+                    entry.engagement_jitter_pct,
+                    engagement_producer,
+                    self.commands_topic.clone(),
+                );
+                let engagement_cancel = self.cancel.clone();
+                tokio::spawn(engagement_scheduler.run(engagement_cancel));
+                tracing::info!(persona = %persona, "engagement collector spawned");
             }
         }
 
@@ -1266,6 +1282,64 @@ impl DaemonCore {
                                         persona = %persona_owned,
                                         error = %e,
                                         "persona post handler failed"
+                                    );
+                                }
+                            });
+                        }
+                        DaemonCommand::EngagementRefresh { persona } => {
+                            let Some(ctx) = self.posts_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "EngagementRefresh: no posts_context configured"
+                                );
+                                continue;
+                            };
+                            let Some(entry) = ctx.entries.get(&persona) else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "EngagementRefresh for unknown persona"
+                                );
+                                continue;
+                            };
+                            // The XClient is shared with the mentions/reply
+                            // pipeline (one OAuth1 user-context client per
+                            // daemon). When mention_context (or its enricher)
+                            // is absent there's no client to refresh against.
+                            let Some(ref mc) = self.mention_context else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "EngagementRefresh: no mention_context (no XClient available)"
+                                );
+                                continue;
+                            };
+                            let Some(client_arc) = mc.enricher.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "EngagementRefresh: mention_context has no XClient enricher"
+                                );
+                                continue;
+                            };
+                            let history = entry.history.clone();
+                            let engagement = entry.engagement_store.clone();
+                            let max_age = entry.engagement_max_age_days;
+                            let min_age = entry.engagement_min_age_hours;
+                            let persona_owned = persona.clone();
+                            tokio::spawn(async move {
+                                let deps = crate::daemon::EngagementRefreshDeps {
+                                    persona: &persona_owned,
+                                    client: client_arc.as_ref(),
+                                    history: history.as_ref(),
+                                    store: engagement.as_ref(),
+                                    max_age_days: max_age,
+                                    min_age_hours: min_age,
+                                };
+                                if let Err(e) =
+                                    crate::daemon::handle_engagement_refresh(deps).await
+                                {
+                                    tracing::error!(
+                                        persona = %persona_owned,
+                                        error = %e,
+                                        "engagement refresh handler failed"
                                     );
                                 }
                             });

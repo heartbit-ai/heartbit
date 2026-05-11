@@ -85,6 +85,13 @@ pub enum DaemonCommand {
         /// Persona name (e.g. `"heartbit-ghost:x"`).
         persona: String,
     },
+    /// Refresh engagement metrics for every Posted tweet in the persona's
+    /// history. Dispatched by `EngagementCollectorScheduler` on the
+    /// configured cadence.
+    EngagementRefresh {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+    },
 }
 
 /// State machine for daemon task lifecycle.
@@ -1123,6 +1130,26 @@ mod tests {
                 assert_eq!(persona, "heartbit-ghost:x");
             }
             other => panic!("expected PersonaPost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_command_engagement_refresh_serde_round_trips() {
+        let cmd = DaemonCommand::EngagementRefresh {
+            persona: "heartbit-ghost:x".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        // Confirm the wire shape the consumer matches against.
+        assert!(
+            s.contains(r#""type":"engagement_refresh""#),
+            "json was: {s}"
+        );
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::EngagementRefresh { persona } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+            }
+            other => panic!("expected EngagementRefresh, got {other:?}"),
         }
     }
 }
