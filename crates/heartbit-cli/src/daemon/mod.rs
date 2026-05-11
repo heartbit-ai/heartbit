@@ -3,6 +3,7 @@ mod eval;
 mod execute;
 mod handlers;
 mod memory;
+pub(crate) mod operator_id;
 mod types;
 
 use std::collections::HashMap;
