@@ -80,6 +80,9 @@ pub struct DaemonMetrics {
 
     // Cascade (prefix: heartbit_cascade_)
     cascade_escalations_total: IntCounterVec,
+
+    // Persona posts (prefix: heartbit_persona_)
+    persona_posts_skipped_total: IntCounterVec,
 }
 
 impl DaemonMetrics {
@@ -354,6 +357,15 @@ impl DaemonMetrics {
             &["from_tier", "to_tier", "reason"],
         )?;
 
+        // -- Persona posts --
+        let persona_posts_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "heartbit_persona_posts_skipped_total",
+                "Number of [[daemon.persona_posts]] entries skipped at startup due to misconfiguration",
+            ),
+            &["persona", "reason"],
+        )?;
+
         // Register all collectors
         registry.register(Box::new(tasks_submitted_total.clone()))?;
         registry.register(Box::new(tasks_completed_total.clone()))?;
@@ -408,6 +420,7 @@ impl DaemonMetrics {
         registry.register(Box::new(routing_escalations_total.clone()))?;
 
         registry.register(Box::new(cascade_escalations_total.clone()))?;
+        registry.register(Box::new(persona_posts_skipped_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -453,6 +466,7 @@ impl DaemonMetrics {
             routing_decisions_total,
             routing_escalations_total,
             cascade_escalations_total,
+            persona_posts_skipped_total,
         })
     }
 
@@ -716,12 +730,24 @@ impl DaemonMetrics {
             .with_label_values(&[source])
             .inc();
     }
+
+    /// Increment the persona-posts skip counter for `persona` with `reason`.
+    ///
+    /// Used at daemon startup when a `[[daemon.persona_posts]]` entry cannot
+    /// be activated (e.g. unresolved operator user-id). The counter exposes
+    /// silent skips so dashboards can alert on `rate(...) > 0`.
+    pub fn inc_persona_posts_skipped(&self, persona: &str, reason: &str) {
+        self.persona_posts_skipped_total
+            .with_label_values(&[persona, reason])
+            .inc();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::types::{StopReason, TokenUsage};
+    use prometheus::Encoder;
 
     #[test]
     fn new_creates_metrics() {
@@ -1573,6 +1599,32 @@ mod tests {
 
         let text = m.encode().unwrap();
         assert!(!text.is_empty());
+    }
+
+    #[test]
+    fn persona_posts_skipped_metric_registers_and_increments() {
+        let m = DaemonMetrics::new().unwrap();
+        m.inc_persona_posts_skipped("heartbit-ghost:x", "missing_operator_user_id");
+        m.inc_persona_posts_skipped("heartbit-ghost:x", "missing_operator_user_id");
+        m.inc_persona_posts_skipped("other:x", "missing_post_history_path");
+
+        let mut buf = Vec::new();
+        TextEncoder::new()
+            .encode(&m.registry.gather(), &mut buf)
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(
+                r#"heartbit_persona_posts_skipped_total{persona="heartbit-ghost:x",reason="missing_operator_user_id"} 2"#
+            ),
+            "missing or wrong counter line: {text}"
+        );
+        assert!(
+            text.contains(
+                r#"heartbit_persona_posts_skipped_total{persona="other:x",reason="missing_post_history_path"} 1"#
+            ),
+            "missing second-label counter line: {text}"
+        );
     }
 
     #[test]
