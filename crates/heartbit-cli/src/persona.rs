@@ -1008,4 +1008,34 @@ mod tests {
         assert!(msg.contains("heartbit-ghost:x"), "got: {msg}");
         assert!(!msg.contains("No personas registered"), "got: {msg}");
     }
+
+    /// The one-off `persona post` CLI must hard-error when
+    /// HEARTBIT_GHOST_OPERATOR_USER_ID is missing — different contract from
+    /// the supervised daemon. If a future refactor wires the fallback helper
+    /// in here too, this test will need to be updated *and* the change
+    /// reviewed against `docs/operating-heartbit.md`.
+    #[test]
+    fn persona_post_uses_strict_env_var_check_not_fallback_helper() {
+        // Grep the source file for the canonical strict pattern. We assert
+        // on a stable substring rather than the literal error message so
+        // wording tweaks don't break the test.
+        let src = include_str!("persona.rs");
+        assert!(
+            src.contains(r#"std::env::var("HEARTBIT_GHOST_OPERATOR_USER_ID")"#),
+            "strict env-var check removed from persona.rs"
+        );
+        assert!(
+            src.contains("must be set for `persona post` without --topic"),
+            "strict error message changed; if intentional, update the doc"
+        );
+        // Negative: the fallback helper must NOT be used from this file —
+        // it would silently substitute a persona_mentions value, masking
+        // a config typo from the operator running the one-off command.
+        // Split the identifier so this assertion doesn't match itself.
+        let fallback_fn = ["resolve", "_operator_user_id"].concat();
+        assert!(
+            !src.contains(&fallback_fn),
+            "persona post must keep strict env-var contract — see Task 4 plan"
+        );
+    }
 }
