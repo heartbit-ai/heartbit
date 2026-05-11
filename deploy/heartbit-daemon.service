@@ -1,0 +1,42 @@
+[Unit]
+Description=Heartbit Daemon — X mentions poll + proactive posts (Telegram-gated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pleclech
+Group=pleclech
+WorkingDirectory=/home/pleclech/projects/heartbit
+
+# Loads OPENROUTER_API_KEY, HEARTBIT_TELEGRAM_TOKEN/CHAT_ID, X_* OAuth1 creds.
+# Format: one KEY=value per line, no quotes, no `export`.
+EnvironmentFile=/home/pleclech/projects/heartbit/.env
+
+ExecStart=/home/pleclech/projects/heartbit/target/release/heartbit daemon --config /home/pleclech/projects/heartbit/daemon-dev.toml
+
+# Auto-restart on crash. Kafka or Postgres being briefly unreachable should
+# not require manual intervention.
+Restart=on-failure
+RestartSec=5s
+# Cap rapid-restart loops so a bug doesn't spin forever; one minute is plenty
+# of time for diagnostics via `journalctl -u heartbit-daemon -e`.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging — go to journald, accessible via `journalctl -u heartbit-daemon`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heartbit-daemon
+
+# Default log level. Override per-module via `RUST_LOG=heartbit=debug,...`
+# in /etc/systemd/system/heartbit-daemon.service.d/override.conf if needed.
+Environment=RUST_LOG=info
+
+# Soft memory cap. Heartbit-daemon idle ~80MB; active reply pipelines can
+# push it to 500-800MB during multi-agent generation. 2G leaves headroom
+# without letting a leak run the box to OOM.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
