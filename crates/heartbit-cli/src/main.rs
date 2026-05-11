@@ -122,6 +122,9 @@ enum Commands {
         /// Print structured agent events to stderr as one-line JSON
         #[arg(long, short)]
         verbose: bool,
+        /// Validate config and exit (no Kafka, no HTTP bind, no DB connect)
+        #[arg(long)]
+        validate_config: bool,
     },
     /// Manage personas (list, run, configure, audit).
     Persona {
@@ -401,18 +404,26 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Daemon { bind, verbose }) => {
+        Some(Commands::Daemon {
+            bind,
+            verbose,
+            validate_config,
+        }) => {
             let config_path = cli
                 .config
                 .as_deref()
                 .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
-            daemon::run_daemon(
-                config_path,
-                bind.as_deref(),
-                verbose,
-                cli.observability.as_deref(),
-            )
-            .await
+            if validate_config {
+                daemon::validate_config_only(config_path).await
+            } else {
+                daemon::run_daemon(
+                    config_path,
+                    bind.as_deref(),
+                    verbose,
+                    cli.observability.as_deref(),
+                )
+                .await
+            }
         }
         Some(Commands::Persona { sub }) => persona::run(sub).await,
         Some(Commands::Templates { action }) => run_template_command(action),

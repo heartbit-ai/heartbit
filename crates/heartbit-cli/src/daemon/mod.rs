@@ -5,6 +5,7 @@ mod handlers;
 mod memory;
 pub(crate) mod operator_id;
 mod types;
+mod validate;
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1013,6 +1014,30 @@ pub async fn run_daemon(
 
     tracing::info!("runtime shut down gracefully");
     Ok(())
+}
+
+/// Static-validate the daemon config and print findings to stderr.
+/// Returns Ok if no issues found, Err with a count summary otherwise.
+///
+/// Performs no network calls and no Kafka/DB initialization — safe to run
+/// against a production config file from anywhere.
+pub async fn validate_config_only(config_path: &std::path::Path) -> Result<()> {
+    let config = HeartbitConfig::from_file(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+
+    let issues =
+        validate::validate_daemon_config(&config, |k| std::env::var(k).ok(), |p| p.exists());
+
+    if issues.is_empty() {
+        eprintln!("✓ {} validates clean", config_path.display());
+        return Ok(());
+    }
+
+    eprintln!("✗ {} has {} issue(s):", config_path.display(), issues.len());
+    for issue in &issues {
+        eprintln!("  - {issue}");
+    }
+    anyhow::bail!("config validation found {} issue(s)", issues.len());
 }
 
 /// Expand a leading `~/` to `$HOME/`. Returns an error if `$HOME` is
