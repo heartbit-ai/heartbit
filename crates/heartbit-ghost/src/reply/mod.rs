@@ -7,11 +7,21 @@
 
 use chrono::{DateTime, Utc};
 
+pub mod bot_guard;
+pub mod budget;
+pub mod budget_guard;
+pub mod conversation_guard;
 pub mod prompts;
 pub mod spam_guard;
 pub mod storage;
+pub mod thread_guard;
+pub use bot_guard::{BotHeuristicConfig, BotHeuristicGuard};
+pub use budget::{BudgetError, DailyTokenBudget, InMemoryDailyBudget, JsonlDailyBudget};
+pub use budget_guard::DailyBudgetGuard;
+pub use conversation_guard::ConversationDepthGuard;
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
+pub use thread_guard::ThreadDepthGuard;
 
 /// A mention of the operator's account fetched from `twitter_mentions`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,6 +39,12 @@ pub struct Mention {
     /// Tweet ID this mention is replying to (None when it's a top-level
     /// `@operator …` mention rather than a reply on an operator's tweet).
     pub in_reply_to_tweet_id: Option<String>,
+    /// X conversation_id (the root tweet of the thread tree). Used by
+    /// the conversation-depth guard (P1.7) to cap reply count per
+    /// conversation. `#[serde(default)]` for backward compatibility
+    /// with stores written before P1.7.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// A small snapshot of a tweet (text + timing). Used as a parent-tweet
@@ -55,6 +71,13 @@ pub struct MentionerContext {
     pub recent_tweets: Vec<TweetSnapshot>,
     /// Follower count of the mentioner, if available.
     pub follower_count: Option<u64>,
+    /// Following count of the mentioner, if available. Used by the
+    /// bot-heuristic guard (P1.7) for the follower/following ratio
+    /// signal.
+    pub following_count: Option<u64>,
+    /// When the mentioner's account was created. Used by the
+    /// bot-heuristic guard (P1.7) for the account-age signal.
+    pub account_created_at: Option<DateTime<Utc>>,
 }
 
 use std::future::Future;
@@ -565,6 +588,7 @@ mod tests {
             author_handle: "alice".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: Some("99".into()),
+            conversation_id: None,
         };
         let copy = m.clone();
         assert_eq!(copy.id, m.id);
@@ -579,6 +603,13 @@ mod tests {
         assert!(m.bio.is_none());
         assert!(m.recent_tweets.is_empty());
         assert!(m.follower_count.is_none());
+    }
+
+    #[test]
+    fn mentioner_context_default_has_none_for_new_fields() {
+        let m = MentionerContext::default();
+        assert!(m.following_count.is_none());
+        assert!(m.account_created_at.is_none());
     }
 
     #[test]
@@ -854,6 +885,7 @@ mod tests {
             author_handle: "grumpy_dev".into(),
             posted_at: chrono::Utc::now(),
             in_reply_to_tweet_id: None,
+            conversation_id: None,
         }
     }
 
@@ -1121,5 +1153,36 @@ mod tests {
             }
             other => panic!("expected PublishFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mention_deserializes_without_conversation_id_field() {
+        // Backward compat: old stores wrote Mention without the field.
+        let json = r#"{
+            "id": "1",
+            "text": "hi",
+            "author_id": "12",
+            "author_handle": "alice",
+            "posted_at": "2026-05-08T11:02:00Z",
+            "in_reply_to_tweet_id": null
+        }"#;
+        let m: Mention = serde_json::from_str(json).expect("backward compat");
+        assert!(m.conversation_id.is_none());
+    }
+
+    #[test]
+    fn mention_round_trips_conversation_id() {
+        let m = Mention {
+            id: "1".into(),
+            text: "hi".into(),
+            author_id: "12".into(),
+            author_handle: "alice".into(),
+            posted_at: Utc::now(),
+            in_reply_to_tweet_id: Some("99".into()),
+            conversation_id: Some("conv-123".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let parsed: Mention = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.conversation_id.as_deref(), Some("conv-123"));
     }
 }

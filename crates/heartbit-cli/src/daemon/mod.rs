@@ -1066,7 +1066,51 @@ async fn build_mention_context(
             _ => Arc::new(heartbit_ghost::reply::InMemoryMentionStore::new()),
         };
 
-        entries.push(PersonaMentionEntry::new(
+        // Resolve budget tracker backend.
+        let budget_tracker: Arc<dyn heartbit_ghost::reply::DailyTokenBudget> =
+            match cfg.budget_store.as_str() {
+                "jsonl" => {
+                    let path = cfg.budget_path.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "persona '{}': budget_store = 'jsonl' requires budget_path",
+                            cfg.persona
+                        )
+                    })?;
+                    let path = expand_tilde(path)?;
+                    match heartbit_ghost::reply::JsonlDailyBudget::open(&path).await {
+                        Ok(b) => Arc::new(b),
+                        Err(e) => {
+                            tracing::warn!(
+                                persona = %cfg.persona,
+                                path = %path.display(),
+                                error = %e,
+                                "failed to open JSONL budget store, falling back to in-memory"
+                            );
+                            Arc::new(heartbit_ghost::reply::InMemoryDailyBudget::new())
+                        }
+                    }
+                }
+                _ => Arc::new(heartbit_ghost::reply::InMemoryDailyBudget::new()),
+            };
+
+        // Build optional bot-heuristic config.
+        let bot_heuristic = if cfg.enable_bot_heuristic_guard && cfg.bot_heuristic_threshold > 0 {
+            let patterns = if cfg.suspicious_handle_patterns.is_empty() {
+                heartbit_ghost::reply::BotHeuristicConfig::defaults().suspicious_handle_patterns
+            } else {
+                cfg.suspicious_handle_patterns.clone()
+            };
+            Some(heartbit_ghost::reply::BotHeuristicConfig {
+                suspicious_handle_patterns: patterns,
+                min_follower_following_ratio: cfg.min_follower_following_ratio,
+                min_account_age_days: cfg.min_account_age_days,
+                threshold: cfg.bot_heuristic_threshold,
+            })
+        } else {
+            None
+        };
+
+        let mut entry = PersonaMentionEntry::new(
             &cfg.persona,
             &cfg.user_id,
             cfg.poll_interval_seconds,
@@ -1074,7 +1118,13 @@ async fn build_mention_context(
             store,
             credentials.clone(),
             10, // max_results default
-        ));
+        );
+        entry.enable_thread_depth_guard = cfg.enable_thread_depth_guard;
+        entry.bot_heuristic = bot_heuristic;
+        entry.per_conversation_max_replies = cfg.per_conversation_max_replies;
+        entry.budget_tracker = budget_tracker;
+        entry.daily_token_budget = cfg.daily_token_budget;
+        entries.push(entry);
     }
 
     tracing::info!(

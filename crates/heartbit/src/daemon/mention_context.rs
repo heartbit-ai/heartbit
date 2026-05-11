@@ -15,7 +15,10 @@ use heartbit_core::ExecutionContext;
 use heartbit_core::Tool;
 use heartbit_core::llm::BoxedProvider;
 use heartbit_core::persona::PersonaRegistry;
-use heartbit_ghost::reply::{MentionStore, ReplyReviewDelivery, SpamGuard, SpamGuardConfig};
+use heartbit_ghost::reply::{
+    BotHeuristicConfig, DailyTokenBudget, InMemoryDailyBudget, MentionStore, ReplyReviewDelivery,
+    SpamGuard, SpamGuardConfig,
+};
 
 /// All dependencies resolved for a single `[[daemon.persona_mentions]]` entry.
 ///
@@ -39,6 +42,18 @@ pub struct PersonaMentionEntry {
     pub exec_ctx: ExecutionContext,
     /// Maximum mentions to fetch per poll cycle (passed to the tool as `max_results`).
     pub max_results: u32,
+
+    // ── P1.7 loop-protection guards ─────────────────────────────────────────
+    /// When `true`, the thread-depth guard skips thread continuations.
+    pub enable_thread_depth_guard: bool,
+    /// Bot-heuristic guard config. `None` disables the guard.
+    pub bot_heuristic: Option<BotHeuristicConfig>,
+    /// Maximum replies per unique conversation (0 = unlimited).
+    pub per_conversation_max_replies: usize,
+    /// Shared daily token-budget tracker (in-memory or JSONL).
+    pub budget_tracker: Arc<dyn DailyTokenBudget>,
+    /// Budget cap in tokens per UTC day. `None` = unlimited.
+    pub daily_token_budget: Option<u64>,
 }
 
 impl PersonaMentionEntry {
@@ -69,6 +84,11 @@ impl PersonaMentionEntry {
             spam_guard,
             exec_ctx,
             max_results,
+            enable_thread_depth_guard: true,
+            bot_heuristic: None,
+            per_conversation_max_replies: 0,
+            budget_tracker: Arc::new(InMemoryDailyBudget::new()),
+            daily_token_budget: None,
         }
     }
 }

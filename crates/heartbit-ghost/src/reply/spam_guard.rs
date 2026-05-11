@@ -19,6 +19,31 @@ pub enum SkipReason {
     PerAuthorRateLimit,
     /// Mention text is too short (fewer than `min_engagement_chars` alphanumerics).
     TooShortToEngage,
+    /// P1.7: this mention's parent tweet is in our replied set —
+    /// continuing the loop would re-engage with our own thread.
+    OwnThreadContinuation,
+    /// P1.7: ≥2 of 3 bot-heuristic signals matched.
+    BotSuspected {
+        /// Human-readable reasons (e.g. "handle pattern '_bot'",
+        /// "follower/following ratio 0.020 < 0.050").
+        reasons: Vec<String>,
+    },
+    /// P1.7: this conversation already has at least `cap` replies from us.
+    ConversationDepthExceeded {
+        /// X conversation_id (the root tweet of the thread tree).
+        conversation_id: String,
+        /// Number of replies we've already sent in this conversation.
+        count: usize,
+        /// The configured cap.
+        cap: usize,
+    },
+    /// P1.7: persona's daily LLM token budget is exhausted for today.
+    DailyBudgetExhausted {
+        /// Tokens already used today.
+        used: u64,
+        /// Configured budget.
+        budget: u64,
+    },
 }
 
 /// Configuration thresholds for [`SpamGuard`].
@@ -128,6 +153,7 @@ mod tests {
             author_handle: "x".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: Some("p1".into()),
+            conversation_id: None,
         }
     }
 
@@ -137,6 +163,8 @@ mod tests {
             bio: None,
             recent_tweets: vec![],
             follower_count: Some(followers),
+            following_count: None,
+            account_created_at: None,
         }
     }
 
@@ -205,5 +233,28 @@ mod tests {
             guard.should_skip(&m, None, None, 0, Utc::now()),
             Some(SkipReason::TooShortToEngage)
         );
+    }
+
+    #[test]
+    fn skip_reason_p1_7_variants_distinct() {
+        let a = SkipReason::OwnThreadContinuation;
+        let b = SkipReason::BotSuspected {
+            reasons: vec!["test".into()],
+        };
+        let c = SkipReason::ConversationDepthExceeded {
+            conversation_id: "x".into(),
+            count: 2,
+            cap: 2,
+        };
+        let d = SkipReason::DailyBudgetExhausted {
+            used: 100,
+            budget: 50,
+        };
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(c, d);
+        // Also assert distinct from existing P1.5 variants.
+        assert_ne!(a, SkipReason::SelfReply);
+        assert_ne!(b, SkipReason::TooShortToEngage);
     }
 }

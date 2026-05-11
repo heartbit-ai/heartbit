@@ -100,6 +100,7 @@ mod tests {
             author_handle: "grumpy_dev".into(),
             posted_at: Utc.with_ymd_and_hms(2026, 5, 8, 11, 2, 0).unwrap(),
             in_reply_to_tweet_id: Some("parent_id".into()),
+            conversation_id: None,
         }
     }
 

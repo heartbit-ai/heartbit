@@ -757,6 +757,19 @@ impl DaemonCore {
                     candidates_per_reply: entry.candidates_per_reply,
                     mention_store: String::new(),
                     mention_store_path: None,
+                    // P1.7 guard config — populated from entry at dispatch time;
+                    // these values in the config struct are only used by
+                    // MentionPollScheduler (for the interval), not for guards.
+                    enable_thread_depth_guard: entry.enable_thread_depth_guard,
+                    enable_bot_heuristic_guard: entry.bot_heuristic.is_some(),
+                    suspicious_handle_patterns: vec![],
+                    min_follower_following_ratio: 0.05,
+                    min_account_age_days: 7,
+                    bot_heuristic_threshold: 2,
+                    per_conversation_max_replies: entry.per_conversation_max_replies,
+                    daily_token_budget: entry.daily_token_budget,
+                    budget_store: "in_memory".into(),
+                    budget_path: None,
                 };
                 match super::mention_poll::MentionPollScheduler::new(
                     &cfg,
@@ -1065,6 +1078,25 @@ impl DaemonCore {
                                         super::kafka::KafkaCommandProducer::new(self.producer.clone()),
                                     );
                                     let commands_topic = self.commands_topic.clone();
+                                    // Build P1.7 guards before spawn so references into
+                                    // owned values are valid inside the async block.
+                                    let thread_depth_guard =
+                                        heartbit_ghost::reply::ThreadDepthGuard::with_enabled(
+                                            entry.enable_thread_depth_guard,
+                                        );
+                                    let bot_heuristic_guard = entry
+                                        .bot_heuristic
+                                        .clone()
+                                        .map(heartbit_ghost::reply::BotHeuristicGuard::new);
+                                    let conversation_depth_guard =
+                                        heartbit_ghost::reply::ConversationDepthGuard::new(
+                                            entry.per_conversation_max_replies,
+                                        );
+                                    let daily_budget_guard =
+                                        heartbit_ghost::reply::DailyBudgetGuard::new(
+                                            entry.daily_token_budget,
+                                        );
+                                    let budget_tracker = entry.budget_tracker.clone();
                                     tokio::spawn(async move {
                                         let deps =
                                             super::mention_poll_handler::MentionPollDeps {
@@ -1077,6 +1109,11 @@ impl DaemonCore {
                                                 producer: producer.as_ref(),
                                                 commands_topic: &commands_topic,
                                                 max_results,
+                                                thread_depth_guard: &thread_depth_guard,
+                                                bot_heuristic: bot_heuristic_guard.as_ref(),
+                                                conversation_depth_guard: &conversation_depth_guard,
+                                                daily_budget_guard: &daily_budget_guard,
+                                                budget_tracker: &*budget_tracker,
                                             };
                                         if let Err(e) =
                                             super::mention_poll_handler::handle_mention_poll(deps)
@@ -1125,6 +1162,7 @@ impl DaemonCore {
                                     let credentials = mc.reply.credentials.clone();
                                     let corpora_root = mc.reply.corpora_root.clone();
                                     let profiles_root = mc.reply.profiles_root.clone();
+                                    let budget_tracker = entry.budget_tracker.clone();
                                     tokio::spawn(async move {
                                         let deps = super::reply_draft_handler::ReplyDraftDeps {
                                             registry: &registry,
@@ -1136,6 +1174,7 @@ impl DaemonCore {
                                             candidates_per_reply,
                                             corpora_root: &corpora_root,
                                             profiles_root: &profiles_root,
+                                            budget_tracker,
                                         };
                                         if let Err(e) =
                                             super::reply_draft_handler::handle_reply_draft(

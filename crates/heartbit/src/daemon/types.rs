@@ -1062,6 +1062,7 @@ mod tests {
             author_handle: "user".into(),
             posted_at: Utc::now(),
             in_reply_to_tweet_id: Some("parent".into()),
+            conversation_id: None,
         };
         let cmd = DaemonCommand::ReplyDraft {
             persona: "heartbit-ghost:x".into(),
