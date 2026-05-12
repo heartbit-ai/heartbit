@@ -378,6 +378,7 @@ fn render_history_only(history: &[PostHistoryEntry]) -> String {
                 PostOutcome::SkippedDuplicate => "SkippedDuplicate",
                 PostOutcome::GateRejected { .. } => "GateRejected",
                 PostOutcome::PublishFailed { .. } => "PublishFailed",
+                PostOutcome::AllCandidatesGateRejected { .. } => "AllCandidatesGateRejected",
             };
             let topic = if entry.topic.is_empty() {
                 "(no topic)"

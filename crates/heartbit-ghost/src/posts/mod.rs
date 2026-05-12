@@ -74,6 +74,13 @@ pub enum PostOutcome {
         /// Reason for failure.
         reason: String,
     },
+    /// Every candidate failed the publish_gate pre-check before delivery.
+    /// Telegram review was skipped — the operator never saw an
+    /// unpublishable draft. Reasons match the candidates in order.
+    AllCandidatesGateRejected {
+        /// Per-candidate rejection reason from `PublishGateError`'s display.
+        reasons: Vec<String>,
+    },
 }
 
 #[cfg(test)]

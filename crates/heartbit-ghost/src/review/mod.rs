@@ -118,6 +118,15 @@ pub enum ReviewOutcome {
         /// Failure reason.
         reason: String,
     },
+    /// Every candidate failed `publish_gate` in the pre-delivery filter.
+    /// Telegram review was skipped — the operator never saw an
+    /// unpublishable draft. The `Skipped`/`TimedOut`/`Posted` paths are
+    /// unreachable for this run.
+    AllCandidatesGateRejected {
+        /// Per-candidate rejection reason from `PublishGateError`'s display,
+        /// in the same order as the original candidates Vec.
+        reasons: Vec<String>,
+    },
 }
 
 /// Errors raised by `run_review_pipeline`. Note: `ReviewDelivery::report()`
@@ -407,7 +416,50 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     // ship-with-fewer; the user may pick from the surviving distinct set.)
     let candidates = crate::pipeline::dedup_candidates(candidates);
 
-    // Sum per-candidate usage.
+    // 7b. Pre-delivery publish-gate filter. Without this, the operator
+    // can approve a draft via Telegram only to have `check_publish_gate`
+    // reject it post-pick (the writer prompt fix in da5d4f7 reduces but
+    // does not eliminate this — LLM output is probabilistic). Drop any
+    // candidate the gate would reject and only deliver the survivors.
+    // When the whole set is rejected, emit
+    // `ReviewOutcome::AllCandidatesGateRejected` and skip delivery.
+    let mut all_rejection_reasons: Vec<String> = Vec::new();
+    let mut surviving: Vec<CandidateRecord> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        match crate::pipeline::check_publish_gate(&c.draft, &profile) {
+            Ok(()) => surviving.push(c),
+            Err(gate_err) => {
+                let reason = gate_err.to_string();
+                progress(&format!(
+                    "pre-filter dropped candidate {}: {reason}",
+                    c.variant_index
+                ));
+                tracing::warn!(
+                    variant = c.variant_index,
+                    reason = %reason,
+                    "publish_gate rejected candidate before delivery"
+                );
+                // Tokens were spent even though we drop the candidate.
+                total_usage += c.usage;
+                all_rejection_reasons.push(reason);
+            }
+        }
+    }
+    let candidates = surviving;
+
+    if candidates.is_empty() {
+        return Ok(ReviewOutput {
+            candidates: Vec::new(),
+            research_digest: research_digest.clone(),
+            usage_summary: total_usage,
+            outcome: ReviewOutcome::AllCandidatesGateRejected {
+                reasons: all_rejection_reasons,
+            },
+            head_image_attached: false,
+        });
+    }
+
+    // Sum per-candidate usage for the survivors.
     for c in &candidates {
         total_usage += c.usage;
     }
@@ -953,7 +1005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_review_pipeline_pick_publish_gate_rejects_long_draft() {
+    async fn run_review_pipeline_all_candidates_gate_rejected_skips_delivery() {
         let (_dir, profiles_root) = seed_snapshot("x");
         let too_long = "x".repeat(290);
         let provider = MockProvider::arc(vec![
@@ -962,22 +1014,31 @@ mod tests {
             r#"{"verdict": "pass", "style_match_score": 0.9}"#,
             r#"{"verdict": "verified"}"#,
         ]);
+        // Pick(0) would route to a candidate the gate rejects post-pick in
+        // the old flow. With the pre-delivery filter, the bad candidate is
+        // dropped before deliver_and_await is ever called — so this mock's
+        // outcome is irrelevant.
         let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
         let twitter_tool: Arc<dyn Tool> = MockTwitterTool::errored("should not be called");
         let cfg = mk_review_cfg(&profiles_root, provider, delivery, twitter_tool);
         let out = run_review_pipeline(cfg)
             .await
-            .expect("gate rejection is success");
+            .expect("all-rejected pre-filter is a success outcome");
         match out.outcome {
-            ReviewOutcome::GateRejected {
-                chosen_index,
-                reason,
-            } => {
-                assert_eq!(chosen_index, 0);
-                assert!(reason.contains("280"), "got: {reason}");
+            ReviewOutcome::AllCandidatesGateRejected { reasons } => {
+                assert_eq!(reasons.len(), 1, "exactly 1 candidate was rejected");
+                assert!(
+                    reasons[0].contains("280"),
+                    "rejection reason should cite the 280-char cap; got: {}",
+                    reasons[0]
+                );
             }
-            other => panic!("expected GateRejected, got {other:?}"),
+            other => panic!("expected AllCandidatesGateRejected, got {other:?}"),
         }
+        assert!(
+            out.candidates.is_empty(),
+            "no candidates should be retained when all are filtered out"
+        );
     }
 
     #[tokio::test]

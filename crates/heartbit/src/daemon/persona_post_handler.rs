@@ -316,6 +316,11 @@ fn map_review_outcome(o: &ReviewOutcome) -> PostOutcome {
             chosen_index: *chosen_index,
             reason: reason.clone(),
         },
+        ReviewOutcome::AllCandidatesGateRejected { reasons } => {
+            PostOutcome::AllCandidatesGateRejected {
+                reasons: reasons.clone(),
+            }
+        }
     }
 }
 
@@ -335,6 +340,7 @@ fn render_history_block(history: &[PostHistoryEntry]) -> String {
                 PostOutcome::SkippedDuplicate => "SkippedDuplicate",
                 PostOutcome::GateRejected { .. } => "GateRejected",
                 PostOutcome::PublishFailed { .. } => "PublishFailed",
+                PostOutcome::AllCandidatesGateRejected { .. } => "AllCandidatesGateRejected",
             };
             let topic = if entry.topic.is_empty() {
                 "(no topic)"
