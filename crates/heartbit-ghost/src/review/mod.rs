@@ -438,6 +438,28 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
     let mut all_rejection_reasons: Vec<String> = Vec::new();
     let mut surviving: Vec<CandidateRecord> = Vec::with_capacity(candidates.len());
     for c in candidates {
+        // Two-layer pre-filter: (a) publish_gate (280-char cap, thread
+        // shape), (b) fact_check verdict (zero-tolerance sourcing).
+        // Order matters only for the rejection-reason text the operator
+        // sees — semantically the filters are AND-composed.
+        if let crate::pipeline::FactVerdict::Unverifiable {
+            reason: fact_reason,
+        } = &c.fact_check_verdict
+        {
+            let reason = format!("fact_check unverifiable: {fact_reason}");
+            progress(&format!(
+                "pre-filter dropped candidate {}: {reason}",
+                c.variant_index
+            ));
+            tracing::warn!(
+                variant = c.variant_index,
+                reason = %reason,
+                "fact_check rejected candidate before delivery"
+            );
+            total_usage += c.usage;
+            all_rejection_reasons.push(reason);
+            continue;
+        }
         match crate::pipeline::check_publish_gate(&c.draft, &profile) {
             Ok(()) => surviving.push(c),
             Err(gate_err) => {

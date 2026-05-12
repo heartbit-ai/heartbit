@@ -17,6 +17,13 @@ OUTPUT FORMAT (free-form text, no JSON):
 - A short list of "open questions" the topic raises (3-5 items).
 - Notable quotes (1-3) attributed by author and link.
 
+SOURCING — ZERO TOLERANCE FOR INVENTION
+- Every quantitative claim (number, percentage, dollar amount, date, count, version) MUST have an inline source link from a URL you actually fetched. Never paraphrase numbers — copy the exact figure from the source.
+- "Many companies report X", "studies show Y", "researchers found Z" without a specific URL = drop the claim entirely. Vague aggregates are the most common hallucination vector.
+- A bullet without a URL is not a fact. Either find the source or omit the bullet.
+- Attribution claims ("X said Y", "the paper showed Z") must trace to a fetched source. No invented quotes.
+- If you cannot find any sourced facts, return a SHORT digest stating that and listing the open questions only. Better to ship less than to ship fabrication — the writer downstream is required to refuse unsourced numbers, so unsupported bullets just get dropped anyway.
+
 Do NOT write the post itself. The writer agent will compose. Do NOT speculate beyond what the sources support."#;
 
 /// Construct the researcher [`AgentConfig`].
@@ -61,6 +68,27 @@ mod tests {
         assert!(
             !s.contains("(twitter)") && !s.contains("on x ") && !s.contains(" x ("),
             "researcher prompt must not mention X as a platform; got snippet: {s}"
+        );
+    }
+
+    /// Regression: zero-tolerance for invented stats in the digest. The
+    /// researcher is the first line of defense; if it fabricates a
+    /// quantitative claim, downstream writer + fact_check both pass it
+    /// through because they only check against the digest, not the world.
+    #[test]
+    fn researcher_prompt_states_zero_tolerance_for_invention() {
+        let p = RESEARCHER_SYSTEM_PROMPT;
+        assert!(
+            p.contains("ZERO TOLERANCE") || p.contains("zero tolerance"),
+            "researcher prompt must state zero-tolerance for invented numbers; got: {p}"
+        );
+        assert!(
+            p.contains("source link") || p.contains("URL"),
+            "researcher prompt must require explicit source links for quant claims; got: {p}"
+        );
+        assert!(
+            p.contains("drop the claim") || p.contains("omit") || p.contains("not a fact"),
+            "researcher prompt must instruct dropping unsourced claims; got: {p}"
         );
     }
 }

@@ -20,6 +20,13 @@ FORMAT — HARD CONSTRAINTS
 - If your content would exceed 280 chars, split it into a thread. Separate tweets with a BLANK LINE (i.e. a double newline). A single newline is a line break WITHIN one tweet, NOT a tweet separator. Drafts that put each sentence on its own single-newline line are read as ONE long tweet and will be rejected.
 - Respect the persona's thread_max_length from the voice guidelines — never emit more tweets than that. Prefer fewer, denser tweets to a long thread.
 
+SOURCING — ZERO TOLERANCE FOR INVENTION
+- Every specific number, percentage, dollar amount, count, date, or version in the draft MUST appear in the research digest. Copy figures exactly; never paraphrase or approximate.
+- "Plausible-sounding" is NOT verified. If the digest says "meaningful improvement", you do NOT write "30% improvement". If the digest gives a range, do not collapse it to a point estimate.
+- Attribution claims ("X said Y", "the paper showed Z", "the team reported W") must trace verbatim to the research digest. No invented quotes, no invented authorship.
+- If you don't have a sourced number for a claim, reframe qualitatively ("often", "noticeably more", "in our tests") OR drop the claim entirely. Never invent precision to make a tweet sound sharper.
+- Fact_check WILL reject any unsourced number and the draft will be silently dropped — the operator never sees it. Save the round trip: source it or skip it.
+
 Honor the voice guidelines exactly. If they say "no em-dashes", use no em-dashes. If they say "lowercase", lowercase everything. If they say "no hedging", make claims, not suggestions."#;
 
 /// Construct the writer [`AgentConfig`].
@@ -82,6 +89,29 @@ mod tests {
         assert!(
             p.contains("blank line") || p.contains("double newline"),
             "prompt must explain thread separator (blank line / double newline); got: {p}"
+        );
+    }
+
+    /// Regression: zero-tolerance rule for invented numbers / attributions.
+    /// Pinned because the previous lax prompt let the writer hallucinate
+    /// "30% improvement" style stats with no source.
+    #[test]
+    fn writer_prompt_states_zero_tolerance_for_invention() {
+        let p = WRITER_SYSTEM_PROMPT;
+        assert!(
+            p.contains("ZERO TOLERANCE") || p.contains("zero tolerance"),
+            "prompt must state zero-tolerance for invented numbers; got: {p}"
+        );
+        assert!(
+            p.contains("research digest"),
+            "prompt must anchor sourcing in the research digest; got: {p}"
+        );
+        assert!(
+            p.contains("never invent")
+                || p.contains("never approximate")
+                || p.contains("Never invent")
+                || p.contains("never paraphrase"),
+            "prompt must forbid invention/approximation of numbers; got: {p}"
         );
     }
 }

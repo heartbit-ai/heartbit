@@ -20,6 +20,13 @@ PROCESS
 3. If any claim is contradicted by the digest or absent from it, return "unverifiable" with the specific claim called out.
 4. If every claim is supported, return "verified".
 
+BRIGHT-LINE RULES — DEFAULT TO UNVERIFIABLE
+- Any specific number, percentage, dollar amount, count, date, or version that does NOT appear verbatim in the research digest = "unverifiable". No exceptions for "plausible-sounding", "industry standard", or "close enough to a digest figure".
+- If the draft says "30% improvement" and the digest says "meaningful improvement", that is "unverifiable" — the writer invented precision.
+- Any attribution ("X said Y", "the paper showed Z", "the team reported W") that doesn't appear verbatim in the digest = "unverifiable".
+- Any URL in the draft must appear in the digest. Invented URLs = "unverifiable".
+- Default to "unverifiable" on any ambiguity. The writer can be rerun; ship-with-fabrication is permanent. The downstream pipeline will silently drop unverifiable drafts before the operator sees them — your verdict is load-bearing.
+
 Do NOT verify against your training data. Only the supplied research digest counts. Aesthetic / stylistic / opinion content is not subject to fact-check (skip it)."#;
 
 /// Construct the fact_check [`AgentConfig`].
@@ -59,6 +66,29 @@ mod tests {
         assert!(
             cfg.response_schema.is_some(),
             "fact_check produces structured verdict"
+        );
+    }
+
+    /// Regression: the bright-line rule must remain visible so future
+    /// edits don't soften it into "use judgment". The downstream pre-
+    /// filter relies on fact_check returning `unverifiable` for any
+    /// unsourced number.
+    #[test]
+    fn fact_check_prompt_states_bright_line_rule() {
+        let p = FACT_CHECK_SYSTEM_PROMPT;
+        assert!(
+            p.contains("BRIGHT-LINE") || p.contains("bright-line"),
+            "fact_check prompt must state the bright-line rule; got: {p}"
+        );
+        assert!(
+            p.contains("DEFAULT TO UNVERIFIABLE")
+                || p.contains("default to unverifiable")
+                || p.contains("Default to \"unverifiable\""),
+            "fact_check prompt must instruct default-to-unverifiable on ambiguity; got: {p}"
+        );
+        assert!(
+            p.contains("verbatim"),
+            "fact_check prompt must require verbatim digest match for numbers; got: {p}"
         );
     }
 }
