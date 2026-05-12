@@ -35,6 +35,28 @@ Run this as part of CI or a deploy hook before rolling out config changes.
 | `post_history_lookback_days` | `30` | How far back duplicate-topic detection scans. |
 | `topic_brief` | unset | Free-form prompt addendum for the topic generator. |
 
+## Engagement-voice provider override
+
+By default every sub-agent in the proactive-post pipeline (researcher, writer, style-critic, fact-check) runs on the daemon's global `[provider]`. The writer + style-critic together drive the "engagement voice" — what the post sounds like — while researcher + fact-check drive verification. These have different ideal models.
+
+Set `[daemon.persona_posts.writer_provider]` to route just the writer and style-critic through a different model:
+
+```toml
+[[daemon.persona_posts]]
+persona = "heartbit-ghost:x"
+# ... other knobs ...
+
+[daemon.persona_posts.writer_provider]
+name = "openrouter"
+model = "x-ai/grok-4"
+# prompt_caching = false        # Grok doesn't support Anthropic prompt caching
+# base_url, api_key — same shape as [provider]; see configuration.md
+```
+
+When the block is omitted, all four stages share the global `[provider]` (prior behavior, no change). The override accepts the same shape as `[provider]` (name, model, base_url, api_key, prompt_caching, cascade), but is wired without the global retry/circuit wrappers in v1 — set the writer-provider retry block separately if needed.
+
+Operators typically pair this with a `[provider]` that's strong on verification (e.g. Claude Sonnet) and a `writer_provider` that's stronger on on-brand X voice (e.g. Grok). Researcher and fact-check stay on the global provider.
+
 ## Engagement-feedback loop
 
 Engagement metrics are refreshed in the background and the top-N engaged posts are injected into the writer as few-shot exemplars.
