@@ -419,6 +419,18 @@ pub struct PersonaPostsConfig {
     /// engagement. Default 24 — gives the algorithm time to fan out.
     #[serde(default = "default_engagement_min_age_hours")]
     pub engagement_min_age_hours: i64,
+
+    /// Override LLM provider for the writer + style-critic stages of the
+    /// proactive-post pipeline. When set, these two "engagement voice"
+    /// agents use this provider; the researcher and fact-check stages
+    /// keep using the global `[provider]`. Use this to point the
+    /// engagement voice at a different model (e.g. Grok via OpenRouter)
+    /// without affecting verification or research quality.
+    ///
+    /// Configured under `[daemon.persona_posts.writer_provider]`. When
+    /// absent, the writer and critic share the global provider.
+    #[serde(default)]
+    pub writer_provider: Option<super::agent::AgentProviderConfig>,
 }
 
 fn default_post_interval_seconds() -> u64 {
@@ -572,6 +584,29 @@ persona = "heartbit-ghost:x"
         assert_eq!(p.engagement_top_n, 5);
         assert_eq!(p.engagement_max_age_days, 30);
         assert_eq!(p.engagement_min_age_hours, 24);
+        // Writer provider override defaults to None.
+        assert!(p.writer_provider.is_none());
+    }
+
+    #[test]
+    fn persona_posts_config_parses_writer_provider_override() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+
+[persona_posts.writer_provider]
+name = "openrouter"
+model = "x-ai/grok-4"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let p = &cfg.persona_posts[0];
+        let wp = p.writer_provider.as_ref().expect("writer_provider present");
+        assert_eq!(wp.name, "openrouter");
+        assert_eq!(wp.model, "x-ai/grok-4");
     }
 
     #[test]

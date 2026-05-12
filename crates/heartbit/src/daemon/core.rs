@@ -735,6 +735,10 @@ impl DaemonCore {
                     engagement_top_n: entry.engagement_top_n,
                     engagement_max_age_days: entry.engagement_max_age_days,
                     engagement_min_age_hours: entry.engagement_min_age_hours,
+                    // The runtime-built provider lives on PersonaPostEntry,
+                    // not in this config-shaped recreation. Scheduler doesn't
+                    // need it (only the post handler does).
+                    writer_provider: None,
                 };
                 let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
                     crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
@@ -1257,6 +1261,7 @@ impl DaemonCore {
                             let operator_user_id = entry.operator_user_id.clone();
                             let top_posts_provider = entry.top_posts_provider.clone();
                             let top_n = entry.engagement_top_n;
+                            let writer_provider = entry.writer_provider.clone();
                             let registry = ctx.registry.clone();
                             let provider = ctx.provider.clone();
                             let delivery = ctx.delivery.clone();
@@ -1283,6 +1288,7 @@ impl DaemonCore {
                                     top_posts_provider: top_posts_provider
                                         .as_deref(),
                                     top_n,
+                                    writer_provider: writer_provider.clone(),
                                 };
                                 if let Err(e) =
                                     crate::daemon::handle_persona_post(deps).await

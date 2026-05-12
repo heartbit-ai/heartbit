@@ -60,6 +60,11 @@ pub struct PersonaPostDeps<'a> {
     /// disables injection. The min-3 threshold is applied inside the
     /// handler, not here.
     pub top_n: usize,
+    /// Optional override provider for the writer + style-critic agents.
+    /// `None` falls back to `provider`. Built by the CLI startup from
+    /// `[daemon.persona_posts.writer_provider]` and threaded onto the
+    /// matching `PersonaPostEntry`.
+    pub writer_provider: Option<Arc<BoxedProvider>>,
 }
 
 /// Run one `PersonaPost` handler invocation.
@@ -208,6 +213,7 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
         } else {
             Some(exemplar_block.as_str())
         },
+        writer_provider: deps.writer_provider.clone(),
     };
     let review_out = run_review_pipeline(cfg)
         .await
@@ -683,6 +689,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -735,6 +742,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("no_topic");
@@ -797,6 +805,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("dup");
@@ -848,6 +857,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("skip");
@@ -887,6 +897,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let err = handle_persona_post(deps)
@@ -946,6 +957,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: None,
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -1095,6 +1107,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 5,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -1164,6 +1177,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 5,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("cold start");
@@ -1236,6 +1250,7 @@ mod tests {
             profiles_root: &profiles_root,
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 0,
+            writer_provider: None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("disabled");

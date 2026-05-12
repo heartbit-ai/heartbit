@@ -58,6 +58,12 @@ pub struct PersonaPostEntry {
     /// `None` disables injection — used by tests and when the operator
     /// has set `engagement_top_n = 0`.
     pub top_posts_provider: Option<Arc<dyn TopPostsProvider>>,
+
+    /// Optional override LLM provider for the writer + style-critic
+    /// agents only. `None` means both share `PostsContext.provider`
+    /// with researcher + fact-check. Built at daemon startup from
+    /// `[daemon.persona_posts.writer_provider]`.
+    pub writer_provider: Option<Arc<BoxedProvider>>,
 }
 
 impl std::fmt::Debug for PersonaPostEntry {

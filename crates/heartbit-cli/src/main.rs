@@ -743,7 +743,7 @@ pub(crate) fn wrap_with_circuit(
 ///
 /// Reads the API key from the environment (same as `build_provider_from_config`).
 /// Uses the global retry config if provided, otherwise wraps with retry defaults.
-fn build_agent_provider(
+pub(crate) fn build_agent_provider(
     config: &heartbit::AgentProviderConfig,
     retry: Option<RetryConfig>,
     on_retry: Option<Arc<OnRetry>>,

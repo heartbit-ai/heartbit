@@ -196,6 +196,7 @@ mod tests {
             engagement_top_n: 5,
             engagement_max_age_days: 30,
             engagement_min_age_hours: 24,
+            writer_provider: None,
         }
     }
 

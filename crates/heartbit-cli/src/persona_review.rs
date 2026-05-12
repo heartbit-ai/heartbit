@@ -513,6 +513,9 @@ pub async fn review_config_from_env<'a>(
         researcher_override,
         // One-shot CLI invocations don't wire the engagement loop.
         exemplar_block: None,
+        // One-shot CLI uses the global provider for all stages — there
+        // is no per-persona daemon config in this path.
+        writer_provider: None,
     })
 }
 

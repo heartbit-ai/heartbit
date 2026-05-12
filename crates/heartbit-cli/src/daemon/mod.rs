@@ -349,6 +349,28 @@ pub async fn run_daemon(
                     engagement_max_age_days: cfg.engagement_max_age_days,
                     engagement_top_n: cfg.engagement_top_n,
                     top_posts_provider: Some(top_posts_provider),
+                    // Build the per-persona writer+critic provider override
+                    // from `[daemon.persona_posts.writer_provider]` when set.
+                    // Retry/on_retry are intentionally None — the override
+                    // provider runs inside the same agent loop and reuses
+                    // the parent's circuit breaker layer above; the
+                    // RetryingProvider wrapping is global to all providers
+                    // built from `build_provider_from_config`, not part of
+                    // per-agent overrides today. Operators who want retry
+                    // on the writer provider specifically should set it
+                    // via `[daemon.persona_posts.writer_provider.retry]`
+                    // (not wired in v1 — falls back to provider defaults).
+                    writer_provider: cfg
+                        .writer_provider
+                        .as_ref()
+                        .map(|wp_cfg| crate::build_agent_provider(wp_cfg, None, None))
+                        .transpose()
+                        .with_context(|| {
+                            format!(
+                                "build writer_provider override for persona '{}'",
+                                cfg.persona
+                            )
+                        })?,
                 },
             );
         }

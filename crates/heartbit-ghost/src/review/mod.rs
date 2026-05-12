@@ -67,6 +67,12 @@ pub struct ReviewConfig<'a> {
     /// no injection — the writer runs unchanged. Kept as `Option<&str>`
     /// so we can borrow the handler's owned String without cloning.
     pub exemplar_block: Option<&'a str>,
+    /// Override LLM provider for the writer + style-critic stages only.
+    /// `None` → both share `provider` with researcher and fact-check.
+    /// Built by the daemon from `[daemon.persona_posts.writer_provider]`
+    /// when present. The "engagement voice" stages can run on a different
+    /// model (e.g. Grok) while research/fact-check stay on the default.
+    pub writer_provider: Option<Arc<BoxedProvider>>,
 }
 
 /// Output of a successful review-mode run.
@@ -299,21 +305,27 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
         stage: "researcher".to_string(),
         source: e,
     })?;
+    // Writer + style_critic optionally run on a different provider than
+    // researcher + fact_check. This lets operators swap the "engagement
+    // voice" model (e.g. to Grok via OpenRouter) without affecting the
+    // verification stages. When writer_provider is None, both fall back
+    // to cfg.provider — preserves prior behavior.
+    let voice_provider = cfg
+        .writer_provider
+        .clone()
+        .unwrap_or_else(|| cfg.provider.clone());
     let writer =
-        crate::pipeline::runner_from_recipe(cfg.provider.clone(), writer_recipe(), Vec::new())
+        crate::pipeline::runner_from_recipe(voice_provider.clone(), writer_recipe(), Vec::new())
             .map_err(|e| PipelineError::Builder {
                 stage: "writer".to_string(),
                 source: e,
             })?;
-    let critic = crate::pipeline::runner_from_recipe(
-        cfg.provider.clone(),
-        style_critic_recipe(),
-        Vec::new(),
-    )
-    .map_err(|e| PipelineError::Builder {
-        stage: "style_critic".to_string(),
-        source: e,
-    })?;
+    let critic =
+        crate::pipeline::runner_from_recipe(voice_provider, style_critic_recipe(), Vec::new())
+            .map_err(|e| PipelineError::Builder {
+                stage: "style_critic".to_string(),
+                source: e,
+            })?;
     let fact =
         crate::pipeline::runner_from_recipe(cfg.provider.clone(), fact_check_recipe(), Vec::new())
             .map_err(|e| PipelineError::Builder {
@@ -937,6 +949,7 @@ mod tests {
             mode_addendum: None,
             researcher_override: None,
             exemplar_block: None,
+            writer_provider: None,
         }
     }
 

@@ -433,6 +433,8 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 // semantics — exactly the same as a fresh daemon run.
                 top_posts_provider: None,
                 top_n: 0,
+                // One-shot CLI uses the global provider for all stages.
+                writer_provider: None,
             };
             let outcome = heartbit::handle_persona_post(deps)
                 .await
