@@ -17,11 +17,13 @@ use thiserror::Error;
 use crate::voice::SnapshotError;
 
 pub mod dedup;
+pub mod length_normalize;
 pub mod prompts;
 pub mod publish_gate;
 pub mod style_render;
 pub mod verdicts;
 
+pub use length_normalize::{MAX_TWEET_CHARS, normalize_tweet_length};
 pub use publish_gate::{PublishGateError, check_publish_gate};
 pub use style_render::render_style_profile_as_english;
 pub use verdicts::{
@@ -385,7 +387,17 @@ pub(crate) async fn generate_candidate(
                 stage: format!("writer (variant {variant_idx}, iter {iter})"),
                 source: e,
             })?;
-        let draft = writer_out.result.clone();
+        // Deterministic length normalization. The writer prompt asks for
+        // ≤280 char tweets but LLMs can't reliably count characters, so
+        // ~33% of drafts overrun (observed in production 2026-05-12).
+        // The normalizer is a no-op when every segment already fits;
+        // when something overruns it splits on sentence boundaries. The
+        // critic and fact_check downstream see the normalized text so
+        // their verdicts match what publish_gate will check.
+        let draft = length_normalize::normalize_tweet_length(
+            &writer_out.result,
+            length_normalize::MAX_TWEET_CHARS,
+        );
         total_usage += writer_out.tokens_used;
 
         let critic_msg = prompts::build_critic_user_message(&draft, voice_guidelines);
