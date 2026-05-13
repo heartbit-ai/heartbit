@@ -192,6 +192,7 @@ mod tests {
             .execute(&ctx, input)
             .await
             .expect("validation returns Ok(ToolOutput::error)");
+        assert!(out.is_error);
         assert!(
             out.content.contains("exceeds 280"),
             "expected length-rejection; got: {}",
@@ -208,10 +209,67 @@ mod tests {
         });
         let ctx = ExecutionContext::default();
         let out = tool.execute(&ctx, input).await.expect("Ok");
+        assert!(out.is_error);
         assert!(
             out.content.contains("non-empty numeric string"),
             "got: {}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn quote_returns_unauthenticated_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/2/tweets"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let input = QuoteInput {
+            text: "x".into(),
+            quote_tweet_id: "1".into(),
+        };
+        let result = call_x(&client, &input).await;
+        assert!(matches!(result, Err(XApiError::Unauthenticated(_))));
+    }
+
+    #[tokio::test]
+    async fn definition_has_stable_name() {
+        let tool = TwitterQuoteTool::new();
+        assert_eq!(tool.definition().name, "twitter_quote");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_empty_text() {
+        let tool = TwitterQuoteTool::new();
+        let input = serde_json::json!({
+            "text": "",
+            "quote_tweet_id": "9001"
+        });
+        let ctx = ExecutionContext::default();
+        let out = tool.execute(&ctx, input).await.expect("Ok");
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("must not be empty"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_no_credentials_returns_clear_error() {
+        let tool = TwitterQuoteTool::new();
+        let ctx = ExecutionContext::default();
+        let result = tool
+            .execute(
+                &ctx,
+                serde_json::json!({"text": "hi", "quote_tweet_id": "1"}),
+            )
+            .await
+            .expect("Tool::execute returns Ok");
+        assert!(result.is_error);
+        assert!(result.content.contains("no credential resolver"));
     }
 }
