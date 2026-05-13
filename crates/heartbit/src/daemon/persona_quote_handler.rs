@@ -194,9 +194,7 @@ mod tests {
     use heartbit_core::persona::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
     use heartbit_core::tool::ToolOutput;
 
-    use heartbit_ghost::quote::sources::{
-        InMemoryQuoteSeenStore, QuoteCandidate, QuoteSource, QuoteStoreError,
-    };
+    use heartbit_ghost::quote::sources::{InMemoryQuoteSeenStore, QuoteCandidate, QuoteSource};
     use heartbit_ghost::quote::{QuoteOutcome, QuoteReviewDelivery, QuoteReviewMessage};
     use heartbit_ghost::review::{
         DeliveredReview, DeliveryOutcome, DeliveryReceipt, ReviewDeliveryError,
@@ -624,9 +622,4 @@ mod tests {
             .expect("was_seen should not error");
         assert!(was_seen, "seen_store must record the source id");
     }
-
-    // Silence unused-import false-positive for QuoteStoreError when the
-    // mocks-only error type compiles cleanly.
-    #[allow(dead_code)]
-    fn _force_use_quote_store_error(_e: QuoteStoreError) {}
 }

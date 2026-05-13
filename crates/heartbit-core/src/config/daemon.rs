@@ -509,7 +509,10 @@ pub struct PersonaQuotesConfig {
     /// Required — must contain at least one entry.
     pub source_user_ids: Vec<String>,
     /// Number of candidate quote-tweets to draft per chosen source
-    /// tweet (1..=5). Default 3.
+    /// tweet (1..=3). Default 3. Bounded tighter than the proactive
+    /// post pipeline (1..=10) because quote-tweets are higher-stakes
+    /// (you're commenting on someone else's content) and 3 candidates
+    /// hits the cost/quality knee.
     #[serde(default = "default_quote_candidates_per_draft")]
     pub candidates_per_draft: usize,
     /// Backend for the "already quoted" dedup store: `"in_memory"` or
