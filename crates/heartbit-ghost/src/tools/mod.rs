@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod mentions;
+pub mod quote;
 pub mod reply;
 pub mod repo_inspect;
 pub mod search;
@@ -15,6 +16,7 @@ pub mod user_tweets;
 
 pub use client::{XApiError, XClient, format_error};
 pub use mentions::TwitterMentionsTool;
+pub use quote::TwitterQuoteTool;
 pub use reply::TwitterReplyTool;
 pub use repo_inspect::RepoInspectTool;
 pub use search::TwitterSearchTool;
