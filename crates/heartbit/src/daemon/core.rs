@@ -1401,6 +1401,7 @@ mod tests {
             idempotency: crate::config::IdempotencyConfig::default(),
             persona_mentions: vec![],
             persona_posts: vec![],
+            persona_quotes: vec![],
         }
     }
 
