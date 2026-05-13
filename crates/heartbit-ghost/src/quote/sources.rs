@@ -186,7 +186,7 @@ impl QuoteSeenStore for InMemoryQuoteSeenStore {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), QuoteStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let key = format!("{persona}:{tweet_id}");
+            let key = format!("{persona}\0{tweet_id}");
             self.seen.lock().await.insert(key);
             Ok(())
         })
@@ -200,7 +200,7 @@ impl QuoteSeenStore for InMemoryQuoteSeenStore {
         Box<dyn std::future::Future<Output = Result<bool, QuoteStoreError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let key = format!("{persona}:{tweet_id}");
+            let key = format!("{persona}\0{tweet_id}");
             Ok(self.seen.lock().await.contains(&key))
         })
     }
@@ -235,7 +235,7 @@ impl JsonlQuoteSeenStore {
                     continue;
                 }
                 let entry: SeenEntry = serde_json::from_str(line)?;
-                cache.insert(format!("{}:{}", entry.persona, entry.tweet_id));
+                cache.insert(format!("{}\0{}", entry.persona, entry.tweet_id));
             }
         }
         Ok(Self {
@@ -253,7 +253,7 @@ impl QuoteSeenStore for JsonlQuoteSeenStore {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), QuoteStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let key = format!("{persona}:{tweet_id}");
+            let key = format!("{persona}\0{tweet_id}");
             let mut cache = self.cache.lock().await;
             if cache.contains(&key) {
                 return Ok(());
@@ -283,7 +283,7 @@ impl QuoteSeenStore for JsonlQuoteSeenStore {
         Box<dyn std::future::Future<Output = Result<bool, QuoteStoreError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let key = format!("{persona}:{tweet_id}");
+            let key = format!("{persona}\0{tweet_id}");
             Ok(self.cache.lock().await.contains(&key))
         })
     }
@@ -333,6 +333,25 @@ mod tests {
             content.lines().count(),
             1,
             "duplicate record() calls must not write twice; got:\n{content}"
+        );
+    }
+
+    /// Persona slugs in this codebase contain `:` (e.g. "heartbit-ghost:x").
+    /// The key separator must NOT be `:` or persona="heartbit-ghost" +
+    /// tweet="x:111" would collide with persona="heartbit-ghost:x" +
+    /// tweet="111". Pinning the collision-safety here so a future
+    /// "just use colon" simplification trips this test.
+    #[tokio::test]
+    async fn key_separator_is_collision_safe_for_colon_in_persona_name() {
+        let store = InMemoryQuoteSeenStore::new();
+        // Record under persona "heartbit-ghost:x" with tweet "111".
+        store.record("heartbit-ghost:x", "111").await.unwrap();
+        // Different persona ("heartbit-ghost") with a tweet that LOOKS
+        // like it concatenates to the same key MUST be was_seen=false.
+        // If the separator were `:`, both would produce "heartbit-ghost:x:111".
+        assert!(
+            !store.was_seen("heartbit-ghost", "x:111").await.unwrap(),
+            "persona/tweet key collision detected — separator must not appear in slugs"
         );
     }
 }
