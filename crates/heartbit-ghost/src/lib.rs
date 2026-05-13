@@ -19,6 +19,7 @@ pub mod corpus;
 pub mod heartbit_rs;
 pub mod pipeline;
 pub mod posts;
+pub mod quote;
 pub mod reply;
 pub mod review;
 pub mod tools;
