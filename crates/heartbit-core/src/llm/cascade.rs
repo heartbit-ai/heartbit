@@ -53,16 +53,34 @@ fn default_refusal_patterns() -> Vec<String> {
     .collect()
 }
 
+/// Sentinel tool name injected by the agent framework when an agent
+/// has a `response_schema`. The LLM is expected to call this tool with
+/// structured args; calling it is the schema-bound "submit" action.
+/// Kept in sync with `agent::AgentRunner`'s injection site (search for
+/// `"__respond__"` in `crates/heartbit-core/src/agent/`).
+const RESPOND_TOOL_NAME: &str = "__respond__";
+
 impl ConfidenceGate for HeuristicGate {
-    fn accept(&self, _request: &CompletionRequest, response: &CompletionResponse) -> bool {
+    fn accept(&self, request: &CompletionRequest, response: &CompletionResponse) -> bool {
+        let has_tool_call = response
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
         // 1. Accept tool calls immediately
-        if self.accept_tool_calls
-            && response
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-        {
+        if self.accept_tool_calls && has_tool_call {
             return true;
+        }
+
+        // 1b. Schema-bound agents inject `__respond__` and the LLM MUST
+        // call it. If the request expects `__respond__` and the response
+        // is plain text, the downstream agent layer will reject with
+        // "LLM returned text without calling __respond__" — so the
+        // cascade must escalate here. Caught in production 2026-05-13
+        // when Gemini-flash returned text for the quote-pipeline's
+        // fact_check stage and the cheap tier was incorrectly accepted.
+        if !has_tool_call && request.tools.iter().any(|t| t.name == RESPOND_TOOL_NAME) {
+            return false;
         }
 
         // 2. Reject on MaxTokens
@@ -257,7 +275,7 @@ impl CascadingProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{ContentBlock, Message, StopReason, TokenUsage};
+    use crate::llm::types::{ContentBlock, Message, StopReason, TokenUsage, ToolDefinition};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -389,6 +407,88 @@ mod tests {
         // "I'm unable to help" via lowercase comparison.
         let resp = text_response("I'M UNABLE TO HELP with that", 10);
         assert!(!gate.accept(&req, &resp));
+    }
+
+    /// Build a CompletionRequest with `__respond__` in the tools list,
+    /// representing the schema-bound agent path (response_schema injection).
+    fn respond_tool_request() -> CompletionRequest {
+        CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("verify this claim")],
+            tools: vec![ToolDefinition {
+                name: "__respond__".into(),
+                description: "Submit the structured verdict.".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Build a ToolUse response calling the `__respond__` tool with
+    /// structured args, as a well-behaved schema-bound model would.
+    fn respond_tool_response() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-respond".into(),
+                name: "__respond__".into(),
+                input: json!({"verdict": "verified"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                output_tokens: 20,
+                ..Default::default()
+            },
+            model: None,
+        }
+    }
+
+    /// Regression: when the agent injects `__respond__` for structured
+    /// output but the LLM returns plain text instead of calling the tool,
+    /// the cascade MUST escalate. Otherwise the cheap tier's text-only
+    /// response is accepted upstream → schema validator rejects → whole
+    /// pipeline fails (observed in production 2026-05-13 on Gemini-flash
+    /// in the quote pipeline's fact_check stage).
+    #[test]
+    fn heuristic_gate_escalates_when_respond_tool_was_expected_but_not_called() {
+        let gate = HeuristicGate::default();
+        let req = respond_tool_request();
+        // Plain-text response, no __respond__ call — the failure mode.
+        let resp = text_response("Verified — the claim is supported.", 50);
+        assert!(
+            !gate.accept(&req, &resp),
+            "schema-bound agent + text response must escalate; \
+             otherwise the downstream agent layer rejects with \
+             `LLM returned text without calling __respond__`"
+        );
+    }
+
+    /// Sanity: when the schema-bound agent DOES get the tool call it
+    /// asked for, the gate accepts (no false-positive escalation).
+    #[test]
+    fn heuristic_gate_accepts_when_respond_tool_was_called_as_expected() {
+        let gate = HeuristicGate::default();
+        let req = respond_tool_request();
+        let resp = respond_tool_response();
+        assert!(
+            gate.accept(&req, &resp),
+            "well-behaved __respond__ call must not trip the new escalation"
+        );
+    }
+
+    /// Sanity: the new check ONLY fires when `__respond__` is in the
+    /// request's tools list. Free-form agents (no schema injection)
+    /// still take the existing text-response acceptance path.
+    #[test]
+    fn heuristic_gate_text_response_still_accepted_when_no_respond_tool() {
+        let gate = HeuristicGate::default();
+        let req = test_request(); // no tools
+        let resp = text_response("A normal long-enough response.", 50);
+        assert!(
+            gate.accept(&req, &resp),
+            "free-form agents shouldn't regress on text acceptance"
+        );
     }
 
     // -- Mock providers for CascadingProvider tests --
