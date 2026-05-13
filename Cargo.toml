@@ -41,6 +41,7 @@ axum = { version = "0.8", features = ["ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 cron = "0.13"
+whatlang = "0.16"
 prometheus = { version = "0.14", default-features = false }
 quick-xml = "0.37"
 pgvector = { version = "0.4", features = ["sqlx"] }

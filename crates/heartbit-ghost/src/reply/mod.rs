@@ -12,6 +12,7 @@ pub mod budget;
 pub mod budget_guard;
 pub mod conversation_guard;
 pub mod enrichment;
+pub mod language;
 pub mod prompts;
 pub mod scam_judge;
 pub mod spam_guard;
@@ -22,6 +23,7 @@ pub use budget::{BudgetError, DailyTokenBudget, InMemoryDailyBudget, JsonlDailyB
 pub use budget_guard::DailyBudgetGuard;
 pub use conversation_guard::ConversationDepthGuard;
 pub use enrichment::{EnrichmentCache, EnrichmentCacheStats, enrich_mentioner, fetch_parent_tweet};
+pub use language::{ReplyLanguage, detect_reply_language};
 pub use scam_judge::{ScamJudge, ScamVerdict};
 pub use spam_guard::{SkipReason, SpamGuard, SpamGuardConfig};
 pub use storage::{InMemoryMentionStore, JsonlMentionStore, MentionStore, StoreError};
@@ -381,6 +383,17 @@ pub async fn run_reply_pipeline(cfg: ReplyConfig<'_>) -> Result<ReplyOutput, Rep
     let voice_owned: Arc<str> = voice_guidelines.clone().into();
     let digest_owned: Arc<str> = digest.clone().into();
     let mode_owned: Option<Arc<str>> = cfg.mode_addendum.map(Arc::from);
+    // Detect the mention's language so the writer can mirror it. The
+    // researcher's digest is system-generated English; we want to mirror
+    // the user-supplied mention text, not the digest. Falls back to
+    // English on short / ambiguous inputs (see language module).
+    let reply_language = Arc::new(language::detect_reply_language(&cfg.mention.text));
+    tracing::info!(
+        author = %cfg.mention.author_handle,
+        lang = %reply_language.code,
+        lang_name = %reply_language.english_name,
+        "detected reply language"
+    );
 
     let mut joinset: tokio::task::JoinSet<
         Result<(String, f32, String, TokenUsage), heartbit_core::error::Error>,
@@ -392,9 +405,10 @@ pub async fn run_reply_pipeline(cfg: ReplyConfig<'_>) -> Result<ReplyOutput, Rep
         let voice = voice_owned.clone();
         let digest = digest_owned.clone();
         let mode = mode_owned.clone();
+        let lang = reply_language.clone();
         joinset.spawn(async move {
             let writer_msg =
-                prompts::build_reply_writer_user_message(&digest, &voice, mode.as_deref());
+                prompts::build_reply_writer_user_message(&digest, &voice, mode.as_deref(), &lang);
             let writer_out = writer.execute(&writer_msg).await?;
             let draft = writer_out.result.trim().to_string();
             // Writer-driven no_reply short-circuit.

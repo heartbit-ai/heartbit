@@ -1,6 +1,7 @@
 //! User-message builders for each reply-pipeline stage. Pure string
 //! composition — same shape as `pipeline/prompts.rs`.
 
+use super::language::ReplyLanguage;
 use super::{Mention, MentionerContext, TweetSnapshot};
 
 /// Build the mini-researcher's user message: the parent tweet (if any),
@@ -49,12 +50,18 @@ pub(crate) fn build_reply_research_user_message(
 }
 
 /// Build the writer's user message — the digest from the researcher,
-/// then voice guidelines, optional mode_addendum, and a clear final
-/// instruction.
+/// then voice guidelines, optional mode_addendum, the target language,
+/// and a clear final instruction.
+///
+/// `language` is the detected language of the mention text (see
+/// [`super::language::detect_reply_language`]). When the language is
+/// English the line is still emitted — it's cheap insurance against the
+/// LLM "translating" an English mention into another language.
 pub(crate) fn build_reply_writer_user_message(
     digest: &str,
     voice_guidelines: &str,
     mode_addendum: Option<&str>,
+    language: &ReplyLanguage,
 ) -> String {
     let mut out = String::new();
     out.push_str("Research digest (the specific point to engage with):\n");
@@ -67,6 +74,16 @@ pub(crate) fn build_reply_writer_user_message(
         out.push_str(addendum);
         out.push('\n');
     }
+    // Language instruction sits AFTER voice guidelines + addendum so the
+    // model treats it as the most-recent / most-specific constraint. The
+    // voice profile is English-described (voice_traits, ai_tells_to_avoid)
+    // but the LLM cross-translates the register to the target language —
+    // this is well within modern LLM capabilities and avoids per-language
+    // voice profiles for now.
+    out.push_str(&format!(
+        "\nRESPOND IN {}. Mirror the mention's language exactly — do not switch to English just because the voice guidelines are English-described.\n",
+        language.english_name
+    ));
     out.push_str("\nCompose ONE reply (≤280 chars). Output the reply text only.\n");
     out
 }
@@ -125,6 +142,7 @@ mod tests {
             "engage with: rig-rs comparison",
             "VOICE GUIDELINES",
             Some("EVANGELISM MODE — fixture"),
+            &ReplyLanguage::english(),
         );
         let voice_pos = s.find("VOICE GUIDELINES").expect("voice present");
         let add_pos = s
@@ -136,8 +154,45 @@ mod tests {
 
     #[test]
     fn writer_message_omits_addendum_block_when_none() {
-        let s = build_reply_writer_user_message("digest", "VOICE", None);
+        let s = build_reply_writer_user_message("digest", "VOICE", None, &ReplyLanguage::english());
         assert!(!s.contains("EVANGELISM"));
         assert!(s.contains("Compose ONE reply"));
+    }
+
+    #[test]
+    fn writer_message_injects_target_language() {
+        let french = ReplyLanguage {
+            code: "fra".to_string(),
+            english_name: "French".to_string(),
+        };
+        let s = build_reply_writer_user_message("digest", "VOICE", None, &french);
+        assert!(
+            s.contains("RESPOND IN French."),
+            "must include explicit language directive; got: {s}"
+        );
+        assert!(
+            s.contains("do not switch to English"),
+            "must remind the model not to fall back to English; got: {s}"
+        );
+    }
+
+    #[test]
+    fn writer_message_language_directive_follows_addendum() {
+        // Layering matters: voice → addendum → language → final compose
+        // instruction. The most-specific constraint (language) must be
+        // the last thing the model sees before the action verb.
+        let french = ReplyLanguage {
+            code: "fra".to_string(),
+            english_name: "French".to_string(),
+        };
+        let s =
+            build_reply_writer_user_message("digest", "VOICE", Some("ADDENDUM_MARKER"), &french);
+        let addendum_pos = s.find("ADDENDUM_MARKER").expect("addendum present");
+        let lang_pos = s
+            .find("RESPOND IN French.")
+            .expect("language directive present");
+        let compose_pos = s.find("Compose ONE reply").expect("compose present");
+        assert!(addendum_pos < lang_pos, "language must follow addendum");
+        assert!(lang_pos < compose_pos, "compose must follow language");
     }
 }
