@@ -17,7 +17,10 @@ pub mod notify;
 pub mod openai_compat;
 pub mod persona_post;
 pub mod persona_post_handler;
+pub mod persona_quote;
+pub mod persona_quote_handler;
 pub mod posts_context;
+pub mod quotes_context;
 pub mod reply_draft_handler;
 pub mod runtime_types;
 pub mod store;
@@ -42,7 +45,10 @@ pub use openai_compat::{
 };
 pub use persona_post::PersonaPostScheduler;
 pub use persona_post_handler::{PersonaPostDeps, handle_persona_post};
+pub use persona_quote::PersonaQuoteScheduler;
+pub use persona_quote_handler::{PersonaQuoteDeps, handle_persona_quote};
 pub use posts_context::{PersonaPostEntry, PostsContext};
+pub use quotes_context::{PersonaQuoteEntry, QuotesContext};
 pub use reply_draft_handler::{ReplyDraftDeps, handle_reply_draft};
 pub use runtime_types::{
     EdgeConditionPattern, EdgeConditionSpec, EdgeTransform, RuntimeAdvancedConfig,

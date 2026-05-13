@@ -85,6 +85,13 @@ pub enum DaemonCommand {
         /// Persona name (e.g. `"heartbit-ghost:x"`).
         persona: String,
     },
+    /// Fire one quote-tweet handler invocation. Picks an un-quoted source
+    /// tweet from the configured `persona_quotes.source_user_ids`, drafts
+    /// via `run_quote_pipeline`, routes through Telegram review.
+    PersonaQuote {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+    },
     /// Refresh engagement metrics for every Posted tweet in the persona's
     /// history. Dispatched by `EngagementCollectorScheduler` on the
     /// configured cadence.
@@ -1130,6 +1137,21 @@ mod tests {
                 assert_eq!(persona, "heartbit-ghost:x");
             }
             other => panic!("expected PersonaPost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persona_quote_command_round_trips() {
+        let cmd = DaemonCommand::PersonaQuote {
+            persona: "heartbit-ghost:x".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::PersonaQuote { persona } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+            }
+            other => panic!("expected PersonaQuote, got {other:?}"),
         }
     }
 

@@ -487,6 +487,10 @@ pub struct DaemonCore {
     /// `PersonaPostScheduler` per persona at startup and dispatches
     /// `DaemonCommand::PersonaPost` to `handle_persona_post`.
     posts_context: Option<Arc<crate::daemon::PostsContext>>,
+    /// Optional quote-tweets context. When set, `run()` spawns one
+    /// `PersonaQuoteScheduler` per persona at startup and dispatches
+    /// `DaemonCommand::PersonaQuote` to `handle_persona_quote`.
+    quotes_context: Option<Arc<crate::daemon::QuotesContext>>,
     /// Persona mention context — when set, one `MentionPollScheduler` is spawned per
     /// `persona_mentions` entry, and `MentionPoll` / `ReplyDraft` commands are dispatched
     /// to the real free-function handlers.
@@ -531,6 +535,7 @@ impl DaemonCore {
             tenant_tracker: None,
             commands_topic: kafka_config.commands_topic.clone(),
             posts_context: None,
+            quotes_context: None,
             mention_context: None,
         };
         (core, handle)
@@ -569,6 +574,14 @@ impl DaemonCore {
     /// dispatches `PersonaPost` commands to the real handler.
     pub fn with_posts_context(mut self, ctx: Arc<crate::daemon::PostsContext>) -> Self {
         self.posts_context = Some(ctx);
+        self
+    }
+
+    /// Attach a quote-tweets context. After this is set, `run()`
+    /// spawns `PersonaQuoteScheduler` instances for each entry and
+    /// dispatches `PersonaQuote` commands to the real handler.
+    pub fn with_quotes_context(mut self, ctx: Arc<crate::daemon::QuotesContext>) -> Self {
+        self.quotes_context = Some(ctx);
         self
     }
 
@@ -764,6 +777,39 @@ impl DaemonCore {
                 let engagement_cancel = self.cancel.clone();
                 tokio::spawn(engagement_scheduler.run(engagement_cancel));
                 tracing::info!(persona = %persona, "engagement collector spawned");
+            }
+        }
+
+        // --- Spawn PersonaQuoteScheduler instances per configured persona ---
+        if let Some(ctx) = self.quotes_context.as_ref() {
+            for (persona, entry) in ctx.entries.iter() {
+                let cfg = heartbit_core::config::PersonaQuotesConfig {
+                    persona: persona.clone(),
+                    enabled: true,
+                    poll_interval_seconds: entry.interval.as_secs(),
+                    interval_jitter_pct: entry.interval_jitter_pct,
+                    active_hours: entry.active_hours.clone(),
+                    source_user_ids: entry.source_user_ids.clone(),
+                    candidates_per_draft: entry.candidates_per_draft,
+                    // Backend strings here are only used by config-load
+                    // wiring; the scheduler reads timing fields only.
+                    seen_store: "in_memory".into(),
+                    seen_store_path: None,
+                    max_age_hours: entry.max_age_hours,
+                    max_candidates_per_tick: entry.max_candidates_per_tick,
+                    // The runtime-built writer override lives on
+                    // PersonaQuoteEntry, not in this config-shaped recreation.
+                    // Scheduler doesn't need it (only the quote handler does).
+                    writer_provider: None,
+                };
+                let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
+                    crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
+                );
+                let scheduler =
+                    crate::daemon::PersonaQuoteScheduler::new(&cfg, producer, &self.commands_topic);
+                let cancel = self.cancel.clone();
+                tokio::spawn(scheduler.run(cancel));
+                tracing::info!(persona = %persona, "quote scheduler spawned");
             }
         }
 
@@ -1297,6 +1343,65 @@ impl DaemonCore {
                                         persona = %persona_owned,
                                         error = %e,
                                         "persona post handler failed"
+                                    );
+                                }
+                            });
+                        }
+                        DaemonCommand::PersonaQuote { persona } => {
+                            let Some(ctx) = self.quotes_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "PersonaQuote received but no quotes_context configured"
+                                );
+                                continue;
+                            };
+                            let Some(entry) = ctx.entries.get(&persona) else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "PersonaQuote for unknown persona"
+                                );
+                                continue;
+                            };
+                            let source = entry.source.clone();
+                            let seen_store = entry.seen_store.clone();
+                            let source_user_ids = entry.source_user_ids.clone();
+                            let max_age_hours = entry.max_age_hours;
+                            let max_candidates_per_tick = entry.max_candidates_per_tick;
+                            let candidates_per_draft = entry.candidates_per_draft;
+                            let writer_provider = entry.writer_provider.clone();
+                            let registry = ctx.registry.clone();
+                            let provider = ctx.provider.clone();
+                            let delivery = ctx.delivery.clone();
+                            let twitter_quote_tool = ctx.twitter_quote_tool.clone();
+                            let credentials = ctx.credentials.clone();
+                            let corpora_root = ctx.corpora_root.clone();
+                            let profiles_root = ctx.profiles_root.clone();
+                            let persona_owned = persona.clone();
+                            tokio::spawn(async move {
+                                let deps = crate::daemon::PersonaQuoteDeps {
+                                    persona_name: &persona_owned,
+                                    registry: &registry,
+                                    source: source.as_ref(),
+                                    seen_store: seen_store.as_ref(),
+                                    source_user_ids: &source_user_ids,
+                                    max_age_hours,
+                                    max_candidates_per_tick,
+                                    provider,
+                                    writer_provider,
+                                    delivery,
+                                    twitter_quote_tool,
+                                    credentials,
+                                    candidates_per_draft,
+                                    corpora_root: &corpora_root,
+                                    profiles_root: &profiles_root,
+                                };
+                                if let Err(e) =
+                                    crate::daemon::handle_persona_quote(deps).await
+                                {
+                                    tracing::error!(
+                                        persona = %persona_owned,
+                                        error = %e,
+                                        "persona quote handler failed"
                                     );
                                 }
                             });
