@@ -28,7 +28,10 @@ pub fn judge_recipe() -> AgentConfig {
         name: "judge".to_string(),
         description: "Multi-candidate ranking. Picks the best draft from N options.".to_string(),
         system_prompt: JUDGE_SYSTEM_PROMPT.to_string(),
-        max_turns: Some(1),
+        // 2 turns so the agent's schema-validation retry can fire once
+        // when the LLM returns malformed JSON. Same rationale as
+        // style_critic / fact_check.
+        max_turns: Some(2),
         max_tokens: Some(512),
         reasoning_effort: Some("medium".to_string()),
         response_schema: Some(serde_json::json!({
@@ -53,7 +56,11 @@ mod tests {
         assert_eq!(cfg.name, "judge");
         assert!(!cfg.description.is_empty());
         assert!(!cfg.system_prompt.is_empty());
-        assert_eq!(cfg.max_turns, Some(1));
+        assert_eq!(
+            cfg.max_turns,
+            Some(2),
+            "schema-validation retry needs 2 turns; see comment on the field"
+        );
         assert_eq!(cfg.max_tokens, Some(512));
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
         assert!(

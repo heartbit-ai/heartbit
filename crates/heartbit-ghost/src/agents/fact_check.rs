@@ -35,7 +35,11 @@ pub fn fact_check_recipe() -> AgentConfig {
         name: "fact_check".to_string(),
         description: "Verify factual claims in a draft against the research digest.".to_string(),
         system_prompt: FACT_CHECK_SYSTEM_PROMPT.to_string(),
-        max_turns: Some(1),
+        // 2 turns so the agent's schema-validation retry can fire once
+        // when the LLM returns malformed JSON. Observed 2026-05-13:
+        // Sonnet (final cascade tier) occasionally truncates __respond__
+        // tool args mid-JSON; max_turns=1 made that fatal.
+        max_turns: Some(2),
         max_tokens: Some(1024),
         reasoning_effort: Some("medium".to_string()),
         response_schema: Some(serde_json::json!({
@@ -60,7 +64,11 @@ mod tests {
         assert_eq!(cfg.name, "fact_check");
         assert!(!cfg.description.is_empty());
         assert!(!cfg.system_prompt.is_empty());
-        assert_eq!(cfg.max_turns, Some(1));
+        assert_eq!(
+            cfg.max_turns,
+            Some(2),
+            "schema-validation retry needs 2 turns; see comment on the field"
+        );
         assert_eq!(cfg.max_tokens, Some(1024));
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
         assert!(
