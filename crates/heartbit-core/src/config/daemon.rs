@@ -49,6 +49,10 @@ pub struct DaemonConfig {
     /// persona that has proactive posting enabled.
     #[serde(default)]
     pub persona_posts: Vec<PersonaPostsConfig>,
+    /// Per-persona quote-tweet configurations. Each entry launches a
+    /// `PersonaQuoteScheduler`.
+    #[serde(default)]
+    pub persona_quotes: Vec<PersonaQuotesConfig>,
 }
 
 /// MCP server configuration for the daemon.
@@ -469,6 +473,95 @@ fn default_engagement_min_age_hours() -> i64 {
     24
 }
 
+/// Per-persona quote-tweet configuration.
+///
+/// When present, the daemon registers a `PersonaQuoteScheduler` that
+/// fires `DaemonCommand::PersonaQuote` on the configured cadence. The
+/// handler polls each `source_user_ids` entry via X v2
+/// `/2/users/{id}/tweets`, filters by `max_age_hours` + not-yet-quoted,
+/// drafts an opinionated-but-charitable quote-tweet via the
+/// `quote_writer` agent, sends to Telegram for review, posts the
+/// chosen draft via `POST /2/tweets` with `quote_tweet_id`.
+///
+/// Configured under `[[daemon.persona_quotes]]` blocks.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaQuotesConfig {
+    /// Persona registry name (e.g. `"heartbit-ghost:x"`).
+    pub persona: String,
+    /// Whether this quoter is enabled.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// Polling interval, in seconds. Default 5400 (90 min — medium per
+    /// brainstorm).
+    /// Validation: must be ≥60 (rejected at config load otherwise).
+    #[serde(default = "default_quote_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// Randomness applied to each `poll_interval_seconds` tick, as a
+    /// percentage (`0`–`50`). Default `25` = ±25%. Same anti-pattern
+    /// rationale as `interval_jitter_pct` on `persona_posts`.
+    #[serde(default = "default_quote_interval_jitter_pct")]
+    pub interval_jitter_pct: u32,
+    /// Optional `"HH:MM-HH:MM"` window during which quote-polls run.
+    /// Outside this window, the scheduler tick is a no-op.
+    #[serde(default)]
+    pub active_hours: Option<ActiveHoursConfig>,
+    /// X user IDs (numeric strings) of accounts to poll. Curated list.
+    /// Required — must contain at least one entry.
+    pub source_user_ids: Vec<String>,
+    /// Number of candidate quote-tweets to draft per chosen source
+    /// tweet (1..=5). Default 3.
+    #[serde(default = "default_quote_candidates_per_draft")]
+    pub candidates_per_draft: usize,
+    /// Backend for the "already quoted" dedup store: `"in_memory"` or
+    /// `"jsonl"`. Default `"in_memory"`.
+    #[serde(default = "default_quote_seen_store")]
+    pub seen_store: String,
+    /// Path to the JSONL store file (only used when
+    /// `seen_store == "jsonl"`). Tilde expansion at construction time.
+    #[serde(default)]
+    pub seen_store_path: Option<String>,
+    /// Maximum age in hours of a source tweet for it to be quote-able.
+    /// Default 12 — beyond that the discourse has moved on. Set to 0
+    /// to disable the age filter.
+    #[serde(default = "default_quote_max_age_hours")]
+    pub max_age_hours: i64,
+    /// Maximum number of quote-tweets to draft+review per scheduler
+    /// tick. Default 1 — pick the best candidate from sources and
+    /// stop. Set higher to draft multiple quote-tweets per tick
+    /// (one Telegram review per draft).
+    #[serde(default = "default_quote_max_candidates_per_tick")]
+    pub max_candidates_per_tick: usize,
+    /// Optional override LLM provider for the quote_writer + critic.
+    /// `None` falls back to the global `[provider]`. Same shape as
+    /// `persona_posts.writer_provider`.
+    #[serde(default)]
+    pub writer_provider: Option<super::agent::AgentProviderConfig>,
+}
+
+fn default_quote_poll_interval_seconds() -> u64 {
+    5400 // 90 minutes
+}
+
+fn default_quote_interval_jitter_pct() -> u32 {
+    25
+}
+
+fn default_quote_candidates_per_draft() -> usize {
+    3
+}
+
+fn default_quote_seen_store() -> String {
+    "in_memory".into()
+}
+
+fn default_quote_max_age_hours() -> i64 {
+    12
+}
+
+fn default_quote_max_candidates_per_tick() -> usize {
+    1
+}
+
 /// WebSocket configuration for bidirectional user↔agent communication.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsConfig {
@@ -629,6 +722,53 @@ engagement_min_age_hours = 6
         assert_eq!(p.engagement_top_n, 0);
         assert_eq!(p.engagement_max_age_days, 7);
         assert_eq!(p.engagement_min_age_hours, 6);
+    }
+
+    #[test]
+    fn persona_quotes_config_parses_with_defaults() {
+        let toml = r#"
+[[persona_quotes]]
+persona = "heartbit-ghost:x"
+source_user_ids = ["44196397", "16884623"]
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_quotes: Vec<PersonaQuotesConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.persona_quotes.len(), 1);
+        let q = &cfg.persona_quotes[0];
+        assert_eq!(q.persona, "heartbit-ghost:x");
+        assert!(q.enabled);
+        assert_eq!(q.poll_interval_seconds, 5400); // default 90 min
+        assert_eq!(q.interval_jitter_pct, 25);
+        assert!(q.active_hours.is_none());
+        assert_eq!(q.candidates_per_draft, 3);
+        assert_eq!(q.seen_store, "in_memory");
+        assert!(q.seen_store_path.is_none());
+        assert_eq!(q.max_age_hours, 12);
+        assert_eq!(q.max_candidates_per_tick, 1);
+        assert_eq!(q.source_user_ids, vec!["44196397", "16884623"]);
+        assert!(q.writer_provider.is_none());
+    }
+
+    #[test]
+    fn persona_quotes_config_rejects_missing_required_fields() {
+        let toml = r#"
+[[persona_quotes]]
+persona = "heartbit-ghost:x"
+"#;
+        // source_user_ids is required (no default). Parse must fail.
+        #[derive(Debug, Deserialize)]
+        struct Shim {
+            #[allow(dead_code)]
+            persona_quotes: Vec<PersonaQuotesConfig>,
+        }
+        let err = toml::from_str::<Shim>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("source_user_ids"),
+            "expected missing-field error for source_user_ids; got: {err}"
+        );
     }
 
     #[test]

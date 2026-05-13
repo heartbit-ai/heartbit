@@ -116,11 +116,12 @@ pub use config::{
     HeartbitPulseConfig, InjectionConfig, InputConstraintConfig, KNOWN_BUILTINS, KafkaConfig,
     KnowledgeConfig, KnowledgeSourceConfig, LspConfig, McpResourceMode, McpServerEntry,
     MemoryConfig, MetricsConfig, OrchestratorConfig, PersonaMentionsConfig, PersonaPostsConfig,
-    PiiConfig, RetryProviderConfig, SalienceConfig, SandboxConfig, ScheduleEntry,
-    SecretPatternConfig, SecretScanConfig, SensorConfig, SensorModality, SensorRoutingConfig,
-    SensorSourceConfig, SessionPruneConfigToml, SpawnConfig, StoryCorrelationConfig,
-    TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig, ToolPolicyRuleConfig, TrustLevel,
-    WorkspaceConfig, WsConfig, parse_reasoning_effort, parse_tool_profile, parse_workflow_type,
+    PersonaQuotesConfig, PiiConfig, RetryProviderConfig, SalienceConfig, SandboxConfig,
+    ScheduleEntry, SecretPatternConfig, SecretScanConfig, SensorConfig, SensorModality,
+    SensorRoutingConfig, SensorSourceConfig, SessionPruneConfigToml, SpawnConfig,
+    StoryCorrelationConfig, TokenBudgetConfig, TokenExchangeConfig, ToolPolicyConfig,
+    ToolPolicyRuleConfig, TrustLevel, WorkspaceConfig, WsConfig, parse_reasoning_effort,
+    parse_tool_profile, parse_workflow_type,
 };
 
 // --- Auth re-exports ---
