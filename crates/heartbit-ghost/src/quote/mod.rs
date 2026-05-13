@@ -67,6 +67,10 @@ pub struct QuoteOutput {
     pub source_id: String,
     /// One generated quote-tweet candidate per surviving slot.
     pub candidates: Vec<QuoteCandidateRecord>,
+    /// Researcher digest produced during this run. Empty string when the
+    /// pipeline short-circuits before the researcher stage (e.g. invalid
+    /// config), or when no research was performed.
+    pub research_digest: String,
     /// Aggregated token usage across all sub-agents.
     pub usage_summary: TokenUsage,
     /// Final outcome of the run.
@@ -405,6 +409,7 @@ pub async fn run_quote_pipeline(cfg: QuoteConfig<'_>) -> Result<QuoteOutput, Quo
         return Ok(QuoteOutput {
             source_id: cfg.source.id.clone(),
             candidates: Vec::new(),
+            research_digest: digest.clone(),
             usage_summary: total_usage,
             outcome: QuoteOutcome::NoQuote,
         });
@@ -436,6 +441,7 @@ pub async fn run_quote_pipeline(cfg: QuoteConfig<'_>) -> Result<QuoteOutput, Quo
             return Ok(QuoteOutput {
                 source_id: cfg.source.id.clone(),
                 candidates: Vec::new(),
+                research_digest: digest.clone(),
                 usage_summary: total_usage,
                 outcome: QuoteOutcome::NoQuote,
             });
@@ -443,6 +449,7 @@ pub async fn run_quote_pipeline(cfg: QuoteConfig<'_>) -> Result<QuoteOutput, Quo
         return Ok(QuoteOutput {
             source_id: cfg.source.id.clone(),
             candidates: Vec::new(),
+            research_digest: digest.clone(),
             usage_summary: total_usage,
             outcome: QuoteOutcome::AllCandidatesGateRejected {
                 reasons: drop_reasons,
@@ -517,6 +524,7 @@ pub async fn run_quote_pipeline(cfg: QuoteConfig<'_>) -> Result<QuoteOutput, Quo
     Ok(QuoteOutput {
         source_id: cfg.source.id.clone(),
         candidates: survivors,
+        research_digest: digest,
         usage_summary: total_usage,
         outcome,
     })
@@ -1053,7 +1061,51 @@ mod tests {
         );
     }
 
-    // --- Test 6: user picks but Twitter API errors → PublishFailed ---
+    // --- Test 6: every candidate is Unverifiable — AllCandidatesGateRejected, delivery not called ---
+
+    #[tokio::test]
+    async fn run_quote_pipeline_all_unverifiable_returns_all_candidates_gate_rejected() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Short draft so publish_gate passes — only the Unverifiable verdict
+        // should trigger the pre-filter drop. The response sequence for a
+        // single-candidate run is: researcher → writer → critic → fact_check.
+        let provider = MockProvider::arc(vec![
+            "research digest about microservices tradeoffs", // researcher
+            "concrete short quote comment",                  // writer (short, passes publish_gate)
+            r#"{"verdict":"pass","style_match_score":0.85}"#, // critic
+            r#"{"verdict":"unverifiable","reason":"no data"}"#, // fact_check → Unverifiable
+        ]);
+        // Delivery should NEVER be called — set it to error if it is.
+        let delivery = MockQuoteReviewDelivery::errored("delivery must not be called");
+        let twitter_tool = MockQuoteTool::errored("twitter must not be called");
+        let cfg = mk_quote_cfg(
+            &profiles_root,
+            provider,
+            delivery as Arc<dyn QuoteReviewDelivery>,
+            twitter_tool.clone() as Arc<dyn Tool>,
+            1,
+            fixture_source(),
+        );
+        let out = run_quote_pipeline(cfg)
+            .await
+            .expect("all-unverifiable is success");
+        match out.outcome {
+            QuoteOutcome::AllCandidatesGateRejected { reasons } => {
+                assert!(!reasons.is_empty(), "expected at least one drop reason");
+                assert!(
+                    reasons[0].starts_with("unverifiable:"),
+                    "first reason should start with 'unverifiable:'; got: {reasons:?}"
+                );
+            }
+            other => panic!("expected AllCandidatesGateRejected, got {other:?}"),
+        }
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be called when all candidates dropped"
+        );
+    }
+
+    // --- Test 7: user picks but Twitter API errors → PublishFailed ---
 
     #[tokio::test]
     async fn run_quote_pipeline_pick_twitter_api_error_returns_publish_failed() {
