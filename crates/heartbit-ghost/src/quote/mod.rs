@@ -486,9 +486,17 @@ pub async fn run_quote_pipeline(cfg: QuoteConfig<'_>) -> Result<QuoteOutput, Quo
                     credentials: Some(cfg.credentials.clone()),
                     ..Default::default()
                 };
+                // Publish as a REPLY (not a quote-tweet) — see comment on
+                // the daemon's wiring (`TwitterReplyTool` is injected in
+                // place of `TwitterQuoteTool`). The X v2 quote endpoint
+                // soft-restricts automated/new accounts; the reply path
+                // works without restriction. The pipeline still calls the
+                // source tweet the "source" and the variant name
+                // `QuoteOutcome::Posted` is preserved for type stability,
+                // but the wire body is `{text, in_reply_to}`.
                 let tool_input = serde_json::json!({
                     "text": chosen_draft,
-                    "quote_tweet_id": cfg.source.id,
+                    "in_reply_to": cfg.source.id,
                 });
                 match cfg.twitter_tool.execute(&exec_ctx, tool_input).await {
                     Ok(out) if !out.is_error => {
@@ -652,7 +660,10 @@ mod tests {
     }
 
     /// MockQuoteTool — captures `last_input` so tests can assert the body
-    /// sent to `twitter_quote` includes `quote_tweet_id` (not `in_reply_to`).
+    /// sent to the underlying Twitter tool. Note: the pipeline now sends
+    /// `in_reply_to` (the publish action is a REPLY, not a quote-tweet);
+    /// the mock still captures the body verbatim for the happy-path test
+    /// to assert on.
     struct MockQuoteTool {
         canned: Mutex<Option<ToolOutput>>,
         last_input: Mutex<Option<serde_json::Value>>,
@@ -890,16 +901,20 @@ mod tests {
         assert_eq!(out.candidates.len(), 1);
         assert_eq!(out.source_id, "9001");
 
-        // Verify the X tool received quote_tweet_id (NOT in_reply_to).
+        // Verify the X tool received in_reply_to (NOT quote_tweet_id).
+        // The publish action is a REPLY, not a quote-tweet, because X
+        // soft-restricts the quote endpoint for automated accounts. See
+        // the comment at the publish call site in `run_quote_pipeline`
+        // (search for `tool_input = serde_json::json!`).
         let body = twitter_tool.last_input().expect("twitter tool was called");
         assert_eq!(
-            body.get("quote_tweet_id").and_then(|v| v.as_str()),
+            body.get("in_reply_to").and_then(|v| v.as_str()),
             Some("9001"),
-            "expected quote_tweet_id=9001 in tool input; got: {body}"
+            "expected in_reply_to=9001 in tool input; got: {body}"
         );
         assert!(
-            body.get("in_reply_to").is_none(),
-            "in_reply_to must NOT be present in quote-tweet tool input; got: {body}"
+            body.get("quote_tweet_id").is_none(),
+            "quote_tweet_id must NOT be present — pipeline publishes as a reply; got: {body}"
         );
         assert!(
             body.get("text").and_then(|v| v.as_str()).is_some(),

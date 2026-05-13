@@ -419,8 +419,18 @@ pub async fn run_daemon(
                     .context("construct TelegramQuoteReviewDelivery for quotes context")?,
             );
 
+        // Quote-tweet pipeline publishes as a REPLY rather than a quote
+        // because X soft-restricts quote-tweets from automated / new /
+        // low-engagement accounts (observed 2026-05-13: every quote
+        // attempt 403'd with "you have not been mentioned or are not part
+        // of the conversation thread"). The X UI test confirmed the
+        // restriction is at the bot-account level, not per-source-tweet.
+        // Replies use a different endpoint shape and aren't subject to
+        // the same restriction. The pipeline keeps its "quote" naming
+        // (config block, type names, file names) for continuity — the
+        // publish action just routes to `twitter_reply` instead.
         let twitter_quote_tool: std::sync::Arc<dyn heartbit_core::Tool> =
-            std::sync::Arc::new(heartbit_ghost::tools::TwitterQuoteTool::new());
+            std::sync::Arc::new(heartbit_ghost::tools::TwitterReplyTool::new());
 
         let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
             std::sync::Arc::new(crate::persona_review::EnvCredentialResolver);
