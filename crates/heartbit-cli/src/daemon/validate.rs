@@ -36,6 +36,8 @@ pub enum ValidationIssueKind {
     /// A JSONL store path's parent directory doesn't exist (and can't be
     /// created at validation time — we only check, don't mutate).
     NonexistentParentDir { path: String },
+    /// `[[daemon.persona_quotes]]` entry has empty `source_user_ids`.
+    MissingSourceUserIds,
 }
 
 impl std::fmt::Display for ValidationIssue {
@@ -62,6 +64,11 @@ impl std::fmt::Display for ValidationIssue {
                 "{}: parent directory of '{path}' does not exist",
                 self.context
             ),
+            ValidationIssueKind::MissingSourceUserIds => write!(
+                f,
+                "{}: source_user_ids is empty — at least one X user ID required",
+                self.context
+            ),
         }
     }
 }
@@ -80,6 +87,7 @@ pub fn validate_daemon_config(
 
     validate_persona_posts(daemon_config, &env_lookup, &path_exists, &mut issues);
     validate_persona_mentions(daemon_config, &path_exists, &mut issues);
+    validate_persona_quotes(daemon_config, &path_exists, &mut issues);
 
     issues
 }
@@ -147,6 +155,32 @@ fn validate_persona_mentions(
     }
 }
 
+fn validate_persona_quotes(
+    daemon: &DaemonConfig,
+    path_exists: &impl Fn(&Path) -> bool,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    for cfg in &daemon.persona_quotes {
+        if !cfg.enabled {
+            continue;
+        }
+        let context = format!("[[daemon.persona_quotes]] persona='{}'", cfg.persona);
+
+        if cfg.source_user_ids.is_empty() {
+            issues.push(ValidationIssue {
+                kind: ValidationIssueKind::MissingSourceUserIds,
+                context: context.clone(),
+            });
+        }
+
+        if cfg.seen_store == "jsonl"
+            && let Some(p) = cfg.seen_store_path.as_deref()
+        {
+            check_parent_dir(p, &context, path_exists, issues);
+        }
+    }
+}
+
 fn check_parent_dir(
     raw_path: &str,
     context: &str,
@@ -181,7 +215,7 @@ fn check_parent_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heartbit::{DaemonConfig, PersonaMentionsConfig, PersonaPostsConfig};
+    use heartbit::{DaemonConfig, PersonaMentionsConfig, PersonaPostsConfig, PersonaQuotesConfig};
 
     fn config_with_daemon(daemon: DaemonConfig) -> HeartbitConfig {
         // HeartbitConfig has all fields #[serde(default)], so empty TOML works.
@@ -211,6 +245,16 @@ persona = "{persona}"
 "#
         );
         toml::from_str(&toml).expect("PersonaPostsConfig fixture parses")
+    }
+
+    fn quote(persona: &str) -> PersonaQuotesConfig {
+        let toml = format!(
+            r#"
+persona = "{persona}"
+source_user_ids = ["44196397"]
+"#
+        );
+        toml::from_str(&toml).expect("PersonaQuotesConfig fixture parses")
     }
 
     #[test]
@@ -282,6 +326,37 @@ persona = "{persona}"
         p.post_history_path = Some("/definitely/not/a/real/dir/file.jsonl".into());
         d.persona_posts.push(p);
         d.persona_mentions.push(mention("heartbit-ghost:x", "42"));
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| false);
+        assert!(
+            issues.iter().any(|i| matches!(
+                &i.kind,
+                ValidationIssueKind::NonexistentParentDir { path } if path.contains("/definitely/not/a/real/dir")
+            )),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn persona_quotes_empty_source_user_ids_is_flagged() {
+        let mut d = minimal_daemon();
+        let mut q = quote("heartbit-ghost:x");
+        q.source_user_ids = vec![]; // explicitly empty
+        d.persona_quotes.push(q);
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| true);
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
+        assert_eq!(issues[0].kind, ValidationIssueKind::MissingSourceUserIds);
+        assert!(issues[0].context.contains("heartbit-ghost:x"));
+    }
+
+    #[test]
+    fn persona_quotes_jsonl_with_missing_parent_dir_is_flagged() {
+        let mut d = minimal_daemon();
+        let mut q = quote("heartbit-ghost:x");
+        q.seen_store = "jsonl".into();
+        q.seen_store_path = Some("/definitely/not/a/real/dir/seen.jsonl".into());
+        d.persona_quotes.push(q);
         let cfg = config_with_daemon(d);
         let issues = validate_daemon_config(&cfg, |_| None, |_| false);
         assert!(

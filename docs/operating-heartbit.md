@@ -83,6 +83,26 @@ Engagement metrics live alongside the post history in `.heartbit/engagement/{per
 
 **Daily LLM budget** — `daily_token_budget = 100000` (set to `null` to disable) is the safest hard stop when the bot is over-engaging.
 
+## Quote-tweet knobs
+
+`[[daemon.persona_quotes]]` controls the proactive quote-tweet loop. The daemon polls each `source_user_ids` entry and quote-tweets the most engaging un-quoted tweet on a jittered cadence.
+
+| Knob | Default | When to change |
+|---|---|---|
+| `enabled` | `true` | Set to `false` to pause this persona's quote loop. |
+| `poll_interval_seconds` | `5400` (90 min) | Lower for higher quote volume; minimum is `60`. |
+| `interval_jitter_pct` | `25` (±25%) | Same anti-bot rationale as proactive posts. |
+| `active_hours` | unset (24/7) | E.g. `"08:00-22:00"` to restrict to waking hours. |
+| `source_user_ids` | required | List of X user IDs (numeric strings) to poll. Curated voices you want to engage with. |
+| `candidates_per_draft` | `3` | Higher = more LLM cost per tick but better picks. |
+| `seen_store` | `"in_memory"` | Use `"jsonl"` for restart durability — recommended for production. |
+| `seen_store_path` | required for jsonl | Tilde-expanded; ensure parent dir exists. |
+| `max_age_hours` | `12` | Tweets older than this are skipped; the discourse has moved on. |
+| `max_candidates_per_tick` | `1` | How many quote-drafts to attempt per scheduler tick. |
+| `writer_provider` | unset | Same shape as `persona_posts.writer_provider`. Falls back to global `[provider]`. |
+
+**Voice note**: the quote_writer uses a distinct disposition (opinionated but charitable — caritas in veritate). Proactive posts and replies keep their existing voice. To audit the disposition see `crates/heartbit-ghost/src/agents/quote_writer.rs::QUOTE_WRITER_SYSTEM_PROMPT`.
+
 ## Kill switches
 
 In order of granularity:

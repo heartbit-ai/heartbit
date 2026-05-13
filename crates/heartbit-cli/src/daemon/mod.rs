@@ -405,6 +405,157 @@ pub async fn run_daemon(
         core
     };
 
+    // --- Build QuotesContext from daemon_config.persona_quotes ---
+    let core = if !daemon_config.persona_quotes.is_empty() && daemon_config.kafka.is_some() {
+        let mut registry = heartbit_core::persona::PersonaRegistry::new();
+        heartbit_ghost::register(&mut registry);
+
+        let provider = crate::build_provider_from_config(&config, None)
+            .map_err(|e| anyhow::anyhow!("build llm provider for quotes context: {e}"))?;
+
+        let delivery: std::sync::Arc<dyn heartbit_ghost::quote::QuoteReviewDelivery> =
+            std::sync::Arc::new(
+                crate::persona_review::TelegramQuoteReviewDelivery::from_env()
+                    .context("construct TelegramQuoteReviewDelivery for quotes context")?,
+            );
+
+        let twitter_quote_tool: std::sync::Arc<dyn heartbit_core::Tool> =
+            std::sync::Arc::new(heartbit_ghost::tools::TwitterQuoteTool::new());
+
+        let credentials: std::sync::Arc<dyn heartbit_core::CredentialResolver> =
+            std::sync::Arc::new(crate::persona_review::EnvCredentialResolver);
+
+        let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+            .map_err(|e| anyhow::anyhow!("resolve corpora dir: {e}"))?;
+        let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+            .map_err(|e| anyhow::anyhow!("resolve profiles dir: {e}"))?;
+
+        // Build a shared XClient for the timeline source. Failure here is
+        // FATAL — the source poller is load-bearing for the quote loop, so
+        // we bail rather than degrade silently (matches the fail-fast
+        // discipline of the rest of the quotes block).
+        let synthetic_ctx = heartbit_core::ExecutionContext {
+            credentials: Some(credentials.clone()),
+            ..heartbit_core::ExecutionContext::default()
+        };
+        let xclient = std::sync::Arc::new(
+            heartbit_ghost::tools::client::XClient::from_context(&synthetic_ctx)
+                .await
+                .with_context(|| {
+                    "build XClient for quote source (check X_CONSUMER_KEY/SECRET + \
+                     X_ACCESS_TOKEN/SECRET)"
+                })?,
+        );
+
+        let mut entries: std::collections::HashMap<String, heartbit::PersonaQuoteEntry> =
+            std::collections::HashMap::new();
+        for cfg in &daemon_config.persona_quotes {
+            if !cfg.enabled {
+                continue;
+            }
+            if cfg.poll_interval_seconds < 60 {
+                anyhow::bail!(
+                    "[[daemon.persona_quotes]] persona='{}': poll_interval_seconds must be \u{2265}60",
+                    cfg.persona
+                );
+            }
+            let seen_store: std::sync::Arc<dyn heartbit_ghost::quote::sources::QuoteSeenStore> =
+                match cfg.seen_store.as_str() {
+                    "in_memory" => std::sync::Arc::new(
+                        heartbit_ghost::quote::sources::InMemoryQuoteSeenStore::new(),
+                    ),
+                    "jsonl" => {
+                        let raw_path = cfg.seen_store_path.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "persona_quotes persona='{}' uses jsonl but no seen_store_path set",
+                                cfg.persona
+                            )
+                        })?;
+                        let path = expand_tilde(raw_path)?;
+                        std::sync::Arc::new(
+                            heartbit_ghost::quote::sources::JsonlQuoteSeenStore::open(&path)
+                                .await
+                                .with_context(|| {
+                                    format!("open jsonl quote seen store at {}", path.display())
+                                })?,
+                        )
+                    }
+                    other => anyhow::bail!(
+                        "unknown seen_store backend '{other}' for persona '{}' \
+                         (expected 'in_memory' or 'jsonl')",
+                        cfg.persona
+                    ),
+                };
+            let source: std::sync::Arc<dyn heartbit_ghost::quote::sources::QuoteSource> =
+                std::sync::Arc::new(heartbit_ghost::quote::sources::XUserTimelineSource::new(
+                    xclient.clone(),
+                ));
+            if entries.contains_key(&cfg.persona) {
+                anyhow::bail!(
+                    "duplicate [[daemon.persona_quotes]] entry for persona '{}'",
+                    cfg.persona
+                );
+            }
+            entries.insert(
+                cfg.persona.clone(),
+                heartbit::PersonaQuoteEntry {
+                    source,
+                    seen_store,
+                    interval: std::time::Duration::from_secs(cfg.poll_interval_seconds),
+                    interval_jitter_pct: cfg.interval_jitter_pct,
+                    active_hours: cfg.active_hours.clone(),
+                    source_user_ids: cfg.source_user_ids.clone(),
+                    candidates_per_draft: cfg.candidates_per_draft,
+                    max_age_hours: cfg.max_age_hours,
+                    max_candidates_per_tick: cfg.max_candidates_per_tick,
+                    // Same retry/on_retry rationale as posts: the override
+                    // provider is wrapped only by the global retry layer
+                    // already applied to `build_provider_from_config`.
+                    writer_provider: cfg
+                        .writer_provider
+                        .as_ref()
+                        .map(|wp_cfg| crate::build_agent_provider(wp_cfg, None, None))
+                        .transpose()
+                        .with_context(|| {
+                            format!(
+                                "build writer_provider override for persona '{}'",
+                                cfg.persona
+                            )
+                        })?,
+                },
+            );
+        }
+
+        if entries.is_empty() {
+            // All entries were disabled.
+            core
+        } else {
+            let quotes_ctx = std::sync::Arc::new(heartbit::QuotesContext {
+                registry: std::sync::Arc::new(registry),
+                provider,
+                delivery,
+                twitter_quote_tool,
+                credentials,
+                corpora_root,
+                profiles_root,
+                entries,
+            });
+            tracing::info!(
+                personas = ?quotes_ctx.entries.keys().collect::<Vec<_>>(),
+                "quotes context configured"
+            );
+            core.map(|c| c.with_quotes_context(quotes_ctx))
+        }
+    } else if !daemon_config.persona_quotes.is_empty() {
+        tracing::warn!(
+            "persona_quotes entries configured but [daemon.kafka] is absent; \
+             quotes pipeline requires Kafka mode and will be skipped"
+        );
+        core
+    } else {
+        core
+    };
+
     // Create shared memory store (one store for all execution paths)
     let shared_memory: Option<Arc<dyn Memory>> = if let Some(ref mem_config) = config.memory {
         match crate::create_memory_store(mem_config).await {
