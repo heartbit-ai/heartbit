@@ -491,6 +491,10 @@ pub struct DaemonCore {
     /// `PersonaQuoteScheduler` per persona at startup and dispatches
     /// `DaemonCommand::PersonaQuote` to `handle_persona_quote`.
     quotes_context: Option<Arc<crate::daemon::QuotesContext>>,
+    /// Optional blog-pipeline context. When set, `run()` spawns one
+    /// `PersonaBlogScheduler` at startup and dispatches
+    /// `DaemonCommand::PersonaBlog` to `handle_persona_blog`.
+    blog_context: Option<Arc<crate::daemon::BlogContext>>,
     /// Persona mention context — when set, one `MentionPollScheduler` is spawned per
     /// `persona_mentions` entry, and `MentionPoll` / `ReplyDraft` commands are dispatched
     /// to the real free-function handlers.
@@ -536,6 +540,7 @@ impl DaemonCore {
             commands_topic: kafka_config.commands_topic.clone(),
             posts_context: None,
             quotes_context: None,
+            blog_context: None,
             mention_context: None,
         };
         (core, handle)
@@ -582,6 +587,14 @@ impl DaemonCore {
     /// dispatches `PersonaQuote` commands to the real handler.
     pub fn with_quotes_context(mut self, ctx: Arc<crate::daemon::QuotesContext>) -> Self {
         self.quotes_context = Some(ctx);
+        self
+    }
+
+    /// Attach the blog pipeline context. After this is set, `run()`
+    /// spawns a `PersonaBlogScheduler` at startup and dispatches
+    /// `PersonaBlog` commands to the real handler.
+    pub fn with_blog_context(mut self, ctx: Arc<crate::daemon::BlogContext>) -> Self {
+        self.blog_context = Some(ctx);
         self
     }
 
@@ -811,6 +824,37 @@ impl DaemonCore {
                 tokio::spawn(scheduler.run(cancel));
                 tracing::info!(persona = %persona, "quote scheduler spawned");
             }
+        }
+
+        // --- Spawn the PersonaBlogScheduler when blog context is set ---
+        if let Some(ctx) = self.blog_context.as_ref() {
+            let entry = &ctx.entry;
+            let persona = ctx.persona_name.clone();
+            let cfg = heartbit_core::config::PersonaBlogConfig {
+                persona: persona.clone(),
+                enabled: true,
+                poll_interval_seconds: entry.interval.as_secs(),
+                interval_jitter_pct: entry.interval_jitter_pct,
+                active_hours: entry.active_hours.clone(),
+                posts_dir: entry.posts_dir.to_string_lossy().into_owned(),
+                out_dir: entry.out_dir.to_string_lossy().into_owned(),
+                seed_lookback_days: entry.seed_lookback_days,
+                candidates_per_draft: entry.candidates_per_draft,
+                site_url: entry.site_url.clone(),
+                site_title: entry.site_title.clone(),
+                // The runtime-built writer override lives on
+                // PersonaBlogEntry, not in this config-shaped recreation.
+                // Scheduler doesn't need it (only the blog handler does).
+                writer_provider: None,
+            };
+            let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
+                crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
+            );
+            let scheduler =
+                crate::daemon::PersonaBlogScheduler::new(&cfg, producer, &self.commands_topic);
+            let cancel = self.cancel.clone();
+            tokio::spawn(scheduler.run(cancel));
+            tracing::info!(persona = %persona, "blog scheduler spawned");
         }
 
         // Spawn one MentionPollScheduler per enabled persona_mentions entry.
@@ -1402,6 +1446,68 @@ impl DaemonCore {
                                         persona = %persona_owned,
                                         error = %e,
                                         "persona quote handler failed"
+                                    );
+                                }
+                            });
+                        }
+                        DaemonCommand::PersonaBlog { persona } => {
+                            let Some(ctx) = self.blog_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "PersonaBlog received but no blog_context configured"
+                                );
+                                continue;
+                            };
+                            if ctx.persona_name != persona {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    configured = %ctx.persona_name,
+                                    "PersonaBlog for unknown persona (blog_context is scoped to a different persona)"
+                                );
+                                continue;
+                            }
+                            let registry = ctx.registry.clone();
+                            let provider = ctx.provider.clone();
+                            let delivery = ctx.delivery.clone();
+                            let credentials = ctx.credentials.clone();
+                            let corpora_root = ctx.corpora_root.clone();
+                            let profiles_root = ctx.profiles_root.clone();
+                            let entry_top = ctx.entry.top_posts_provider.clone();
+                            let seed_lookback_days = ctx.entry.seed_lookback_days;
+                            let candidates_per_draft = ctx.entry.candidates_per_draft;
+                            let writer_provider = ctx.entry.writer_provider.clone();
+                            let posts_dir = ctx.entry.posts_dir.clone();
+                            let out_dir = ctx.entry.out_dir.clone();
+                            let style_css = ctx.entry.style_css.clone();
+                            let site_url = ctx.entry.site_url.clone();
+                            let site_title = ctx.entry.site_title.clone();
+                            let persona_owned = persona.clone();
+                            tokio::spawn(async move {
+                                let deps = crate::daemon::PersonaBlogDeps {
+                                    persona_name: &persona_owned,
+                                    registry: &registry,
+                                    top_posts_provider: entry_top.as_ref(),
+                                    seed_lookback_days,
+                                    provider,
+                                    writer_provider,
+                                    delivery,
+                                    credentials,
+                                    candidates_per_draft,
+                                    corpora_root: &corpora_root,
+                                    profiles_root: &profiles_root,
+                                    posts_dir: &posts_dir,
+                                    out_dir: &out_dir,
+                                    style_css: &style_css,
+                                    site_url: &site_url,
+                                    site_title: &site_title,
+                                };
+                                if let Err(e) =
+                                    crate::daemon::handle_persona_blog(deps).await
+                                {
+                                    tracing::error!(
+                                        persona = %persona_owned,
+                                        error = %e,
+                                        "persona blog handler failed"
                                     );
                                 }
                             });

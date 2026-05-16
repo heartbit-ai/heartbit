@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use crate::Error;
 
+pub mod blog_context;
 pub mod core;
 pub mod cron;
 pub mod engagement_collector;
@@ -15,6 +16,8 @@ pub mod mention_poll_handler;
 pub mod metrics;
 pub mod notify;
 pub mod openai_compat;
+pub mod persona_blog;
+pub mod persona_blog_handler;
 pub mod persona_post;
 pub mod persona_post_handler;
 pub mod persona_quote;
@@ -28,6 +31,7 @@ pub mod todo;
 pub mod types;
 
 pub use self::core::{DaemonCore, DaemonHandle};
+pub use blog_context::{BlogContext, PersonaBlogEntry};
 pub use cron::CronScheduler;
 pub use engagement_collector::EngagementCollectorScheduler;
 pub use engagement_refresh_handler::{EngagementRefreshDeps, handle_engagement_refresh};
@@ -43,6 +47,8 @@ pub use openai_compat::{
     build_done_chunk, build_model_list, build_response, build_role_chunk, build_text_chunk,
     extract_system_prompt, extract_task,
 };
+pub use persona_blog::PersonaBlogScheduler;
+pub use persona_blog_handler::{PersonaBlogDeps, handle_persona_blog};
 pub use persona_post::PersonaPostScheduler;
 pub use persona_post_handler::{PersonaPostDeps, handle_persona_post};
 pub use persona_quote::PersonaQuoteScheduler;

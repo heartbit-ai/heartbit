@@ -138,20 +138,21 @@ pub use daemon::PostgresTaskStore;
 pub use daemon::openai_compat;
 #[cfg(feature = "daemon")]
 pub use daemon::{
-    CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle, DaemonMetrics,
-    DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform,
+    BlogContext, CommandProducer, CronScheduler, DaemonCommand, DaemonCore, DaemonHandle,
+    DaemonMetrics, DaemonTask, EdgeConditionPattern, EdgeConditionSpec, EdgeTransform,
     EngagementCollectorScheduler, EngagementRefreshDeps, FileTodoStore, HeartbitPulseScheduler,
     InMemoryTaskStore, KafkaCommandProducer, MentionContext, MentionPollDeps, MentionPollScheduler,
-    OnTaskComplete, PersonaMentionEntry, PersonaPostDeps, PersonaPostEntry, PersonaPostScheduler,
-    PersonaQuoteEntry, PostsContext, QuotesContext, ReplyDraftDeps, ReplySharedContext,
-    RuntimeAdvancedConfig, RuntimeAgentConfig, RuntimeEvalRequest, RuntimeEvalResponse,
-    RuntimeEvalSseEvent, RuntimeGuardrailConfig, RuntimeMcpServer, RuntimeMemoryConfig,
-    RuntimeOrchestratorConfig, RuntimeProviderConfig, RuntimeProviderType, RuntimeRequest,
-    RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig, RuntimeSseEvent,
-    RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig, RuntimeWorkflowEdge,
-    RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore, TodoEntry, TodoList,
-    TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext, format_notification,
-    handle_engagement_refresh, handle_mention_poll, handle_persona_post, handle_reply_draft,
+    OnTaskComplete, PersonaBlogDeps, PersonaBlogEntry, PersonaBlogScheduler, PersonaMentionEntry,
+    PersonaPostDeps, PersonaPostEntry, PersonaPostScheduler, PersonaQuoteEntry, PostsContext,
+    QuotesContext, ReplyDraftDeps, ReplySharedContext, RuntimeAdvancedConfig, RuntimeAgentConfig,
+    RuntimeEvalRequest, RuntimeEvalResponse, RuntimeEvalSseEvent, RuntimeGuardrailConfig,
+    RuntimeMcpServer, RuntimeMemoryConfig, RuntimeOrchestratorConfig, RuntimeProviderConfig,
+    RuntimeProviderType, RuntimeRequest, RuntimeResponse, RuntimeScorerConfig, RuntimeSpawnConfig,
+    RuntimeSseEvent, RuntimeSubAgentConfig, RuntimeTwitterCredentials, RuntimeWorkflowConfig,
+    RuntimeWorkflowEdge, RuntimeWorkflowNode, TaskOutcome, TaskState, TaskStats, TaskStore,
+    TodoEntry, TodoList, TodoManageTool, UsageGroupBy, UsageQuery, UsageRow, UserContext,
+    format_notification, handle_engagement_refresh, handle_mention_poll, handle_persona_blog,
+    handle_persona_post, handle_reply_draft,
 };
 
 // --- Eval re-exports ---

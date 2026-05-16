@@ -92,6 +92,14 @@ pub enum DaemonCommand {
         /// Persona name (e.g. `"heartbit-ghost:x"`).
         persona: String,
     },
+    /// Fire one blog-pipeline tick. Selects the highest-engagement X
+    /// post from the prior `seed_lookback_days` as the topic seed,
+    /// drafts an essay, routes through Telegram, writes Markdown +
+    /// renders the static site.
+    PersonaBlog {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+    },
     /// Refresh engagement metrics for every Posted tweet in the persona's
     /// history. Dispatched by `EngagementCollectorScheduler` on the
     /// configured cadence.
@@ -1152,6 +1160,21 @@ mod tests {
                 assert_eq!(persona, "heartbit-ghost:x");
             }
             other => panic!("expected PersonaQuote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persona_blog_command_round_trips() {
+        let cmd = DaemonCommand::PersonaBlog {
+            persona: "heartbit-ghost:x".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::PersonaBlog { persona } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+            }
+            other => panic!("expected PersonaBlog, got {other:?}"),
         }
     }
 
