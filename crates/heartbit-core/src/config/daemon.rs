@@ -53,6 +53,10 @@ pub struct DaemonConfig {
     /// `PersonaQuoteScheduler`.
     #[serde(default)]
     pub persona_quotes: Vec<PersonaQuotesConfig>,
+    /// Personal blog configuration. Single block (one blog per daemon).
+    /// When absent, the daemon does not spawn a blog scheduler.
+    #[serde(default)]
+    pub persona_blog: Option<PersonaBlogConfig>,
 }
 
 /// MCP server configuration for the daemon.
@@ -565,6 +569,104 @@ fn default_quote_max_candidates_per_tick() -> usize {
     1
 }
 
+/// Personal-blog publishing configuration.
+///
+/// When present, the daemon registers a `PersonaBlogScheduler` that
+/// fires `DaemonCommand::PersonaBlog` on a weekly cadence (with jitter).
+/// The handler picks the highest-engagement X post from the prior
+/// `seed_lookback_days` (default 7) as the topic seed, drafts a
+/// long-form essay via the `blog_writer` agent, routes through
+/// Telegram for review, writes the picked draft as Markdown to
+/// `posts_dir`, and re-renders the static site into `out_dir`.
+///
+/// Configured under `[daemon.persona_blog]` (single block, not a
+/// list — one blog per daemon).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaBlogConfig {
+    /// Persona registry name (e.g. `"heartbit-ghost:x"`). Must match an
+    /// existing persona whose post history + engagement store are
+    /// already configured under `[[daemon.persona_posts]]` for the same
+    /// slug — the blog reuses those stores for seed selection.
+    pub persona: String,
+    /// Whether the blog scheduler is enabled.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// Polling interval in seconds. Default 604_800 (7 days = weekly).
+    /// Validation: must be ≥3600 (1 hour) — anything tighter is almost
+    /// certainly a misconfig and produces thin posts.
+    #[serde(default = "default_blog_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// Jitter percentage applied to the cadence. Default 10 — tighter
+    /// than X posts because weekly is already coarse and operators
+    /// usually want a predictable day-of-week.
+    #[serde(default = "default_blog_interval_jitter_pct")]
+    pub interval_jitter_pct: u32,
+    /// Optional active-hours window for the scheduler.
+    #[serde(default)]
+    pub active_hours: Option<ActiveHoursConfig>,
+    /// Directory holding the generated Markdown post files. Relative to
+    /// the daemon's CWD; tilde-expanded.
+    /// Default: `"blog-site/posts"`.
+    #[serde(default = "default_blog_posts_dir")]
+    pub posts_dir: String,
+    /// Directory where the rendered static site is written. Relative to
+    /// CWD; tilde-expanded. This is what gets deployed to Cloudflare
+    /// Pages (commit + push triggers deploy).
+    /// Default: `"blog-site/public"`.
+    #[serde(default = "default_blog_out_dir")]
+    pub out_dir: String,
+    /// How many days back to look for the highest-engagement X post
+    /// used as the topic seed. Default 7. Set to 0 to disable
+    /// X-derived seeding (forces the operator to set `topic_brief`).
+    #[serde(default = "default_blog_seed_lookback_days")]
+    pub seed_lookback_days: i64,
+    /// Number of candidate essay drafts per tick. Default 2 — long-form
+    /// drafts are expensive (~3-5k tokens each); 2 is enough for
+    /// meaningful comparison without blowing the budget.
+    #[serde(default = "default_blog_candidates_per_draft")]
+    pub candidates_per_draft: usize,
+    /// Public site URL (required) — used to build canonical URLs,
+    /// OpenGraph tags, the sitemap, and the RSS feed.
+    pub site_url: String,
+    /// Site title rendered in `<title>` and the index page header.
+    /// Default: `"pascal.heartbit.ai"`.
+    #[serde(default = "default_blog_site_title")]
+    pub site_title: String,
+    /// Optional override LLM provider for the blog_writer + critic.
+    /// `None` falls back to the global `[provider]`. Same shape as
+    /// `persona_posts.writer_provider`.
+    #[serde(default)]
+    pub writer_provider: Option<super::agent::AgentProviderConfig>,
+}
+
+fn default_blog_poll_interval_seconds() -> u64 {
+    604_800 // 7 days
+}
+
+fn default_blog_interval_jitter_pct() -> u32 {
+    10
+}
+
+fn default_blog_posts_dir() -> String {
+    "blog-site/posts".into()
+}
+
+fn default_blog_out_dir() -> String {
+    "blog-site/public".into()
+}
+
+fn default_blog_seed_lookback_days() -> i64 {
+    7
+}
+
+fn default_blog_candidates_per_draft() -> usize {
+    2
+}
+
+fn default_blog_site_title() -> String {
+    "pascal.heartbit.ai".into()
+}
+
 /// WebSocket configuration for bidirectional user↔agent communication.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsConfig {
@@ -771,6 +873,51 @@ persona = "heartbit-ghost:x"
         assert!(
             err.to_string().contains("source_user_ids"),
             "expected missing-field error for source_user_ids; got: {err}"
+        );
+    }
+
+    #[test]
+    fn persona_blog_config_parses_with_defaults() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+site_url = "https://pascal.heartbit.ai"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_blog: PersonaBlogConfig,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let b = &cfg.persona_blog;
+        assert_eq!(b.persona, "heartbit-ghost:x");
+        assert!(b.enabled);
+        assert_eq!(b.poll_interval_seconds, 604_800); // 7 days
+        assert_eq!(b.interval_jitter_pct, 10);
+        assert_eq!(b.posts_dir, "blog-site/posts");
+        assert_eq!(b.out_dir, "blog-site/public");
+        assert_eq!(b.seed_lookback_days, 7);
+        assert_eq!(b.candidates_per_draft, 2);
+        assert_eq!(b.site_url, "https://pascal.heartbit.ai");
+        assert_eq!(b.site_title, "pascal.heartbit.ai");
+        assert!(b.writer_provider.is_none());
+    }
+
+    #[test]
+    fn persona_blog_config_rejects_missing_required_fields() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+"#;
+        // site_url is required (no default). Parse must fail.
+        #[derive(Deserialize, Debug)]
+        struct Shim {
+            #[allow(dead_code)]
+            persona_blog: PersonaBlogConfig,
+        }
+        let err = toml::from_str::<Shim>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("site_url"),
+            "expected missing-field error for site_url; got: {err}"
         );
     }
 

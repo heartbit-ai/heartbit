@@ -1507,6 +1507,7 @@ mod tests {
             persona_mentions: vec![],
             persona_posts: vec![],
             persona_quotes: vec![],
+            persona_blog: None,
         }
     }
 

@@ -503,6 +503,7 @@ mod tests {
             persona_mentions: vec![],
             persona_posts: vec![],
             persona_quotes: vec![],
+            persona_blog: None,
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
