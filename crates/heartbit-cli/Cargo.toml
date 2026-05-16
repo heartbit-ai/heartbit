@@ -13,6 +13,10 @@ keywords = ["agent", "llm", "cli", "mcp", "ai"]
 name = "heartbit"
 path = "src/main.rs"
 
+[[bin]]
+name = "heartbit_blog_render"
+path = "src/bin/heartbit_blog_render.rs"
+
 [dependencies]
 heartbit = { path = "../heartbit", features = ["full"] }
 heartbit-core = { path = "../heartbit-core" }
