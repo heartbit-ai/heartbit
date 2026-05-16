@@ -16,14 +16,10 @@ pub(crate) struct BlogSeedInput<'a> {
 
 impl<'a> From<&'a BlogSeed> for BlogSeedInput<'a> {
     fn from(seed: &'a BlogSeed) -> Self {
-        // The full BlogSeed type is a stub for now (Task 6 fills it in).
-        // We return placeholder strings to keep the prompts compilable
-        // until that task replaces this impl with real field access.
-        let _ = seed;
         Self {
-            text: "<seed-todo>",
-            source_url: None,
-            rationale: None,
+            text: &seed.text,
+            source_url: Some(&seed.source_url),
+            rationale: Some(&seed.rationale),
         }
     }
 }

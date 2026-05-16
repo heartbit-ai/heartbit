@@ -10,4 +10,4 @@ pub mod templates;
 
 pub use markdown::{BlogPostFrontmatter, WriteMarkdownError, write_post_markdown};
 pub use render::{RenderError, RenderedPostMeta, render_site};
-pub use seed::{BlogSeed, SeedError, select_blog_seed};
+pub use seed::{BlogSeed, DEFAULT_TOP_N, SeedError, select_blog_seed};
