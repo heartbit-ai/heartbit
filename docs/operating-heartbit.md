@@ -103,6 +103,53 @@ Engagement metrics live alongside the post history in `.heartbit/engagement/{per
 
 **Voice note**: the quote_writer uses a distinct disposition (opinionated but charitable — caritas in veritate). Proactive posts and replies keep their existing voice. To audit the disposition see `crates/heartbit-ghost/src/agents/quote_writer.rs::QUOTE_WRITER_SYSTEM_PROMPT`.
 
+## Personal blog knobs
+
+`[daemon.persona_blog]` controls the weekly blog pipeline. The blog reuses the X persona's post history + engagement store to seed each week's topic from the highest-engagement post in the prior 7 days.
+
+| Knob | Default | When to change |
+|---|---|---|
+| `enabled` | `true` | Set `false` to pause without removing the block. |
+| `poll_interval_seconds` | `604800` (7 days) | Weekly is the recommended cadence — long-form posts need accumulated X signal to seed from. Don't go shorter than 3 days. |
+| `interval_jitter_pct` | `10` (±10%) | Tighter than X posts because weekly is already coarse. |
+| `active_hours` | unset | Set to a narrow window (e.g. `10:00-12:00`) for predictable publish times. |
+| `posts_dir` | `blog-site/posts` | Where Markdown files are written. |
+| `out_dir` | `blog-site/public` | Where the rendered static site is written. This is what gets deployed. |
+| `seed_lookback_days` | `7` | How far back to look for the X-derived seed. Set to `0` to disable X-seeding (rarely useful — disables the main feature). |
+| `candidates_per_draft` | `2` | Long-form drafts are expensive; 2 is enough for meaningful comparison. |
+| `site_url` | required | Public URL for canonical tags, RSS, sitemap. |
+| `site_title` | `pascal.heartbit.ai` | Site title in `<title>` and the index header. |
+| `writer_provider` | unset | Same shape as `persona_posts.writer_provider`. Falls back to global `[provider]`. |
+
+### Prerequisite: matching `[[daemon.persona_posts]]` entry
+
+The blog requires a matching `[[daemon.persona_posts]]` entry for the same persona slug — it reuses that entry's post history + engagement store for seed selection. If you've configured proactive posts, this is automatic. The daemon fails fast at startup with a clear error if missing.
+
+### Deployment to Cloudflare Pages
+
+1. Create a Cloudflare Pages project pointed at the repository.
+2. Set the build directory to `blog-site/public/`. No build command needed (the daemon pre-renders).
+3. Add the custom domain `pascal.heartbit.ai` in the Pages project's domain settings.
+4. Each successful blog tick:
+   a. The daemon writes a new Markdown file to `blog-site/posts/`.
+   b. The renderer regenerates `blog-site/public/` from all posts.
+   c. The daemon (or you, on next git push) commits + pushes.
+   d. Cloudflare Pages auto-deploys from the push.
+
+For now the daemon does NOT auto-commit. After a successful tick, the operator runs `git add blog-site/ && git commit -m "blog: <slug>" && git push` to trigger deploy. (Future enhancement: optional auto-commit hook.)
+
+### Manual regen
+
+Edit a template or fix a typo in a post? Regenerate the whole site:
+
+```bash
+target/release/heartbit_blog_render \
+  --site-url https://pascal.heartbit.ai \
+  --site-title pascal.heartbit.ai
+```
+
+Output lands in `blog-site/public/`. Commit + push to deploy.
+
 ## Kill switches
 
 In order of granularity:
