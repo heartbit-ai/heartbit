@@ -43,7 +43,7 @@ tokio-util = "0.7"
 cron = "0.13"
 whatlang = "0.16"
 pulldown-cmark = "0.12"
-minijinja = "2"
+minijinja = { version = "2", features = ["json"] }
 serde_yaml = "0.9"
 slug = "0.1"
 prometheus = { version = "0.14", default-features = false }

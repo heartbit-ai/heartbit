@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="post-list">
+  {% for post in posts %}
+  <article class="post-card">
+    <h2 class="post-card-title"><a href="/{{ post.slug }}/">{{ post.title }}</a></h2>
+    <time class="post-card-date" datetime="{{ post.date_iso }}">{{ post.date_human }}</time>
+    <p class="post-card-excerpt">{{ post.excerpt }}</p>
+  </article>
+  {% endfor %}
+  {% if not posts %}
+  <p class="empty">No posts yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

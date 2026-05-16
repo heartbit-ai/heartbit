@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}{{ site_title }}{% endblock %}</title>
+  <meta name="description" content="{% block description %}{{ site_description | default(site_title) }}{% endblock %}">
+  <link rel="canonical" href="{% block canonical %}{{ site_url }}{% endblock %}">
+  <link rel="alternate" type="application/rss+xml" title="{{ site_title }}" href="{{ site_url }}/feed.xml">
+  <link rel="stylesheet" href="/style.css">
+  {# OpenGraph + Twitter card — minimal but complete. #}
+  <meta property="og:title" content="{% block og_title %}{{ site_title }}{% endblock %}">
+  <meta property="og:description" content="{% block og_description %}{{ site_description | default(site_title) }}{% endblock %}">
+  <meta property="og:type" content="{% block og_type %}website{% endblock %}">
+  <meta property="og:url" content="{% block og_url %}{{ site_url }}{% endblock %}">
+  <meta name="twitter:card" content="summary_large_image">
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-title" href="/">{{ site_title }}</a>
+    <nav class="site-nav">
+      <a href="/">posts</a>
+      <a href="/feed.xml">rss</a>
+    </nav>
+  </header>
+  <main class="site-main">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="site-footer">
+    <p>{{ site_title }} · <a href="/feed.xml">RSS</a></p>
+  </footer>
+</body>
+</html>
