@@ -718,6 +718,248 @@ impl heartbit_ghost::quote::QuoteReviewDelivery for TelegramQuoteReviewDelivery 
     }
 }
 
+// =============================================================================
+// TelegramBlogReviewDelivery — blog-essay counterpart of TelegramQuoteReviewDelivery
+// =============================================================================
+
+/// Telegram-backed delivery for the personal-blog pipeline. Renders a
+/// header (persona + seed text/url), per-candidate title + 300-char body
+/// preview + a "preview-after-publish" note + [1]…[N] [Skip] inline
+/// keyboard, awaits the user's pick, returns the outcome.
+///
+/// Shares the same process-global pending map and dispatcher as
+/// `TelegramReviewDelivery` / `TelegramReplyReviewDelivery` /
+/// `TelegramQuoteReviewDelivery` — only one Telegram dispatcher runs
+/// per process. Full essays are too long for Telegram (4096-char message
+/// cap), so the review surface ships the title + first 300 chars and
+/// defers the full read to the rendered post URL after publish.
+pub struct TelegramBlogReviewDelivery {
+    bot: Bot,
+    chat_id: ChatId,
+    timeout: Duration,
+    /// Shared process-global pending resolvers.
+    pending: PendingMap,
+}
+
+impl TelegramBlogReviewDelivery {
+    /// Construct from environment variables and eagerly spawn the
+    /// callback dispatcher (shared with the other Telegram deliveries).
+    ///
+    /// Required env:
+    /// - `HEARTBIT_TELEGRAM_TOKEN` — bot token
+    /// - `HEARTBIT_TELEGRAM_REVIEW_CHAT_ID` — destination chat (`i64`)
+    ///
+    /// Optional:
+    /// - `HEARTBIT_REVIEW_TIMEOUT_SECS` — pick timeout (default 3600 = 1h)
+    pub fn from_env() -> Result<Self, ReviewDeliveryError> {
+        let token = std::env::var("HEARTBIT_TELEGRAM_TOKEN").map_err(|_| {
+            ReviewDeliveryError::Config("HEARTBIT_TELEGRAM_TOKEN env var not set".into())
+        })?;
+        let chat_id_raw = std::env::var("HEARTBIT_TELEGRAM_REVIEW_CHAT_ID").map_err(|_| {
+            ReviewDeliveryError::Config("HEARTBIT_TELEGRAM_REVIEW_CHAT_ID env var not set".into())
+        })?;
+        let chat_id_num: i64 = chat_id_raw.parse().map_err(|e| {
+            ReviewDeliveryError::Config(format!(
+                "invalid HEARTBIT_TELEGRAM_REVIEW_CHAT_ID '{chat_id_raw}': {e}"
+            ))
+        })?;
+        let timeout_secs = std::env::var("HEARTBIT_REVIEW_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+        let bot = Bot::new(token);
+
+        // Spawn the shared callback dispatcher (no-op if already running).
+        ensure_callback_dispatcher(bot.clone());
+
+        Ok(Self {
+            bot,
+            chat_id: ChatId(chat_id_num),
+            timeout: Duration::from_secs(timeout_secs),
+            pending: shared_pending(),
+        })
+    }
+
+    /// Extract the title from a Markdown draft: first non-blank line,
+    /// stripped of leading `#` and whitespace. Mirrors the blog
+    /// pipeline's `extract_title_slug_excerpt` title rule (which is
+    /// private inside `heartbit_ghost::blog`, so we duplicate it here
+    /// rather than re-export).
+    fn extract_title(draft: &str) -> String {
+        draft
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.trim_start_matches('#').trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Render the message body for a blog review. Long essays don't fit
+    /// in Telegram's 4096-char message cap, so the review surface ships:
+    /// header + seed + per-candidate (title + ~300 char preview).
+    fn render_review_body(msg: &heartbit_ghost::blog::BlogReviewMessage) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("BLOG REVIEW — {}\n\n", msg.persona_name));
+        let abridged_seed: String = msg.seed_text.chars().take(200).collect();
+        s.push_str("SEED:\n> ");
+        s.push_str(&abridged_seed);
+        if msg.seed_text.chars().count() > 200 {
+            s.push('…');
+        }
+        s.push('\n');
+        s.push_str(&format!("({})\n\n", msg.seed_url));
+        for (i, draft) in msg.candidates.iter().enumerate() {
+            let title = Self::extract_title(draft);
+            let preview: String = draft.chars().take(300).collect();
+            s.push_str(&format!("DRAFT {}: {}\n", i + 1, title));
+            s.push_str("> ");
+            s.push_str(&preview);
+            if draft.chars().count() > 300 {
+                s.push('…');
+            }
+            s.push_str("\n\n");
+        }
+        s.push_str("(Full essays are too long for Telegram — pick a draft to publish, then read it at the post URL.)");
+        s
+    }
+
+    /// Render the outcome report that replaces the original Telegram message.
+    fn render_outcome_report(outcome: &heartbit_ghost::blog::BlogOutcome) -> String {
+        match outcome {
+            heartbit_ghost::blog::BlogOutcome::Posted {
+                chosen_index,
+                post_url,
+                ..
+            } => {
+                format!("Posted draft {}: {}", chosen_index + 1, post_url)
+            }
+            heartbit_ghost::blog::BlogOutcome::Skipped => "Skipped".to_string(),
+            heartbit_ghost::blog::BlogOutcome::TimedOut => {
+                "Timed out — no post written".to_string()
+            }
+            heartbit_ghost::blog::BlogOutcome::AllCandidatesGateRejected { reasons } => {
+                format!(
+                    "All candidates rejected by pre-filter:\n- {}",
+                    reasons.join("\n- ")
+                )
+            }
+            heartbit_ghost::blog::BlogOutcome::NoSeed => {
+                "No eligible seed this week — nothing written".to_string()
+            }
+        }
+    }
+}
+
+impl heartbit_ghost::blog::BlogReviewDelivery for TelegramBlogReviewDelivery {
+    fn deliver_and_await<'a>(
+        &'a self,
+        message: &'a heartbit_ghost::blog::BlogReviewMessage,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        heartbit_ghost::review::DeliveredReview,
+                        heartbit_ghost::review::ReviewDeliveryError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // BlogReviewMessage already carries its own interaction_id —
+            // reuse it for callback correlation (unlike the quote /
+            // reply deliveries, which generate one at deliver time).
+            let interaction_id = message.interaction_id;
+            let body = Self::render_review_body(message);
+            let buttons = persona_pick_buttons(interaction_id, message.candidates.len());
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                buttons
+                    .into_iter()
+                    .map(|(label, data)| InlineKeyboardButton::callback(label, data))
+                    .collect::<Vec<_>>(),
+            ]);
+
+            let (tx, rx) = oneshot::channel::<DeliveryOutcome>();
+            self.pending.lock().await.insert(interaction_id, tx);
+
+            let sent = self
+                .bot
+                .send_message(self.chat_id, body)
+                .reply_markup(keyboard)
+                .await
+                .map_err(|e| {
+                    heartbit_ghost::review::ReviewDeliveryError::Transport(format!(
+                        "send_message: {e}"
+                    ))
+                })?;
+            let message_id = sent.id;
+
+            let outcome = match timeout(self.timeout, rx).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(_)) => DeliveryOutcome::TimedOut, // sender dropped
+                Err(_) => {
+                    // Timeout — clean up the pending entry.
+                    self.pending.lock().await.remove(&interaction_id);
+                    DeliveryOutcome::TimedOut
+                }
+            };
+
+            let receipt = heartbit_ghost::review::DeliveryReceipt {
+                data: serde_json::json!({
+                    "chat_id": self.chat_id.0,
+                    "message_id": message_id.0,
+                }),
+            };
+
+            Ok(heartbit_ghost::review::DeliveredReview { outcome, receipt })
+        })
+    }
+
+    fn report<'a>(
+        &'a self,
+        receipt: heartbit_ghost::review::DeliveryReceipt,
+        outcome: heartbit_ghost::blog::BlogOutcome,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), heartbit_ghost::review::ReviewDeliveryError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let chat_id_num = receipt
+                .data
+                .get("chat_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    heartbit_ghost::review::ReviewDeliveryError::InvalidCallback(
+                        "receipt missing chat_id".into(),
+                    )
+                })?;
+            let message_id_num = receipt
+                .data
+                .get("message_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| {
+                    heartbit_ghost::review::ReviewDeliveryError::InvalidCallback(
+                        "receipt missing message_id".into(),
+                    )
+                })?;
+            let body = Self::render_outcome_report(&outcome);
+            self.bot
+                .edit_message_text(ChatId(chat_id_num), MessageId(message_id_num as i32), body)
+                .await
+                .map_err(|e| {
+                    heartbit_ghost::review::ReviewDeliveryError::Transport(format!(
+                        "edit_message: {e}"
+                    ))
+                })?;
+            Ok(())
+        })
+    }
+}
+
 /// Helper: construct the production `ReviewConfig` from env + CLI args.
 #[allow(clippy::too_many_arguments)]
 pub async fn review_config_from_env<'a>(

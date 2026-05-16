@@ -200,6 +200,11 @@ pub async fn run_daemon(
         handle
     };
 
+    // Lifted out so the BlogContext build block can reference the same
+    // `PostsContext` (the blog reuses the posts pipeline's history +
+    // engagement stores for top-engagement seed selection).
+    let mut posts_ctx_for_blog: Option<std::sync::Arc<heartbit::PostsContext>> = None;
+
     // --- Build PostsContext from daemon_config.persona_posts ---
     let core = if !daemon_config.persona_posts.is_empty() && daemon_config.kafka.is_some() {
         let mut registry = heartbit_core::persona::PersonaRegistry::new();
@@ -393,6 +398,10 @@ pub async fn run_daemon(
                 personas = ?posts_ctx.entries.keys().collect::<Vec<_>>(),
                 "posts context configured"
             );
+            // Capture for the BlogContext build block below — the blog
+            // pipeline reuses these post-history / engagement stores for
+            // its seed selection. Arc::clone is cheap.
+            posts_ctx_for_blog = Some(posts_ctx.clone());
             core.map(|c| c.with_posts_context(posts_ctx))
         }
     } else if !daemon_config.persona_posts.is_empty() {
@@ -562,6 +571,122 @@ pub async fn run_daemon(
              quotes pipeline requires Kafka mode and will be skipped"
         );
         core
+    } else {
+        core
+    };
+
+    // --- Build BlogContext from daemon_config.persona_blog ---
+    //
+    // The blog pipeline reuses the matching `[[daemon.persona_posts]]`
+    // entry's post history + engagement stores for seed selection, so
+    // posts_ctx_for_blog must be present (which transitively requires
+    // Kafka mode — the blog scheduler also publishes via the Kafka
+    // producer).
+    let core = if let Some(ref blog_cfg) = daemon_config.persona_blog {
+        if !blog_cfg.enabled {
+            tracing::info!("persona_blog config present but disabled — skipping");
+            core
+        } else {
+            let posts_ctx_inner = posts_ctx_for_blog.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persona_blog requires posts context (no enabled \
+                     [[daemon.persona_posts]] entries configured, or [daemon.kafka] \
+                     is missing — the blog reuses the posts pipeline's history + \
+                     engagement stores for seed selection)"
+                )
+            })?;
+            let posts_entry = posts_ctx_inner
+                .entries
+                .get(&blog_cfg.persona)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "persona_blog references persona '{}' but no matching \
+                     [[daemon.persona_posts]] entry exists — the blog reuses \
+                     the post history + engagement stores for seed selection",
+                        blog_cfg.persona
+                    )
+                })?;
+
+            let posts_dir = expand_tilde(&blog_cfg.posts_dir)?;
+            let out_dir = expand_tilde(&blog_cfg.out_dir)?;
+            let style_css = std::path::PathBuf::from("blog-site/style.css");
+
+            std::fs::create_dir_all(&posts_dir)
+                .with_context(|| format!("create posts_dir at {}", posts_dir.display()))?;
+            std::fs::create_dir_all(&out_dir)
+                .with_context(|| format!("create out_dir at {}", out_dir.display()))?;
+
+            let blog_delivery: std::sync::Arc<dyn heartbit_ghost::blog::BlogReviewDelivery> =
+                std::sync::Arc::new(
+                    crate::persona_review::TelegramBlogReviewDelivery::from_env()
+                        .context("construct TelegramBlogReviewDelivery for blog context")?,
+                );
+
+            // Same retry/on_retry rationale as posts and quotes: the
+            // per-agent override provider is wrapped only by the global
+            // retry layer already applied to `build_provider_from_config`.
+            let writer_provider: Option<std::sync::Arc<heartbit::BoxedProvider>> = blog_cfg
+                .writer_provider
+                .as_ref()
+                .map(|wp_cfg| crate::build_agent_provider(wp_cfg, None, None))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "build writer_provider override for persona_blog '{}'",
+                        blog_cfg.persona
+                    )
+                })?;
+
+            let top_posts_provider = posts_entry.top_posts_provider.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persona_blog requires the matching [[daemon.persona_posts]] \
+                     entry to have a top_posts_provider configured (auto-built \
+                     when post_history_store='jsonl' or 'in_memory' — verify the \
+                     posts entry isn't disabled)"
+                )
+            })?;
+
+            // The corpora + profiles roots are re-resolved here. The
+            // existing posts/quotes blocks pay the same cost — keep this
+            // block self-contained rather than threading the prior values
+            // through extra locals.
+            let corpora_root = heartbit_ghost::corpus::default_corpora_dir()
+                .map_err(|e| anyhow::anyhow!("resolve corpora dir: {e}"))?;
+            let profiles_root = heartbit_ghost::voice::default_profiles_dir()
+                .map_err(|e| anyhow::anyhow!("resolve profiles dir: {e}"))?;
+
+            let entry = heartbit::PersonaBlogEntry {
+                top_posts_provider,
+                interval: std::time::Duration::from_secs(blog_cfg.poll_interval_seconds),
+                interval_jitter_pct: blog_cfg.interval_jitter_pct,
+                active_hours: blog_cfg.active_hours.clone(),
+                seed_lookback_days: blog_cfg.seed_lookback_days,
+                candidates_per_draft: blog_cfg.candidates_per_draft,
+                posts_dir,
+                out_dir,
+                style_css,
+                site_url: blog_cfg.site_url.clone(),
+                site_title: blog_cfg.site_title.clone(),
+                writer_provider,
+            };
+
+            let blog_ctx = std::sync::Arc::new(heartbit::BlogContext {
+                registry: posts_ctx_inner.registry.clone(),
+                provider: posts_ctx_inner.provider.clone(),
+                delivery: blog_delivery,
+                credentials: posts_ctx_inner.credentials.clone(),
+                corpora_root,
+                profiles_root,
+                entry,
+                persona_name: blog_cfg.persona.clone(),
+            });
+            tracing::info!(
+                persona = %blog_ctx.persona_name,
+                site_url = %blog_ctx.entry.site_url,
+                "blog context configured"
+            );
+            core.map(|c| c.with_blog_context(blog_ctx))
+        }
     } else {
         core
     };

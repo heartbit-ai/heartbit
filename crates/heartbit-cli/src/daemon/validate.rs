@@ -38,6 +38,19 @@ pub enum ValidationIssueKind {
     NonexistentParentDir { path: String },
     /// `[[daemon.persona_quotes]]` entry has empty `source_user_ids`.
     MissingSourceUserIds,
+    /// `[daemon.persona_blog]` references a persona that doesn't have a
+    /// matching `[[daemon.persona_posts]]` entry. The blog reuses the
+    /// posts pipeline's history + engagement stores for seed selection,
+    /// so the cross-reference is required.
+    BlogMissingMatchingPostsEntry { persona: String },
+    /// `[daemon.persona_blog].site_url` is empty.
+    BlogEmptySiteUrl,
+    /// `[daemon.persona_blog].site_url` doesn't start with `https://`.
+    BlogNonHttpsSiteUrl { site_url: String },
+    /// `[daemon.persona_blog].posts_dir` is empty.
+    BlogEmptyPostsDir,
+    /// `[daemon.persona_blog].out_dir` is empty.
+    BlogEmptyOutDir,
 }
 
 impl std::fmt::Display for ValidationIssue {
@@ -69,6 +82,28 @@ impl std::fmt::Display for ValidationIssue {
                 "{}: source_user_ids is empty — at least one X user ID required",
                 self.context
             ),
+            ValidationIssueKind::BlogMissingMatchingPostsEntry { persona } => write!(
+                f,
+                "{}: references persona '{persona}' but no matching \
+                 [[daemon.persona_posts]] entry exists (the blog reuses \
+                 the posts pipeline's history + engagement stores for \
+                 seed selection)",
+                self.context
+            ),
+            ValidationIssueKind::BlogEmptySiteUrl => {
+                write!(f, "{}: site_url must be non-empty", self.context)
+            }
+            ValidationIssueKind::BlogNonHttpsSiteUrl { site_url } => write!(
+                f,
+                "{}: site_url should start with https:// (got '{site_url}')",
+                self.context
+            ),
+            ValidationIssueKind::BlogEmptyPostsDir => {
+                write!(f, "{}: posts_dir must be non-empty", self.context)
+            }
+            ValidationIssueKind::BlogEmptyOutDir => {
+                write!(f, "{}: out_dir must be non-empty", self.context)
+            }
         }
     }
 }
@@ -88,6 +123,7 @@ pub fn validate_daemon_config(
     validate_persona_posts(daemon_config, &env_lookup, &path_exists, &mut issues);
     validate_persona_mentions(daemon_config, &path_exists, &mut issues);
     validate_persona_quotes(daemon_config, &path_exists, &mut issues);
+    validate_persona_blog(daemon_config, &mut issues);
 
     issues
 }
@@ -181,6 +217,60 @@ fn validate_persona_quotes(
     }
 }
 
+fn validate_persona_blog(daemon: &DaemonConfig, issues: &mut Vec<ValidationIssue>) {
+    let Some(blog_cfg) = daemon.persona_blog.as_ref() else {
+        return;
+    };
+    if !blog_cfg.enabled {
+        return;
+    }
+    let context = format!("[daemon.persona_blog] persona='{}'", blog_cfg.persona);
+
+    // 1. Cross-reference: persona must have a matching persona_posts entry
+    //    (the blog reuses the posts pipeline's stores for seed selection).
+    let has_matching = daemon
+        .persona_posts
+        .iter()
+        .any(|p| p.persona == blog_cfg.persona);
+    if !has_matching {
+        issues.push(ValidationIssue {
+            kind: ValidationIssueKind::BlogMissingMatchingPostsEntry {
+                persona: blog_cfg.persona.clone(),
+            },
+            context: context.clone(),
+        });
+    }
+
+    // 2. site_url: non-empty, https://.
+    if blog_cfg.site_url.is_empty() {
+        issues.push(ValidationIssue {
+            kind: ValidationIssueKind::BlogEmptySiteUrl,
+            context: context.clone(),
+        });
+    } else if !blog_cfg.site_url.starts_with("https://") {
+        issues.push(ValidationIssue {
+            kind: ValidationIssueKind::BlogNonHttpsSiteUrl {
+                site_url: blog_cfg.site_url.clone(),
+            },
+            context: context.clone(),
+        });
+    }
+
+    // 3. posts_dir + out_dir non-empty.
+    if blog_cfg.posts_dir.is_empty() {
+        issues.push(ValidationIssue {
+            kind: ValidationIssueKind::BlogEmptyPostsDir,
+            context: context.clone(),
+        });
+    }
+    if blog_cfg.out_dir.is_empty() {
+        issues.push(ValidationIssue {
+            kind: ValidationIssueKind::BlogEmptyOutDir,
+            context: context.clone(),
+        });
+    }
+}
+
 fn check_parent_dir(
     raw_path: &str,
     context: &str,
@@ -215,7 +305,10 @@ fn check_parent_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heartbit::{DaemonConfig, PersonaMentionsConfig, PersonaPostsConfig, PersonaQuotesConfig};
+    use heartbit::{
+        DaemonConfig, PersonaBlogConfig, PersonaMentionsConfig, PersonaPostsConfig,
+        PersonaQuotesConfig,
+    };
 
     fn config_with_daemon(daemon: DaemonConfig) -> HeartbitConfig {
         // HeartbitConfig has all fields #[serde(default)], so empty TOML works.
@@ -373,5 +466,92 @@ source_user_ids = ["44196397"]
         let cfg: HeartbitConfig = toml::from_str("").expect("config parses");
         let issues = validate_daemon_config(&cfg, |_| None, |_| true);
         assert!(issues.is_empty(), "issues: {issues:?}");
+    }
+
+    fn blog(persona: &str) -> PersonaBlogConfig {
+        let toml = format!(
+            r#"
+persona = "{persona}"
+site_url = "https://pascal.heartbit.ai"
+"#
+        );
+        toml::from_str(&toml).expect("PersonaBlogConfig fixture parses")
+    }
+
+    #[test]
+    fn validate_persona_blog_missing_matching_persona_posts_flags_issue() {
+        let mut d = minimal_daemon();
+        // Blog persona='foo', but no [[daemon.persona_posts]] entry named 'foo'.
+        d.persona_blog = Some(blog("foo"));
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| true);
+        assert!(
+            issues.iter().any(|i| matches!(
+                &i.kind,
+                ValidationIssueKind::BlogMissingMatchingPostsEntry { persona } if persona == "foo"
+            )),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_persona_blog_non_https_site_url_flags_issue() {
+        let mut d = minimal_daemon();
+        let mut b = blog("heartbit-ghost:x");
+        b.site_url = "http://example.com".into();
+        d.persona_blog = Some(b);
+        // Matching persona_posts so the cross-reference doesn't add noise.
+        d.persona_posts.push(post("heartbit-ghost:x"));
+        d.persona_mentions.push(mention("heartbit-ghost:x", "42"));
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| true);
+        assert!(
+            issues.iter().any(|i| matches!(
+                &i.kind,
+                ValidationIssueKind::BlogNonHttpsSiteUrl { site_url } if site_url == "http://example.com"
+            )),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_persona_blog_happy_path_no_issues() {
+        let mut d = minimal_daemon();
+        d.persona_blog = Some(blog("heartbit-ghost:x"));
+        d.persona_posts.push(post("heartbit-ghost:x"));
+        d.persona_mentions.push(mention("heartbit-ghost:x", "42"));
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| true);
+        // No blog-related issues should appear. (Other validators have
+        // already been exercised in earlier tests; here we only care that
+        // a correctly-configured blog block contributes zero issues.)
+        assert!(
+            !issues.iter().any(|i| matches!(
+                &i.kind,
+                ValidationIssueKind::BlogMissingMatchingPostsEntry { .. }
+                    | ValidationIssueKind::BlogEmptySiteUrl
+                    | ValidationIssueKind::BlogNonHttpsSiteUrl { .. }
+                    | ValidationIssueKind::BlogEmptyPostsDir
+                    | ValidationIssueKind::BlogEmptyOutDir
+            )),
+            "expected no blog-related issues; got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_persona_blog_disabled_skips_validation() {
+        let mut d = minimal_daemon();
+        let mut b = blog("foo"); // mismatched persona — would normally flag
+        b.enabled = false; // but disabled blocks must be skipped entirely
+        d.persona_blog = Some(b);
+        let cfg = config_with_daemon(d);
+        let issues = validate_daemon_config(&cfg, |_| None, |_| true);
+        assert!(
+            !issues.iter().any(|i| matches!(
+                &i.kind,
+                ValidationIssueKind::BlogMissingMatchingPostsEntry { .. }
+            )),
+            "disabled blog must skip cross-reference check; got: {issues:?}"
+        );
     }
 }
