@@ -205,3 +205,15 @@ mod tests {
         assert!(r.get(crate::heartbit_rs::PERSONA_NAME).is_some());
     }
 }
+
+#[cfg(test)]
+mod blog_deps_smoke {
+    #[test]
+    fn blog_deps_compile() {
+        let _md = pulldown_cmark::Parser::new("# hello");
+        let env = minijinja::Environment::new();
+        let _ = env.render_str("{{ x }}", minijinja::context! { x => "y" });
+        let _yaml: serde_yaml::Value = serde_yaml::from_str("a: 1").unwrap();
+        let _slug = slug::slugify("Hello World!");
+    }
+}
