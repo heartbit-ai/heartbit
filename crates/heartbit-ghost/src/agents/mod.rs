@@ -21,6 +21,7 @@ use std::sync::Arc;
 use heartbit_core::config::AgentConfig;
 use heartbit_core::tool::Tool;
 
+pub mod blog_writer;
 pub mod fact_check;
 pub mod image_generator;
 pub mod judge;
@@ -33,6 +34,7 @@ pub mod style_critic;
 pub mod topic_generator;
 pub mod writer;
 
+pub use blog_writer::{BLOG_WRITER_SYSTEM_PROMPT, blog_writer_recipe};
 pub use fact_check::fact_check_recipe;
 pub use image_generator::image_generator_recipe;
 pub use judge::judge_recipe;
