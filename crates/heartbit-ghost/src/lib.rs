@@ -17,6 +17,7 @@ use heartbit_core::{Persona, PersonaExpansion, PersonaParams, PersonaRegistry};
 pub mod agents;
 pub mod blog;
 pub mod corpus;
+pub mod github_readme;
 pub mod heartbit_rs;
 pub mod pipeline;
 pub mod posts;
