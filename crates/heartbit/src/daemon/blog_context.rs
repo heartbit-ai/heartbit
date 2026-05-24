@@ -48,6 +48,12 @@ pub struct PersonaBlogEntry {
     /// Invoked from daemon CWD; daemon env is inherited (e.g.
     /// `CLOUDFLARE_API_TOKEN` for `wrangler pages deploy …`).
     pub deploy_command: Option<String>,
+    /// Optional X self-amplification config. When `Some`, each Posted
+    /// outcome enqueues a `DaemonCommand::BlogAnnounceX`.
+    pub x_announce: Option<heartbit_core::config::XAnnounceConfig>,
+    /// Optional GitHub README auto-update config. When `Some`, each
+    /// Posted outcome refreshes the operator's profile README.
+    pub github_readme: Option<heartbit_core::config::GithubReadmeConfig>,
 }
 
 impl std::fmt::Debug for PersonaBlogEntry {
@@ -65,6 +71,14 @@ impl std::fmt::Debug for PersonaBlogEntry {
             .field("site_title", &self.site_title)
             .field("writer_provider_set", &self.writer_provider.is_some())
             .field("deploy_command_set", &self.deploy_command.is_some())
+            .field(
+                "x_announce_enabled",
+                &self.x_announce.as_ref().map(|c| c.enabled),
+            )
+            .field(
+                "github_readme_enabled",
+                &self.github_readme.as_ref().map(|c| c.enabled),
+            )
             .finish()
     }
 }

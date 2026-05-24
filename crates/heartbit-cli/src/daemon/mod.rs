@@ -669,6 +669,8 @@ pub async fn run_daemon(
                 site_title: blog_cfg.site_title.clone(),
                 writer_provider,
                 deploy_command: blog_cfg.deploy_command.clone(),
+                x_announce: None,
+                github_readme: None,
             };
 
             let blog_ctx = std::sync::Arc::new(heartbit::BlogContext {
