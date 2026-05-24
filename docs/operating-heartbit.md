@@ -120,6 +120,7 @@ Engagement metrics live alongside the post history in `.heartbit/engagement/{per
 | `site_url` | required | Public URL for canonical tags, RSS, sitemap. |
 | `site_title` | `pascal.heartbit.ai` | Site title in `<title>` and the index header. |
 | `writer_provider` | unset | Same shape as `persona_posts.writer_provider`. Falls back to global `[provider]`. |
+| `deploy_command` | unset | Shell command run after a successful `Posted` outcome. Runs from daemon CWD, inherits env. Use to push the regen output to the host (e.g. Cloudflare Pages). See *Deployment* below. |
 
 ### Prerequisite: matching `[[daemon.persona_posts]]` entry
 
@@ -127,16 +128,31 @@ The blog requires a matching `[[daemon.persona_posts]]` entry for the same perso
 
 ### Deployment to Cloudflare Pages
 
-1. Create a Cloudflare Pages project pointed at the repository.
-2. Set the build directory to `blog-site/public/`. No build command needed (the daemon pre-renders).
-3. Add the custom domain `pascal.heartbit.ai` in the Pages project's domain settings.
-4. Each successful blog tick:
-   a. The daemon writes a new Markdown file to `blog-site/posts/`.
-   b. The renderer regenerates `blog-site/public/` from all posts.
-   c. The daemon (or you, on next git push) commits + pushes.
-   d. Cloudflare Pages auto-deploys from the push.
+Current setup uses `wrangler pages deploy` shell-out — no Git integration. To switch hosts, edit the `deploy_command` knob; everything else stays the same.
 
-For now the daemon does NOT auto-commit. After a successful tick, the operator runs `git add blog-site/ && git commit -m "blog: <slug>" && git push` to trigger deploy. (Future enhancement: optional auto-commit hook.)
+**One-time CF setup:**
+1. Create a Cloudflare API token at https://dash.cloudflare.com/profile/api-tokens with `Cloudflare Pages: Edit` + `Account Settings: Read`.
+2. Create the Pages project (CLI or dashboard): `npx wrangler@latest pages project create pascal-heartbit-ai --production-branch=main`.
+3. Add the custom domain (`pascal.heartbit.ai`) — CLI via the Pages API, or dashboard.
+
+**Daemon launch:** export the API token in the daemon's env so the `deploy_command` hook can use it:
+
+```bash
+export CLOUDFLARE_API_TOKEN=cfat_…
+target/release/heartbit --config daemon-dev.toml daemon
+```
+
+**On each successful tick** (`BlogOutcome::Posted`):
+- The daemon writes a new Markdown file to `blog-site/posts/`.
+- `render_site()` regenerates `blog-site/public/` from all posts.
+- The daemon shells out to `deploy_command` (5-min timeout, failures logged + swallowed — never crashes the daemon).
+- Cloudflare Pages serves the new build at the custom domain.
+
+The default `deploy_command` in the example config:
+
+```toml
+deploy_command = "npx --yes wrangler@latest pages deploy blog-site/public --project-name=pascal-heartbit-ai --commit-dirty=true --branch=main"
+```
 
 ### Manual regen
 
