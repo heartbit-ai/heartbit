@@ -651,4 +651,133 @@ mod tests {
         let ok = run_deploy_command("test-persona", "exit 17").await;
         assert!(!ok, "non-zero exit must return false");
     }
+
+    // ─── CapturingProducer mock ──────────────────────────────────────────────
+
+    struct CapturingProducer {
+        captured: std::sync::Mutex<Vec<crate::daemon::DaemonCommand>>,
+    }
+
+    impl CapturingProducer {
+        fn arc() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(CapturingProducer {
+                captured: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl crate::daemon::CommandProducer for CapturingProducer {
+        fn send_command<'a>(
+            &'a self,
+            _topic: &'a str,
+            _key: &'a str,
+            payload: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::Error>> + Send + 'a>,
+        > {
+            let payload = payload.to_vec();
+            Box::pin(async move {
+                let cmd: crate::daemon::DaemonCommand = serde_json::from_slice(&payload)?;
+                self.captured.lock().unwrap().push(cmd);
+                Ok(())
+            })
+        }
+    }
+
+    // ─── Minimal local repo init helper (inlined, no shared test fixture) ────
+
+    fn init_local_repo_for_test() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let upstream = tmp.path().join("upstream");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&upstream).unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {args:?} failed");
+        };
+        run(&upstream, &["init", "--bare", "-b", "main"]);
+        run(&repo, &["init", "-b", "main"]);
+        run(&repo, &["config", "user.email", "test@test"]);
+        run(&repo, &["config", "user.name", "test"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", &upstream.to_string_lossy()],
+        );
+        std::fs::write(repo.join("README.md"), "# Original\n").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-m", "init"]);
+        run(&repo, &["push", "-u", "origin", "main"]);
+        (tmp, repo)
+    }
+
+    // ─── Integration test ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn amp_helpers_work_in_isolation() {
+        // We can't easily mock run_blog_pipeline inside handle_persona_blog,
+        // so this test verifies the HELPERS the handler calls work correctly:
+        //   1) update_github_readme — writes README and pushes to a bare upstream
+        //   2) CapturingProducer — captures a BlogAnnounceX command when produced
+        //
+        // Coverage of `handle_persona_blog` itself comes from the existing
+        // unknown-persona / no-seed tests in this file.
+
+        // ─── Surface 1: update_github_readme works ───────────────────────────
+        let (_tmp, repo) = init_local_repo_for_test();
+        let posts_dir = _tmp.path().join("posts");
+        std::fs::create_dir_all(&posts_dir).unwrap();
+
+        let gh_res = heartbit_ghost::github_readme::update_github_readme(
+            heartbit_ghost::github_readme::UpdateReadmeParams {
+                local_repo_path: &repo,
+                bio_template_path: std::path::Path::new("bio.md"),
+                blog_posts_dir: &posts_dir,
+                site_url: "https://pascal.heartbit.ai",
+                git_author_name: "test",
+                git_author_email: "test@test",
+                new_post_slug: "smoke-test",
+            },
+        )
+        .await;
+        assert!(gh_res.is_ok(), "update_github_readme failed: {gh_res:?}");
+        let readme = std::fs::read_to_string(repo.join("README.md")).unwrap();
+        assert!(
+            readme.contains(heartbit_ghost::github_readme::AUTO_GENERATED_MARKER),
+            "README should contain the auto-generated marker"
+        );
+
+        // ─── Surface 2: CapturingProducer captures BlogAnnounceX ─────────────
+        let producer = CapturingProducer::arc();
+        let cmd = crate::daemon::DaemonCommand::BlogAnnounceX {
+            persona: "heartbit-ghost:x".into(),
+            post_url: "https://pascal.heartbit.ai/test/".into(),
+            title: "Test".into(),
+            excerpt: "x".into(),
+            body_snippet: "y".into(),
+        };
+        let payload = serde_json::to_vec(&cmd).unwrap();
+        crate::daemon::CommandProducer::send_command(
+            producer.as_ref(),
+            "test.commands",
+            "test-key",
+            &payload,
+        )
+        .await
+        .unwrap();
+
+        let captured = producer.captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one command should be captured");
+        assert!(
+            matches!(
+                &captured[0],
+                crate::daemon::DaemonCommand::BlogAnnounceX { .. }
+            ),
+            "captured command must be BlogAnnounceX"
+        );
+    }
 }
