@@ -58,6 +58,19 @@ pub struct PersonaBlogDeps<'a> {
     /// Runs from the daemon CWD; env is inherited. Errors are logged
     /// but never propagated (the post is already written).
     pub deploy_command: Option<&'a str>,
+    /// Optional X self-amp config (from `BlogContext.entry.x_announce`).
+    /// `None` (or `Some` with `enabled=false`) disables X announcement
+    /// enqueue on Posted outcomes.
+    pub x_announce: Option<&'a heartbit_core::config::XAnnounceConfig>,
+    /// Optional GitHub README config (from `BlogContext.entry.github_readme`).
+    /// `None` (or `Some` with `enabled=false`) disables the README refresh
+    /// on Posted outcomes.
+    pub github_readme: Option<&'a heartbit_core::config::GithubReadmeConfig>,
+    /// Command producer for enqueueing `BlogAnnounceX`. Optional —
+    /// `None` disables X self-amp even if `x_announce` is enabled.
+    pub command_producer: Option<Arc<dyn crate::daemon::CommandProducer>>,
+    /// Kafka topic for commands (used when enqueueing `BlogAnnounceX`).
+    pub commands_topic: &'a str,
 }
 
 /// Run one blog pipeline tick. Selects the seed via
@@ -126,9 +139,9 @@ pub async fn handle_persona_blog(deps: PersonaBlogDeps<'_>) -> Result<()> {
                 "blog pipeline complete"
             );
             if let BlogOutcome::Posted {
+                chosen_index,
                 post_path,
                 post_url,
-                ..
             } = &out.outcome
             {
                 tracing::info!(
@@ -137,8 +150,104 @@ pub async fn handle_persona_blog(deps: PersonaBlogDeps<'_>) -> Result<()> {
                     path = %post_path.display(),
                     "blog: post published"
                 );
-                if let Some(cmd) = deps.deploy_command {
-                    run_deploy_command(deps.persona_name, cmd).await;
+                // Run deploy_command first; track success so amp surfaces
+                // are gated on a live published site.
+                let deploy_ok = if let Some(cmd) = deps.deploy_command {
+                    run_deploy_command(deps.persona_name, cmd).await
+                } else {
+                    true
+                };
+                if deploy_ok {
+                    // Surface 1: GitHub README on-publish (synchronous).
+                    if let Some(gh) = deps.github_readme
+                        && gh.enabled
+                    {
+                        let slug = post_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        let res = heartbit_ghost::github_readme::update_github_readme(
+                            heartbit_ghost::github_readme::UpdateReadmeParams {
+                                local_repo_path: std::path::Path::new(&gh.local_repo_path),
+                                bio_template_path: std::path::Path::new(&gh.bio_template_path),
+                                blog_posts_dir: deps.posts_dir,
+                                site_url: deps.site_url,
+                                git_author_name: &gh.git_author_name,
+                                git_author_email: &gh.git_author_email,
+                                new_post_slug: slug,
+                            },
+                        )
+                        .await;
+                        if let Err(e) = res {
+                            tracing::error!(
+                                persona = %deps.persona_name,
+                                error = %e,
+                                "github_readme update failed"
+                            );
+                        }
+                    }
+                    // Surface 2: X announcement via Kafka.
+                    if let Some(xa) = deps.x_announce
+                        && xa.enabled
+                    {
+                        if let Some(producer) = deps.command_producer.as_ref() {
+                            let body_snippet =
+                                body_snippet_from_path(post_path).unwrap_or_default();
+                            // Use the operator-picked candidate for
+                            // title/excerpt — falling back to the
+                            // first surviving candidate when the
+                            // index is somehow out of range (which
+                            // shouldn't happen for a Posted outcome).
+                            let chosen = out
+                                .candidates
+                                .get(*chosen_index)
+                                .or_else(|| out.candidates.first());
+                            let title = chosen.map(|c| c.title.clone()).unwrap_or_default();
+                            let excerpt = chosen.map(|c| c.excerpt.clone()).unwrap_or_default();
+                            let cmd = crate::daemon::DaemonCommand::BlogAnnounceX {
+                                persona: deps.persona_name.to_string(),
+                                post_url: post_url.clone(),
+                                title,
+                                excerpt,
+                                body_snippet,
+                            };
+                            let payload = match serde_json::to_vec(&cmd) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::error!(
+                                        persona = %deps.persona_name,
+                                        error = %e,
+                                        "BlogAnnounceX serialize failed"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                            let key = format!("blog_announce_x:{}", deps.persona_name);
+                            if let Err(e) = producer
+                                .send_command(deps.commands_topic, &key, &payload)
+                                .await
+                            {
+                                tracing::error!(
+                                    persona = %deps.persona_name,
+                                    error = %e,
+                                    "BlogAnnounceX enqueue failed"
+                                );
+                            } else {
+                                tracing::info!(
+                                    persona = %deps.persona_name,
+                                    topic = %deps.commands_topic,
+                                    "BlogAnnounceX enqueued"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                persona = %deps.persona_name,
+                                "x_announce enabled but no command_producer configured"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        persona = %deps.persona_name,
+                        "deploy_command failed — skipping amp surfaces (github_readme + BlogAnnounceX)"
+                    );
                 }
             }
         }
@@ -153,11 +262,35 @@ pub async fn handle_persona_blog(deps: PersonaBlogDeps<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Read the first ~500 chars of the post body (after YAML frontmatter)
+/// for the X announcement writer. Returns `None` if the file can't be
+/// read or has YAML opening fences with no closing delimiter.
+fn body_snippet_from_path(post_path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(post_path).ok()?;
+    let trimmed = content.trim_start();
+    let body = if let Some(after) = trimmed.strip_prefix("---") {
+        match after.find("\n---\n") {
+            Some(end) => after[end + 5..].trim_start_matches('\n').to_string(),
+            None => return None,
+        }
+    } else {
+        trimmed.to_string()
+    };
+    let snippet: String = body.chars().take(500).collect();
+    Some(snippet)
+}
+
 /// Shell out to the operator-configured deploy command after a Posted
 /// outcome. Bounded at 5 minutes; failures are logged and swallowed
 /// (the post is already written to disk — deploy failure should never
 /// crash the daemon).
-async fn run_deploy_command(persona_name: &str, cmd: &str) {
+///
+/// Returns `true` when the command exited with status 0, `false`
+/// otherwise (spawn failure, non-zero exit, wait error, or timeout).
+/// Callers use the bool to gate downstream amplification surfaces
+/// (X announcement, GitHub README) so we don't broadcast a URL whose
+/// live site failed to deploy.
+async fn run_deploy_command(persona_name: &str, cmd: &str) -> bool {
     tracing::info!(persona = %persona_name, %cmd, "blog: running deploy_command");
     let child = match tokio::process::Command::new("sh")
         .arg("-c")
@@ -170,7 +303,7 @@ async fn run_deploy_command(persona_name: &str, cmd: &str) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(persona = %persona_name, error = %e, "blog: deploy spawn failed");
-            return;
+            return false;
         }
     };
     let result = tokio::time::timeout(
@@ -188,6 +321,7 @@ async fn run_deploy_command(persona_name: &str, cmd: &str) {
                     stdout = %stdout.trim(),
                     "blog: deploy succeeded"
                 );
+                true
             } else {
                 tracing::error!(
                     persona = %persona_name,
@@ -196,13 +330,16 @@ async fn run_deploy_command(persona_name: &str, cmd: &str) {
                     stderr = %stderr.trim(),
                     "blog: deploy exited non-zero"
                 );
+                false
             }
         }
         Ok(Err(e)) => {
             tracing::error!(persona = %persona_name, error = %e, "blog: deploy wait failed");
+            false
         }
         Err(_) => {
             tracing::error!(persona = %persona_name, "blog: deploy timed out after 300s");
+            false
         }
     }
 }
@@ -417,6 +554,10 @@ mod tests {
             site_url: "https://pascal.heartbit.ai",
             site_title: "pascal.heartbit.ai",
             deploy_command: None,
+            x_announce: None,
+            github_readme: None,
+            command_producer: None,
+            commands_topic: "test.commands",
         };
 
         let err = handle_persona_blog(deps)
@@ -463,6 +604,10 @@ mod tests {
             site_url: "https://pascal.heartbit.ai",
             site_title: "pascal.heartbit.ai",
             deploy_command: None,
+            x_announce: None,
+            github_readme: None,
+            command_producer: None,
+            commands_topic: "test.commands",
         };
 
         handle_persona_blog(deps)
@@ -489,7 +634,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("deployed");
         let cmd = format!("touch {}", marker.display());
-        run_deploy_command("test-persona", &cmd).await;
+        let ok = run_deploy_command("test-persona", &cmd).await;
+        assert!(ok, "deploy command exit-0 must return true");
         assert!(
             marker.exists(),
             "deploy command should have created the marker file at {}",
@@ -501,7 +647,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_deploy_command_swallows_failure() {
-        // Should NOT panic or propagate; just log and return.
-        run_deploy_command("test-persona", "exit 17").await;
+        // Should NOT panic or propagate; non-zero exit returns false.
+        let ok = run_deploy_command("test-persona", "exit 17").await;
+        assert!(!ok, "non-zero exit must return false");
     }
 }

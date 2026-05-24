@@ -1487,6 +1487,17 @@ impl DaemonCore {
                             let site_url = ctx.entry.site_url.clone();
                             let site_title = ctx.entry.site_title.clone();
                             let deploy_command = ctx.entry.deploy_command.clone();
+                            let x_announce = ctx.entry.x_announce.clone();
+                            let github_readme = ctx.entry.github_readme.clone();
+                            // Wrap the daemon's concrete FutureProducer in
+                            // the CommandProducer trait object for the
+                            // handler. Cloning the FutureProducer is cheap
+                            // (Arc-internal).
+                            let cmd_producer: Arc<dyn crate::daemon::CommandProducer> =
+                                Arc::new(crate::daemon::KafkaCommandProducer::new(
+                                    self.producer.clone(),
+                                ));
+                            let commands_topic = self.commands_topic.clone();
                             let persona_owned = persona.clone();
                             tokio::spawn(async move {
                                 let deps = crate::daemon::PersonaBlogDeps {
@@ -1507,6 +1518,10 @@ impl DaemonCore {
                                     site_url: &site_url,
                                     site_title: &site_title,
                                     deploy_command: deploy_command.as_deref(),
+                                    x_announce: x_announce.as_ref(),
+                                    github_readme: github_readme.as_ref(),
+                                    command_producer: Some(cmd_producer),
+                                    commands_topic: &commands_topic,
                                 };
                                 if let Err(e) =
                                     crate::daemon::handle_persona_blog(deps).await
@@ -1577,8 +1592,83 @@ impl DaemonCore {
                                 }
                             });
                         }
-                        DaemonCommand::BlogAnnounceX { .. } => {
-                            tracing::trace!("BlogAnnounceX received but not handled here");
+                        DaemonCommand::BlogAnnounceX {
+                            persona,
+                            post_url,
+                            title,
+                            excerpt,
+                            body_snippet,
+                        } => {
+                            let Some(blog_ctx) = self.blog_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "BlogAnnounceX: no blog_context configured"
+                                );
+                                continue;
+                            };
+                            if blog_ctx.persona_name != persona {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    configured = %blog_ctx.persona_name,
+                                    "BlogAnnounceX for persona other than the configured blog persona"
+                                );
+                                continue;
+                            }
+                            let Some(posts_ctx) = self.posts_context.clone() else {
+                                tracing::warn!(
+                                    persona = %persona,
+                                    "BlogAnnounceX: no posts_context (needed for twitter_thread + delivery)"
+                                );
+                                continue;
+                            };
+                            let enabled = blog_ctx
+                                .entry
+                                .x_announce
+                                .as_ref()
+                                .map(|c| c.enabled)
+                                .unwrap_or(false);
+                            if !enabled {
+                                tracing::info!(
+                                    persona = %persona,
+                                    "BlogAnnounceX: x_announce disabled — skipping"
+                                );
+                                continue;
+                            }
+                            let registry = blog_ctx.registry.clone();
+                            let provider = blog_ctx.provider.clone();
+                            let writer_provider = blog_ctx.entry.writer_provider.clone();
+                            let credentials = blog_ctx.credentials.clone();
+                            let corpora_root = blog_ctx.corpora_root.clone();
+                            let profiles_root = blog_ctx.profiles_root.clone();
+                            let delivery = posts_ctx.delivery.clone();
+                            let twitter_tool = posts_ctx.twitter_thread.clone();
+                            let persona_owned = persona.clone();
+                            tokio::spawn(async move {
+                                let deps = crate::daemon::BlogAnnounceXDeps {
+                                    persona_name: &persona_owned,
+                                    registry: &registry,
+                                    provider,
+                                    writer_provider,
+                                    corpora_root: &corpora_root,
+                                    profiles_root: &profiles_root,
+                                    title: &title,
+                                    excerpt: &excerpt,
+                                    body_snippet: &body_snippet,
+                                    post_url: &post_url,
+                                    delivery,
+                                    twitter_tool,
+                                    credentials,
+                                };
+                                if let Err(e) =
+                                    crate::daemon::handle_blog_announce_x(deps).await
+                                {
+                                    tracing::error!(
+                                        persona = %persona_owned,
+                                        error = %e,
+                                        "blog announce X handler failed"
+                                    );
+                                }
+                            });
                         }
                     }
                 }
