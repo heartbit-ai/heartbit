@@ -121,6 +121,36 @@ Engagement metrics live alongside the post history in `.heartbit/engagement/{per
 | `site_title` | `pascal.heartbit.ai` | Site title in `<title>` and the index header. |
 | `writer_provider` | unset | Same shape as `persona_posts.writer_provider`. Falls back to global `[provider]`. |
 | `deploy_command` | unset | Shell command run after a successful `Posted` outcome. Runs from daemon CWD, inherits env. Use to push the regen output to the host (e.g. Cloudflare Pages). See *Deployment* below. |
+| `x_announce` | unset | Optional sub-block. When `enabled`, fires an X announcement thread after each Posted+deploy success. See *Sub-blocks* below. |
+| `github_readme` | unset | Optional sub-block. When `enabled`, auto-updates GitHub Profile README to feature 3 most recent essays. See *Sub-blocks* below. |
+
+### Sub-blocks: `x_announce` + `github_readme`
+
+`[daemon.persona_blog.x_announce]` — when set, each successful blog publish (gated on `deploy_command` succeeding or being absent) enqueues a `DaemonCommand::BlogAnnounceX` that drafts a 3-5 tweet announcement thread, sends it to Telegram for your review, then publishes on Pick.
+
+```toml
+[daemon.persona_blog.x_announce]
+enabled = true
+```
+
+Reuses the same Telegram review dispatcher as proactive X posts, the same `twitter_thread` tool for publishing, and the operator's voice profile. The writer's source-of-truth is the just-published blog post (title + excerpt + first ~500 chars of body) — no fact-checking step (the blog post is the source).
+
+`[daemon.persona_blog.github_readme]` — when set, after a successful blog publish the daemon refreshes the operator's GitHub Profile README to feature the 3 most recent essays, then `git push`es the change to the configured local clone.
+
+```toml
+[daemon.persona_blog.github_readme]
+enabled = true
+local_repo_path = "/home/pleclech/projects/100-tokens-profile"
+bio_template_path = "bio.md"           # relative to local_repo_path
+git_author_name = "Pascal Le Clech"
+git_author_email = "pascal@heartbit.ai"
+```
+
+The README is rendered with a marker (`<!-- AUTO-GENERATED: do not edit below this line -->`). Everything above the marker is preserved verbatim — that's where your bio lives. Everything below is regenerated on each blog publish. On first run (no marker yet), the full rendered README — bio template + auto section — is written.
+
+**Requirements:**
+- `local_repo_path` must be a working git clone with `origin` configured for push (HTTPS token or SSH key).
+- The daemon does NOT manage GitHub auth — same model as `deploy_command` for `wrangler`.
 
 ### Prerequisite: matching `[[daemon.persona_posts]]` entry
 
