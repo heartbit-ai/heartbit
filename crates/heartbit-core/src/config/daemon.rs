@@ -643,6 +643,19 @@ pub struct PersonaBlogConfig {
     /// `wrangler pages deploy …`). Empty/`None` skips the hook.
     #[serde(default)]
     pub deploy_command: Option<String>,
+    /// Optional X self-amplification — when `Some(cfg)` and `cfg.enabled`,
+    /// each successful blog publish (after deploy_command succeeds or is
+    /// absent) enqueues a `DaemonCommand::BlogAnnounceX` that drafts an
+    /// announcement thread through the existing X persona pipeline +
+    /// Telegram review.
+    #[serde(default)]
+    pub x_announce: Option<XAnnounceConfig>,
+    /// Optional GitHub Profile README auto-update — when `Some(cfg)` and
+    /// `cfg.enabled`, each successful blog publish re-renders the
+    /// operator's profile README to feature the 3 most recent essays
+    /// and pushes the change to GitHub via the local repo clone.
+    #[serde(default)]
+    pub github_readme: Option<GithubReadmeConfig>,
 }
 
 fn default_blog_poll_interval_seconds() -> u64 {
@@ -671,6 +684,40 @@ fn default_blog_candidates_per_draft() -> usize {
 
 fn default_blog_site_title() -> String {
     "pascal.heartbit.ai".into()
+}
+
+/// X self-amplification settings (sub-block of `[daemon.persona_blog]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct XAnnounceConfig {
+    /// Whether X self-amplification is enabled.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+}
+
+/// GitHub Profile README auto-update settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubReadmeConfig {
+    /// Whether the GitHub README update is enabled.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// Absolute path to the local clone of the profile repo
+    /// (e.g. `/home/pleclech/projects/100-tokens-profile`). Must already
+    /// be cloned with `origin` configured for `git push` (HTTPS token or
+    /// SSH key).
+    pub local_repo_path: String,
+    /// Path (absolute or relative to `local_repo_path`) to the operator-
+    /// authored bio template inserted at the top of the README. If the
+    /// file is missing, a minimal default is used.
+    #[serde(default = "default_bio_template_path")]
+    pub bio_template_path: String,
+    /// Git commit author name.
+    pub git_author_name: String,
+    /// Git commit author email.
+    pub git_author_email: String,
+}
+
+fn default_bio_template_path() -> String {
+    "bio.md".into()
 }
 
 /// WebSocket configuration for bidirectional user↔agent communication.
@@ -925,6 +972,69 @@ deploy_command = "npx wrangler pages deploy blog-site/public --project-name=pasc
         let cmd = cfg.persona_blog.deploy_command.as_deref().unwrap();
         assert!(cmd.contains("wrangler pages deploy"));
         assert!(cmd.contains("pascal-heartbit-ai"));
+    }
+
+    #[test]
+    fn persona_blog_config_parses_x_announce_block() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+site_url = "https://pascal.heartbit.ai"
+
+[persona_blog.x_announce]
+enabled = true
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_blog: PersonaBlogConfig,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let x = cfg.persona_blog.x_announce.as_ref().unwrap();
+        assert!(x.enabled);
+    }
+
+    #[test]
+    fn persona_blog_config_parses_github_readme_block() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+site_url = "https://pascal.heartbit.ai"
+
+[persona_blog.github_readme]
+enabled = true
+local_repo_path = "/home/pleclech/projects/100-tokens-profile"
+git_author_name = "Pascal Le Clech"
+git_author_email = "pascal@heartbit.ai"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_blog: PersonaBlogConfig,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let gh = cfg.persona_blog.github_readme.as_ref().unwrap();
+        assert!(gh.enabled);
+        assert_eq!(
+            gh.local_repo_path,
+            "/home/pleclech/projects/100-tokens-profile"
+        );
+        assert_eq!(gh.bio_template_path, "bio.md"); // default
+        assert_eq!(gh.git_author_name, "Pascal Le Clech");
+    }
+
+    #[test]
+    fn persona_blog_config_amp_blocks_default_to_none() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+site_url = "https://pascal.heartbit.ai"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_blog: PersonaBlogConfig,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert!(cfg.persona_blog.x_announce.is_none());
+        assert!(cfg.persona_blog.github_readme.is_none());
     }
 
     #[test]

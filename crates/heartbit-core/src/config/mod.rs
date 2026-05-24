@@ -15,9 +15,9 @@ pub use agent::{
 };
 pub use daemon::{
     ActiveHoursConfig, AuthConfig, DaemonAuditConfig, DaemonConfig, DaemonMcpServerConfig,
-    DaemonMemoryConfig, HeartbitPulseConfig, IdempotencyConfig, KafkaConfig, MetricsConfig,
-    PersonaBlogConfig, PersonaMentionsConfig, PersonaPostsConfig, PersonaQuotesConfig,
-    ScheduleEntry, TokenExchangeConfig, WsConfig,
+    DaemonMemoryConfig, GithubReadmeConfig, HeartbitPulseConfig, IdempotencyConfig, KafkaConfig,
+    MetricsConfig, PersonaBlogConfig, PersonaMentionsConfig, PersonaPostsConfig,
+    PersonaQuotesConfig, ScheduleEntry, TokenExchangeConfig, WsConfig, XAnnounceConfig,
 };
 pub use guardrails::{
     ActionBudgetConfig, ActionBudgetRuleConfig, BehavioralConfig, BehavioralRuleConfig,

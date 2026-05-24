@@ -849,6 +849,8 @@ impl DaemonCore {
                 // Same rationale as writer_provider — the deploy hook is
                 // executed by the handler, not the scheduler.
                 deploy_command: None,
+                x_announce: None,
+                github_readme: None,
             };
             let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
                 crate::daemon::KafkaCommandProducer::new(self.producer.clone()),

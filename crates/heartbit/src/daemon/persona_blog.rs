@@ -198,6 +198,8 @@ mod tests {
             site_title: "pascal.heartbit.ai".into(),
             writer_provider: None,
             deploy_command: None,
+            x_announce: None,
+            github_readme: None,
         }
     }
 
