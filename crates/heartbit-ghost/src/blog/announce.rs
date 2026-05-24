@@ -11,17 +11,19 @@
 //! No researcher / no fact_check: the source is the operator's own
 //! blog, already fact-checked through the blog pipeline.
 
-#![allow(dead_code)] // Pipeline impl arrives in Task 5; types are public for the handler.
-
 use std::path::Path;
 use std::sync::Arc;
 
 use heartbit_core::CredentialResolver;
 use heartbit_core::llm::BoxedProvider;
+use heartbit_core::llm::types::TokenUsage;
 use heartbit_core::tool::Tool;
 
-use crate::pipeline::ProgressCallback;
-use crate::review::ReviewDelivery;
+use crate::agents::writer_recipe;
+use crate::pipeline::{ProgressCallback, normalize_tweet_length, runner_from_recipe};
+use crate::review::{
+    DeliveryOutcome, ReportableOutcome, ReviewDelivery, ReviewMessage, parse_thread_tweets,
+};
 
 /// Configuration for one X announcement tick.
 pub struct XAnnouncementConfig<'a> {
@@ -130,17 +132,160 @@ Write the thread now. One tweet per line. ≤280 chars each."
     )
 }
 
-/// Entry point for the X announcement pipeline (implementation in Task 5).
+/// Run the X announcement pipeline end-to-end.
 ///
-/// Drafts a tweet thread from the blog post context in `cfg`, sends it for
-/// Telegram review, and publishes via `cfg.twitter_tool` on approval.
+/// Drafts a tweet thread from the blog post context in `cfg`, length-normalizes
+/// it to 280 chars/segment, sends it for Telegram review, and publishes via
+/// `cfg.twitter_tool` on approval. Mirrors `run_review_pipeline` minus the
+/// researcher / fact_check / publish_gate / image stages (the blog post is the
+/// pre-vetted source of truth).
 pub async fn run_x_announcement_pipeline(
-    _cfg: XAnnouncementConfig<'_>,
+    cfg: XAnnouncementConfig<'_>,
 ) -> Result<XAnnouncementOutput, XAnnouncementError> {
-    // TODO(Task 5): implement full pipeline.
-    Err(XAnnouncementError::InvalidConfig(
-        "run_x_announcement_pipeline not yet implemented".to_string(),
-    ))
+    let progress = |msg: &str| {
+        if let Some(cb) = cfg.on_progress.as_ref() {
+            cb(msg);
+        }
+    };
+
+    let mut total_usage = TokenUsage::default();
+
+    // 1. Build the writer with the X-announcement-specific system prompt.
+    progress("Drafting announcement thread...");
+    let voice_provider = cfg
+        .writer_provider
+        .clone()
+        .unwrap_or_else(|| cfg.provider.clone());
+    let mut recipe = writer_recipe();
+    recipe.system_prompt = X_ANNOUNCE_WRITER_PROMPT.to_string();
+    // Allow more tokens than the default writer (1024) — a 3-5 tweet thread
+    // plus reasoning headroom benefits from a higher cap.
+    recipe.max_tokens = Some(2048);
+    let writer = runner_from_recipe(voice_provider, recipe, Vec::new())
+        .map_err(|e| XAnnouncementError::Writer(e.to_string()))?;
+
+    // 2. Run the writer.
+    let user_msg =
+        build_x_announce_user_message(cfg.title, cfg.excerpt, cfg.body_snippet, cfg.post_url);
+    let writer_out = writer
+        .execute(&user_msg)
+        .await
+        .map_err(|e| XAnnouncementError::Writer(e.to_string()))?;
+    total_usage += writer_out.tokens_used;
+    let raw_draft = writer_out.result;
+
+    // 3. Length-normalize each segment to 280 chars.
+    let normalized = normalize_tweet_length(&raw_draft, 280);
+
+    // 4. Telegram review (single candidate — the blog post is the source of
+    // truth, so a multi-candidate fanout adds noise without information).
+    progress("Sending to Telegram for review...");
+    let review_msg = ReviewMessage {
+        persona_name: cfg.persona_name.to_string(),
+        topic: format!("Announcement: {}", cfg.title),
+        candidates: vec![normalized.clone()],
+        interaction_id: uuid::Uuid::new_v4(),
+    };
+    let delivered = cfg.delivery.deliver_and_await(&review_msg).await?;
+    let receipt = delivered.receipt;
+
+    // 5. Branch on outcome.
+    let (outcome, report) = match delivered.outcome {
+        DeliveryOutcome::Skip => {
+            progress("User skipped.");
+            (XAnnouncementOutcome::Skipped, ReportableOutcome::Skipped)
+        }
+        DeliveryOutcome::TimedOut => {
+            progress("Review timed out.");
+            (XAnnouncementOutcome::TimedOut, ReportableOutcome::TimedOut)
+        }
+        DeliveryOutcome::Pick(_chosen_index) => {
+            // 6. Publish via twitter_tool.
+            progress("Publishing thread to X...");
+            let tweets = parse_thread_tweets(&normalized);
+            let exec_ctx = heartbit_core::ExecutionContext {
+                credentials: Some(cfg.credentials.clone()),
+                ..Default::default()
+            };
+            let input = serde_json::json!({ "tweets": tweets });
+            match cfg.twitter_tool.execute(&exec_ctx, input).await {
+                Err(e) => {
+                    let reason = format!("{e}");
+                    progress(&format!("twitter_tool errored: {reason}"));
+                    (
+                        XAnnouncementOutcome::PublishFailed {
+                            reason: reason.clone(),
+                        },
+                        ReportableOutcome::PublishFailed {
+                            chosen_index: 0,
+                            reason,
+                        },
+                    )
+                }
+                Ok(tool_out) if tool_out.is_error => {
+                    let reason = tool_out.content.clone();
+                    progress(&format!("twitter_tool returned is_error=true: {reason}"));
+                    (
+                        XAnnouncementOutcome::PublishFailed {
+                            reason: reason.clone(),
+                        },
+                        ReportableOutcome::PublishFailed {
+                            chosen_index: 0,
+                            reason,
+                        },
+                    )
+                }
+                Ok(tool_out) => {
+                    let (tweet_ids, head_url) = parse_thread_output(&tool_out.content);
+                    (
+                        XAnnouncementOutcome::Posted {
+                            tweet_ids,
+                            head_url: head_url.clone(),
+                        },
+                        ReportableOutcome::Posted {
+                            chosen_index: 0,
+                            tweet_url: head_url,
+                        },
+                    )
+                }
+            }
+        }
+    };
+
+    // 7. Report final state back to delivery (best-effort).
+    if let Err(e) = cfg.delivery.report(receipt, report).await {
+        progress(&format!("report failed (non-fatal): {e}"));
+    }
+
+    progress("Done.");
+    Ok(XAnnouncementOutput {
+        outcome,
+        usage_summary: total_usage,
+    })
+}
+
+/// Parse `twitter_tool` success output JSON: `{thread_root_id, tweet_ids, urls}`.
+/// Returns `(tweet_ids, head_url)`. On parse failure returns
+/// `(vec![], "<unknown>")` — the caller has already accepted the post as
+/// successful; missing structure is a non-fatal observability gap.
+fn parse_thread_output(content: &str) -> (Vec<String>, String) {
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        tweet_ids: Vec<String>,
+        urls: Vec<String>,
+    }
+    match serde_json::from_str::<Parsed>(content) {
+        Ok(p) => {
+            let head_url = p.urls.first().cloned().unwrap_or_else(|| {
+                p.tweet_ids
+                    .first()
+                    .map(|id| format!("https://twitter.com/i/web/status/{id}"))
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            });
+            (p.tweet_ids, head_url)
+        }
+        Err(_) => (Vec::new(), "<unknown>".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +312,37 @@ mod tests {
         assert!(msg.contains("Agent loops cost money"));
         assert!(msg.contains("https://pascal.heartbit.ai/agent-loops/"));
         assert!(msg.contains("only source of truth"));
+    }
+
+    #[test]
+    fn parse_thread_output_extracts_ids_and_head_url() {
+        let content = r#"{"thread_root_id":"1","tweet_ids":["1","2"],"urls":["https://x.com/i/web/status/1"]}"#;
+        let (ids, url) = parse_thread_output(content);
+        assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(url, "https://x.com/i/web/status/1");
+    }
+
+    #[test]
+    fn parse_thread_output_falls_back_to_twitter_url_when_urls_missing() {
+        // Empty `urls` array → synthesize from first tweet_id.
+        let content = r#"{"thread_root_id":"1","tweet_ids":["42"],"urls":[]}"#;
+        let (ids, url) = parse_thread_output(content);
+        assert_eq!(ids, vec!["42".to_string()]);
+        assert_eq!(url, "https://twitter.com/i/web/status/42");
+    }
+
+    #[test]
+    fn parse_thread_output_invalid_json_returns_unknown() {
+        let (ids, url) = parse_thread_output("not json");
+        assert!(ids.is_empty());
+        assert_eq!(url, "<unknown>");
+    }
+
+    #[test]
+    fn parse_thread_output_missing_fields_returns_unknown() {
+        // Missing `urls` field → serde rejects → fallback path.
+        let (ids, url) = parse_thread_output(r#"{"thread_root_id":"1","tweet_ids":["1"]}"#);
+        assert!(ids.is_empty());
+        assert_eq!(url, "<unknown>");
     }
 }
