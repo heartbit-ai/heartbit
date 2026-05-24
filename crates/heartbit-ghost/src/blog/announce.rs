@@ -292,6 +292,309 @@ fn parse_thread_output(content: &str) -> (Vec<String>, String) {
 mod tests {
     use super::*;
 
+    use crate::review::{DeliveredReview, DeliveryReceipt};
+    use heartbit_core::ExecutionContext;
+    use heartbit_core::error::Error as CoreError;
+    use heartbit_core::execution_context::CredentialResolver as CredentialResolverTrait;
+    use heartbit_core::execution_context::Secret;
+    use heartbit_core::llm::LlmProvider;
+    use heartbit_core::llm::types::ToolDefinition;
+    use heartbit_core::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason,
+    };
+    use heartbit_core::tool::ToolOutput;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    // ── Mocks (mirrors crates/heartbit-ghost/src/review/mod.rs::tests) ────────
+
+    /// MockReviewDelivery returns a pre-canned outcome and records report() calls.
+    struct MockReviewDelivery {
+        outcome: DeliveryOutcome,
+        reports: Mutex<Vec<ReportableOutcome>>,
+    }
+
+    impl MockReviewDelivery {
+        fn arc(outcome: DeliveryOutcome) -> Arc<dyn ReviewDelivery> {
+            Arc::new(MockReviewDelivery {
+                outcome,
+                reports: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ReviewDelivery for MockReviewDelivery {
+        fn deliver_and_await<'a>(
+            &'a self,
+            _message: &'a ReviewMessage,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<DeliveredReview, crate::review::ReviewDeliveryError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let outcome = self.outcome.clone();
+            Box::pin(async move {
+                Ok(DeliveredReview {
+                    outcome,
+                    receipt: DeliveryReceipt {
+                        data: serde_json::Value::Null,
+                    },
+                })
+            })
+        }
+
+        fn report<'a>(
+            &'a self,
+            _receipt: DeliveryReceipt,
+            outcome: ReportableOutcome,
+        ) -> Pin<Box<dyn Future<Output = Result<(), crate::review::ReviewDeliveryError>> + Send + 'a>>
+        {
+            self.reports.lock().unwrap().push(outcome);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// MockTwitterTool returns a canned ToolOutput and records the last input.
+    struct MockTwitterTool {
+        canned: Mutex<Option<ToolOutput>>,
+        last_input: Mutex<Option<serde_json::Value>>,
+    }
+
+    impl MockTwitterTool {
+        fn success(thread_json: &str) -> Arc<Self> {
+            Arc::new(MockTwitterTool {
+                canned: Mutex::new(Some(ToolOutput::success(thread_json))),
+                last_input: Mutex::new(None),
+            })
+        }
+
+        fn errored(reason: &str) -> Arc<Self> {
+            Arc::new(MockTwitterTool {
+                canned: Mutex::new(Some(ToolOutput::error(reason))),
+                last_input: Mutex::new(None),
+            })
+        }
+
+        fn last_input(&self) -> Option<serde_json::Value> {
+            self.last_input.lock().unwrap().clone()
+        }
+    }
+
+    impl Tool for MockTwitterTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "twitter_thread".to_string(),
+                description: "mock".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, CoreError>> + Send + '_>> {
+            *self.last_input.lock().unwrap() = Some(input);
+            let canned = self.canned.lock().unwrap().take();
+            Box::pin(async move {
+                canned.ok_or_else(|| CoreError::Agent("mock twitter tool exhausted".into()))
+            })
+        }
+    }
+
+    /// MockProvider returns canned completion text (one entry per writer call).
+    struct MockProvider {
+        responses: Mutex<VecDeque<String>>,
+    }
+
+    impl MockProvider {
+        fn arc(responses: Vec<&str>) -> Arc<BoxedProvider> {
+            let p = MockProvider {
+                responses: Mutex::new(responses.into_iter().map(String::from).collect()),
+            };
+            Arc::new(BoxedProvider::new(p))
+        }
+    }
+
+    impl LlmProvider for MockProvider {
+        fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> impl Future<Output = Result<CompletionResponse, CoreError>> + Send {
+            let response = self.responses.lock().unwrap().pop_front();
+            let has_respond = request
+                .tools
+                .iter()
+                .any(|t| t.name == heartbit_core::llm::types::RESPOND_TOOL_NAME);
+            async move {
+                let text =
+                    response.ok_or_else(|| CoreError::Agent("mock exhausted".to_string()))?;
+                let content = if has_respond {
+                    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                        CoreError::Agent(format!("mock: canned response is not valid JSON: {e}"))
+                    })?;
+                    vec![ContentBlock::ToolUse {
+                        id: "respond_1".to_string(),
+                        name: "__respond__".to_string(),
+                        input: value,
+                    }]
+                } else {
+                    vec![ContentBlock::Text { text }]
+                };
+                Ok(CompletionResponse {
+                    content,
+                    usage: TokenUsage::default(),
+                    stop_reason: if has_respond {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    },
+                    model: None,
+                })
+            }
+        }
+    }
+
+    /// Stub credential resolver — never called in mock tests.
+    struct StubCredentialResolver;
+
+    impl CredentialResolverTrait for StubCredentialResolver {
+        fn resolve(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Secret, CoreError>> + Send + '_>> {
+            Box::pin(async move { Ok(Secret::new("stub")) })
+        }
+    }
+
+    /// A 3-tweet thread draft (one tweet per line). The final tweet carries
+    /// the canonical URL, mirroring the X_ANNOUNCE_WRITER_PROMPT contract.
+    const DRAFT_THREAD: &str = "Background loops quietly compound API cost.\n\
+Every tick is a fresh model call — the loop never amortizes.\n\
+Full argument: https://pascal.heartbit.ai/agent-loops/";
+
+    /// Build an `XAnnouncementConfig` with the supplied collaborators.
+    fn mk_cfg<'a>(
+        profiles_root: &'a std::path::Path,
+        provider: Arc<BoxedProvider>,
+        delivery: Arc<dyn ReviewDelivery>,
+        twitter_tool: Arc<dyn Tool>,
+    ) -> XAnnouncementConfig<'a> {
+        XAnnouncementConfig {
+            persona_name: "x",
+            provider,
+            writer_provider: None,
+            corpora_root: profiles_root,
+            profiles_root,
+            on_progress: None,
+            title: "Agent loops cost money",
+            excerpt: "Why background loops compound costs.",
+            body_snippet: "When you wrap a model in a loop, every tick is a separate API call.",
+            post_url: "https://pascal.heartbit.ai/agent-loops/",
+            delivery,
+            twitter_tool,
+            credentials: Arc::new(StubCredentialResolver),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_pick_publishes_and_returns_posted() {
+        let provider = MockProvider::arc(vec![DRAFT_THREAD]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool: Arc<dyn Tool> = MockTwitterTool::success(
+            r#"{"thread_root_id":"123","tweet_ids":["123","124"],"urls":["https://twitter.com/i/web/status/123"]}"#,
+        );
+        let cfg = mk_cfg(
+            std::path::Path::new("/tmp"),
+            provider,
+            delivery,
+            twitter_tool,
+        );
+        let out = run_x_announcement_pipeline(cfg).await.expect("happy path");
+        match out.outcome {
+            XAnnouncementOutcome::Posted {
+                tweet_ids,
+                head_url,
+            } => {
+                assert_eq!(tweet_ids, vec!["123".to_string(), "124".to_string()]);
+                assert_eq!(head_url, "https://twitter.com/i/web/status/123");
+            }
+            other => panic!("expected Posted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_skip_returns_skipped_no_publish() {
+        let provider = MockProvider::arc(vec![DRAFT_THREAD]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Skip);
+        // Concrete handle so we can assert the tool was never invoked.
+        let twitter_tool = MockTwitterTool::errored("should not be called");
+        let twitter_tool_dyn: Arc<dyn Tool> = twitter_tool.clone();
+        let cfg = mk_cfg(
+            std::path::Path::new("/tmp"),
+            provider,
+            delivery,
+            twitter_tool_dyn,
+        );
+        let out = run_x_announcement_pipeline(cfg)
+            .await
+            .expect("skip is a success outcome");
+        assert!(matches!(out.outcome, XAnnouncementOutcome::Skipped));
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be invoked on Skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_timeout_returns_timed_out() {
+        let provider = MockProvider::arc(vec![DRAFT_THREAD]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::TimedOut);
+        let twitter_tool = MockTwitterTool::errored("should not be called");
+        let twitter_tool_dyn: Arc<dyn Tool> = twitter_tool.clone();
+        let cfg = mk_cfg(
+            std::path::Path::new("/tmp"),
+            provider,
+            delivery,
+            twitter_tool_dyn,
+        );
+        let out = run_x_announcement_pipeline(cfg)
+            .await
+            .expect("timeout is a success outcome");
+        assert!(matches!(out.outcome, XAnnouncementOutcome::TimedOut));
+        assert!(
+            twitter_tool.last_input().is_none(),
+            "twitter_tool must not be invoked on TimedOut"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_publish_failure_returns_publish_failed() {
+        let provider = MockProvider::arc(vec![DRAFT_THREAD]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool: Arc<dyn Tool> =
+            MockTwitterTool::errored("X auth failed (401): Unauthorized");
+        let cfg = mk_cfg(
+            std::path::Path::new("/tmp"),
+            provider,
+            delivery,
+            twitter_tool,
+        );
+        let out = run_x_announcement_pipeline(cfg)
+            .await
+            .expect("publish failure is a success outcome");
+        match out.outcome {
+            XAnnouncementOutcome::PublishFailed { reason } => {
+                assert!(reason.contains("401"), "got: {reason}");
+            }
+            other => panic!("expected PublishFailed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn writer_prompt_pins_load_bearing_rules() {
         assert!(X_ANNOUNCE_WRITER_PROMPT.contains("3-5 tweets"));

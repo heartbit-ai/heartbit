@@ -100,16 +100,134 @@ pub async fn handle_blog_announce_x(deps: BlogAnnounceXDeps<'_>) -> Result<()> {
 mod tests {
     use super::*;
 
-    // Full handler test requires MockProvider/MockTwitterTool/MockReviewDelivery
-    // — those mocks live in heartbit_ghost::blog::announce::tests. This handler
-    // is a 30-line dispatcher; the only path worth testing here is the unknown-
-    // persona early return.
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use heartbit_core::ExecutionContext;
+    use heartbit_core::error::Error as CoreError;
+    use heartbit_core::execution_context::{CredentialResolver as CredentialResolverTrait, Secret};
+    use heartbit_core::llm::LlmProvider;
+    use heartbit_core::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage, ToolDefinition,
+    };
+    use heartbit_core::tool::ToolOutput;
+    use heartbit_ghost::review::{
+        DeliveredReview, DeliveryReceipt, ReportableOutcome, ReviewDeliveryError, ReviewMessage,
+    };
+
+    // ── Trivial stubs ─────────────────────────────────────────────────────────
+    //
+    // The handler bails on `registry.get().ok_or_else(...)` BEFORE it ever
+    // touches provider/delivery/tool/credentials. So these stubs only need to
+    // satisfy the type bounds — they are never exercised on this path.
+
+    struct StubProvider;
+
+    impl StubProvider {
+        fn arc() -> Arc<BoxedProvider> {
+            Arc::new(BoxedProvider::new(StubProvider))
+        }
+    }
+
+    impl LlmProvider for StubProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, CoreError> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "noop".to_string(),
+                }],
+                usage: TokenUsage::default(),
+                stop_reason: StopReason::EndTurn,
+                model: None,
+            })
+        }
+    }
+
+    struct StubDelivery;
+
+    impl ReviewDelivery for StubDelivery {
+        fn deliver_and_await<'a>(
+            &'a self,
+            _message: &'a ReviewMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<DeliveredReview, ReviewDeliveryError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Err(ReviewDeliveryError::Transport(
+                    "stub: never called".to_string(),
+                ))
+            })
+        }
+
+        fn report<'a>(
+            &'a self,
+            _receipt: DeliveryReceipt,
+            _outcome: ReportableOutcome,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReviewDeliveryError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    struct StubTool;
+
+    impl Tool for StubTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "twitter_thread".to_string(),
+                description: "stub".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, CoreError>> + Send + '_>> {
+            Box::pin(async move { Ok(ToolOutput::success("stub")) })
+        }
+    }
+
+    struct StubCredentialResolver;
+
+    impl CredentialResolverTrait for StubCredentialResolver {
+        fn resolve(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Secret, CoreError>> + Send + '_>> {
+            Box::pin(async move { Ok(Secret::new("stub")) })
+        }
+    }
 
     #[tokio::test]
     async fn handle_blog_announce_x_unknown_persona_errors() {
-        // Build a registry with no personas registered.
+        // Empty registry — no personas registered.
         let registry = PersonaRegistry::new();
-        // Verify the registry lookup that the handler relies on.
-        assert!(registry.get("missing-persona").is_none());
+        let provider = StubProvider::arc();
+        let delivery: Arc<dyn ReviewDelivery> = Arc::new(StubDelivery);
+        let twitter_tool: Arc<dyn Tool> = Arc::new(StubTool);
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(StubCredentialResolver);
+
+        let deps = BlogAnnounceXDeps {
+            persona_name: "missing-persona",
+            registry: &registry,
+            provider,
+            writer_provider: None,
+            corpora_root: std::path::Path::new("/tmp"),
+            profiles_root: std::path::Path::new("/tmp"),
+            title: "T",
+            excerpt: "E",
+            body_snippet: "B",
+            post_url: "https://pascal.heartbit.ai/x/",
+            delivery,
+            twitter_tool,
+            credentials,
+        };
+
+        let err = handle_blog_announce_x(deps)
+            .await
+            .expect_err("expected error for unknown persona");
+        assert!(err.to_string().contains("not registered"), "got: {err}");
     }
 }
