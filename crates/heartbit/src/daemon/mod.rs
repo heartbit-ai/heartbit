@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use crate::Error;
 
+pub mod blog_announce_x_handler;
 pub mod blog_context;
 pub mod core;
 pub mod cron;
@@ -31,6 +32,7 @@ pub mod todo;
 pub mod types;
 
 pub use self::core::{DaemonCore, DaemonHandle};
+pub use blog_announce_x_handler::{BlogAnnounceXDeps, handle_blog_announce_x};
 pub use blog_context::{BlogContext, PersonaBlogEntry};
 pub use cron::CronScheduler;
 pub use engagement_collector::EngagementCollectorScheduler;
