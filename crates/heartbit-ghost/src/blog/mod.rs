@@ -2,6 +2,7 @@
 //! long-form essay via `blog_writer`, routes through Telegram review,
 //! commits Markdown to disk + renders the static site.
 
+pub mod announce;
 pub mod markdown;
 pub mod prompts;
 pub mod render;
