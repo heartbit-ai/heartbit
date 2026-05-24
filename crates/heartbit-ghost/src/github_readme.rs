@@ -363,12 +363,7 @@ mod tests {
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
         run_git(
             &repo,
-            &[
-                "remote",
-                "add",
-                "origin",
-                &upstream.to_string_lossy().into_owned(),
-            ],
+            &["remote", "add", "origin", &upstream.to_string_lossy()],
         );
         std::fs::write(repo.join("README.md"), "# Original\n").unwrap();
         run_git(&repo, &["add", "README.md"]);

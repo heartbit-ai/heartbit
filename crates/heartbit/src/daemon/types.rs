@@ -100,6 +100,22 @@ pub enum DaemonCommand {
         /// Persona name (e.g. `"heartbit-ghost:x"`).
         persona: String,
     },
+    /// Fire one X announcement thread for a freshly published blog post.
+    /// Enqueued by `handle_persona_blog` after `BlogOutcome::Posted` and
+    /// successful `deploy_command` (or no `deploy_command` configured).
+    BlogAnnounceX {
+        /// Persona name (e.g. `"heartbit-ghost:x"`).
+        persona: String,
+        /// Canonical URL of the blog post.
+        post_url: String,
+        /// Title of the blog post.
+        title: String,
+        /// One-line excerpt.
+        excerpt: String,
+        /// First ~500 chars of body, used as the only source-of-truth
+        /// for the writer.
+        body_snippet: String,
+    },
     /// Refresh engagement metrics for every Posted tweet in the persona's
     /// history. Dispatched by `EngagementCollectorScheduler` on the
     /// configured cadence.
@@ -1175,6 +1191,35 @@ mod tests {
                 assert_eq!(persona, "heartbit-ghost:x");
             }
             other => panic!("expected PersonaBlog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blog_announce_x_command_round_trips() {
+        let cmd = DaemonCommand::BlogAnnounceX {
+            persona: "heartbit-ghost:x".into(),
+            post_url: "https://pascal.heartbit.ai/agent-loops/".into(),
+            title: "Agent loops cost money".into(),
+            excerpt: "Why loops compound costs.".into(),
+            body_snippet: "When you wrap a model in a loop...".into(),
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let parsed: DaemonCommand = serde_json::from_str(&s).unwrap();
+        match parsed {
+            DaemonCommand::BlogAnnounceX {
+                persona,
+                post_url,
+                title,
+                excerpt,
+                body_snippet,
+            } => {
+                assert_eq!(persona, "heartbit-ghost:x");
+                assert_eq!(post_url, "https://pascal.heartbit.ai/agent-loops/");
+                assert_eq!(title, "Agent loops cost money");
+                assert_eq!(excerpt, "Why loops compound costs.");
+                assert!(body_snippet.starts_with("When you wrap"));
+            }
+            other => panic!("expected BlogAnnounceX, got {other:?}"),
         }
     }
 

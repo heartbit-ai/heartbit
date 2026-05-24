@@ -1577,6 +1577,9 @@ impl DaemonCore {
                                 }
                             });
                         }
+                        DaemonCommand::BlogAnnounceX { .. } => {
+                            tracing::trace!("BlogAnnounceX received but not handled here");
+                        }
                     }
                 }
                 Some(result) = self.active_tasks.join_next() => {
