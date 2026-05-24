@@ -197,6 +197,7 @@ mod tests {
             site_url: "https://pascal.heartbit.ai".into(),
             site_title: "pascal.heartbit.ai".into(),
             writer_provider: None,
+            deploy_command: None,
         }
     }
 

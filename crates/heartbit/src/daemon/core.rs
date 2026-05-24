@@ -846,6 +846,9 @@ impl DaemonCore {
                 // PersonaBlogEntry, not in this config-shaped recreation.
                 // Scheduler doesn't need it (only the blog handler does).
                 writer_provider: None,
+                // Same rationale as writer_provider — the deploy hook is
+                // executed by the handler, not the scheduler.
+                deploy_command: None,
             };
             let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
                 crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
@@ -1481,6 +1484,7 @@ impl DaemonCore {
                             let style_css = ctx.entry.style_css.clone();
                             let site_url = ctx.entry.site_url.clone();
                             let site_title = ctx.entry.site_title.clone();
+                            let deploy_command = ctx.entry.deploy_command.clone();
                             let persona_owned = persona.clone();
                             tokio::spawn(async move {
                                 let deps = crate::daemon::PersonaBlogDeps {
@@ -1500,6 +1504,7 @@ impl DaemonCore {
                                     style_css: &style_css,
                                     site_url: &site_url,
                                     site_title: &site_title,
+                                    deploy_command: deploy_command.as_deref(),
                                 };
                                 if let Err(e) =
                                     crate::daemon::handle_persona_blog(deps).await

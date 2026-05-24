@@ -39,3 +39,8 @@ rust_version.txt
 
 # Claude Code local session metadata
 .claude/
+
+# Wrangler / Cloudflare Pages local cache
+.wrangler/
+.vercel/
+

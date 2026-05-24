@@ -54,6 +54,10 @@ pub struct PersonaBlogDeps<'a> {
     pub site_url: &'a str,
     /// Site title.
     pub site_title: &'a str,
+    /// Optional shell command run after a successful Posted outcome.
+    /// Runs from the daemon CWD; env is inherited. Errors are logged
+    /// but never propagated (the post is already written).
+    pub deploy_command: Option<&'a str>,
 }
 
 /// Run one blog pipeline tick. Selects the seed via
@@ -133,6 +137,9 @@ pub async fn handle_persona_blog(deps: PersonaBlogDeps<'_>) -> Result<()> {
                     path = %post_path.display(),
                     "blog: post published"
                 );
+                if let Some(cmd) = deps.deploy_command {
+                    run_deploy_command(deps.persona_name, cmd).await;
+                }
             }
         }
         Err(e) => {
@@ -144,6 +151,60 @@ pub async fn handle_persona_blog(deps: PersonaBlogDeps<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Shell out to the operator-configured deploy command after a Posted
+/// outcome. Bounded at 5 minutes; failures are logged and swallowed
+/// (the post is already written to disk — deploy failure should never
+/// crash the daemon).
+async fn run_deploy_command(persona_name: &str, cmd: &str) {
+    tracing::info!(persona = %persona_name, %cmd, "blog: running deploy_command");
+    let child = match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(persona = %persona_name, error = %e, "blog: deploy spawn failed");
+            return;
+        }
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        child.wait_with_output(),
+    )
+    .await;
+    match result {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                tracing::info!(
+                    persona = %persona_name,
+                    stdout = %stdout.trim(),
+                    "blog: deploy succeeded"
+                );
+            } else {
+                tracing::error!(
+                    persona = %persona_name,
+                    status = ?out.status,
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "blog: deploy exited non-zero"
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!(persona = %persona_name, error = %e, "blog: deploy wait failed");
+        }
+        Err(_) => {
+            tracing::error!(persona = %persona_name, "blog: deploy timed out after 300s");
+        }
+    }
 }
 
 // =============================================================================
@@ -355,6 +416,7 @@ mod tests {
             style_css: &style_css,
             site_url: "https://pascal.heartbit.ai",
             site_title: "pascal.heartbit.ai",
+            deploy_command: None,
         };
 
         let err = handle_persona_blog(deps)
@@ -400,6 +462,7 @@ mod tests {
             style_css: &style_css,
             site_url: "https://pascal.heartbit.ai",
             site_title: "pascal.heartbit.ai",
+            deploy_command: None,
         };
 
         handle_persona_blog(deps)
@@ -417,5 +480,28 @@ mod tests {
             0,
             "delivery must NOT be invoked when seed selection fails"
         );
+    }
+
+    // ─── Test: run_deploy_command executes the shell command ─────────────────
+
+    #[tokio::test]
+    async fn run_deploy_command_executes_shell() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("deployed");
+        let cmd = format!("touch {}", marker.display());
+        run_deploy_command("test-persona", &cmd).await;
+        assert!(
+            marker.exists(),
+            "deploy command should have created the marker file at {}",
+            marker.display()
+        );
+    }
+
+    // ─── Test: run_deploy_command swallows non-zero exits ────────────────────
+
+    #[tokio::test]
+    async fn run_deploy_command_swallows_failure() {
+        // Should NOT panic or propagate; just log and return.
+        run_deploy_command("test-persona", "exit 17").await;
     }
 }

@@ -637,6 +637,12 @@ pub struct PersonaBlogConfig {
     /// `persona_posts.writer_provider`.
     #[serde(default)]
     pub writer_provider: Option<super::agent::AgentProviderConfig>,
+    /// Optional shell command run after a successful `BlogOutcome::Posted`.
+    /// Runs from the daemon CWD; env is inherited (use this with
+    /// `CLOUDFLARE_API_TOKEN` exported in the daemon shell to invoke
+    /// `wrangler pages deploy …`). Empty/`None` skips the hook.
+    #[serde(default)]
+    pub deploy_command: Option<String>,
 }
 
 fn default_blog_poll_interval_seconds() -> u64 {
@@ -900,6 +906,25 @@ site_url = "https://pascal.heartbit.ai"
         assert_eq!(b.site_url, "https://pascal.heartbit.ai");
         assert_eq!(b.site_title, "pascal.heartbit.ai");
         assert!(b.writer_provider.is_none());
+        assert!(b.deploy_command.is_none());
+    }
+
+    #[test]
+    fn persona_blog_config_parses_deploy_command() {
+        let toml = r#"
+[persona_blog]
+persona = "heartbit-ghost:x"
+site_url = "https://pascal.heartbit.ai"
+deploy_command = "npx wrangler pages deploy blog-site/public --project-name=pascal-heartbit-ai --commit-dirty=true --branch=main"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_blog: PersonaBlogConfig,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        let cmd = cfg.persona_blog.deploy_command.as_deref().unwrap();
+        assert!(cmd.contains("wrangler pages deploy"));
+        assert!(cmd.contains("pascal-heartbit-ai"));
     }
 
     #[test]

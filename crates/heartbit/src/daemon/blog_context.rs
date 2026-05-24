@@ -44,6 +44,10 @@ pub struct PersonaBlogEntry {
     pub site_title: String,
     /// Optional override provider for the writer stage.
     pub writer_provider: Option<Arc<BoxedProvider>>,
+    /// Optional shell command run after a successful Posted outcome.
+    /// Invoked from daemon CWD; daemon env is inherited (e.g.
+    /// `CLOUDFLARE_API_TOKEN` for `wrangler pages deploy …`).
+    pub deploy_command: Option<String>,
 }
 
 impl std::fmt::Debug for PersonaBlogEntry {
@@ -60,6 +64,7 @@ impl std::fmt::Debug for PersonaBlogEntry {
             .field("site_url", &self.site_url)
             .field("site_title", &self.site_title)
             .field("writer_provider_set", &self.writer_provider.is_some())
+            .field("deploy_command_set", &self.deploy_command.is_some())
             .finish()
     }
 }
