@@ -765,6 +765,9 @@ impl DaemonCore {
                     // not in this config-shaped recreation. Scheduler doesn't
                     // need it (only the post handler does).
                     writer_provider: None,
+                    // Same rationale — the scheduler doesn't consume
+                    // image_source; carry the entry's value for fidelity.
+                    image_source: entry.image_source,
                 };
                 let producer: Arc<dyn crate::daemon::CommandProducer> = Arc::new(
                     crate::daemon::KafkaCommandProducer::new(self.producer.clone()),
@@ -1357,6 +1360,7 @@ impl DaemonCore {
                             let top_posts_provider = entry.top_posts_provider.clone();
                             let top_n = entry.engagement_top_n;
                             let writer_provider = entry.writer_provider.clone();
+                            let image_source = entry.image_source;
                             let registry = ctx.registry.clone();
                             let provider = ctx.provider.clone();
                             let delivery = ctx.delivery.clone();
@@ -1384,6 +1388,7 @@ impl DaemonCore {
                                         .as_deref(),
                                     top_n,
                                     writer_provider: writer_provider.clone(),
+                                    image_source,
                                 };
                                 if let Err(e) =
                                     crate::daemon::handle_persona_post(deps).await

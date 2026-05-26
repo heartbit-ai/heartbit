@@ -354,6 +354,9 @@ pub async fn run_daemon(
                     engagement_max_age_days: cfg.engagement_max_age_days,
                     engagement_top_n: cfg.engagement_top_n,
                     top_posts_provider: Some(top_posts_provider),
+                    // How to produce the optional head-tweet image, from
+                    // `[[daemon.persona_posts]].image_source` (default online).
+                    image_source: cfg.image_source,
                     // Build the per-persona writer+critic provider override
                     // from `[daemon.persona_posts.writer_provider]` when set.
                     // Retry/on_retry are intentionally None — the override

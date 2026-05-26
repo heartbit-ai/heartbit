@@ -996,6 +996,8 @@ pub async fn review_config_from_env<'a>(
         // One-shot CLI uses the global provider for all stages — there
         // is no per-persona daemon config in this path.
         writer_provider: None,
+        // One-shot CLI uses the default online (Openverse) image source.
+        image_source: heartbit_core::config::ImageSource::default(),
     })
 }
 

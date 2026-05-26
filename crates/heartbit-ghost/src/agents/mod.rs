@@ -36,7 +36,7 @@ pub mod writer;
 
 pub use blog_writer::{BLOG_WRITER_SYSTEM_PROMPT, blog_writer_recipe};
 pub use fact_check::fact_check_recipe;
-pub use image_generator::image_generator_recipe;
+pub use image_generator::{image_generator_recipe, image_search_recipe};
 pub use judge::judge_recipe;
 pub use publisher::publisher_recipe;
 pub use quote_writer::{QUOTE_WRITER_SYSTEM_PROMPT, quote_writer_recipe};

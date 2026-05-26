@@ -63,9 +63,75 @@ pub fn image_generator_recipe() -> AgentConfig {
     }
 }
 
+/// System prompt for the image_search agent (Openverse online search).
+///
+/// Same decision shape as the AI generator — decide whether an image
+/// fits, then either output `no_image` or call the search tool — but
+/// the action is `openverse_image_search` with concise keywords rather
+/// than `image_generate` with a visual prompt.
+pub const IMAGE_SEARCH_SYSTEM_PROMPT: &str = r#"You find an existing CC0/public-domain image to accompany a social media post when one would meaningfully add to it.
+
+INPUT
+The user message contains: the approved draft, the persona's voice guidelines.
+
+DECISION
+Does this post benefit from an image at all? If the post is purely textual / aphoristic / a quoted reply, output the literal string "no_image" (lowercase, no quotes, no punctuation) and stop.
+
+SEARCH
+If an image fits, call `openverse_image_search` with 2-4 concise SEARCH KEYWORDS describing the subject — not a sentence. Examples: "rust programming code", "data center servers", "ocean waves storm". Prefer concrete nouns over abstract phrasing. Then return the tool's output as your final answer.
+
+RULES
+- Keywords only — no full sentences, no punctuation-heavy queries.
+- No real people's names or likeness searches.
+- No brand-logo searches."#;
+
+/// Construct the image_search [`AgentConfig`] for the Openverse online
+/// path. Mirrors [`image_generator_recipe`]'s shape but instructs the
+/// agent to call `openverse_image_search` with keywords.
+pub fn image_search_recipe() -> AgentConfig {
+    AgentConfig {
+        name: "image_search".to_string(),
+        description: "Optionally find an accompanying CC0/public-domain image for a draft."
+            .to_string(),
+        system_prompt: IMAGE_SEARCH_SYSTEM_PROMPT.to_string(),
+        max_turns: Some(2),
+        max_tokens: Some(1024),
+        reasoning_effort: Some("low".to_string()),
+        ..super::stub_recipe("image_search")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_search_recipe_has_expected_shape() {
+        let cfg = image_search_recipe();
+        assert_eq!(cfg.name, "image_search");
+        assert!(!cfg.description.is_empty());
+        assert!(!cfg.system_prompt.is_empty());
+        assert_eq!(cfg.max_turns, Some(2));
+        assert_eq!(cfg.max_tokens, Some(1024));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn image_search_prompt_names_openverse_tool_and_keywords() {
+        let p = IMAGE_SEARCH_SYSTEM_PROMPT;
+        assert!(
+            p.contains("openverse_image_search"),
+            "prompt must name the openverse_image_search tool"
+        );
+        assert!(
+            p.contains("no_image"),
+            "no_image escape hatch must be present"
+        );
+        assert!(
+            p.contains("KEYWORDS") || p.contains("keywords"),
+            "prompt must steer toward concise keywords"
+        );
+    }
 
     #[test]
     fn image_generator_recipe_has_expected_shape() {

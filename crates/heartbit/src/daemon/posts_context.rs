@@ -64,6 +64,11 @@ pub struct PersonaPostEntry {
     /// with researcher + fact-check. Built at daemon startup from
     /// `[daemon.persona_posts.writer_provider]`.
     pub writer_provider: Option<Arc<BoxedProvider>>,
+
+    /// How to produce the optional head-tweet image. `Online` (default)
+    /// searches Openverse, `Ai` generates with the image tool, `None`
+    /// disables images. From `[daemon.persona_posts.image_source]`.
+    pub image_source: heartbit_core::config::ImageSource,
 }
 
 impl std::fmt::Debug for PersonaPostEntry {
@@ -83,6 +88,7 @@ impl std::fmt::Debug for PersonaPostEntry {
             .field("engagement_max_age_days", &self.engagement_max_age_days)
             .field("engagement_top_n", &self.engagement_top_n)
             .field("top_posts_provider_set", &self.top_posts_provider.is_some())
+            .field("image_source", &self.image_source)
             .finish()
     }
 }

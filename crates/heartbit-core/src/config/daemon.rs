@@ -356,6 +356,19 @@ fn parse_hhmm(s: &str) -> Result<(u32, u32), Error> {
     Ok((hour, minute))
 }
 
+/// How the X-post pipeline produces the optional head-tweet image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSource {
+    /// Search Openverse for a CC0/public-domain image matching the post.
+    #[default]
+    Online,
+    /// Generate an image with the AI image tool.
+    Ai,
+    /// No image — text-only posts.
+    None,
+}
+
 /// Per-persona proactive-posting configuration.
 ///
 /// When present, the daemon registers a `PersonaPostScheduler` that
@@ -439,6 +452,12 @@ pub struct PersonaPostsConfig {
     /// absent, the writer and critic share the global provider.
     #[serde(default)]
     pub writer_provider: Option<super::agent::AgentProviderConfig>,
+
+    /// How to produce the optional head-tweet image. Default `online`
+    /// (Openverse CC0/public-domain search). `ai` uses the image
+    /// generator; `none` disables images.
+    #[serde(default)]
+    pub image_source: ImageSource,
 }
 
 fn default_post_interval_seconds() -> u64 {
@@ -880,6 +899,50 @@ engagement_min_age_hours = 6
         assert_eq!(p.engagement_top_n, 0);
         assert_eq!(p.engagement_max_age_days, 7);
         assert_eq!(p.engagement_min_age_hours, 6);
+    }
+
+    #[test]
+    fn persona_posts_image_source_defaults_to_online() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.persona_posts[0].image_source, ImageSource::Online);
+    }
+
+    #[test]
+    fn persona_posts_image_source_parses_explicit() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+image_source = "none"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.persona_posts[0].image_source, ImageSource::None);
+    }
+
+    #[test]
+    fn persona_posts_image_source_parses_ai() {
+        let toml = r#"
+[[persona_posts]]
+persona = "heartbit-ghost:x"
+image_source = "ai"
+"#;
+        #[derive(Deserialize)]
+        struct Shim {
+            persona_posts: Vec<PersonaPostsConfig>,
+        }
+        let cfg: Shim = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.persona_posts[0].image_source, ImageSource::Ai);
     }
 
     #[test]

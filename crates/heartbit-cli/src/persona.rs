@@ -435,6 +435,8 @@ async fn dispatch(cmd: PersonaCommand, registry: &PersonaRegistry) -> Result<()>
                 top_n: 0,
                 // One-shot CLI uses the global provider for all stages.
                 writer_provider: None,
+                // One-shot CLI uses the default online (Openverse) image source.
+                image_source: heartbit_core::config::ImageSource::default(),
             };
             let outcome = heartbit::handle_persona_post(deps)
                 .await

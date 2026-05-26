@@ -73,6 +73,9 @@ pub struct ReviewConfig<'a> {
     /// when present. The "engagement voice" stages can run on a different
     /// model (e.g. Grok) while research/fact-check stay on the default.
     pub writer_provider: Option<Arc<BoxedProvider>>,
+    /// How to produce the optional head image. `Online` → Openverse
+    /// search; `Ai` → image generator; `None` → skip.
+    pub image_source: heartbit_core::config::ImageSource,
 }
 
 /// Output of a successful review-mode run.
@@ -550,68 +553,135 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                     )
                 }
                 Ok(()) => {
-                    // 10b. NEW (P1.3f): run image_generator on the
-                    // chosen draft. Failure is non-blocking — text-only
-                    // post on any error.
-                    progress("Generating optional image...");
-                    let head_image_b64: Option<String> = {
-                        let recipe = crate::agents::image_generator_recipe();
-                        let image_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
-                            heartbit_core::tool::builtins::ImageGenerateTool::new(),
-                        )];
-                        match crate::pipeline::runner_from_recipe(
-                            cfg.provider.clone(),
-                            recipe,
-                            image_tools,
-                        ) {
-                            Ok(image_runner) => {
-                                let voice =
-                                    crate::pipeline::render_style_profile_as_english(&profile);
-                                let msg = format!(
-                                    "Approved draft:\n{}\n\n{}\n\n\
-                                     Decide whether to attach an image. \
-                                     If no, output the literal string \"no_image\". \
-                                     If yes, call image_generate with a concise visual prompt and return the result.",
-                                    chosen.draft, voice,
-                                );
-                                match image_runner.execute(&msg).await {
-                                    Ok(out) => {
-                                        total_usage += out.tokens_used;
-                                        // P1.3g: prefer the raw `image_generate`
-                                        // tool output (full marker, untruncated)
-                                        // over the model's text response. The
-                                        // tool result that re-entered the
-                                        // conversation was redacted to a tiny
-                                        // placeholder, so `out.result` would not
-                                        // recover the base64 payload. The
-                                        // fallback to `out.result` covers the
-                                        // case where the agent decided
-                                        // "no_image" without calling the tool.
-                                        let raw_tool_output: Option<String> = out
-                                            .tool_call_results
-                                            .iter()
-                                            .find(|r| {
-                                                r.tool_name == "image_generate" && !r.is_error
-                                            })
-                                            .map(|r| r.output.clone());
-                                        match raw_tool_output {
-                                            Some(raw) => extract_image_marker(&raw),
-                                            None => extract_image_marker(&out.result),
+                    // 10b. NEW (P1.3f): produce the optional head image on
+                    // the chosen draft. The source is operator-selected via
+                    // `cfg.image_source`: `Online` searches Openverse, `Ai`
+                    // generates with the image tool, `None` skips entirely.
+                    // Failure is non-blocking — text-only post on any error.
+                    // Both tools emit the same `[IMAGE:base64:...]` marker, so
+                    // `extract_image_marker` + the attach flow are unchanged.
+                    use heartbit_core::config::ImageSource;
+                    let head_image_b64: Option<String> = match cfg.image_source {
+                        ImageSource::None => None,
+                        ImageSource::Ai => {
+                            progress("Generating optional image...");
+                            let recipe = crate::agents::image_generator_recipe();
+                            let image_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+                                heartbit_core::tool::builtins::ImageGenerateTool::new(),
+                            )];
+                            match crate::pipeline::runner_from_recipe(
+                                cfg.provider.clone(),
+                                recipe,
+                                image_tools,
+                            ) {
+                                Ok(image_runner) => {
+                                    let voice =
+                                        crate::pipeline::render_style_profile_as_english(&profile);
+                                    let msg = format!(
+                                        "Approved draft:\n{}\n\n{}\n\n\
+                                         Decide whether to attach an image. \
+                                         If no, output the literal string \"no_image\". \
+                                         If yes, call image_generate with a concise visual prompt and return the result.",
+                                        chosen.draft, voice,
+                                    );
+                                    match image_runner.execute(&msg).await {
+                                        Ok(out) => {
+                                            total_usage += out.tokens_used;
+                                            // P1.3g: prefer the raw `image_generate`
+                                            // tool output (full marker, untruncated)
+                                            // over the model's text response. The
+                                            // tool result that re-entered the
+                                            // conversation was redacted to a tiny
+                                            // placeholder, so `out.result` would not
+                                            // recover the base64 payload. The
+                                            // fallback to `out.result` covers the
+                                            // case where the agent decided
+                                            // "no_image" without calling the tool.
+                                            let raw_tool_output: Option<String> = out
+                                                .tool_call_results
+                                                .iter()
+                                                .find(|r| {
+                                                    r.tool_name == "image_generate" && !r.is_error
+                                                })
+                                                .map(|r| r.output.clone());
+                                            match raw_tool_output {
+                                                Some(raw) => extract_image_marker(&raw),
+                                                None => extract_image_marker(&out.result),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            progress(&format!(
+                                                "image_generator failed (non-blocking): {e}"
+                                            ));
+                                            None
                                         }
                                     }
-                                    Err(e) => {
-                                        progress(&format!(
-                                            "image_generator failed (non-blocking): {e}"
-                                        ));
-                                        None
-                                    }
+                                }
+                                Err(e) => {
+                                    progress(&format!(
+                                        "image_generator builder failed (non-blocking): {e}"
+                                    ));
+                                    None
                                 }
                             }
-                            Err(e) => {
-                                progress(&format!(
-                                    "image_generator builder failed (non-blocking): {e}"
-                                ));
-                                None
+                        }
+                        ImageSource::Online => {
+                            progress("Searching for optional image (Openverse)...");
+                            let recipe = crate::agents::image_search_recipe();
+                            let image_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+                                heartbit_core::tool::builtins::OpenverseImageSearchTool::new(),
+                            )];
+                            match crate::pipeline::runner_from_recipe(
+                                cfg.provider.clone(),
+                                recipe,
+                                image_tools,
+                            ) {
+                                Ok(image_runner) => {
+                                    let voice =
+                                        crate::pipeline::render_style_profile_as_english(&profile);
+                                    let msg = format!(
+                                        "Approved draft:\n{}\n\n{}\n\n\
+                                         Decide whether an image fits this post. \
+                                         If no, output the literal string \"no_image\". \
+                                         If yes, call openverse_image_search with 2-4 concise search keywords describing the subject (e.g. 'rust programming code', 'data center servers'). Return the tool result.",
+                                        chosen.draft, voice,
+                                    );
+                                    match image_runner.execute(&msg).await {
+                                        Ok(out) => {
+                                            total_usage += out.tokens_used;
+                                            // Same rationale as the Ai arm:
+                                            // prefer the raw `openverse_image_search`
+                                            // tool output (full marker) over the
+                                            // model's (redacted) text response.
+                                            // Fallback to `out.result` covers the
+                                            // no_image-without-tool-call case.
+                                            let raw_tool_output: Option<String> = out
+                                                .tool_call_results
+                                                .iter()
+                                                .find(|r| {
+                                                    r.tool_name == "openverse_image_search"
+                                                        && !r.is_error
+                                                })
+                                                .map(|r| r.output.clone());
+                                            match raw_tool_output {
+                                                Some(raw) => extract_image_marker(&raw),
+                                                None => extract_image_marker(&out.result),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            progress(&format!(
+                                                "image_search failed (non-blocking): {e}"
+                                            ));
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    progress(&format!(
+                                        "image_search builder failed (non-blocking): {e}"
+                                    ));
+                                    None
+                                }
                             }
                         }
                     };
@@ -972,6 +1042,12 @@ mod tests {
             researcher_override: None,
             exemplar_block: None,
             writer_provider: None,
+            // Default the shared helper to the AI path: the existing
+            // image-stage tests below wire canned `image_generator`
+            // responses (`no_image` / `[IMAGE:base64:...]`) and assert on
+            // `head_image_attached`. The `None`/`Online` paths get their
+            // own dedicated tests that override this field.
+            image_source: heartbit_core::config::ImageSource::Ai,
         }
     }
 
@@ -1246,6 +1322,86 @@ mod tests {
         assert!(
             last_input.get("head_image_b64").is_none(),
             "no_image path must NOT pass head_image_b64; got: {last_input}"
+        );
+    }
+
+    // --- image_source toggle (online / ai / none) ---
+
+    #[tokio::test]
+    async fn run_review_pipeline_image_source_none_skips_image_stage() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // Note the response queue has NO image slot: with ImageSource::None
+        // the image stage is skipped entirely, so the image agent never
+        // makes an LLM call. An extra slot would go unconsumed and a missing
+        // one would error if the stage ran — this asserts it does NOT run.
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- notes",
+            "draft text",
+            r#"{"verdict": "pass", "style_match_score": 0.9}"#,
+            r#"{"verdict": "verified"}"#,
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"789","tweet_ids":["789"],"urls":["https://twitter.com/i/web/status/789"]}"#,
+        );
+        let mut cfg = mk_review_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+        );
+        cfg.image_source = heartbit_core::config::ImageSource::None;
+        let out = run_review_pipeline(cfg).await.expect("none path");
+        assert!(matches!(out.outcome, ReviewOutcome::Posted { .. }));
+        assert!(
+            !out.head_image_attached,
+            "ImageSource::None must skip the image stage; head_image_attached must be false"
+        );
+        let last_input = twitter_tool.last_input().expect("twitter_tool was called");
+        assert!(
+            last_input.get("head_image_b64").is_none(),
+            "ImageSource::None must NOT pass head_image_b64; got: {last_input}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_review_pipeline_image_source_online_runs_search_agent() {
+        let (_dir, profiles_root) = seed_snapshot("x");
+        // The Online arm runs the image_search agent (OpenverseImageSearchTool).
+        // The MockProvider returns plain text (no tool call), so the pipeline
+        // falls back to extract_image_marker(out.result) — exactly the same
+        // marker-parsing path the Ai arm uses. The canned marker therefore
+        // attaches, proving the Online branch threads through and shares the
+        // unchanged extract/attach flow.
+        let provider = MockProvider::arc(vec![
+            "Research digest:\n- notes",
+            "draft text",
+            r#"{"verdict": "pass", "style_match_score": 0.9}"#,
+            r#"{"verdict": "verified"}"#,
+            "[IMAGE:base64:iVBORw0KGgo=]", // image_search (Openverse) result
+        ]);
+        let delivery = MockReviewDelivery::arc(DeliveryOutcome::Pick(0));
+        let twitter_tool = MockTwitterTool::success(
+            r#"{"thread_root_id":"321","tweet_ids":["321"],"urls":["https://twitter.com/i/web/status/321"]}"#,
+        );
+        let mut cfg = mk_review_cfg(
+            &profiles_root,
+            provider,
+            delivery,
+            twitter_tool.clone() as Arc<dyn Tool>,
+        );
+        cfg.image_source = heartbit_core::config::ImageSource::Online;
+        let out = run_review_pipeline(cfg).await.expect("online path");
+        assert!(matches!(out.outcome, ReviewOutcome::Posted { .. }));
+        assert!(
+            out.head_image_attached,
+            "Online arm returned a marker; head_image_attached must be true"
+        );
+        let last_input = twitter_tool.last_input().expect("twitter_tool was called");
+        assert_eq!(
+            last_input.get("head_image_b64").and_then(|v| v.as_str()),
+            Some("iVBORw0KGgo="),
+            "Online arm must carry head_image_b64; got: {last_input}"
         );
     }
 }

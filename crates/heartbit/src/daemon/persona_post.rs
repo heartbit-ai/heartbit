@@ -197,6 +197,8 @@ mod tests {
             engagement_max_age_days: 30,
             engagement_min_age_hours: 24,
             writer_provider: None,
+            // Scheduler tests don't exercise the image stage; default.
+            image_source: heartbit_core::config::ImageSource::default(),
         }
     }
 

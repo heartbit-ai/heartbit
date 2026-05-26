@@ -65,6 +65,10 @@ pub struct PersonaPostDeps<'a> {
     /// `[daemon.persona_posts.writer_provider]` and threaded onto the
     /// matching `PersonaPostEntry`.
     pub writer_provider: Option<Arc<BoxedProvider>>,
+    /// How to produce the optional head-tweet image. Threaded onto the
+    /// review pipeline's `ReviewConfig.image_source`. `Online` (default)
+    /// searches Openverse, `Ai` generates, `None` skips.
+    pub image_source: heartbit_core::config::ImageSource,
 }
 
 /// Run one `PersonaPost` handler invocation.
@@ -214,6 +218,7 @@ pub async fn handle_persona_post(deps: PersonaPostDeps<'_>) -> Result<PostOutcom
             Some(exemplar_block.as_str())
         },
         writer_provider: deps.writer_provider.clone(),
+        image_source: deps.image_source,
     };
     let review_out = run_review_pipeline(cfg)
         .await
@@ -690,6 +695,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // Reaches the post arm; AI path consumes the canned image slot.
+            image_source: heartbit_core::config::ImageSource::Ai,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -743,6 +750,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // no_topic short-circuit — never reaches the image stage.
+            image_source: heartbit_core::config::ImageSource::None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("no_topic");
@@ -806,6 +815,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // Duplicate-topic skip — never reaches the image stage.
+            image_source: heartbit_core::config::ImageSource::None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("dup");
@@ -858,6 +869,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // Telegram Skip — never reaches the image stage.
+            image_source: heartbit_core::config::ImageSource::None,
         };
 
         let outcome = handle_persona_post(deps).await.expect("skip");
@@ -898,6 +911,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // Unknown-persona error path — never reaches the image stage.
+            image_source: heartbit_core::config::ImageSource::None,
         };
 
         let err = handle_persona_post(deps)
@@ -958,6 +973,8 @@ mod tests {
             top_posts_provider: None,
             top_n: 0,
             writer_provider: None,
+            // Reaches the post arm; AI path consumes the canned image slot.
+            image_source: heartbit_core::config::ImageSource::Ai,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -1108,6 +1125,8 @@ mod tests {
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 5,
             writer_provider: None,
+            // Reaches the post arm; AI path consumes the canned image slot.
+            image_source: heartbit_core::config::ImageSource::Ai,
         };
 
         let outcome = handle_persona_post(deps).await.expect("happy path");
@@ -1178,6 +1197,8 @@ mod tests {
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 5,
             writer_provider: None,
+            // Reaches the post arm; AI path consumes the canned image slot.
+            image_source: heartbit_core::config::ImageSource::Ai,
         };
 
         let outcome = handle_persona_post(deps).await.expect("cold start");
@@ -1251,6 +1272,8 @@ mod tests {
             top_posts_provider: Some(top_provider.as_ref()),
             top_n: 0,
             writer_provider: None,
+            // Reaches the post arm; AI path consumes the canned image slot.
+            image_source: heartbit_core::config::ImageSource::Ai,
         };
 
         let outcome = handle_persona_post(deps).await.expect("disabled");
