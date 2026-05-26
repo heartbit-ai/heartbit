@@ -8,6 +8,7 @@ mod glob;
 mod grep;
 mod image_generate;
 mod list;
+mod openverse_image;
 mod patch;
 mod question;
 mod read;
@@ -144,6 +145,7 @@ pub fn floor_char_boundary(text: &str, target: usize) -> usize {
 
 pub use file_tracker::FileTracker;
 pub use image_generate::ImageGenerateTool;
+pub use openverse_image::OpenverseImageSearchTool;
 pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
