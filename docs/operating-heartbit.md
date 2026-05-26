@@ -34,6 +34,25 @@ Run this as part of CI or a deploy hook before rolling out config changes.
 | `post_history_path` | required for jsonl | Tilde-expanded; ensure the parent directory exists. |
 | `post_history_lookback_days` | `30` | How far back duplicate-topic detection scans. |
 | `topic_brief` | unset | Free-form prompt addendum for the topic generator. |
+| `image_source` | `"online"` | How the optional head-tweet image is produced. See *Head-tweet image source* below. |
+
+## Head-tweet image source
+
+`image_source` on `[[daemon.persona_posts]]` selects how the optional head-tweet image is produced after a draft is approved:
+
+| Value | Behavior |
+|---|---|
+| `"online"` (default) | Search **Openverse** for a CC0 / public-domain image matching the post, download the top match, attach it. Web-wide (Flickr, Wikimedia, museums, …), keyless, no attribution obligation. |
+| `"ai"` | Generate an image with the AI image tool (prior behavior). |
+| `"none"` | Text-only — no image stage. |
+
+```toml
+[[daemon.persona_posts]]
+persona = "heartbit-ghost:x"
+image_source = "online"   # or "ai" / "none"
+```
+
+The image stage is always non-blocking: any failure (no match, download error, agent declines with `no_image`) falls back to a text-only post. Openverse search uses license filter `cc0,pdm` — no attribution is required, so nothing is appended to the post. To widen the pool or change provider, a Google Custom Search backend (with `rights` filter) can be added later — Openverse is the zero-setup default.
 
 ## Engagement-voice provider override
 
