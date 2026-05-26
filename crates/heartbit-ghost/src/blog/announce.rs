@@ -105,12 +105,13 @@ pub enum XAnnouncementError {
 /// System prompt for the X-announcement writer.
 pub const X_ANNOUNCE_WRITER_PROMPT: &str = "You are writing an X (Twitter) announcement thread for a long-form essay the operator just published on their personal blog.\n\n\
 Rules:\n\
-- Produce 3-5 tweets. Each tweet ≤280 characters (hard cap).\n\
+- Produce 3-5 tweets TOTAL, and that count INCLUDES the final link tweet. Each tweet ≤280 characters (hard cap).\n\
 - Tweet 1 = the hook. Lead with the most surprising claim from the essay.\n\
 - Middle tweets = the substance. Distill the argument into bite-sized chunks.\n\
-- Final tweet MUST include the canonical blog URL. Format the URL on its own line.\n\
+- The thread ends with EXACTLY ONE tweet that pairs a short call-to-read with the canonical blog URL (e.g. \"The full essay: <url>\"). The URL appears exactly ONCE in the whole thread — only in this final tweet.\n\
+- NEVER emit a tweet that is just a bare URL with no sentence. Do NOT repeat the URL across multiple tweets.\n\
 - Maintain the operator's voice (dhh/mitsuhiko-leaning, opinionated, no marketing-speak).\n\
-- NO emojis. NO hashtags. NO 'Read more here'. Just substance + link.\n\
+- NO emojis. NO hashtags. NO 'Read more here'. Just substance + one closing link line.\n\
 - Do NOT quote the essay verbatim. Re-state the argument in tweet-native form.\n\
 - ZERO TOLERANCE FOR INVENTION: every claim in the thread MUST be supported by the body_snippet provided. If you can't say something from the snippet, omit it.\n\n\
 Output format: one tweet per line. Empty lines between tweets are ignored.";
@@ -602,6 +603,9 @@ Full argument: https://pascal.heartbit.ai/agent-loops/";
         assert!(X_ANNOUNCE_WRITER_PROMPT.contains("ZERO TOLERANCE FOR INVENTION"));
         assert!(X_ANNOUNCE_WRITER_PROMPT.contains("canonical blog URL"));
         assert!(X_ANNOUNCE_WRITER_PROMPT.contains("NO emojis"));
+        // Pin the single-link rule that prevents trailing bare-link tweets.
+        assert!(X_ANNOUNCE_WRITER_PROMPT.contains("EXACTLY ONE tweet"));
+        assert!(X_ANNOUNCE_WRITER_PROMPT.contains("bare URL"));
     }
 
     #[test]
