@@ -4,7 +4,112 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — heartbit-ghost P1.1 (X tool family)
+## [2026.507.4] - 2026-05-26 — heartbit-ghost P1.x integration + heartbit-core boundary cleanup
+
+Covers everything since `v2026.507.3` (commit `ca994e6`, published 2026-05-07
+but never tagged in git — tagged retroactively today). The release pulls in
+heartbit-ghost's P1.1-P1.7 work that landed on `main` over the past three
+weeks plus a deliberate `heartbit-core` boundary cleanup that makes the crate
+shippable as a SOTA Rust agentic framework via `default-features = false`.
+
+### Added (heartbit-core)
+
+- **`ghost-domain-config` cargo feature** (default on) — gates the
+  `heartbit-ghost` domain leaks (X persona configs, `ImageSource` enum,
+  `TwitterPostTool`/`TwitterCredentials`) so SOTA framework users can
+  depend on `heartbit-core` with `default-features = false` and get a
+  pure agent-framework surface (~95 tests / ~1500 LoC stay behind the
+  flag). Mirrors the pattern langchain-rust uses for vendor backends.
+- **`Tool::redact_for_history` trait method** + `AgentOutput.tool_call_results`
+  — generic fix for multimodal-blob context bloat (P1.3g). Lets tools
+  swap large base64/binary payloads for a short SHA-256 placeholder in
+  conversation history without losing the original tool result.
+- **`TopicContextProvider` trait** + 2 persona impls (`HeartbitRsXTopicContext`,
+  `XGhostTopicContext`). Pluggable seam for per-persona topic-context wiring.
+- **`PersonaExpansion::mode_addendum` field** — optional system-prompt
+  addendum for sub-mode scoping (e.g. a persona that posts generally vs.
+  one focused on a specific topic cluster).
+- Persona-specific config types under `ghost-domain-config` (gated):
+  `PersonaPostsConfig`, `PersonaQuotesConfig`, `PersonaBlogConfig` +
+  `XAnnounceConfig` + `GithubReadmeConfig`, `PersonaMentionsConfig`,
+  `ImageSource` enum (`Online` / `Ai` / `None`).
+- `TwitterPostTool` optional `media_url` + `media_alt_text` (gated under
+  `ghost-domain-config`). Backward-compatible text-only path unchanged.
+
+### Changed (heartbit-core)
+
+- **`#![deny(missing_docs)]` is now genuinely enforced.** Three inner-attr
+  escape hatches (`#![allow(missing_docs)]` in `config/daemon.rs`,
+  `tool/builtins/mod.rs`, `tool/builtins/twitter_post.rs`) silently
+  neutralized the gate across ~40 files in the crate. Dropping them
+  surfaced ~410 missing-docs items, all filled with one-line rustdoc.
+  Zero remaining module-level allows in the crate.
+- **Cascade `__respond__` escalation fix** — when a non-final tier returns
+  plain text where a `__respond__` tool call was expected (structured
+  output mode), the cascade now correctly escalates to the next tier
+  instead of accepting the unparseable response.
+- `OpenverseImageSearchTool` and `Persona*Config` types are no longer
+  unconditionally re-exported at the crate root; they live under the
+  `ghost-domain-config` feature.
+- `PersonaPostsConfig` gains `writer_provider` (per-persona engagement-voice
+  override), `interval_jitter_pct` (anti-bot cadence), `image_source`
+  toggle (online/ai/none).
+
+### Removed (heartbit-core)
+
+- `OpenverseImageSearchTool` (the CC0/public-domain Openverse image-search
+  builtin added earlier) **moved to `heartbit-ghost`** — its sole consumer
+  is the ghost X-post review pipeline. SOTA Rust frameworks (rig, swiftide,
+  autoagents) keep domain-specific tools out of core; this matches that
+  precedent.
+- "Evangelism framing" example phrasing removed from
+  `PersonaExpansion::mode_addendum` doc — replaced with a domain-neutral
+  sub-mode-scoping description. The trait itself is unchanged; only the
+  docstring leaked the heartbit-ghost use case.
+- Empty `TriggerSpec {}` and `ReviewSpec {}` placeholder enums in
+  `persona/types.rs` were kept (they're referenced by `PersonaExpansion`)
+  but now carry explicit placeholder rustdoc.
+
+### Breaking changes (heartbit-core)
+
+- `Tool::execute(&self, ctx: &ExecutionContext, input: Value)` — was
+  shipped in `v2026.507.3` (commit `93ba0e5`). External `Tool`
+  implementors need to add the `&ExecutionContext` parameter. The
+  `ExecutionContext` provides `credentials: Option<Arc<dyn CredentialResolver>>`
+  and `audit: Option<Arc<dyn AuditSink>>` per-request.
+- **None new** in v2026.507.4 itself. The cargo feature gate is
+  additive — internal callers depend on `heartbit-core` with default
+  features and see zero surface change. SOTA users opting out via
+  `default-features = false` get a NARROWER surface (no
+  `Persona*Config`, no `TwitterPostTool`, no `ImageSource`), which is
+  the entire point of the release.
+
+### heartbit-ghost (companion changes — not on crates.io)
+
+The persona-specific crate gained: blog feature (Cloudflare Pages
+deploy via `deploy_command` hook, GitHub README auto-update, weekly
+X-derived blog seed selection, full LLM essay pipeline with strict
+sourcing chain), quote/reply pipelines with bot-signature guards,
+`PersonaMentionsConfig` + mention-poll pipeline, `MentionPoll` handler,
+`PersonaQuotesConfig` + quote-tweet scheduler, X-announce thread for
+blog publishes, OpenverseImageSearchTool now lives here. Not published
+to crates.io.
+
+### Notes
+
+- **Internal callers see zero surface change**: `heartbit` (umbrella) and
+  `heartbit-cli` depend on `heartbit-core` with default features on, so
+  every prior API path keeps working. Operator TOML format (`daemon-dev.toml`)
+  is unchanged — `cargo run -- daemon --validate-config` passes.
+- **SOTA-user verification**: `cargo build --package heartbit-core --no-default-features`
+  builds clean; `cargo test --lib --no-default-features` produces 2353
+  passing tests (vs 2448 with default features — the 95-test delta is
+  the `ghost-domain-config`-gated material).
+- The `v2026.507.3` git tag was created retroactively on commit `ca994e6`
+  (matches the crates.io publish on 2026-05-07).
+
+## [Unreleased]
+
 
 The P1.1 increment ships the X (Twitter) tool family on top of the Phase 0
 `ExecutionContext` / `CredentialResolver` foundation. Five new tools live
