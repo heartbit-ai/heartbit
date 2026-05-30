@@ -32,10 +32,11 @@ pub struct PersonaExpansion {
     pub triggers: Vec<TriggerSpec>,
     /// Optional review channel spec. None in Phase 0.
     pub review: Option<ReviewSpec>,
-    /// Persona-specific mode addendum, appended to voice-aware user
-    /// messages by the pipeline. Carries persona-design constants
-    /// (e.g. evangelism framing) without coupling them to user TOML.
-    /// `None` for personas that don't need one.
+    /// Optional addendum appended to the persona's system prompt at
+    /// expansion time. Implementations use this to scope a single
+    /// persona to multiple sub-modes (e.g. one persona that posts
+    /// generally vs. one that focuses on a specific topic cluster).
+    /// `None` for personas without per-mode variation.
     pub mode_addendum: Option<&'static str>,
     /// Optional persona-specific topic context provider for proactive
     /// posting. When present, `handle_persona_post` calls
@@ -80,12 +81,18 @@ pub enum AuthorshipMode {
     AutonomousUndisclosed,
 }
 
-/// Trigger spec — concrete variants land with their consumers (Phase 1).
+/// Placeholder for future persona trigger specifications (cron, sensor,
+/// mention-polling, manual). Currently has no variants — implementors
+/// should not pattern-match on this type. Reserved as a stable
+/// type-level seam for trigger taxonomy (Phase 1+).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TriggerSpec {}
 
-/// Review channel spec — concrete variants land with their consumers (Phase 1).
+/// Placeholder for future persona review-channel specifications.
+/// Currently has no variants — implementors should not pattern-match
+/// on this type. Reserved as a stable type-level seam for review-flow
+/// taxonomy (Phase 1+).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReviewSpec {}
@@ -131,7 +138,7 @@ mod tests {
 
     #[test]
     fn persona_expansion_carries_static_mode_addendum() {
-        const ADDENDUM: &str = "EVANGELISM MODE — test fixture";
+        const ADDENDUM: &str = "topic-cluster:rust — test fixture";
         let e = PersonaExpansion {
             mode_addendum: Some(ADDENDUM),
             ..PersonaExpansion::default()
