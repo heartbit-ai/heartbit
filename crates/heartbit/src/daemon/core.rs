@@ -1705,21 +1705,11 @@ mod tests {
     }
 
     fn test_config() -> DaemonConfig {
-        crate::config::DaemonConfig {
-            kafka: Some(test_kafka_config()),
-            bind: "127.0.0.1:0".into(),
-            max_concurrent_tasks: 4,
-            metrics: None,
-            database_url: None,
-            auth: None,
-            memory: crate::config::DaemonMemoryConfig::default(),
-            audit: crate::config::DaemonAuditConfig::default(),
-            idempotency: crate::config::IdempotencyConfig::default(),
-            persona_mentions: vec![],
-            persona_posts: vec![],
-            persona_quotes: vec![],
-            persona_blog: None,
-        }
+        let mut cfg = crate::config::DaemonConfig::default();
+        cfg.kafka = Some(test_kafka_config());
+        cfg.bind = "127.0.0.1:0".into();
+        cfg.max_concurrent_tasks = 4;
+        cfg
     }
 
     fn test_producer() -> FutureProducer {

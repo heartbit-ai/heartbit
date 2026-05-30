@@ -84,17 +84,13 @@ impl Persona for XGhostPersona {
 
         let tools = agents::tools_for_persona();
 
-        Ok(PersonaExpansion {
-            agents,
-            tools,
-            topic_context_provider: Some(std::sync::Arc::new(
-                crate::posts::XGhostTopicContext::new(),
-            )),
-            // P1.3b populates orchestrator.
-            // P1.3d populates review.
-            // P1.4 populates triggers.
-            ..PersonaExpansion::default()
-        })
+        // P1.3b populates orchestrator. P1.3d populates review. P1.4 populates triggers.
+        let mut expansion = PersonaExpansion::default();
+        expansion.agents = agents;
+        expansion.tools = tools;
+        expansion.topic_context_provider =
+            Some(std::sync::Arc::new(crate::posts::XGhostTopicContext::new()));
+        Ok(expansion)
     }
 }
 

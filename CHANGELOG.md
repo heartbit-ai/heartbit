@@ -77,12 +77,21 @@ shippable as a SOTA Rust agentic framework via `default-features = false`.
   implementors need to add the `&ExecutionContext` parameter. The
   `ExecutionContext` provides `credentials: Option<Arc<dyn CredentialResolver>>`
   and `audit: Option<Arc<dyn AuditSink>>` per-request.
-- **None new** in v2026.507.4 itself. The cargo feature gate is
-  additive — internal callers depend on `heartbit-core` with default
-  features and see zero surface change. SOTA users opting out via
-  `default-features = false` get a NARROWER surface (no
-  `Persona*Config`, no `TwitterPostTool`, no `ImageSource`), which is
-  the entire point of the release.
+- **`AgentOutput`, `PersonaExpansion`, and `DaemonConfig` are now
+  `#[non_exhaustive]`.** Construction via struct literal from outside
+  `heartbit-core` is no longer permitted. Internal callers (heartbit,
+  heartbit-cli, heartbit-ghost) are already migrated. External
+  consumers should use `Type::default()` then mutate the fields they
+  care about, or — for `AgentOutput` specifically — read it from
+  `runner.execute(...)` rather than construct manually. The structs
+  now all `#[derive(Default)]`, making this idiomatic. Trade-off
+  this release for future-proofing: subsequent field additions to
+  these types are non-breaking.
+- The cargo feature gate is itself additive — internal callers depend
+  on `heartbit-core` with default features and see zero surface change.
+  SOTA users opting out via `default-features = false` get a NARROWER
+  surface (no `Persona*Config`, no `TwitterPostTool`, no `ImageSource`),
+  which is the entire point of the release.
 
 ### heartbit-ghost (companion changes — not on crates.io)
 

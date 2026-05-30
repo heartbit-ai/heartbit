@@ -490,20 +490,12 @@ mod tests {
         let producer = create_producer(&config).expect("create producer");
         let consumer = create_commands_consumer(&config).expect("create consumer");
 
-        let daemon_config = crate::config::DaemonConfig {
-            kafka: Some(config.clone()),
-            bind: "127.0.0.1:0".into(),
-            max_concurrent_tasks: 4,
-            metrics: None,
-            database_url: None,
-            auth: None,
-            memory: crate::config::DaemonMemoryConfig::default(),
-            audit: crate::config::DaemonAuditConfig::default(),
-            idempotency: crate::config::IdempotencyConfig::default(),
-            persona_mentions: vec![],
-            persona_posts: vec![],
-            persona_quotes: vec![],
-            persona_blog: None,
+        let daemon_config = {
+            let mut cfg = crate::config::DaemonConfig::default();
+            cfg.kafka = Some(config.clone());
+            cfg.bind = "127.0.0.1:0".into();
+            cfg.max_concurrent_tasks = 4;
+            cfg
         };
 
         let store: std::sync::Arc<dyn super::super::store::TaskStore> =
@@ -567,16 +559,10 @@ mod tests {
                 let tx = runner_tx.clone();
                 async move {
                     let _ = tx.send(task).await;
-                    Ok(crate::agent::AgentOutput {
-                        result: "HEARTBIT_OK".into(),
-                        tool_calls_made: 0,
-                        tokens_used: crate::llm::types::TokenUsage::default(),
-                        structured: None,
-                        estimated_cost_usd: None,
-                        model_name: None,
-                        // Test stub: no real tools dispatched in this code path.
-                        tool_call_results: Vec::new(),
-                    })
+                    let mut out = crate::agent::AgentOutput::default();
+                    out.result = "HEARTBIT_OK".into();
+                    // Test stub: no real tools dispatched; all other fields stay at Default.
+                    Ok(out)
                 }
             };
 

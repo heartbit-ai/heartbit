@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-cli"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-core"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "a2a-sdk",
  "anyhow",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-gateway"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-ghost"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-macro"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-sensors"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "chrono",
  "futures",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "heartbit-telegram"
-version = "2026.507.3"
+version = "2026.507.4"
 dependencies = [
  "chrono",
  "futures",

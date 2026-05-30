@@ -13,7 +13,8 @@ use crate::Error;
 /// owner_emails, mcp_server) have been moved to the gateway crate as part
 /// of the 3-tier architecture refactoring. The type definitions are kept
 /// here so they can be re-used by the gateway.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[non_exhaustive]
 pub struct DaemonConfig {
     /// Kafka transport configuration. Omit for in-process channel mode.
     #[serde(default)]

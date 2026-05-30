@@ -21,6 +21,7 @@ pub struct PersonaParams {
 
 /// What a persona expands into at startup.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct PersonaExpansion {
     /// Sub-agents the persona requires.
     pub agents: Vec<AgentConfig>,

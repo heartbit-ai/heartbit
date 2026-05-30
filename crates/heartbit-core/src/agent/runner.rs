@@ -77,7 +77,8 @@ pub struct ToolCallRecord {
 ///
 /// Returned by [`AgentRunner::execute`] on success. Contains the agent's
 /// final text response and usage accounting for the entire run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AgentOutput {
     /// The agent's final text response.
     pub result: String,

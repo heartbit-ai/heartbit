@@ -88,15 +88,14 @@ impl Persona for XHeartbitRsPersona {
             })?,
         };
 
-        Ok(PersonaExpansion {
-            agents,
-            tools,
-            mode_addendum: Some(MODE_ADDENDUM),
-            topic_context_provider: Some(std::sync::Arc::new(
-                crate::posts::HeartbitRsXTopicContext::new(repo_root),
-            )),
-            ..PersonaExpansion::default()
-        })
+        let mut expansion = PersonaExpansion::default();
+        expansion.agents = agents;
+        expansion.tools = tools;
+        expansion.mode_addendum = Some(MODE_ADDENDUM);
+        expansion.topic_context_provider = Some(std::sync::Arc::new(
+            crate::posts::HeartbitRsXTopicContext::new(repo_root),
+        ));
+        Ok(expansion)
     }
 }
 
