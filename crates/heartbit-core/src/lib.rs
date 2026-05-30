@@ -83,7 +83,7 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 // the `agent` module at the crate root. The data types are re-exported at root
 // for discoverability, matching the workflow-agent re-exports above.
 pub use agent::flow;
-pub use agent::flow::agent::{AgentCall, AgentOpts};
+pub use agent::flow::agent::{AgentCall, AgentOpts, NoSchema, RawJson, StructuredSchema};
 pub use agent::flow::ctx::{WorkflowCtx, WorkflowCtxBuilder};
 pub use agent::flow::event::{OnWorkflowEvent, PhaseGuard, WorkflowEvent};
 pub use agent::flow::parallel::BoxThunk;

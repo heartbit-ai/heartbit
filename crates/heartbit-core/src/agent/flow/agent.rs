@@ -12,13 +12,40 @@
 //! *combinators*, never of `agent()` — control errors (backstop, cancellation,
 //! and later the budget) must propagate.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+use serde_json::Value;
 
 use crate::agent::{AgentOutput, AgentRunner};
 use crate::error::Error;
 
 use super::ctx::WorkflowCtx;
 use super::event::WorkflowEvent;
+
+/// A Rust type an [`agent`] can be forced to produce as validated structured
+/// output via [`AgentCall::schema`]. Implementors supply the JSON Schema the
+/// model's `__respond__` payload is validated against; the payload is then
+/// `serde`-deserialized into `Self`, so `serde` enforces everything JSON Schema
+/// cannot express (exact integer widths, enum variants, `deny_unknown_fields`).
+///
+/// Dep-free by design: write [`json_schema`](Self::json_schema) by hand, or
+/// generate it with a future `#[derive(StructuredSchema)]` in `heartbit-macro`.
+/// (We deliberately do *not* pull in `schemars`, whose dialect would have to be
+/// reconciled with the `jsonschema` validator already used by the runner.)
+pub trait StructuredSchema: serde::de::DeserializeOwned + Send {
+    /// The JSON Schema the model output is validated against before deserialization.
+    fn json_schema() -> Value;
+}
+
+/// Marker type for an [`AgentCall`] with no schema: its `run()` yields the
+/// agent's text. This is the default type parameter of [`AgentCall`].
+pub struct NoSchema;
+
+/// Marker type for an [`AgentCall`] given a hand-written `serde_json::Value`
+/// schema via [`AgentCall::schema_value`]: its `run()` yields the raw validated
+/// `Value` (no deserialization into a Rust type).
+pub struct RawJson;
 
 /// Per-call options for an [`agent`] leaf. `#[non_exhaustive]` so later phases
 /// can add fields (schema, model, isolation, …) without breaking callers.
@@ -30,30 +57,41 @@ pub struct AgentOpts {
     /// Explicit phase override. When unset, the leaf adopts the context's
     /// default phase snapshotted at construction time.
     pub phase: Option<String>,
+    /// JSON Schema for forced structured output. When set, the underlying
+    /// runner injects `__respond__`, validates the payload, and retries on
+    /// mismatch. Set indirectly via [`AgentCall::schema`] / [`AgentCall::schema_value`].
+    pub schema: Option<Value>,
 }
 
 /// A fluent, owned builder for one [`agent`] leaf. Created by [`agent`].
-pub struct AgentCall {
+///
+/// The type parameter `T` selects the terminal: [`NoSchema`] (default) yields
+/// the agent's text, a [`StructuredSchema`] type `T` yields a validated `T`, and
+/// [`RawJson`] yields a validated `serde_json::Value`. `T` is phantom — it lives
+/// only here, so the underlying runner stays `Value`-only and object-safe.
+pub struct AgentCall<T = NoSchema> {
     ctx: WorkflowCtx,
     prompt: String,
     opts: AgentOpts,
     /// Default phase captured when this call was *constructed*, so concurrently
     /// running agents never observe a torn phase if another phase begins later.
     phase_snapshot: Option<Arc<str>>,
+    _t: PhantomData<fn() -> T>,
 }
 
 /// Begin an [`AgentCall`] against `ctx`. Snapshots the current default phase.
-pub fn agent(ctx: &WorkflowCtx, prompt: impl Into<String>) -> AgentCall {
+pub fn agent(ctx: &WorkflowCtx, prompt: impl Into<String>) -> AgentCall<NoSchema> {
     let phase_snapshot = ctx.current_phase();
     AgentCall {
         ctx: ctx.clone(),
         prompt: prompt.into(),
         opts: AgentOpts::default(),
         phase_snapshot,
+        _t: PhantomData,
     }
 }
 
-impl AgentCall {
+impl<T> AgentCall<T> {
     /// Set the display label (used in events and as the runner name).
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.opts.label = Some(label.into());
@@ -74,17 +112,18 @@ impl AgentCall {
             .or_else(|| self.phase_snapshot.as_deref().map(str::to_owned))
     }
 
-    /// Run the agent leaf to completion.
+    /// Run the leaf to completion, returning the full [`AgentOutput`] (or `None`
+    /// if the run was cancelled / skipped). Shared by every typed terminal.
     ///
     /// Leaf sequence: acquire a concurrency permit -> register against the
     /// runaway backstop -> admit against the shared budget -> race the run
     /// against cancellation -> on success record the spend and emit
-    /// `AgentFinished`. `Ok(None)` is returned only when the run was cancelled
-    /// (skipped); agent-domain failures return `Err` so the combinators can
-    /// decide whether to collapse them to `None`. The backstop and budget are
-    /// *control* errors: they record a breach and fire run-wide cancellation,
-    /// so they survive a combinator's `Err -> None` collapse.
-    pub async fn run(self) -> Result<Option<String>, Error> {
+    /// `AgentFinished`. `Ok(None)` only on cancellation; agent-domain failures
+    /// return `Err` so the combinators can decide whether to collapse them to
+    /// `None`. The backstop and budget are *control* errors: they record a
+    /// breach and fire run-wide cancellation, so they survive a combinator's
+    /// `Err -> None` collapse.
+    async fn run_leaf(self) -> Result<Option<AgentOutput>, Error> {
         let label = self
             .opts
             .label
@@ -128,18 +167,96 @@ impl AgentCall {
             label,
             usage: output.tokens_used,
         });
-        Ok(Some(output.result))
+        Ok(Some(output))
+    }
+}
+
+impl AgentCall<NoSchema> {
+    /// Force validated structured output of type `S`, transforming this into an
+    /// [`AgentCall<S>`] whose `run()` returns `Option<S>`. The schema comes from
+    /// [`StructuredSchema::json_schema`].
+    pub fn schema<S: StructuredSchema>(self) -> AgentCall<S> {
+        let mut opts = self.opts;
+        opts.schema = Some(S::json_schema());
+        AgentCall {
+            ctx: self.ctx,
+            prompt: self.prompt,
+            opts,
+            phase_snapshot: self.phase_snapshot,
+            _t: PhantomData,
+        }
+    }
+
+    /// Force validated structured output against a hand-written JSON Schema,
+    /// transforming this into an [`AgentCall<RawJson>`] whose `run()` returns the
+    /// raw validated `serde_json::Value` (no deserialization).
+    pub fn schema_value(self, schema: Value) -> AgentCall<RawJson> {
+        let mut opts = self.opts;
+        opts.schema = Some(schema);
+        AgentCall {
+            ctx: self.ctx,
+            prompt: self.prompt,
+            opts,
+            phase_snapshot: self.phase_snapshot,
+            _t: PhantomData,
+        }
+    }
+
+    /// Run the agent leaf and return its text. `Ok(None)` only on cancellation.
+    pub async fn run(self) -> Result<Option<String>, Error> {
+        Ok(self.run_leaf().await?.map(|o| o.result))
+    }
+}
+
+impl<T: StructuredSchema> AgentCall<T> {
+    /// Run the agent leaf and deserialize its validated structured output into
+    /// `T`. `Ok(None)` only on cancellation. A run that finishes without
+    /// producing structured output, or whose output fails to deserialize into
+    /// `T`, returns `Err` — never a silent `None`.
+    pub async fn run(self) -> Result<Option<T>, Error> {
+        match self.run_leaf().await? {
+            None => Ok(None),
+            Some(output) => {
+                let value = output.structured.ok_or_else(|| {
+                    Error::Agent("agent finished without structured output".to_string())
+                })?;
+                let typed = serde_json::from_value::<T>(value).map_err(Error::Json)?;
+                Ok(Some(typed))
+            }
+        }
+    }
+}
+
+impl AgentCall<RawJson> {
+    /// Run the agent leaf and return its raw validated `serde_json::Value`.
+    /// `Ok(None)` only on cancellation; a run that finishes without structured
+    /// output returns `Err`.
+    pub async fn run(self) -> Result<Option<Value>, Error> {
+        match self.run_leaf().await? {
+            None => Ok(None),
+            Some(output) => {
+                let value = output.structured.ok_or_else(|| {
+                    Error::Agent("agent finished without structured output".to_string())
+                })?;
+                Ok(Some(value))
+            }
+        }
     }
 }
 
 /// Build and execute a fresh per-call [`AgentRunner`] over the shared provider.
 ///
-/// Seam: later phases attach the schema, per-call model, budget recording, and
-/// journal hooks here without changing the leaf sequence.
+/// Seam: later phases attach the per-call model and journal hooks here without
+/// changing the leaf sequence. When `opts.schema` is set, the runner injects the
+/// `__respond__` tool, validates the payload against the schema, and retries on
+/// mismatch — the typed terminal then deserializes `AgentOutput.structured`.
 async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<AgentOutput, Error> {
     let mut builder = AgentRunner::builder(ctx.provider());
     if let Some(label) = &opts.label {
         builder = builder.name(label.clone());
+    }
+    if let Some(schema) = &opts.schema {
+        builder = builder.structured_schema(schema.clone());
     }
     let runner = builder.build()?;
     runner.execute(prompt).await
@@ -506,5 +623,179 @@ mod tests {
         assert_eq!(ran, 10);
         assert_eq!(ctx.budget().spent(), 100);
         assert_eq!(ctx.remaining(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: per-call typed structured output via .schema::<T>()
+    // -----------------------------------------------------------------------
+
+    use super::{RawJson, StructuredSchema};
+    use crate::llm::types::RESPOND_TOOL_NAME;
+
+    /// Provider that always answers by calling the synthetic `__respond__` tool
+    /// with a fixed payload — mimicking a model producing structured output.
+    struct RespondProvider {
+        payload: serde_json::Value,
+    }
+
+    impl LlmProvider for RespondProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "resp-1".into(),
+                    name: RESPOND_TOOL_NAME.into(),
+                    input: self.payload.clone(),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("respond-mock")
+        }
+    }
+
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct Finding {
+        title: String,
+        severity: u8,
+    }
+
+    impl StructuredSchema for Finding {
+        fn json_schema() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "required": ["title", "severity"],
+                "properties": {
+                    "title": { "type": "string" },
+                    "severity": { "type": "integer" }
+                }
+            })
+        }
+    }
+
+    fn respond_ctx(payload: serde_json::Value) -> WorkflowCtx {
+        WorkflowCtx::builder(Arc::new(BoxedProvider::new(RespondProvider { payload })))
+            .build()
+            .expect("build ctx")
+    }
+
+    #[tokio::test]
+    async fn typed_schema_round_trips() {
+        let ctx = respond_ctx(serde_json::json!({ "title": "SQLi", "severity": 9 }));
+        let found: Option<Finding> = agent(&ctx, "audit")
+            .schema::<Finding>()
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(
+            found,
+            Some(Finding {
+                title: "SQLi".into(),
+                severity: 9
+            })
+        );
+        // The budget still records through the typed path (input 5 + output 5).
+        assert_eq!(ctx.budget().spent(), 10);
+    }
+
+    #[tokio::test]
+    async fn schema_value_returns_raw_json() {
+        let payload = serde_json::json!({ "anything": [1, 2, 3] });
+        let ctx = respond_ctx(payload.clone());
+        let out: Option<serde_json::Value> = agent(&ctx, "task")
+            .schema_value(serde_json::json!({ "type": "object" }))
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(out, Some(payload));
+    }
+
+    #[tokio::test]
+    async fn finished_without_respond_is_err_not_none() {
+        // A text-only provider never calls __respond__. With a schema set, the
+        // runner treats that as a contract violation. The typed terminal must
+        // surface an Err — NEVER silently collapse a missing structured output
+        // to Ok(None) (that is reserved for cancellation).
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "just prose",
+            5,
+            5,
+        )]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(mock)))
+            .build()
+            .expect("build ctx");
+        let result = agent(&ctx, "audit").schema::<Finding>().run().await;
+        assert!(
+            result.is_err(),
+            "missing structured output must be Err, got {result:?}"
+        );
+    }
+
+    // Deserialize-only fixtures: their fields/variants are exercised through
+    // serde, never read in Rust, so dead-code analysis is intentionally muted.
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Choice {
+        pick: Pick,
+    }
+
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(rename_all = "lowercase")]
+    #[allow(dead_code)]
+    enum Pick {
+        Yes,
+        No,
+    }
+
+    impl StructuredSchema for Choice {
+        // Deliberately LOOSER than the Rust type: jsonschema only checks that
+        // `pick` is a string, but serde restricts it to the enum variants.
+        fn json_schema() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "required": ["pick"],
+                "properties": { "pick": { "type": "string" } }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn serde_catches_what_jsonschema_misses() {
+        // "maybe" passes the loose string schema (so the runner accepts it) but
+        // is not a valid `Pick` variant — `from_value` must fail with Error::Json.
+        let ctx = respond_ctx(serde_json::json!({ "pick": "maybe" }));
+        let result = agent(&ctx, "decide").schema::<Choice>().run().await;
+        match result {
+            Err(Error::Json(_)) => {}
+            other => panic!("expected Error::Json from serde, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_typed_run_is_none() {
+        let ctx = respond_ctx(serde_json::json!({ "title": "x", "severity": 1 }));
+        ctx.cancellation_token().cancel();
+        let found: Option<Finding> = agent(&ctx, "audit")
+            .schema::<Finding>()
+            .run()
+            .await
+            .expect("run ok");
+        assert!(found.is_none(), "cancelled typed run must be Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn raw_json_marker_is_distinct_from_no_schema() {
+        // Type-level guard: schema_value yields AgentCall<RawJson>, whose run()
+        // returns Option<Value>, while the plain path returns Option<String>.
+        let ctx = respond_ctx(serde_json::json!({ "k": "v" }));
+        let call = agent(&ctx, "t").schema_value(serde_json::json!({ "type": "object" }));
+        let _assert_type: fn(AgentCall<RawJson>) = |_c| {};
+        _assert_type(call);
     }
 }
