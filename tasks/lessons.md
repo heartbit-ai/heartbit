@@ -49,3 +49,35 @@ process is gone (`ps -p <pid>`) AND the port is free
 OAuth1.0a, OPENROUTER_API_KEY) plus CLOUDFLARE_API_TOKEN (for the blog
 deploy hook + github_readme push). Killing/relaunching requires explicit
 user authorization per CLAUDE.md — never autonomous.
+
+---
+
+## 2026-05-30 — Never batch `git commit` in the same tool-call group as the gate
+
+**Correction (self-caught, twice in one phase):** during dynamic-workflows P4 I
+put `cargo fmt` + `clippy` + `cargo test` + `git commit --amend` in ONE batch of
+parallel tool calls. Batched calls all execute regardless of each other's
+results, so the commit ran while the gate was RED — a non-compiling commit landed
+at HEAD. I repeated the exact mistake on the next amend.
+
+**Rule:** the gate (`cargo fmt -- --check && cargo clippy -- -D warnings &&
+cargo test`) and the `git commit` MUST be in separate turns. Read the gate result
+first; commit only after confirming green. Because the tool channel this session
+corrupted inline `echo` output, treat a result as green only when read back from
+a file (`… > /tmp/x.txt; <Read>`), not from inline stdout. Recovery when a broken
+commit lands: fix forward, re-gate, `git commit --amend` (safe while unpushed).
+
+## 2026-05-30 — A failed Edit can leave `unimplemented!` stubs that still compile
+
+**Correction:** two `Edit`s meant to fill `content_hash`/`derive_run_id` failed
+with "String to replace not found" (I used `old_string` copied from a *cancelled*
+turn's assumed state, not the live file). The fns stayed `unimplemented!(...)`,
+which COMPILES — only 3 runtime tests panicked, easy to miss in a noisy batch. A
+later import fix used a fabricated `old_string` (`_Dup`/`_Ord` text that never
+existed) and also failed silently.
+
+**Rule:** "String to replace not found" is a HARD STOP — re-Read the exact region
+and copy `old_string` verbatim before retrying; never hand-type the anchor. Before
+committing a slice, `grep -rn 'unimplemented!\|todo!(\|FIXME'` the touched files
+and confirm zero. `cargo build` passing ≠ no stubs; only a test that exercises
+each path proves it.
