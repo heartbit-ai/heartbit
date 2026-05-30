@@ -121,6 +121,7 @@ pub struct IdempotencyConfig {
 /// periodic mention polling loop. When `enabled = true`, the daemon spawns
 /// a `MentionPollScheduler` for each entry that fires a
 /// `DaemonCommand::MentionPoll` on the configured interval.
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonaMentionsConfig {
     /// Persona slug (must match a loaded persona file, e.g. `"heartbit-ghost"`).
@@ -185,34 +186,42 @@ pub struct PersonaMentionsConfig {
     pub budget_path: Option<String>,
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_poll_interval_seconds() -> u64 {
     300
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_candidates_per_reply() -> usize {
     2
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_mention_store() -> String {
     "in_memory".into()
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_min_follower_following_ratio() -> f32 {
     0.05
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_min_account_age_days() -> i64 {
     7
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_bot_heuristic_threshold() -> usize {
     2
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_per_conversation_max_replies() -> usize {
     2
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_p1_7_budget_store() -> String {
     "in_memory".into()
 }
@@ -357,6 +366,7 @@ fn parse_hhmm(s: &str) -> Result<(u32, u32), Error> {
 }
 
 /// How the X-post pipeline produces the optional head-tweet image.
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageSource {
@@ -378,6 +388,7 @@ pub enum ImageSource {
 /// them to Telegram for review, posts the chosen draft.
 ///
 /// Configured under `[[daemon.persona_posts]]` blocks.
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonaPostsConfig {
     /// Persona registry name (e.g. `"heartbit-ghost:x"`).
@@ -460,38 +471,47 @@ pub struct PersonaPostsConfig {
     pub image_source: ImageSource,
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_post_interval_seconds() -> u64 {
     14400
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_post_interval_jitter_pct() -> u32 {
     25
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_post_candidates() -> usize {
     3
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_post_history_store() -> String {
     "in_memory".into()
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_post_history_lookback_days() -> i64 {
     30
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_engagement_refresh_seconds() -> u64 {
     21600
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_engagement_top_n() -> usize {
     5
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_engagement_max_age_days() -> i64 {
     30
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_engagement_min_age_hours() -> i64 {
     24
 }
@@ -507,6 +527,7 @@ fn default_engagement_min_age_hours() -> i64 {
 /// chosen draft via `POST /2/tweets` with `quote_tweet_id`.
 ///
 /// Configured under `[[daemon.persona_quotes]]` blocks.
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonaQuotesConfig {
     /// Persona registry name (e.g. `"heartbit-ghost:x"`).
@@ -564,26 +585,32 @@ pub struct PersonaQuotesConfig {
     pub writer_provider: Option<super::agent::AgentProviderConfig>,
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_poll_interval_seconds() -> u64 {
     5400 // 90 minutes
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_interval_jitter_pct() -> u32 {
     25
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_candidates_per_draft() -> usize {
     3
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_seen_store() -> String {
     "in_memory".into()
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_max_age_hours() -> i64 {
     12
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_quote_max_candidates_per_tick() -> usize {
     1
 }
@@ -600,6 +627,7 @@ fn default_quote_max_candidates_per_tick() -> usize {
 ///
 /// Configured under `[daemon.persona_blog]` (single block, not a
 /// list — one blog per daemon).
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonaBlogConfig {
     /// Persona registry name (e.g. `"heartbit-ghost:x"`). Must match an
@@ -677,35 +705,43 @@ pub struct PersonaBlogConfig {
     pub github_readme: Option<GithubReadmeConfig>,
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_poll_interval_seconds() -> u64 {
     604_800 // 7 days
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_interval_jitter_pct() -> u32 {
     10
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_posts_dir() -> String {
     "blog-site/posts".into()
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_out_dir() -> String {
     "blog-site/public".into()
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_seed_lookback_days() -> i64 {
     7
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_candidates_per_draft() -> usize {
     2
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_blog_site_title() -> String {
     "pascal.heartbit.ai".into()
 }
 
 /// X self-amplification settings (sub-block of `[daemon.persona_blog]`).
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct XAnnounceConfig {
     /// Whether X self-amplification is enabled.
@@ -714,6 +750,7 @@ pub struct XAnnounceConfig {
 }
 
 /// GitHub Profile README auto-update settings.
+#[cfg(feature = "ghost-domain-config")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubReadmeConfig {
     /// Whether the GitHub README update is enabled.
@@ -735,6 +772,7 @@ pub struct GithubReadmeConfig {
     pub git_author_email: String,
 }
 
+#[cfg(feature = "ghost-domain-config")]
 fn default_bio_template_path() -> String {
     "bio.md".into()
 }
@@ -823,7 +861,7 @@ fn default_dead_letter_topic() -> String {
     "heartbit.dead-letter".into()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ghost-domain-config"))]
 mod tests {
     use super::*;
 
