@@ -7,8 +7,8 @@
 //! their own handle.
 
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::Error;
 use crate::llm::BoxedProvider;
 
+use super::budget::Budget;
 use super::event::{OnWorkflowEvent, WorkflowEvent};
 
 /// Hard upper bound on concurrently-running agents, matching Claude Code's
@@ -36,6 +37,28 @@ pub(crate) fn default_concurrency() -> usize {
         .clamp(1, MAX_CONCURRENCY_CAP)
 }
 
+/// A run-level limit breach that must halt the whole run, distinct from an
+/// agent-domain failure. When one occurs inside a combinator the breach is
+/// recorded (set-once) and the run-wide cancellation token is fired, so the
+/// breach survives the combinator's `Err -> None` collapse and the caller can
+/// detect it via [`WorkflowCtx::control_breach`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlBreach {
+    /// The shared token budget was exhausted.
+    Budget {
+        /// Weighted cost recorded when admission was refused.
+        used: u64,
+        /// The configured ceiling.
+        limit: u64,
+    },
+    /// The runaway agent backstop was hit.
+    AgentBackstop {
+        /// The configured maximum agents per run.
+        limit: u64,
+    },
+}
+
 /// Shared, cheaply-cloneable workflow run context.
 #[derive(Clone)]
 pub struct WorkflowCtx {
@@ -51,6 +74,10 @@ struct CtxInner {
     spawned: AtomicU64,
     /// Maximum total agents per run.
     max_agents: u64,
+    /// Shared hard-ceiling token-equivalent spend pool.
+    budget: Budget,
+    /// First run-level limit breach, if any (set-once).
+    control: Mutex<Option<ControlBreach>>,
     /// Optional workflow event sink.
     events: Option<Arc<OnWorkflowEvent>>,
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
@@ -66,6 +93,8 @@ impl std::fmt::Debug for WorkflowCtx {
             .field("max_agents", &self.inner.max_agents)
             .field("permits", &self.inner.sem.available_permits())
             .field("spawned", &self.inner.spawned.load(Ordering::Relaxed))
+            .field("budget_spent", &self.inner.budget.spent())
+            .field("budget_total", &self.inner.budget.total())
             .finish()
     }
 }
@@ -77,6 +106,7 @@ impl WorkflowCtx {
             provider,
             max_concurrency: None,
             max_agents: None,
+            budget: None,
             events: None,
             cancel: None,
         }
@@ -102,6 +132,22 @@ impl WorkflowCtx {
         self.inner.max_agents
     }
 
+    /// The shared token-equivalent budget pool.
+    pub fn budget(&self) -> &Budget {
+        &self.inner.budget
+    }
+
+    /// Remaining budget headroom, or `u64::MAX` if unbounded. Drives
+    /// `loop-until-budget`: `while ctx.remaining() > threshold { … }`.
+    pub fn remaining(&self) -> u64 {
+        self.inner.budget.remaining()
+    }
+
+    /// The first run-level limit breach, if one has occurred.
+    pub fn control_breach(&self) -> Option<ControlBreach> {
+        self.inner.control.lock().ok().and_then(|g| *g)
+    }
+
     // ----- pub(crate) seams consumed by the agent() leaf (slice 5) -----
 
     /// A clone of the shared, type-erased provider for building an agent leaf.
@@ -120,15 +166,46 @@ impl WorkflowCtx {
     }
 
     /// Reserve one slot against the runaway backstop. Monotonic: a rejected
-    /// admission still counts (it is a backstop, not a live gauge).
+    /// admission still counts (it is a backstop, not a live gauge). On breach,
+    /// records the control breach and fires run-wide cancellation.
     pub(crate) fn register_agent(&self) -> Result<(), Error> {
         let prior = self.inner.spawned.fetch_add(1, Ordering::Relaxed);
         if prior >= self.inner.max_agents {
-            return Err(Error::AgentBudgetExceeded {
-                limit: self.inner.max_agents,
-            });
+            let limit = self.inner.max_agents;
+            self.record_breach(ControlBreach::AgentBackstop { limit });
+            return Err(Error::AgentBudgetExceeded { limit });
         }
         Ok(())
+    }
+
+    /// Admit one agent against the shared budget. On exhaustion, records the
+    /// control breach, fires run-wide cancellation, and returns the error.
+    pub(crate) fn admit_budget(&self) -> Result<(), Error> {
+        match self.inner.budget.check_admit() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if let Error::BudgetExceeded { used, limit } = err {
+                    self.record_breach(ControlBreach::Budget { used, limit });
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Record one agent's completed cost against the shared budget.
+    pub(crate) fn record_spend(&self, usage: &crate::llm::types::TokenUsage) {
+        self.inner.budget.record(usage);
+    }
+
+    /// Record a run-level breach (set-once) and fire run-wide cancellation so
+    /// in-flight combinator tasks wind down. Idempotent on the stored breach.
+    pub(crate) fn record_breach(&self, breach: ControlBreach) {
+        if let Ok(mut guard) = self.inner.control.lock()
+            && guard.is_none()
+        {
+            *guard = Some(breach);
+        }
+        self.inner.cancel.cancel();
     }
 
     /// Emit a workflow event if a sink is installed.
@@ -157,6 +234,7 @@ pub struct WorkflowCtxBuilder {
     provider: Arc<BoxedProvider>,
     max_concurrency: Option<usize>,
     max_agents: Option<u64>,
+    budget: Option<Budget>,
     events: Option<Arc<OnWorkflowEvent>>,
     cancel: Option<CancellationToken>,
 }
@@ -171,6 +249,20 @@ impl WorkflowCtxBuilder {
     /// Override the runaway agent backstop (must be >= 1).
     pub fn max_agents(mut self, n: u64) -> Self {
         self.max_agents = Some(n);
+        self
+    }
+
+    /// Set a hard token-equivalent budget ceiling for the run (`0` ⇒ unbounded).
+    /// Default is unbounded.
+    pub fn budget(mut self, total: u64) -> Self {
+        self.budget = Some(Budget::with_total(total));
+        self
+    }
+
+    /// Share an existing [`Budget`] pool (e.g. a parent run's, for nested
+    /// workflows). Takes precedence over [`budget`](Self::budget).
+    pub fn budget_pool(mut self, budget: Budget) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -209,6 +301,8 @@ impl WorkflowCtxBuilder {
                 sem: Arc::new(Semaphore::new(max_concurrency)),
                 spawned: AtomicU64::new(0),
                 max_agents,
+                budget: self.budget.unwrap_or_default(),
+                control: Mutex::new(None),
                 events: self.events,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),

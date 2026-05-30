@@ -23,6 +23,7 @@
 //! caller; only agent-domain failures collapse to `None`.
 
 pub mod agent;
+pub mod budget;
 pub mod ctx;
 pub mod event;
 pub mod parallel;
