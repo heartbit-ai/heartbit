@@ -6,6 +6,8 @@
 
 pub mod client;
 pub mod mentions;
+/// Openverse CC0/public-domain image search tool.
+pub mod openverse_image;
 pub mod quote;
 pub mod reply;
 pub mod repo_inspect;
@@ -16,6 +18,7 @@ pub mod user_tweets;
 
 pub use client::{XApiError, XClient, format_error};
 pub use mentions::TwitterMentionsTool;
+pub use openverse_image::OpenverseImageSearchTool;
 pub use quote::TwitterQuoteTool;
 pub use reply::TwitterReplyTool;
 pub use repo_inspect::RepoInspectTool;

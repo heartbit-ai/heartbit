@@ -628,9 +628,8 @@ pub async fn run_review_pipeline(cfg: ReviewConfig<'_>) -> Result<ReviewOutput, 
                         ImageSource::Online => {
                             progress("Searching for optional image (Openverse)...");
                             let recipe = crate::agents::image_search_recipe();
-                            let image_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
-                                heartbit_core::tool::builtins::OpenverseImageSearchTool::new(),
-                            )];
+                            let image_tools: Vec<Arc<dyn Tool>> =
+                                vec![Arc::new(crate::tools::OpenverseImageSearchTool::new())];
                             match crate::pipeline::runner_from_recipe(
                                 cfg.provider.clone(),
                                 recipe,

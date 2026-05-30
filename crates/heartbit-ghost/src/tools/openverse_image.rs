@@ -4,16 +4,16 @@ use std::pin::Pin;
 use base64::Engine;
 use serde_json::json;
 
-use crate::error::Error;
-use crate::llm::types::ToolDefinition;
-use crate::tool::{Tool, ToolOutput};
+use heartbit_core::error::Error;
+use heartbit_core::llm::types::ToolDefinition;
+use heartbit_core::tool::{Tool, ToolOutput};
 
 /// Default Openverse API host. Tests override this via
 /// [`OpenverseImageSearchTool::with_base_url`].
 const DEFAULT_BASE_URL: &str = "https://api.openverse.org";
 
-/// Marker prefix shared with [`super::ImageGenerateTool`]; downstream handlers
-/// (e.g. `extract_image_marker` in the X-post pipeline) parse base64 image data
+/// Marker prefix shared with [`heartbit_core::tool::builtins::ImageGenerateTool`]; downstream
+/// handlers (e.g. `extract_image_marker` in the X-post pipeline) parse base64 image data
 /// out of `[IMAGE:base64:<mime>;base64,<data>]`.
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:base64:";
 
@@ -32,7 +32,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// the safest filter for an automated brand account), downloads the first
 /// usable result, and returns it as a base64 image marker in the same
 /// `[IMAGE:base64:<mime>;base64,<data>]` shape emitted by
-/// [`super::ImageGenerateTool`]. Returns the literal `no_image` when nothing
+/// `ImageGenerateTool`. Returns the literal `no_image` when nothing
 /// suitable is found. No API key is required for anonymous use.
 pub struct OpenverseImageSearchTool {
     client: reqwest::Client,
@@ -52,12 +52,12 @@ impl OpenverseImageSearchTool {
     ///
     /// Returns `Err` if the underlying HTTP client cannot be constructed
     /// (e.g., TLS initialisation failure).
-    pub fn try_new() -> Result<Self, crate::error::Error> {
-        let client = crate::http::vendor_client_builder()
+    pub fn try_new() -> Result<Self, heartbit_core::error::Error> {
+        let client = heartbit_core::http::vendor_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| {
-                crate::error::Error::Agent(format!("failed to build reqwest client: {e}"))
+                heartbit_core::error::Error::Agent(format!("failed to build reqwest client: {e}"))
             })?;
         Ok(Self {
             client,
@@ -72,7 +72,7 @@ impl OpenverseImageSearchTool {
     ///
     /// Panics if the HTTP client cannot be built.
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
-        let client = crate::http::vendor_client_builder()
+        let client = heartbit_core::http::vendor_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
@@ -100,7 +100,7 @@ impl OpenverseImageSearchTool {
 
         let mime = mime_from_response(&response, url);
 
-        let (bytes, truncated) = crate::http::read_body_capped(response, MAX_IMAGE_BYTES)
+        let (bytes, truncated) = heartbit_core::http::read_body_capped(response, MAX_IMAGE_BYTES)
             .await
             .ok()?;
         if truncated || bytes.is_empty() {
@@ -204,7 +204,7 @@ impl Tool for OpenverseImageSearchTool {
 
     fn execute(
         &self,
-        _ctx: &crate::ExecutionContext,
+        _ctx: &heartbit_core::ExecutionContext,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, Error>> + Send + '_>> {
         Box::pin(async move {
@@ -235,7 +235,7 @@ impl Tool for OpenverseImageSearchTool {
 
             let status = response.status();
             if !status.is_success() {
-                let body = crate::http::read_text_capped(response, 4 * 1024)
+                let body = heartbit_core::http::read_text_capped(response, 4 * 1024)
                     .await
                     .unwrap_or_default();
                 return Ok(ToolOutput::error(format!(
@@ -244,10 +244,12 @@ impl Tool for OpenverseImageSearchTool {
                 )));
             }
 
-            let (bytes, _) =
-                crate::http::read_body_capped(response, crate::http::DEFAULT_VENDOR_BODY_CAP)
-                    .await
-                    .map_err(|e| Error::Agent(format!("openverse search failed: {e}")))?;
+            let (bytes, _) = heartbit_core::http::read_body_capped(
+                response,
+                heartbit_core::http::DEFAULT_VENDOR_BODY_CAP,
+            )
+            .await
+            .map_err(|e| Error::Agent(format!("openverse search failed: {e}")))?;
             let data: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Agent(format!("openverse search failed: {e}")))?;
 
@@ -344,7 +346,7 @@ mod tests {
         let tool = OpenverseImageSearchTool::with_base_url(server.uri());
         let result = tool
             .execute(
-                &crate::ExecutionContext::default(),
+                &heartbit_core::ExecutionContext::default(),
                 json!({"query": "cats"}),
             )
             .await
@@ -378,7 +380,7 @@ mod tests {
         let tool = OpenverseImageSearchTool::with_base_url(server.uri());
         let result = tool
             .execute(
-                &crate::ExecutionContext::default(),
+                &heartbit_core::ExecutionContext::default(),
                 json!({"query": "nothing"}),
             )
             .await
@@ -392,14 +394,17 @@ mod tests {
         let tool = OpenverseImageSearchTool::new();
 
         let result = tool
-            .execute(&crate::ExecutionContext::default(), json!({}))
+            .execute(&heartbit_core::ExecutionContext::default(), json!({}))
             .await
             .expect("ok");
         assert!(result.is_error);
         assert!(result.content.contains("query required"));
 
         let result = tool
-            .execute(&crate::ExecutionContext::default(), json!({"query": "   "}))
+            .execute(
+                &heartbit_core::ExecutionContext::default(),
+                json!({"query": "   "}),
+            )
             .await
             .expect("ok");
         assert!(result.is_error);
@@ -443,7 +448,7 @@ mod tests {
         let tool = OpenverseImageSearchTool::with_base_url(server.uri());
         let result = tool
             .execute(
-                &crate::ExecutionContext::default(),
+                &heartbit_core::ExecutionContext::default(),
                 json!({"query": "dogs"}),
             )
             .await
