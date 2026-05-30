@@ -43,18 +43,22 @@ pub struct DaemonConfig {
     /// Per-persona X/Twitter mention-poll configurations.
     /// Each entry launches a `MentionPollScheduler` that fires
     /// `DaemonCommand::MentionPoll` on its configured interval.
+    #[cfg(feature = "ghost-domain-config")]
     #[serde(default)]
     pub persona_mentions: Vec<PersonaMentionsConfig>,
     /// Per-persona proactive-posting configuration. One entry per
     /// persona that has proactive posting enabled.
+    #[cfg(feature = "ghost-domain-config")]
     #[serde(default)]
     pub persona_posts: Vec<PersonaPostsConfig>,
     /// Per-persona quote-tweet configurations. Each entry launches a
     /// `PersonaQuoteScheduler`.
+    #[cfg(feature = "ghost-domain-config")]
     #[serde(default)]
     pub persona_quotes: Vec<PersonaQuotesConfig>,
     /// Personal blog configuration. Single block (one blog per daemon).
     /// When absent, the daemon does not spawn a blog scheduler.
+    #[cfg(feature = "ghost-domain-config")]
     #[serde(default)]
     pub persona_blog: Option<PersonaBlogConfig>,
 }
