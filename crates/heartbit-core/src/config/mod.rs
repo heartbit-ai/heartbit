@@ -15,9 +15,14 @@ pub use agent::{
 };
 pub use daemon::{
     ActiveHoursConfig, AuthConfig, DaemonAuditConfig, DaemonConfig, DaemonMcpServerConfig,
-    DaemonMemoryConfig, GithubReadmeConfig, HeartbitPulseConfig, IdempotencyConfig, ImageSource,
-    KafkaConfig, MetricsConfig, PersonaBlogConfig, PersonaMentionsConfig, PersonaPostsConfig,
-    PersonaQuotesConfig, ScheduleEntry, TokenExchangeConfig, WsConfig, XAnnounceConfig,
+    DaemonMemoryConfig, HeartbitPulseConfig, IdempotencyConfig, KafkaConfig, MetricsConfig,
+    ScheduleEntry, TokenExchangeConfig, WsConfig,
+};
+
+#[cfg(feature = "ghost-domain-config")]
+pub use daemon::{
+    GithubReadmeConfig, ImageSource, PersonaBlogConfig, PersonaMentionsConfig, PersonaPostsConfig,
+    PersonaQuotesConfig, XAnnounceConfig,
 };
 pub use guardrails::{
     ActionBudgetConfig, ActionBudgetRuleConfig, BehavioralConfig, BehavioralRuleConfig,
