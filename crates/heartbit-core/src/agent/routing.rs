@@ -5,7 +5,6 @@
 //! - **Tier 2**: Agent capability matching (< 1ms, zero LLM calls)
 //! - **Tier 3**: Runtime escalation on failure (zero upfront overhead)
 
-#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
 use super::events::AgentEvent;
@@ -76,11 +75,16 @@ pub enum RoutingMode {
 /// Routing outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoutingDecision {
+    /// Route directly to a single agent — bypasses the orchestrator.
     SingleAgent {
+        /// Index of the chosen agent in the agent list.
         agent_index: usize,
+        /// Human-readable reason captured for telemetry.
         reason: &'static str,
     },
+    /// Send the request through the orchestrator.
     Orchestrate {
+        /// Human-readable reason captured for telemetry.
         reason: &'static str,
     },
 }
@@ -88,22 +92,32 @@ pub enum RoutingDecision {
 /// Heuristic signals exposed for testing and telemetry.
 #[derive(Debug, Clone, Default)]
 pub struct ComplexitySignals {
+    /// Number of whitespace-separated tokens in the input.
     pub word_count: usize,
+    /// Count of explicit step markers (e.g. `1.`, `2.`).
     pub step_markers: usize,
+    /// Detected domain keywords (code, image, file, etc.).
     pub domain_signals: Vec<String>,
+    /// `true` if the input explicitly asks for delegation.
     pub explicit_delegation: bool,
+    /// `true` if the input names two or more agents.
     pub names_multiple_agents: bool,
     /// Tier 2: indices of agents that cover all detected domains.
     pub covering_agents: Vec<usize>,
+    /// Composite score; higher = more complex / more likely to orchestrate.
     pub complexity_score: f32,
 }
 
 /// Pre-computed agent capability summary.
 #[derive(Debug, Clone)]
 pub struct AgentCapability {
+    /// Agent name.
     pub name: String,
+    /// Lowercased description used for keyword matching.
     pub description_lower: String,
+    /// Names of tools available to the agent.
     pub tool_names: Vec<String>,
+    /// Domains the agent claims (e.g. `code`, `image`).
     pub domains: Vec<String>,
 }
 
@@ -338,6 +352,7 @@ pub struct TaskComplexityAnalyzer<'a> {
 }
 
 impl<'a> TaskComplexityAnalyzer<'a> {
+    /// Build an analyzer over a slice of pre-computed `AgentCapability` entries.
     pub fn new(agents: &'a [AgentCapability]) -> Self {
         Self { agents }
     }

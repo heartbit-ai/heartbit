@@ -13,7 +13,6 @@
 //!   `HashMap::entry().or_insert_with(...)` + `Arc::new(ProviderCircuit::new(...))`,
 //!   neither of which can panic.
 
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,9 +33,13 @@ use crate::error::Error;
 /// conservative starting points suitable for most production deployments.
 #[derive(Debug, Clone)]
 pub struct CircuitConfig {
+    /// Consecutive failures required to trip the circuit open.
     pub failure_threshold: u32,
+    /// Initial cooldown after the circuit first opens.
     pub initial_open_duration: Duration,
+    /// Upper cap on the exponential backoff cooldown.
     pub max_open_duration: Duration,
+    /// Multiplier applied to the cooldown after each failed half-open probe.
     pub backoff_multiplier: f64,
 }
 
@@ -96,11 +99,13 @@ impl std::fmt::Debug for CircuitPermit {
 }
 
 impl CircuitPermit {
+    /// Consume the permit on success — resets the failure counter / closes a HalfOpen probe.
     pub fn record_success(self) {
         self.consumed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.circuit.record_success();
     }
+    /// Consume the permit on failure — increments the failure counter / re-opens the circuit.
     pub fn record_failure(self) {
         self.consumed
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -120,6 +125,7 @@ impl Drop for CircuitPermit {
 }
 
 impl ProviderCircuit {
+    /// Create a circuit starting in the Closed state.
     pub fn new(config: CircuitConfig) -> Self {
         Self {
             state: Mutex::new(CircuitState::Closed {
@@ -209,7 +215,9 @@ impl ProviderCircuit {
 /// misbehaving tenant cannot trip the circuit for other tenants.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct CircuitKey {
+    /// Tenant identifier scoping the circuit.
     pub tenant_id: String,
+    /// Provider name (e.g. `anthropic`, `openrouter`).
     pub provider: String,
 }
 
@@ -224,6 +232,7 @@ pub struct CircuitTracker {
 }
 
 impl CircuitTracker {
+    /// Create an empty tracker; circuits are allocated lazily on first request.
     pub fn new(config: CircuitConfig) -> Self {
         Self {
             circuits: RwLock::new(HashMap::new()),
@@ -304,6 +313,7 @@ pub struct CircuitBreakerProvider<P: super::LlmProvider> {
 }
 
 impl<P: super::LlmProvider> CircuitBreakerProvider<P> {
+    /// Wrap `inner` so each completion call passes through the circuit for `(scope, provider_name)`.
     pub fn new(
         inner: P,
         tracker: Arc<CircuitTracker>,

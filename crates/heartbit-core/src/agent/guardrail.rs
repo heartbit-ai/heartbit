@@ -1,6 +1,5 @@
 //! `Guardrail` trait and `GuardAction` — base types for all guardrail implementations.
 
-#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 
@@ -14,18 +13,27 @@ pub enum GuardAction {
     /// Allow the operation to proceed.
     Allow,
     /// Deny the operation with a reason.
-    Deny { reason: String },
+    Deny {
+        /// Human-readable reason recorded in audit + events.
+        reason: String,
+    },
     /// Log the concern but allow the operation to proceed.
     ///
     /// The agent loop treats `Warn` like `Allow` but emits
     /// `AgentEvent::GuardrailWarned` and an audit record. This enables
     /// monitoring mode (shadow enforcement) without blocking production.
-    Warn { reason: String },
+    Warn {
+        /// Human-readable reason recorded in audit + events.
+        reason: String,
+    },
     /// Immediately terminate the agent run. Used for critical detections
     /// (e.g., CSAM, active exploitation) where the agent loop must stop
     /// without further processing. The agent emits `KillSwitchActivated`
     /// and returns `Error::KillSwitch`.
-    Kill { reason: String },
+    Kill {
+        /// Human-readable reason recorded in audit + events.
+        reason: String,
+    },
 }
 
 impl GuardAction {

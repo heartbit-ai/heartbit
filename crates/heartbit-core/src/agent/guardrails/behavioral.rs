@@ -5,7 +5,6 @@
 //! denial storms). Stateful — uses `set_turn` for turn context and records
 //! calls in `pre_tool` (denied) and `post_tool` (allowed).
 
-#![allow(missing_docs)]
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -30,20 +29,31 @@ pub enum BehaviorRule {
     /// Triggers when more than `max_count` calls to tools matching `tool_pattern`
     /// occur within `window`.
     FrequencyLimit {
+        /// Wildcard or substring matched against tool names.
         tool_pattern: String,
+        /// Threshold (exclusive); strictly more than this trips the rule.
         max_count: usize,
+        /// Sliding-window duration over which `max_count` is evaluated.
         window: Duration,
     },
     /// Triggers when a call matching `first` is followed by a call matching
     /// `then` within `within_turns` turns.
     SuspiciousSequence {
+        /// Pattern matching the first tool call in the suspicious sequence.
         first: String,
+        /// Pattern matching the follow-up tool call.
         then: String,
+        /// Maximum turn gap between `first` and `then`.
         within_turns: usize,
     },
     /// Triggers `Kill` when more than `max_denied` denied calls occur within
     /// `window`.
-    DenialSpike { max_denied: usize, window: Duration },
+    DenialSpike {
+        /// Threshold (exclusive) of denied-tool-call records within the window.
+        max_denied: usize,
+        /// Sliding-window duration.
+        window: Duration,
+    },
 }
 
 /// Behavioral monitoring guardrail that tracks tool call patterns over a

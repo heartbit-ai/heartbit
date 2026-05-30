@@ -1,6 +1,5 @@
 //! Built-in agent tool implementations — filesystem I/O, web, code execution, search, and more.
 
-#![allow(missing_docs)]
 mod bash;
 mod edit;
 mod file_tracker;
@@ -135,6 +134,10 @@ pub(crate) fn resolve_path(
     }
 }
 
+/// Round `target` down to the nearest UTF-8 character boundary in `text`.
+///
+/// Returns the largest position `≤ target.min(text.len())` that lies on a char
+/// boundary, so `&text[..pos]` is always a valid UTF-8 slice.
 pub fn floor_char_boundary(text: &str, target: usize) -> usize {
     let mut pos = target.min(text.len());
     while pos > 0 && !text.is_char_boundary(pos) {
@@ -166,9 +169,13 @@ pub enum ToolRisk {
 /// Configuration for creating built-in tools.
 #[non_exhaustive]
 pub struct BuiltinToolsConfig {
+    /// Shared mtime-based read-before-write tracker.
     pub file_tracker: Arc<FileTracker>,
+    /// Shared todo-list store for the `todo` tool.
     pub todo_store: Arc<TodoStore>,
+    /// Optional callback that resolves structured questions raised by the agent.
     pub on_question: Option<Arc<OnQuestion>>,
+    /// Optional workspace root; tools restrict path access to descendants when set.
     pub workspace: Option<PathBuf>,
     /// Enable dangerous tools (e.g. bash). Default: false.
     pub dangerous_tools: bool,

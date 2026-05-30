@@ -1,3 +1,5 @@
+//! Agent-to-agent (A2A) tool transport — discover and call peer agents as tools.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

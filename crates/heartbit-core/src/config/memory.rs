@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use serde::Deserialize;
 
 /// Memory configuration for the orchestrator.
@@ -9,6 +8,7 @@ pub enum MemoryConfig {
     InMemory,
     /// PostgreSQL-backed store.
     Postgres {
+        /// `postgres://…` connection string.
         database_url: String,
         /// Optional embedding configuration for hybrid retrieval.
         #[serde(default)]
@@ -78,11 +78,20 @@ fn default_chunk_overlap() -> usize {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KnowledgeSourceConfig {
     /// A single file path.
-    File { path: String },
+    File {
+        /// Filesystem path to ingest.
+        path: String,
+    },
     /// A glob pattern matching multiple files.
-    Glob { pattern: String },
+    Glob {
+        /// Glob pattern (e.g. `docs/**/*.md`).
+        pattern: String,
+    },
     /// A URL to fetch and index.
-    Url { url: String },
+    Url {
+        /// HTTP(S) URL whose body is fetched and indexed.
+        url: String,
+    },
 }
 
 /// Workspace configuration for agent home directories.
@@ -119,6 +128,7 @@ fn default_workspace_root() -> String {
 /// Restate server connection settings.
 #[derive(Debug, Deserialize)]
 pub struct RestateConfig {
+    /// Restate ingress endpoint (e.g. `http://localhost:8080`).
     pub endpoint: String,
 }
 

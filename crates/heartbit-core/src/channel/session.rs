@@ -1,6 +1,5 @@
 //! Session management for WebSocket-connected agent interactions.
 
-#![allow(missing_docs)]
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
@@ -13,9 +12,13 @@ use crate::error::Error;
 /// A conversation session containing message history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Session identifier.
     pub id: Uuid,
+    /// Optional human-readable title.
     pub title: Option<String>,
+    /// Creation timestamp (UTC).
     pub created_at: DateTime<Utc>,
+    /// Ordered message history.
     pub messages: Vec<SessionMessage>,
     /// User who owns this session (multi-tenant isolation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,8 +31,11 @@ pub struct Session {
 /// A single message within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
+    /// Who authored the message.
     pub role: SessionRole,
+    /// Message text.
     pub content: String,
+    /// Authoring timestamp (UTC).
     pub timestamp: DateTime<Utc>,
 }
 
@@ -37,7 +43,9 @@ pub struct SessionMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {
+    /// User-authored message.
     User,
+    /// Assistant-authored (agent) message.
     Assistant,
 }
 
@@ -110,6 +118,7 @@ pub struct InMemorySessionStore {
 }
 
 impl InMemorySessionStore {
+    /// Create an empty session store.
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),

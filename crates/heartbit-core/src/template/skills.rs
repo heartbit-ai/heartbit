@@ -1,6 +1,5 @@
 //! Built-in agent skill fragments — short prompt blocks injected via `skills = ["rust-expert"]`.
 
-#![allow(missing_docs)]
 use std::path::PathBuf;
 
 use crate::error::Error;
@@ -9,9 +8,13 @@ use crate::tool::builtins::floor_char_boundary;
 /// Parsed skill content from a SKILL.md file.
 #[derive(Debug, Clone)]
 pub struct SkillContent {
+    /// Skill identifier (matches the `skills = [...]` entry that loaded it).
     pub name: String,
+    /// Optional short description parsed from the SKILL.md frontmatter.
     pub description: Option<String>,
+    /// Raw skill content injected into the agent's system prompt.
     pub content: String,
+    /// Optional cap on tokens of `content` to inject (truncated when exceeded).
     pub max_inject_tokens: Option<usize>,
 }
 

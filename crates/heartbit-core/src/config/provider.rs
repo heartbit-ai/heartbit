@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -8,8 +7,10 @@ use std::time::Duration;
 /// the provider section can be omitted — per-request provider keys are used instead.
 #[derive(Debug, Default, Deserialize)]
 pub struct ProviderConfig {
+    /// Provider name (`anthropic`, `openrouter`, `mock`, …).
     #[serde(default)]
     pub name: String,
+    /// Model identifier (provider-specific).
     #[serde(default)]
     pub model: String,
     /// Custom API endpoint URL (overrides the default for the provider).
@@ -57,6 +58,7 @@ pub struct CascadeConfig {
 /// A single tier in the model cascade.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CascadeTierConfig {
+    /// Model identifier for this cascade tier.
     pub model: String,
 }
 

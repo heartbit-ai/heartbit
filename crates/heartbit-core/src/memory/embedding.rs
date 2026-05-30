@@ -1,6 +1,5 @@
 //! Embedding providers for semantic memory retrieval.
 
-#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,11 +14,13 @@ use super::{Memory, MemoryEntry};
 /// Trait for generating text embeddings.
 #[allow(clippy::type_complexity)]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Generate embeddings for each input string (parallel batch).
     fn embed(
         &self,
         texts: &[&str],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, Error>> + Send + '_>>;
 
+    /// Dimension of vectors returned by [`embed`](Self::embed).
     fn dimension(&self) -> usize;
 }
 
@@ -97,6 +98,7 @@ impl OpenAiEmbedding {
         self
     }
 
+    /// Override the auto-detected embedding dimension.
     pub fn with_dimension(mut self, dimension: usize) -> Self {
         self.dimension = dimension;
         self
@@ -172,6 +174,7 @@ pub struct EmbeddingMemory {
 }
 
 impl EmbeddingMemory {
+    /// Wrap `inner` so that stored entries lacking an embedding are vectorized via `embedder` first.
     pub fn new(inner: Arc<dyn Memory>, embedder: Arc<dyn EmbeddingProvider>) -> Self {
         Self { inner, embedder }
     }

@@ -3,7 +3,6 @@
 //! Scans LLM responses and tool outputs for personally identifiable
 //! information (email, phone, SSN, credit card) and can redact, warn, or deny.
 
-#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -57,11 +56,21 @@ pub enum PiiAction {
 /// Built-in and custom PII detector types.
 #[derive(Debug, Clone)]
 pub enum PiiDetector {
+    /// Email addresses.
     Email,
+    /// Phone numbers (international + US formats).
     Phone,
+    /// US Social Security numbers (`NNN-NN-NNNN`).
     Ssn,
+    /// Credit card numbers (Luhn-validated).
     CreditCard,
-    Custom { name: String, pattern: Regex },
+    /// User-supplied regex with a label.
+    Custom {
+        /// Label reported when this detector matches.
+        name: String,
+        /// Compiled regex pattern.
+        pattern: Regex,
+    },
 }
 
 impl PiiDetector {
@@ -107,6 +116,7 @@ pub struct PiiGuardrail {
 }
 
 impl PiiGuardrail {
+    /// Construct a PII guardrail with the given detectors and action policy.
     pub fn new(detectors: Vec<PiiDetector>, action: PiiAction) -> Self {
         Self { detectors, action }
     }

@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
 /// Dispatch mode for orchestrator delegation.
@@ -90,7 +89,9 @@ impl std::fmt::Display for TrustLevel {
 /// Token usage statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Tokens consumed by the request prompt.
     pub input_tokens: u32,
+    /// Tokens produced in the response.
     pub output_tokens: u32,
     /// Tokens used to create a new cache entry (Anthropic prompt caching).
     #[serde(default)]

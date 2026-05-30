@@ -1,6 +1,5 @@
 //! In-process channel bridge connecting the HTTP layer to the agent runtime.
 
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -16,36 +15,57 @@ use crate::tool::builtins::{OnQuestion, QuestionRequest, QuestionResponse};
 /// Messages sent from bridge to the WS handler for forwarding to the client.
 #[derive(Debug, Clone)]
 pub enum OutboundMessage {
+    /// Streaming text chunk from the agent.
     TextDelta {
+        /// Session to push to.
         session_id: Uuid,
+        /// Text chunk content.
         text: String,
     },
+    /// Forwarded `AgentEvent` for the client.
     AgentEvent {
+        /// Session to push to.
         session_id: Uuid,
+        /// Event payload.
         event: AgentEvent,
     },
+    /// Interactive input requested from the client.
     InputNeeded {
+        /// Session to push to.
         session_id: Uuid,
+        /// Interaction ID to echo back via `input.resolve`.
         interaction_id: Uuid,
     },
+    /// Human-in-the-loop approval requested for one or more tool calls.
     ApprovalNeeded {
+        /// Session to push to.
         session_id: Uuid,
+        /// Interaction ID to echo back via `approval.resolve`.
         interaction_id: Uuid,
+        /// JSON-serialized list of pending tool calls.
         tool_calls: serde_json::Value,
     },
+    /// Structured agent question requested from the client.
     QuestionNeeded {
+        /// Session to push to.
         session_id: Uuid,
+        /// Interaction ID to echo back via `question.resolve`.
         interaction_id: Uuid,
+        /// The question payload (questions, options, etc.).
         request: QuestionRequest,
     },
     /// Agent run completed successfully.
     ChatFinal {
+        /// Session that produced the result.
         session_id: Uuid,
+        /// Final agent output text.
         result: String,
     },
     /// Agent run failed with an error.
     ChatError {
+        /// Session that failed.
         session_id: Uuid,
+        /// Error message.
         error: String,
     },
     /// Pre-built WS frame (e.g., method responses) to send as-is.

@@ -8,7 +8,6 @@
 //! preset = "github"
 //! ```
 
-#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -17,10 +16,15 @@ use crate::error::Error;
 /// A bundled MCP server preset.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpPreset {
+    /// Preset identifier (e.g. `github`, `slack`).
     pub name: String,
+    /// Human-readable preset description.
     pub description: String,
+    /// Command to spawn the MCP server (typically `npx`).
     pub command: String,
+    /// Command-line arguments.
     pub args: Vec<String>,
+    /// Required environment-variable keys (looked up at runtime).
     pub env_keys: Vec<String>,
 }
 

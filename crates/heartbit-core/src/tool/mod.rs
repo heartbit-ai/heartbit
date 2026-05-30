@@ -1,6 +1,5 @@
 //! Tool trait and built-in tool implementations (filesystem, web, MCP, A2A, etc.).
 
-#![allow(missing_docs)]
 #[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod builtins;
@@ -18,11 +17,14 @@ use crate::llm::types::ToolDefinition;
 /// Output of a tool execution.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
+    /// Stringified tool output (may be JSON, plain text, etc.).
     pub content: String,
+    /// `true` when the tool returned an error.
     pub is_error: bool,
 }
 
 impl ToolOutput {
+    /// Construct a successful tool output.
     pub fn success(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -30,6 +32,7 @@ impl ToolOutput {
         }
     }
 
+    /// Construct a failed tool output (`is_error = true`).
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -106,8 +109,12 @@ impl ToolOutput {
 /// }
 /// ```
 pub trait Tool: Send + Sync {
+    /// Return the tool's definition (name, description, input schema) for the LLM.
     fn definition(&self) -> ToolDefinition;
 
+    /// Execute the tool with the LLM-supplied `input` JSON.
+    ///
+    /// Input is validated against the tool's declared schema before reaching this method.
     fn execute(
         &self,
         ctx: &crate::ExecutionContext,

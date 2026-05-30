@@ -9,7 +9,6 @@
 //! Resolution happens at the config boundary (before agent construction).
 //! All downstream code sees a fully materialized `AgentConfig`.
 
-#![allow(missing_docs)]
 mod merge;
 pub mod registry;
 pub mod skills;
@@ -68,7 +67,9 @@ pub struct PartialAgentConfig {
 /// A bundled or user-defined agent template.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentTemplate {
+    /// Template metadata (name, description).
     pub meta: TemplateMeta,
+    /// Default agent settings supplied by the template.
     #[serde(default)]
     pub agent: PartialAgentConfig,
 }

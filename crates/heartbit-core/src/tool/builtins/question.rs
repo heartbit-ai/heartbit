@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,25 +11,36 @@ use crate::tool::{Tool, ToolOutput};
 
 // --- Types ---
 
+/// Request payload for the `question` builtin tool — one or more structured questions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionRequest {
+    /// Questions to present to the user, in order.
     pub questions: Vec<Question>,
 }
 
+/// A single structured question with predefined options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
+    /// Prompt text shown to the user.
     pub question: String,
+    /// Short heading rendered above the prompt.
     pub header: String,
+    /// Selectable options.
     pub options: Vec<QuestionOption>,
+    /// `true` allows multi-select; `false` requires a single choice.
     pub multiple: bool,
 }
 
+/// One selectable option in a structured question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionOption {
+    /// Option label (returned in the answer).
     pub label: String,
+    /// Human-readable description shown alongside the label.
     pub description: String,
 }
 
+/// Response payload — the user's selections, one entry per question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResponse {
     /// Per-question list of selected labels.
@@ -57,6 +67,7 @@ pub struct QuestionTool {
 }
 
 impl QuestionTool {
+    /// Construct a `QuestionTool` that resolves answers via the supplied callback.
     pub fn new(on_question: Arc<OnQuestion>) -> Self {
         Self { on_question }
     }

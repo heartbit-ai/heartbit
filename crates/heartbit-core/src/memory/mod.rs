@@ -1,6 +1,5 @@
 //! Agent memory system — `Memory` trait, in-memory and PostgreSQL stores, BM25 and vector recall, Ebbinghaus decay, reflection, and consolidation.
 
-#![allow(missing_docs)]
 pub mod bm25;
 pub mod consolidation;
 pub mod embedding;
@@ -58,13 +57,21 @@ pub enum Confidentiality {
 /// A single memory entry stored by an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
+    /// Unique entry ID (UUID).
     pub id: String,
+    /// Owning agent / namespace.
     pub agent: String,
+    /// Stored content (free text or serialized fact).
     pub content: String,
+    /// User-supplied category (e.g. `fact`, `preference`).
     pub category: String,
+    /// Free-form tags for filtering.
     pub tags: Vec<String>,
+    /// Insertion timestamp.
     pub created_at: DateTime<Utc>,
+    /// Timestamp of the most recent recall hit.
     pub last_accessed: DateTime<Utc>,
+    /// Number of times this entry has been recalled.
     pub access_count: u32,
     /// Importance score (1-10). Default: 5. Set by agent at store time.
     #[serde(default = "default_importance")]
@@ -130,9 +137,13 @@ pub(crate) fn default_recall_limit() -> usize {
 /// means no limit (return all matching entries). This is the default.
 #[derive(Debug, Clone)]
 pub struct MemoryQuery {
+    /// Optional full-text query (BM25 scored against `content` + `keywords`).
     pub text: Option<String>,
+    /// Restrict to a single category.
     pub category: Option<String>,
+    /// Restrict to entries that include all of these tags.
     pub tags: Vec<String>,
+    /// Restrict to a single agent / namespace.
     pub agent: Option<String>,
     /// Filter entries whose `agent` field starts with this prefix.
     /// Useful for cross-agent recall within a user namespace (e.g. `"tg:123"`
@@ -257,6 +268,7 @@ pub trait Memory: Send + Sync {
         query: MemoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, Error>> + Send + '_>>;
 
+    /// Replace `content` on the entry identified by `id`.
     fn update(
         &self,
         scope: &TenantScope,
@@ -264,6 +276,7 @@ pub trait Memory: Send + Sync {
         content: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
+    /// Delete the entry identified by `id`; returns `true` if an entry was removed.
     fn forget(
         &self,
         scope: &TenantScope,

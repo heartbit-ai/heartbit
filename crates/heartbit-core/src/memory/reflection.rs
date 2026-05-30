@@ -13,6 +13,7 @@ pub struct ReflectionTracker {
 }
 
 impl ReflectionTracker {
+    /// Create a tracker that fires when cumulative importance reaches `threshold`.
     pub fn new(threshold: u32) -> Self {
         Self {
             threshold,

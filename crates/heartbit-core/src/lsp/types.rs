@@ -1,16 +1,20 @@
-#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
 /// LSP diagnostic severity levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
+    /// LSP severity 1 — error.
     Error = 1,
+    /// LSP severity 2 — warning.
     Warning = 2,
+    /// LSP severity 3 — informational.
     Information = 3,
+    /// LSP severity 4 — hint.
     Hint = 4,
 }
 
 impl DiagnosticSeverity {
+    /// Convert an LSP severity number (1–4) to the typed variant; unknown values map to `Hint`.
     pub fn from_u8(value: u8) -> Self {
         match value {
             1 => Self::Error,
@@ -20,6 +24,7 @@ impl DiagnosticSeverity {
         }
     }
 
+    /// Short lowercase label (`error`, `warning`, `info`, `hint`) suitable for output formatting.
     pub fn label(self) -> &'static str {
         match self {
             Self::Error => "error",
@@ -33,22 +38,29 @@ impl DiagnosticSeverity {
 /// A position in a text document (0-indexed line and character).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
+    /// 0-indexed line number.
     pub line: u32,
+    /// 0-indexed character offset within the line.
     pub character: u32,
 }
 
 /// A range in a text document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
+    /// Inclusive start position.
     pub start: Position,
+    /// Exclusive end position.
     pub end: Position,
 }
 
 /// A diagnostic reported by the language server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// Source-code range the diagnostic applies to.
     pub range: Range,
+    /// Severity classification.
     pub severity: DiagnosticSeverity,
+    /// Human-readable diagnostic message.
     pub message: String,
 }
 
@@ -58,16 +70,21 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct PublishDiagnosticsParams {
+    /// Document URI the diagnostics apply to.
     pub uri: String,
+    /// Raw diagnostics (severity still numeric — convert via `into_diagnostic`).
     pub diagnostics: Vec<RawDiagnostic>,
 }
 
 /// Raw diagnostic from JSON-RPC — severity is a number.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawDiagnostic {
+    /// Source-code range.
     pub range: Range,
+    /// LSP severity number (1=Error … 4=Hint); defaults to `1` when absent.
     #[serde(default = "default_severity")]
     pub severity: u8,
+    /// Human-readable message.
     pub message: String,
 }
 
@@ -76,6 +93,7 @@ fn default_severity() -> u8 {
 }
 
 impl RawDiagnostic {
+    /// Promote a numeric-severity raw diagnostic into a typed [`Diagnostic`].
     pub fn into_diagnostic(self) -> Diagnostic {
         Diagnostic {
             range: self.range,

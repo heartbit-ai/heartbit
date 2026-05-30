@@ -1,6 +1,5 @@
 //! Path-level sandbox policy shared across filesystem-touching builtins.
 
-#![allow(missing_docs)]
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -19,6 +18,7 @@ pub struct CorePathPolicy {
 }
 
 impl CorePathPolicy {
+    /// Start building a `CorePathPolicy`.
     pub fn builder() -> CorePathPolicyBuilder {
         CorePathPolicyBuilder::default()
     }
@@ -97,6 +97,7 @@ impl CorePathPolicy {
     }
 }
 
+/// Builder for [`CorePathPolicy`].
 #[derive(Default, Debug)]
 pub struct CorePathPolicyBuilder {
     allowed_dirs: Vec<PathBuf>,
@@ -119,6 +120,7 @@ impl CorePathPolicyBuilder {
         self
     }
 
+    /// Canonicalize allowed directories, compile deny globs, and produce the policy.
     pub fn build(self) -> Result<CorePathPolicy, Error> {
         let allowed_dirs = self
             .allowed_dirs

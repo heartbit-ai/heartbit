@@ -1,4 +1,8 @@
-#![allow(missing_docs)]
+//! MCP server — exposes heartbit tools/resources to external MCP clients.
+//!
+//! Designed to be mounted on an existing Axum router via `handle_request()`. See
+//! [`McpServer`] for security caveats; the caller is responsible for authentication.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,10 +76,15 @@ const INTERNAL_ERROR: i64 = -32603;
 /// Configuration for the MCP server.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
+    /// Server name reported in the `initialize` response.
     pub name: String,
+    /// Server version reported in the `initialize` response.
     pub version: String,
+    /// Expose registered tools via `tools/list` and `tools/call`.
     pub expose_tools: bool,
+    /// Expose registered resources via `resources/list` and `resources/read`.
     pub expose_resources: bool,
+    /// Expose prompts via `prompts/list` and `prompts/get` (currently a no-op).
     pub expose_prompts: bool,
 }
 
@@ -95,10 +104,14 @@ impl Default for McpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerResource {
+    /// Resource URI (e.g. `file:///docs/readme.md`).
     pub uri: String,
+    /// Display name for the resource.
     pub name: String,
+    /// Optional description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional MIME type hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
@@ -155,6 +168,8 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    /// Create a fresh server with the given config. No tools/resources are registered until
+    /// [`McpServer::with_tools`] / [`McpServer::with_resources`] are called.
     pub fn new(config: McpServerConfig) -> Self {
         Self {
             config,

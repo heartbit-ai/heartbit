@@ -80,8 +80,9 @@ pub fn bm25_score_pre(
     score
 }
 
-/// Default BM25 parameters.
+/// Default BM25 `k1` parameter (term-frequency saturation).
 pub const DEFAULT_K1: f64 = 1.2;
+/// Default BM25 `b` parameter (document-length normalization).
 pub const DEFAULT_B: f64 = 0.75;
 
 #[cfg(test)]

@@ -4,7 +4,6 @@
 //! transfer to a different agent. The `HandoffRunner` detects this sentinel
 //! output and routes the conversation accordingly.
 
-#![allow(missing_docs)]
 use std::future::Future;
 use std::pin::Pin;
 
@@ -27,7 +26,9 @@ pub enum HandoffContextMode {
 /// A target agent that can receive a handoff.
 #[derive(Debug, Clone)]
 pub struct HandoffTarget {
+    /// Target agent name.
     pub name: String,
+    /// Description shown to the originating LLM so it can pick the right target.
     pub description: String,
 }
 

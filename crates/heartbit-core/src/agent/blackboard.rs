@@ -1,6 +1,5 @@
 //! Shared blackboard for inter-agent state exchange in squad-based orchestration.
 
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -14,19 +13,23 @@ use crate::error::Error;
 ///
 /// Uses `Pin<Box<dyn Future>>` for dyn-compatibility, matching `Tool` and `Memory` traits.
 pub trait Blackboard: Send + Sync {
+    /// Insert or overwrite `key` with `value`.
     fn write(
         &self,
         key: &str,
         value: Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 
+    /// Return the value for `key` or `None` if absent.
     fn read(
         &self,
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, Error>> + Send + '_>>;
 
+    /// Return all keys currently present, sorted lexicographically.
     fn list_keys(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>, Error>> + Send + '_>>;
 
+    /// Remove every entry.
     fn clear(&self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 }
 
@@ -39,6 +42,7 @@ pub struct InMemoryBlackboard {
 }
 
 impl InMemoryBlackboard {
+    /// Create an empty in-memory blackboard.
     pub fn new() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),

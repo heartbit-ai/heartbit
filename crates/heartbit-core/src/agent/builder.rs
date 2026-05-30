@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,16 +96,19 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
+    /// Set the agent's name (used in logs, traces, and the orchestrator's prompt).
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Set the agent's system prompt.
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
         self
     }
 
+    /// Register a single tool.
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
@@ -125,16 +127,19 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Cap on agent loop iterations before the runner aborts.
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
     }
 
+    /// `max_tokens` cap on each LLM completion the runner issues.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
+    /// Context window management strategy.
     pub fn context_strategy(mut self, strategy: ContextStrategy) -> Self {
         self.context_strategy = Some(strategy);
         self
@@ -271,16 +276,19 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Enable post-tool reflection prompts (Reflexion/CRITIC pattern).
     pub fn enable_reflection(mut self, enabled: bool) -> Self {
         self.enable_reflection = enabled;
         self
     }
 
+    /// Byte threshold above which tool output is compressed via an LLM call.
     pub fn tool_output_compression_threshold(mut self, threshold: usize) -> Self {
         self.tool_output_compression_threshold = Some(threshold);
         self
     }
 
+    /// Cap on tool definitions sent to the LLM per turn (dynamic tool selection).
     pub fn max_tools_per_turn(mut self, max: usize) -> Self {
         self.max_tools_per_turn = Some(max);
         self
@@ -506,6 +514,10 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Validate the builder and produce a ready-to-run [`AgentRunner`].
+    ///
+    /// Returns [`Error::Config`] for mis-configured runners (empty name, zero `max_turns`,
+    /// mutually-exclusive options like `on_input` + `structured_schema`, etc.).
     pub fn build(self) -> Result<AgentRunner<P>, Error> {
         if self.name.is_empty() {
             return Err(Error::Config("agent name must not be empty".into()));

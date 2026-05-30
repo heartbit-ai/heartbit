@@ -1,5 +1,4 @@
 //! Sensor pipeline configuration types.
-#![allow(missing_docs)]
 use serde::Deserialize;
 
 use super::SensorModality;
@@ -133,8 +132,11 @@ fn default_stale_after_hours() -> u64 {
 pub enum SensorSourceConfig {
     /// JMAP email sensor (push/poll).
     JmapEmail {
+        /// Logical sensor name (used in events and routing).
         name: String,
+        /// JMAP server URL.
         server: String,
+        /// Account username for authentication.
         username: String,
         /// Environment variable containing the password.
         password_env: String,
@@ -144,28 +146,38 @@ pub enum SensorSourceConfig {
         /// Senders whose emails are silently dropped during triage.
         #[serde(default)]
         blocked_senders: Vec<String>,
+        /// Polling interval in seconds.
         #[serde(default = "default_email_poll_interval")]
         poll_interval_seconds: u64,
     },
     /// RSS/Atom feed sensor.
     Rss {
+        /// Logical sensor name.
         name: String,
+        /// One or more feed URLs to poll.
         feeds: Vec<String>,
+        /// Keywords that bump matched items to higher priority.
         #[serde(default)]
         interest_keywords: Vec<String>,
+        /// Polling interval in seconds.
         #[serde(default = "default_rss_poll_interval")]
         poll_interval_seconds: u64,
     },
     /// Directory watcher for images.
     Image {
+        /// Logical sensor name.
         name: String,
+        /// Directory to watch for new image files.
         watch_directory: String,
+        /// Polling interval in seconds.
         #[serde(default = "default_file_poll_interval")]
         poll_interval_seconds: u64,
     },
     /// Directory watcher for audio files.
     Audio {
+        /// Logical sensor name.
         name: String,
+        /// Directory to watch for new audio files.
         watch_directory: String,
         /// Whisper model size: "tiny", "base", "small", "medium", "large".
         #[serde(default = "default_whisper_model")]
@@ -173,15 +185,19 @@ pub enum SensorSourceConfig {
         /// Known contacts whose voice recordings get priority triage.
         #[serde(default)]
         known_contacts: Vec<String>,
+        /// Polling interval in seconds.
         #[serde(default = "default_file_poll_interval")]
         poll_interval_seconds: u64,
     },
     /// Weather API sensor.
     Weather {
+        /// Logical sensor name.
         name: String,
         /// Environment variable containing the API key.
         api_key_env: String,
+        /// Locations to fetch weather for.
         locations: Vec<String>,
+        /// Polling interval in seconds.
         #[serde(default = "default_weather_poll_interval")]
         poll_interval_seconds: u64,
         /// When true, only promote weather alerts (not regular readings).
@@ -190,6 +206,7 @@ pub enum SensorSourceConfig {
     },
     /// Generic webhook receiver.
     Webhook {
+        /// Logical sensor name.
         name: String,
         /// URL path for the webhook endpoint (e.g., "/webhooks/github").
         path: String,
@@ -198,6 +215,7 @@ pub enum SensorSourceConfig {
     },
     /// Generic MCP sensor — polls a tool on any MCP server.
     Mcp {
+        /// Logical sensor name.
         name: String,
         /// MCP server endpoint (string URL, `{url, auth_header}`, or `{command, args, env}`).
         server: Box<McpServerEntry>,

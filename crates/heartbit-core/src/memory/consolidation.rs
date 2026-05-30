@@ -1,6 +1,5 @@
 //! Memory consolidation pipeline — clusters and merges episodic memories into semantic summaries.
 
-#![allow(missing_docs)]
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -61,6 +60,7 @@ pub struct ConsolidationPipeline<P: LlmProvider> {
 }
 
 impl<P: LlmProvider> ConsolidationPipeline<P> {
+    /// Construct a pipeline operating on `memory` for `agent_name` via the given LLM `provider`.
     pub fn new(memory: Arc<dyn Memory>, provider: Arc<P>, agent_name: impl Into<String>) -> Self {
         Self {
             memory,
@@ -72,11 +72,13 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
         }
     }
 
+    /// Override the Jaccard similarity threshold used to cluster entries (default: 0.3).
     pub fn with_similarity_threshold(mut self, threshold: f64) -> Self {
         self.similarity_threshold = threshold;
         self
     }
 
+    /// Override the minimum cluster size considered for consolidation (default: 2).
     pub fn with_min_cluster_size(mut self, size: usize) -> Self {
         self.min_cluster_size = size;
         self

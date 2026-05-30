@@ -26,6 +26,7 @@ pub struct NamespacedMemory {
 }
 
 impl NamespacedMemory {
+    /// Wrap `inner` so all reads/writes are scoped to `agent_name`.
     pub fn new(inner: Arc<dyn Memory>, agent_name: impl Into<String>) -> Self {
         Self {
             inner,

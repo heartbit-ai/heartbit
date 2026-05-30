@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 
 use crate::agent::routing::RoutingMode;
@@ -14,16 +13,24 @@ pub enum ContextStrategyConfig {
     /// No trimming (default).
     Unlimited,
     /// Sliding window: trim old messages to stay within `max_tokens`.
-    SlidingWindow { max_tokens: u32 },
+    SlidingWindow {
+        /// Maximum tokens to keep in the context window.
+        max_tokens: u32,
+    },
     /// Summarize: compress old messages when context exceeds `threshold` tokens.
-    Summarize { threshold: u32 },
+    Summarize {
+        /// Token threshold that triggers summarization.
+        threshold: u32,
+    },
 }
 
 /// Per-agent provider override. When set on an agent, overrides the
 /// orchestrator's default provider for that agent only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentProviderConfig {
+    /// Provider name (`anthropic`, `openrouter`, etc.).
     pub name: String,
+    /// Model identifier (provider-specific).
     pub model: String,
     /// Custom API endpoint URL (overrides the default for the provider).
     /// Useful for self-hosted models, Azure, or proxies.
@@ -43,8 +50,10 @@ pub struct AgentProviderConfig {
 /// Orchestrator-level settings with sensible defaults.
 #[derive(Debug, Deserialize)]
 pub struct OrchestratorConfig {
+    /// Maximum agent loop iterations before the orchestrator aborts.
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+    /// `max_tokens` cap on each LLM completion the orchestrator issues.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Context window management strategy for the orchestrator's own conversation.
@@ -167,7 +176,9 @@ pub enum McpServerEntry {
     Simple(String),
     /// Full HTTP entry with optional auth header.
     Full {
+        /// MCP server URL.
         url: String,
+        /// Optional pre-configured `Authorization` header value.
         #[serde(default)]
         auth_header: Option<String>,
         /// RFC 8707 resource indicator — audience for exchanged tokens.
@@ -180,9 +191,12 @@ pub enum McpServerEntry {
     },
     /// Stdio transport — spawn a child process communicating via stdin/stdout.
     Stdio {
+        /// Command to spawn (e.g. `npx`).
         command: String,
+        /// Command-line arguments.
         #[serde(default)]
         args: Vec<String>,
+        /// Extra environment variables for the child process.
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
     },
@@ -264,8 +278,11 @@ pub enum McpResourceMode {
 /// A sub-agent defined in the configuration file.
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
+    /// Unique agent name (referenced from the orchestrator's prompt).
     pub name: String,
+    /// Human-readable description used by routing/orchestration.
     pub description: String,
+    /// Agent-specific system prompt (appended to template/defaults).
     #[serde(default)]
     pub system_prompt: String,
     /// Agent template to use as a base. The template provides default values
@@ -277,6 +294,7 @@ pub struct AgentConfig {
     /// Each skill name maps to a bundled or filesystem SKILL.md file.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// MCP servers whose tools/resources are exposed to this agent.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerEntry>,
     /// A2A agent endpoints to discover and register as tools.

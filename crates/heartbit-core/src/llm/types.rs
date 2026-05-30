@@ -1,7 +1,5 @@
 //! Core LLM request/response types — messages, content blocks, tool definitions, usage.
 
-#![allow(missing_docs)]
-
 use serde::{Deserialize, Serialize};
 
 // Re-export TokenUsage from sibling module for backward compatibility
@@ -19,7 +17,9 @@ pub const RESPOND_TOOL_DESCRIPTION: &str = "Produce your final structured respon
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// User-authored message.
     User,
+    /// Assistant-authored (LLM) message.
     Assistant,
 }
 
@@ -27,26 +27,42 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    /// Plain text fragment.
     Text {
+        /// The text content.
         text: String,
     },
+    /// LLM-emitted tool invocation.
     ToolUse {
+        /// Tool-call ID; the matching [`ToolResult`] echoes this.
         id: String,
+        /// Tool name (matches a [`ToolDefinition::name`]).
         name: String,
+        /// JSON arguments, schema-validated against the tool's input schema.
         input: serde_json::Value,
     },
+    /// Result of a previously requested tool call.
     ToolResult {
+        /// ID of the originating `ToolUse` block.
         tool_use_id: String,
+        /// Stringified result content (may be JSON).
         content: String,
+        /// `true` when the tool returned an error.
         #[serde(default)]
         is_error: bool,
     },
+    /// Inline image (base64-encoded).
     Image {
+        /// MIME type, e.g. `image/png`.
         media_type: String,
+        /// Base64-encoded image bytes.
         data: String,
     },
+    /// Inline audio (base64-encoded).
     Audio {
+        /// Audio format, e.g. `mp3`, `ogg`.
         format: String,
+        /// Base64-encoded audio bytes.
         data: String,
     },
 }
@@ -54,11 +70,14 @@ pub enum ContentBlock {
 /// A message in a conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    /// Who authored this message.
     pub role: Role,
+    /// Ordered content blocks composing the message.
     pub content: Vec<ContentBlock>,
 }
 
 impl Message {
+    /// Construct a user message with a single text block.
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
@@ -66,6 +85,7 @@ impl Message {
         }
     }
 
+    /// Construct an assistant message with a single text block.
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -73,6 +93,7 @@ impl Message {
         }
     }
 
+    /// Construct a user message with arbitrary mixed content (text + images, etc.).
     pub fn user_with_content(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,
@@ -80,6 +101,7 @@ impl Message {
         }
     }
 
+    /// Construct a user-role message carrying tool results from previously requested calls.
     pub fn tool_results(results: Vec<ToolResult>) -> Self {
         Self {
             role: Role::User,
@@ -98,8 +120,11 @@ impl Message {
 /// Definition of a tool the LLM can call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
+    /// Tool name (used to invoke via `ContentBlock::ToolUse`).
     pub name: String,
+    /// Description shown to the LLM to guide tool selection.
     pub description: String,
+    /// JSON Schema describing the tool's input arguments.
     pub input_schema: serde_json::Value,
 }
 
@@ -116,7 +141,10 @@ pub enum ToolChoice {
     /// Force the LLM to call at least one tool (any tool).
     Any,
     /// Force the LLM to call a specific tool by name.
-    Tool { name: String },
+    Tool {
+        /// Name of the tool the LLM must call.
+        name: String,
+    },
 }
 
 /// Controls reasoning/thinking effort for models that support it.
@@ -139,9 +167,13 @@ pub enum ReasoningEffort {
 /// The model is not part of the request — it's a property of the provider.
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
+    /// System prompt prepended ahead of the message history.
     pub system: String,
+    /// Conversation history in chronological order.
     pub messages: Vec<Message>,
+    /// Tools the LLM may call.
     pub tools: Vec<ToolDefinition>,
+    /// Maximum tokens the response may consume.
     pub max_tokens: u32,
     /// Optional tool choice constraint. `None` = provider default (auto).
     pub tool_choice: Option<ToolChoice>,
@@ -153,16 +185,22 @@ pub struct CompletionRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
+    /// Model finished its turn naturally (no tool calls pending).
     EndTurn,
+    /// Model requested one or more tool calls.
     ToolUse,
+    /// Model hit the `max_tokens` budget mid-response.
     MaxTokens,
 }
 
 /// A response from the LLM.
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
+    /// Content blocks the LLM produced (text + tool calls).
     pub content: Vec<ContentBlock>,
+    /// Why generation stopped.
     pub stop_reason: StopReason,
+    /// Token counts for billing / usage tracking.
     pub usage: TokenUsage,
     /// Model that produced this response. Set by cascading/routing providers.
     /// `None` when the model is known statically from the provider.
@@ -200,20 +238,27 @@ impl CompletionResponse {
 /// A tool call extracted from a response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Tool-call ID (echoes the originating `ContentBlock::ToolUse::id`).
     pub id: String,
+    /// Tool name.
     pub name: String,
+    /// JSON arguments the LLM supplied.
     pub input: serde_json::Value,
 }
 
 /// Result of executing a tool.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
+    /// ID of the originating `ContentBlock::ToolUse`.
     pub tool_use_id: String,
+    /// Stringified result content (may be JSON).
     pub content: String,
+    /// `true` if the tool returned an error.
     pub is_error: bool,
 }
 
 impl ToolResult {
+    /// Construct a successful tool result.
     pub fn success(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),
@@ -222,6 +267,7 @@ impl ToolResult {
         }
     }
 
+    /// Construct a failed tool result (`is_error = true`).
     pub fn error(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),

@@ -1,6 +1,5 @@
 //! Agent audit trail — structured records of LLM calls, tool invocations, and completions.
 
-#![allow(missing_docs)]
 use parking_lot::RwLock;
 use std::future::Future;
 use std::pin::Pin;
@@ -156,11 +155,17 @@ fn redact_marker_owned(value: serde_json::Value) -> serde_json::Value {
 /// and guardrail denials with full (untruncated) payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
+    /// Agent that emitted the record.
     pub agent: String,
+    /// Agent loop turn index when the record was emitted.
     pub turn: usize,
+    /// Event type discriminator (e.g. `llm_response`, `tool_call`).
     pub event_type: String,
+    /// Event-specific JSON payload (full, untruncated).
     pub payload: serde_json::Value,
+    /// Token usage attributed to this event.
     pub usage: TokenUsage,
+    /// Timestamp (UTC) the record was emitted.
     pub timestamp: DateTime<Utc>,
     /// User ID of the authenticated user who triggered this action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +243,7 @@ pub struct InMemoryAuditTrail {
 }
 
 impl InMemoryAuditTrail {
+    /// Create an empty audit trail.
     pub fn new() -> Self {
         Self {
             records: RwLock::new(Vec::new()),

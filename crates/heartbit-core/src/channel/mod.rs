@@ -3,7 +3,6 @@
 //! Platform-specific adapters (Telegram, Discord, Slack) and the
 //! Postgres-backed session store live in the heartbit umbrella crate.
 
-#![allow(missing_docs)]
 pub mod bridge;
 pub mod session;
 pub mod types;
@@ -20,8 +19,11 @@ use crate::tool::builtins::OnQuestion;
 
 /// A media attachment from a messaging channel (photo, voice, document).
 pub struct MediaAttachment {
+    /// MIME type or platform-specific media kind (`image/jpeg`, `voice`, etc.).
     pub media_type: String,
+    /// Raw attachment bytes.
     pub data: Vec<u8>,
+    /// Optional caption supplied with the attachment.
     pub caption: Option<String>,
 }
 
@@ -30,15 +32,21 @@ pub struct MediaAttachment {
 /// Each messaging channel (Telegram, Discord, etc.) implements this trait
 /// so the same `RunTask` closure can drive any channel without duplication.
 pub trait ChannelBridge: Send + Sync {
+    /// Produce the `OnText` callback that forwards streaming text to the client.
     fn make_on_text(self: Arc<Self>) -> Arc<OnText>;
+    /// Produce the `OnEvent` callback that forwards `AgentEvent` records to the client.
     fn make_on_event(self: Arc<Self>) -> Arc<OnEvent>;
+    /// Produce the `OnApproval` callback for human-in-the-loop tool gating.
     fn make_on_approval(self: Arc<Self>) -> Arc<OnApproval>;
+    /// Produce the `OnQuestion` callback for structured agent-to-user questions.
     fn make_on_question(self: Arc<Self>) -> Arc<OnQuestion>;
 }
 
 /// Input for the `RunTask` callback.
 pub struct RunTaskInput {
+    /// User-typed task text.
     pub task_text: String,
+    /// Channel bridge providing the callback set for this run.
     pub bridge: Arc<dyn ChannelBridge>,
     /// Pre-existing shared memory store so sub-agent memory tools persist
     /// across tasks. Passed as the raw (un-namespaced) store.

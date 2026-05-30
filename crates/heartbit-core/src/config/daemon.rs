@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use serde::Deserialize;
 
 use crate::Error;
@@ -16,10 +15,13 @@ use crate::Error;
 /// here so they can be re-used by the gateway.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonConfig {
+    /// Kafka transport configuration. Omit for in-process channel mode.
     #[serde(default)]
     pub kafka: Option<KafkaConfig>,
+    /// HTTP bind address (e.g. `0.0.0.0:8080`).
     #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    /// Maximum concurrently-executing tasks across all consumers.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_tasks: usize,
     /// Prometheus metrics configuration. Metrics are enabled by default.
@@ -811,11 +813,15 @@ fn default_max_ws_connections() -> usize {
 /// Kafka broker connection settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KafkaConfig {
+    /// Comma-separated bootstrap broker list (e.g. `localhost:9092`).
     pub brokers: String,
+    /// Consumer group ID for the daemon's command consumer.
     #[serde(default = "default_consumer_group")]
     pub consumer_group: String,
+    /// Topic the daemon consumes `DaemonCommand` messages from.
     #[serde(default = "default_commands_topic")]
     pub commands_topic: String,
+    /// Topic the daemon emits `AgentEvent` records to.
     #[serde(default = "default_events_topic")]
     pub events_topic: String,
     /// Topic for events that failed triage processing.
@@ -826,9 +832,13 @@ pub struct KafkaConfig {
 /// A scheduled task entry for the cron scheduler.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScheduleEntry {
+    /// Human-readable schedule name (used in logs/metrics).
     pub name: String,
+    /// Cron expression (5- or 6-field, depending on parser).
     pub cron: String,
+    /// Task body to submit when the schedule fires.
     pub task: String,
+    /// Set to `false` to keep the entry declared but inactive.
     #[serde(default = "super::default_true")]
     pub enabled: bool,
 }

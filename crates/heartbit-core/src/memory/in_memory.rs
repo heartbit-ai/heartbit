@@ -1,6 +1,5 @@
 //! In-memory `Memory` implementation backed by a sorted `Vec`.
 
-#![allow(missing_docs)]
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -139,6 +138,7 @@ pub struct InMemoryStore {
 }
 
 impl InMemoryStore {
+    /// Create an empty in-memory store with default scoring weights and cap.
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
@@ -149,6 +149,7 @@ impl InMemoryStore {
         }
     }
 
+    /// Override the composite-score weights used by `recall`.
     pub fn with_scoring_weights(mut self, weights: ScoringWeights) -> Self {
         self.scoring_weights = weights;
         self

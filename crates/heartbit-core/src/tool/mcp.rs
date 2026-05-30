@@ -131,10 +131,14 @@ struct InitializeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpResourceDef {
+    /// Resource URI (e.g. `file:///path/to/doc`).
     pub uri: String,
+    /// Human-readable resource name.
     pub name: String,
+    /// Optional description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional MIME type hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
@@ -150,11 +154,15 @@ struct McpResourcesListResult {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpResourceContent {
+    /// URI of the resource that was read.
     pub uri: String,
+    /// MIME type of the returned content, if known.
     #[serde(default)]
     pub mime_type: Option<String>,
+    /// Text content (mutually exclusive with `blob`).
     #[serde(default)]
     pub text: Option<String>,
+    /// Base64-encoded binary content (mutually exclusive with `text`).
     #[serde(default)]
     pub blob: Option<String>,
 }
@@ -169,9 +177,12 @@ struct McpResourceReadResult {
 /// A prompt definition from an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPromptDef {
+    /// Prompt name (used as the `prompts/get` argument).
     pub name: String,
+    /// Optional description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Declared arguments the prompt accepts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<McpPromptArgument>,
 }
@@ -179,9 +190,12 @@ pub struct McpPromptDef {
 /// An argument for an MCP prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPromptArgument {
+    /// Argument name.
     pub name: String,
+    /// Optional description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether the prompt requires this argument.
     #[serde(default)]
     pub required: bool,
 }
@@ -196,7 +210,9 @@ struct McpPromptsListResult {
 /// A message returned by `prompts/get`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpPromptMessage {
+    /// Message role (`user`, `assistant`, etc.).
     pub role: String,
+    /// Message content body.
     pub content: McpPromptMessageContent,
 }
 
@@ -204,8 +220,10 @@ pub struct McpPromptMessage {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpPromptMessageContent {
+    /// Content type discriminator (e.g. `text`).
     #[serde(rename = "type")]
     pub content_type: String,
+    /// Text payload (present when `content_type == "text"`).
     #[serde(default)]
     pub text: Option<String>,
 }
@@ -642,6 +660,7 @@ pub struct StaticAuthProvider {
 }
 
 impl StaticAuthProvider {
+    /// Construct a static-header auth provider; `None` disables the `Authorization` header.
     pub fn new(header: Option<String>) -> Self {
         Self { header }
     }
@@ -664,6 +683,7 @@ pub struct DirectAuthProvider {
 }
 
 impl DirectAuthProvider {
+    /// Construct from a pre-populated `{server_url → bearer_token}` map.
     pub fn new(tokens: HashMap<String, String>) -> Self {
         Self { tokens }
     }
@@ -734,6 +754,7 @@ pub struct DynamicAuthResolver {
 }
 
 impl DynamicAuthResolver {
+    /// Construct a per-user resolver. `resource` and `scopes` default to `None`.
     pub fn new(
         provider: Arc<dyn AuthProvider>,
         user_id: impl Into<String>,
@@ -1788,11 +1809,15 @@ impl Tool for McpPromptTool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SamplingRequest {
+    /// Conversation messages to send to the LLM.
     pub messages: Vec<SamplingMessage>,
+    /// Optional model selection hints supplied by the server.
     #[serde(default)]
     pub model_preferences: Option<SamplingModelPreferences>,
+    /// Optional system prompt override.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Optional `max_tokens` cap.
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }
@@ -1800,15 +1825,19 @@ pub struct SamplingRequest {
 /// A single message in an MCP sampling request, with a role and content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingMessage {
+    /// Role (`user`, `assistant`, etc.).
     pub role: String,
+    /// Message body.
     pub content: SamplingContent,
 }
 
 /// Content payload for an MCP sampling message — currently text only (`type = "text"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingContent {
+    /// Content discriminator (currently `text`).
     #[serde(rename = "type")]
     pub content_type: String,
+    /// Text payload (present when `content_type == "text"`).
     #[serde(default)]
     pub text: Option<String>,
 }
@@ -1820,6 +1849,7 @@ pub struct SamplingContent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SamplingModelPreferences {
+    /// Ordered list of model-name hints (most-preferred first).
     #[serde(default)]
     pub hints: Vec<SamplingModelHint>,
 }
@@ -1830,6 +1860,7 @@ pub struct SamplingModelPreferences {
 /// The client should prefer models whose names contain this hint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SamplingModelHint {
+    /// Partial model-name substring to match against.
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -1872,7 +1903,9 @@ fn sanitize_tool_name(name: &str) -> String {
 /// so it can resolve relative URIs and restrict filesystem access.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpRoot {
+    /// Filesystem URI (e.g. `file:///home/user/project`).
     pub uri: String,
+    /// Optional display name for the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -2373,6 +2406,7 @@ pub struct McpTransportPool {
 }
 
 impl McpTransportPool {
+    /// Create an empty transport pool.
     pub fn new() -> Self {
         Self {
             pool: RwLock::new(HashMap::new()),

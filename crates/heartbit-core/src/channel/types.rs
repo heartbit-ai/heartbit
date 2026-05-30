@@ -4,8 +4,6 @@
 //! protocol properties; see the `method` and `event` sub-modules for the
 //! corresponding RPC method and event name constants.
 
-#![allow(missing_docs)]
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -18,22 +16,31 @@ use uuid::Uuid;
 pub enum WsFrame {
     /// Client -> Server request.
     Req {
+        /// Correlation ID; the matching `Res` echoes this value.
         id: String,
+        /// JSON-RPC method name (see [`method`]).
         method: String,
+        /// Method-specific parameters; defaults to `null` when omitted.
         #[serde(default)]
         params: serde_json::Value,
     },
     /// Server -> Client response.
     Res {
+        /// Correlation ID — matches the originating `Req`.
         id: String,
+        /// `true` on success, `false` on error.
         ok: bool,
+        /// Result payload on success, or `{ "error": "..." }` on failure.
         #[serde(default)]
         payload: serde_json::Value,
     },
     /// Server -> Client push event.
     Event {
+        /// Event name (see [`event`]).
         event: String,
+        /// Event-specific data.
         payload: serde_json::Value,
+        /// Monotonic sequence number for ordering and gap detection.
         seq: u64,
     },
 }
@@ -42,14 +49,23 @@ pub enum WsFrame {
 
 pub mod method {
     //! JSON-RPC method name constants for the channel protocol.
+    /// Send a user message to an agent session.
     pub const CHAT_SEND: &str = "chat.send";
+    /// Abort an in-progress agent task.
     pub const CHAT_ABORT: &str = "chat.abort";
+    /// Retrieve past messages for a session.
     pub const CHAT_HISTORY: &str = "chat.history";
+    /// Resolve a pending approval request (human-in-the-loop).
     pub const APPROVAL_RESOLVE: &str = "approval.resolve";
+    /// Provide the next user message during an interactive session.
     pub const INPUT_RESOLVE: &str = "input.resolve";
+    /// Submit answers to a structured agent question.
     pub const QUESTION_RESOLVE: &str = "question.resolve";
+    /// List all sessions visible to the caller.
     pub const SESSION_LIST: &str = "session.list";
+    /// Create a new conversation session.
     pub const SESSION_CREATE: &str = "session.create";
+    /// Delete a session and its history.
     pub const SESSION_DELETE: &str = "session.delete";
 }
 
@@ -57,12 +73,19 @@ pub mod method {
 
 pub mod event {
     //! SSE event name constants for the channel protocol.
+    /// Streaming text chunk from the agent.
     pub const CHAT_DELTA: &str = "chat.delta";
+    /// Agent run completed with a final result.
     pub const CHAT_FINAL: &str = "chat.final";
+    /// Agent run failed with an error.
     pub const CHAT_ERROR: &str = "chat.error";
+    /// Generic `AgentEvent` push (run lifecycle, tool calls, etc.).
     pub const AGENT_EVENT: &str = "agent.event";
+    /// Interactive input requested from the user.
     pub const INPUT_NEEDED: &str = "input.needed";
+    /// Human-in-the-loop approval requested for tool calls.
     pub const APPROVAL_NEEDED: &str = "approval.needed";
+    /// Structured agent question requested from the user.
     pub const QUESTION_NEEDED: &str = "question.needed";
 }
 
@@ -71,26 +94,32 @@ pub mod event {
 /// Parameters for the `chat.send` method — send a user message to an agent session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSendParams {
+    /// Target session to receive the message.
     pub session_id: Uuid,
+    /// User-typed message text.
     pub message: String,
 }
 
 /// Response to `chat.send` — carries the task ID for tracking streaming deltas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSendResult {
+    /// Task ID — subsequent `chat.delta`/`chat.final` events carry this ID.
     pub task_id: Uuid,
 }
 
 /// Parameters for the `chat.abort` method — cancel an in-progress agent task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAbortParams {
+    /// Session owning the task to abort.
     pub session_id: Uuid,
+    /// Task ID returned by the originating `chat.send`.
     pub task_id: Uuid,
 }
 
 /// Parameters for the `chat.history` method — retrieve past messages for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatHistoryParams {
+    /// Session whose history is being requested.
     pub session_id: Uuid,
 }
 
@@ -100,6 +129,7 @@ pub struct ChatHistoryParams {
 /// of `"allow"`, `"deny"`, `"always_allow"`, or `"always_deny"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResolveParams {
+    /// ID of the pending approval interaction.
     pub interaction_id: Uuid,
     /// One of: "allow", "deny", "always_allow", "always_deny"
     pub decision: String,
@@ -110,6 +140,7 @@ pub struct ApprovalResolveParams {
 /// A `None` or empty `message` signals end-of-input and terminates the interactive loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputResolveParams {
+    /// ID of the pending input interaction.
     pub interaction_id: Uuid,
     /// None or empty ends the session.
     pub message: Option<String>,
@@ -118,6 +149,7 @@ pub struct InputResolveParams {
 /// Parameters for `question.resolve` — submit answers to a structured agent question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResolveParams {
+    /// ID of the pending question interaction.
     pub interaction_id: Uuid,
     /// Per-question list of selected option labels.
     pub answers: Vec<Vec<String>>,
@@ -126,33 +158,41 @@ pub struct QuestionResolveParams {
 /// Parameters for `session.create` — create a new conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateParams {
+    /// Optional human-readable title for the session.
     pub title: Option<String>,
 }
 
 /// Response to `session.create` — carries the newly allocated session ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateResult {
+    /// Newly allocated session ID.
     pub session_id: Uuid,
 }
 
 /// Parameters for `session.delete` — remove a session and its history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDeleteParams {
+    /// Session to delete.
     pub session_id: Uuid,
 }
 
 /// Response to `session.list` — returns all sessions visible to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListResult {
+    /// All sessions visible to the caller.
     pub sessions: Vec<SessionSummary>,
 }
 
 /// Metadata summary for a single conversation session, used in list responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Session identifier.
     pub id: Uuid,
+    /// Optional human-readable title.
     pub title: Option<String>,
+    /// Creation timestamp (UTC).
     pub created_at: DateTime<Utc>,
+    /// Number of messages currently stored in the session.
     pub message_count: usize,
 }
 
@@ -161,34 +201,45 @@ pub struct SessionSummary {
 /// Push-event payload for `chat.delta` — a streaming text chunk from the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatDeltaPayload {
+    /// Originating session.
     pub session_id: Uuid,
+    /// Streaming text chunk.
     pub text: String,
 }
 
 /// Push-event payload for `chat.final` — signals that the agent run completed with a result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatFinalPayload {
+    /// Originating session.
     pub session_id: Uuid,
+    /// Final agent output text.
     pub result: String,
 }
 
 /// Push-event payload for `chat.error` — signals that the agent run failed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatErrorPayload {
+    /// Originating session.
     pub session_id: Uuid,
+    /// Error message describing the failure.
     pub error: String,
 }
 
+/// Push-event payload for `agent.event` — forwarded `AgentEvent` from the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEventPayload {
+    /// Originating session.
     pub session_id: Uuid,
+    /// Serialized `AgentEvent` (variant-tagged JSON).
     pub event: serde_json::Value,
 }
 
 /// Shared payload for `input.needed`, `approval.needed`, `question.needed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractionNeededPayload {
+    /// Originating session.
     pub session_id: Uuid,
+    /// ID to echo back in the corresponding `*.resolve` request.
     pub interaction_id: Uuid,
     /// Type-specific data (tool calls for approval, question for question, etc.)
     #[serde(default)]

@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -31,6 +30,7 @@ impl Default for FileTracker {
 }
 
 impl FileTracker {
+    /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
             records: RwLock::new(HashMap::new()),

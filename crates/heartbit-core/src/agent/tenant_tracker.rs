@@ -3,7 +3,6 @@
 //! See `docs/superpowers/specs/2026-05-02-b5b-failure-mode-hardening-design.md`
 //! Component 2 for design rationale.
 
-#![allow(missing_docs)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,7 +19,9 @@ use crate::error::Error;
 /// `TenantTokenTracker`'s write lock.
 #[derive(Debug, Default, Clone)]
 pub struct TenantTokenState {
+    /// Tokens currently reserved across all active requests for the tenant.
     pub in_flight: usize,
+    /// All-time peak of `in_flight` (capacity-planning metric).
     pub high_water: usize,
 }
 
@@ -65,6 +66,7 @@ impl Drop for TokenReservation {
 }
 
 impl TenantTokenTracker {
+    /// Construct an empty tracker enforcing `per_tenant_cap` tokens in flight per tenant.
     pub fn new(per_tenant_cap: usize) -> Self {
         Self {
             states: RwLock::new(HashMap::new()),
@@ -72,6 +74,10 @@ impl TenantTokenTracker {
         }
     }
 
+    /// Reserve `tokens` for the tenant identified by `scope`.
+    ///
+    /// Returns [`Error::TenantOverloaded`] if the reservation would exceed the cap.
+    /// On success, the returned `TokenReservation` releases the reservation on drop.
     pub fn reserve(
         self: &Arc<Self>,
         scope: &TenantScope,
@@ -140,6 +146,7 @@ impl TenantTokenTracker {
         }
     }
 
+    /// Return a snapshot of `(tenant_id, state)` pairs for all known tenants.
     pub fn snapshot(&self) -> Vec<(String, TenantTokenState)> {
         self.states
             .read()

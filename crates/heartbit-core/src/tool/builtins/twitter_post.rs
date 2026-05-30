@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
@@ -21,9 +20,13 @@ type HmacSha1 = Hmac<Sha1>;
 /// Per-tenant X/Twitter credentials for OAuth 1.0a signing.
 #[derive(Clone)]
 pub struct TwitterCredentials {
+    /// OAuth 1.0a consumer (app) key.
     pub consumer_key: String,
+    /// OAuth 1.0a consumer (app) secret.
     pub consumer_secret: String,
+    /// Per-user access token.
     pub access_token: String,
+    /// Per-user access token secret.
     pub access_token_secret: String,
 }
 

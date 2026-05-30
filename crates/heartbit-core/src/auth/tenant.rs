@@ -1,6 +1,5 @@
 //! Tenant + optional user identity for scoping memory, audit, and policy.
 
-#![allow(missing_docs)]
 /// Tenant + optional user identity for scoping memory, audit, and policy
 /// decisions. Owned (no lifetime parameter) so it composes cleanly into
 /// async contexts and can be stored in `Arc`-shared state.
@@ -11,7 +10,9 @@
 /// "single-tenant mode" is the empty string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TenantScope {
+    /// Tenant identifier; empty string represents single-tenant mode.
     pub tenant_id: String,
+    /// Optional user identifier for per-user scoping inside the tenant.
     pub user_id: Option<String>,
 }
 
