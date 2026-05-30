@@ -15,6 +15,7 @@ mod read;
 mod skill;
 mod todo;
 mod tts;
+#[cfg(feature = "ghost-domain-config")]
 pub(crate) mod twitter_post;
 mod webfetch;
 mod websearch;
@@ -150,6 +151,7 @@ pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
 pub use todo::{TodoPriority, TodoStatus, TodoStore};
+#[cfg(feature = "ghost-domain-config")]
 pub use twitter_post::TwitterCredentials;
 pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
@@ -180,6 +182,7 @@ pub struct BuiltinToolsConfig {
     #[cfg(all(target_os = "linux", feature = "sandbox"))]
     pub sandbox_policy: Option<crate::sandbox::SandboxPolicy>,
     /// X/Twitter credentials for the `twitter_post` builtin tool (per-tenant).
+    #[cfg(feature = "ghost-domain-config")]
     pub twitter_credentials: Option<TwitterCredentials>,
     /// Optional allowlist of builtin tool names. When `Some`, only tools whose
     /// name appears in this list are returned. When `None`, all builtins are
@@ -239,6 +242,7 @@ impl Default for BuiltinToolsConfig {
             protected_paths: default_protected_paths(),
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
             sandbox_policy: None,
+            #[cfg(feature = "ghost-domain-config")]
             twitter_credentials: None,
             allowlist: None,
             path_policy: None,
@@ -331,6 +335,7 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         tools.push(Arc::new(question::QuestionTool::new(on_question)));
     }
 
+    #[cfg(feature = "ghost-domain-config")]
     if let Some(creds) = config.twitter_credentials {
         tools.push(Arc::new(twitter_post::TwitterPostTool::new(creds)));
     }
@@ -493,6 +498,7 @@ mod tests {
         assert_eq!(tools.len(), 16);
     }
 
+    #[cfg(feature = "ghost-domain-config")]
     #[test]
     fn builtin_tools_includes_twitter_when_credentials_present() {
         let config = BuiltinToolsConfig {
@@ -509,6 +515,7 @@ mod tests {
         assert!(tools.iter().any(|t| t.definition().name == "twitter_post"));
     }
 
+    #[cfg(feature = "ghost-domain-config")]
     #[test]
     fn builtin_tools_excludes_twitter_when_no_credentials() {
         let tools = builtin_tools(BuiltinToolsConfig::default());

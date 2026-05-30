@@ -150,10 +150,11 @@ pub use persona::{
 // --- Tool re-exports ---
 #[cfg(feature = "a2a")]
 pub use tool::a2a::A2aClient;
+#[cfg(feature = "ghost-domain-config")]
+pub use tool::builtins::TwitterCredentials;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
-    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, TwitterCredentials,
-    builtin_tools,
+    QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, builtin_tools,
 };
 pub use tool::handoff::{HandoffContextMode, HandoffTarget, HandoffTool};
 pub use tool::mcp::{
