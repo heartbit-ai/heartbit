@@ -53,13 +53,17 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 wiremock = "0.6"
 
 [features]
-default = []
+default = ["ghost-domain-config"]
 a2a = ["dep:a2a-sdk"]
 # Features inherited from tool/ (gated conditionals in code)
 sandbox = ["dep:landlock"]
 # Mirror umbrella's `sensor` feature so cfg-gated items
 # (`agent::guardrails::sensor_security`) compile when the umbrella enables it.
 sensor = []
+# Gate persona-specific config types (e.g. PersonaPostsConfig).
+# Default ON so existing callers see zero change.
+# SOTA users who embed only the core can opt out via `default-features = false`.
+ghost-domain-config = []
 # Exposes selected crate-internal types for criterion benchmarks under
 # `crates/heartbit-core/benches/`. Enabled automatically when running
 # `cargo bench`; should not be enabled by downstream consumers.
