@@ -12,6 +12,7 @@ pub mod debate;
 mod doom_loop;
 pub mod evaluator;
 pub mod events;
+pub mod flow;
 pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;

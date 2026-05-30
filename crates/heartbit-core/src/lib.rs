@@ -77,6 +77,18 @@ pub use agent::workflow::{
 };
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 
+// --- Dynamic-workflow combinator core (P1) ---
+// The free functions (`agent`, `parallel`, `pipeline`, `phase`, `log`, `thunk`)
+// are reached via the `flow` namespace because `flow::agent` would collide with
+// the `agent` module at the crate root. The data types are re-exported at root
+// for discoverability, matching the workflow-agent re-exports above.
+pub use agent::flow;
+pub use agent::flow::agent::{AgentCall, AgentOpts};
+pub use agent::flow::ctx::{WorkflowCtx, WorkflowCtxBuilder};
+pub use agent::flow::event::{OnWorkflowEvent, PhaseGuard, WorkflowEvent};
+pub use agent::flow::parallel::BoxThunk;
+pub use agent::flow::pipeline::PipelineBuilder;
+
 // --- Error re-exports ---
 pub use error::Error;
 
