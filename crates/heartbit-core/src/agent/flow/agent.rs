@@ -22,6 +22,7 @@ use crate::error::Error;
 
 use super::ctx::WorkflowCtx;
 use super::event::WorkflowEvent;
+use super::journal;
 
 /// A Rust type an [`agent`] can be forced to produce as validated structured
 /// output via [`AgentCall::schema`]. Implementors supply the JSON Schema the
@@ -115,20 +116,64 @@ impl<T> AgentCall<T> {
     /// Run the leaf to completion, returning the full [`AgentOutput`] (or `None`
     /// if the run was cancelled / skipped). Shared by every typed terminal.
     ///
-    /// Leaf sequence: acquire a concurrency permit -> register against the
-    /// runaway backstop -> admit against the shared budget -> race the run
-    /// against cancellation -> on success record the spend and emit
-    /// `AgentFinished`. `Ok(None)` only on cancellation; agent-domain failures
-    /// return `Err` so the combinators can decide whether to collapse them to
-    /// `None`. The backstop and budget are *control* errors: they record a
-    /// breach and fire run-wide cancellation, so they survive a combinator's
-    /// `Err -> None` collapse.
+    /// Order: **(0)** cancellation dominates everything — even a journal hit;
+    /// **(1)** if journaling is on, a journal HIT replays the cached output with
+    /// zero work and zero spend (no permit, backstop, or budget — it represents
+    /// work already done in a prior run), and a MISS runs live then appends;
+    /// **(2)** otherwise run live (permit -> backstop -> budget -> race -> record).
+    ///
+    /// `Ok(None)` only on cancellation; agent-domain failures return `Err` so the
+    /// combinators can decide whether to collapse them to `None`. The backstop
+    /// and budget are *control* errors: they record a breach and fire run-wide
+    /// cancellation, so they survive a combinator's `Err -> None` collapse.
     async fn run_leaf(self) -> Result<Option<AgentOutput>, Error> {
         let label = self
             .opts
             .label
             .clone()
             .unwrap_or_else(|| "agent".to_string());
+
+        // 0. Cancellation dominates — a fired cancel beats a cache hit.
+        if self.ctx.is_cancelled() {
+            self.ctx.emit(WorkflowEvent::AgentSkipped { label });
+            return Ok(None);
+        }
+
+        // 1. Resume journal (HIT = 0 work, 0 spend; MISS = run live then append).
+        //    `journal_arc()` clones the Arc so no ctx borrow is held across the
+        //    `self.run_live(..)` move below.
+        if let Some(journal) = self.ctx.journal_arc() {
+            // Hash the call's INPUTS only (never the output model). `model` is
+            // None until a per-call `.model()` exists; it is hashed now so the
+            // on-disk format is forward-stable.
+            let hash = journal::content_hash(&self.prompt, None, self.opts.schema.as_ref());
+            let occurrence = journal.next_occurrence(&hash);
+            let key = journal::CallKey {
+                content_hash: hash,
+                occurrence,
+            };
+            if let Some(cached) = journal.lookup(&key) {
+                self.ctx.emit(WorkflowEvent::AgentReplayed {
+                    label,
+                    usage: cached.tokens_used,
+                });
+                return Ok(Some(cached));
+            }
+            let result = self.run_live(label).await?;
+            if let Some(ref output) = result {
+                journal.append(&key, output)?;
+            }
+            return Ok(result);
+        }
+
+        // 2. No journal: run live directly.
+        self.run_live(label).await
+    }
+
+    /// The live leaf path: permit -> backstop -> budget -> race(cancel|run) ->
+    /// record spend. Separated from [`run_leaf`](Self::run_leaf) so a journal
+    /// HIT can bypass it entirely (0 work, 0 spend).
+    async fn run_live(self, label: String) -> Result<Option<AgentOutput>, Error> {
         let phase = self.effective_phase();
 
         // 1. Concurrency permit (the run-wide cap). Held until this leaf finishes.
@@ -489,21 +534,26 @@ mod tests {
             ..Default::default()
         }); // spent 5 >= 1: pool exhausted
 
-        let thunks: Vec<BoxThunk<String>> = (0..2)
+        // Preserve the agent's Option (do NOT `unwrap_or_default`, which would
+        // mask a cancelled `Ok(None)` as `Some("")`). With an exhausted budget,
+        // each agent either loses the admission race (`Err(BudgetExceeded)` ->
+        // outer slot `None`) or, once the first breach fires run-wide cancel,
+        // short-circuits at the leaf's step-0 cancellation check (`Ok(None)` ->
+        // `Some(None)`). Which path each takes is a race; *neither* yields real
+        // output, which is the invariant we assert.
+        let thunks: Vec<BoxThunk<Option<String>>> = (0..2)
             .map(|i| {
                 let ctx = ctx.clone();
-                flow_thunk(move || async move {
-                    Ok(agent(&ctx, format!("p{i}"))
-                        .run()
-                        .await?
-                        .unwrap_or_default())
-                })
+                flow_thunk(move || async move { agent(&ctx, format!("p{i}")).run().await })
             })
             .collect();
         let out = flow_parallel(&ctx, thunks).await;
 
-        // Combinator collapsed the control errors to None ...
-        assert!(out.iter().all(Option::is_none));
+        // No agent produced real output (no slot is `Some(Some(_))`) ...
+        assert!(
+            out.iter().all(|slot| !matches!(slot, Some(Some(_)))),
+            "a budget-exhausted run must yield no real output, got {out:?}"
+        );
         // ... but the breach is sticky: cancellation fired and is recorded.
         assert!(
             ctx.is_cancelled(),
@@ -797,5 +847,194 @@ mod tests {
         let call = agent(&ctx, "t").schema_value(serde_json::json!({ "type": "object" }));
         let _assert_type: fn(AgentCall<RawJson>) = |_c| {};
         _assert_type(call);
+    }
+
+    // -----------------------------------------------------------------------
+    // P4: resume journal wired through the leaf
+    // -----------------------------------------------------------------------
+
+    // AtomicUsize + Ordering are already in scope from this mod's top import.
+    use super::super::journal::ResumeMode;
+
+    /// Provider that counts how many times the model was actually called, so a
+    /// test can prove a journal replay did NOT hit the provider.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmProvider for CountingProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: format!("live-{n}"),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("counting-mock")
+        }
+    }
+
+    fn counting_ctx(
+        calls: &Arc<AtomicUsize>,
+        path: &std::path::Path,
+        mode: ResumeMode,
+    ) -> WorkflowCtx {
+        WorkflowCtx::builder(Arc::new(BoxedProvider::new(CountingProvider {
+            calls: Arc::clone(calls),
+        })))
+        .journal(path, mode)
+        .expect("open journal")
+        .build()
+        .expect("build ctx")
+    }
+
+    #[tokio::test]
+    async fn resume_replays_without_calling_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+
+        // First run (Fresh): the model is called once and the output journaled.
+        let calls1 = Arc::new(AtomicUsize::new(0));
+        let ctx1 = counting_ctx(&calls1, &path, ResumeMode::Fresh);
+        let first = agent(&ctx1, "do the task").run().await.expect("run ok");
+        assert_eq!(first.as_deref(), Some("live-0"));
+        assert_eq!(calls1.load(Ordering::SeqCst), 1);
+
+        // Second run (Resume) with the SAME prompt: replayed from the journal,
+        // so the provider is NOT called and the cached text is returned.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let ctx2 = counting_ctx(&calls2, &path, ResumeMode::Resume);
+        let replayed = agent(&ctx2, "do the task").run().await.expect("run ok");
+        assert_eq!(
+            replayed.as_deref(),
+            Some("live-0"),
+            "must replay cached text"
+        );
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "replay must NOT call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_prefix_costs_zero_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+
+        let calls1 = Arc::new(AtomicUsize::new(0));
+        let ctx1 = counting_ctx(&calls1, &path, ResumeMode::Fresh);
+        agent(&ctx1, "task").run().await.expect("run ok");
+
+        // Resume run with a bounded budget: the replayed call must spend nothing,
+        // so even a tiny budget is untouched.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let ctx2 = WorkflowCtx::builder(Arc::new(BoxedProvider::new(CountingProvider {
+            calls: Arc::clone(&calls2),
+        })))
+        .journal(&path, ResumeMode::Resume)
+        .expect("open journal")
+        .budget(1) // would reject any live admission (a live call costs 15)
+        .build()
+        .expect("build ctx");
+
+        let replayed = agent(&ctx2, "task").run().await.expect("run ok");
+        assert_eq!(replayed.as_deref(), Some("live-0"));
+        assert_eq!(
+            ctx2.budget().spent(),
+            0,
+            "replayed call must spend 0 budget"
+        );
+        assert!(!ctx2.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn changed_prompt_reruns_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+
+        let calls1 = Arc::new(AtomicUsize::new(0));
+        let ctx1 = counting_ctx(&calls1, &path, ResumeMode::Fresh);
+        agent(&ctx1, "original").run().await.expect("run ok");
+
+        // Resume but with a DIFFERENT prompt -> content hash differs -> MISS ->
+        // runs live (provider called) and appends a new entry.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let ctx2 = counting_ctx(&calls2, &path, ResumeMode::Resume);
+        let out = agent(&ctx2, "changed").run().await.expect("run ok");
+        assert_eq!(out.as_deref(), Some("live-0"));
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            1,
+            "a changed prompt must re-run live"
+        );
+    }
+
+    #[tokio::test]
+    async fn reordered_schema_keys_still_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+
+        // First run with a schema written one way.
+        let calls1 = Arc::new(AtomicUsize::new(0));
+        let ctx1 = WorkflowCtx::builder(Arc::new(BoxedProvider::new(RespondProvider {
+            payload: serde_json::json!({ "title": "x", "severity": 1 }),
+        })))
+        .journal(&path, ResumeMode::Fresh)
+        .expect("open journal")
+        .build()
+        .expect("build ctx");
+        let _ = calls1; // RespondProvider has no counter; correctness is via the replay below
+        let f1: Option<Finding> = agent(&ctx1, "audit")
+            .schema::<Finding>()
+            .run()
+            .await
+            .unwrap();
+        assert!(f1.is_some());
+
+        // Resume with the SAME Finding schema (its json_schema() is stable). The
+        // canonicalized hash matches regardless of key order, so it replays.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let ctx2 = counting_ctx(&calls2, &path, ResumeMode::Resume);
+        let f2: Option<Finding> = agent(&ctx2, "audit")
+            .schema::<Finding>()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            f2,
+            Some(Finding {
+                title: "x".into(),
+                severity: 1
+            })
+        );
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "identical schema+prompt must replay, not re-run"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_journal_path_is_unaffected() {
+        // Sanity: without .journal(), the leaf runs live every time.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        })))
+        .build()
+        .expect("build ctx");
+        agent(&ctx, "a").run().await.expect("run ok");
+        agent(&ctx, "a").run().await.expect("run ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no journal -> always live");
     }
 }

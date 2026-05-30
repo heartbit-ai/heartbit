@@ -39,6 +39,14 @@ pub enum WorkflowEvent {
         /// Token usage reported by the underlying runner.
         usage: TokenUsage,
     },
+    /// An agent leaf's result was replayed from the resume journal (no model
+    /// call). `usage` is the originally-recorded usage, for progress totals.
+    AgentReplayed {
+        /// Agent label.
+        label: String,
+        /// Token usage recorded when this output was first produced.
+        usage: TokenUsage,
+    },
     /// An agent leaf was skipped (e.g. cancelled mid-run); the combinator
     /// surfaces this as `Ok(None)`.
     AgentSkipped {

@@ -26,6 +26,7 @@ pub mod agent;
 pub mod budget;
 pub mod ctx;
 pub mod event;
+pub mod journal;
 pub mod parallel;
 pub mod pipeline;
 

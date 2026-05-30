@@ -18,6 +18,7 @@ use crate::llm::BoxedProvider;
 
 use super::budget::Budget;
 use super::event::{OnWorkflowEvent, WorkflowEvent};
+use super::journal::{ResumeMode, RunJournal};
 
 /// Hard upper bound on concurrently-running agents, matching Claude Code's
 /// `min(16, cores - 2)`.
@@ -78,6 +79,8 @@ struct CtxInner {
     budget: Budget,
     /// First run-level limit breach, if any (set-once).
     control: Mutex<Option<ControlBreach>>,
+    /// Optional resume journal: memoizes agent outputs for deterministic replay.
+    journal: Option<Arc<RunJournal>>,
     /// Optional workflow event sink.
     events: Option<Arc<OnWorkflowEvent>>,
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
@@ -107,6 +110,7 @@ impl WorkflowCtx {
             max_concurrency: None,
             max_agents: None,
             budget: None,
+            journal: None,
             events: None,
             cancel: None,
         }
@@ -197,6 +201,11 @@ impl WorkflowCtx {
         self.inner.budget.record(usage);
     }
 
+    /// A clone of the resume journal handle, if journaling is enabled.
+    pub(crate) fn journal_arc(&self) -> Option<Arc<RunJournal>> {
+        self.inner.journal.clone()
+    }
+
     /// Record a run-level breach (set-once) and fire run-wide cancellation so
     /// in-flight combinator tasks wind down. Idempotent on the stored breach.
     pub(crate) fn record_breach(&self, breach: ControlBreach) {
@@ -235,6 +244,7 @@ pub struct WorkflowCtxBuilder {
     max_concurrency: Option<usize>,
     max_agents: Option<u64>,
     budget: Option<Budget>,
+    journal: Option<Arc<RunJournal>>,
     events: Option<Arc<OnWorkflowEvent>>,
     cancel: Option<CancellationToken>,
 }
@@ -263,6 +273,28 @@ impl WorkflowCtxBuilder {
     /// workflows). Takes precedence over [`budget`](Self::budget).
     pub fn budget_pool(mut self, budget: Budget) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Enable deterministic resume by journaling agent outputs to `path` (a
+    /// `.jsonl` file). [`ResumeMode::Fresh`] starts a new journal;
+    /// [`ResumeMode::Resume`] replays matching calls from an existing one.
+    /// Returns an error if the journal file cannot be opened.
+    ///
+    /// See [`RunJournal`] for the soundness scope (return values, not side
+    /// effects; single process; fixed provider).
+    pub fn journal(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        mode: ResumeMode,
+    ) -> Result<Self, Error> {
+        self.journal = Some(Arc::new(RunJournal::open(path.as_ref(), mode)?));
+        Ok(self)
+    }
+
+    /// Share an existing [`RunJournal`] handle (e.g. a parent run's).
+    pub fn journal_handle(mut self, journal: Arc<RunJournal>) -> Self {
+        self.journal = Some(journal);
         self
     }
 
@@ -303,6 +335,7 @@ impl WorkflowCtxBuilder {
                 max_agents,
                 budget: self.budget.unwrap_or_default(),
                 control: Mutex::new(None),
+                journal: self.journal,
                 events: self.events,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),
