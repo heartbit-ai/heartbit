@@ -76,7 +76,15 @@ pub(crate) fn url_host(url: &str) -> Option<String> {
         return None;
     }
     let after_scheme = match u.split_once("://") {
-        Some(("http" | "https", rest)) => rest,
+        // RFC 3986 §3.1: scheme is case-insensitive — browsers accept `HTTP://`.
+        // A case-sensitive `"http" | "https"` match would treat `HTTP://evil.com`
+        // as a non-web scheme, return None, and the guard would ALLOW it past the
+        // allowlist (a deny-by-default bypass).
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            rest
+        }
         Some(_) => return None, // non-web scheme with authority (ftp://, ws://, …)
         None => {
             // No "://": either a bare host[:port][/path], or an opaque-scheme URL
@@ -170,6 +178,37 @@ mod tests {
         assert_eq!(url_host("about:blank"), None);
         assert_eq!(url_host("javascript:alert(1)"), None);
         assert_eq!(url_host("back"), None);
+    }
+
+    #[test]
+    fn url_host_scheme_is_case_insensitive() {
+        // RFC 3986 §3.1: scheme is case-insensitive. Browsers accept `HTTP://`.
+        // A case-sensitive match would return None here → the navigation would be
+        // treated as a non-web scheme and ALLOWED, bypassing the allowlist.
+        assert_eq!(url_host("HTTP://evil.com/steal"), Some("evil.com".into()));
+        assert_eq!(url_host("Https://evil.com"), Some("evil.com".into()));
+        assert_eq!(url_host("hTtP://Evil.COM/x"), Some("evil.com".into()));
+        // A genuinely non-web scheme is still None regardless of case.
+        assert_eq!(url_host("ABOUT:blank"), None);
+        assert_eq!(url_host("JavaScript:alert(1)"), None);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_scheme_is_gated_not_bypassed() {
+        let g = DomainAllowlistGuard::new(["example.com"]);
+        // The bypass: an uppercase scheme to an off-allowlist host must be DENIED.
+        match decide(&g, &nav("HTTP://evil.com/steal")).await {
+            GuardAction::Deny { reason } => {
+                assert!(reason.contains("evil.com"), "reason: {reason}")
+            }
+            other => panic!("uppercase-scheme off-allowlist nav must be denied, got {other:?}"),
+        }
+        // And a mixed-case scheme to an allowlisted host must still be ALLOWED
+        // (the fix must not over-block legitimate navigation).
+        assert_eq!(
+            decide(&g, &nav("HTTPS://example.com/login")).await,
+            GuardAction::Allow
+        );
     }
 
     #[test]
