@@ -57,13 +57,17 @@ accessibility tree. Elements are addressed by `uid` handles from `take_snapshot`
 Follow this loop and these invariants:\n\
 \n\
 1. OBSERVE: take_snapshot before acting. A `uid` is only valid in the snapshot \
-that produced it — never reuse a `uid` across an action that changes the page; \
-re-snapshot first. CRITICAL: never call take_snapshot twice in a row. One \
-snapshot per observation is enough — once you have it you MUST take an action \
-(click/fill/fill_form/wait_for/navigate) before observing again. If the snapshot \
-already shows the element you need (a Start/Submit button, a field), act on it \
-immediately; do not re-snapshot to double-check. Consecutive snapshots make no \
-progress and waste the turn budget.\n\
+that produced it. Two rules that together prevent the most common loops:\n\
+   (a) NEVER take_snapshot twice with no action in between. One snapshot is \
+   enough to observe — if it already shows the element you need (a Start/Submit \
+   button, a link, a field), act on it immediately; do not re-snapshot to \
+   double-check. Back-to-back snapshots make no progress and waste the budget.\n\
+   (b) ALWAYS take_snapshot ONCE after an action that changes the page (a \
+   navigation, or a click that opens a new page/section) and BEFORE your next \
+   action — the old `uid`s are dead on the new page, so clicking again without \
+   re-snapshotting does nothing. Clicking repeatedly without an intervening \
+   snapshot is the failure mode for multi-page navigation: click → snapshot → \
+   read the new page → click the next thing.\n\
 2. SETTLE: after navigating or any action that loads content, wait for the page \
 to stabilize before the next snapshot — never act on a half-rendered page. If \
 content appears only after a delay (a spinner, a countdown, an async fetch), use \
