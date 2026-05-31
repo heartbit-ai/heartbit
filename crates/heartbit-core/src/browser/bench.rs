@@ -14,14 +14,28 @@
 //! [`scorecard`]) is pure and unit-tested; the live driver ([`run_bench`]) and
 //! the `#[ignore]` live suite are the thin shells over real Chrome + a real model.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::agent::events::AgentEvent;
 use crate::execution_context::ExecutionContext;
 use crate::llm::LlmProvider;
 use crate::tool::Tool;
 
 use super::builder::BrowserAgentBuilder;
+
+/// State a bench run's event callback writes; read after the run on BOTH paths so
+/// a max-turns FAILURE still reports its turn count + ordered tool sequence
+/// (which `AgentOutput`, lost on the error path, cannot provide). Field names
+/// match the real [`AgentEvent`] variants (verified against agent/events.rs).
+#[derive(Default)]
+struct RunTrace {
+    turns: usize,
+    tool_calls: usize,
+    tools: Vec<String>,
+    input_tokens: u32,
+    output_tokens: u32,
+}
 
 /// A deterministic success oracle, graded against the REAL post-run page and the
 /// agent's answer — independent of whatever the agent claims it did.
@@ -100,6 +114,13 @@ pub struct BenchResult {
     pub cost_usd: Option<f64>,
     /// Wall-clock duration in milliseconds.
     pub millis: u128,
+    /// LLM turns observed via events — populated even when the task FAILS on a
+    /// max-turns loop (unlike `AgentOutput`, lost on the error path).
+    pub turns: usize,
+    /// Ordered tool-call sequence the agent issued (e.g. `["navigate_page",
+    /// "take_snapshot", "click", ...]`). Captured via events, so a FAILED task
+    /// still shows what it looped on — the diagnostic the error path discarded.
+    pub trace: Vec<String>,
     /// First ~160 chars of the agent's answer (for the trace).
     pub answer_excerpt: String,
     /// Error, if the build or run failed before grading.
@@ -134,15 +155,38 @@ pub async fn run_bench<P: LlmProvider>(
             output_tokens: 0,
             cost_usd: None,
             millis: 0,
+            turns: 0,
+            trace: Vec::new(),
             answer_excerpt: String::new(),
             error: None,
         };
+
+        // Shared trace the event callback writes; read on BOTH paths so a
+        // max-turns FAILURE still reports its turns + ordered tool sequence.
+        let trace = Arc::new(Mutex::new(RunTrace::default()));
+        let trace_cb = Arc::clone(&trace);
+        let on_event: Arc<crate::agent::events::OnEvent> = Arc::new(move |ev: AgentEvent| {
+            let Ok(mut t) = trace_cb.lock() else { return };
+            match ev {
+                AgentEvent::TurnStarted { turn, .. } => t.turns = t.turns.max(turn),
+                AgentEvent::ToolCallStarted { tool_name, .. } => {
+                    t.tool_calls += 1;
+                    t.tools.push(tool_name);
+                }
+                AgentEvent::RunCompleted { total_usage, .. } => {
+                    t.input_tokens = total_usage.input_tokens;
+                    t.output_tokens = total_usage.output_tokens;
+                }
+                _ => {}
+            }
+        });
 
         match BrowserAgentBuilder::new(Arc::clone(&provider))
             .name(task.name.clone())
             .allow_hosts(task.allow_hosts.clone())
             .max_turns(task.max_turns)
             .tools_allow(task.tools.clone())
+            .on_event(on_event)
             .build_with_tools(tools.clone())
         {
             Err(e) => r.error = Some(format!("build: {e}")),
@@ -161,13 +205,19 @@ pub async fn run_bench<P: LlmProvider>(
                         None => String::new(),
                     };
                     r.passed = task.oracle.grade(&snap, &out.result);
-                    r.tool_calls = out.tool_calls_made;
-                    r.input_tokens = out.tokens_used.input_tokens;
-                    r.output_tokens = out.tokens_used.output_tokens;
                     r.cost_usd = out.estimated_cost_usd;
                     r.answer_excerpt = out.result.chars().take(160).collect();
                 }
             },
+        }
+        // Fold in the captured trace — the ONLY source of turns/tools on the
+        // failure path, and a cross-check on success.
+        if let Ok(t) = trace.lock() {
+            r.turns = t.turns;
+            r.tool_calls = t.tool_calls;
+            r.trace = t.tools.clone();
+            r.input_tokens = t.input_tokens;
+            r.output_tokens = t.output_tokens;
         }
         r.millis = started.elapsed().as_millis();
         results.push(r);
@@ -205,7 +255,13 @@ pub fn scorecard(results: &[BenchResult]) -> String {
         );
         if let Some(e) = &r.error {
             let _ = writeln!(s, "    ! {e}");
-        } else if !r.answer_excerpt.is_empty() {
+        }
+        // The tool trace is the diagnostic for max-turns loops — show it on any
+        // task that captured one; on success it documents the path taken.
+        if !r.trace.is_empty() {
+            let _ = writeln!(s, "    trace: {}", r.trace.join(" -> "));
+        }
+        if !r.answer_excerpt.is_empty() {
             let _ = writeln!(s, "    answer: {}", r.answer_excerpt.replace('\n', " "));
         }
     }
@@ -442,6 +498,13 @@ mod tests {
                 output_tokens: 80,
                 cost_usd: Some(0.01),
                 millis: 4200,
+                turns: 4,
+                trace: vec![
+                    "navigate_page".into(),
+                    "take_snapshot".into(),
+                    "fill_form".into(),
+                    "click".into(),
+                ],
                 answer_excerpt: "logged in".into(),
                 error: None,
             },
@@ -454,6 +517,8 @@ mod tests {
                 output_tokens: 140,
                 cost_usd: None,
                 millis: 9000,
+                turns: 14,
+                trace: vec!["navigate_page".into(), "take_snapshot".into()],
                 answer_excerpt: String::new(),
                 error: Some("run: timeout".into()),
             },
@@ -461,8 +526,11 @@ mod tests {
         let card = scorecard(&results);
         assert!(card.contains("1/2 tasks passed"));
         assert!(card.contains("login"));
+        assert!(card.contains("basket"));
         assert!(card.contains("PASS"));
         assert!(card.contains("FAIL"));
         assert!(card.contains("! run: timeout"));
+        // The tool trace is the max-turns diagnostic — it must render.
+        assert!(card.contains("trace: navigate_page -> take_snapshot"));
     }
 }

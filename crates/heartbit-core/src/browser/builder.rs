@@ -131,6 +131,9 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     name: Option<String>,
     max_turns: Option<usize>,
     chrome_executable: Option<String>,
+    /// Optional lifecycle-event callback (forwarded to the inner runner) — used
+    /// e.g. by the benchmark to capture a turn/tool trace even when a task fails.
+    on_event: Option<Arc<crate::agent::events::OnEvent>>,
     /// If non-empty, keep ONLY tools whose name is in this set (token control —
     /// fewer tool definitions re-sent every turn). Empty = keep all.
     tool_allow: Vec<String>,
@@ -156,6 +159,7 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             name: None,
             max_turns: None,
             chrome_executable: None,
+            on_event: None,
             tool_allow: Vec::new(),
             distill_enabled: true,
             distill: DistillConfig::default(),
@@ -209,6 +213,14 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
     /// Only affects [`Self::connect`]; ignored by [`Self::build_with_tools`].
     pub fn chrome_executable(mut self, path: impl Into<String>) -> Self {
         self.chrome_executable = Some(path.into());
+        self
+    }
+
+    /// Attach a lifecycle-event callback, forwarded to the underlying
+    /// [`AgentRunner`]. Lets callers observe turns/tool-calls/usage — e.g. the
+    /// benchmark uses it to capture a trace even when a task fails on max-turns.
+    pub fn on_event(mut self, callback: Arc<crate::agent::events::OnEvent>) -> Self {
+        self.on_event = Some(callback);
         self
     }
 
@@ -278,6 +290,9 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         }
         if let Some(mt) = self.max_turns {
             b = b.max_turns(mt);
+        }
+        if let Some(cb) = self.on_event {
+            b = b.on_event(cb);
         }
         b.build()
     }
