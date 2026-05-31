@@ -294,6 +294,15 @@ pub struct AgentConfig {
     /// Each skill name maps to a bundled or filesystem SKILL.md file.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Directories to discover Agent Skills from (each holding `<name>/SKILL.md`).
+    /// When non-empty, a Level-1 catalog (`name: description` per skill) is
+    /// injected into the system prompt so the model knows which skills exist and
+    /// loads each one's full instructions on demand via the `skill` tool
+    /// (progressive disclosure). Earlier directories take precedence on a name
+    /// clash. Distinct from [`skills`](Self::skills), which eagerly inlines full
+    /// content for an explicit set of named skills.
+    #[serde(default)]
+    pub skill_dirs: Vec<String>,
     /// MCP servers whose tools/resources are exposed to this agent.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerEntry>,
@@ -427,6 +436,7 @@ impl AgentConfig {
             system_prompt: self.system_prompt.clone(),
             template: self.template.clone(),
             skills: self.skills.clone(),
+            skill_dirs: self.skill_dirs.clone(),
             mcp_servers: self.mcp_servers.clone(),
             a2a_agents: self.a2a_agents.clone(),
             context_strategy: self.context_strategy.clone(),

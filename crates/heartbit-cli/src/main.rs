@@ -802,7 +802,10 @@ async fn run_from_config(
     // Resolve agent templates, skills, and variables before building agents.
     let variables = config.variables.clone();
     for i in 0..config.agents.len() {
-        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+        if config.agents[i].template.is_some()
+            || !config.agents[i].skills.is_empty()
+            || !config.agents[i].skill_dirs.is_empty()
+        {
             let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
                 .with_context(|| {
                     format!(
@@ -2209,11 +2212,21 @@ async fn run_default_agent(
     observability_mode: ObservabilityMode,
     workspace_dir: Option<PathBuf>,
 ) -> Result<AgentOutput> {
+    // Opt-in Agent Skills discovery: only when the operator explicitly sets
+    // HEARTBIT_SKILL_DIRS (comma-separated). This avoids auto-injecting skill
+    // descriptions from ancestor/home `.claude/skills` dirs into the system
+    // prompt (a trust-boundary / prompt-injection risk). Empty => no skills.
+    let skill_dirs: Vec<PathBuf> = std::env::var("HEARTBIT_SKILL_DIRS")
+        .ok()
+        .map(|v| parse_csv_env(&v).into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
+
     let mut tools = {
         let mut btc = BuiltinToolsConfig::default();
         btc.on_question = Some(question_callback());
         btc.workspace = workspace_dir.clone();
         btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
+        btc.skill_dirs = skill_dirs.clone();
         builtin_tools(btc)
     };
 
@@ -2243,14 +2256,25 @@ async fn run_default_agent(
         parse_env("HEARTBIT_MAX_TOOL_OUTPUT_BYTES").unwrap_or(32_768);
     let tool_timeout_secs: u64 = parse_env("HEARTBIT_TOOL_TIMEOUT").unwrap_or(120);
 
+    // Base instructions + Level-1 Agent Skills catalog (progressive disclosure):
+    // advertise the OPT-IN, explicitly-configured skills (name: description) so
+    // the model knows which to load on demand via the `skill` tool. Uses the same
+    // explicit dirs the skill tool searches, so the catalog never lists a skill
+    // that cannot be loaded. No ancestor/$HOME auto-discovery (security).
+    let mut env_system_prompt = String::from(
+        "You are a skilled software engineer. Use the available tools to accomplish \
+         the task. Work methodically: read relevant files before making changes, \
+         verify your work by running tests, and explain your reasoning. \
+         When modifying code, always read the file first.",
+    );
+    if let Some(catalog) = heartbit::skill::catalog_from_dirs(&skill_dirs) {
+        env_system_prompt.push_str("\n\n");
+        env_system_prompt.push_str(&catalog);
+    }
+
     let mut builder = AgentRunner::builder(provider)
         .name("heartbit")
-        .system_prompt(
-            "You are a skilled software engineer. Use the available tools to accomplish \
-             the task. Work methodically: read relevant files before making changes, \
-             verify your work by running tests, and explain your reasoning. \
-             When modifying code, always read the file first.",
-        )
+        .system_prompt(&env_system_prompt)
         .tools(tools)
         .max_turns(max_turns)
         .summarize_threshold(summarize_threshold)
@@ -2407,7 +2431,10 @@ async fn run_chat_from_config(
     // Resolve agent templates, skills, and variables.
     let variables = config.variables.clone();
     for i in 0..config.agents.len() {
-        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+        if config.agents[i].template.is_some()
+            || !config.agents[i].skills.is_empty()
+            || !config.agents[i].skill_dirs.is_empty()
+        {
             let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
                 .with_context(|| {
                     format!(

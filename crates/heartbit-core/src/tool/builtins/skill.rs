@@ -15,21 +15,35 @@ use crate::tool::{Tool, ToolOutput};
 /// instructions for the agent. This enables reusable, version-controlled
 /// prompt recipes. Skill names are validated against path traversal: names
 /// containing `/`, `\`, `..`, or empty strings are rejected.
+#[derive(Default)]
 pub struct SkillTool {
     /// Override the starting directory for skill search. When `None`, uses `cwd`.
     /// Exposed for testing without mutating the process-global cwd.
     search_root: Option<PathBuf>,
+    /// Explicit, highest-precedence skill directories (e.g. from config). These
+    /// are searched before the conventional `.opencode/.claude/skills` walk, and
+    /// are the SAME dirs the Level-1 catalog is built from, so the catalog never
+    /// advertises a skill this tool cannot load.
+    extra_dirs: Vec<PathBuf>,
 }
 
 impl SkillTool {
-    pub fn new() -> Self {
-        Self { search_root: None }
+    /// Create a tool that also searches `extra_dirs` (highest precedence). Pass
+    /// the same directories used to build the Level-1 catalog so advertise and
+    /// load stay in agreement. Use [`SkillTool::default`] for conventional
+    /// discovery only (no extra dirs).
+    pub fn with_dirs(extra_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            search_root: None,
+            extra_dirs,
+        }
     }
 
     #[cfg(test)]
     fn with_search_root(root: PathBuf) -> Self {
         Self {
             search_root: Some(root),
+            extra_dirs: Vec::new(),
         }
     }
 }
@@ -73,8 +87,10 @@ impl Tool for SkillTool {
                 ));
             }
 
-            // Collect search directories
-            let search_dirs = collect_search_dirs(self.search_root.as_deref());
+            // Collect search directories from the canonical resolver shared with
+            // the Level-1 catalog (so advertise == load).
+            let search_dirs =
+                crate::skill::search_dirs(self.search_root.as_deref(), &self.extra_dirs);
 
             for dir in &search_dirs {
                 let skill_dir = dir.join(name);
@@ -88,7 +104,26 @@ impl Tool for SkillTool {
                     // List sibling files
                     let siblings = list_siblings(&skill_dir);
 
-                    let mut output = format!("# Skill: {name}\n\n{content}");
+                    // Frontmatter-aware rendering (progressive disclosure level 2):
+                    // when the SKILL.md has a valid Claude-format YAML frontmatter,
+                    // strip it and present the clean body plus the parsed metadata
+                    // (description + allowed-tools). A SKILL.md with no/invalid
+                    // frontmatter falls back to the raw content (back-compat).
+                    let mut output = match crate::skill::SkillManifest::parse(&content, name) {
+                        Ok(manifest) => {
+                            let mut o = format!("# Skill: {name}\n\n{}", manifest.description);
+                            if !manifest.allowed_tools.is_empty() {
+                                o.push_str(&format!(
+                                    "\n\nAllowed tools while this skill is active: {}",
+                                    manifest.allowed_tools.join(", ")
+                                ));
+                            }
+                            o.push_str("\n\n");
+                            o.push_str(manifest.body.trim_start());
+                            o
+                        }
+                        Err(_) => format!("# Skill: {name}\n\n{content}"),
+                    };
 
                     if !siblings.is_empty() {
                         output.push_str("\n\n## Sibling files:\n");
@@ -115,51 +150,6 @@ impl Tool for SkillTool {
             }
         })
     }
-}
-
-fn collect_search_dirs(override_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // SECURITY (F-FS-7): cap the walk depth so a `cwd` deep under `/home`
-    // does not pick up `.opencode/skills/` or `.claude/skills/` from the
-    // user's home root or even from `/`. Without the cap, a malicious
-    // sibling repo (or a tampered `~/.opencode/skills/build/SKILL.md`)
-    // would silently inject prompts into a project that has no `.git/`.
-    const MAX_WALK_DEPTH: usize = 8;
-    let cwd = override_root
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let mut current = cwd.as_path();
-    let mut depth = 0usize;
-    loop {
-        dirs.push(current.join(".opencode").join("skills"));
-        dirs.push(current.join(".claude").join("skills"));
-
-        // Stop at git root or filesystem root
-        if current.join(".git").exists() {
-            break;
-        }
-        depth += 1;
-        if depth >= MAX_WALK_DEPTH {
-            break;
-        }
-        match current.parent() {
-            Some(parent) if parent != current => current = parent,
-            _ => break,
-        }
-    }
-
-    // Global config directory
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("heartbit")
-                .join("skills"),
-        );
-    }
-
-    dirs
 }
 
 fn list_siblings(skill_dir: &Path) -> Vec<String> {
@@ -204,13 +194,13 @@ mod tests {
 
     #[test]
     fn definition_has_correct_name() {
-        let tool = SkillTool::new();
+        let tool = SkillTool::default();
         assert_eq!(tool.definition().name, "skill");
     }
 
     #[tokio::test]
     async fn skill_not_found() {
-        let tool = SkillTool::new();
+        let tool = SkillTool::default();
         let result = tool
             .execute(
                 &crate::ExecutionContext::default(),
@@ -224,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_rejects_path_traversal() {
-        let tool = SkillTool::new();
+        let tool = SkillTool::default();
 
         // Directory traversal
         let result = tool
@@ -292,5 +282,65 @@ mod tests {
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("Test Skill"));
         assert!(result.content.contains("helper.sh"));
+    }
+
+    #[tokio::test]
+    async fn skill_with_yaml_frontmatter_is_stripped_and_metadata_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join(".claude").join("skills").join("pdf-tool");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "---\nname: pdf-tool\ndescription: Extract text from PDFs. Use for PDF tasks.\nallowed-tools: read, bash\n---\n# PDF Tool\n\nStep 1: open the file.\n",
+        )
+        .unwrap();
+
+        let tool = SkillTool::with_search_root(dir.path().to_path_buf());
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "pdf-tool"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "got error: {}", result.content);
+        // The raw frontmatter fence must NOT leak into the model's context.
+        assert!(
+            !result.content.contains("---\nname:"),
+            "frontmatter must be stripped: {}",
+            result.content
+        );
+        // The body and parsed metadata are surfaced.
+        assert!(result.content.contains("Extract text from PDFs"));
+        assert!(result.content.contains("Step 1: open the file."));
+        assert!(
+            result
+                .content
+                .contains("Allowed tools while this skill is active: read, bash")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_without_frontmatter_falls_back_to_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join(".claude").join("skills").join("plain");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "# Plain\n\nNo frontmatter here.",
+        )
+        .unwrap();
+
+        let tool = SkillTool::with_search_root(dir.path().to_path_buf());
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"name": "plain"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("No frontmatter here."));
     }
 }

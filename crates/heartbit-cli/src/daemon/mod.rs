@@ -50,7 +50,10 @@ pub async fn run_daemon(
     // Resolve agent templates, skills, and variables.
     let variables = config.variables.clone();
     for i in 0..config.agents.len() {
-        if config.agents[i].template.is_some() || !config.agents[i].skills.is_empty() {
+        if config.agents[i].template.is_some()
+            || !config.agents[i].skills.is_empty()
+            || !config.agents[i].skill_dirs.is_empty()
+        {
             let resolved = heartbit::resolve_agent_config(&config.agents[i], &variables)
                 .with_context(|| {
                     format!(
