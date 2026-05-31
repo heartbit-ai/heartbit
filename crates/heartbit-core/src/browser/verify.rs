@@ -99,7 +99,10 @@ pub fn diff(before: &SnapshotSignature, after: &SnapshotSignature) -> ActionEffe
         reasons.push(format!("title {:?} -> {:?}", before.title, after.title));
     }
     if before.interactable_uids != after.interactable_uids {
-        let added = after.interactable_uids.difference(&before.interactable_uids).count();
+        let added = after
+            .interactable_uids
+            .difference(&before.interactable_uids)
+            .count();
         let removed = before
             .interactable_uids
             .difference(&after.interactable_uids)
@@ -141,7 +144,10 @@ mod tests {
         assert_eq!(sig.title.as_deref(), Some("Login"));
         assert_eq!(
             sig.interactable_uids,
-            ["1_1", "1_2", "1_3"].iter().map(|s| s.to_string()).collect()
+            ["1_1", "1_2", "1_3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         );
         assert_eq!(sig.console_errors, 0);
     }
@@ -211,7 +217,12 @@ mod tests {
 
     #[test]
     fn noop_hint_guides_replan() {
-        assert!(ActionEffect::NoOp.hint().unwrap().contains("observed change: NO"));
+        assert!(
+            ActionEffect::NoOp
+                .hint()
+                .unwrap()
+                .contains("observed change: NO")
+        );
         assert!(ActionEffect::Changed("x".into()).hint().is_none());
     }
 }

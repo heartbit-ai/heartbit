@@ -98,17 +98,20 @@ impl Tool for ReliableInteractionTool {
         &self,
         ctx: &ExecutionContext,
         input: Value,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+    {
         let input = self.with_snapshot(input);
+        // Own the ctx inside the future so it borrows only `&self` (the trait's
+        // elided `'_`), not the separate `ctx` parameter borrow — otherwise the
+        // borrowed `ctx` escapes the method (E0521). ExecutionContext is Clone.
+        let ctx = ctx.clone();
         Box::pin(async move {
-            let first = self.inner.execute(ctx, input.clone()).await?;
+            let first = self.inner.execute(&ctx, input.clone()).await?;
             if self.mutating && is_stale_uid_error(&first) {
                 // Stale handle: the snapshot the agent grounded on is gone.
                 // Retry once; the forced includeSnapshot on this retry returns a
                 // fresh tree so the loop can re-ground. Append a structured hint.
-                let retried = self.inner.execute(ctx, input).await?;
+                let retried = self.inner.execute(&ctx, input).await?;
                 if retried.is_error {
                     return Ok(ToolOutput::error(format!(
                         "{}\n\n[browser] stale uid: re-snapshot and re-resolve the \
@@ -139,7 +142,10 @@ mod tests {
     }
 
     impl ScriptedTool {
-        fn new(name: &str, outputs: Vec<ToolOutput>) -> (Arc<Self>, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        fn new(
+            name: &str,
+            outputs: Vec<ToolOutput>,
+        ) -> (Arc<Self>, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let inputs = Arc::new(Mutex::new(Vec::new()));
             let t = Arc::new(Self {
@@ -179,9 +185,12 @@ mod tests {
     async fn injects_include_snapshot_for_mutating_tool() {
         let (inner, calls, inputs) = ScriptedTool::new("click", vec![ToolOutput::success("ok")]);
         let tool = ReliableInteractionTool::wrap(inner);
-        tool.execute(&ExecutionContext::default(), serde_json::json!({ "uid": "1_2" }))
-            .await
-            .expect("ok");
+        tool.execute(
+            &ExecutionContext::default(),
+            serde_json::json!({ "uid": "1_2" }),
+        )
+        .await
+        .expect("ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let recorded = &inputs.lock().expect("lock")[0];
         assert_eq!(
@@ -218,7 +227,10 @@ mod tests {
         );
         let tool = ReliableInteractionTool::wrap(inner);
         let out = tool
-            .execute(&ExecutionContext::default(), serde_json::json!({ "uid": "1_2" }))
+            .execute(
+                &ExecutionContext::default(),
+                serde_json::json!({ "uid": "1_2" }),
+            )
             .await
             .expect("ok");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "must retry exactly once");
@@ -228,13 +240,14 @@ mod tests {
 
     #[tokio::test]
     async fn stale_uid_twice_escalates_with_hint() {
-        let (inner, calls, _inputs) = ScriptedTool::new(
-            "click",
-            vec![ToolOutput::error("no element with uid 1_2")],
-        );
+        let (inner, calls, _inputs) =
+            ScriptedTool::new("click", vec![ToolOutput::error("no element with uid 1_2")]);
         let tool = ReliableInteractionTool::wrap(inner);
         let out = tool
-            .execute(&ExecutionContext::default(), serde_json::json!({ "uid": "1_2" }))
+            .execute(
+                &ExecutionContext::default(),
+                serde_json::json!({ "uid": "1_2" }),
+            )
             .await
             .expect("ok");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry then give up");
@@ -248,22 +261,29 @@ mod tests {
 
     #[tokio::test]
     async fn non_stale_error_is_not_retried() {
-        let (inner, calls, _inputs) = ScriptedTool::new(
-            "click",
-            vec![ToolOutput::error("Error: network timeout")],
-        );
+        let (inner, calls, _inputs) =
+            ScriptedTool::new("click", vec![ToolOutput::error("Error: network timeout")]);
         let tool = ReliableInteractionTool::wrap(inner);
         let out = tool
-            .execute(&ExecutionContext::default(), serde_json::json!({ "uid": "1_2" }))
+            .execute(
+                &ExecutionContext::default(),
+                serde_json::json!({ "uid": "1_2" }),
+            )
             .await
             .expect("ok");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "non-stale error must not retry");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "non-stale error must not retry"
+        );
         assert!(out.is_error);
     }
 
     #[test]
     fn is_stale_uid_error_matches_phrasings() {
-        assert!(is_stale_uid_error(&ToolOutput::error("no element with uid 1_2")));
+        assert!(is_stale_uid_error(&ToolOutput::error(
+            "no element with uid 1_2"
+        )));
         assert!(is_stale_uid_error(&ToolOutput::error(
             "Error: uid 3_7 not found in snapshot"
         )));

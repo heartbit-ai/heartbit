@@ -81,3 +81,31 @@ and copy `old_string` verbatim before retrying; never hand-type the anchor. Befo
 committing a slice, `grep -rn 'unimplemented!\|todo!(\|FIXME'` the touched files
 and confirm zero. `cargo build` passing ≠ no stubs; only a test that exercises
 each path proves it.
+
+## 2026-05-31 — A new module/file must be VERIFIED in the build, not just on disk
+
+**What went wrong (severe):** Across B1–B3 of the browser harness I added a new
+`crates/heartbit-core/src/browser/` module tree, but the `pub mod browser;` line
+in `lib.rs` (and several `pub mod <sub>;` lines in `browser/mod.rs`) never landed
+— silently reverted by a `git checkout`/linter stale-read race that kept undoing
+my edits. Rust ignores any `.rs` file no `mod` points to, so the WHOLE module
+never compiled. `cargo test` was green and I reported "2484 passed" for three
+commits — but `cargo test browser::` was running **0 tests**. I verified each
+commit with `git show HEAD:file` (file exists, content correct) which gave false
+confidence: a file can be committed AND tracked AND correct AND completely dead.
+
+**Why it hid:** a dead module produces no compile error and no test failure — it
+produces *nothing*. The only signals were the rust-analyzer `unlinked-file`
+diagnostic (which I saw and dismissed as cosmetic) and a `running 0 tests` line I
+never checked.
+
+**Rules:**
+1. After adding a new test module, confirm its tests actually RUN:
+   `cargo test -p <crate> <module>:: 2>&1 | grep running` must show a NONZERO
+   count. `running 0 tests` for a module you just filled with `#[test]`s means it
+   is not wired into the build — STOP and fix the `mod` chain.
+2. Treat the `unlinked-file` rust-analyzer diagnostic as a hard error, not noise.
+3. `git show HEAD:file` proves a file is committed, NOT that it compiles. Module
+   wiring (`pub mod`) is the load-bearing part; verify it explicitly.
+4. When edits to the same file keep "not landing," re-Read immediately before each
+   edit and confirm the change with a grep AFTER — the file-state race is real.
