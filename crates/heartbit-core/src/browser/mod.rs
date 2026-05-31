@@ -18,9 +18,11 @@
 pub mod distill;
 pub mod guard;
 pub mod harness;
+pub mod settle;
 pub mod verify;
 
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
 pub use guard::DomainAllowlistGuard;
 pub use harness::ReliableInteractionTool;
+pub use settle::{Probe, SettleConfig, SettleOutcome, parse_dom_ready, settle};
 pub use verify::{ActionEffect, SnapshotSignature, diff, signature};
