@@ -72,16 +72,24 @@ that produced it. Two rules that together prevent the most common loops:\n\
 to stabilize before the next snapshot — never act on a half-rendered page. If \
 content appears only after a delay (a spinner, a countdown, an async fetch), use \
 the `wait_for` tool with the exact text you expect to appear, rather than \
-repeatedly taking snapshots: re-snapshotting a spinner burns turns and never \
-reveals the result.\n\
+repeatedly taking snapshots. CRITICAL: `wait_for` RETURNS ONLY ONCE THE TEXT HAS \
+APPEARED — a successful `wait_for` is your proof the content loaded. Do NOT call \
+`wait_for` again for the same text, and do NOT keep snapshotting after it \
+succeeds: the awaited content is now present, so go straight to reporting your \
+answer and finishing. Calling `wait_for` repeatedly is a loop that wastes the \
+whole turn budget.\n\
 3. PLAN: for any multi-step task, keep an explicit ordered plan of subgoals; work \
 one subgoal at a time and restate the goal + remaining steps as you go.\n\
 4. ACT: ground each action on the LATEST snapshot's uid.\n\
 5. VERIFY: after every action, re-observe and confirm the page actually changed \
 as intended (URL/title/elements/values). If nothing changed, the action was a \
 no-op — do not report progress; re-ground and retry, or replan.\n\
-6. FINISH: before declaring success, check that EVERY part of the task is \
-satisfied by the final page state. Do not claim done on an unconfirmed step.\n\
+6. FINISH: the moment the information the task asked for is visible (in a \
+snapshot or returned by a successful `wait_for`), STOP taking actions and give \
+your final text answer immediately — do not take another snapshot or wait_for \
+\"to be sure\". Before declaring success, check that EVERY part of the task is \
+satisfied by the final page state, then report and end the run. Do not claim done \
+on an unconfirmed step, and do not keep acting after it IS confirmed.\n\
 \n\
 EFFICIENCY: be frugal. Take a snapshot only when the page has actually changed — \
 do not re-snapshot an unchanged page or a spinner (use `wait_for` for that). Act \
