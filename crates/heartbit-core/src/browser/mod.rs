@@ -15,6 +15,7 @@
 //! - B2+: stale-uid retry, post-action verification, settle, replan-loop,
 //!   completion judge, browser guardrails. (See the spec.)
 
+pub mod bench;
 pub mod builder;
 pub mod confirm;
 pub mod distill;
@@ -26,6 +27,7 @@ pub mod plan;
 pub mod settle;
 pub mod verify;
 
+pub use bench::{BenchResult, BenchTask, Oracle, run_bench, scorecard};
 pub use builder::{
     BROWSER_SYSTEM_PROMPT, BrowserAgentBuilder, browser_guardrails, wrap_browser_tools,
 };
