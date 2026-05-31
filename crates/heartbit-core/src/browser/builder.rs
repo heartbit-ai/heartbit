@@ -58,7 +58,12 @@ Follow this loop and these invariants:\n\
 \n\
 1. OBSERVE: take_snapshot before acting. A `uid` is only valid in the snapshot \
 that produced it — never reuse a `uid` across an action that changes the page; \
-re-snapshot first.\n\
+re-snapshot first. CRITICAL: never call take_snapshot twice in a row. One \
+snapshot per observation is enough — once you have it you MUST take an action \
+(click/fill/fill_form/wait_for/navigate) before observing again. If the snapshot \
+already shows the element you need (a Start/Submit button, a field), act on it \
+immediately; do not re-snapshot to double-check. Consecutive snapshots make no \
+progress and waste the turn budget.\n\
 2. SETTLE: after navigating or any action that loads content, wait for the page \
 to stabilize before the next snapshot — never act on a half-rendered page. If \
 content appears only after a delay (a spinner, a countdown, an async fetch), use \
@@ -137,6 +142,10 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     /// If non-empty, keep ONLY tools whose name is in this set (token control —
     /// fewer tool definitions re-sent every turn). Empty = keep all.
     tool_allow: Vec<String>,
+    /// Optional session pruning: shrink OLD tool results (stale snapshots, whose
+    /// `uid`s are dead after a navigation anyway) to head+tail while preserving
+    /// the task + recent results. Token control for long multi-page runs.
+    session_prune: Option<crate::agent::pruner::SessionPruneConfig>,
     /// Whether to distill snapshot tool output before it re-enters context.
     distill_enabled: bool,
     /// Distillation tuning (exposed for the caller's observe step).
@@ -160,6 +169,7 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             max_turns: None,
             chrome_executable: None,
             on_event: None,
+            session_prune: None,
             tool_allow: Vec::new(),
             distill_enabled: true,
             distill: DistillConfig::default(),
@@ -234,6 +244,17 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         self
     }
 
+    /// Prune OLD tool results (stale page snapshots, whose `uid`s are dead after a
+    /// navigation anyway) to a head+tail summary, keeping the task and most recent
+    /// results at full fidelity. The dominant token cost on long multi-page runs
+    /// is re-sending every past snapshot each turn; this bounds it. Safe for
+    /// extraction tasks — the reported value lives in a recent (preserved)
+    /// snapshot. `None` (default) keeps full history.
+    pub fn session_prune(mut self, config: crate::agent::pruner::SessionPruneConfig) -> Self {
+        self.session_prune = Some(config);
+        self
+    }
+
     /// Enable/disable snapshot distillation of tool output (default: enabled).
     /// Distillation drops redundant echoed `StaticText` while preserving every
     /// interactive `uid`, shrinking what re-enters context each turn.
@@ -293,6 +314,9 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         }
         if let Some(cb) = self.on_event {
             b = b.on_event(cb);
+        }
+        if let Some(prune) = self.session_prune {
+            b = b.session_prune_config(prune);
         }
         b.build()
     }

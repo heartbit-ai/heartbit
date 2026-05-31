@@ -181,12 +181,21 @@ pub async fn run_bench<P: LlmProvider>(
             }
         });
 
+        // Bound O(n^2) history growth on long multi-page runs: prune OLD snapshots
+        // to head+tail, keep task + recent 3 results full. Safe for the extraction
+        // task (the reported value is in a recent, preserved snapshot).
+        let prune = crate::agent::pruner::SessionPruneConfig {
+            keep_recent_n: 3,
+            pruned_tool_result_max_bytes: 256,
+            preserve_task: true,
+        };
         match BrowserAgentBuilder::new(Arc::clone(&provider))
             .name(task.name.clone())
             .allow_hosts(task.allow_hosts.clone())
             .max_turns(task.max_turns)
             .tools_allow(task.tools.clone())
             .on_event(on_event)
+            .session_prune(prune)
             .build_with_tools(tools.clone())
         {
             Err(e) => r.error = Some(format!("build: {e}")),
