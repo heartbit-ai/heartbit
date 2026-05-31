@@ -537,8 +537,9 @@ mod tests {
         let (key, tools, suite, attempts) = live_setup().await;
         // Model override so this same test benches any OpenRouter model:
         // BENCH_MODEL=z-ai/glm-4.6 cargo test ... -- --ignored --nocapture
+        // Default = deepseek-v3.2 (the model that cleared 4/4 in the matrix).
         let model =
-            std::env::var("BENCH_MODEL").unwrap_or_else(|_| "moonshotai/kimi-k2-0905".to_string());
+            std::env::var("BENCH_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v3.2".to_string());
         let provider = Arc::new(crate::OpenRouterProvider::new(key, model));
         let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
         eprintln!("\n{}", scorecard(&results));
@@ -566,10 +567,16 @@ mod tests {
     #[ignore = "live: needs OpenRouter key + spawns real Chrome; runs the suite per model"]
     async fn live_model_matrix_benchmark() {
         let (key, tools, suite, attempts) = live_setup().await;
+        // Default field: DeepSeek-v3.2 first (the 4/4 leader), then strong agentic
+        // Chinese-lab models, then the two frontier models usable on this account
+        // (OpenAI 400s — its 128k context cap is exceeded by browser snapshots).
+        // All slugs HTTP-probed (200) before being listed. Override with
+        // BENCH_MODELS="a,b,c".
         let models: Vec<String> = std::env::var("BENCH_MODELS")
             .unwrap_or_else(|_| {
-                "moonshotai/kimi-k2-0905,z-ai/glm-4.6,deepseek/deepseek-v3.2,\
-                 qwen/qwen3-235b-a22b-2507,minimax/minimax-m2"
+                "deepseek/deepseek-v3.2,moonshotai/kimi-k2-0905,z-ai/glm-4.6,\
+                 qwen/qwen3-235b-a22b-2507,minimax/minimax-m2,\
+                 google/gemini-2.5-pro,x-ai/grok-4.3"
                     .to_string()
             })
             .split(',')
