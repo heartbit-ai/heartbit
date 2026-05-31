@@ -10,8 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Error;
+use crate::tool::Tool;
+use crate::tool::mcp::McpClient;
 
 /// A bundled MCP server preset.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,6 +89,35 @@ pub fn check_preset_env(preset: &McpPreset) -> HashMap<String, bool> {
         .iter()
         .map(|key| (key.clone(), std::env::var(key).is_ok()))
         .collect()
+}
+
+/// Connect to a bundled MCP preset over stdio and return its tools, ready for
+/// [`AgentRunnerBuilder::tools`](crate::AgentRunnerBuilder::tools) or
+/// [`WorkflowCtxBuilder::base_tools`](crate::WorkflowCtxBuilder::base_tools).
+///
+/// This is the one-call bridge from a preset name to a usable tool set: it
+/// resolves the preset, forwards any of its `env_keys` that are present in the
+/// process environment to the spawned server, performs the MCP handshake, and
+/// stamps the discovered tools as `Arc<dyn Tool>`. Missing `env_keys` are simply
+/// omitted — the server decides whether they are required.
+///
+/// The returned tools own the server subprocess (via a shared transport), so the
+/// child process lives as long as any tool is held and is killed on drop.
+///
+/// # Security
+///
+/// When combining these with trusted builtins, register the builtins **first**
+/// (`builtins ++ mcp_tools`) so a hostile MCP server cannot shadow a trusted
+/// builtin name (first-wins de-duplication in the runner).
+pub async fn connect_preset(name: &str) -> Result<Vec<Arc<dyn Tool>>, Error> {
+    let preset = resolve_preset(name)?;
+    let env: HashMap<String, String> = preset
+        .env_keys
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
+        .collect();
+    let client = McpClient::connect_stdio(&preset.command, &preset.args, &env).await?;
+    Ok(client.into_tools())
 }
 
 #[cfg(test)]

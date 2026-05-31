@@ -178,7 +178,9 @@ pub use tool::mcp::{
     SamplingModelHint, SamplingModelPreferences, SamplingRequest, StaticAuthProvider,
     StaticAuthResolver, TokenExchangeAuthProvider,
 };
-pub use tool::mcp_presets::{McpPreset, check_preset_env, known_presets, resolve_preset};
+pub use tool::mcp_presets::{
+    McpPreset, check_preset_env, connect_preset, known_presets, resolve_preset,
+};
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
 
