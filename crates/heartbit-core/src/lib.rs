@@ -25,6 +25,7 @@ pub mod persona;
 pub mod sandbox;
 #[cfg(unix)]
 pub mod signal;
+pub mod skill;
 pub mod store;
 pub mod template;
 pub mod tool;

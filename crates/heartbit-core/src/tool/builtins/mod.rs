@@ -198,6 +198,12 @@ pub struct BuiltinToolsConfig {
     /// before any I/O, complementing the existing workspace + protected_paths
     /// mechanism and the Linux-only Landlock sandbox.
     pub path_policy: Option<Arc<crate::sandbox::CorePathPolicy>>,
+    /// Explicit, highest-precedence skill directories given to the `skill` tool
+    /// (each holding `<name>/SKILL.md`). These are searched before the
+    /// conventional `.opencode/.claude/skills` walk and are the SAME dirs the
+    /// Level-1 catalog is built from, so the catalog never advertises a skill the
+    /// tool cannot load. Empty (default) = conventional discovery only.
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 /// Sensible default `protected_paths` patterns for filesystem builtins.
@@ -251,6 +257,7 @@ impl Default for BuiltinToolsConfig {
             twitter_credentials: None,
             allowlist: None,
             path_policy: None,
+            skill_dirs: Vec::new(),
         }
     }
 }
@@ -330,7 +337,7 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         Arc::new(websearch::WebSearchTool::new()),
         Arc::new(image_generate::ImageGenerateTool::new()),
         Arc::new(tts::TtsTool::new()),
-        Arc::new(skill::SkillTool::new()),
+        Arc::new(skill::SkillTool::with_dirs(config.skill_dirs.clone())),
     ]);
 
     let todo_tools = todo::todo_tools(config.todo_store);

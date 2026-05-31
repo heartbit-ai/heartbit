@@ -98,6 +98,21 @@ pub fn resolve_agent_config(
         resolved.system_prompt = format!("{}{skills_section}", resolved.system_prompt);
     }
 
+    // Step 3b: Inject the Level-1 skill catalog (progressive disclosure) for any
+    // configured `skill_dirs`. Unlike `skills` (eager full-content injection),
+    // this lists only `name: description` per discovered skill so the model knows
+    // which skills exist and loads each one's body on demand via the `skill` tool.
+    if !config.skill_dirs.is_empty() {
+        let registry = crate::skill::SkillRegistry::discover(&config.skill_dirs);
+        if let Some(section) = registry.system_prompt_section() {
+            resolved.system_prompt = if resolved.system_prompt.is_empty() {
+                section
+            } else {
+                format!("{}\n\n{section}", resolved.system_prompt)
+            };
+        }
+    }
+
     // Step 4: Substitute variables
     let workspace = variables.get("workspace").map(|s| s.as_str());
     let all_vars =
@@ -148,6 +163,7 @@ mod tests {
             builtin_tools: None,
             template: None,
             skills: vec![],
+            skill_dirs: vec![],
         }
     }
 
@@ -251,5 +267,48 @@ mod tests {
 
         assert_eq!(resolved.system_prompt, "I am a legacy agent.");
         assert_eq!(resolved.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn resolve_injects_skill_dir_catalog() {
+        // A skill_dirs entry holding `<name>/SKILL.md` yields a Level-1 catalog
+        // (name: description) in the resolved system prompt — NOT the full body.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("pdf-tool");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pdf-tool\ndescription: Extract text from PDFs. Use for PDF tasks.\n---\n# PDF Tool\n\nSECRET_BODY_MARKER step one.\n",
+        )
+        .unwrap();
+
+        let mut config = test_config("disclosed");
+        config.skill_dirs = vec![tmp.path().to_string_lossy().into_owned()];
+        let resolved = resolve_agent_config(&config, &HashMap::new()).unwrap();
+
+        assert!(
+            resolved
+                .system_prompt
+                .contains("pdf-tool: Extract text from PDFs"),
+            "catalog line missing: {}",
+            resolved.system_prompt
+        );
+        assert!(
+            resolved.system_prompt.contains("`skill` tool"),
+            "should instruct the model to load skills via the skill tool"
+        );
+        // Progressive disclosure: the BODY must NOT be eagerly injected.
+        assert!(
+            !resolved.system_prompt.contains("SECRET_BODY_MARKER"),
+            "skill body must NOT be injected at level 1: {}",
+            resolved.system_prompt
+        );
+    }
+
+    #[test]
+    fn resolve_without_skill_dirs_injects_no_catalog() {
+        let config = test_config("plain");
+        let resolved = resolve_agent_config(&config, &HashMap::new()).unwrap();
+        assert!(!resolved.system_prompt.contains("Available skills"));
     }
 }

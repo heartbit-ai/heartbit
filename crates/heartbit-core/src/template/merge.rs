@@ -176,6 +176,7 @@ pub(super) fn apply_template(config: &AgentConfig, template: &AgentTemplate) -> 
         // Template-only fields: pass through
         template: None,     // Already resolved
         skills: Vec::new(), // Already injected
+        skill_dirs: config.skill_dirs.clone(),
     }
 }
 
@@ -220,6 +221,7 @@ mod tests {
             builtin_tools: None,
             template: None,
             skills: vec![],
+            skill_dirs: vec![],
         }
     }
 

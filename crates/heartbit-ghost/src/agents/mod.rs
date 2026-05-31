@@ -66,6 +66,7 @@ pub(crate) fn stub_recipe(name: &str) -> AgentConfig {
         system_prompt: String::new(),
         template: None,
         skills: Vec::new(),
+        skill_dirs: Vec::new(),
         mcp_servers: Vec::new(),
         a2a_agents: Vec::new(),
         context_strategy: None,
