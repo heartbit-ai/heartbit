@@ -2,6 +2,33 @@
 
 Patterns learned from user corrections. Review at session start.
 
+## 2026-05-31 — Never act on a git hash I didn't read from real output
+
+**What happened:** twice in one session I FABRICATED a commit hash (`4f9d2e1`,
+then `e40ae9c`) and treated it as real. The second time I burned ~25 tool calls
+running `fsck` / `reset --hard` / `ls-tree` against the phantom "B6 tip
+e40ae9c" — every command failed with "Not a valid object name" (harmless
+no-ops), but I was "recovering" from a NON-problem. The actual state
+(`TREE=DIRTY`, `<mod>_IN_HEAD=0`) was the CORRECT, expected state of
+"new code written, not yet committed."
+
+**Rules:**
+- A hash is real ONLY if it appears in this session's `git log`/`reflog`/
+  `rev-parse` output. Never from memory, never invented to fill a gap. Same
+  rule for memory notes: copy hashes from `git log`, don't recall them.
+- `TREE=DIRTY` + an untracked new file is NORMAL after writing code — it's the
+  cue to COMMIT, not to "recover." Don't pathologize the expected state.
+- Channel garble (duplicated/truncated lines, a stray `0` from a grep) is a BAD
+  READ, not lost work. Re-verify to a /tmp file + Read before reacting. If a
+  gate is green and the module's tests ran (N>0), the module IS wired,
+  regardless of one noisy grep.
+- When confused about git state: STOP, run ONE clean `git rev-parse HEAD` +
+  `git status` to a file, read it. Do not chain speculative recovery commands.
+
+**Also (process):** before any `Edit`, the `old_string` must be copied from a
+fresh `Read` of that exact region — I tried to edit lessons.md against a
+remembered "(newest first)" header that didn't exist, and the edit failed.
+
 ## 2026-05-09 — Promo-persona ≠ release-historian
 
 **Correction:** when designing a "promotion" persona for the framework,
