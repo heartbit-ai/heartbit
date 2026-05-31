@@ -69,6 +69,9 @@ pub struct WorkflowCtx {
 struct CtxInner {
     /// Type-erased provider shared by every agent leaf.
     provider: Arc<BoxedProvider>,
+    /// Optional default tool set wired into every agent leaf that does not
+    /// supply its own per-call tools. Shared with nested workflows.
+    base_tools: Option<Arc<Vec<Arc<dyn crate::tool::Tool>>>>,
     /// Global concurrency limiter; permits acquired only at the agent() leaf.
     sem: Arc<Semaphore>,
     /// Monotonic count of agents ever issued (runaway backstop; never
@@ -113,6 +116,7 @@ impl WorkflowCtx {
     pub fn builder(provider: Arc<BoxedProvider>) -> WorkflowCtxBuilder {
         WorkflowCtxBuilder {
             provider,
+            base_tools: None,
             max_concurrency: None,
             max_agents: None,
             budget: None,
@@ -172,6 +176,12 @@ impl WorkflowCtx {
     /// A clone of the shared, type-erased provider for building an agent leaf.
     pub(crate) fn provider(&self) -> Arc<BoxedProvider> {
         Arc::clone(&self.inner.provider)
+    }
+
+    /// The ctx's default tool set (cloned `Vec`), if any. Used by an agent leaf
+    /// that supplies no per-call tools.
+    pub(crate) fn base_tools(&self) -> Option<Vec<Arc<dyn crate::tool::Tool>>> {
+        self.inner.base_tools.as_ref().map(|t| t.as_ref().clone())
     }
 
     /// A clone of the global concurrency limiter; acquired only at the leaf.
@@ -234,6 +244,7 @@ impl WorkflowCtx {
         Ok(WorkflowCtx {
             inner: Arc::new(CtxInner {
                 provider: Arc::clone(&self.inner.provider),
+                base_tools: self.inner.base_tools.clone(),
                 sem: Arc::clone(&self.inner.sem),
                 spawned: Arc::clone(&self.inner.spawned),
                 max_agents: self.inner.max_agents,
@@ -283,6 +294,7 @@ impl WorkflowCtx {
 /// Builder for [`WorkflowCtx`].
 pub struct WorkflowCtxBuilder {
     provider: Arc<BoxedProvider>,
+    base_tools: Option<Arc<Vec<Arc<dyn crate::tool::Tool>>>>,
     max_concurrency: Option<usize>,
     max_agents: Option<u64>,
     budget: Option<Budget>,
@@ -292,6 +304,13 @@ pub struct WorkflowCtxBuilder {
 }
 
 impl WorkflowCtxBuilder {
+    /// Set the default tool set wired into every agent leaf that does not supply
+    /// its own per-call tools (see [`AgentCall::tools`](super::agent::AgentCall::tools)).
+    pub fn base_tools(mut self, tools: Vec<Arc<dyn crate::tool::Tool>>) -> Self {
+        self.base_tools = Some(Arc::new(tools));
+        self
+    }
+
     /// Override the concurrency cap (must be >= 1).
     pub fn max_concurrency(mut self, n: usize) -> Self {
         self.max_concurrency = Some(n);
@@ -372,6 +391,7 @@ impl WorkflowCtxBuilder {
         Ok(WorkflowCtx {
             inner: Arc::new(CtxInner {
                 provider: self.provider,
+                base_tools: self.base_tools,
                 sem: Arc::new(Semaphore::new(max_concurrency)),
                 spawned: Arc::new(AtomicU64::new(0)),
                 max_agents,

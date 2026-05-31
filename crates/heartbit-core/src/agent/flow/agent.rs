@@ -24,6 +24,11 @@ use super::ctx::WorkflowCtx;
 use super::event::WorkflowEvent;
 use super::journal;
 
+/// Max ReAct turns for a tool-using flow agent. A tool-less agent finishes in
+/// one turn; a tool user needs at least a ToolUse turn plus a final-answer turn,
+/// so we give it headroom. (Per-call override is a later refinement.)
+const DEFAULT_TOOL_TURNS: usize = 10;
+
 /// A Rust type an [`agent`] can be forced to produce as validated structured
 /// output via [`AgentCall::schema`]. Implementors supply the JSON Schema the
 /// model's `__respond__` payload is validated against; the payload is then
@@ -50,7 +55,10 @@ pub struct RawJson;
 
 /// Per-call options for an [`agent`] leaf. `#[non_exhaustive]` so later phases
 /// can add fields (schema, model, isolation, …) without breaking callers.
-#[derive(Clone, Default, Debug)]
+///
+/// `Debug` is hand-written because `dyn Tool` is not `Debug`; the tools field is
+/// rendered as a count.
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct AgentOpts {
     /// Display label for events/observability. Defaults to `"agent"`.
@@ -62,6 +70,10 @@ pub struct AgentOpts {
     /// runner injects `__respond__`, validates the payload, and retries on
     /// mismatch. Set indirectly via [`AgentCall::schema`] / [`AgentCall::schema_value`].
     pub schema: Option<Value>,
+    /// Per-call tool set. When `Some`, these tools are wired into the agent
+    /// (overriding the ctx's base tools); when `None`, the ctx base tools (if
+    /// any) are used. Set via [`AgentCall::tools`].
+    pub tools: Option<Vec<Arc<dyn crate::tool::Tool>>>,
 }
 
 /// A fluent, owned builder for one [`agent`] leaf. Created by [`agent`].
@@ -102,6 +114,14 @@ impl<T> AgentCall<T> {
     /// Override the phase this call is grouped under.
     pub fn phase(mut self, phase: impl Into<String>) -> Self {
         self.opts.phase = Some(phase.into());
+        self
+    }
+
+    /// Wire a tool set into this agent, overriding the ctx's base tools. The
+    /// agent can then call these tools during its ReAct loop. (Sub-agents
+    /// inherit tools the way Claude Code's subagents inherit the allowlist.)
+    pub fn tools(mut self, tools: Vec<Arc<dyn crate::tool::Tool>>) -> Self {
+        self.opts.tools = Some(tools);
         self
     }
 
@@ -302,6 +322,11 @@ async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<Ag
     }
     if let Some(schema) = &opts.schema {
         builder = builder.structured_schema(schema.clone());
+    }
+    // Per-call tools override the ctx's base tools; otherwise inherit the base
+    // set (if any). A 2-turn agent (ToolUse then text) needs max_turns > 1.
+    if let Some(tools) = opts.tools.clone().or_else(|| ctx.base_tools()) {
+        builder = builder.tools(tools).max_turns(DEFAULT_TOOL_TURNS);
     }
     let runner = builder.build()?;
     runner.execute(prompt).await
@@ -855,6 +880,175 @@ mod tests {
 
     // AtomicUsize + Ordering are already in scope from this mod's top import.
     use super::super::journal::ResumeMode;
+
+    // -----------------------------------------------------------------------
+    // P5a: tools plumbing
+    // -----------------------------------------------------------------------
+
+    use crate::ExecutionContext;
+    use crate::llm::types::ToolDefinition;
+    use crate::tool::{Tool, ToolOutput};
+
+    /// A tool that records (via an atomic flag) whether it was executed.
+    struct RecordingTool {
+        name: String,
+        invoked: Arc<AtomicUsize>,
+    }
+
+    impl Tool for RecordingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "records that it ran".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+        > {
+            let invoked = Arc::clone(&self.invoked);
+            Box::pin(async move {
+                invoked.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutput::success("recorded"))
+            })
+        }
+    }
+
+    /// Provider: first turn calls `tool_name` via __respond__-style ToolUse, then
+    /// (after the tool result) finishes with plain text. Drives a 2-turn agent so
+    /// the wired tool actually executes.
+    struct CallsToolProvider {
+        tool_name: String,
+        turn: AtomicUsize,
+    }
+
+    impl LlmProvider for CallsToolProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            let content = if turn == 0 {
+                vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: self.tool_name.clone(),
+                    input: serde_json::json!({}),
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]
+            };
+            Ok(CompletionResponse {
+                content,
+                stop_reason: if turn == 0 {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                },
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("calls-tool-mock")
+        }
+    }
+
+    fn tool_ctx(tool_name: &str) -> WorkflowCtx {
+        // max_turns defaults to 1 in make_agent, but the flow leaf builds its own
+        // runner; CallsToolProvider needs 2 turns, so use a ctx that allows it.
+        WorkflowCtx::builder(Arc::new(BoxedProvider::new(CallsToolProvider {
+            tool_name: tool_name.to_string(),
+            turn: AtomicUsize::new(0),
+        })))
+        .build()
+        .expect("build ctx")
+    }
+
+    #[tokio::test]
+    async fn per_call_tools_are_invoked_by_the_agent() {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let tool = Arc::new(RecordingTool {
+            name: "rec".into(),
+            invoked: Arc::clone(&invoked),
+        }) as Arc<dyn Tool>;
+        let ctx = tool_ctx("rec");
+
+        agent(&ctx, "use the tool")
+            .tools(vec![tool])
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "the per-call wired tool must be executed by the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctx_base_tools_are_used_when_no_per_call_tools() {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let tool = Arc::new(RecordingTool {
+            name: "rec".into(),
+            invoked: Arc::clone(&invoked),
+        }) as Arc<dyn Tool>;
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::new(CallsToolProvider {
+            tool_name: "rec".into(),
+            turn: AtomicUsize::new(0),
+        })))
+        .base_tools(vec![tool])
+        .build()
+        .expect("build ctx");
+
+        agent(&ctx, "use the tool").run().await.expect("run ok");
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "ctx base_tools must be used when the call sets no tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_tools_override_base_tools() {
+        // base tool is "base"; per-call tool is "rec"; the LLM calls "rec".
+        // Only the per-call set should be visible -> base tool never runs.
+        let base_invoked = Arc::new(AtomicUsize::new(0));
+        let per_invoked = Arc::new(AtomicUsize::new(0));
+        let base = Arc::new(RecordingTool {
+            name: "base".into(),
+            invoked: Arc::clone(&base_invoked),
+        }) as Arc<dyn Tool>;
+        let per = Arc::new(RecordingTool {
+            name: "rec".into(),
+            invoked: Arc::clone(&per_invoked),
+        }) as Arc<dyn Tool>;
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::new(CallsToolProvider {
+            tool_name: "rec".into(),
+            turn: AtomicUsize::new(0),
+        })))
+        .base_tools(vec![base])
+        .build()
+        .expect("build ctx");
+
+        agent(&ctx, "use rec")
+            .tools(vec![per])
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(per_invoked.load(Ordering::SeqCst), 1, "per-call tool runs");
+        assert_eq!(
+            base_invoked.load(Ordering::SeqCst),
+            0,
+            "base tool must be shadowed by the per-call override"
+        );
+    }
 
     /// Provider that counts how many times the model was actually called, so a
     /// test can prove a journal replay did NOT hit the provider.
