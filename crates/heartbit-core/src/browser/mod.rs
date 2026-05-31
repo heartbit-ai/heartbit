@@ -16,5 +16,7 @@
 //!   completion judge, browser guardrails. (See the spec.)
 
 pub mod distill;
+pub mod harness;
 
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
+pub use harness::ReliableInteractionTool;
