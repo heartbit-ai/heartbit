@@ -84,10 +84,12 @@ pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
 // for discoverability, matching the workflow-agent re-exports above.
 pub use agent::flow;
 pub use agent::flow::agent::{AgentCall, AgentOpts, NoSchema, RawJson, StructuredSchema};
-pub use agent::flow::ctx::{WorkflowCtx, WorkflowCtxBuilder};
+pub use agent::flow::ctx::{ControlBreach, WorkflowCtx, WorkflowCtxBuilder};
 pub use agent::flow::event::{OnWorkflowEvent, PhaseGuard, WorkflowEvent};
+pub use agent::flow::journal::{ResumeMode, RunJournal};
 pub use agent::flow::parallel::BoxThunk;
 pub use agent::flow::pipeline::PipelineBuilder;
+pub use agent::flow::progress::{PhaseProgress, ProgressTracker, RunProgress};
 
 // --- Error re-exports ---
 pub use error::Error;

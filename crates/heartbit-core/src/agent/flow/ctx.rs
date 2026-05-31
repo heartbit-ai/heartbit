@@ -71,14 +71,16 @@ struct CtxInner {
     provider: Arc<BoxedProvider>,
     /// Global concurrency limiter; permits acquired only at the agent() leaf.
     sem: Arc<Semaphore>,
-    /// Monotonic count of agents ever issued (runaway backstop; never decremented).
-    spawned: AtomicU64,
+    /// Monotonic count of agents ever issued (runaway backstop; never
+    /// decremented). `Arc` so a nested workflow shares the same counter.
+    spawned: Arc<AtomicU64>,
     /// Maximum total agents per run.
     max_agents: u64,
     /// Shared hard-ceiling token-equivalent spend pool.
     budget: Budget,
-    /// First run-level limit breach, if any (set-once).
-    control: Mutex<Option<ControlBreach>>,
+    /// First run-level limit breach, if any (set-once). `Arc` so a nested
+    /// workflow's breach is visible on the parent ctx.
+    control: Arc<Mutex<Option<ControlBreach>>>,
     /// Optional resume journal: memoizes agent outputs for deterministic replay.
     journal: Option<Arc<RunJournal>>,
     /// Optional workflow event sink.
@@ -86,8 +88,12 @@ struct CtxInner {
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
     cancel: CancellationToken,
     /// Default phase for subsequently-issued agents. `std` lock: never held
-    /// across `.await` (snapshotted at `AgentCall` construction).
+    /// across `.await` (snapshotted at `AgentCall` construction). NOT shared
+    /// with a nested workflow — each level groups its own agents.
     default_phase: RwLock<Option<Arc<str>>>,
+    /// Nesting depth: 0 for a top-level run, 1 for a `workflow()` child. A
+    /// second level is rejected by [`WorkflowCtx::nested`].
+    depth: u8,
 }
 
 impl std::fmt::Debug for WorkflowCtx {
@@ -119,6 +125,15 @@ impl WorkflowCtx {
     /// Whether the run has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancel.is_cancelled()
+    }
+
+    /// Stop the run: fires the shared cancellation token so in-flight agents
+    /// wind down at their next leaf cancel-check (and combinator tasks abort).
+    /// Idempotent. Restarting a stopped run is done by re-running with a resume
+    /// [`journal`](WorkflowCtxBuilder::journal): completed agents replay, the
+    /// stopped ones run live.
+    pub fn stop(&self) {
+        self.inner.cancel.cancel();
     }
 
     /// A clone of the run's cancellation token (for external pause/stop wiring).
@@ -204,6 +219,33 @@ impl WorkflowCtx {
     /// A clone of the resume journal handle, if journaling is enabled.
     pub(crate) fn journal_arc(&self) -> Option<Arc<RunJournal>> {
         self.inner.journal.clone()
+    }
+
+    /// Create a one-level-deeper child context that **shares** this run's
+    /// provider, concurrency limiter, runaway backstop counter, budget pool,
+    /// breach state, journal, event sink, and cancellation token — but gets a
+    /// fresh default-phase. Rejects a second level with [`Error::Config`].
+    pub(crate) fn nested(&self) -> Result<WorkflowCtx, Error> {
+        if self.inner.depth >= 1 {
+            return Err(Error::Config(
+                "workflow() may nest only one level deep".into(),
+            ));
+        }
+        Ok(WorkflowCtx {
+            inner: Arc::new(CtxInner {
+                provider: Arc::clone(&self.inner.provider),
+                sem: Arc::clone(&self.inner.sem),
+                spawned: Arc::clone(&self.inner.spawned),
+                max_agents: self.inner.max_agents,
+                budget: self.inner.budget.clone(),
+                control: Arc::clone(&self.inner.control),
+                journal: self.inner.journal.clone(),
+                events: self.inner.events.clone(),
+                cancel: self.inner.cancel.clone(),
+                default_phase: RwLock::new(None),
+                depth: self.inner.depth + 1,
+            }),
+        })
     }
 
     /// Record a run-level breach (set-once) and fire run-wide cancellation so
@@ -331,14 +373,15 @@ impl WorkflowCtxBuilder {
             inner: Arc::new(CtxInner {
                 provider: self.provider,
                 sem: Arc::new(Semaphore::new(max_concurrency)),
-                spawned: AtomicU64::new(0),
+                spawned: Arc::new(AtomicU64::new(0)),
                 max_agents,
                 budget: self.budget.unwrap_or_default(),
-                control: Mutex::new(None),
+                control: Arc::new(Mutex::new(None)),
                 journal: self.journal,
                 events: self.events,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),
+                depth: 0,
             }),
         })
     }
@@ -376,5 +419,88 @@ mod tests {
         let ctx = WorkflowCtx::builder(provider()).build().expect("build");
         assert_eq!(ctx.max_agents(), DEFAULT_MAX_AGENTS);
         assert!(!ctx.is_cancelled());
+    }
+
+    // ----- P6: nesting + stop() -----
+
+    fn budgeted(total: u64) -> WorkflowCtx {
+        WorkflowCtx::builder(provider())
+            .budget(total)
+            .build()
+            .expect("build")
+    }
+
+    #[test]
+    fn nested_shares_budget_pool() {
+        let parent = budgeted(1000);
+        let child = parent.nested().expect("nest");
+        // A spend recorded through the child is visible on the parent's budget.
+        child.record_spend(&crate::llm::types::TokenUsage {
+            input_tokens: 30,
+            ..Default::default()
+        });
+        assert_eq!(parent.budget().spent(), 30);
+        assert_eq!(child.budget().spent(), 30);
+    }
+
+    #[test]
+    fn nested_shares_runaway_backstop() {
+        let parent = WorkflowCtx::builder(provider())
+            .max_agents(2)
+            .build()
+            .expect("build");
+        let child = parent.nested().expect("nest");
+        // Two registrations across parent+child exhaust the shared backstop.
+        assert!(parent.register_agent().is_ok()); // prior 0
+        assert!(child.register_agent().is_ok()); // prior 1
+        assert!(child.register_agent().is_err()); // prior 2 >= 2 -> breach
+        // The monotonic counter is shared, not per-ctx.
+        assert_eq!(parent.spawned(), 3);
+        assert_eq!(child.spawned(), 3);
+    }
+
+    #[test]
+    fn child_breach_cancels_parent() {
+        let parent = budgeted(1000);
+        let child = parent.nested().expect("nest");
+        child.record_breach(ControlBreach::AgentBackstop { limit: 5 });
+        // Breach + cancellation propagate to the shared parent ctx.
+        assert!(parent.is_cancelled());
+        assert!(matches!(
+            parent.control_breach(),
+            Some(ControlBreach::AgentBackstop { limit: 5 })
+        ));
+    }
+
+    #[test]
+    fn nesting_is_one_level_only() {
+        let parent = budgeted(1000);
+        let child = parent.nested().expect("first level ok");
+        let grandchild = child.nested();
+        assert!(
+            grandchild.is_err(),
+            "a second nesting level must be rejected"
+        );
+    }
+
+    #[test]
+    fn child_has_independent_default_phase() {
+        let parent = budgeted(1000);
+        parent.swap_default_phase(Some(std::sync::Arc::from("parent-phase")));
+        let child = parent.nested().expect("nest");
+        // The child starts with no default phase of its own.
+        assert!(child.current_phase().is_none());
+        // And setting the child's phase does not leak back to the parent.
+        child.swap_default_phase(Some(std::sync::Arc::from("child-phase")));
+        assert_eq!(parent.current_phase().as_deref(), Some("parent-phase"));
+        assert_eq!(child.current_phase().as_deref(), Some("child-phase"));
+    }
+
+    #[test]
+    fn stop_sets_cancelled() {
+        let ctx = budgeted(1000);
+        assert!(!ctx.is_cancelled());
+        ctx.stop();
+        assert!(ctx.is_cancelled());
     }
 }

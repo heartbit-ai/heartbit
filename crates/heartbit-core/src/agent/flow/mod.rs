@@ -29,6 +29,7 @@ pub mod event;
 pub mod journal;
 pub mod parallel;
 pub mod pipeline;
+pub mod progress;
 
 // Re-export the free functions at the `flow` level so callers write
 // `flow::agent(..)`, `flow::parallel(..)`, etc. A module and a same-named
@@ -39,6 +40,35 @@ pub use ctx::WorkflowCtx;
 pub use event::{log, phase};
 pub use parallel::{parallel, thunk};
 pub use pipeline::pipeline;
+
+/// Run `body` as a nested sub-workflow sharing this run's budget, journal,
+/// concurrency cap, runaway backstop, and cancellation. Exactly **one** level of
+/// nesting is allowed: calling `workflow()` from inside a `body` returns
+/// [`Error::Config`](crate::Error::Config).
+///
+/// The child receives a fresh [`WorkflowCtx`] whose default-phase is independent
+/// of the parent's, but whose limits and journal are the *same shared state*, so
+/// a child's spend counts against the parent budget and a child's breach halts
+/// the whole run.
+///
+/// ```ignore
+/// let summary = workflow(&ctx, "research", |child| async move {
+///     let findings = parallel(&child, finders).await;
+///     agent(&child, summarize(findings)).run().await
+/// }).await?;
+/// ```
+pub async fn workflow<R, F, Fut>(
+    ctx: &WorkflowCtx,
+    _name: impl Into<String>,
+    body: F,
+) -> Result<R, crate::error::Error>
+where
+    F: FnOnce(WorkflowCtx) -> Fut,
+    Fut: std::future::Future<Output = Result<R, crate::error::Error>>,
+{
+    let child = ctx.nested()?;
+    body(child).await
+}
 
 #[cfg(test)]
 mod smoke_tests {
