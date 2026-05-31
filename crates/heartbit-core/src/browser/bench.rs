@@ -567,16 +567,22 @@ mod tests {
     #[ignore = "live: needs OpenRouter key + spawns real Chrome; runs the suite per model"]
     async fn live_model_matrix_benchmark() {
         let (key, tools, suite, attempts) = live_setup().await;
-        // Default field: DeepSeek-v3.2 first (the 4/4 leader), then strong agentic
-        // Chinese-lab models, then the two frontier models usable on this account
-        // (OpenAI 400s — its 128k context cap is exceeded by browser snapshots).
-        // All slugs HTTP-probed (200) before being listed. Override with
+        // Default field: DeepSeek-v3.2 first (the 4/4 leader from the first
+        // matrix), then strong agentic Chinese-lab models, then frontier models.
+        // Every slug was HTTP-probed (200, real completion) before listing —
+        // including OpenAI GPT-5.1 / GPT-4.1, which DO work here (an earlier
+        // "GPT 400/128k-context" claim was wrong: the 400 was a too-small
+        // max_tokens in the probe, not the model). grok-4.3-fast +
+        // gemini-3.1-pro-preview are the current x-ai/google frontier slugs (no
+        // grok-4.1-fast / gemini-3-pro exist on this route). Override with
         // BENCH_MODELS="a,b,c".
         let models: Vec<String> = std::env::var("BENCH_MODELS")
             .unwrap_or_else(|_| {
                 "deepseek/deepseek-v3.2,moonshotai/kimi-k2-0905,z-ai/glm-4.6,\
                  qwen/qwen3-235b-a22b-2507,minimax/minimax-m2,\
-                 google/gemini-2.5-pro,x-ai/grok-4.3"
+                 google/gemini-2.5-pro,google/gemini-3.1-pro-preview,\
+                 x-ai/grok-4.3,x-ai/grok-4.3-fast,\
+                 openai/gpt-5.1,openai/gpt-4.1"
                     .to_string()
             })
             .split(',')
