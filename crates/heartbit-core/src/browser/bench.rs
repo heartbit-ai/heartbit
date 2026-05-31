@@ -285,6 +285,21 @@ async fn run_task_once<P: LlmProvider>(
         r.output_tokens = t.output_tokens;
     }
     r.millis = started.elapsed().as_millis();
+    // Derive cost from the static price table using the FINAL token counts folded
+    // in above. OpenRouter reports no per-call cost (out.estimated_cost_usd is
+    // None), so the price table is the only source — and it must run AFTER the
+    // trace fold, when input/output_tokens are known. Computed on BOTH paths: an
+    // errored (e.g. max-turns) run still burned tokens. A provider-reported cost
+    // (set on the Ok path) survives as the fallback for models absent from the
+    // table.
+    if let Some((pin, pout)) = provider.model_name().and_then(model_price_per_mtok) {
+        r.cost_usd = Some(estimate_cost_usd(
+            r.input_tokens,
+            r.output_tokens,
+            pin,
+            pout,
+        ));
+    }
     r
 }
 
@@ -509,6 +524,10 @@ pub fn hard_suite() -> Vec<BenchTask> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
+    use crate::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+    };
 
     const LOGIN_OK_SNAP: &str = r#"uid=1_0 RootWebArea "The Internet" url="https://the-internet.herokuapp.com/secure"
   uid=1_1 StaticText "You logged into a secure area!"
@@ -952,5 +971,66 @@ mod tests {
             Some((5.0, 25.0))
         );
         assert_eq!(model_price_per_mtok("nonexistent/model"), None);
+    }
+
+    /// A provider whose `model_name()` is in the price table and that reports real
+    /// token usage — lets us assert `run_task_once` derives cost offline, with no
+    /// network or live browser.
+    struct PricedMock;
+    impl LlmProvider for PricedMock {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "the answer is 42".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("qwen/qwen3-235b-a22b-2507")
+        }
+    }
+
+    /// Regression: the per-task cost must be derived from the static price table
+    /// using the REAL token counts (folded from the run trace). The bug was that
+    /// `run_task_once` only set `cost_usd = out.estimated_cost_usd` — `None` for
+    /// OpenRouter — so every agent row in the scorecard printed `-`.
+    #[tokio::test]
+    async fn run_task_once_derives_cost_from_price_table() {
+        let provider = Arc::new(PricedMock);
+        let tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let ctx = ExecutionContext::default();
+        let task = BenchTask {
+            name: "cost".to_string(),
+            difficulty: "easy".to_string(),
+            allow_hosts: vec![],
+            instruction: "say the answer".to_string(),
+            oracle: Oracle::AgentAnswerContains("42".to_string()),
+            max_turns: 1,
+            tools: vec![],
+        };
+        let r = run_task_once(&provider, &tools, None, &ctx, &task).await;
+        // The run must produce token counts (folded from the trace) ...
+        assert!(
+            r.input_tokens > 0,
+            "token counts must be captured from the run (got {})",
+            r.input_tokens
+        );
+        // ... and cost must derive from the price table using THOSE counts — not
+        // stay None (OpenRouter reports no per-call cost).
+        let (pin, pout) = model_price_per_mtok("qwen/qwen3-235b-a22b-2507").unwrap();
+        let expected = estimate_cost_usd(r.input_tokens, r.output_tokens, pin, pout);
+        assert_eq!(
+            r.cost_usd,
+            Some(expected),
+            "cost must derive from the price table using the real token counts"
+        );
+        assert_ne!(r.cost_usd, Some(0.0), "cost must be nonzero for a real run");
     }
 }
