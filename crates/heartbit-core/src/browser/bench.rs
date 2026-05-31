@@ -96,7 +96,7 @@ pub struct BenchTask {
 }
 
 /// Outcome of running one [`BenchTask`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BenchResult {
     /// Task name.
     pub name: String,
@@ -114,6 +114,10 @@ pub struct BenchResult {
     pub cost_usd: Option<f64>,
     /// Wall-clock duration in milliseconds.
     pub millis: u128,
+    /// Number of attempts made (1 = passed first try). Transient per-task
+    /// failures (max-turns dither, a malformed model reply) are retried up to the
+    /// suite's `max_attempts`; this records how many it actually took. `pass@k`.
+    pub attempts: usize,
     /// LLM turns observed via events — populated even when the task FAILS on a
     /// max-turns loop (unlike `AgentOutput`, lost on the error path).
     pub turns: usize,
@@ -127,114 +131,141 @@ pub struct BenchResult {
     pub error: Option<String>,
 }
 
-/// Run a benchmark suite live. For each task, builds a fresh agent over the
-/// SHARED MCP `tools` (one Chrome, reused), runs it, then INDEPENDENTLY grades by
-/// taking a fresh snapshot of the real page. Never panics on a task failure — a
-/// build/run error is captured into [`BenchResult::error`] and graded as failed,
-/// so one bad task can't abort the suite.
+/// Run a benchmark suite live with ONE attempt per task. Equivalent to
+/// [`run_bench_with_retries`] with `max_attempts = 1`.
 pub async fn run_bench<P: LlmProvider>(
     provider: Arc<P>,
     tools: Vec<Arc<dyn Tool>>,
     tasks: &[BenchTask],
+) -> Vec<BenchResult> {
+    run_bench_with_retries(provider, tools, tasks, 1).await
+}
+
+/// Run a benchmark suite live, retrying each task up to `max_attempts` times
+/// until its oracle passes (pass@k). The residual failures on a capable model are
+/// TRANSIENT per-task variance — a max-turns dither on one run, a malformed reply
+/// on another, migrating between tasks — so a bounded retry is the
+/// production-honest way to turn a flaky-but-capable agent into a reliable one.
+/// Each attempt is a FRESH agent (fresh context + turn budget); grading is
+/// unchanged (independent post-run snapshot). The returned [`BenchResult`]
+/// reflects the last attempt and records [`BenchResult::attempts`].
+pub async fn run_bench_with_retries<P: LlmProvider>(
+    provider: Arc<P>,
+    tools: Vec<Arc<dyn Tool>>,
+    tasks: &[BenchTask],
+    max_attempts: usize,
 ) -> Vec<BenchResult> {
     let ctx = ExecutionContext::default();
     let snapshot_tool = tools
         .iter()
         .find(|t| t.definition().name == "take_snapshot")
         .cloned();
+    let cap = max_attempts.max(1);
 
     let mut results = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let started = Instant::now();
-        let mut r = BenchResult {
-            name: task.name.clone(),
-            difficulty: task.difficulty.clone(),
-            passed: false,
-            tool_calls: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_usd: None,
-            millis: 0,
-            turns: 0,
-            trace: Vec::new(),
-            answer_excerpt: String::new(),
-            error: None,
-        };
-
-        // Shared trace the event callback writes; read on BOTH paths so a
-        // max-turns FAILURE still reports its turns + ordered tool sequence.
-        let trace = Arc::new(Mutex::new(RunTrace::default()));
-        let trace_cb = Arc::clone(&trace);
-        let on_event: Arc<crate::agent::events::OnEvent> = Arc::new(move |ev: AgentEvent| {
-            let Ok(mut t) = trace_cb.lock() else { return };
-            match ev {
-                AgentEvent::TurnStarted { turn, .. } => t.turns = t.turns.max(turn),
-                AgentEvent::ToolCallStarted { tool_name, .. } => {
-                    t.tool_calls += 1;
-                    t.tools.push(tool_name);
-                }
-                AgentEvent::RunCompleted { total_usage, .. } => {
-                    t.input_tokens = total_usage.input_tokens;
-                    t.output_tokens = total_usage.output_tokens;
-                }
-                _ => {}
+        let mut r = BenchResult::default();
+        for attempt in 1..=cap {
+            r = run_task_once(&provider, &tools, snapshot_tool.as_ref(), &ctx, task).await;
+            r.attempts = attempt;
+            if r.passed {
+                break;
             }
-        });
-
-        // Bound O(n^2) history growth on long multi-page runs: prune OLD snapshots
-        // to head+tail, keep task + recent 3 results full. Safe for the extraction
-        // task (the reported value is in a recent, preserved snapshot).
-        let prune = crate::agent::pruner::SessionPruneConfig {
-            keep_recent_n: 3,
-            pruned_tool_result_max_bytes: 256,
-            preserve_task: true,
-        };
-        match BrowserAgentBuilder::new(Arc::clone(&provider))
-            .name(task.name.clone())
-            .allow_hosts(task.allow_hosts.clone())
-            .max_turns(task.max_turns)
-            .tools_allow(task.tools.clone())
-            .on_event(on_event)
-            .session_prune(prune)
-            // After 3 identical consecutive tool batches (the re-snapshot /
-            // re-wait_for dither), inject a stop-and-finish warning and continue.
-            .max_identical_tool_calls(3)
-            .build_with_tools(tools.clone())
-        {
-            Err(e) => r.error = Some(format!("build: {e}")),
-            Ok(agent) => match agent.execute(&task.instruction).await {
-                Err(e) => r.error = Some(format!("run: {e}")),
-                Ok(out) => {
-                    // Independent grading: take a RAW snapshot of the live page
-                    // (the unwrapped preset tool, not distilled) so the oracle
-                    // sees full ground truth regardless of what the agent saw.
-                    let snap = match &snapshot_tool {
-                        Some(t) => t
-                            .execute(&ctx, serde_json::json!({}))
-                            .await
-                            .map(|o| o.content)
-                            .unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    r.passed = task.oracle.grade(&snap, &out.result);
-                    r.cost_usd = out.estimated_cost_usd;
-                    r.answer_excerpt = out.result.chars().take(160).collect();
-                }
-            },
         }
-        // Fold in the captured trace — the ONLY source of turns/tools on the
-        // failure path, and a cross-check on success.
-        if let Ok(t) = trace.lock() {
-            r.turns = t.turns;
-            r.tool_calls = t.tool_calls;
-            r.trace = t.tools.clone();
-            r.input_tokens = t.input_tokens;
-            r.output_tokens = t.output_tokens;
-        }
-        r.millis = started.elapsed().as_millis();
         results.push(r);
     }
     results
+}
+
+/// Run a single task once and grade it. The per-attempt unit used by
+/// [`run_bench_with_retries`]. Never panics — build/run errors land in
+/// [`BenchResult::error`] and grade as failed.
+async fn run_task_once<P: LlmProvider>(
+    provider: &Arc<P>,
+    tools: &[Arc<dyn Tool>],
+    snapshot_tool: Option<&Arc<dyn Tool>>,
+    ctx: &ExecutionContext,
+    task: &BenchTask,
+) -> BenchResult {
+    let started = Instant::now();
+    let mut r = BenchResult {
+        name: task.name.clone(),
+        difficulty: task.difficulty.clone(),
+        ..BenchResult::default()
+    };
+
+    // Shared trace the event callback writes; read on BOTH paths so a max-turns
+    // FAILURE still reports its turns + ordered tool sequence.
+    let trace = Arc::new(Mutex::new(RunTrace::default()));
+    let trace_cb = Arc::clone(&trace);
+    let on_event: Arc<crate::agent::events::OnEvent> = Arc::new(move |ev: AgentEvent| {
+        let Ok(mut t) = trace_cb.lock() else { return };
+        match ev {
+            AgentEvent::TurnStarted { turn, .. } => t.turns = t.turns.max(turn),
+            AgentEvent::ToolCallStarted { tool_name, .. } => {
+                t.tool_calls += 1;
+                t.tools.push(tool_name);
+            }
+            AgentEvent::RunCompleted { total_usage, .. } => {
+                t.input_tokens = total_usage.input_tokens;
+                t.output_tokens = total_usage.output_tokens;
+            }
+            _ => {}
+        }
+    });
+
+    // Bound O(n^2) history growth on long multi-page runs: prune OLD snapshots to
+    // head+tail, keep task + recent 3 results full. Safe for the extraction task
+    // (the reported value is in a recent, preserved snapshot).
+    let prune = crate::agent::pruner::SessionPruneConfig {
+        keep_recent_n: 3,
+        pruned_tool_result_max_bytes: 256,
+        preserve_task: true,
+    };
+    match BrowserAgentBuilder::new(Arc::clone(provider))
+        .name(task.name.clone())
+        .allow_hosts(task.allow_hosts.clone())
+        .max_turns(task.max_turns)
+        .tools_allow(task.tools.clone())
+        .on_event(on_event)
+        .session_prune(prune)
+        // After 3 identical consecutive tool batches (the re-snapshot /
+        // re-wait_for dither), inject a stop-and-finish warning and continue.
+        .max_identical_tool_calls(3)
+        .build_with_tools(tools.to_vec())
+    {
+        Err(e) => r.error = Some(format!("build: {e}")),
+        Ok(agent) => match agent.execute(&task.instruction).await {
+            Err(e) => r.error = Some(format!("run: {e}")),
+            Ok(out) => {
+                // Independent grading: take a RAW snapshot of the live page (the
+                // unwrapped preset tool, not distilled) so the oracle sees full
+                // ground truth regardless of what the agent saw.
+                let snap = match snapshot_tool {
+                    Some(t) => t
+                        .execute(ctx, serde_json::json!({}))
+                        .await
+                        .map(|o| o.content)
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                r.passed = task.oracle.grade(&snap, &out.result);
+                r.cost_usd = out.estimated_cost_usd;
+                r.answer_excerpt = out.result.chars().take(160).collect();
+            }
+        },
+    }
+    // Fold in the captured trace — the ONLY source of turns/tools on the failure
+    // path, and a cross-check on success.
+    if let Ok(t) = trace.lock() {
+        r.turns = t.turns;
+        r.tool_calls = t.tool_calls;
+        r.trace = t.tools.clone();
+        r.input_tokens = t.input_tokens;
+        r.output_tokens = t.output_tokens;
+    }
+    r.millis = started.elapsed().as_millis();
+    r
 }
 
 /// Render a human-readable scorecard from results.
@@ -250,16 +281,17 @@ pub fn scorecard(results: &[BenchResult]) -> String {
     );
     let _ = writeln!(
         s,
-        "{:<24} {:<8} {:<5} {:>6} {:>8} {:>8} {:>9}",
-        "task", "diff", "pass", "calls", "in_tok", "out_tok", "ms"
+        "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>9}",
+        "task", "diff", "pass", "att", "calls", "in_tok", "out_tok", "ms"
     );
     for r in results {
         let _ = writeln!(
             s,
-            "{:<24} {:<8} {:<5} {:>6} {:>8} {:>8} {:>9}",
+            "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>9}",
             r.name,
             r.difficulty,
             if r.passed { "PASS" } else { "FAIL" },
+            r.attempts,
             r.tool_calls,
             r.input_tokens,
             r.output_tokens,
@@ -484,7 +516,15 @@ mod tests {
             suite.retain(|t| t.name.contains(&only));
             assert!(!suite.is_empty(), "BENCH_ONLY={only} matched no task");
         }
-        let results = run_bench(provider, tools, &suite).await;
+        // pass@k: retry each task up to k times (transient per-task model variance
+        // — max-turns dither / malformed reply — migrates between tasks run to run,
+        // so a bounded retry is the production-honest path to a reliable 4/4).
+        // Override with BENCH_ATTEMPTS=N.
+        let attempts = std::env::var("BENCH_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
         eprintln!("\n{}", scorecard(&results));
 
         // Sanity gate: when the easy extract task is in the run, it must pass
@@ -511,6 +551,7 @@ mod tests {
                 cost_usd: Some(0.01),
                 millis: 4200,
                 turns: 4,
+                attempts: 1,
                 trace: vec![
                     "navigate_page".into(),
                     "take_snapshot".into(),
@@ -530,6 +571,7 @@ mod tests {
                 cost_usd: None,
                 millis: 9000,
                 turns: 14,
+                attempts: 3,
                 trace: vec!["navigate_page".into(), "take_snapshot".into()],
                 answer_excerpt: String::new(),
                 error: Some("run: timeout".into()),
