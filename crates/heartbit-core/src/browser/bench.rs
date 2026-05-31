@@ -581,7 +581,7 @@ mod tests {
                 "deepseek/deepseek-v3.2,moonshotai/kimi-k2-0905,z-ai/glm-4.6,\
                  qwen/qwen3-235b-a22b-2507,minimax/minimax-m2,\
                  google/gemini-2.5-pro,google/gemini-3.1-pro-preview,\
-                 x-ai/grok-4.3,x-ai/grok-4.3-fast,\
+                 x-ai/grok-4.3,x-ai/grok-4.20,\
                  openai/gpt-5.1,openai/gpt-4.1"
                     .to_string()
             })
