@@ -105,6 +105,8 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     extra_guardrails: Vec<Arc<dyn Guardrail>>,
     system_prompt: Option<String>,
     name: Option<String>,
+    max_turns: Option<usize>,
+    chrome_executable: Option<String>,
     /// Distillation tuning (exposed for the caller's observe step).
     pub distill: DistillConfig,
     /// Settle tuning (exposed for the caller's settle step).
@@ -123,6 +125,8 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             extra_guardrails: Vec::new(),
             system_prompt: None,
             name: None,
+            max_turns: None,
+            chrome_executable: None,
             distill: DistillConfig::default(),
             settle: SettleConfig::default(),
             confirm: ConfirmPolicy::default(),
@@ -156,6 +160,24 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
     /// Set the agent name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Bound the ReAct loop: the agent stops after `max_turns` LLM turns. A
+    /// browser agent should always cap this — an unbounded loop on a live site is
+    /// a cost and safety hazard. Left unset, the underlying `AgentRunner` default
+    /// applies.
+    pub fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = Some(max_turns);
+        self
+    }
+
+    /// Point chrome-devtools-mcp at a specific Chrome binary (passed as
+    /// `--executable-path`). Set this when Chrome auto-detection fails (e.g. some
+    /// CI/sandbox environments) or Chrome is installed at a non-standard path.
+    /// Only affects [`Self::connect`]; ignored by [`Self::build_with_tools`].
+    pub fn chrome_executable(mut self, path: impl Into<String>) -> Self {
+        self.chrome_executable = Some(path.into());
         self
     }
 
@@ -195,14 +217,25 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         if let Some(name) = self.name {
             b = b.name(name);
         }
+        if let Some(mt) = self.max_turns {
+            b = b.max_turns(mt);
+        }
         b.build()
     }
 
     /// Connect the bundled `chrome-devtools` MCP preset (spawns headless Chrome),
     /// then assemble the agent. The thin async shell over [`Self::build_with_tools`];
-    /// covered by a `#[ignore]` live test since it needs a real browser.
+    /// covered by a `#[ignore]` live test since it needs a real browser. If a
+    /// [`chrome_executable`](Self::chrome_executable) was set, it is forwarded as
+    /// `--executable-path`.
     pub async fn connect(self) -> Result<AgentRunner<P>, Error> {
-        let raw = crate::connect_preset("chrome-devtools").await?;
+        let raw = match &self.chrome_executable {
+            Some(path) => {
+                let extra = vec!["--executable-path".to_string(), path.clone()];
+                crate::connect_preset_with_args("chrome-devtools", &extra).await?
+            }
+            None => crate::connect_preset("chrome-devtools").await?,
+        };
         self.build_with_tools(raw)
     }
 }
@@ -339,5 +372,172 @@ mod tests {
             .system_prompt("custom instructions")
             .build_with_tools(mock_tools());
         assert!(runner.is_ok());
+    }
+
+    #[test]
+    fn builder_accepts_max_turns() {
+        use crate::agent::test_helpers::MockProvider;
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let runner = BrowserAgentBuilder::new(provider)
+            .allow_host("example.com")
+            .max_turns(8)
+            .build_with_tools(mock_tools());
+        assert!(
+            runner.is_ok(),
+            "max_turns must be accepted: {:?}",
+            runner.err()
+        );
+    }
+
+    #[test]
+    fn builder_accepts_chrome_executable() {
+        // chrome_executable only affects connect(); build_with_tools ignores it,
+        // but the builder must accept it without disturbing assembly.
+        use crate::agent::test_helpers::MockProvider;
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let runner = BrowserAgentBuilder::new(provider)
+            .allow_host("example.com")
+            .chrome_executable("/usr/bin/google-chrome")
+            .build_with_tools(mock_tools());
+        assert!(
+            runner.is_ok(),
+            "chrome_executable must be accepted: {:?}",
+            runner.err()
+        );
+    }
+
+    /// Resolve the Chrome binary for live tests: `CHROME_PATH` env override, else
+    /// the standard Linux install if present, else `None` (let chrome-devtools-mcp
+    /// auto-detect). chrome-devtools-mcp's auto-detection fails in some sandboxes,
+    /// so the live tests forward this via the builder's `--executable-path` option.
+    fn live_chrome_path() -> Option<String> {
+        if let Ok(p) = std::env::var("CHROME_PATH") {
+            return Some(p);
+        }
+        let default = "/usr/bin/google-chrome";
+        std::path::Path::new(default)
+            .exists()
+            .then(|| default.to_string())
+    }
+
+    /// LIVE diagnostic: drive heartbit's spawned chrome-devtools MCP directly (no
+    /// LLM) to isolate browser-control from the agent loop. Uses the real
+    /// `connect_preset_with_args` path, forwarding `--executable-path` so Chrome
+    /// connects (auto-detection fails in this sandbox → "-32000 Not connected").
+    #[tokio::test]
+    #[ignore = "live: spawns real Chrome via the chrome-devtools MCP preset"]
+    async fn live_chrome_devtools_tools_drive_browser() {
+        let extra: Vec<String> = match live_chrome_path() {
+            Some(p) => vec!["--executable-path".to_string(), p],
+            None => Vec::new(),
+        };
+        let tools = crate::connect_preset_with_args("chrome-devtools", &extra)
+            .await
+            .expect("connect chrome-devtools preset");
+        let ctx = ExecutionContext::default();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.definition().name == name)
+                .unwrap_or_else(|| panic!("tool {name} not found in preset"))
+                .clone()
+        };
+
+        // Open a page explicitly first (chrome-devtools-mcp launches Chrome here).
+        let new_page = find("new_page");
+        let r = new_page
+            .execute(&ctx, serde_json::json!({ "url": "https://example.com" }))
+            .await
+            .expect("new_page call dispatched");
+        eprintln!(
+            "[diag] new_page is_error={} content={}",
+            r.is_error, r.content
+        );
+        assert!(
+            !r.is_error,
+            "new_page should open example.com, got: {}",
+            r.content
+        );
+
+        // Snapshot the page.
+        let snap = find("take_snapshot");
+        let s = snap
+            .execute(&ctx, serde_json::json!({}))
+            .await
+            .expect("take_snapshot dispatched");
+        eprintln!(
+            "[diag] take_snapshot is_error={} content={}",
+            s.is_error, s.content
+        );
+        assert!(
+            !s.is_error && s.content.contains("Example Domain"),
+            "snapshot should show Example Domain, got: {}",
+            s.content
+        );
+    }
+
+    /// LIVE end-to-end: a real LLM (Kimi K2 via OpenRouter) drives a real headless
+    /// Chrome through the full `BrowserAgentBuilder` stack — connect the
+    /// chrome-devtools MCP preset, navigate to example.com under the domain
+    /// allowlist, and report the page heading. This is the honest end-to-end
+    /// validation the unit tests cannot give: it exercises the actual agent loop
+    /// (observe → act → verify) against a live browser and a live model.
+    ///
+    /// `#[ignore]` — needs network, an OpenRouter key, and spawns Chrome, so it is
+    /// excluded from the default suite. Run explicitly:
+    ///
+    /// ```text
+    /// LLM_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::builder::tests::live_kimi_drives_chrome -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome"]
+    async fn live_kimi_drives_chrome_to_example_domain() {
+        let key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .expect("set LLM_API_KEY or OPENROUTER_API_KEY to run this live test");
+
+        // Kimi K2 (Moonshot) — the latest agentic/tool-calling variant on
+        // OpenRouter. Per the project goal: a strong Chinese agentic model, not
+        // an Anthropic one.
+        let provider = std::sync::Arc::new(crate::OpenRouterProvider::new(
+            key,
+            "moonshotai/kimi-k2-0905",
+        ));
+
+        let mut builder = BrowserAgentBuilder::new(provider)
+            .name("kimi-browser")
+            .allow_host("example.com")
+            .max_turns(10);
+        if let Some(chrome) = live_chrome_path() {
+            builder = builder.chrome_executable(chrome);
+        }
+        let agent = builder
+            .connect()
+            .await
+            .expect("connect chrome-devtools preset + assemble agent");
+
+        let out = agent
+            .execute(
+                "Navigate to https://example.com and tell me the main heading text \
+                 shown on the page.",
+            )
+            .await
+            .expect("agent run should succeed");
+
+        // Structural proof it actually drove the browser (not just answered from
+        // prior knowledge): it must have made at least one tool call.
+        assert!(
+            out.tool_calls_made >= 1,
+            "agent must have used the browser tools, made {} calls; result: {}",
+            out.tool_calls_made,
+            out.result
+        );
+        // Faithful answer proof: example.com's heading is "Example Domain".
+        assert!(
+            out.result.to_lowercase().contains("example domain"),
+            "expected the heading 'Example Domain' in the answer, got: {}",
+            out.result
+        );
     }
 }

@@ -110,13 +110,30 @@ pub fn check_preset_env(preset: &McpPreset) -> HashMap<String, bool> {
 /// (`builtins ++ mcp_tools`) so a hostile MCP server cannot shadow a trusted
 /// builtin name (first-wins de-duplication in the runner).
 pub async fn connect_preset(name: &str) -> Result<Vec<Arc<dyn Tool>>, Error> {
+    connect_preset_with_args(name, &[]).await
+}
+
+/// Like [`connect_preset`], but appends `extra_args` to the preset's command line
+/// before spawning the server.
+///
+/// Use this for server-specific runtime flags the bundled preset cannot hardcode
+/// portably — most importantly `--executable-path <chrome>` for the
+/// `chrome-devtools` preset when Chrome auto-detection fails or Chrome lives at a
+/// non-standard location (the preset stays OS-portable; the caller supplies the
+/// local path). Same env-forwarding and security note as [`connect_preset`].
+pub async fn connect_preset_with_args(
+    name: &str,
+    extra_args: &[String],
+) -> Result<Vec<Arc<dyn Tool>>, Error> {
     let preset = resolve_preset(name)?;
     let env: HashMap<String, String> = preset
         .env_keys
         .iter()
         .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
         .collect();
-    let client = McpClient::connect_stdio(&preset.command, &preset.args, &env).await?;
+    let mut args = preset.args.clone();
+    args.extend(extra_args.iter().cloned());
+    let client = McpClient::connect_stdio(&preset.command, &args, &env).await?;
     Ok(client.into_tools())
 }
 
@@ -151,6 +168,18 @@ mod tests {
         let err = resolve_preset("nonexistent").unwrap_err();
         assert!(err.to_string().contains("unknown MCP preset"));
         assert!(err.to_string().contains("github")); // lists available presets
+    }
+
+    #[tokio::test]
+    async fn connect_preset_with_args_unknown_is_err() {
+        // The arg-appending variant must reject an unknown preset before spawning
+        // anything (no process is launched on the error path). NB: can't use
+        // `.unwrap_err()` here — the Ok type `Vec<Arc<dyn Tool>>` isn't `Debug`.
+        let result = connect_preset_with_args("nonexistent", &["--flag".to_string()]).await;
+        match result {
+            Err(e) => assert!(e.to_string().contains("unknown MCP preset")),
+            Ok(_) => panic!("unknown preset must error, not spawn a server"),
+        }
     }
 
     #[test]
