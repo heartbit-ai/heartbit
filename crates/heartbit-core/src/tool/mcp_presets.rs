@@ -49,6 +49,10 @@ static PRESETS: &[(&str, &str)] = &[
         include_str!("../../mcp-presets/google-calendar.json"),
     ),
     ("jira", include_str!("../../mcp-presets/jira.json")),
+    (
+        "chrome-devtools",
+        include_str!("../../mcp-presets/chrome-devtools.json"),
+    ),
 ];
 
 /// Resolve a preset name to its MCP server configuration.
@@ -120,9 +124,33 @@ mod tests {
     #[test]
     fn known_presets_returns_all() {
         let presets = known_presets();
-        assert_eq!(presets.len(), 10);
+        assert_eq!(presets.len(), 11);
         assert!(presets.contains(&"github"));
         assert!(presets.contains(&"jira"));
+        assert!(presets.contains(&"chrome-devtools"));
+    }
+
+    #[test]
+    fn chrome_devtools_preset_is_bundled() {
+        let p = resolve_preset("chrome-devtools").expect("chrome-devtools preset exists");
+        assert_eq!(p.command, "npx");
+        // Launches the official browser-automation server package.
+        assert!(
+            p.args.iter().any(|a| a.contains("chrome-devtools-mcp")),
+            "args must launch chrome-devtools-mcp: {:?}",
+            p.args
+        );
+        // CI/bot-safe defaults: no UI, throwaway profile that auto-cleans.
+        assert!(
+            p.args.iter().any(|a| a == "--headless"),
+            "expected --headless"
+        );
+        assert!(
+            p.args.iter().any(|a| a == "--isolated"),
+            "expected --isolated"
+        );
+        // Driving a browser needs no secrets.
+        assert!(p.env_keys.is_empty());
     }
 
     #[test]

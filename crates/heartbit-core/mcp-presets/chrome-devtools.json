@@ -1,0 +1,7 @@
+{
+  "name": "Chrome DevTools",
+  "description": "Drive and inspect a live Chrome browser — navigate, click, fill, snapshot the accessibility tree, read network requests, and run performance traces — via the official chrome-devtools MCP server. No credentials required.",
+  "command": "npx",
+  "args": ["-y", "chrome-devtools-mcp@latest", "--headless", "--isolated"],
+  "env_keys": []
+}
