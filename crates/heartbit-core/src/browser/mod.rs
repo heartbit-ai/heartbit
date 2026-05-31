@@ -18,6 +18,7 @@
 pub mod distill;
 pub mod guard;
 pub mod harness;
+pub mod judge;
 pub mod plan;
 pub mod settle;
 pub mod verify;
@@ -25,6 +26,7 @@ pub mod verify;
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
 pub use guard::DomainAllowlistGuard;
 pub use harness::ReliableInteractionTool;
+pub use judge::{CompletionVerdict, build_completion_prompt, parse_completion_verdict};
 pub use plan::{
     Plan, PlanStep, ReplanAction, ReplanBudget, StepOutcome, StepStatus, replan_decision,
 };
