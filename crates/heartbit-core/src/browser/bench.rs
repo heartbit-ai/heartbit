@@ -503,17 +503,13 @@ mod tests {
     /// OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
     ///   browser::bench::tests::live_kimi_browser_benchmark -- --ignored --nocapture
     /// ```
-    #[tokio::test]
-    #[ignore = "live: needs OpenRouter key + spawns real Chrome; hits 3 external sites"]
-    async fn live_kimi_browser_benchmark() {
+    /// Shared live-bench helpers: read the key, the optional task filter, the
+    /// attempt count, and connect Chrome once. Returns `(key, tools, suite,
+    /// attempts)` or panics with a clear message.
+    async fn live_setup() -> (String, Vec<Arc<dyn Tool>>, Vec<BenchTask>, usize) {
         let key = std::env::var("LLM_API_KEY")
             .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
             .expect("set LLM_API_KEY or OPENROUTER_API_KEY to run this live benchmark");
-        let provider = Arc::new(crate::OpenRouterProvider::new(
-            key,
-            "moonshotai/kimi-k2-0905",
-        ));
-
         let chrome = "/usr/bin/google-chrome";
         let extra: Vec<String> = if std::path::Path::new(chrome).exists() {
             vec!["--executable-path".to_string(), chrome.to_string()]
@@ -523,33 +519,96 @@ mod tests {
         let tools = crate::connect_preset_with_args("chrome-devtools", &extra)
             .await
             .expect("connect chrome-devtools preset");
-
-        // Optional `BENCH_ONLY=<substr>` filter for cheap single-task re-runs.
         let mut suite = bench_suite();
         if let Ok(only) = std::env::var("BENCH_ONLY") {
             suite.retain(|t| t.name.contains(&only));
             assert!(!suite.is_empty(), "BENCH_ONLY={only} matched no task");
         }
-        // pass@k: retry each task up to k times (transient per-task model variance
-        // — max-turns dither / malformed reply — migrates between tasks run to run,
-        // so a bounded retry is the production-honest path to a reliable 4/4).
-        // Override with BENCH_ATTEMPTS=N.
         let attempts = std::env::var("BENCH_ATTEMPTS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(3);
+        (key, tools, suite, attempts)
+    }
+
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome; hits 3 external sites"]
+    async fn live_kimi_browser_benchmark() {
+        let (key, tools, suite, attempts) = live_setup().await;
+        // Model override so this same test benches any OpenRouter model:
+        // BENCH_MODEL=z-ai/glm-4.6 cargo test ... -- --ignored --nocapture
+        let model =
+            std::env::var("BENCH_MODEL").unwrap_or_else(|_| "moonshotai/kimi-k2-0905".to_string());
+        let provider = Arc::new(crate::OpenRouterProvider::new(key, model));
         let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
         eprintln!("\n{}", scorecard(&results));
-
-        // Sanity gate: when the easy extract task is in the run, it must pass
-        // (proves the harness works end-to-end). Harder tasks are MEASURED, not
-        // gated — their pass/fail is the benchmark signal in the scorecard above.
         if let Some(easy) = results.iter().find(|r| r.name == "example_extract") {
             assert!(
                 easy.passed,
                 "harness sanity: the easy extract task must pass (see scorecard above)"
             );
         }
+    }
+
+    /// LIVE MODEL MATRIX: run the SAME benchmark suite (same tasks, same harness,
+    /// same pass@k) across several OpenRouter models and print a comparison table.
+    /// This is the fair apples-to-apples model comparison — only the model string
+    /// changes between rows. Default models are strong agentic/tool-calling ones
+    /// (Chinese-lab-first per project direction, no Anthropic); override with a
+    /// comma-separated `BENCH_MODELS`. Chrome is connected ONCE and shared.
+    ///
+    /// ```text
+    /// BENCH_MODELS="moonshotai/kimi-k2-0905,z-ai/glm-4.6,deepseek/deepseek-v3.2" \
+    ///   OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::bench::tests::live_model_matrix_benchmark -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome; runs the suite per model"]
+    async fn live_model_matrix_benchmark() {
+        let (key, tools, suite, attempts) = live_setup().await;
+        let models: Vec<String> = std::env::var("BENCH_MODELS")
+            .unwrap_or_else(|_| {
+                "moonshotai/kimi-k2-0905,z-ai/glm-4.6,deepseek/deepseek-v3.2,\
+                 qwen/qwen3-235b-a22b-2507,minimax/minimax-m2"
+                    .to_string()
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut summary =
+            String::from("\n=== MODEL MATRIX (same tasks, same harness, pass@k) ===\n");
+        for model in &models {
+            let provider = Arc::new(crate::OpenRouterProvider::new(key.clone(), model.clone()));
+            let results =
+                run_bench_with_retries(Arc::clone(&provider), tools.clone(), &suite, attempts)
+                    .await;
+            let passed = results.iter().filter(|r| r.passed).count();
+            let in_tok: u32 = results.iter().map(|r| r.input_tokens).sum();
+            let out_tok: u32 = results.iter().map(|r| r.output_tokens).sum();
+            let per_task: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.name.split('_').next().unwrap_or(&r.name),
+                        if r.passed { "P" } else { "F" }
+                    )
+                })
+                .collect();
+            eprintln!("\n--- {model} ---\n{}", scorecard(&results));
+            summary.push_str(&format!(
+                "{:<34} {}/{}  in={:>7} out={:>6}  [{}]\n",
+                model,
+                passed,
+                results.len(),
+                in_tok,
+                out_tok,
+                per_task.join(" ")
+            ));
+        }
+        eprintln!("{summary}");
     }
 
     #[test]
