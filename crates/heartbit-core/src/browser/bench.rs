@@ -193,6 +193,9 @@ async fn run_task_once<P: LlmProvider>(
         difficulty: task.difficulty.clone(),
         ..BenchResult::default()
     };
+    // The agent's final text answer, if the run returned Ok. Empty on a run error
+    // (e.g. max-turns) — page-state oracles still grade from the live page.
+    let mut answer = String::new();
 
     // Shared trace the event callback writes; read on BOTH paths so a max-turns
     // FAILURE still reports its turns + ordered tool sequence.
@@ -238,22 +241,33 @@ async fn run_task_once<P: LlmProvider>(
         Ok(agent) => match agent.execute(&task.instruction).await {
             Err(e) => r.error = Some(format!("run: {e}")),
             Ok(out) => {
-                // Independent grading: take a RAW snapshot of the live page (the
-                // unwrapped preset tool, not distilled) so the oracle sees full
-                // ground truth regardless of what the agent saw.
-                let snap = match snapshot_tool {
-                    Some(t) => t
-                        .execute(ctx, serde_json::json!({}))
-                        .await
-                        .map(|o| o.content)
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                r.passed = task.oracle.grade(&snap, &out.result);
                 r.cost_usd = out.estimated_cost_usd;
                 r.answer_excerpt = out.result.chars().take(160).collect();
+                answer = out.result;
             }
         },
+    }
+
+    // Grade against the LIVE page even when the agent run errored (e.g. it
+    // reached the goal state but looped past max_turns without cleanly
+    // reporting). For a page-state oracle (FinalPageContains / UrlContains) the
+    // page — not the agent's clean termination — is ground truth; discarding a
+    // reached goal-state just because the loop didn't stop was a grading bug. An
+    // AgentAnswerContains oracle still needs the answer, so it stays failed on
+    // the error path (no answer). The run error remains recorded in `r.error`
+    // for full transparency. Skipped only when the BUILD failed (no browser
+    // state to grade).
+    let build_failed = matches!(&r.error, Some(e) if e.starts_with("build:"));
+    if !build_failed {
+        let snap = match snapshot_tool {
+            Some(t) => t
+                .execute(ctx, serde_json::json!({}))
+                .await
+                .map(|o| o.content)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        r.passed = task.oracle.grade(&snap, &answer);
     }
     // Fold in the captured trace — the ONLY source of turns/tools on the failure
     // path, and a cross-check on success.
