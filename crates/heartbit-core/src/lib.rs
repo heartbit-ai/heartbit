@@ -10,6 +10,7 @@
 // Modules are added one at a time as subsequent tasks move them in.
 pub mod agent;
 pub mod auth;
+pub mod browser;
 pub mod channel;
 pub mod config;
 pub mod error;
@@ -76,6 +77,20 @@ pub use agent::workflow::{
     SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
+
+// --- Dynamic-workflow combinator core (P1) ---
+// The free functions (`agent`, `parallel`, `pipeline`, `phase`, `log`, `thunk`)
+// are reached via the `flow` namespace because `flow::agent` would collide with
+// the `agent` module at the crate root. The data types are re-exported at root
+// for discoverability, matching the workflow-agent re-exports above.
+pub use agent::flow;
+pub use agent::flow::agent::{AgentCall, AgentOpts, NoSchema, RawJson, StructuredSchema};
+pub use agent::flow::ctx::{ControlBreach, WorkflowCtx, WorkflowCtxBuilder};
+pub use agent::flow::event::{OnWorkflowEvent, PhaseGuard, WorkflowEvent};
+pub use agent::flow::journal::{ResumeMode, RunJournal};
+pub use agent::flow::parallel::BoxThunk;
+pub use agent::flow::pipeline::PipelineBuilder;
+pub use agent::flow::progress::{PhaseProgress, ProgressTracker, RunProgress};
 
 // --- Error re-exports ---
 pub use error::Error;
@@ -164,7 +179,10 @@ pub use tool::mcp::{
     SamplingModelHint, SamplingModelPreferences, SamplingRequest, StaticAuthProvider,
     StaticAuthResolver, TokenExchangeAuthProvider,
 };
-pub use tool::mcp_presets::{McpPreset, check_preset_env, known_presets, resolve_preset};
+pub use tool::mcp_presets::{
+    McpPreset, check_preset_env, connect_preset, connect_preset_with_args, known_presets,
+    resolve_preset,
+};
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
 pub use tool::{Tool, ToolOutput, validate_tool_input};
 

@@ -1,0 +1,1036 @@
+//! Live browser-agent benchmark — the "go to a real site and perform actions"
+//! smoke test, as a repeatable evaluation process.
+//!
+//! The unit tests prove navigation works; this proves the *agent loop* works
+//! against live, uncontrolled web pages: a real LLM (Kimi K2 via OpenRouter)
+//! drives real Chrome through the full [`BrowserAgentBuilder`] stack to complete
+//! multi-step interactive tasks (log in, wait for async content, navigate +
+//! extract), and each outcome is graded by an INDEPENDENT deterministic oracle
+//! — we re-snapshot the real page after the run and check a verbatim ground-truth
+//! signal, rather than trusting the agent's own "done" claim (the
+//! Online-Mind2Web / "Illusion of Progress" lesson: agents over-report success).
+//!
+//! Design mirrors the rest of the module: the gradable core ([`Oracle::grade`],
+//! [`scorecard`]) is pure and unit-tested; the live driver ([`run_bench`]) and
+//! the `#[ignore]` live suite are the thin shells over real Chrome + a real model.
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::agent::events::AgentEvent;
+use crate::execution_context::ExecutionContext;
+use crate::llm::LlmProvider;
+use crate::tool::Tool;
+
+use super::builder::BrowserAgentBuilder;
+
+/// State a bench run's event callback writes; read after the run on BOTH paths so
+/// a max-turns FAILURE still reports its turn count + ordered tool sequence
+/// (which `AgentOutput`, lost on the error path, cannot provide). Field names
+/// match the real [`AgentEvent`] variants (verified against agent/events.rs).
+#[derive(Default)]
+struct RunTrace {
+    turns: usize,
+    tool_calls: usize,
+    tools: Vec<String>,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+/// A deterministic success oracle, graded against the REAL post-run page and the
+/// agent's answer — independent of whatever the agent claims it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Oracle {
+    /// The final-page accessibility snapshot must contain this verbatim substring
+    /// (e.g. a success banner that only renders once the task is complete).
+    FinalPageContains(String),
+    /// The agent's text answer must contain this substring (case-insensitive) —
+    /// for extraction tasks where the proof is the value reported, not page state.
+    AgentAnswerContains(String),
+    /// The final page URL must contain this fragment (e.g. `/secure` after login).
+    UrlContains(String),
+}
+
+impl Oracle {
+    /// Grade an outcome. `snapshot` is an independent post-run `take_snapshot` of
+    /// the live page; `answer` is the agent's final text. Pure + unit-testable.
+    pub fn grade(&self, snapshot: &str, answer: &str) -> bool {
+        match self {
+            Oracle::FinalPageContains(s) => snapshot.contains(s.as_str()),
+            Oracle::AgentAnswerContains(s) => answer.to_lowercase().contains(&s.to_lowercase()),
+            Oracle::UrlContains(s) => {
+                snapshot_url(snapshot).is_some_and(|u| u.contains(s.as_str()))
+            }
+        }
+    }
+}
+
+/// Extract the `RootWebArea` `url="..."` value from a snapshot, if present.
+fn snapshot_url(snapshot: &str) -> Option<&str> {
+    let line = snapshot.lines().find(|l| l.contains("RootWebArea"))?;
+    let key = "url=\"";
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// One benchmark task: a natural-language goal for the agent + a deterministic
+/// oracle for grading.
+#[derive(Debug, Clone)]
+pub struct BenchTask {
+    /// Short identifier.
+    pub name: String,
+    /// Difficulty label (easy/medium/hard/hardest) for the scorecard.
+    pub difficulty: String,
+    /// Hosts the agent is allowed to navigate to (deny-by-default otherwise).
+    pub allow_hosts: Vec<String>,
+    /// The task handed to the browser agent.
+    pub instruction: String,
+    /// Deterministic success check.
+    pub oracle: Oracle,
+    /// Turn cap for this task's ReAct loop.
+    pub max_turns: usize,
+    /// Tools the agent is allowed (token control). Empty = all preset tools.
+    pub tools: Vec<String>,
+}
+
+/// Outcome of running one [`BenchTask`].
+#[derive(Debug, Clone, Default)]
+pub struct BenchResult {
+    /// Task name.
+    pub name: String,
+    /// Difficulty label.
+    pub difficulty: String,
+    /// Whether the independent oracle judged the task complete.
+    pub passed: bool,
+    /// Tool calls the agent made.
+    pub tool_calls: usize,
+    /// Input tokens consumed.
+    pub input_tokens: u32,
+    /// Output tokens produced.
+    pub output_tokens: u32,
+    /// Estimated cost in USD, if the provider reported it.
+    pub cost_usd: Option<f64>,
+    /// Wall-clock duration in milliseconds.
+    pub millis: u128,
+    /// Number of attempts made (1 = passed first try). Transient per-task
+    /// failures (max-turns dither, a malformed model reply) are retried up to the
+    /// suite's `max_attempts`; this records how many it actually took. `pass@k`.
+    pub attempts: usize,
+    /// LLM turns observed via events — populated even when the task FAILS on a
+    /// max-turns loop (unlike `AgentOutput`, lost on the error path).
+    pub turns: usize,
+    /// Ordered tool-call sequence the agent issued (e.g. `["navigate_page",
+    /// "take_snapshot", "click", ...]`). Captured via events, so a FAILED task
+    /// still shows what it looped on — the diagnostic the error path discarded.
+    pub trace: Vec<String>,
+    /// First ~160 chars of the agent's answer (for the trace).
+    pub answer_excerpt: String,
+    /// The agent's FULL final answer (for an LLM judge / inspection).
+    pub answer: String,
+    /// The independent post-run page snapshot used for grading (for an LLM judge).
+    pub final_snapshot: String,
+    /// Error, if the build or run failed before grading.
+    pub error: Option<String>,
+}
+
+/// Run a benchmark suite live with ONE attempt per task. Equivalent to
+/// [`run_bench_with_retries`] with `max_attempts = 1`.
+pub async fn run_bench<P: LlmProvider>(
+    provider: Arc<P>,
+    tools: Vec<Arc<dyn Tool>>,
+    tasks: &[BenchTask],
+) -> Vec<BenchResult> {
+    run_bench_with_retries(provider, tools, tasks, 1).await
+}
+
+/// Run a benchmark suite live, retrying each task up to `max_attempts` times
+/// until its oracle passes (pass@k). The residual failures on a capable model are
+/// TRANSIENT per-task variance — a max-turns dither on one run, a malformed reply
+/// on another, migrating between tasks — so a bounded retry is the
+/// production-honest way to turn a flaky-but-capable agent into a reliable one.
+/// Each attempt is a FRESH agent (fresh context + turn budget); grading is
+/// unchanged (independent post-run snapshot). The returned [`BenchResult`]
+/// reflects the last attempt and records [`BenchResult::attempts`].
+pub async fn run_bench_with_retries<P: LlmProvider>(
+    provider: Arc<P>,
+    tools: Vec<Arc<dyn Tool>>,
+    tasks: &[BenchTask],
+    max_attempts: usize,
+) -> Vec<BenchResult> {
+    let ctx = ExecutionContext::default();
+    let snapshot_tool = tools
+        .iter()
+        .find(|t| t.definition().name == "take_snapshot")
+        .cloned();
+    let cap = max_attempts.max(1);
+
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let mut r = BenchResult::default();
+        for attempt in 1..=cap {
+            r = run_task_once(&provider, &tools, snapshot_tool.as_ref(), &ctx, task).await;
+            r.attempts = attempt;
+            if r.passed {
+                break;
+            }
+        }
+        results.push(r);
+    }
+    results
+}
+
+/// Run a single task once and grade it. The per-attempt unit used by
+/// [`run_bench_with_retries`]. Never panics — build/run errors land in
+/// [`BenchResult::error`] and grade as failed.
+async fn run_task_once<P: LlmProvider>(
+    provider: &Arc<P>,
+    tools: &[Arc<dyn Tool>],
+    snapshot_tool: Option<&Arc<dyn Tool>>,
+    ctx: &ExecutionContext,
+    task: &BenchTask,
+) -> BenchResult {
+    let started = Instant::now();
+    let mut r = BenchResult {
+        name: task.name.clone(),
+        difficulty: task.difficulty.clone(),
+        ..BenchResult::default()
+    };
+    // The agent's final text answer, if the run returned Ok. Empty on a run error
+    // (e.g. max-turns) — page-state oracles still grade from the live page.
+    let mut answer = String::new();
+
+    // Shared trace the event callback writes; read on BOTH paths so a max-turns
+    // FAILURE still reports its turns + ordered tool sequence.
+    let trace = Arc::new(Mutex::new(RunTrace::default()));
+    let trace_cb = Arc::clone(&trace);
+    let on_event: Arc<crate::agent::events::OnEvent> = Arc::new(move |ev: AgentEvent| {
+        let Ok(mut t) = trace_cb.lock() else { return };
+        match ev {
+            AgentEvent::TurnStarted { turn, .. } => t.turns = t.turns.max(turn),
+            AgentEvent::ToolCallStarted { tool_name, .. } => {
+                t.tool_calls += 1;
+                t.tools.push(tool_name);
+            }
+            AgentEvent::RunCompleted { total_usage, .. } => {
+                t.input_tokens = total_usage.input_tokens;
+                t.output_tokens = total_usage.output_tokens;
+            }
+            _ => {}
+        }
+    });
+
+    // Bound O(n^2) history growth on long multi-page runs: prune OLD snapshots to
+    // head+tail, keep task + recent 3 results full. Safe for the extraction task
+    // (the reported value is in a recent, preserved snapshot).
+    let prune = crate::agent::pruner::SessionPruneConfig {
+        keep_recent_n: 3,
+        pruned_tool_result_max_bytes: 256,
+        preserve_task: true,
+    };
+    match BrowserAgentBuilder::new(Arc::clone(provider))
+        .name(task.name.clone())
+        .allow_hosts(task.allow_hosts.clone())
+        .max_turns(task.max_turns)
+        .tools_allow(task.tools.clone())
+        .on_event(on_event)
+        .session_prune(prune)
+        // After 3 identical consecutive tool batches (the re-snapshot /
+        // re-wait_for dither), inject a stop-and-finish warning and continue.
+        .max_identical_tool_calls(3)
+        .build_with_tools(tools.to_vec())
+    {
+        Err(e) => r.error = Some(format!("build: {e}")),
+        Ok(agent) => match agent.execute(&task.instruction).await {
+            Err(e) => r.error = Some(format!("run: {e}")),
+            Ok(out) => {
+                r.cost_usd = out.estimated_cost_usd;
+                r.answer_excerpt = out.result.chars().take(160).collect();
+                answer = out.result;
+            }
+        },
+    }
+
+    // Grade against the LIVE page even when the agent run errored (e.g. it
+    // reached the goal state but looped past max_turns without cleanly
+    // reporting). For a page-state oracle (FinalPageContains / UrlContains) the
+    // page — not the agent's clean termination — is ground truth; discarding a
+    // reached goal-state just because the loop didn't stop was a grading bug. An
+    // AgentAnswerContains oracle still needs the answer, so it stays failed on
+    // the error path (no answer). The run error remains recorded in `r.error`
+    // for full transparency. Skipped only when the BUILD failed (no browser
+    // state to grade).
+    let build_failed = matches!(&r.error, Some(e) if e.starts_with("build:"));
+    if !build_failed {
+        let snap = match snapshot_tool {
+            Some(t) => t
+                .execute(ctx, serde_json::json!({}))
+                .await
+                .map(|o| o.content)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        r.passed = task.oracle.grade(&snap, &answer);
+        r.final_snapshot = snap;
+    }
+    r.answer = answer;
+    // Fold in the captured trace — the ONLY source of turns/tools on the failure
+    // path, and a cross-check on success.
+    if let Ok(t) = trace.lock() {
+        r.turns = t.turns;
+        r.tool_calls = t.tool_calls;
+        r.trace = t.tools.clone();
+        r.input_tokens = t.input_tokens;
+        r.output_tokens = t.output_tokens;
+    }
+    r.millis = started.elapsed().as_millis();
+    // Derive cost from the static price table using the FINAL token counts folded
+    // in above. OpenRouter reports no per-call cost (out.estimated_cost_usd is
+    // None), so the price table is the only source — and it must run AFTER the
+    // trace fold, when input/output_tokens are known. Computed on BOTH paths: an
+    // errored (e.g. max-turns) run still burned tokens. A provider-reported cost
+    // (set on the Ok path) survives as the fallback for models absent from the
+    // table.
+    if let Some((pin, pout)) = provider.model_name().and_then(model_price_per_mtok) {
+        r.cost_usd = Some(estimate_cost_usd(
+            r.input_tokens,
+            r.output_tokens,
+            pin,
+            pout,
+        ));
+    }
+    r
+}
+
+/// USD cost of a run from token counts and per-million-token prices. Pure.
+pub fn estimate_cost_usd(
+    input_tokens: u32,
+    output_tokens: u32,
+    in_per_mtok: f64,
+    out_per_mtok: f64,
+) -> f64 {
+    (input_tokens as f64 / 1_000_000.0) * in_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * out_per_mtok
+}
+
+/// Per-million-token (input, output) USD price for a model, or `None` if unknown.
+/// Snapshot of OpenRouter list prices verified 2026-05-31 (copied from the live
+/// /models API, not estimated). Prices drift and vary by sub-provider/region, so
+/// the cost column is an estimate; re-pull for exact billing. Unknown models get
+/// no cost (column shows `-`).
+pub fn model_price_per_mtok(model: &str) -> Option<(f64, f64)> {
+    match model {
+        "deepseek/deepseek-v3.2" => Some((0.2520, 0.3780)),
+        "moonshotai/kimi-k2-0905" => Some((0.6000, 2.5000)),
+        "z-ai/glm-4.6" => Some((0.4286, 1.7143)),
+        "qwen/qwen3-235b-a22b-2507" => Some((0.0710, 0.1000)),
+        "qwen/qwen3-235b-a22b-thinking-2507" => Some((0.0780, 0.3600)),
+        "minimax/minimax-m2" => Some((0.2600, 1.0000)),
+        "google/gemini-2.5-pro" => Some((1.2500, 10.0000)),
+        "google/gemini-3.1-pro-preview" => Some((2.0000, 12.0000)),
+        "x-ai/grok-4.3" => Some((1.2500, 2.5000)),
+        "x-ai/grok-4.20" => Some((1.2500, 2.5000)),
+        "openai/gpt-5.1" => Some((1.2500, 10.0000)),
+        "openai/gpt-4.1" => Some((2.0000, 8.0000)),
+        "anthropic/claude-opus-4.8" => Some((5.0000, 25.0000)),
+        _ => None,
+    }
+}
+
+/// Render a human-readable scorecard from results.
+pub fn scorecard(results: &[BenchResult]) -> String {
+    use std::fmt::Write as _;
+    let passed = results.iter().filter(|r| r.passed).count();
+    let total_cost: f64 = results.iter().filter_map(|r| r.cost_usd).sum();
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "=== Browser-agent benchmark: {}/{} tasks passed (est. ${:.5} total) ===",
+        passed,
+        results.len(),
+        total_cost
+    );
+    let _ = writeln!(
+        s,
+        "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>10} {:>9}",
+        "task", "diff", "pass", "att", "calls", "in_tok", "out_tok", "cost$", "ms"
+    );
+    for r in results {
+        let cost = match r.cost_usd {
+            Some(c) => format!("{c:.5}"),
+            None => "-".to_string(),
+        };
+        let _ = writeln!(
+            s,
+            "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>10} {:>9}",
+            r.name,
+            r.difficulty,
+            if r.passed { "PASS" } else { "FAIL" },
+            r.attempts,
+            r.tool_calls,
+            r.input_tokens,
+            r.output_tokens,
+            cost,
+            r.millis
+        );
+        if let Some(e) = &r.error {
+            let _ = writeln!(s, "    ! {e}");
+        }
+        // The tool trace is the diagnostic for max-turns loops — show it on any
+        // task that captured one; on success it documents the path taken.
+        if !r.trace.is_empty() {
+            let _ = writeln!(s, "    trace: {}", r.trace.join(" -> "));
+        }
+        if !r.answer_excerpt.is_empty() {
+            let _ = writeln!(s, "    answer: {}", r.answer_excerpt.replace('\n', " "));
+        }
+    }
+    s
+}
+
+/// The default tiered benchmark suite: a sanity task plus three genuinely
+/// multi-step interactive tasks — form login, async wait-for-stability, and
+/// multi-page navigation + extraction. Every oracle value was verified verbatim
+/// against the live sites (2026-05-31 recon), so a pass means the agent actually
+/// achieved the goal, not that it claimed to.
+pub fn bench_suite() -> Vec<BenchTask> {
+    vec![
+        // Sanity: navigate + read. Confirms the harness is wired end-to-end.
+        BenchTask {
+            name: "example_extract".into(),
+            difficulty: "easy".into(),
+            allow_hosts: vec!["example.com".into()],
+            instruction: "Go to https://example.com and report the main heading text shown on \
+                           the page."
+                .into(),
+            oracle: Oracle::FinalPageContains("Example Domain".into()),
+            max_turns: 8,
+            tools: vec!["navigate_page".into(), "take_snapshot".into()],
+        },
+        // Form auth: fill two fields, submit, verify the state transition to the
+        // secure area (the success banner only renders after a correct login).
+        BenchTask {
+            name: "the_internet_login".into(),
+            difficulty: "medium".into(),
+            allow_hosts: vec!["the-internet.herokuapp.com".into()],
+            instruction: "Go to https://the-internet.herokuapp.com/login and log in with \
+                           username \"tomsmith\" and password \"SuperSecretPassword!\". Confirm \
+                           you reached the secure area."
+                .into(),
+            oracle: Oracle::FinalPageContains("You logged into a secure area!".into()),
+            max_turns: 22,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "fill".into(),
+                "fill_form".into(),
+                "click".into(),
+            ],
+        },
+        // Async settle: click Start, wait out a 5s spinner, read the revealed text
+        // (not in the initial DOM) — exercises the wait-for-stability discipline.
+        BenchTask {
+            name: "dynamic_loading_settle".into(),
+            difficulty: "hard".into(),
+            allow_hosts: vec!["the-internet.herokuapp.com".into()],
+            instruction: "Go to https://the-internet.herokuapp.com/dynamic_loading/2 , click the \
+                           Start button, wait for the content to finish loading, and report the \
+                           text that appears."
+                .into(),
+            oracle: Oracle::FinalPageContains("Hello World!".into()),
+            max_turns: 18,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "click".into(),
+                "wait_for".into(),
+            ],
+        },
+        // Multi-step navigation + extraction across pages: home -> Travel category
+        // -> the specific book -> read its price. Graded on the reported value.
+        BenchTask {
+            name: "books_travel_price".into(),
+            difficulty: "hardest".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com , open the Travel category, find the \
+                           book titled \"Under the Tuscan Sun\", open its page, and report its \
+                           exact price."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("37.33".into()),
+            max_turns: 24,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "click".into(),
+            ],
+        },
+    ]
+}
+
+/// A HARDER suite for stress-testing a strong model (qwen3-235b is the default).
+/// Each task needs genuine multi-step navigation + cross-element reasoning, not a
+/// single-value read. All oracle values were verified verbatim via `curl` of the
+/// live pages (2026-05-31), so they are deterministic ground truth.
+pub fn hard_suite() -> Vec<BenchTask> {
+    let books = || {
+        vec![
+            "navigate_page".to_string(),
+            "take_snapshot".to_string(),
+            "click".to_string(),
+        ]
+    };
+    vec![
+        // Count: navigate to a specific category, read the "N results" heading.
+        BenchTask {
+            name: "books_mystery_count".into(),
+            difficulty: "hard".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com , open the Mystery category, and \
+                           report exactly how many books are in it (the number of results)."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("32".into()),
+            max_turns: 20,
+            tools: books(),
+        },
+        // Cross-item reasoning: read ALL Travel books' prices, pick the max.
+        BenchTask {
+            name: "books_travel_priciest".into(),
+            difficulty: "hardest".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com , open the Travel category, compare \
+                           the prices of every book in it, and report the TITLE of the most \
+                           expensive one."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("The Great Railway Bazaar".into()),
+            max_turns: 26,
+            tools: books(),
+        },
+        // Whole-catalog figure shown on the home page.
+        BenchTask {
+            name: "books_catalog_total".into(),
+            difficulty: "hard".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com and report the total number of books \
+                           listed in the whole catalogue."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("1000".into()),
+            max_turns: 16,
+            tools: books(),
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+    use crate::llm::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+    };
+
+    const LOGIN_OK_SNAP: &str = r#"uid=1_0 RootWebArea "The Internet" url="https://the-internet.herokuapp.com/secure"
+  uid=1_1 StaticText "You logged into a secure area!"
+  uid=1_2 button "Logout""#;
+
+    const LOGIN_FAIL_SNAP: &str = r#"uid=1_0 RootWebArea "The Internet" url="https://the-internet.herokuapp.com/login"
+  uid=1_1 StaticText "Your username is invalid!"
+  uid=1_2 textbox "Username""#;
+
+    #[test]
+    fn final_page_contains_grades_on_banner() {
+        let o = Oracle::FinalPageContains("You logged into a secure area!".into());
+        assert!(o.grade(LOGIN_OK_SNAP, "I logged in."));
+        assert!(!o.grade(LOGIN_FAIL_SNAP, "I logged in.")); // agent claims success, page says no
+    }
+
+    #[test]
+    fn url_contains_grades_on_redirect() {
+        let o = Oracle::UrlContains("/secure".into());
+        assert!(o.grade(LOGIN_OK_SNAP, ""));
+        assert!(!o.grade(LOGIN_FAIL_SNAP, ""));
+    }
+
+    #[test]
+    fn agent_answer_contains_is_case_insensitive() {
+        let o = Oracle::AgentAnswerContains("£51.77".into());
+        assert!(o.grade("", "The price is £51.77 incl. tax."));
+        assert!(!o.grade("", "I could not find the price."));
+        let o2 = Oracle::AgentAnswerContains("Hello World".into());
+        assert!(o2.grade("", "the revealed text was HELLO WORLD!"));
+    }
+
+    #[test]
+    fn oracle_does_not_trust_agent_over_page() {
+        // The whole point: a lying "done" answer must still FAIL when the page
+        // doesn't show the success signal.
+        let o = Oracle::FinalPageContains("secure area".into());
+        assert!(
+            !o.grade(LOGIN_FAIL_SNAP, "Done! Successfully logged in."),
+            "page is the source of truth, not the agent's claim"
+        );
+    }
+
+    #[test]
+    fn snapshot_url_extracts_root_url() {
+        assert_eq!(
+            snapshot_url(LOGIN_OK_SNAP),
+            Some("https://the-internet.herokuapp.com/secure")
+        );
+        assert_eq!(snapshot_url("uid=1_0 RootWebArea \"x\""), None); // no url=
+        assert_eq!(snapshot_url(""), None);
+    }
+
+    #[test]
+    fn bench_suite_is_wellformed() {
+        let suite = bench_suite();
+        assert_eq!(suite.len(), 4, "tiered suite has 4 tasks");
+        for t in &suite {
+            assert!(!t.name.is_empty());
+            assert!(
+                !t.allow_hosts.is_empty(),
+                "{} must allowlist a host",
+                t.name
+            );
+            assert!(
+                t.instruction.contains("http"),
+                "{} instruction must name a URL",
+                t.name
+            );
+            assert!(t.max_turns >= 4, "{} max_turns too low", t.name);
+            // The task's allowlisted host should appear in its instruction URL.
+            assert!(
+                t.allow_hosts
+                    .iter()
+                    .any(|h| t.instruction.contains(h.as_str())),
+                "{} instruction must target its allowlisted host",
+                t.name
+            );
+        }
+        let diffs: Vec<_> = suite.iter().map(|t| t.difficulty.as_str()).collect();
+        assert!(
+            diffs.contains(&"easy") && diffs.contains(&"hardest"),
+            "suite must span easy..hardest, got {diffs:?}"
+        );
+    }
+
+    /// LIVE: Kimi K2 (OpenRouter) drives real Chrome through the whole benchmark
+    /// suite on real sites, each graded by an independent oracle (a fresh
+    /// post-run snapshot of the real page, not the agent's claim). This is the
+    /// "go to a website and perform actions" smoke test. Run:
+    ///
+    /// ```text
+    /// OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::bench::tests::live_kimi_browser_benchmark -- --ignored --nocapture
+    /// ```
+    /// Shared live-bench helpers: read the key, the optional task filter, the
+    /// attempt count, and connect Chrome once. Returns `(key, tools, suite,
+    /// attempts)` or panics with a clear message.
+    async fn live_setup() -> (String, Vec<Arc<dyn Tool>>, Vec<BenchTask>, usize) {
+        let key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .expect("set LLM_API_KEY or OPENROUTER_API_KEY to run this live benchmark");
+        let chrome = "/usr/bin/google-chrome";
+        let extra: Vec<String> = if std::path::Path::new(chrome).exists() {
+            vec!["--executable-path".to_string(), chrome.to_string()]
+        } else {
+            Vec::new()
+        };
+        let tools = crate::connect_preset_with_args("chrome-devtools", &extra)
+            .await
+            .expect("connect chrome-devtools preset");
+        let mut suite = bench_suite();
+        if let Ok(only) = std::env::var("BENCH_ONLY") {
+            suite.retain(|t| t.name.contains(&only));
+            assert!(!suite.is_empty(), "BENCH_ONLY={only} matched no task");
+        }
+        let attempts = std::env::var("BENCH_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        (key, tools, suite, attempts)
+    }
+
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome; hits 3 external sites"]
+    async fn live_kimi_browser_benchmark() {
+        let (key, tools, suite, attempts) = live_setup().await;
+        // Model override so this same test benches any OpenRouter model:
+        // BENCH_MODEL=z-ai/glm-4.6 cargo test ... -- --ignored --nocapture
+        // Default = qwen3-235b (the best value in the wide matrix: 4/4 at the
+        // lowest cost, ~$0.005/run). Override with BENCH_MODEL=<slug>.
+        let model = std::env::var("BENCH_MODEL")
+            .unwrap_or_else(|_| "qwen/qwen3-235b-a22b-2507".to_string());
+        let provider = Arc::new(crate::OpenRouterProvider::new(key, model));
+        let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
+        eprintln!("\n{}", scorecard(&results));
+        if let Some(easy) = results.iter().find(|r| r.name == "example_extract") {
+            assert!(
+                easy.passed,
+                "harness sanity: the easy extract task must pass (see scorecard above)"
+            );
+        }
+    }
+
+    /// LIVE MODEL MATRIX: run the SAME benchmark suite (same tasks, same harness,
+    /// same pass@k) across several OpenRouter models and print a comparison table.
+    /// This is the fair apples-to-apples model comparison — only the model string
+    /// changes between rows. Default models are strong agentic/tool-calling ones
+    /// (Chinese-lab-first per project direction, no Anthropic); override with a
+    /// comma-separated `BENCH_MODELS`. Chrome is connected ONCE and shared.
+    ///
+    /// ```text
+    /// BENCH_MODELS="moonshotai/kimi-k2-0905,z-ai/glm-4.6,deepseek/deepseek-v3.2" \
+    ///   OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::bench::tests::live_model_matrix_benchmark -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome; runs the suite per model"]
+    async fn live_model_matrix_benchmark() {
+        let (key, tools, suite, attempts) = live_setup().await;
+        // Default field: DeepSeek-v3.2 first (the 4/4 leader from the first
+        // matrix), then strong agentic Chinese-lab models, then frontier models.
+        // Every slug was HTTP-probed (200, real completion) before listing —
+        // including OpenAI GPT-5.1 / GPT-4.1, which DO work here (an earlier
+        // "GPT 400/128k-context" claim was wrong: the 400 was a too-small
+        // max_tokens in the probe, not the model). grok-4.3-fast +
+        // gemini-3.1-pro-preview are the current x-ai/google frontier slugs (no
+        // grok-4.1-fast / gemini-3-pro exist on this route). Override with
+        // BENCH_MODELS="a,b,c".
+        let models: Vec<String> = std::env::var("BENCH_MODELS")
+            .unwrap_or_else(|_| {
+                "deepseek/deepseek-v3.2,moonshotai/kimi-k2-0905,z-ai/glm-4.6,\
+                 qwen/qwen3-235b-a22b-2507,minimax/minimax-m2,\
+                 google/gemini-2.5-pro,google/gemini-3.1-pro-preview,\
+                 x-ai/grok-4.3,x-ai/grok-4.20,\
+                 openai/gpt-5.1,openai/gpt-4.1"
+                    .to_string()
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut summary =
+            String::from("\n=== MODEL MATRIX (same tasks, same harness, pass@k) ===\n");
+        for model in &models {
+            let provider = Arc::new(crate::OpenRouterProvider::new(key.clone(), model.clone()));
+            let results =
+                run_bench_with_retries(Arc::clone(&provider), tools.clone(), &suite, attempts)
+                    .await;
+            let passed = results.iter().filter(|r| r.passed).count();
+            let in_tok: u32 = results.iter().map(|r| r.input_tokens).sum();
+            let out_tok: u32 = results.iter().map(|r| r.output_tokens).sum();
+            let per_task: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}:{}",
+                        r.name.split('_').next().unwrap_or(&r.name),
+                        if r.passed { "P" } else { "F" }
+                    )
+                })
+                .collect();
+            eprintln!("\n--- {model} ---\n{}", scorecard(&results));
+            summary.push_str(&format!(
+                "{:<34} {}/{}  in={:>7} out={:>6}  [{}]\n",
+                model,
+                passed,
+                results.len(),
+                in_tok,
+                out_tok,
+                per_task.join(" ")
+            ));
+        }
+        eprintln!("{summary}");
+    }
+
+    /// Ask an LLM judge (Opus) whether the agent genuinely completed `task`,
+    /// given the final page snapshot + the agent's full answer. Reuses the
+    /// thin-DOM judge prompt + verdict parser from `super::super::judge`. Returns
+    /// (passed, reason, judge_input_tokens, judge_output_tokens). Fail-open toward
+    /// NOT-done (an unparseable/empty judge reply is treated as fail).
+    async fn opus_judge<P: crate::llm::LlmProvider>(
+        judge: &P,
+        task: &str,
+        snapshot: &str,
+        answer: &str,
+    ) -> (bool, String, u32, u32) {
+        use crate::browser::judge::{
+            CompletionVerdict, build_completion_prompt, parse_completion_verdict,
+        };
+        use crate::llm::types::{CompletionRequest, ContentBlock, Message};
+        let prompt = build_completion_prompt(task, &[], &[], snapshot);
+        // CompletionRequest has no Default — fill every field explicitly.
+        let req = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user(format!(
+                "{prompt}\n\n# The agent's reported answer\n{answer}"
+            ))],
+            tools: Vec::new(),
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        match judge.complete(req).await {
+            Err(e) => (false, format!("judge error: {e}"), 0, 0),
+            Ok(resp) => {
+                let text: String = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let (pass, reason) = match parse_completion_verdict(&text) {
+                    Some(CompletionVerdict::Complete) => (true, "COMPLETE".to_string()),
+                    Some(CompletionVerdict::Incomplete(r)) => (false, format!("INCOMPLETE: {r}")),
+                    Some(CompletionVerdict::Uncertain(r)) => (false, format!("UNCERTAIN: {r}")),
+                    None => (false, "unparseable judge reply".to_string()),
+                };
+                (
+                    pass,
+                    reason,
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                )
+            }
+        }
+    }
+
+    /// LIVE: run the default model (qwen3-235b) on the HARDER suite, then have
+    /// Opus (claude-opus-4.8 via OpenRouter — judging only, not driving) grade
+    /// each result against the page + answer. Prints, per task: the deterministic
+    /// oracle verdict, the Opus verdict + reason, qwen run cost, and Opus judge
+    /// cost. The deterministic oracle is ground truth; the Opus judge is the
+    /// nuanced second opinion the user asked for on hard cases.
+    ///
+    /// ```text
+    /// BENCH_MODEL=qwen/qwen3-235b-a22b-2507 JUDGE_MODEL=anthropic/claude-opus-4.8 \
+    ///   OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::bench::tests::live_qwen_hard_opus_judge -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + Chrome; runs hard suite + Opus judge"]
+    async fn live_qwen_hard_opus_judge() {
+        let (key, tools, _suite, attempts) = live_setup().await;
+        let agent_model = std::env::var("BENCH_MODEL")
+            .unwrap_or_else(|_| "qwen/qwen3-235b-a22b-2507".to_string());
+        let judge_model = std::env::var("JUDGE_MODEL")
+            .unwrap_or_else(|_| "anthropic/claude-opus-4.8".to_string());
+
+        let provider = Arc::new(crate::OpenRouterProvider::new(
+            key.clone(),
+            agent_model.clone(),
+        ));
+        let judge = crate::OpenRouterProvider::new(key, judge_model.clone());
+
+        let suite = hard_suite();
+        let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
+        eprintln!("\n=== HARD SUITE: {agent_model} (agent) judged by {judge_model} ===");
+        eprintln!("{}", scorecard(&results));
+
+        let (jp_in, jp_out) = model_price_per_mtok(&judge_model).unwrap_or((0.0, 0.0));
+        let mut judge_in = 0u32;
+        let mut judge_out = 0u32;
+        let mut both_pass = 0usize;
+        for r in &results {
+            let task = suite.iter().find(|t| t.name == r.name);
+            let instr = task.map(|t| t.instruction.as_str()).unwrap_or("");
+            let (jpass, reason, jin, jout) =
+                opus_judge(&judge, instr, &r.final_snapshot, &r.answer).await;
+            judge_in += jin;
+            judge_out += jout;
+            if r.passed && jpass {
+                both_pass += 1;
+            }
+            eprintln!(
+                "{:<24} oracle={} opus={} | {}",
+                r.name,
+                if r.passed { "PASS" } else { "FAIL" },
+                if jpass { "PASS" } else { "FAIL" },
+                reason.chars().take(120).collect::<String>()
+            );
+        }
+        let judge_cost = estimate_cost_usd(judge_in, judge_out, jp_in, jp_out);
+        eprintln!(
+            "\noracle+opus agree-PASS: {}/{}.  Opus judge tokens in={} out={} (~${:.5}).",
+            both_pass,
+            results.len(),
+            judge_in,
+            judge_out,
+            judge_cost
+        );
+    }
+
+    #[test]
+    fn hard_suite_is_wellformed() {
+        let s = hard_suite();
+        assert!(s.len() >= 3, "hard suite has >=3 tasks");
+        for t in &s {
+            assert!(t.instruction.contains("http"), "{} has a URL", t.name);
+            assert!(!t.tools.is_empty(), "{} pins tools", t.name);
+            assert!(t.max_turns >= 8, "{} has headroom", t.name);
+        }
+        // The verified-by-curl ground-truth oracle values are present.
+        let joined: String = s
+            .iter()
+            .map(|t| match &t.oracle {
+                Oracle::AgentAnswerContains(v) => v.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            joined.contains("32")
+                && joined.contains("Great Railway Bazaar")
+                && joined.contains("1000")
+        );
+    }
+
+    #[test]
+    fn scorecard_counts_and_formats() {
+        let results = vec![
+            BenchResult {
+                name: "login".into(),
+                difficulty: "hard".into(),
+                passed: true,
+                tool_calls: 5,
+                input_tokens: 1200,
+                output_tokens: 80,
+                cost_usd: Some(0.01),
+                millis: 4200,
+                turns: 4,
+                attempts: 1,
+                trace: vec![
+                    "navigate_page".into(),
+                    "take_snapshot".into(),
+                    "fill_form".into(),
+                    "click".into(),
+                ],
+                answer_excerpt: "logged in".into(),
+                error: None,
+                ..Default::default()
+            },
+            BenchResult {
+                name: "basket".into(),
+                difficulty: "hardest".into(),
+                passed: false,
+                tool_calls: 9,
+                input_tokens: 3000,
+                output_tokens: 140,
+                cost_usd: None,
+                millis: 9000,
+                turns: 14,
+                attempts: 3,
+                trace: vec!["navigate_page".into(), "take_snapshot".into()],
+                answer_excerpt: String::new(),
+                error: Some("run: timeout".into()),
+                ..Default::default()
+            },
+        ];
+        let card = scorecard(&results);
+        assert!(card.contains("1/2 tasks passed"));
+        assert!(card.contains("login"));
+        assert!(card.contains("basket"));
+        assert!(card.contains("PASS"));
+        assert!(card.contains("FAIL"));
+        assert!(card.contains("! run: timeout"));
+        // The tool trace is the max-turns diagnostic — it must render.
+        assert!(card.contains("trace: navigate_page -> take_snapshot"));
+        // Cost column: priced row shows the value, unpriced shows "-", header +
+        // total present.
+        assert!(card.contains("cost$"), "scorecard has a cost column");
+        assert!(card.contains("0.01000"), "priced row shows its cost");
+        assert!(
+            card.contains("est. $0.01000 total"),
+            "header shows total cost"
+        );
+    }
+
+    #[test]
+    fn estimate_cost_is_tokens_times_price() {
+        // 1M in @ $0.07 + 1M out @ $0.10 = $0.17.
+        let c = estimate_cost_usd(1_000_000, 1_000_000, 0.07, 0.10);
+        assert!((c - 0.17).abs() < 1e-9, "got {c}");
+        // The real qwen3-235b matrix run: 73477 in / 429 out.
+        let q = estimate_cost_usd(73477, 429, 0.071, 0.10);
+        assert!((0.005..0.006).contains(&q), "qwen run ~ $0.0053, got {q}");
+        assert_eq!(estimate_cost_usd(0, 0, 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn price_table_known_and_unknown() {
+        assert_eq!(
+            model_price_per_mtok("qwen/qwen3-235b-a22b-2507"),
+            Some((0.0710, 0.1000))
+        );
+        assert_eq!(
+            model_price_per_mtok("anthropic/claude-opus-4.8"),
+            Some((5.0, 25.0))
+        );
+        assert_eq!(model_price_per_mtok("nonexistent/model"), None);
+    }
+
+    /// A provider whose `model_name()` is in the price table and that reports real
+    /// token usage — lets us assert `run_task_once` derives cost offline, with no
+    /// network or live browser.
+    struct PricedMock;
+    impl LlmProvider for PricedMock {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "the answer is 42".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+        fn model_name(&self) -> Option<&str> {
+            Some("qwen/qwen3-235b-a22b-2507")
+        }
+    }
+
+    /// Regression: the per-task cost must be derived from the static price table
+    /// using the REAL token counts (folded from the run trace). The bug was that
+    /// `run_task_once` only set `cost_usd = out.estimated_cost_usd` — `None` for
+    /// OpenRouter — so every agent row in the scorecard printed `-`.
+    #[tokio::test]
+    async fn run_task_once_derives_cost_from_price_table() {
+        let provider = Arc::new(PricedMock);
+        let tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let ctx = ExecutionContext::default();
+        let task = BenchTask {
+            name: "cost".to_string(),
+            difficulty: "easy".to_string(),
+            allow_hosts: vec![],
+            instruction: "say the answer".to_string(),
+            oracle: Oracle::AgentAnswerContains("42".to_string()),
+            max_turns: 1,
+            tools: vec![],
+        };
+        let r = run_task_once(&provider, &tools, None, &ctx, &task).await;
+        // The run must produce token counts (folded from the trace) ...
+        assert!(
+            r.input_tokens > 0,
+            "token counts must be captured from the run (got {})",
+            r.input_tokens
+        );
+        // ... and cost must derive from the price table using THOSE counts — not
+        // stay None (OpenRouter reports no per-call cost).
+        let (pin, pout) = model_price_per_mtok("qwen/qwen3-235b-a22b-2507").unwrap();
+        let expected = estimate_cost_usd(r.input_tokens, r.output_tokens, pin, pout);
+        assert_eq!(
+            r.cost_usd,
+            Some(expected),
+            "cost must derive from the price table using the real token counts"
+        );
+        assert_ne!(r.cost_usd, Some(0.0), "cost must be nonzero for a real run");
+    }
+}

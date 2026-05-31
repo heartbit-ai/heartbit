@@ -10,8 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::Error;
+use crate::tool::Tool;
+use crate::tool::mcp::McpClient;
 
 /// A bundled MCP server preset.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -49,6 +52,10 @@ static PRESETS: &[(&str, &str)] = &[
         include_str!("../../mcp-presets/google-calendar.json"),
     ),
     ("jira", include_str!("../../mcp-presets/jira.json")),
+    (
+        "chrome-devtools",
+        include_str!("../../mcp-presets/chrome-devtools.json"),
+    ),
 ];
 
 /// Resolve a preset name to its MCP server configuration.
@@ -84,6 +91,52 @@ pub fn check_preset_env(preset: &McpPreset) -> HashMap<String, bool> {
         .collect()
 }
 
+/// Connect to a bundled MCP preset over stdio and return its tools, ready for
+/// [`AgentRunnerBuilder::tools`](crate::AgentRunnerBuilder::tools) or
+/// [`WorkflowCtxBuilder::base_tools`](crate::WorkflowCtxBuilder::base_tools).
+///
+/// This is the one-call bridge from a preset name to a usable tool set: it
+/// resolves the preset, forwards any of its `env_keys` that are present in the
+/// process environment to the spawned server, performs the MCP handshake, and
+/// stamps the discovered tools as `Arc<dyn Tool>`. Missing `env_keys` are simply
+/// omitted — the server decides whether they are required.
+///
+/// The returned tools own the server subprocess (via a shared transport), so the
+/// child process lives as long as any tool is held and is killed on drop.
+///
+/// # Security
+///
+/// When combining these with trusted builtins, register the builtins **first**
+/// (`builtins ++ mcp_tools`) so a hostile MCP server cannot shadow a trusted
+/// builtin name (first-wins de-duplication in the runner).
+pub async fn connect_preset(name: &str) -> Result<Vec<Arc<dyn Tool>>, Error> {
+    connect_preset_with_args(name, &[]).await
+}
+
+/// Like [`connect_preset`], but appends `extra_args` to the preset's command line
+/// before spawning the server.
+///
+/// Use this for server-specific runtime flags the bundled preset cannot hardcode
+/// portably — most importantly `--executable-path <chrome>` for the
+/// `chrome-devtools` preset when Chrome auto-detection fails or Chrome lives at a
+/// non-standard location (the preset stays OS-portable; the caller supplies the
+/// local path). Same env-forwarding and security note as [`connect_preset`].
+pub async fn connect_preset_with_args(
+    name: &str,
+    extra_args: &[String],
+) -> Result<Vec<Arc<dyn Tool>>, Error> {
+    let preset = resolve_preset(name)?;
+    let env: HashMap<String, String> = preset
+        .env_keys
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|val| (key.clone(), val)))
+        .collect();
+    let mut args = preset.args.clone();
+    args.extend(extra_args.iter().cloned());
+    let client = McpClient::connect_stdio(&preset.command, &args, &env).await?;
+    Ok(client.into_tools())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,12 +170,48 @@ mod tests {
         assert!(err.to_string().contains("github")); // lists available presets
     }
 
+    #[tokio::test]
+    async fn connect_preset_with_args_unknown_is_err() {
+        // The arg-appending variant must reject an unknown preset before spawning
+        // anything (no process is launched on the error path). NB: can't use
+        // `.unwrap_err()` here — the Ok type `Vec<Arc<dyn Tool>>` isn't `Debug`.
+        let result = connect_preset_with_args("nonexistent", &["--flag".to_string()]).await;
+        match result {
+            Err(e) => assert!(e.to_string().contains("unknown MCP preset")),
+            Ok(_) => panic!("unknown preset must error, not spawn a server"),
+        }
+    }
+
     #[test]
     fn known_presets_returns_all() {
         let presets = known_presets();
-        assert_eq!(presets.len(), 10);
+        assert_eq!(presets.len(), 11);
         assert!(presets.contains(&"github"));
         assert!(presets.contains(&"jira"));
+        assert!(presets.contains(&"chrome-devtools"));
+    }
+
+    #[test]
+    fn chrome_devtools_preset_is_bundled() {
+        let p = resolve_preset("chrome-devtools").expect("chrome-devtools preset exists");
+        assert_eq!(p.command, "npx");
+        // Launches the official browser-automation server package.
+        assert!(
+            p.args.iter().any(|a| a.contains("chrome-devtools-mcp")),
+            "args must launch chrome-devtools-mcp: {:?}",
+            p.args
+        );
+        // CI/bot-safe defaults: no UI, throwaway profile that auto-cleans.
+        assert!(
+            p.args.iter().any(|a| a == "--headless"),
+            "expected --headless"
+        );
+        assert!(
+            p.args.iter().any(|a| a == "--isolated"),
+            "expected --isolated"
+        );
+        // Driving a browser needs no secrets.
+        assert!(p.env_keys.is_empty());
     }
 
     #[test]

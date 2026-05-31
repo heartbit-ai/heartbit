@@ -145,6 +145,17 @@ pub enum Error {
         limit: u64,
     },
 
+    /// A workflow run hit its runaway agent backstop (total agents per run).
+    ///
+    /// Produced by the dynamic-workflow combinator core when more than `limit`
+    /// agents are issued in a single run. Distinct from [`Self::BudgetExceeded`]
+    /// (which is about tokens); this is a structural guard against runaway loops.
+    #[error("Agent backstop exceeded: limit {limit} agents per run")]
+    AgentBudgetExceeded {
+        /// The configured maximum number of agents per run.
+        limit: u64,
+    },
+
     /// An error in the WebSocket/session channel layer.
     #[error("Channel error: {0}")]
     Channel(String),
