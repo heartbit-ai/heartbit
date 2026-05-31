@@ -59,8 +59,11 @@ Follow this loop and these invariants:\n\
 that produced it — never reuse a `uid` across an action that changes the page; \
 re-snapshot first.\n\
 2. SETTLE: after navigating or any action that loads content, wait for the page \
-to stabilize (document.readyState complete and the DOM quiet) before the next \
-snapshot. Never act on a half-rendered page.\n\
+to stabilize before the next snapshot — never act on a half-rendered page. If \
+content appears only after a delay (a spinner, a countdown, an async fetch), use \
+the `wait_for` tool with the exact text you expect to appear, rather than \
+repeatedly taking snapshots: re-snapshotting a spinner burns turns and never \
+reveals the result.\n\
 3. PLAN: for any multi-step task, keep an explicit ordered plan of subgoals; work \
 one subgoal at a time and restate the goal + remaining steps as you go.\n\
 4. ACT: ground each action on the LATEST snapshot's uid.\n\

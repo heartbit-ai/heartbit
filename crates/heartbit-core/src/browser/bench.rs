@@ -385,21 +385,24 @@ mod tests {
             .await
             .expect("connect chrome-devtools preset");
 
-        let suite = bench_suite();
+        // Optional `BENCH_ONLY=<substr>` filter for cheap single-task re-runs.
+        let mut suite = bench_suite();
+        if let Ok(only) = std::env::var("BENCH_ONLY") {
+            suite.retain(|t| t.name.contains(&only));
+            assert!(!suite.is_empty(), "BENCH_ONLY={only} matched no task");
+        }
         let results = run_bench(provider, tools, &suite).await;
         eprintln!("\n{}", scorecard(&results));
 
-        // Sanity gate: the harness must work end-to-end, so the easy extract task
-        // must pass. The harder tasks are MEASURED, not gated — their pass/fail is
-        // the benchmark signal, printed in the scorecard above.
-        let easy = results
-            .iter()
-            .find(|r| r.name == "example_extract")
-            .expect("easy task ran");
-        assert!(
-            easy.passed,
-            "harness sanity: the easy extract task must pass (see scorecard above)"
-        );
+        // Sanity gate: when the easy extract task is in the run, it must pass
+        // (proves the harness works end-to-end). Harder tasks are MEASURED, not
+        // gated — their pass/fail is the benchmark signal in the scorecard above.
+        if let Some(easy) = results.iter().find(|r| r.name == "example_extract") {
+            assert!(
+                easy.passed,
+                "harness sanity: the easy extract task must pass (see scorecard above)"
+            );
+        }
     }
 
     #[test]
