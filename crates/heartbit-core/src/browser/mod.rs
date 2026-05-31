@@ -15,6 +15,7 @@
 //! - B2+: stale-uid retry, post-action verification, settle, replan-loop,
 //!   completion judge, browser guardrails. (See the spec.)
 
+pub mod builder;
 pub mod confirm;
 pub mod distill;
 pub mod guard;
@@ -25,6 +26,9 @@ pub mod plan;
 pub mod settle;
 pub mod verify;
 
+pub use builder::{
+    BROWSER_SYSTEM_PROMPT, BrowserAgentBuilder, browser_guardrails, wrap_browser_tools,
+};
 pub use confirm::{ActionRisk, ConfirmPolicy, classify_label, label_for_uid};
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
 pub use guard::DomainAllowlistGuard;
