@@ -127,6 +127,10 @@ pub struct BenchResult {
     pub trace: Vec<String>,
     /// First ~160 chars of the agent's answer (for the trace).
     pub answer_excerpt: String,
+    /// The agent's FULL final answer (for an LLM judge / inspection).
+    pub answer: String,
+    /// The independent post-run page snapshot used for grading (for an LLM judge).
+    pub final_snapshot: String,
     /// Error, if the build or run failed before grading.
     pub error: Option<String>,
 }
@@ -268,7 +272,9 @@ async fn run_task_once<P: LlmProvider>(
             None => String::new(),
         };
         r.passed = task.oracle.grade(&snap, &answer);
+        r.final_snapshot = snap;
     }
+    r.answer = answer;
     // Fold in the captured trace — the ONLY source of turns/tools on the failure
     // path, and a cross-check on success.
     if let Ok(t) = trace.lock() {
@@ -282,26 +288,67 @@ async fn run_task_once<P: LlmProvider>(
     r
 }
 
+/// USD cost of a run from token counts and per-million-token prices. Pure.
+pub fn estimate_cost_usd(
+    input_tokens: u32,
+    output_tokens: u32,
+    in_per_mtok: f64,
+    out_per_mtok: f64,
+) -> f64 {
+    (input_tokens as f64 / 1_000_000.0) * in_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * out_per_mtok
+}
+
+/// Per-million-token (input, output) USD price for a model, or `None` if unknown.
+/// Snapshot of OpenRouter list prices verified 2026-05-31 (copied from the live
+/// /models API, not estimated). Prices drift and vary by sub-provider/region, so
+/// the cost column is an estimate; re-pull for exact billing. Unknown models get
+/// no cost (column shows `-`).
+pub fn model_price_per_mtok(model: &str) -> Option<(f64, f64)> {
+    match model {
+        "deepseek/deepseek-v3.2" => Some((0.2520, 0.3780)),
+        "moonshotai/kimi-k2-0905" => Some((0.6000, 2.5000)),
+        "z-ai/glm-4.6" => Some((0.4286, 1.7143)),
+        "qwen/qwen3-235b-a22b-2507" => Some((0.0710, 0.1000)),
+        "qwen/qwen3-235b-a22b-thinking-2507" => Some((0.0780, 0.3600)),
+        "minimax/minimax-m2" => Some((0.2600, 1.0000)),
+        "google/gemini-2.5-pro" => Some((1.2500, 10.0000)),
+        "google/gemini-3.1-pro-preview" => Some((2.0000, 12.0000)),
+        "x-ai/grok-4.3" => Some((1.2500, 2.5000)),
+        "x-ai/grok-4.20" => Some((1.2500, 2.5000)),
+        "openai/gpt-5.1" => Some((1.2500, 10.0000)),
+        "openai/gpt-4.1" => Some((2.0000, 8.0000)),
+        "anthropic/claude-opus-4.8" => Some((5.0000, 25.0000)),
+        _ => None,
+    }
+}
+
 /// Render a human-readable scorecard from results.
 pub fn scorecard(results: &[BenchResult]) -> String {
     use std::fmt::Write as _;
     let passed = results.iter().filter(|r| r.passed).count();
+    let total_cost: f64 = results.iter().filter_map(|r| r.cost_usd).sum();
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "=== Browser-agent benchmark: {}/{} tasks passed ===",
+        "=== Browser-agent benchmark: {}/{} tasks passed (est. ${:.5} total) ===",
         passed,
-        results.len()
+        results.len(),
+        total_cost
     );
     let _ = writeln!(
         s,
-        "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>9}",
-        "task", "diff", "pass", "att", "calls", "in_tok", "out_tok", "ms"
+        "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>10} {:>9}",
+        "task", "diff", "pass", "att", "calls", "in_tok", "out_tok", "cost$", "ms"
     );
     for r in results {
+        let cost = match r.cost_usd {
+            Some(c) => format!("{c:.5}"),
+            None => "-".to_string(),
+        };
         let _ = writeln!(
             s,
-            "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>9}",
+            "{:<24} {:<8} {:<5} {:>4} {:>6} {:>8} {:>8} {:>10} {:>9}",
             r.name,
             r.difficulty,
             if r.passed { "PASS" } else { "FAIL" },
@@ -309,6 +356,7 @@ pub fn scorecard(results: &[BenchResult]) -> String {
             r.tool_calls,
             r.input_tokens,
             r.output_tokens,
+            cost,
             r.millis
         );
         if let Some(e) = &r.error {
@@ -401,6 +449,59 @@ pub fn bench_suite() -> Vec<BenchTask> {
                 "take_snapshot".into(),
                 "click".into(),
             ],
+        },
+    ]
+}
+
+/// A HARDER suite for stress-testing a strong model (qwen3-235b is the default).
+/// Each task needs genuine multi-step navigation + cross-element reasoning, not a
+/// single-value read. All oracle values were verified verbatim via `curl` of the
+/// live pages (2026-05-31), so they are deterministic ground truth.
+pub fn hard_suite() -> Vec<BenchTask> {
+    let books = || {
+        vec![
+            "navigate_page".to_string(),
+            "take_snapshot".to_string(),
+            "click".to_string(),
+        ]
+    };
+    vec![
+        // Count: navigate to a specific category, read the "N results" heading.
+        BenchTask {
+            name: "books_mystery_count".into(),
+            difficulty: "hard".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com , open the Mystery category, and \
+                           report exactly how many books are in it (the number of results)."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("32".into()),
+            max_turns: 20,
+            tools: books(),
+        },
+        // Cross-item reasoning: read ALL Travel books' prices, pick the max.
+        BenchTask {
+            name: "books_travel_priciest".into(),
+            difficulty: "hardest".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com , open the Travel category, compare \
+                           the prices of every book in it, and report the TITLE of the most \
+                           expensive one."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("The Great Railway Bazaar".into()),
+            max_turns: 26,
+            tools: books(),
+        },
+        // Whole-catalog figure shown on the home page.
+        BenchTask {
+            name: "books_catalog_total".into(),
+            difficulty: "hard".into(),
+            allow_hosts: vec!["books.toscrape.com".into()],
+            instruction: "Go to https://books.toscrape.com and report the total number of books \
+                           listed in the whole catalogue."
+                .into(),
+            oracle: Oracle::AgentAnswerContains("1000".into()),
+            max_turns: 16,
+            tools: books(),
         },
     ]
 }
@@ -537,9 +638,10 @@ mod tests {
         let (key, tools, suite, attempts) = live_setup().await;
         // Model override so this same test benches any OpenRouter model:
         // BENCH_MODEL=z-ai/glm-4.6 cargo test ... -- --ignored --nocapture
-        // Default = deepseek-v3.2 (the model that cleared 4/4 in the matrix).
-        let model =
-            std::env::var("BENCH_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v3.2".to_string());
+        // Default = qwen3-235b (the best value in the wide matrix: 4/4 at the
+        // lowest cost, ~$0.005/run). Override with BENCH_MODEL=<slug>.
+        let model = std::env::var("BENCH_MODEL")
+            .unwrap_or_else(|_| "qwen/qwen3-235b-a22b-2507".to_string());
         let provider = Arc::new(crate::OpenRouterProvider::new(key, model));
         let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
         eprintln!("\n{}", scorecard(&results));
@@ -624,6 +726,150 @@ mod tests {
         eprintln!("{summary}");
     }
 
+    /// Ask an LLM judge (Opus) whether the agent genuinely completed `task`,
+    /// given the final page snapshot + the agent's full answer. Reuses the
+    /// thin-DOM judge prompt + verdict parser from `super::super::judge`. Returns
+    /// (passed, reason, judge_input_tokens, judge_output_tokens). Fail-open toward
+    /// NOT-done (an unparseable/empty judge reply is treated as fail).
+    async fn opus_judge<P: crate::llm::LlmProvider>(
+        judge: &P,
+        task: &str,
+        snapshot: &str,
+        answer: &str,
+    ) -> (bool, String, u32, u32) {
+        use crate::browser::judge::{
+            CompletionVerdict, build_completion_prompt, parse_completion_verdict,
+        };
+        use crate::llm::types::{CompletionRequest, ContentBlock, Message};
+        let prompt = build_completion_prompt(task, &[], &[], snapshot);
+        // CompletionRequest has no Default — fill every field explicitly.
+        let req = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user(format!(
+                "{prompt}\n\n# The agent's reported answer\n{answer}"
+            ))],
+            tools: Vec::new(),
+            max_tokens: 1024,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        match judge.complete(req).await {
+            Err(e) => (false, format!("judge error: {e}"), 0, 0),
+            Ok(resp) => {
+                let text: String = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let (pass, reason) = match parse_completion_verdict(&text) {
+                    Some(CompletionVerdict::Complete) => (true, "COMPLETE".to_string()),
+                    Some(CompletionVerdict::Incomplete(r)) => (false, format!("INCOMPLETE: {r}")),
+                    Some(CompletionVerdict::Uncertain(r)) => (false, format!("UNCERTAIN: {r}")),
+                    None => (false, "unparseable judge reply".to_string()),
+                };
+                (
+                    pass,
+                    reason,
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                )
+            }
+        }
+    }
+
+    /// LIVE: run the default model (qwen3-235b) on the HARDER suite, then have
+    /// Opus (claude-opus-4.8 via OpenRouter — judging only, not driving) grade
+    /// each result against the page + answer. Prints, per task: the deterministic
+    /// oracle verdict, the Opus verdict + reason, qwen run cost, and Opus judge
+    /// cost. The deterministic oracle is ground truth; the Opus judge is the
+    /// nuanced second opinion the user asked for on hard cases.
+    ///
+    /// ```text
+    /// BENCH_MODEL=qwen/qwen3-235b-a22b-2507 JUDGE_MODEL=anthropic/claude-opus-4.8 \
+    ///   OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::bench::tests::live_qwen_hard_opus_judge -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + Chrome; runs hard suite + Opus judge"]
+    async fn live_qwen_hard_opus_judge() {
+        let (key, tools, _suite, attempts) = live_setup().await;
+        let agent_model = std::env::var("BENCH_MODEL")
+            .unwrap_or_else(|_| "qwen/qwen3-235b-a22b-2507".to_string());
+        let judge_model = std::env::var("JUDGE_MODEL")
+            .unwrap_or_else(|_| "anthropic/claude-opus-4.8".to_string());
+
+        let provider = Arc::new(crate::OpenRouterProvider::new(
+            key.clone(),
+            agent_model.clone(),
+        ));
+        let judge = crate::OpenRouterProvider::new(key, judge_model.clone());
+
+        let suite = hard_suite();
+        let results = run_bench_with_retries(provider, tools, &suite, attempts).await;
+        eprintln!("\n=== HARD SUITE: {agent_model} (agent) judged by {judge_model} ===");
+        eprintln!("{}", scorecard(&results));
+
+        let (jp_in, jp_out) = model_price_per_mtok(&judge_model).unwrap_or((0.0, 0.0));
+        let mut judge_in = 0u32;
+        let mut judge_out = 0u32;
+        let mut both_pass = 0usize;
+        for r in &results {
+            let task = suite.iter().find(|t| t.name == r.name);
+            let instr = task.map(|t| t.instruction.as_str()).unwrap_or("");
+            let (jpass, reason, jin, jout) =
+                opus_judge(&judge, instr, &r.final_snapshot, &r.answer).await;
+            judge_in += jin;
+            judge_out += jout;
+            if r.passed && jpass {
+                both_pass += 1;
+            }
+            eprintln!(
+                "{:<24} oracle={} opus={} | {}",
+                r.name,
+                if r.passed { "PASS" } else { "FAIL" },
+                if jpass { "PASS" } else { "FAIL" },
+                reason.chars().take(120).collect::<String>()
+            );
+        }
+        let judge_cost = estimate_cost_usd(judge_in, judge_out, jp_in, jp_out);
+        eprintln!(
+            "\noracle+opus agree-PASS: {}/{}.  Opus judge tokens in={} out={} (~${:.5}).",
+            both_pass,
+            results.len(),
+            judge_in,
+            judge_out,
+            judge_cost
+        );
+    }
+
+    #[test]
+    fn hard_suite_is_wellformed() {
+        let s = hard_suite();
+        assert!(s.len() >= 3, "hard suite has >=3 tasks");
+        for t in &s {
+            assert!(t.instruction.contains("http"), "{} has a URL", t.name);
+            assert!(!t.tools.is_empty(), "{} pins tools", t.name);
+            assert!(t.max_turns >= 8, "{} has headroom", t.name);
+        }
+        // The verified-by-curl ground-truth oracle values are present.
+        let joined: String = s
+            .iter()
+            .map(|t| match &t.oracle {
+                Oracle::AgentAnswerContains(v) => v.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            joined.contains("32")
+                && joined.contains("Great Railway Bazaar")
+                && joined.contains("1000")
+        );
+    }
+
     #[test]
     fn scorecard_counts_and_formats() {
         let results = vec![
@@ -646,6 +892,7 @@ mod tests {
                 ],
                 answer_excerpt: "logged in".into(),
                 error: None,
+                ..Default::default()
             },
             BenchResult {
                 name: "basket".into(),
@@ -661,6 +908,7 @@ mod tests {
                 trace: vec!["navigate_page".into(), "take_snapshot".into()],
                 answer_excerpt: String::new(),
                 error: Some("run: timeout".into()),
+                ..Default::default()
             },
         ];
         let card = scorecard(&results);
@@ -672,5 +920,37 @@ mod tests {
         assert!(card.contains("! run: timeout"));
         // The tool trace is the max-turns diagnostic — it must render.
         assert!(card.contains("trace: navigate_page -> take_snapshot"));
+        // Cost column: priced row shows the value, unpriced shows "-", header +
+        // total present.
+        assert!(card.contains("cost$"), "scorecard has a cost column");
+        assert!(card.contains("0.01000"), "priced row shows its cost");
+        assert!(
+            card.contains("est. $0.01000 total"),
+            "header shows total cost"
+        );
+    }
+
+    #[test]
+    fn estimate_cost_is_tokens_times_price() {
+        // 1M in @ $0.07 + 1M out @ $0.10 = $0.17.
+        let c = estimate_cost_usd(1_000_000, 1_000_000, 0.07, 0.10);
+        assert!((c - 0.17).abs() < 1e-9, "got {c}");
+        // The real qwen3-235b matrix run: 73477 in / 429 out.
+        let q = estimate_cost_usd(73477, 429, 0.071, 0.10);
+        assert!((0.005..0.006).contains(&q), "qwen run ~ $0.0053, got {q}");
+        assert_eq!(estimate_cost_usd(0, 0, 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn price_table_known_and_unknown() {
+        assert_eq!(
+            model_price_per_mtok("qwen/qwen3-235b-a22b-2507"),
+            Some((0.0710, 0.1000))
+        );
+        assert_eq!(
+            model_price_per_mtok("anthropic/claude-opus-4.8"),
+            Some((5.0, 25.0))
+        );
+        assert_eq!(model_price_per_mtok("nonexistent/model"), None);
     }
 }
