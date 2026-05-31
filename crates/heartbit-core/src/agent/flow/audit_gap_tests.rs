@@ -26,12 +26,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::agent::flow::WorkflowCtx;
-use crate::agent::flow::agent;
 use crate::agent::flow::event::{self, OnWorkflowEvent, WorkflowEvent};
 use crate::agent::flow::journal::ResumeMode;
+use crate::agent::flow::{agent, pipeline, workflow};
 use crate::agent::test_helpers::MockProvider;
 use crate::llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, RESPOND_TOOL_NAME, StopReason, TokenUsage,
@@ -430,5 +430,115 @@ async fn phase_snapshot_captured_at_construction_and_overridable() {
     assert!(
         phases.contains(&Some("C".to_string())),
         "an explicit .phase('C') override must win: {phases:?}"
+    );
+}
+
+/// Build a plain (no-journal) ctx over a `CountingProvider`.
+fn plain_counting_ctx(calls: &Arc<AtomicUsize>) -> WorkflowCtx {
+    WorkflowCtx::builder(Arc::new(BoxedProvider::new(CountingProvider {
+        calls: Arc::clone(calls),
+    })))
+    .build()
+    .expect("build ctx")
+}
+
+/// The `workflow()` nesting wrapper's happy path: it runs the body with a child
+/// ctx that shares the parent's budget pool, and returns the body's value. No
+/// test invoked the free fn before. Asserts the body ran (provider called) and
+/// the child's spend is visible on the parent budget (shared pool).
+#[tokio::test]
+async fn workflow_runs_body_with_child_sharing_budget() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = plain_counting_ctx(&calls);
+
+    let result = workflow(&ctx, "research", |child| async move {
+        // The child is a real, usable ctx: run an agent through it.
+        agent(&child, "task").run().await
+    })
+    .await
+    .expect("workflow ok");
+
+    assert_eq!(result.as_deref(), Some("live-0"), "body value is returned");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the body actually ran");
+    // CountingProvider charges 10+5=15 weighted; the child's spend lands on the
+    // shared parent budget pool.
+    assert_eq!(
+        ctx.budget().spent(),
+        15,
+        "the child's spend counts against the shared parent budget"
+    );
+}
+
+/// `workflow()` allows exactly one level of nesting: calling it again from
+/// inside a body must return `Error::Config` (not silently nest deeper).
+#[tokio::test]
+async fn workflow_nested_one_level_only_returns_config_error() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = plain_counting_ctx(&calls);
+
+    let result: Result<(), crate::error::Error> = workflow(&ctx, "outer", |child| async move {
+        // A second level must be rejected.
+        workflow(&child, "inner", |_grandchild| async move { Ok(()) }).await
+    })
+    .await;
+
+    assert!(
+        matches!(result, Err(crate::error::Error::Config(_))),
+        "nesting a second workflow() level must return Error::Config, got {result:?}"
+    );
+}
+
+/// A pipeline with NO stages returns one slot per item, each `Some(Value::Null)`
+/// (the initial accumulator), in original order. Boundary case, previously
+/// untested.
+#[tokio::test]
+async fn zero_stage_pipeline_returns_null_per_item() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = plain_counting_ctx(&calls);
+    let out = pipeline(&ctx, vec![10usize, 20usize, 30usize]).run().await;
+    assert_eq!(
+        out,
+        vec![Some(Value::Null), Some(Value::Null), Some(Value::Null)],
+        "a zero-stage pipeline yields the initial Null accumulator per item"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no stages -> no agent calls"
+    );
+}
+
+/// Each stage receives the PREVIOUS stage's returned value as its `prev`
+/// accumulator (the stage chain threads state). Previously, no test asserted the
+/// `acc` hand-off between stages.
+#[tokio::test]
+async fn pipeline_threads_accumulator_between_stages() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ctx = plain_counting_ctx(&calls);
+    let out = pipeline(&ctx, vec![7i64])
+        // Stage 0 sees the initial Null accumulator and emits a number.
+        .stage(|prev, _item, _idx| async move {
+            assert_eq!(
+                prev,
+                Value::Null,
+                "stage 0 starts from the Null accumulator"
+            );
+            Ok(Value::from(100i64))
+        })
+        // Stage 1 must receive stage 0's exact output.
+        .stage(|prev, _item, _idx| async move {
+            assert_eq!(
+                prev,
+                Value::from(100i64),
+                "stage 1 must receive stage 0's returned value"
+            );
+            Ok(Value::from(prev.as_i64().unwrap() + 1))
+        })
+        .run()
+        .await;
+    assert_eq!(
+        out,
+        vec![Some(Value::from(101i64))],
+        "the final accumulator is threaded through both stages"
     );
 }

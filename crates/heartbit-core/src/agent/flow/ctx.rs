@@ -331,7 +331,9 @@ impl WorkflowCtxBuilder {
     }
 
     /// Share an existing [`Budget`] pool (e.g. a parent run's, for nested
-    /// workflows). Takes precedence over [`budget`](Self::budget).
+    /// workflows). This and [`budget`](Self::budget) write the same slot, so
+    /// whichever is called *last* wins (last-write-wins, not unconditional
+    /// precedence).
     pub fn budget_pool(mut self, budget: Budget) -> Self {
         self.budget = Some(budget);
         self
