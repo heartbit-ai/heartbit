@@ -252,4 +252,46 @@ mod tests {
             .await;
         assert!(out.is_empty());
     }
+
+    /// Regression: `pipeline` must NOT acquire a per-item/per-stage concurrency
+    /// permit. If it did, an `agent()` leaf inside a stage would deadlock at
+    /// `max_concurrency == 1` — the item-task would hold the only permit while
+    /// its own stage's leaf waited for one. Permits live ONLY at the leaf, so an
+    /// item runs its chain (acquiring + releasing the leaf permit) and N>cap
+    /// items still complete. Times out (fails) if a barrier/permit is introduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_permit_pipeline_with_agent_stages_does_not_deadlock() {
+        let provider = Arc::new(BoxedProvider::new(MockProvider::new(
+            (0..3)
+                .map(|i| MockProvider::text_response(&format!("r{i}"), 1, 1))
+                .collect(),
+        )));
+        let ctx = WorkflowCtx::builder(provider)
+            .max_concurrency(1)
+            .build()
+            .expect("build ctx");
+
+        let stage_ctx = ctx.clone();
+        let fut = pipeline(&ctx, vec![0usize, 1usize, 2usize])
+            .stage(move |_prev, item, _idx| {
+                let ctx = stage_ctx.clone();
+                async move {
+                    let text = crate::agent::flow::agent(&ctx, format!("item {}", *item))
+                        .run()
+                        .await?
+                        .unwrap_or_default();
+                    Ok(Value::String(text))
+                }
+            })
+            .run();
+
+        let out = tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .expect("pipeline with agent() stages must not deadlock at concurrency=1");
+        assert_eq!(
+            out.iter().filter(|o| o.is_some()).count(),
+            3,
+            "all three items complete: {out:?}"
+        );
+    }
 }

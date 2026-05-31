@@ -31,6 +31,9 @@ pub mod parallel;
 pub mod pipeline;
 pub mod progress;
 
+#[cfg(test)]
+mod audit_gap_tests;
+
 // Re-export the free functions at the `flow` level so callers write
 // `flow::agent(..)`, `flow::parallel(..)`, etc. A module and a same-named
 // function coexist (type vs value namespace), so `flow::agent` is the module in
