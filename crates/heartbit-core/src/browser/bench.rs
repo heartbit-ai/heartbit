@@ -196,6 +196,9 @@ pub async fn run_bench<P: LlmProvider>(
             .tools_allow(task.tools.clone())
             .on_event(on_event)
             .session_prune(prune)
+            // After 3 identical consecutive tool batches (the re-snapshot /
+            // re-wait_for dither), inject a stop-and-finish warning and continue.
+            .max_identical_tool_calls(3)
             .build_with_tools(tools.clone())
         {
             Err(e) => r.error = Some(format!("build: {e}")),

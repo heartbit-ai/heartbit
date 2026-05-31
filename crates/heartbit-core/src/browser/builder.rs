@@ -151,6 +151,11 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     /// Optional lifecycle-event callback (forwarded to the inner runner) — used
     /// e.g. by the benchmark to capture a turn/tool trace even when a task fails.
     on_event: Option<Arc<crate::agent::events::OnEvent>>,
+    /// Optional doom-loop threshold: after this many identical tool-call batches
+    /// in a row, the runner injects a "stop repeating / finish if done" warning
+    /// and continues. The framework-level cure for the dithering loops a browser
+    /// agent falls into (re-snapshotting / re-waiting without progressing).
+    max_identical_tool_calls: Option<u32>,
     /// If non-empty, keep ONLY tools whose name is in this set (token control —
     /// fewer tool definitions re-sent every turn). Empty = keep all.
     tool_allow: Vec<String>,
@@ -182,6 +187,7 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             chrome_executable: None,
             on_event: None,
             session_prune: None,
+            max_identical_tool_calls: None,
             tool_allow: Vec::new(),
             distill_enabled: true,
             distill: DistillConfig::default(),
@@ -253,6 +259,17 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
     /// Empty (default) keeps all tools. Unknown names are simply absent.
     pub fn tools_allow(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.tool_allow = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Break dithering loops: after `n` identical consecutive tool-call batches,
+    /// the runner injects a "you're repeating, stop and finish if done" warning
+    /// and continues (it does NOT abort). This is the framework's anti-loop
+    /// recovery; for a browser agent it cures the dominant failure mode —
+    /// re-snapshotting or re-`wait_for`-ing the same thing without making
+    /// progress until the turn budget is exhausted. `None` (default) disables it.
+    pub fn max_identical_tool_calls(mut self, n: u32) -> Self {
+        self.max_identical_tool_calls = Some(n);
         self
     }
 
@@ -329,6 +346,9 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         }
         if let Some(prune) = self.session_prune {
             b = b.session_prune_config(prune);
+        }
+        if let Some(n) = self.max_identical_tool_calls {
+            b = b.max_identical_tool_calls(n);
         }
         b.build()
     }
