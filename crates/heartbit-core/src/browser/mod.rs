@@ -19,6 +19,7 @@ pub mod bench;
 pub mod builder;
 pub mod confirm;
 pub mod distill;
+pub mod distill_tool;
 pub mod guard;
 pub mod harness;
 pub mod inject;
@@ -29,10 +30,12 @@ pub mod verify;
 
 pub use bench::{BenchResult, BenchTask, Oracle, run_bench, scorecard};
 pub use builder::{
-    BROWSER_SYSTEM_PROMPT, BrowserAgentBuilder, browser_guardrails, wrap_browser_tools,
+    BROWSER_SYSTEM_PROMPT, BrowserAgentBuilder, browser_guardrails, filter_tools,
+    wrap_browser_tools,
 };
 pub use confirm::{ActionRisk, ConfirmPolicy, classify_label, label_for_uid};
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
+pub use distill_tool::DistillingTool;
 pub use guard::DomainAllowlistGuard;
 pub use harness::ReliableInteractionTool;
 pub use inject::{InjectionRisk, scan_snapshot_for_injection};

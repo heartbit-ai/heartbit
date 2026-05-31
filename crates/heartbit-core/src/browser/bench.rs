@@ -77,6 +77,8 @@ pub struct BenchTask {
     pub oracle: Oracle,
     /// Turn cap for this task's ReAct loop.
     pub max_turns: usize,
+    /// Tools the agent is allowed (token control). Empty = all preset tools.
+    pub tools: Vec<String>,
 }
 
 /// Outcome of running one [`BenchTask`].
@@ -140,12 +142,16 @@ pub async fn run_bench<P: LlmProvider>(
             .name(task.name.clone())
             .allow_hosts(task.allow_hosts.clone())
             .max_turns(task.max_turns)
+            .tools_allow(task.tools.clone())
             .build_with_tools(tools.clone())
         {
             Err(e) => r.error = Some(format!("build: {e}")),
             Ok(agent) => match agent.execute(&task.instruction).await {
                 Err(e) => r.error = Some(format!("run: {e}")),
                 Ok(out) => {
+                    // Independent grading: take a RAW snapshot of the live page
+                    // (the unwrapped preset tool, not distilled) so the oracle
+                    // sees full ground truth regardless of what the agent saw.
                     let snap = match &snapshot_tool {
                         Some(t) => t
                             .execute(&ctx, serde_json::json!({}))
@@ -222,7 +228,8 @@ pub fn bench_suite() -> Vec<BenchTask> {
                            the page."
                 .into(),
             oracle: Oracle::FinalPageContains("Example Domain".into()),
-            max_turns: 6,
+            max_turns: 8,
+            tools: vec!["navigate_page".into(), "take_snapshot".into()],
         },
         // Form auth: fill two fields, submit, verify the state transition to the
         // secure area (the success banner only renders after a correct login).
@@ -235,7 +242,14 @@ pub fn bench_suite() -> Vec<BenchTask> {
                            you reached the secure area."
                 .into(),
             oracle: Oracle::FinalPageContains("You logged into a secure area!".into()),
-            max_turns: 12,
+            max_turns: 22,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "fill".into(),
+                "fill_form".into(),
+                "click".into(),
+            ],
         },
         // Async settle: click Start, wait out a 5s spinner, read the revealed text
         // (not in the initial DOM) — exercises the wait-for-stability discipline.
@@ -248,7 +262,13 @@ pub fn bench_suite() -> Vec<BenchTask> {
                            text that appears."
                 .into(),
             oracle: Oracle::FinalPageContains("Hello World!".into()),
-            max_turns: 14,
+            max_turns: 18,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "click".into(),
+                "wait_for".into(),
+            ],
         },
         // Multi-step navigation + extraction across pages: home -> Travel category
         // -> the specific book -> read its price. Graded on the reported value.
@@ -261,7 +281,12 @@ pub fn bench_suite() -> Vec<BenchTask> {
                            exact price."
                 .into(),
             oracle: Oracle::AgentAnswerContains("37.33".into()),
-            max_turns: 16,
+            max_turns: 24,
+            tools: vec![
+                "navigate_page".into(),
+                "take_snapshot".into(),
+                "click".into(),
+            ],
         },
     ]
 }
