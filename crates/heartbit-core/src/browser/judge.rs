@@ -83,9 +83,16 @@ pub fn parse_completion_verdict(text: &str) -> Option<CompletionVerdict> {
 }
 
 /// Case-insensitive [`str::strip_prefix`].
+///
+/// Compares on BYTES so a multibyte char straddling `prefix.len()` cannot panic
+/// — `s[..prefix.len()]` (a fixed byte index) would split the codepoint of e.g.
+/// `"VERDICTé"`. A match implies the first `prefix.len()` bytes are ASCII (they
+/// equal-ignore-case an ASCII prefix), so `s[prefix.len()..]` lands on a char
+/// boundary and is safe. Judge replies are untrusted, so this must never panic.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
+    if sb.len() >= pb.len() && sb[..pb.len()].eq_ignore_ascii_case(pb) {
+        Some(&s[pb.len()..])
     } else {
         None
     }
@@ -209,6 +216,22 @@ mod tests {
                 .map(|v| v.is_complete())
                 .unwrap_or(false),
             "an unparseable reply must never read as complete"
+        );
+    }
+
+    #[test]
+    fn non_ascii_reply_does_not_panic() {
+        // A judge reply with a multibyte char straddling the "VERDICT:" byte
+        // length must NOT panic. `s[..prefix.len()]` (a fixed byte index) would
+        // split the codepoint of e.g. "VERDICTé" (é spans bytes 7-8, len=9 ≥ 8,
+        // byte 8 is mid-char). Untrusted judge output reaches this directly.
+        assert_eq!(parse_completion_verdict("VERDICTé stray line"), None);
+        // And a well-formed verdict whose reason is non-ASCII parses correctly.
+        assert_eq!(
+            parse_completion_verdict("VERDICT: INCOMPLETE: café not confirmé"),
+            Some(CompletionVerdict::Incomplete(
+                "café not confirmé".to_string()
+            ))
         );
     }
 
