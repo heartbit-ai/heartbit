@@ -1,0 +1,29 @@
+[package]
+name = "heartbit-tui"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Terminal UI (TUI) for the Heartbit multi-agent runtime — chat with your framework."
+
+[[bin]]
+name = "heartbit-tui"
+path = "src/main.rs"
+
+[dependencies]
+heartbit = { path = "../heartbit" }
+heartbit-core = { path = "../heartbit-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

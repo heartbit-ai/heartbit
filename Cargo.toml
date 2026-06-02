@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core", "crates/heartbit-sensors", "crates/heartbit-telegram", "crates/heartbit-ghost"]
+members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core", "crates/heartbit-sensors", "crates/heartbit-telegram", "crates/heartbit-ghost", "crates/heartbit-tui"]
 
 [workspace.package]
 version = "2026.507.4"
@@ -71,3 +71,5 @@ quote = "1"
 proc-macro2 = "1"
 parking_lot = "0.12"
 libc = "0.2"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
