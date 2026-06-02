@@ -14,6 +14,8 @@ pub mod evaluator;
 pub mod events;
 pub mod flow;
 pub mod goal;
+#[cfg(test)]
+mod goal_live;
 pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;
@@ -27,6 +29,8 @@ pub mod pruner;
 pub mod routing;
 mod runner;
 pub mod tenant_tracker;
+#[cfg(test)]
+mod tetris_live;
 pub mod token_estimator;
 pub mod tool_filter;
 pub mod voting;

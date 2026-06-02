@@ -171,6 +171,12 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     pub settle: SettleConfig,
     /// Destructive-action policy (exposed for the caller's confirm step).
     pub confirm: ConfirmPolicy,
+    /// Optional persistent goal: an independent judge gates the agent's
+    /// completion so it keeps navigating/acting until the objective is verifiably
+    /// met. The judge reads the conversation transcript — which for a browser
+    /// agent INCLUDES the page snapshots returned by the tools — so it grades the
+    /// real page state, not the agent's claim. Set via [`Self::goal`].
+    goal: Option<crate::agent::goal::GoalCondition>,
 }
 
 impl<P: LlmProvider> BrowserAgentBuilder<P> {
@@ -193,7 +199,20 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             distill: DistillConfig::default(),
             settle: SettleConfig::default(),
             confirm: ConfirmPolicy::default(),
+            goal: None,
         }
+    }
+
+    /// Set a persistent [`GoalCondition`](crate::agent::goal::GoalCondition): an
+    /// INDEPENDENT judge decides — from the page snapshots in the transcript —
+    /// whether the objective is met before the agent is allowed to finish, and
+    /// otherwise re-prompts it to keep going (bounded by the goal's
+    /// `max_continuations` and the agent's `max_turns`). This is the natural way
+    /// to express "navigate until the page shows X": the judge verifies the real
+    /// page state rather than trusting the agent's "I'm done".
+    pub fn goal(mut self, goal: crate::agent::goal::GoalCondition) -> Self {
+        self.goal = Some(goal);
+        self
     }
 
     /// Allow navigation to `host` (and its subdomains).
@@ -349,6 +368,9 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         }
         if let Some(n) = self.max_identical_tool_calls {
             b = b.max_identical_tool_calls(n);
+        }
+        if let Some(goal) = self.goal {
+            b = b.goal(goal);
         }
         b.build()
     }
@@ -668,6 +690,91 @@ mod tests {
             out.result.to_lowercase().contains("example domain"),
             "expected the heading 'Example Domain' in the answer, got: {}",
             out.result
+        );
+    }
+
+    /// LIVE: GOAL + BROWSER combined. A goal-driven browser agent (qwen3-235b)
+    /// drives real Chrome to LOG IN to a site, and an INDEPENDENT judge decides
+    /// completion from the PAGE SNAPSHOTS in the transcript — i.e. it verifies the
+    /// real page reached the "secure area", not the agent's claim. If the agent
+    /// stops before the success banner shows, the judge re-prompts it to continue.
+    ///
+    /// This is the natural marriage: the browser tools surface the page state as
+    /// `[Tool result: <snapshot>]`, which is exactly the evidence the goal judge
+    /// grades — so "navigate until the page shows X" needs no custom oracle.
+    ///
+    /// ```text
+    /// OPENROUTER_API_KEY=sk-or-... cargo test -p heartbit-core --lib \
+    ///   browser::builder::tests::live_goal_browser_login_qwen -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live: needs OpenRouter key + spawns real Chrome + network"]
+    async fn live_goal_browser_login_qwen() {
+        use crate::agent::events::{AgentEvent, OnEvent};
+        use crate::agent::goal::GoalCondition;
+        use crate::llm::BoxedProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let key = std::env::var("OPENROUTER_API_KEY")
+            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .expect("set OPENROUTER_API_KEY to run this live test");
+        let model = "qwen/qwen3-235b-a22b-2507";
+
+        let worker = std::sync::Arc::new(crate::OpenRouterProvider::new(key.clone(), model));
+        // The goal judge is a SEPARATE provider (type-erased): it grades the page
+        // snapshots in the transcript, independent of the agent's self-assessment.
+        let judge = std::sync::Arc::new(BoxedProvider::new(crate::OpenRouterProvider::new(
+            key, model,
+        )));
+
+        let turns = std::sync::Arc::new(AtomicUsize::new(0));
+        let t = std::sync::Arc::clone(&turns);
+        let on_event: Arc<OnEvent> = Arc::new(move |ev: AgentEvent| {
+            if let AgentEvent::TurnStarted { turn, .. } = ev {
+                t.fetch_max(turn, Ordering::SeqCst);
+            }
+        });
+
+        let objective = "Log into https://the-internet.herokuapp.com/login using \
+                         username 'tomsmith' and password 'SuperSecretPassword!'. The \
+                         objective is met ONLY when the page actually shows the success \
+                         banner text 'You logged into a secure area!'.";
+
+        let mut builder = BrowserAgentBuilder::new(worker)
+            .name("goal-browser")
+            .allow_host("the-internet.herokuapp.com")
+            .max_turns(16)
+            .on_event(on_event)
+            // After 3 identical re-snapshot/re-wait batches, nudge the agent on.
+            .max_identical_tool_calls(3)
+            // The goal: keep navigating/acting until the judge confirms the secure
+            // area from the page snapshot. Bounded by max_continuations + max_turns.
+            .goal(GoalCondition::new(objective, judge).with_max_continuations(3));
+        if let Some(chrome) = live_chrome_path() {
+            builder = builder.chrome_executable(chrome);
+        }
+        let agent = builder
+            .connect()
+            .await
+            .expect("connect chrome-devtools preset + assemble agent");
+
+        let out = agent
+            .execute(objective)
+            .await
+            .expect("agent run should succeed");
+
+        eprintln!("\n=== live_goal_browser_login_qwen ===");
+        eprintln!("turns taken     : {}", turns.load(Ordering::SeqCst));
+        eprintln!("tool calls made : {}", out.tool_calls_made);
+        eprintln!("goal_met        : {:?}", out.goal_met);
+        eprintln!("tokens          : {:?}", out.tokens_used);
+        eprintln!("final answer    : {}", out.result.trim());
+
+        assert!(out.goal_met.is_some(), "a goal was set");
+        assert!(
+            out.tool_calls_made >= 2,
+            "the agent must have driven the browser (fill + click + snapshot), made {}",
+            out.tool_calls_made
         );
     }
 }
