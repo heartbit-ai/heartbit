@@ -74,6 +74,11 @@ pub struct AgentOpts {
     /// (overriding the ctx's base tools); when `None`, the ctx base tools (if
     /// any) are used. Set via [`AgentCall::tools`].
     pub tools: Option<Vec<Arc<dyn crate::tool::Tool>>>,
+    /// Optional persistent goal: an independent judge gates the leaf's
+    /// completion so it self-continues until the objective is met (bounded by
+    /// the goal's `max_continuations`). Each continuation's spend accrues into
+    /// the leaf's single budget record. Set via [`AgentCall::goal`].
+    pub goal: Option<crate::agent::goal::GoalCondition>,
 }
 
 /// A fluent, owned builder for one [`agent`] leaf. Created by [`agent`].
@@ -122,6 +127,17 @@ impl<T> AgentCall<T> {
     /// inherit tools the way Claude Code's subagents inherit the allowlist.)
     pub fn tools(mut self, tools: Vec<Arc<dyn crate::tool::Tool>>) -> Self {
         self.opts.tools = Some(tools);
+        self
+    }
+
+    /// Attach a persistent [`GoalCondition`](crate::agent::goal::GoalCondition):
+    /// the leaf self-continues until an independent judge confirms the objective
+    /// (bounded by the goal's `max_continuations`). The continuations all run
+    /// inside the one leaf, so their combined token spend is recorded once
+    /// against the shared flow budget, and a run-wide budget breach or
+    /// cancellation aborts the goal loop at the leaf's cancel race.
+    pub fn goal(mut self, goal: crate::agent::goal::GoalCondition) -> Self {
+        self.opts.goal = Some(goal);
         self
     }
 
@@ -327,6 +343,28 @@ async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<Ag
     // set (if any). A 2-turn agent (ToolUse then text) needs max_turns > 1.
     if let Some(tools) = opts.tools.clone().or_else(|| ctx.base_tools()) {
         builder = builder.tools(tools).max_turns(DEFAULT_TOOL_TURNS);
+    }
+    // A goal makes the leaf self-continue, so it needs enough turns for the
+    // initial completion plus its continuations (layered on top of any tool
+    // turns). The goal's own continuation cap is the inner bound.
+    if let Some(goal) = &opts.goal {
+        let needed = (goal.max_continuations() as usize).saturating_add(1);
+        builder = builder
+            .goal(goal.clone())
+            .max_turns(needed.max(DEFAULT_TOOL_TURNS));
+        // Bound a SOLO goal leaf against the shared budget mid-loop: cap the
+        // leaf's cumulative tokens at the budget remaining at leaf start, so a
+        // long goal loop cannot overshoot the pool arbitrarily even when no
+        // sibling leaf is around to fire the run-wide cancel. (The cross-leaf
+        // case is handled by the leaf's biased cancel-race.) Unbounded budget =
+        // no cap. NOTE: the budget is weighted (input+output+reasoning + cache
+        // ratios) while `max_total_tokens` counts raw input+output, so the cap is
+        // exact for input/output-only usage and a slight over-allowance when
+        // cache/reasoning tokens are present — a conservative bound either way.
+        let remaining = ctx.remaining();
+        if remaining != u64::MAX {
+            builder = builder.max_total_tokens(remaining);
+        }
     }
     let runner = builder.build()?;
     runner.execute(prompt).await

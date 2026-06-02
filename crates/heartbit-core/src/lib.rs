@@ -43,6 +43,7 @@ pub use agent::dag::{DagAgent, DagAgentBuilder};
 pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
+pub use agent::goal::{GoalCondition, GoalVerdict};
 pub use agent::guardrail::{GuardAction, Guardrail};
 #[allow(deprecated)]
 pub use agent::guardrails::ContentFenceGuardrail;

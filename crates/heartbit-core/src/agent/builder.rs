@@ -77,6 +77,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) workspace: Option<std::path::PathBuf>,
     /// Hard limit on cumulative tokens (input + output) across all turns.
     pub(super) max_total_tokens: Option<u64>,
+    /// Optional persistent goal gated by an independent judge.
+    pub(super) goal: Option<super::goal::GoalCondition>,
     /// Controls whether audit records include full content or metadata only.
     pub(super) audit_mode: audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
@@ -444,6 +446,17 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set a persistent [`GoalCondition`](super::goal::GoalCondition): after the
+    /// agent would naturally finish, an INDEPENDENT judge decides whether the
+    /// objective is met. If not, the judge's reason is re-injected and the agent
+    /// continues (bounded by the goal's `max_continuations` and the agent's
+    /// `max_turns`). [`AgentOutput::goal_met`](super::AgentOutput::goal_met)
+    /// records the outcome.
+    pub fn goal(mut self, goal: super::goal::GoalCondition) -> Self {
+        self.goal = Some(goal);
+        self
+    }
+
     /// Set the audit mode controlling what data is stored in audit records.
     ///
     /// - `Full` (default): all content is recorded.
@@ -540,6 +553,16 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         if self.on_input.is_some() && self.structured_schema.is_some() {
             return Err(Error::Config(
                 "on_input (interactive mode) and structured_schema are mutually exclusive".into(),
+            ));
+        }
+        // A goal gates only the text natural-completion exit; with structured
+        // output the run returns via the `__respond__` path, so a goal would be a
+        // silent no-op. Reject it at build time rather than mislead the caller.
+        if self.goal.is_some() && self.structured_schema.is_some() {
+            return Err(Error::Config(
+                "goal and structured_schema are mutually exclusive (a goal gates the text \
+                 completion exit, which structured output bypasses)"
+                    .into(),
             ));
         }
         if self.max_tools_per_turn == Some(0) {
@@ -710,6 +733,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 self.observability_mode,
             ),
             max_total_tokens: self.max_total_tokens,
+            goal: self.goal,
             audit_mode: self.audit_mode,
             audit_trail: self.audit_trail,
             audit_user_id: self.audit_user_id,

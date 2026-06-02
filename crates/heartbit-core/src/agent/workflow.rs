@@ -215,6 +215,7 @@ impl<P: LlmProvider + 'static> ParallelAgent<P> {
             model_name: None,
             // Composite agents don't track per-sub-agent tool calls in this aggregate output.
             tool_call_results: Vec::new(),
+            goal_met: None,
         })
     }
 }

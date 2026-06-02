@@ -105,6 +105,12 @@ pub struct AgentOutput {
     /// appear here.
     #[serde(default)]
     pub tool_call_results: Vec<ToolCallRecord>,
+    /// Whether the run's [`GoalCondition`](super::goal::GoalCondition) was met,
+    /// as decided by the independent goal judge. `None` when no goal was set;
+    /// `Some(true)` when the judge confirmed the objective; `Some(false)` when
+    /// the continuation cap was exhausted without the objective being met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_met: Option<bool>,
 }
 
 impl AgentOutput {
@@ -211,6 +217,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Hard limit on cumulative tokens (input + output) across all turns.
     /// When exceeded, the agent returns `Error::BudgetExceeded`.
     pub(super) max_total_tokens: Option<u64>,
+    /// Optional persistent goal: an independent judge gates the natural-completion
+    /// exit and the agent keeps working (bounded by `max_continuations` and
+    /// `max_turns`) until the objective is met. `None` = no goal gating.
+    pub(super) goal: Option<super::goal::GoalCondition>,
     /// Controls whether audit records include full content or metadata only.
     pub(super) audit_mode: super::audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
@@ -296,6 +306,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             observability_mode: None,
             workspace: None,
             max_total_tokens: None,
+            goal: None,
             audit_mode: super::audit::AuditMode::Full,
             audit_trail: None,
             audit_user_id: None,
@@ -547,6 +558,11 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut total_usage = TokenUsage::default();
             // Accumulate cost per-turn for accurate cascade pricing.
             let mut total_cost: f64 = 0.0;
+            // Goal gating: how many extra continuations the independent judge has
+            // granted so far (bounded by the goal's `max_continuations`). The
+            // turn counter on `ctx` is the other bound — a goal continuation goes
+            // through the loop top, so it consumes a turn and respects max_turns.
+            let mut goal_continuations_used: u32 = 0;
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
@@ -1158,6 +1174,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         },
                         model_name: last_model_name.clone(),
                         tool_call_results: std::mem::take(&mut tool_call_records),
+                        goal_met: None,
                     });
                 }
 
@@ -1201,6 +1218,41 @@ impl<P: LlmProvider> AgentRunner<P> {
                         continue;
                     }
 
+                    // Goal gating: an INDEPENDENT judge decides whether the
+                    // objective is met before this natural completion is allowed
+                    // to return (anti over-report). Not-met re-injects the judge's
+                    // reason and continues (bounded by max_continuations AND the
+                    // loop's max_turns guard); met or cap-exhausted falls through
+                    // with `goal_met` recorded. Other exits (MaxTurns/Truncated)
+                    // are NOT looped — an unmet goal there is reported, not retried.
+                    let goal_met: Option<bool> = if let Some(goal) = self.goal.clone() {
+                        // The judge sees the whole conversation rendered to text —
+                        // including tool results (the EVIDENCE) — not just the
+                        // agent's final claim, so it grades what actually happened.
+                        let transcript = ctx.conversation_text();
+                        let (verdict, judge_usage) = goal.evaluate(&transcript).await;
+                        // Account the judge's tokens against the run's usage.
+                        total_usage += judge_usage;
+                        if verdict.satisfied {
+                            Some(true)
+                        } else if goal_continuations_used < goal.max_continuations() {
+                            goal_continuations_used += 1;
+                            debug!(
+                                agent = %self.name,
+                                continuation = goal_continuations_used,
+                                reason = %verdict.reason,
+                                "goal not yet met; continuing"
+                            );
+                            ctx.add_user_message(goal.continuation_message(&verdict.reason));
+                            continue;
+                        } else {
+                            // Continuation budget exhausted without meeting the goal.
+                            Some(false)
+                        }
+                    } else {
+                        None
+                    };
+
                     self.emit(AgentEvent::RunCompleted {
                         agent: self.name.clone(),
                         total_usage,
@@ -1238,6 +1290,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         },
                         model_name: last_model_name.clone(),
                         tool_call_results: std::mem::take(&mut tool_call_records),
+                        goal_met,
                     });
                 }
 

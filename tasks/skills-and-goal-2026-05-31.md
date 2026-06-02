@@ -204,3 +204,105 @@ Goal (PR2) — my own design notes to raise with advisor:
 Process: act → read ONE clean confirmation → state result. Don't end a turn on
 "now I'll do X" narration. NEVER write "advisor said X" without an actual
 advisor() call returning X.
+
+## Skills PR1 (#12) — ADVISOR SIGN-OFF (2026-06-02, real advisor() call)
+SIGNED OFF. The two real blockers from the adversarial review are fixed:
+opt-in discovery (`catalog_from_dirs`, no ancestor/$HOME walk) closes the
+prompt-injection vector; the `skill_dirs` resolve-gate is fixed at all three
+sites. Manifest/registry/discovery are spec-faithful, mutation-verified
+(precedence + body-absence), merged at `d7798c3`, full workspace gate green.
+Reserved-word rule KEPT (the published overview doc mandates it; `contains`
+matches "cannot contain"; divergence vs Anthropic's validate script documented).
+allowed-tools-not-enforced + unknown-key leniency = accepted documented v1
+non-goals. **Skills is done.**
+
+## Goal — SOTA research synthesis (cited, 2026-06-02)
+Primary source: Claude Code `/goal` doc — `/goal` is a session-scoped prompt-based
+Stop hook; after each turn a small fast model judges the condition vs the
+conversation (NOT calling tools), returns yes/no + reason; "no" → keep working
+with the reason as guidance, "yes" → clear. Condition must be demonstrable by the
+agent's own surfaced output.
+
+arXiv corroboration (the "why independent judge" evidence):
+- **"An Illusion of Progress? Assessing the Current State of Web Agents"**
+  (arXiv:2504.01382, OSU-NLP 2025): web agents OVER-REPORT success; trusting the
+  agent's own "done" claim inflates results. Their WebJudge (LLM-as-judge over the
+  FINAL STATE, independent of the agent) reaches ~85% human agreement, 3.8% SR
+  gap — far better than self-report. ⇒ judge the surfaced final state with an
+  INDEPENDENT model, never the agent's self-assessment.
+- **"Self-Preference Bias in LLM-as-a-Judge"** (arXiv:2410.21819, Wataoka 2024):
+  LLMs systematically over-score their OWN outputs; bias persists even when
+  authorship is hidden and scales with model size. ⇒ the goal judge must be a
+  SEPARATE provider call with an impartial-evaluator prompt — a self-judge would
+  over-report "done".
+- **Mind2Web 2 / Agent-as-a-Judge** (arXiv:2506.21506): rubric/criteria-based
+  independent judging of agentic task completion — supports criteria-conditioned
+  judging over the transcript.
+- Reflexion / Self-Refine (verbal self-critique loops): the re-injected judge
+  reason is the "what remains" feedback that drives the next attempt; bounded by a
+  continuation cap to avoid the known non-termination failure mode.
+
+Design implications (all already in D3, now evidence-backed):
+(a) INDEPENDENT judge, not self-judge [2410.21819]; (b) judge sees goal-as-criteria
++ transcript/final-state, NO tools [/goal doc, 2504.01382]; (c) bound both
+premature-stop (judge gates the natural-completion exit) AND infinite-loop
+(continuation cap + flow shared budget); (d) re-inject the judge's reason as a
+user message [Reflexion]; (e) deterministic escape hatch = condition phrased as a
+checkable output the agent surfaces [/goal doc].
+
+## Goal PR2 — SHIPPED (2026-06-02, branch feat/goal-condition off main d7798c3)
+`crates/heartbit-core/src/agent/goal.rs`:
+- `GoalCondition { objective, judge: Arc<BoxedProvider>, max_continuations }` +
+  `new()`/`with_max_continuations()`; `GoalVerdict { satisfied, reason }`.
+- Independent judge: a SEPARATE provider call (`judge.complete`) with an
+  impartial-evaluator system prompt and NO tools, over the agent's surfaced
+  output. Verdict parser `GOAL_MET: YES | NO[: reason]`; unparseable/error →
+  NOT-met (safe direction vs over-report). Cited rationale in the module doc
+  (arXiv:2504.01382 WebJudge, arXiv:2410.21819 self-preference bias).
+- Runner integration: `AgentRunnerBuilder::goal()`; `AgentOutput.goal_met:
+  Option<bool>`. Intercepts ONLY the natural-completion branch (`tool_calls
+  .is_empty()`): satisfied → return goal_met=Some(true); not-met & cap remaining
+  → inject judge reason as a user message + `continue` (through the loop top, so
+  it consumes a turn and respects max_turns — counter never reset); cap exhausted
+  → goal_met=Some(false). MaxTurns/Truncated exits NOT looped.
+- Flow composition (no second impl): `AgentCall::goal()` threads into `run_one`
+  (bumps max_turns to fit continuations). The leaf's single `record_spend` carries
+  the SUM across all continuations → shared-budget accrual; a breached budget
+  aborts admission + fires run-wide cancel.
+
+Tests (mutation-verified where it counts):
+- goal_satisfied_stops_after_one_turn (always-YES → 1 turn).
+- goal_unsatisfied_loops_to_cap_then_reports_false (always-NO, cap 2 → 3 turns,
+  goal_met=false; NEVER infinite).
+- worker_self_claim_does_not_satisfy_an_independent_no_judge (BEHAVIORAL
+  independence: worker says "Done!", judge says NO → run continues).
+- goal_continuations_respect_max_turns (low max_turns → MaxTurnsExceeded, bounded).
+- no_goal_leaves_goal_met_none_and_one_turn.
+- goal_driven_leaf_accrues_continuation_spend_into_shared_budget (flow: 3 turns
+  × 15 = 45 on the shared budget).
+- exhausted_budget_bounds_goal_leaf (flow: breach aborts the loop).
+15 goal-module tests + 2 flow-composition tests. Full workspace gate green.
+
+**DONE.** Both Skills (merged #12) and Goal are implemented, thoroughly tested,
+and research-backed. Awaiting final advisor sign-off on Goal.
+
+## Goal PR2 — adversarial review fixes (2026-06-02, DO-NOT-MERGE → addressed)
+A 68k-token adversarial review rated termination PASS (solid) but DO-NOT-MERGE on
+3 must-fixes — all addressed:
+1. **Judge blindness (headline)**: the judge saw only `last_assistant_text()` (the
+   agent's prose claim), not the tool-output EVIDENCE — undercutting the
+   anti-over-report guarantee the doc claimed. FIXED: the judge now receives
+   `ctx.conversation_text()` (renders `[Tool result: ...]` lines = evidence),
+   tail-capped to 12k chars. Makes the WebJudge/"final state" framing true.
+2. **Unaccounted judge tokens**: judge `response.usage` was dropped. FIXED:
+   `evaluate()` returns `(GoalVerdict, TokenUsage)`; the runner folds judge usage
+   into `total_usage`. Verified end-to-end by the flow test (worker 45 + judge 6
+   = 51 on the shared budget).
+3. **Solo-leaf mid-loop budget overshoot**: a solo goal leaf admitted once
+   (pre-loop) and recorded once (post-loop), so it could overshoot the shared
+   budget mid-loop (the test comment overclaimed the cancel-race covered it).
+   FIXED: `run_one` caps the goal leaf's `max_total_tokens` at the budget
+   remaining at leaf start; comment corrected.
+Nice-to-haves also done: reject `goal + structured_schema` at build (was a silent
+no-op); convergence test (NO→YES reaches the goal); `max_continuations=0` test;
+`warn!` on judge-call failure. 19 goal-module + 2 flow-composition tests.

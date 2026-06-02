@@ -13,6 +13,7 @@ mod doom_loop;
 pub mod evaluator;
 pub mod events;
 pub mod flow;
+pub mod goal;
 pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;
@@ -1579,6 +1580,7 @@ mod tests {
             estimated_cost_usd: Some(0.0342),
             model_name: Some("claude-sonnet-4-6-20250610".into()),
             tool_call_results: Vec::new(),
+            goal_met: None,
         };
         let json_str = serde_json::to_string(&output).unwrap();
         let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
@@ -1603,6 +1605,7 @@ mod tests {
             estimated_cost_usd: None,
             model_name: None,
             tool_call_results: Vec::new(),
+            goal_met: None,
         };
         let json_str = serde_json::to_string(&output).unwrap();
         let parsed: AgentOutput = serde_json::from_str(&json_str).unwrap();
