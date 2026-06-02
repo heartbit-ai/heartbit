@@ -12,6 +12,7 @@ pub mod agent;
 pub mod auth;
 pub mod browser;
 pub mod channel;
+pub mod codegen;
 pub mod config;
 pub mod error;
 pub mod eval;
