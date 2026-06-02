@@ -542,3 +542,156 @@ async fn pipeline_threads_accumulator_between_stages() {
         "the final accumulator is threaded through both stages"
     );
 }
+
+/// A judge provider that always returns a NOT-met verdict — forces a
+/// goal-driven leaf to use all its continuations.
+struct AlwaysNoJudge;
+impl LlmProvider for AlwaysNoJudge {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionResponse, crate::error::Error> {
+        Ok(CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "GOAL_MET: NO: keep going".to_string(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            model: None,
+        })
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some("always-no-judge")
+    }
+}
+
+/// GOAL × FLOW COMPOSITION (front-loaded de-risk): a goal-driven flow leaf
+/// self-continues until its cap, and the COMBINED spend of all continuations is
+/// recorded ONCE against the shared flow budget — proving the goal feature
+/// composes with the dynamic-workflow budget for free (no second Goal impl in
+/// flow). The worker (ctx provider, CountingProvider) costs 10+5 weighted per
+/// turn; an always-NO judge forces 1 initial completion + 2 continuations = 3
+/// turns. Worker spend (3 × 15 = 45) PLUS the independent judge's spend (one call
+/// per completion: 3 × (1 input + 1 output) = 6) all accrue into the shared
+/// budget via the leaf's single record — proving both per-continuation accrual
+/// AND that the judge's tokens are accounted (not dropped on the floor).
+#[tokio::test]
+async fn goal_driven_leaf_accrues_continuation_spend_into_shared_budget() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Arc::new(BoxedProvider::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let ctx = WorkflowCtx::builder(worker)
+        .budget(10_000)
+        .build()
+        .expect("build ctx");
+
+    let judge = Arc::new(BoxedProvider::new(AlwaysNoJudge));
+    let goal = crate::agent::goal::GoalCondition::new("ship it", judge).with_max_continuations(2);
+
+    let out = agent(&ctx, "task").goal(goal).run().await.expect("run ok");
+    assert!(out.is_some(), "the leaf returns its final text");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "1 initial completion + 2 goal continuations = 3 worker turns"
+    );
+    assert_eq!(
+        ctx.budget().spent(),
+        51,
+        "worker 3×(10+5)=45 + judge 3×(1+1)=6 = 51 accrues into the shared budget \
+         (continuation spend AND the independent judge's tokens are accounted)"
+    );
+}
+
+/// A breached shared budget bounds a goal loop: with the budget pre-exhausted,
+/// the goal-driven leaf's admission fails BEFORE the goal loop starts — it
+/// returns a control error (which a combinator would collapse to `None`) and
+/// fires run-wide cancellation, rather than looping to its (1000) continuation
+/// cap. Two further bounds keep a SOLO goal leaf from overshooting mid-loop:
+/// (a) `run_one` caps the leaf's `max_total_tokens` at the budget remaining at
+/// leaf start, and (b) a breach by a SIBLING leaf fires the run-wide cancel that
+/// the leaf's biased select races (same mechanism as
+/// [`inflight_cancel_returns_none_records_no_spend_and_emits_skipped`]).
+#[tokio::test]
+async fn exhausted_budget_bounds_goal_leaf() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Arc::new(BoxedProvider::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    let ctx = WorkflowCtx::builder(worker)
+        .budget(1)
+        .build()
+        .expect("build ctx");
+    ctx.budget().record(&TokenUsage {
+        input_tokens: 5,
+        ..Default::default()
+    }); // spent 5 >= 1 → pool exhausted
+
+    let judge = Arc::new(BoxedProvider::new(AlwaysNoJudge));
+    let goal =
+        crate::agent::goal::GoalCondition::new("ship it", judge).with_max_continuations(1000);
+
+    let result = agent(&ctx, "task").goal(goal).run().await;
+    assert!(
+        matches!(result, Err(crate::error::Error::BudgetExceeded { .. })),
+        "an exhausted budget must abort admission (control error), got {result:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the goal loop never starts — the worker is never called"
+    );
+    assert!(
+        ctx.is_cancelled(),
+        "the budget breach fires run-wide cancellation"
+    );
+}
+
+/// EXERCISES the solo-leaf mid-loop budget cap (Fix 3): a goal leaf with a huge
+/// continuation cap (1000) but a small shared budget must stop on the
+/// budget-derived `max_total_tokens` cap after a few turns — NOT loop 1000 times.
+/// This is the only test that actually fires that cap (others use a large budget
+/// or exhaust it pre-admission), so it would catch an off-by-one or no-op there.
+#[tokio::test]
+async fn solo_goal_leaf_stops_on_budget_cap_not_continuation_cap() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = Arc::new(BoxedProvider::new(CountingProvider {
+        calls: Arc::clone(&calls),
+    }));
+    // Budget ≈ a few worker turns (each 10+5 raw tokens); far below the 1000 cap.
+    let ctx = WorkflowCtx::builder(worker)
+        .budget(40)
+        .build()
+        .expect("build ctx");
+
+    let judge = Arc::new(BoxedProvider::new(AlwaysNoJudge));
+    let goal =
+        crate::agent::goal::GoalCondition::new("ship it", judge).with_max_continuations(1000);
+
+    let result = agent(&ctx, "task").goal(goal).run().await;
+    // The runner's max_total_tokens cap (set from the remaining budget) trips,
+    // surfaced as BudgetExceeded — possibly wrapped in WithPartialUsage.
+    let is_budget_exceeded = match &result {
+        Err(crate::error::Error::BudgetExceeded { .. }) => true,
+        Err(crate::error::Error::WithPartialUsage { source, .. }) => {
+            matches!(**source, crate::error::Error::BudgetExceeded { .. })
+        }
+        _ => false,
+    };
+    assert!(
+        is_budget_exceeded,
+        "the budget-derived token cap must stop the loop, got {result:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) < 10,
+        "the leaf stops on the budget cap, bounded well below the 1000 continuation \
+         cap — got {} worker turns",
+        calls.load(Ordering::SeqCst)
+    );
+}
