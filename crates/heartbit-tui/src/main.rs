@@ -122,6 +122,10 @@ async fn main() -> anyhow::Result<()> {
     let interrupt = InterruptHandle::new();
 
     let mut terminal = ratatui::init();
+    // Capture the mouse so the wheel arrives as scroll events we route to the
+    // transcript — without it, terminals translate the wheel into ↑/↓ arrows
+    // (which would scroll the composer's command history instead).
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let result = run_ui(
         &mut terminal,
         &mut app,
@@ -133,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         interrupt,
     )
     .await;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -433,10 +438,18 @@ fn default_permissions() -> PermissionRuleset {
 
 /// Translate a raw crossterm event into a [`Msg`] (or ignore it).
 fn translate(event: Event) -> Option<Msg> {
+    use crossterm::event::MouseEventKind;
     match event {
         Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
         Event::Paste(s) => Some(Msg::Paste(s)),
         Event::Resize(..) => Some(Msg::Resize),
+        // Mouse capture is on, so the wheel arrives as scroll events (not arrow
+        // keys) — route it to the transcript, leaving ↑/↓ for command history.
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => Some(Msg::WheelUp),
+            MouseEventKind::ScrollDown => Some(Msg::WheelDown),
+            _ => None,
+        },
         _ => None,
     }
 }

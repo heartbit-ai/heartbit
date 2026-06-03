@@ -45,7 +45,9 @@ pub fn view(frame: &mut Frame, app: &App) {
     // listing every agent and what it's doing now. The transcript then gets the
     // remaining width — which MUST feed `line_count` below, or the scroll offset
     // (computed from a stale full width) would clip the newest content.
-    let show_roster = app.multi_agent && !app.agents.is_empty();
+    // Only while the turn is actually running — the live panel disappears once the
+    // agents stop (the transcript keeps the per-agent record).
+    let show_roster = app.multi_agent && app.running && !app.agents.is_empty();
     let (transcript_area, roster_area) = if show_roster && chunks[0].width >= 50 {
         let w = (chunks[0].width / 3).clamp(22, 36);
         let split =
@@ -445,6 +447,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("m");
         app.multi_agent = true;
+        app.running = true;
         app.agents = vec![AgentRow {
             name: "worker".into(),
             state: AgentState::Working,
@@ -546,6 +549,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("m");
         app.multi_agent = true;
+        app.running = true; // the live panel shows only while the turn runs
         app.agents = vec![
             AgentRow {
                 name: "worker".into(),
@@ -569,6 +573,28 @@ mod tests {
         );
         assert!(text.contains("write"), "live activity missing:\n{text}");
         assert!(text.contains('✓'), "done state icon missing:\n{text}");
+    }
+
+    #[test]
+    fn roster_panel_hidden_once_the_turn_is_idle() {
+        use crate::app::{AgentRow, AgentState};
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.multi_agent = true;
+        app.running = false; // turn finished — the live panel must disappear
+        app.agents = vec![AgentRow {
+            name: "worker".into(),
+            state: AgentState::Done,
+            activity: "done".into(),
+            tokens: 100,
+        }];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("agents ·"),
+            "roster panel must hide when no agent is running:\n{text}"
+        );
     }
 
     #[test]

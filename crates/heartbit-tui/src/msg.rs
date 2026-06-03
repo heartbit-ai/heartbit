@@ -21,6 +21,10 @@ pub enum Msg {
     Key(KeyEvent),
     Paste(String),
     Resize,
+    /// Mouse wheel — scroll the transcript (output history), NOT the composer's
+    /// command history (which stays on ↑/↓).
+    WheelUp,
+    WheelDown,
     /// Periodic tick (spinner animation / coalesced redraw).
     Tick,
 

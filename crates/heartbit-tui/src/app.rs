@@ -16,6 +16,8 @@ use crate::msg::{Msg, PendingTool};
 
 /// How many transcript lines a PageUp/PageDown moves.
 const SCROLL_STEP: u16 = 8;
+/// How many transcript lines one mouse-wheel notch moves.
+const WHEEL_STEP: u16 = 3;
 
 /// Live state of one agent in the multi-agent roster panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +235,10 @@ impl App {
         match msg {
             Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
             Msg::Resize => {}
+            // Mouse wheel scrolls the transcript (output history). Over-scrolling
+            // is harmless — the renderer clamps the offset to the top.
+            Msg::WheelUp => self.scroll = self.scroll.saturating_add(WHEEL_STEP),
+            Msg::WheelDown => self.scroll = self.scroll.saturating_sub(WHEEL_STEP),
             Msg::Paste(s) => match &mut self.modal {
                 // Pasting into a prompt must land in that field, not the composer
                 // hidden behind the modal.
@@ -1526,6 +1532,26 @@ mod tests {
         app.update(Msg::RunFailed("boom".into()));
         assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("boom")));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_not_command_history() {
+        let mut app = keyed();
+        // type a command so there'd be composer history to (wrongly) move
+        typed(&mut app, "earlier");
+        app.update(key(KeyCode::Enter));
+        let composed_before = app.composer.text();
+        // wheel up scrolls the transcript output, leaving the composer untouched
+        app.update(Msg::WheelUp);
+        app.update(Msg::WheelUp);
+        assert_eq!(app.scroll, 2 * WHEEL_STEP);
+        assert_eq!(
+            app.composer.text(),
+            composed_before,
+            "the wheel must NOT touch the composer (command history stays on ↑/↓)"
+        );
+        app.update(Msg::WheelDown);
+        assert_eq!(app.scroll, WHEEL_STEP);
     }
 
     #[test]
