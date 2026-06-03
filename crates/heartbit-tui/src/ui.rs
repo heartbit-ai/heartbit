@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{App, Modal};
-use crate::cells::Cell;
 
 const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 
@@ -20,7 +19,10 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
     }
     if let Some(active) = &app.active {
-        lines.extend(Cell::Agent(active.clone()).to_lines());
+        // The streaming reply renders PLAIN — Markdown is applied only when the
+        // cell finalizes into history, so partial markup (e.g. an unclosed `**`)
+        // never flashes styled mid-stream.
+        lines.extend(active.split('\n').map(|l| Line::raw(l.to_string())));
     }
     lines
 }
@@ -187,6 +189,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::Cell;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -228,6 +231,32 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    #[test]
+    fn streaming_renders_plain_finalized_renders_markdown() {
+        fn joined(lines: &[Line<'static>]) -> String {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect()
+        }
+        // Streaming `active`: raw Markdown shown as-is (no transient half-parsed markup).
+        let mut app = App::new("m");
+        app.active = Some("# Heading **bold**".into());
+        assert!(
+            joined(&transcript_lines(&app)).contains("# Heading **bold**"),
+            "streaming text must render plain"
+        );
+        // Finalized agent cell: Markdown rendered (markers gone).
+        let mut app2 = App::new("m");
+        app2.history.push(Cell::Agent("# Heading **bold**".into()));
+        let t = joined(&transcript_lines(&app2));
+        assert!(
+            !t.contains('#') && !t.contains('*'),
+            "finalized cell must render markdown: {t}"
+        );
     }
 
     #[test]
