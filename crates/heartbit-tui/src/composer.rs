@@ -112,6 +112,15 @@ impl Composer {
         }
     }
 
+    /// Clear the live buffer WITHOUT recording it in history (used for slash
+    /// commands so a `/key <token>` secret is never recalled via the Up arrow).
+    pub fn clear(&mut self) {
+        self.lines = vec![Vec::new()];
+        self.row = 0;
+        self.col = 0;
+        self.hist_pos = None;
+    }
+
     /// Submit: returns the text, records non-blank entries in history, and clears
     /// the live buffer (history is retained).
     pub fn take(&mut self) -> String {

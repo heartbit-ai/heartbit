@@ -31,9 +31,6 @@ pub enum Cell {
     Notice(String),
 }
 
-/// Max lines of tool output shown inline before truncation.
-const MAX_OUTPUT_LINES: usize = 12;
-
 fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("");
     if line.chars().count() > max {
@@ -41,6 +38,51 @@ fn first_line(s: &str, max: usize) -> String {
         format!("{truncated}…")
     } else {
         line.to_string()
+    }
+}
+
+/// A compact, human summary of a tool's input for the one-line "Compact" view:
+/// the most relevant string value of its JSON (command/query/path/…), or the
+/// first string field, falling back to the raw first line. Clamped to width.
+fn summarize_input(input: &str) -> String {
+    const KEYS: [&str; 8] = [
+        "command",
+        "query",
+        "q",
+        "pattern",
+        "path",
+        "file_path",
+        "url",
+        "prompt",
+    ];
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(input) {
+        for k in KEYS {
+            if let Some(s) = map.get(k).and_then(|v| v.as_str()) {
+                return first_line(s, 64);
+            }
+        }
+        return map
+            .values()
+            .find_map(|v| v.as_str())
+            .map(|s| first_line(s, 64))
+            .unwrap_or_default();
+    }
+    first_line(input, 64)
+}
+
+/// A short one-line summary of a tool's output: the content itself when it is a
+/// single short line, otherwise a line count (so the cell never becomes a dump).
+fn output_summary(out: &str) -> String {
+    let nonempty: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    match nonempty.as_slice() {
+        [] => String::new(),
+        [only] if only.chars().count() <= 56 => (*only).to_string(),
+        [only] => first_line(only, 56),
+        _ => format!("{} lines", out.lines().count()),
     }
 }
 
@@ -79,31 +121,25 @@ impl Cell {
                 let timing = duration_ms
                     .map(|ms| format!(" ({ms}ms)"))
                     .unwrap_or_default();
-                let header = Line::from(vec![
-                    Span::styled(
-                        format!("{marker} {name}{timing}"),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {}", first_line(input, 80)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]);
-                let mut lines = vec![header];
+                let dim = Style::default().fg(Color::DarkGray);
+                // "Compact" preview: one line — marker + name + timing + a short
+                // input summary + a short output summary. Never a multi-line dump
+                // (the agent sees the full output; the user wants only an aperçu).
+                let mut spans = vec![Span::styled(
+                    format!("{marker} {name}{timing}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )];
+                let in_sum = summarize_input(input);
+                if !in_sum.is_empty() {
+                    spans.push(Span::styled(format!("  {in_sum}"), dim));
+                }
                 if let Some(out) = output {
-                    let dim = Style::default().fg(Color::DarkGray);
-                    let total = out.lines().count();
-                    for l in out.lines().take(MAX_OUTPUT_LINES) {
-                        lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
-                    }
-                    if total > MAX_OUTPUT_LINES {
-                        lines.push(Line::from(Span::styled(
-                            format!("  … ({} more lines)", total - MAX_OUTPUT_LINES),
-                            dim,
-                        )));
+                    let out_sum = output_summary(out);
+                    if !out_sum.is_empty() {
+                        spans.push(Span::styled(format!("  → {out_sum}"), dim));
                     }
                 }
-                lines
+                vec![Line::from(spans)]
             }
             Cell::Notice(text) => vec![Line::from(Span::styled(
                 format!("— {text}"),
@@ -195,22 +231,49 @@ mod tests {
     }
 
     #[test]
-    fn long_tool_output_is_truncated() {
+    fn completed_tool_renders_a_single_compact_line() {
+        // "Compact" preview: a tool cell is ONE line — marker + name + timing +
+        // input summary + a short output summary — never a multi-line dump.
         let out = (0..100)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let cell = Cell::Tool {
-            name: "bash".into(),
-            input: "{}".into(),
+            name: "websearch".into(),
+            input: r#"{"query":"rust async runtime"}"#.into(),
             status: ToolStatus::Ok,
             output: Some(out),
-            duration_ms: Some(1),
+            duration_ms: Some(1200),
+        };
+        let lines = cell.to_lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a tool cell must collapse to one compact line"
+        );
+        let s = plain(&lines);
+        assert!(s.contains("websearch"), "name missing: {s}");
+        assert!(s.contains("1200ms"), "timing missing: {s}");
+        assert!(
+            s.contains("rust async runtime"),
+            "input value should be summarised (not raw JSON): {s}"
+        );
+        assert!(s.contains("100 lines"), "output summary missing: {s}");
+    }
+
+    #[test]
+    fn compact_tool_input_summary_strips_json_wrapper() {
+        // bash's `{"command":"ls -la"}` should read as `ls -la`, not the JSON.
+        let cell = Cell::Tool {
+            name: "bash".into(),
+            input: r#"{"command":"ls -la /tmp"}"#.into(),
+            status: ToolStatus::Running,
+            output: None,
+            duration_ms: None,
         };
         let s = plain(&cell.to_lines());
-        assert!(s.contains("more lines"), "should note truncation: {s}");
-        // header + MAX_OUTPUT_LINES + truncation note
-        assert_eq!(cell.to_lines().len(), 1 + MAX_OUTPUT_LINES + 1);
+        assert!(s.contains("ls -la /tmp"), "command not summarised: {s}");
+        assert!(!s.contains('{'), "raw JSON leaked into the summary: {s}");
     }
 
     #[test]

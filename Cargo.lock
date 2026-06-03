@@ -2131,9 +2131,11 @@ dependencies = [
  "heartbit",
  "heartbit-core",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::App;
+use crate::app::{App, Modal};
 use crate::cells::Cell;
 
 const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
@@ -40,14 +40,17 @@ pub fn view(frame: &mut Frame, app: &App) {
 
     // --- transcript ---
     let lines = transcript_lines(app);
-    let total = lines.len() as u16;
     let view_h = chunks[0].height;
+    let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Count VISUAL rows (post-wrap), not logical lines: a long line occupies
+    // several rows, so a bottom-anchored offset computed from `lines.len()`
+    // under-scrolls and clips the newest content below the fold. `line_count`
+    // uses the same WordWrapper as the renderer (honours `trim: false`); the
+    // transcript has no block/border so the border caveat (ratatui #1233) is moot.
+    let total = transcript.line_count(chunks[0].width) as u16;
     let max_off = total.saturating_sub(view_h);
     let offset = max_off.saturating_sub(app.scroll);
-    let transcript = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
-    frame.render_widget(transcript, chunks[0]);
+    frame.render_widget(transcript.scroll((offset, 0)), chunks[0]);
 
     // --- status line ---
     let state = if app.running {
@@ -102,38 +105,73 @@ pub fn view(frame: &mut Frame, app: &App) {
         Paragraph::new(comp_text).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(composer, chunks[2]);
 
-    // --- approval modal overlay ---
-    if let Some(modal) = &app.modal {
-        let w = area.width.min(72);
-        let h = (modal.tools.len() as u16 + 5).min(area.height);
-        let rect = centered(area, w, h);
-        frame.render_widget(Clear, rect);
-        let mut mlines = vec![Line::from(Span::styled(
-            "The agent wants to run:",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))];
-        for t in &modal.tools {
-            let summary: String = t.input.chars().take(48).collect();
-            mlines.push(Line::raw(format!("  • {}  {}", t.name, summary)));
+    // --- modal overlays ---
+    match &app.modal {
+        Some(Modal::Approval(modal)) => {
+            let w = area.width.min(72);
+            let h = (modal.tools.len() as u16 + 5).min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let mut mlines = vec![Line::from(Span::styled(
+                "The agent wants to run:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))];
+            for t in &modal.tools {
+                let summary: String = t.input.chars().take(48).collect();
+                mlines.push(Line::raw(format!("  • {}  {}", t.name, summary)));
+            }
+            mlines.push(Line::raw(""));
+            mlines.push(Line::from(Span::styled(
+                "[y] allow   [a] always allow   [n] deny",
+                Style::default().fg(Color::Cyan),
+            )));
+            let modal_widget = Paragraph::new(mlines)
+                .block(Block::default().borders(Borders::ALL).title(" approve? "))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(modal_widget, rect);
         }
-        mlines.push(Line::raw(""));
-        mlines.push(Line::from(Span::styled(
-            "[y] allow   [a] always allow   [n] deny",
-            Style::default().fg(Color::Cyan),
-        )));
-        let modal_widget = Paragraph::new(mlines)
-            .block(Block::default().borders(Borders::ALL).title(" approve? "))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(modal_widget, rect);
-    } else {
-        // Show the text cursor in the composer when no modal is up.
-        let (crow, ccol) = app.composer.cursor();
-        frame.set_cursor_position(Position::new(
-            chunks[2].x + 1 + ccol as u16,
-            chunks[2].y + 1 + crow as u16,
-        ));
+        Some(Modal::KeyEntry(modal)) => {
+            let w = area.width.min(72);
+            let h = 7u16.min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let masked: String = "•".repeat(modal.input.chars().count());
+            let mlines = vec![
+                Line::from(Span::raw("Paste your OpenRouter API key:")),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    if masked.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        masked
+                    },
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "Enter to save · Esc to cancel · keys at openrouter.ai/keys",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            let modal_widget = Paragraph::new(mlines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" OpenRouter API key "),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(modal_widget, rect);
+        }
+        None => {
+            // Show the text cursor in the composer when no modal is up.
+            let (crow, ccol) = app.composer.cursor();
+            frame.set_cursor_position(Position::new(
+                chunks[2].x + 1 + ccol as u16,
+                chunks[2].y + 1 + crow as u16,
+            ));
+        }
     }
 }
 
@@ -193,6 +231,29 @@ mod tests {
     }
 
     #[test]
+    fn newest_content_stays_visible_when_earlier_lines_wrap() {
+        // Earlier cells have long lines that wrap into many VISUAL rows in a
+        // narrow viewport. The transcript must auto-scroll by visual rows so the
+        // newest cell is visible — counting logical lines under-scrolls and
+        // clips the newest content below the fold (the reported bug).
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        for i in 0..8 {
+            app.history.push(Cell::Agent(format!(
+                "filler {i} a rather long assistant line that wraps across several visual rows in a narrow viewport indeed"
+            )));
+        }
+        app.history.push(Cell::Agent("NEWEST_MARKER".into()));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("NEWEST_MARKER"),
+            "newest content was clipped below the fold:\n{text}"
+        );
+    }
+
+    #[test]
     fn renders_approval_modal_over_transcript() {
         use crate::msg::PendingTool;
         use std::sync::mpsc::sync_channel;
@@ -212,5 +273,27 @@ mod tests {
         assert!(text.contains("approve"), "modal title missing:\n{text}");
         assert!(text.contains("bash"), "tool name missing:\n{text}");
         assert!(text.contains("allow"), "approval options missing:\n{text}");
+    }
+
+    #[test]
+    fn key_entry_modal_masks_the_secret() {
+        use crate::app::{KeyEntryModal, Modal};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.modal = Some(Modal::KeyEntry(KeyEntryModal {
+            input: "sk-or-supersecret".into(),
+        }));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("OpenRouter API key"),
+            "title missing:\n{text}"
+        );
+        assert!(text.contains('•'), "masked dots missing:\n{text}");
+        assert!(
+            !text.contains("sk-or-supersecret"),
+            "the raw key must never be rendered:\n{text}"
+        );
     }
 }

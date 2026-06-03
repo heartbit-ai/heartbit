@@ -71,5 +71,7 @@ quote = "1"
 proc-macro2 = "1"
 parking_lot = "0.12"
 libc = "0.2"
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count(width)` so the
+# transcript can auto-scroll by VISUAL (wrapped) rows, not logical lines.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
