@@ -16,6 +16,15 @@ use crate::msg::{Msg, PendingTool};
 /// How many transcript lines a PageUp/PageDown moves.
 const SCROLL_STEP: u16 = 8;
 
+/// Slash commands offered by the `/` autocomplete menu: (name, description).
+pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "list commands"),
+    ("/model", "show or set the model"),
+    ("/mcp", "list / add / clear MCP servers"),
+    ("/key", "set the OpenRouter API key"),
+    ("/quit", "exit the TUI"),
+];
+
 /// A side-effect for the edge (main loop) to perform after an update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -70,6 +79,8 @@ pub struct App {
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
+    /// Highlighted row in the `/` command-autocomplete menu.
+    pub menu_selected: usize,
     pub spinner: usize,
     pub should_quit: bool,
     pub effects: Vec<Effect>,
@@ -91,6 +102,7 @@ impl App {
             mcp_servers: Vec::new(),
             running: false,
             scroll: 0,
+            menu_selected: 0,
             spinner: 0,
             should_quit: false,
             effects: Vec::new(),
@@ -201,6 +213,63 @@ impl App {
             Msg::Approval { tools, reply } => {
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
             }
+        }
+    }
+
+    /// Candidates for the `/` autocomplete menu given the current composer text,
+    /// or empty when the menu should not show (not typing a bare `/command`).
+    pub fn command_candidates(&self) -> Vec<(&'static str, &'static str)> {
+        if self.modal.is_some() {
+            return Vec::new();
+        }
+        let text = self.composer.text();
+        if !text.starts_with('/') || text.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(text.as_str()))
+            .copied()
+            .collect()
+    }
+
+    /// Whether the `/` command menu is currently showing.
+    pub fn menu_open(&self) -> bool {
+        !self.command_candidates().is_empty()
+    }
+
+    fn menu_selected_command(&self) -> Option<&'static str> {
+        let cands = self.command_candidates();
+        if cands.is_empty() {
+            return None;
+        }
+        Some(cands[self.menu_selected.min(cands.len() - 1)].0)
+    }
+
+    /// Move the menu highlight (wrapping).
+    fn menu_move(&mut self, delta: isize) {
+        let n = self.command_candidates().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.menu_selected.min(n - 1) as isize;
+        self.menu_selected = (cur + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// Tab: complete to the selected command + a trailing space (ready for args).
+    fn menu_complete(&mut self) {
+        if let Some(name) = self.menu_selected_command() {
+            self.composer.set_text(&format!("{name} "));
+            self.menu_selected = 0;
+        }
+    }
+
+    /// Enter on the menu: complete to the selected command and run it now.
+    fn menu_run(&mut self) {
+        if let Some(name) = self.menu_selected_command() {
+            self.composer.set_text(name);
+            self.submit();
+            self.menu_selected = 0;
         }
     }
 
@@ -351,6 +420,18 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Slash-command autocomplete: while the `/` menu is open, arrows/Tab/Enter/
+        // Esc drive the menu instead of the composer/history.
+        if self.menu_open() {
+            match key.code {
+                KeyCode::Up => return self.menu_move(-1),
+                KeyCode::Down => return self.menu_move(1),
+                KeyCode::Tab => return self.menu_complete(),
+                KeyCode::Enter if !shift && !alt => return self.menu_run(),
+                KeyCode::Esc => return self.composer.clear(),
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Enter => {
                 if shift || alt {
@@ -361,8 +442,14 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit(),
             KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
-            KeyCode::Char(c) if !ctrl && !alt => self.composer.insert_char(c),
-            KeyCode::Backspace => self.composer.backspace(),
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.composer.insert_char(c);
+                self.menu_selected = 0; // re-filter from the top
+            }
+            KeyCode::Backspace => {
+                self.composer.backspace();
+                self.menu_selected = 0;
+            }
             KeyCode::Left => self.composer.move_left(),
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Up => self.composer.history_prev(),
@@ -620,6 +707,69 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e, Effect::SendInput(_)))
         );
+    }
+
+    #[test]
+    fn slash_opens_command_menu_with_all_commands() {
+        let mut app = keyed();
+        typed(&mut app, "/");
+        assert!(app.menu_open());
+        assert_eq!(app.command_candidates().len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn command_menu_filters_by_prefix() {
+        let mut app = keyed();
+        typed(&mut app, "/m");
+        let names: Vec<&str> = app.command_candidates().iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"/model") && names.contains(&"/mcp"));
+        assert!(!names.contains(&"/help"));
+        typed(&mut app, "o"); // "/mo" → only /model
+        let names: Vec<&str> = app.command_candidates().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/model"]);
+    }
+
+    #[test]
+    fn command_menu_closes_after_a_space() {
+        let mut app = keyed();
+        typed(&mut app, "/model ");
+        assert!(!app.menu_open(), "a space ends command-name typing");
+    }
+
+    #[test]
+    fn menu_arrows_navigate_and_wrap() {
+        let mut app = keyed();
+        typed(&mut app, "/");
+        let n = app.command_candidates().len();
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.menu_selected, 1);
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.menu_selected, 0);
+        app.update(key(KeyCode::Up)); // wrap to the bottom
+        assert_eq!(app.menu_selected, n - 1);
+    }
+
+    #[test]
+    fn menu_tab_completes_with_trailing_space() {
+        let mut app = keyed();
+        typed(&mut app, "/mo"); // → /model
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(app.composer.text(), "/model ");
+        assert!(!app.menu_open(), "completion closes the menu");
+    }
+
+    #[test]
+    fn menu_enter_runs_the_selected_command() {
+        let mut app = keyed();
+        typed(&mut app, "/he"); // → /help
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("commands"))),
+            "Enter must run /help (not the partial /he)"
+        );
+        assert!(app.composer.is_empty());
     }
 
     #[test]

@@ -107,6 +107,48 @@ pub fn view(frame: &mut Frame, app: &App) {
         Paragraph::new(comp_text).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(composer, chunks[2]);
 
+    // --- slash-command autocomplete menu (floats above the composer) ---
+    let candidates = app.command_candidates();
+    if !candidates.is_empty() {
+        let h = (candidates.len() as u16 + 2).min(area.height);
+        let w = 52.min(area.width);
+        let rect = Rect {
+            x: chunks[2].x,
+            y: chunks[2].y.saturating_sub(h),
+            width: w,
+            height: h,
+        };
+        frame.render_widget(Clear, rect);
+        let sel = app.menu_selected.min(candidates.len() - 1);
+        let items: Vec<Line> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                let (name_style, desc_style) = if i == sel {
+                    let base = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    (base.add_modifier(Modifier::BOLD), base)
+                } else {
+                    (
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {name:<7}"), name_style),
+                    Span::styled(format!("  {desc} "), desc_style),
+                ])
+            })
+            .collect();
+        let menu = Paragraph::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" commands · ↑↓ Tab Enter "),
+        );
+        frame.render_widget(menu, rect);
+    }
+
     // --- modal overlays ---
     match &app.modal {
         Some(Modal::Approval(modal)) => {
@@ -279,6 +321,21 @@ mod tests {
         assert!(
             text.contains("NEWEST_MARKER"),
             "newest content was clipped below the fold:\n{text}"
+        );
+    }
+
+    #[test]
+    fn slash_renders_command_menu() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.composer.insert_str("/");
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("commands"), "menu title missing:\n{text}");
+        assert!(
+            text.contains("/model") && text.contains("/mcp"),
+            "commands missing:\n{text}"
         );
     }
 

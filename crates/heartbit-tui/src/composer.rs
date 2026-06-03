@@ -121,6 +121,13 @@ impl Composer {
         self.hist_pos = None;
     }
 
+    /// Replace the buffer with `s` (cursor at end), without recording history.
+    /// Used by slash-command autocompletion.
+    pub fn set_text(&mut self, s: &str) {
+        self.load(s);
+        self.hist_pos = None;
+    }
+
     /// Submit: returns the text, records non-blank entries in history, and clears
     /// the live buffer (history is retained).
     pub fn take(&mut self) -> String {
@@ -264,6 +271,15 @@ mod tests {
         let _ = c.take();
         c.history_prev();
         assert_eq!(c.text(), "", "blank entry must not enter history");
+    }
+
+    #[test]
+    fn set_text_replaces_buffer_cursor_at_end() {
+        let mut c = Composer::new();
+        c.insert_str("foo");
+        c.set_text("/model ");
+        assert_eq!(c.text(), "/model ");
+        assert_eq!(c.cursor(), (0, 7));
     }
 
     #[test]
