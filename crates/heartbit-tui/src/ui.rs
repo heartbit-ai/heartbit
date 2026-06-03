@@ -208,6 +208,74 @@ pub fn view(frame: &mut Frame, app: &App) {
                 .wrap(Wrap { trim: false });
             frame.render_widget(modal_widget, rect);
         }
+        Some(Modal::ModelPicker(picker)) => {
+            let w = area.width.min(74);
+            let h = area.height.min(20);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let mut mlines = vec![
+                Line::from(vec![
+                    Span::styled("search: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        picker.query.clone(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::raw(""),
+            ];
+            if app.models.is_empty() {
+                mlines.push(Line::from(Span::styled(
+                    if app.models_loading {
+                        "loading models…"
+                    } else {
+                        "(no models — use /model <name>)"
+                    },
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let filtered = crate::models::filter_models(&app.models, &picker.query);
+                let visible = (h as usize).saturating_sub(6).max(1);
+                let sel = picker.selected.min(filtered.len().saturating_sub(1));
+                let start = if sel >= visible { sel + 1 - visible } else { 0 };
+                for (fi, &idx) in filtered.iter().enumerate().skip(start).take(visible) {
+                    let m = &app.models[idx];
+                    let ctx = m
+                        .context
+                        .map(|c| format!("  {}k", c / 1000))
+                        .unwrap_or_default();
+                    if fi == sel {
+                        mlines.push(Line::from(Span::styled(
+                            format!(" ▸ {}{ctx} ", m.id),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    } else {
+                        mlines.push(Line::from(vec![
+                            Span::raw(format!("   {}", m.id)),
+                            Span::styled(ctx, Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                }
+                mlines.push(Line::raw(""));
+                mlines.push(Line::from(Span::styled(
+                    format!(
+                        "{} models · type to filter · ↑↓ · Enter set · Esc",
+                        filtered.len()
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            let widget = Paragraph::new(mlines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" select model "),
+            );
+            frame.render_widget(widget, rect);
+        }
         None => {
             // Show the text cursor in the composer when no modal is up.
             let (crow, ccol) = app.composer.cursor();
@@ -336,6 +404,42 @@ mod tests {
         assert!(
             text.contains("/model") && text.contains("/mcp"),
             "commands missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn model_picker_renders_loading_then_list() {
+        use crate::app::{Modal, ModelPicker};
+        use crate::models::ModelEntry;
+        let backend = TestBackend::new(72, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        // loading state
+        app.modal = Some(Modal::ModelPicker(ModelPicker::default()));
+        app.models_loading = true;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("select model"), "title missing:\n{text}");
+        assert!(text.contains("loading"), "loading state missing:\n{text}");
+        // loaded state
+        app.models_loading = false;
+        app.models = vec![
+            ModelEntry {
+                id: "anthropic/claude-x".into(),
+                name: "Claude".into(),
+                context: Some(200000),
+            },
+            ModelEntry {
+                id: "openai/gpt-y".into(),
+                name: "GPT".into(),
+                context: None,
+            },
+        ];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text2 = buffer_text(terminal.backend().buffer());
+        assert!(
+            text2.contains("anthropic/claude-x") && text2.contains("openai/gpt-y"),
+            "model list missing:\n{text2}"
         );
     }
 

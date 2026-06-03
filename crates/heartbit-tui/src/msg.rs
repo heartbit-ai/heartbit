@@ -49,6 +49,10 @@ pub enum Msg {
     RunCompleted,
     RunFailed(String),
 
+    // ---- OpenRouter model catalog (fetched async for the model picker) ----
+    ModelsLoaded(Vec<crate::models::ModelEntry>),
+    ModelsFailed(String),
+
     // ---- the synchronous approval round-trip ----
     Approval {
         tools: Vec<PendingTool>,

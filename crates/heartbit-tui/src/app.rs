@@ -11,6 +11,7 @@ use heartbit_core::{ApprovalDecision, TokenUsage};
 use crate::cells::{Cell, ToolStatus};
 use crate::composer::Composer;
 use crate::config::McpServerSpec;
+use crate::models::ModelEntry;
 use crate::msg::{Msg, PendingTool};
 
 /// How many transcript lines a PageUp/PageDown moves.
@@ -36,6 +37,8 @@ pub enum Effect {
     SaveModel(String),
     /// Persist the MCP server list to the config file.
     SaveMcp(Vec<McpServerSpec>),
+    /// Fetch the OpenRouter model catalog (async, for the model picker).
+    FetchModels,
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
     /// Tear down and exit.
@@ -54,10 +57,19 @@ pub struct KeyEntryModal {
     pub input: String,
 }
 
+/// The OpenRouter model picker overlay: a search query + the highlighted row
+/// (an index into the FILTERED list, which is derived from `App.models`).
+#[derive(Default)]
+pub struct ModelPicker {
+    pub query: String,
+    pub selected: usize,
+}
+
 /// A modal overlay.
 pub enum Modal {
     Approval(ApprovalModal),
     KeyEntry(KeyEntryModal),
+    ModelPicker(ModelPicker),
 }
 
 /// The full UI state.
@@ -76,6 +88,10 @@ pub struct App {
     pub tokens: TokenUsage,
     /// MCP servers to connect when the agent starts (mirrors the config file).
     pub mcp_servers: Vec<McpServerSpec>,
+    /// The OpenRouter model catalog (lazily fetched for the picker).
+    pub models: Vec<ModelEntry>,
+    /// True while the catalog fetch is in flight.
+    pub models_loading: bool,
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
@@ -100,6 +116,8 @@ impl App {
             has_fallback_provider: false,
             tokens: TokenUsage::default(),
             mcp_servers: Vec::new(),
+            models: Vec::new(),
+            models_loading: false,
             running: false,
             scroll: 0,
             menu_selected: 0,
@@ -126,9 +144,13 @@ impl App {
             Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
             Msg::Resize => {}
             Msg::Paste(s) => match &mut self.modal {
-                // Pasting the API key into its prompt must land in the key field,
-                // not the composer hidden behind the modal.
+                // Pasting into a prompt must land in that field, not the composer
+                // hidden behind the modal.
                 Some(Modal::KeyEntry(m)) => m.input.push_str(&s.replace(['\n', '\r'], "")),
+                Some(Modal::ModelPicker(p)) => {
+                    p.query.push_str(&s.replace(['\n', '\r'], ""));
+                    p.selected = 0;
+                }
                 Some(Modal::Approval(_)) => {}
                 None => self.composer.insert_str(&s),
             },
@@ -212,6 +234,20 @@ impl App {
             }
             Msg::Approval { tools, reply } => {
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
+            }
+            Msg::ModelsLoaded(models) => {
+                self.models = models;
+                self.models_loading = false;
+            }
+            Msg::ModelsFailed(err) => {
+                self.models_loading = false;
+                // Close the picker and fall back to `/model <name>`.
+                if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+                    self.modal = None;
+                }
+                self.history.push(Cell::Notice(format!(
+                    "could not load models: {err} — use /model <name>"
+                )));
             }
         }
     }
@@ -314,15 +350,11 @@ impl App {
                     self.set_api_key(arg);
                 }
             }
-            "model" => {
+            "model" | "models" => {
                 if arg.is_empty() {
-                    self.history
-                        .push(Cell::Notice(format!("model: {}", self.model)));
+                    self.open_model_picker();
                 } else {
-                    self.model = arg.clone();
-                    self.effects.push(Effect::SaveModel(arg.clone()));
-                    self.history
-                        .push(Cell::Notice(format!("model set to {arg}")));
+                    self.set_model(arg);
                 }
             }
             "mcp" => self.handle_mcp(arg),
@@ -411,6 +443,73 @@ impl App {
             .push(Cell::Notice("OpenRouter API key saved.".into()));
     }
 
+    /// Set the model (same semantics as `/model <name>`): update, persist, notice.
+    /// Takes effect on the next agent start.
+    fn set_model(&mut self, model: String) {
+        self.model = model.clone();
+        self.effects.push(Effect::SaveModel(model.clone()));
+        self.history.push(Cell::Notice(format!(
+            "model set to {model} — active on next start"
+        )));
+    }
+
+    /// Open the OpenRouter model picker, fetching the catalog on first use.
+    fn open_model_picker(&mut self) {
+        self.modal = Some(Modal::ModelPicker(ModelPicker::default()));
+        if self.models.is_empty() && !self.models_loading {
+            self.models_loading = true;
+            self.effects.push(Effect::FetchModels);
+        }
+    }
+
+    /// Keys for the model-picker modal: type to filter, ↑/↓ select, Enter set,
+    /// Esc cancel. Enter may arrive as a raw CR/LF char on some terminals.
+    fn handle_model_picker_key(&mut self, key: KeyEvent) {
+        let query = match &self.modal {
+            Some(Modal::ModelPicker(p)) => p.query.clone(),
+            _ => return,
+        };
+        let filtered = crate::models::filter_models(&self.models, &query);
+        let n = filtered.len();
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up if n > 0 => {
+                if let Some(Modal::ModelPicker(p)) = &mut self.modal {
+                    p.selected = (p.selected.min(n - 1) + n - 1) % n;
+                }
+            }
+            KeyCode::Down if n > 0 => {
+                if let Some(Modal::ModelPicker(p)) = &mut self.modal {
+                    p.selected = (p.selected.min(n - 1) + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let sel = match &self.modal {
+                    Some(Modal::ModelPicker(p)) => p.selected,
+                    _ => 0,
+                };
+                if let Some(&idx) = filtered.get(sel.min(n.saturating_sub(1))) {
+                    let id = self.models[idx].id.clone();
+                    self.modal = None;
+                    self.set_model(id);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(Modal::ModelPicker(p)) = &mut self.modal {
+                    p.query.pop();
+                    p.selected = 0;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(Modal::ModelPicker(p)) = &mut self.modal {
+                    p.query.push(c);
+                    p.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn quit(&mut self) {
         self.should_quit = true;
         self.effects.push(Effect::Quit);
@@ -487,6 +586,7 @@ impl App {
         match self.modal {
             Some(Modal::Approval(_)) => self.handle_approval_key(key),
             Some(Modal::KeyEntry(_)) => self.handle_key_entry(key),
+            Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
             None => {}
         }
     }
@@ -769,11 +869,10 @@ mod tests {
         typed(&mut app, "/"); // all commands, selected = 0 (/help)
         app.update(key(KeyCode::Down)); // selected = 1 (/model)
         app.update(key(KeyCode::Enter));
+        // /model opens the picker — proving the NAVIGATED command ran, not /help.
         assert!(
-            app.history
-                .iter()
-                .any(|c| matches!(c, Cell::Notice(n) if n.contains("model:"))),
-            "navigated /model must run, not /help"
+            matches!(app.modal, Some(Modal::ModelPicker(_))),
+            "navigated /model must run (open the picker), not /help"
         );
     }
 
@@ -806,6 +905,95 @@ mod tests {
             "Enter must run /help (not the partial /he)"
         );
         assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn slash_model_no_arg_opens_picker_and_fetches() {
+        let mut app = keyed();
+        typed(&mut app, "/model");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::ModelPicker(_))));
+        assert!(app.models_loading);
+        assert!(app.effects.contains(&Effect::FetchModels));
+    }
+
+    #[test]
+    fn slash_model_with_arg_sets_directly_no_picker() {
+        let mut app = keyed();
+        typed(&mut app, "/model openai/gpt-x");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.model, "openai/gpt-x");
+        assert!(
+            app.effects
+                .contains(&Effect::SaveModel("openai/gpt-x".into()))
+        );
+        assert!(app.modal.is_none(), "a direct set must not open the picker");
+    }
+
+    #[test]
+    fn model_picker_loads_filters_and_selects() {
+        let mut app = keyed();
+        typed(&mut app, "/model");
+        app.update(key(KeyCode::Enter)); // open picker + FetchModels
+        app.update(Msg::ModelsLoaded(vec![
+            ModelEntry {
+                id: "qwen/q".into(),
+                name: "Qwen".into(),
+                context: None,
+            },
+            ModelEntry {
+                id: "anthropic/claude".into(),
+                name: "Claude".into(),
+                context: None,
+            },
+            ModelEntry {
+                id: "openai/gpt".into(),
+                name: "GPT".into(),
+                context: None,
+            },
+        ]));
+        assert!(!app.models_loading);
+        for c in "claude".chars() {
+            app.update(key(KeyCode::Char(c)));
+        }
+        app.update(key(KeyCode::Enter)); // select the only match
+        assert_eq!(app.model, "anthropic/claude");
+        assert!(app.modal.is_none(), "selecting closes the picker");
+        assert!(
+            app.effects
+                .contains(&Effect::SaveModel("anthropic/claude".into()))
+        );
+    }
+
+    #[test]
+    fn model_picker_esc_cancels_without_change() {
+        let mut app = keyed();
+        typed(&mut app, "/model");
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::ModelsLoaded(vec![ModelEntry {
+            id: "x/y".into(),
+            name: "X".into(),
+            context: None,
+        }]));
+        app.update(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    #[test]
+    fn models_failed_closes_picker_and_notices() {
+        let mut app = keyed();
+        typed(&mut app, "/model");
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::ModelsFailed("offline".into()));
+        assert!(app.modal.is_none(), "failure closes the picker");
+        assert!(!app.models_loading);
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("could not load models"))),
+            "must fall back with a notice"
+        );
     }
 
     #[test]

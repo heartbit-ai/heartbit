@@ -22,6 +22,7 @@ mod cells;
 mod composer;
 mod config;
 mod markdown;
+mod models;
 mod msg;
 mod ui;
 
@@ -468,6 +469,18 @@ async fn run_ui(
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
                     }
+                }
+                Effect::FetchModels => {
+                    // Fetch the OpenRouter catalog off the UI thread; the result
+                    // comes back as Msg::ModelsLoaded / ModelsFailed.
+                    let tx = ui_tx.clone();
+                    tokio::spawn(async move {
+                        let msg = match models::fetch_openrouter_models().await {
+                            Ok(m) => Msg::ModelsLoaded(m),
+                            Err(e) => Msg::ModelsFailed(e.to_string()),
+                        };
+                        let _ = tx.send(msg);
+                    });
                 }
                 Effect::Interrupt => {
                     tracing::info!(

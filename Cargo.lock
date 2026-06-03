@@ -2132,6 +2132,7 @@ dependencies = [
  "heartbit-core",
  "pulldown-cmark",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
