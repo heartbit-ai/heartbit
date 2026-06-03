@@ -162,6 +162,10 @@ pub struct App {
     pub agents: Vec<AgentRow>,
     /// Live task list mirrored from the agent's latest `todowrite` call.
     pub todos: Vec<TodoRow>,
+    /// Current context fill (latest request's input tokens) — for the status bar.
+    pub context_tokens: u32,
+    /// Time-to-first-token of the latest turn (ms) — status-line throughput.
+    pub last_ttft_ms: u64,
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
@@ -191,6 +195,8 @@ impl App {
             multi_agent: false,
             agents: Vec::new(),
             todos: Vec::new(),
+            context_tokens: 0,
+            last_ttft_ms: 0,
             running: false,
             scroll: 0,
             menu_selected: 0,
@@ -199,6 +205,16 @@ impl App {
             effects: Vec::new(),
             tool_index: HashMap::new(),
         }
+    }
+
+    /// The current model's context window (tokens), from the OpenRouter catalog
+    /// if loaded — used to draw the context-fill bar. `None` falls back to a
+    /// raw token count in the status line.
+    pub fn context_limit(&self) -> Option<u64> {
+        self.models
+            .iter()
+            .find(|m| m.id == self.model)
+            .and_then(|m| m.context)
     }
 
     /// Finalize the streamed assistant text into a transcript cell.
@@ -306,6 +322,7 @@ impl App {
             Msg::LlmDone {
                 usage,
                 had_tool_calls,
+                ttft_ms,
             } => {
                 self.finalize_active();
                 self.tokens.input_tokens =
@@ -314,6 +331,14 @@ impl App {
                     .tokens
                     .output_tokens
                     .saturating_add(usage.output_tokens);
+                // The latest request's input tokens ≈ current context fill (the
+                // whole conversation is the prompt), not summed — for the bar.
+                if usage.input_tokens > 0 {
+                    self.context_tokens = usage.input_tokens;
+                }
+                if ttft_ms > 0 {
+                    self.last_ttft_ms = ttft_ms;
+                }
                 // A text-only turn means the agent now idles awaiting input — the
                 // orchestrator finished synthesizing, so settle the roster.
                 if !had_tool_calls {
@@ -1297,6 +1322,7 @@ mod tests {
         app.update(Msg::LlmDone {
             usage: TokenUsage::default(),
             had_tool_calls: false,
+            ttft_ms: 0,
         });
         assert_eq!(app.agents[0].state, AgentState::Done);
     }
@@ -1404,6 +1430,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            ttft_ms: 0,
         });
         assert!(app.active.is_none());
         assert!(matches!(app.history.last(), Some(Cell::Agent(t)) if t == "Hello"));
@@ -1419,12 +1446,14 @@ mod tests {
         app.update(Msg::LlmDone {
             usage: TokenUsage::default(),
             had_tool_calls: true,
+            ttft_ms: 0,
         });
         assert!(app.running, "tool turn should stay running");
         // A text-only turn means the agent now idles awaiting input.
         app.update(Msg::LlmDone {
             usage: TokenUsage::default(),
             had_tool_calls: false,
+            ttft_ms: 0,
         });
         assert!(!app.running, "text-only turn should go idle");
     }

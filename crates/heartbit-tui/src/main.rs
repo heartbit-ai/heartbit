@@ -115,6 +115,10 @@ async fn main() -> anyhow::Result<()> {
     app.has_fallback_provider = has_anthropic;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
+    // Fetch the OpenRouter catalog at startup (public endpoint) so the status-line
+    // context bar knows the model's window and the /model picker is pre-warmed.
+    app.models_loading = true;
+    app.effects.push(Effect::FetchModels);
     // No provider configured at all → open the key prompt immediately.
     if app.api_key.is_none() && !has_anthropic {
         app.modal = Some(app::Modal::KeyEntry(app::KeyEntryModal::default()));

@@ -36,6 +36,8 @@ pub enum Msg {
     LlmDone {
         usage: TokenUsage,
         had_tool_calls: bool,
+        /// Time-to-first-token for this turn (ms) — shown in the status line.
+        ttft_ms: u64,
     },
     StreamDelta(String),
     ToolStarted {
@@ -93,10 +95,12 @@ impl Msg {
             AgentEvent::LlmResponse {
                 usage,
                 tool_call_count,
+                time_to_first_token_ms,
                 ..
             } => Some(Msg::LlmDone {
                 usage,
                 had_tool_calls: tool_call_count > 0,
+                ttft_ms: time_to_first_token_ms,
             }),
             AgentEvent::ToolCallStarted {
                 tool_name,

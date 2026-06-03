@@ -74,36 +74,43 @@ pub fn view(frame: &mut Frame, app: &App) {
         }
     }
 
-    // --- status line ---
+    // --- status line: model · context bar · cumulative tokens · TTFT · state ---
     let state = if app.running {
         format!("{} working", SPINNER[app.spinner % SPINNER.len()])
     } else {
         "ready".to_string()
     };
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.model),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+    let mut status = vec![Span::styled(
+        format!(" {} ", app.model),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )];
+    // Context-window fill: a small gauge when we know the model's limit, else a
+    // raw token count. Color thresholds: green <70%, yellow <90%, red beyond.
+    status.extend(context_spans(app));
+    status.push(Span::styled(
+        format!(
+            "· {} tok ",
+            human_tokens(app.tokens.input_tokens + app.tokens.output_tokens)
         ),
-        Span::styled(
-            format!(
-                "· {}+{} tok ",
-                app.tokens.input_tokens, app.tokens.output_tokens
-            ),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if app.last_ttft_ms > 0 {
+        status.push(Span::styled(
+            format!("· {} ttft ", human_ms(app.last_ttft_ms)),
             Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("· {state} "),
-            Style::default().fg(if app.running {
-                Color::Yellow
-            } else {
-                Color::Green
-            }),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(status), chunks[1]);
+        ));
+    }
+    status.push(Span::styled(
+        format!("· {state} "),
+        Style::default().fg(if app.running {
+            Color::Yellow
+        } else {
+            Color::Green
+        }),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(status)), chunks[1]);
 
     // --- composer ---
     let comp_text: Vec<Line> = if app.composer.is_empty() && app.modal.is_none() {
@@ -319,6 +326,56 @@ pub fn view(frame: &mut Frame, app: &App) {
                 chunks[2].y + 1 + crow as u16,
             ));
         }
+    }
+}
+
+/// `1234 → "1.2k"`, `999 → "999"` — compact token/number formatting.
+fn human_tokens(n: u32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// `1400 → "1.4s"`, `420 → "420ms"` — compact latency formatting.
+fn human_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// The status-line context indicator: a colored fill gauge `[████░░░░] 42%` when
+/// the model's context window is known (catalog loaded), else a raw `12.8k ctx`.
+fn context_spans(app: &App) -> Vec<Span<'static>> {
+    if app.context_tokens == 0 {
+        return Vec::new();
+    }
+    match app.context_limit() {
+        Some(limit) if limit > 0 => {
+            let frac = (app.context_tokens as f64 / limit as f64).clamp(0.0, 1.0);
+            let pct = (frac * 100.0).round() as u32;
+            const W: usize = 8;
+            let filled = (frac * W as f64).round() as usize;
+            let bar: String = "█".repeat(filled) + &"░".repeat(W - filled);
+            let color = if pct < 70 {
+                Color::Green
+            } else if pct < 90 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            vec![
+                Span::styled(format!("· {bar} "), Style::default().fg(color)),
+                Span::styled(format!("{pct}% ctx "), Style::default().fg(color)),
+            ]
+        }
+        _ => vec![Span::styled(
+            format!("· {} ctx ", human_tokens(app.context_tokens)),
+            Style::default().fg(Color::DarkGray),
+        )],
     }
 }
 
@@ -658,6 +715,52 @@ mod tests {
             !text.contains("agents ·"),
             "roster panel must hide when no agent is running:\n{text}"
         );
+    }
+
+    #[test]
+    fn status_line_shows_context_bar_when_limit_known() {
+        use crate::models::ModelEntry;
+        let backend = TestBackend::new(100, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("qwen/q");
+        app.models = vec![ModelEntry {
+            id: "qwen/q".into(),
+            name: "Q".into(),
+            context: Some(10_000),
+        }];
+        app.context_tokens = 5_000; // 50%
+        app.last_ttft_ms = 1400;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("50% ctx"), "context % missing:\n{text}");
+        assert!(text.contains('█'), "context gauge missing:\n{text}");
+        assert!(text.contains("1.4s ttft"), "ttft missing:\n{text}");
+    }
+
+    #[test]
+    fn status_line_falls_back_to_raw_ctx_without_catalog() {
+        let backend = TestBackend::new(100, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("unknown/model"); // not in (empty) catalog
+        app.context_tokens = 12_800;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("12.8k ctx"),
+            "raw ctx fallback missing:\n{text}"
+        );
+        assert!(
+            !text.contains('%'),
+            "no percent without a known limit:\n{text}"
+        );
+    }
+
+    #[test]
+    fn human_helpers_format_compactly() {
+        assert_eq!(human_tokens(999), "999");
+        assert_eq!(human_tokens(1500), "1.5k");
+        assert_eq!(human_ms(420), "420ms");
+        assert_eq!(human_ms(1400), "1.4s");
     }
 
     #[test]
