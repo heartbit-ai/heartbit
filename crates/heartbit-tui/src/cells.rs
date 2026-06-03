@@ -34,6 +34,40 @@ pub enum Cell {
     Notice(String),
 }
 
+/// Max diff lines shown inline before truncation (compact "aperçu" philosophy).
+const MAX_DIFF_LINES: usize = 10;
+
+/// Render a tool's input as colored diff `Line`s (red `-` / green `+` / dim
+/// context), capped at `max` with a "… N more" note. Empty for non-editing
+/// tools or malformed input — the caller then shows only the compact header.
+/// Shared by the transcript tool cell and the approval modal.
+pub fn diff_preview(tool_name: &str, input: &str, max: usize) -> Vec<Line<'static>> {
+    let diff = crate::diff::diff_lines(tool_name, input);
+    if diff.is_empty() {
+        return Vec::new();
+    }
+    let total = diff.len();
+    let mut out: Vec<Line<'static>> = diff
+        .iter()
+        .take(max)
+        .map(|d| {
+            let (sign, style) = match d.kind {
+                crate::diff::DiffKind::Add => ("+", Style::default().fg(Color::Green)),
+                crate::diff::DiffKind::Del => ("-", Style::default().fg(Color::Red)),
+                crate::diff::DiffKind::Ctx => (" ", Style::default().fg(Color::DarkGray)),
+            };
+            Line::from(Span::styled(format!("  {sign}{}", d.text), style))
+        })
+        .collect();
+    if total > max {
+        out.push(Line::from(Span::styled(
+            format!("  … ({} more diff lines)", total - max),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
+}
+
 /// A stable identity color for an agent name (consistent across the transcript
 /// and the roster panel) — hashed into a small distinct palette (AgentPipe-style).
 pub fn agent_color(name: &str) -> Color {
@@ -172,7 +206,11 @@ impl Cell {
                         spans.push(Span::styled(format!("  → {out_sum}"), dim));
                     }
                 }
-                vec![Line::from(spans)]
+                let mut lines = vec![Line::from(spans)];
+                // For file-editing tools, render the change as a compact, capped
+                // colored diff under the header (the SOTA "see what changed").
+                lines.extend(diff_preview(name, input, MAX_DIFF_LINES));
+                lines
             }
             Cell::Notice(text) => vec![Line::from(Span::styled(
                 format!("— {text}"),
@@ -332,6 +370,66 @@ mod tests {
         let s = plain(&cell.to_lines());
         assert!(s.contains("ls -la /tmp"), "command not summarised: {s}");
         assert!(!s.contains('{'), "raw JSON leaked into the summary: {s}");
+    }
+
+    #[test]
+    fn edit_tool_cell_renders_a_colored_diff() {
+        let cell = Cell::Tool {
+            name: "edit".into(),
+            input: r#"{"file_path":"f.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#
+                .into(),
+            status: ToolStatus::Ok,
+            output: Some("ok".into()),
+            duration_ms: Some(3),
+            agent: None,
+        };
+        let s = plain(&cell.to_lines());
+        assert!(s.contains("-let x = 1;"), "removed line missing:\n{s}");
+        assert!(s.contains("+let x = 2;"), "added line missing:\n{s}");
+        // the colors are set (red del / green add)
+        let spans: Vec<_> = cell.to_lines().into_iter().flat_map(|l| l.spans).collect();
+        assert!(
+            spans
+                .iter()
+                .any(|sp| sp.content.contains("-let x = 1;") && sp.style.fg == Some(Color::Red))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|sp| sp.content.contains("+let x = 2;") && sp.style.fg == Some(Color::Green))
+        );
+    }
+
+    #[test]
+    fn long_diff_is_capped_with_more_note() {
+        let new: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let cell = Cell::Tool {
+            name: "write".into(),
+            input: serde_json::json!({"file_path": "f", "content": new}).to_string(),
+            status: ToolStatus::Ok,
+            output: None,
+            duration_ms: None,
+            agent: None,
+        };
+        let s = plain(&cell.to_lines());
+        assert!(s.contains("more diff lines"), "cap note missing:\n{s}");
+    }
+
+    #[test]
+    fn non_editing_tool_cell_has_no_diff() {
+        let cell = Cell::Tool {
+            name: "bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            status: ToolStatus::Ok,
+            output: Some("a\nb".into()),
+            duration_ms: Some(1),
+            agent: None,
+        };
+        let s = plain(&cell.to_lines());
+        assert!(
+            !s.contains('+') && !s.contains('-'),
+            "no diff for bash:\n{s}"
+        );
     }
 
     #[test]
