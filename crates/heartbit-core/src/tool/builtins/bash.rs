@@ -14,6 +14,49 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_CHARS: usize = 30_000;
 const HEAD_TAIL_SIZE: usize = 14_000;
 
+/// RAII guard that SIGKILLs an entire process group on drop.
+///
+/// `bash` runs the user command as a compound statement, so it *forks*
+/// grandchildren (e.g. a `sleep` inside `cd … && { … }`). `kill_on_drop` reaps
+/// only the bash leader, orphaning those grandchildren. By spawning bash in its
+/// own process group (`process_group(0)`) and killing `-pgid` on drop, a
+/// timeout — or an interrupt that drops the wait future mid-flight — tears down
+/// the whole tree. Armed by default; disarmed on clean completion (the group has
+/// already exited, so killing is both unnecessary and a pid-recycle hazard, and
+/// it would also kill intentional `cmd &` background jobs).
+#[cfg(unix)]
+struct ProcessGroupKiller {
+    pgid: Option<u32>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupKiller {
+    fn new(pgid: Option<u32>) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupKiller {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(pgid) = self.pgid
+        {
+            // SAFETY: a single `kill(2)` syscall. A negative pid targets the
+            // process group led by `pgid`; SIGKILL cannot be caught, so the
+            // whole tree dies. No memory is read or written.
+            unsafe {
+                libc::kill(-(pgid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Builtin tool that executes shell commands in a persistent working directory.
 ///
 /// Each agent session gets one `BashTool` instance; `cd` commands update an
@@ -210,6 +253,15 @@ impl Tool for BashTool {
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
 
+            // Run bash in its own process group so a timeout or an interrupt can
+            // SIGKILL the whole tree (`-pgid`), not just the leader. See
+            // `ProcessGroupKiller`.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.as_std_mut().process_group(0);
+            }
+
             match &self.env_policy {
                 crate::workspace::EnvPolicy::Inherit => {}
                 crate::workspace::EnvPolicy::Allowlist(allowed) => {
@@ -241,14 +293,28 @@ impl Tool for BashTool {
                 .spawn()
                 .map_err(|e| Error::Agent(format!("Failed to spawn bash: {e}")))?;
 
+            // Arm the group killer BEFORE awaiting: `child.id()` is the pgid
+            // (process_group(0)). It fires on timeout, error, or an interrupt that
+            // drops this future mid-wait — tearing down forked grandchildren.
+            #[cfg(unix)]
+            let mut group_killer = ProcessGroupKiller::new(child.id());
+
             let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
             let output =
                 match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
-                    Ok(Ok(output)) => output,
+                    Ok(Ok(output)) => {
+                        // Clean exit: the group has already terminated. Disarm so
+                        // we neither kill a recycled pid nor reap an intentional
+                        // `cmd &` background job the user launched and detached.
+                        #[cfg(unix)]
+                        group_killer.disarm();
+                        output
+                    }
                     Ok(Err(e)) => return Ok(ToolOutput::error(format!("Command failed: {e}"))),
                     Err(_) => {
-                        // kill_on_drop ensures cleanup when `child` is dropped here
+                        // kill_on_drop reaps the bash leader; `group_killer`
+                        // (dropped on this return) SIGKILLs the rest of the group.
                         return Ok(ToolOutput::error(format!(
                             "Command timed out after {timeout_ms}ms"
                         )));
@@ -390,6 +456,41 @@ mod tests {
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("hello"));
         assert!(result.content.contains("exit code: 0"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_kills_orphaned_grandchildren() {
+        // A timed-out command's forked grandchildren (here a subshell that writes
+        // a marker AFTER the timeout fires) must be killed with the whole process
+        // group — not orphaned to keep running. `kill_on_drop` only reaps the bash
+        // leader; the subshell would survive and touch the marker. The same group
+        // teardown is what makes a mid-tool interrupt actually stop the work.
+        let marker = std::env::temp_dir().join(format!(
+            "heartbit_orphan_{}.marker",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let tool = BashTool::new();
+        let cmd = format!("( sleep 2; touch '{}' )", marker.display());
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": cmd, "timeout": 200}),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "the command must time out");
+        assert!(result.content.contains("timed out"), "{}", result.content);
+
+        // Give the (would-be) orphaned grandchild well past its 2s sleep to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        let leaked = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !leaked,
+            "a timed-out command's grandchild must be killed, not orphaned"
+        );
     }
 
     #[tokio::test]

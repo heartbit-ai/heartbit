@@ -161,6 +161,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// text without tool calls, the callback is invoked to get the next user
     /// message instead of returning immediately.
     pub(super) on_input: Option<Arc<OnInput>>,
+    /// Optional re-armable per-turn interrupt. When set and triggered, the
+    /// in-flight LLM generation is aborted and the turn ends cleanly (the session
+    /// continues, awaiting the next `on_input` message).
+    pub(super) interrupt: Option<super::interrupt::InterruptHandle>,
     /// Optional wall-clock deadline for the entire run. When set, the full
     /// `execute` call (all turns) is wrapped in `tokio::time::timeout`.
     pub(super) run_timeout: Option<Duration>,
@@ -286,6 +290,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             guardrails: Vec::new(),
             on_question: None,
             on_input: None,
+            interrupt: None,
             run_timeout: None,
             reasoning_effort: None,
             enable_reflection: false,
@@ -704,7 +709,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // TTFT: wrap on_text to capture time-to-first-token
                     let ttft_ms_inner = Arc::new(std::sync::atomic::AtomicU64::new(0));
                     let ttft_ref = ttft_ms_inner.clone();
-                    let result = async {
+                    let llm_future = async {
                         match &self.on_text {
                             Some(cb) => {
                                 let ttft_ref = ttft_ref.clone();
@@ -727,12 +732,40 @@ impl<P: LlmProvider> AgentRunner<P> {
                             None => self.provider.complete(request).await,
                         }
                     }
-                    .instrument(llm_span.clone())
-                    .await;
-                    // Store successful non-streaming responses in cache.
-                    // Only cache EndTurn responses — ToolUse responses trigger
-                    // side-effecting tool execution and must not be replayed.
-                    if let (Ok(resp), Some(key)) = (&result, cache_key)
+                    .instrument(llm_span.clone());
+                    // A triggered interrupt aborts the in-flight generation: race the
+                    // LLM call against the per-turn token. On interrupt, synthesize a
+                    // clean end-of-turn (non-empty text — providers reject empty
+                    // assistant content), rearm for the next turn, and let the
+                    // existing no-tool-calls path await the next `on_input` message.
+                    let mut interrupted = false;
+                    let result = match self.interrupt.as_ref() {
+                        Some(handle) => {
+                            let token = handle.token();
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {
+                                    handle.rearm();
+                                    interrupted = true;
+                                    Ok(crate::llm::types::CompletionResponse {
+                                        content: vec![crate::llm::types::ContentBlock::Text {
+                                            text: "[interrupted by user]".into(),
+                                        }],
+                                        stop_reason: crate::llm::types::StopReason::EndTurn,
+                                        usage: TokenUsage::default(),
+                                        model: None,
+                                    })
+                                }
+                                r = llm_future => r,
+                            }
+                        }
+                        None => llm_future.await,
+                    };
+                    // Store successful non-streaming responses in cache (never the
+                    // synthetic interrupt response). Only EndTurn responses are
+                    // cached — ToolUse responses trigger side-effecting execution.
+                    if !interrupted
+                        && let (Ok(resp), Some(key)) = (&result, cache_key)
                         && resp.stop_reason == crate::llm::types::StopReason::EndTurn
                         && let Some(ref c) = self.response_cache
                     {
@@ -1603,23 +1636,65 @@ impl<P: LlmProvider> AgentRunner<P> {
                     turn = ctx.current_turn(),
                     tool_count = allowed_calls.len(),
                 );
-                let (mut results, batch_records) = self
-                    .execute_tools_parallel(&allowed_calls, ctx.current_turn())
-                    .instrument(tool_batch_span)
-                    .await;
+                // A triggered interrupt abandons the in-flight tool batch: race
+                // the batch against the per-turn token. On interrupt, synthesize a
+                // result for EVERY allowed call (so no tool_use is left without a
+                // tool_result — providers reject that), drop the batch future (its
+                // JoinSet drop kills any in-flight subprocess via kill_on_drop), and
+                // leave the token CANCELLED so the next LLM call's own race ends the
+                // turn cleanly → await `on_input` (history preserved).
+                let mut tool_interrupted = false;
+                let (mut results, batch_records) = match self.interrupt.as_ref() {
+                    Some(handle) => {
+                        let token = handle.token();
+                        tracing::info!(
+                            target: "heartbit::interrupt",
+                            checkpoint = "CP4_before_tool_select",
+                            is_cancelled = token.is_cancelled(),
+                            turn = ctx.current_turn(),
+                            tool_count = allowed_calls.len(),
+                            "tool-batch interrupt race armed"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                tracing::info!(
+                                    target: "heartbit::interrupt",
+                                    checkpoint = "CP3_tool_cancel_arm_fired",
+                                    turn = ctx.current_turn(),
+                                    "tool-batch interrupted: synthesizing results, abandoning batch"
+                                );
+                                tool_interrupted = true;
+                                self.synthesize_interrupted_tool_batch(&allowed_calls)
+                            }
+                            r = self
+                                .execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                                .instrument(tool_batch_span) => r,
+                        }
+                    }
+                    None => {
+                        self.execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                            .instrument(tool_batch_span)
+                            .await
+                    }
+                };
                 tool_call_records.extend(batch_records);
                 results.extend(denied_results);
                 results.extend(permission_denied_results);
 
                 // LSP diagnostics: after file-modifying tools, collect diagnostics
                 // and append to the tool result so the LLM sees errors immediately.
-                if let Some(ref lsp) = self.lsp_manager {
+                if !tool_interrupted
+                    && let Some(ref lsp) = self.lsp_manager
+                {
                     self.append_lsp_diagnostics(lsp, &allowed_calls, &mut results)
                         .await;
                 }
 
                 // Compress oversized tool outputs via LLM call
-                if let Some(threshold) = self.tool_output_compression_threshold {
+                if !tool_interrupted
+                    && let Some(threshold) = self.tool_output_compression_threshold
+                {
                     for result in &mut results {
                         if !result.is_error && result.content.len() > threshold {
                             let compressed = self
@@ -1635,7 +1710,7 @@ impl<P: LlmProvider> AgentRunner<P> {
 
                 // Reflection: inject a user-role prompt that nudges the LLM to assess
                 // tool results before deciding the next action (Reflexion/CRITIC pattern).
-                if self.enable_reflection {
+                if !tool_interrupted && self.enable_reflection {
                     ctx.add_user_message(
                         "Before proceeding, briefly reflect on the tool results above:\n\
                      1. Did you get the information you needed?\n\
@@ -1648,7 +1723,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // Summarization: if threshold is set and context exceeds it, compress.
                 // Guard on message count: inject_summary(keep_last_n=4) is a no-op
                 // when total messages <= 5 (1 first + 4 kept), so skip the LLM call.
-                if let Some(threshold) = self.summarize_threshold
+                if !tool_interrupted
+                    && let Some(threshold) = self.summarize_threshold
                     && ctx.message_count() > 5
                     && ctx.needs_compaction(threshold)
                 {
@@ -2111,6 +2187,42 @@ impl<P: LlmProvider> AgentRunner<P> {
         }
     }
 
+    /// Synthesize results for a tool batch abandoned by a user interrupt.
+    ///
+    /// Emits a `ToolCallCompleted` (so a TUI's in-flight ⏳ cell finalizes) and
+    /// records an error `ToolResult`/`ToolCallRecord` for EVERY call — leaving no
+    /// `tool_use` without a matching `tool_result`, which providers reject. The
+    /// real batch future is dropped by the caller, killing any in-flight
+    /// subprocess via `kill_on_drop`.
+    fn synthesize_interrupted_tool_batch(
+        &self,
+        calls: &[ToolCall],
+    ) -> (Vec<ToolResult>, Vec<ToolCallRecord>) {
+        const MSG: &str = "Interrupted by user before completion.";
+        let mut results = Vec::with_capacity(calls.len());
+        let mut records = Vec::with_capacity(calls.len());
+        for call in calls {
+            self.emit(AgentEvent::ToolCallCompleted {
+                agent: self.name.clone(),
+                tool_name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                is_error: true,
+                duration_ms: 0,
+                output: MSG.to_string(),
+            });
+            results.push(ToolResult::error(call.id.clone(), MSG.to_string()));
+            records.push(ToolCallRecord {
+                tool_name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                input: call.input.clone(),
+                output: MSG.to_string(),
+                is_error: true,
+                duration_ms: 0,
+            });
+        }
+        (results, records)
+    }
+
     /// Execute tools in parallel via JoinSet, returning results in original call order.
     ///
     /// Panicked tasks produce an error `ToolResult` so the LLM always gets a
@@ -2459,6 +2571,169 @@ mod tests {
         drop(runner);
         let snap = tracker.snapshot();
         assert_eq!(snap[0].1.in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn interrupt_aborts_turn_then_continues_with_next_input() {
+        use crate::agent::interrupt::InterruptHandle;
+
+        // A single real response — it must only be consumed by the turn AFTER the
+        // interrupted one (proving the interrupted turn never called the provider).
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "real answer",
+            3,
+            2,
+        )]));
+
+        // Pre-trigger: the biased select takes the cancel arm on the first turn.
+        let interrupt = InterruptHandle::new();
+        interrupt.interrupt();
+
+        // on_input yields one follow-up message, then ends the session.
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+
+        let runner = AgentRunner::builder(provider)
+            .name("interruptible")
+            .max_turns(10)
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+
+        let out = runner.execute("hello").await.unwrap();
+
+        // The interrupted first turn produced no real assistant content; the
+        // follow-up turn produced the real answer, and the run ended cleanly.
+        assert_eq!(out.result, "real answer");
+        // Only the real turn's tokens count (the synthetic interrupt added none).
+        assert_eq!(out.tokens_used.input_tokens, 3);
+        assert_eq!(out.tokens_used.output_tokens, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_during_tool_batch_abandons_it_and_ends_turn() {
+        use crate::agent::interrupt::InterruptHandle;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A tool that signals when it starts running, sleeps, then records that
+        // it ran to completion. If the batch is interrupted, `finished` stays false.
+        struct SlowTool {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            finished: Arc<AtomicBool>,
+        }
+        impl Tool for SlowTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "slow".into(),
+                    description: "Sleeps for a while.".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                let started = self.started.clone();
+                let finished = self.finished.clone();
+                Box::pin(async move {
+                    let _ = started.send(());
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    finished.store(true, Ordering::SeqCst);
+                    Ok(ToolOutput::success("slept".to_string()))
+                })
+            }
+        }
+
+        let (start_tx, mut start_rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // turn 1: ask for the slow tool.
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-slow".into(),
+                    name: "slow".into(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // turn 2 (after the follow-up message): the real answer.
+            MockProvider::text_response("real answer", 3, 2),
+        ]));
+
+        let interrupt = InterruptHandle::new();
+        // Cancel the instant the slow tool starts — i.e. mid-batch.
+        let canceller = {
+            let interrupt = interrupt.clone();
+            tokio::spawn(async move {
+                start_rx.recv().await;
+                interrupt.interrupt();
+            })
+        };
+
+        // on_input yields one follow-up message, then ends the session.
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+
+        let runner = AgentRunner::builder(provider)
+            .name("interruptible")
+            .max_turns(10)
+            .tool(Arc::new(SlowTool {
+                started: start_tx,
+                finished: finished.clone(),
+            }))
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+
+        let out = runner.execute("please run slow").await.unwrap();
+        canceller.await.unwrap();
+
+        // The interrupt abandoned the running batch and ended the turn; the
+        // follow-up message was then answered normally (history preserved).
+        assert_eq!(out.result, "real answer");
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the tool batch must be abandoned, not awaited to completion"
+        );
+        // Every interrupted tool_use still gets a (synthetic) result, so the
+        // conversation stays valid (no orphan tool_use).
+        assert!(
+            out.tool_call_results
+                .iter()
+                .any(|r| r.is_error && r.output.contains("Interrupted")),
+            "the interrupted tool must record a synthetic result"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

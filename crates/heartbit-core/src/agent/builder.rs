@@ -51,6 +51,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) guardrails: Vec<Arc<dyn Guardrail>>,
     pub(super) on_question: Option<Arc<OnQuestion>>,
     pub(super) on_input: Option<Arc<OnInput>>,
+    pub(super) interrupt: Option<super::interrupt::InterruptHandle>,
     pub(super) run_timeout: Option<Duration>,
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
     pub(super) enable_reflection: bool,
@@ -257,6 +258,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// or `None` to end the session.
     pub fn on_input(mut self, callback: Arc<OnInput>) -> Self {
         self.on_input = Some(callback);
+        self
+    }
+
+    /// Attach a re-armable interrupt handle. Triggering it abandons the in-flight
+    /// turn (aborting LLM generation) and returns to awaiting input, preserving the
+    /// session. Only meaningful with `on_input` (the interactive path).
+    pub fn interrupt(mut self, handle: super::interrupt::InterruptHandle) -> Self {
+        self.interrupt = Some(handle);
         self
     }
 
@@ -711,6 +720,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             on_event: self.on_event,
             guardrails: self.guardrails,
             on_input: self.on_input,
+            interrupt: self.interrupt,
             run_timeout: self.run_timeout,
             reasoning_effort: self.reasoning_effort,
             enable_reflection: self.enable_reflection,

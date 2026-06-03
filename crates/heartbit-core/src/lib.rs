@@ -79,7 +79,7 @@ pub use agent::workflow::{
     LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
     SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
-pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
+pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, InterruptHandle, OnInput};
 
 // --- Dynamic-workflow combinator core (P1) ---
 // The free functions (`agent`, `parallel`, `pipeline`, `phase`, `log`, `thunk`)

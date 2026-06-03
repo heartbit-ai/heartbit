@@ -20,6 +20,7 @@ pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;
 pub mod instructions;
+pub mod interrupt;
 pub mod mixture;
 pub mod observability;
 pub mod orchestrator;
@@ -41,6 +42,7 @@ pub(crate) mod test_helpers;
 
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
+pub use interrupt::InterruptHandle;
 pub use runner::{AgentOutput, AgentRunner, OnInput};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
