@@ -406,6 +406,12 @@ impl App {
                 self.scroll = 0; // autoscroll to newest while streaming
                 self.active.get_or_insert_with(String::new).push_str(&s);
             }
+            // The model's chain-of-thought for this turn — pushed as a distinct
+            // dimmed cell ahead of the answer (a reasoning model only).
+            Msg::Reasoning(text) => {
+                self.scroll = 0;
+                self.history.push(Cell::Reasoning(text));
+            }
             Msg::LlmDone {
                 usage,
                 had_tool_calls,
@@ -1702,6 +1708,18 @@ mod tests {
         typed(&mut app, "b");
         assert_eq!(app.composer.text(), "a\nb");
         assert!(app.effects.is_empty(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn reasoning_msg_pushes_a_distinct_reasoning_cell() {
+        let mut app = App::new("m");
+        app.update(Msg::Reasoning("let me think".into()));
+        assert!(
+            matches!(app.history.last(), Some(Cell::Reasoning(t)) if t == "let me think"),
+            "a Reasoning msg must push a Cell::Reasoning"
+        );
+        // It does NOT touch the streaming answer buffer (separate channel).
+        assert_eq!(app.active, None);
     }
 
     #[test]

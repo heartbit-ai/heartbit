@@ -40,6 +40,8 @@ pub enum Msg {
         ttft_ms: u64,
     },
     StreamDelta(String),
+    /// The model emitted chain-of-thought (reasoning models) for this turn.
+    Reasoning(String),
     ToolStarted {
         id: String,
         name: String,
@@ -119,6 +121,7 @@ impl Msg {
                 input,
                 agent,
             }),
+            AgentEvent::Reasoning { text, .. } => Some(Msg::Reasoning(text)),
             AgentEvent::SubAgentsDispatched { agents, .. } => Some(Msg::AgentsDispatched(agents)),
             AgentEvent::SubAgentCompleted {
                 agent,
@@ -248,6 +251,16 @@ mod tests {
             Some(Msg::Notice(n)) => assert!(n.contains("blocked") && n.contains("bash")),
             _ => panic!("expected Notice"),
         }
+    }
+
+    #[test]
+    fn reasoning_event_maps_to_reasoning_msg() {
+        let ev = AgentEvent::Reasoning {
+            agent: "a".into(),
+            turn: 1,
+            text: "thinking hard".into(),
+        };
+        assert!(matches!(Msg::from_event(ev), Some(Msg::Reasoning(t)) if t == "thinking hard"));
     }
 
     #[test]

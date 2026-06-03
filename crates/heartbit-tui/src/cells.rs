@@ -33,6 +33,9 @@ pub enum Cell {
     },
     /// A small framework notice (guardrail / retry / compaction / error).
     Notice(String),
+    /// The model's chain-of-thought (reasoning models only) — rendered dimmed
+    /// and distinct from the answer.
+    Reasoning(String),
 }
 
 /// Max diff lines shown inline before truncation (compact "aperçu" philosophy).
@@ -219,6 +222,24 @@ impl Cell {
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ))],
+            // Chain-of-thought: dimmed + italic, with a "thinking" header, so it
+            // reads as the model's scratchpad — clearly not the answer.
+            Cell::Reasoning(text) => {
+                let dim = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                let mut lines = vec![Line::from(Span::styled(
+                    "💭 thinking",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::ITALIC),
+                ))];
+                lines.extend(
+                    text.split('\n')
+                        .map(|l| Line::from(Span::styled(format!("  {l}"), dim))),
+                );
+                lines
+            }
         }
     }
 }
@@ -259,6 +280,25 @@ mod tests {
         let lines = Cell::Agent("line1\nline2".into()).to_lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(plain(&lines), "line1\nline2");
+    }
+
+    #[test]
+    fn reasoning_cell_renders_dimmed_with_header() {
+        let lines = Cell::Reasoning("step one\nstep two".into()).to_lines();
+        // A "thinking" header plus one line per reasoning line.
+        assert_eq!(lines.len(), 3);
+        assert!(plain(&lines).contains("thinking"));
+        assert!(plain(&lines).contains("step one"));
+        assert!(plain(&lines).contains("step two"));
+        // The body lines must be dimmed + italic (clearly not the answer).
+        let body = &lines[1];
+        assert!(
+            body.spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::ITALIC)
+                    && s.style.fg == Some(Color::DarkGray)),
+            "reasoning body must be dim italic"
+        );
     }
 
     #[test]

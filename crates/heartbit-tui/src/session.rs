@@ -122,6 +122,11 @@ pub fn to_markdown(history: &[Cell]) -> String {
                 out.push_str(&format!("- `{mark} {name}{ms}`\n"));
             }
             Cell::Notice(t) => out.push_str(&format!("> _{t}_\n\n")),
+            Cell::Reasoning(t) => {
+                out.push_str("<details><summary>💭 reasoning</summary>\n\n");
+                out.push_str(t);
+                out.push_str("\n\n</details>\n\n");
+            }
         }
     }
     out
