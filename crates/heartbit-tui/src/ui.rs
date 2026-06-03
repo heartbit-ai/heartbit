@@ -40,19 +40,32 @@ pub fn view(frame: &mut Frame, app: &App) {
     ])
     .split(area);
 
-    // --- transcript ---
+    // --- transcript (+ agent roster panel in multi-agent mode) ---
+    // In multi-agent mode with a populated roster, split off a right-hand panel
+    // listing every agent and what it's doing now. The transcript then gets the
+    // remaining width — which MUST feed `line_count` below, or the scroll offset
+    // (computed from a stale full width) would clip the newest content.
+    let show_roster = app.multi_agent && !app.agents.is_empty();
+    let (transcript_area, roster_area) = if show_roster && chunks[0].width >= 50 {
+        let w = (chunks[0].width / 3).clamp(22, 36);
+        let split =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).split(chunks[0]);
+        (split[0], Some(split[1]))
+    } else {
+        (chunks[0], None)
+    };
+
     let lines = transcript_lines(app);
-    let view_h = chunks[0].height;
+    let view_h = transcript_area.height;
     let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
-    // Count VISUAL rows (post-wrap), not logical lines: a long line occupies
-    // several rows, so a bottom-anchored offset computed from `lines.len()`
-    // under-scrolls and clips the newest content below the fold. `line_count`
-    // uses the same WordWrapper as the renderer (honours `trim: false`); the
-    // transcript has no block/border so the border caveat (ratatui #1233) is moot.
-    let total = transcript.line_count(chunks[0].width) as u16;
+    // Count VISUAL rows (post-wrap) at the TRANSCRIPT width, not logical lines.
+    let total = transcript.line_count(transcript_area.width) as u16;
     let max_off = total.saturating_sub(view_h);
     let offset = max_off.saturating_sub(app.scroll);
-    frame.render_widget(transcript.scroll((offset, 0)), chunks[0]);
+    frame.render_widget(transcript.scroll((offset, 0)), transcript_area);
+    if let Some(rect) = roster_area {
+        render_roster(frame, app, rect);
+    }
 
     // --- status line ---
     let state = if app.running {
@@ -287,6 +300,60 @@ pub fn view(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Render the live agent roster: one row per agent with a state icon (animated
+/// spinner while working), its identity color, and a one-line activity. Working
+/// agents are listed first so "who is doing what right now" is at a glance.
+fn render_roster(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::app::AgentState;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let mut rows: Vec<&crate::app::AgentRow> = app.agents.iter().collect();
+    // Working first, then done/failed — preserving first-seen order within a group.
+    rows.sort_by_key(|r| match r.state {
+        AgentState::Working => 0,
+        AgentState::Done => 1,
+        AgentState::Failed => 2,
+    });
+    let spin = SPINNER[app.spinner % SPINNER.len()];
+    let mut lines: Vec<Line> = Vec::new();
+    for r in rows {
+        let (icon, icon_style) = match r.state {
+            AgentState::Working => (spin.to_string(), Style::default().fg(Color::Yellow)),
+            AgentState::Done => ("✓".to_string(), Style::default().fg(Color::Green)),
+            AgentState::Failed => ("✗".to_string(), Style::default().fg(Color::Red)),
+        };
+        let name_style = Style::default()
+            .fg(crate::cells::agent_color(&r.name))
+            .add_modifier(Modifier::BOLD);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{icon} "), icon_style),
+            Span::styled(r.name.clone(), name_style),
+        ]));
+        // Activity sub-line (dimmed, indented), plus token cost when finished.
+        let detail = if r.state == AgentState::Working {
+            r.activity.clone()
+        } else if r.tokens > 0 {
+            format!("{} · {} tok", r.activity, r.tokens)
+        } else {
+            r.activity.clone()
+        };
+        let detail: String = detail.chars().take(inner_w.saturating_sub(3)).collect();
+        lines.push(Line::from(Span::styled(
+            format!("  {detail}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let working = app
+        .agents
+        .iter()
+        .filter(|r| r.state == AgentState::Working)
+        .count();
+    let title = format!(" agents · {working} working ");
+    let panel = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
@@ -370,6 +437,35 @@ mod tests {
     }
 
     #[test]
+    fn newest_content_visible_even_with_roster_panel_narrowing_transcript() {
+        use crate::app::{AgentRow, AgentState};
+        // The roster panel steals width; the scroll offset must be computed from
+        // the NARROWED transcript width (post-split), or the newest line is clipped.
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.multi_agent = true;
+        app.agents = vec![AgentRow {
+            name: "worker".into(),
+            state: AgentState::Working,
+            activity: "x".into(),
+            tokens: 0,
+        }];
+        for i in 0..8 {
+            app.history.push(Cell::Agent(format!(
+                "filler {i} a long assistant line that wraps across several visual rows in the narrowed transcript column for sure"
+            )));
+        }
+        app.history.push(Cell::Agent("NEWEST_MARKER".into()));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("NEWEST_MARKER"),
+            "newest content clipped when the roster panel narrows the transcript:\n{text}"
+        );
+    }
+
+    #[test]
     fn newest_content_stays_visible_when_earlier_lines_wrap() {
         // Earlier cells have long lines that wrap into many VISUAL rows in a
         // narrow viewport. The transcript must auto-scroll by visual rows so the
@@ -440,6 +536,51 @@ mod tests {
         assert!(
             text2.contains("anthropic/claude-x") && text2.contains("openai/gpt-y"),
             "model list missing:\n{text2}"
+        );
+    }
+
+    #[test]
+    fn multi_agent_roster_panel_renders_agents_and_state() {
+        use crate::app::{AgentRow, AgentState};
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.multi_agent = true;
+        app.agents = vec![
+            AgentRow {
+                name: "worker".into(),
+                state: AgentState::Working,
+                activity: "write".into(),
+                tokens: 0,
+            },
+            AgentRow {
+                name: "researcher".into(),
+                state: AgentState::Done,
+                activity: "done".into(),
+                tokens: 1200,
+            },
+        ];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("agents"), "roster title missing:\n{text}");
+        assert!(
+            text.contains("worker") && text.contains("researcher"),
+            "agent names missing:\n{text}"
+        );
+        assert!(text.contains("write"), "live activity missing:\n{text}");
+        assert!(text.contains('✓'), "done state icon missing:\n{text}");
+    }
+
+    #[test]
+    fn no_roster_panel_in_single_agent_mode() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new("m"); // multi_agent = false
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("agents ·"),
+            "no roster panel when single-agent:\n{text}"
         );
     }
 

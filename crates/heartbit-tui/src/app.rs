@@ -17,6 +17,28 @@ use crate::msg::{Msg, PendingTool};
 /// How many transcript lines a PageUp/PageDown moves.
 const SCROLL_STEP: u16 = 8;
 
+/// Live state of one agent in the multi-agent roster panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentState {
+    /// Actively working (a tool is running, or synthesizing).
+    Working,
+    /// Finished successfully.
+    Done,
+    /// Finished with an error.
+    Failed,
+}
+
+/// One row in the multi-agent roster: an agent, its live state, what it is doing
+/// right now (deterministic — its latest tool/event, no extra LLM call), and the
+/// token cost once it completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    pub name: String,
+    pub state: AgentState,
+    pub activity: String,
+    pub tokens: u32,
+}
+
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
@@ -97,6 +119,9 @@ pub struct App {
     pub models_loading: bool,
     /// Multi-agent orchestrator mode (applies on next agent start).
     pub multi_agent: bool,
+    /// Live roster of agents for the current turn (multi-agent mode): who was
+    /// instantiated and what each is doing right now. Ordered by first-seen.
+    pub agents: Vec<AgentRow>,
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
@@ -124,6 +149,7 @@ impl App {
             models: Vec::new(),
             models_loading: false,
             multi_agent: false,
+            agents: Vec::new(),
             running: false,
             scroll: 0,
             menu_selected: 0,
@@ -140,6 +166,64 @@ impl App {
             let trimmed = text.trim_end();
             if !trimmed.is_empty() {
                 self.history.push(Cell::Agent(trimmed.to_string()));
+            }
+        }
+    }
+
+    /// Find or create an agent row (first-seen order), and set it Working with
+    /// the given activity. Only tracked in multi-agent mode.
+    fn agent_set_working(&mut self, name: &str, activity: impl Into<String>) {
+        if !self.multi_agent {
+            return;
+        }
+        let activity = activity.into();
+        if let Some(row) = self.agents.iter_mut().find(|r| r.name == name) {
+            // Don't resurrect a finished agent from a late event.
+            if row.state == AgentState::Working {
+                row.activity = activity;
+            }
+        } else {
+            self.agents.push(AgentRow {
+                name: name.to_string(),
+                state: AgentState::Working,
+                activity,
+                tokens: 0,
+            });
+        }
+    }
+
+    /// Mark an agent finished (Done/Failed) with its token cost.
+    fn agent_finish(&mut self, name: &str, success: bool, tokens: u32) {
+        if !self.multi_agent {
+            return;
+        }
+        if let Some(row) = self.agents.iter_mut().find(|r| r.name == name) {
+            row.state = if success {
+                AgentState::Done
+            } else {
+                AgentState::Failed
+            };
+            row.activity = if success { "done" } else { "failed" }.into();
+            row.tokens = row.tokens.max(tokens);
+        }
+    }
+
+    /// The agent badge to stamp on a tool cell: the agent name in multi-agent
+    /// mode (so the transcript shows who ran each tool), `None` in single mode.
+    fn agent_badge(&self, agent: &str) -> Option<String> {
+        if self.multi_agent {
+            Some(agent.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Mark every still-Working agent as Done (the turn produced a final answer).
+    fn agents_settle(&mut self) {
+        for row in &mut self.agents {
+            if row.state == AgentState::Working {
+                row.state = AgentState::Done;
+                row.activity = "done".into();
             }
         }
     }
@@ -185,13 +269,21 @@ impl App {
                     .tokens
                     .output_tokens
                     .saturating_add(usage.output_tokens);
-                // A text-only turn means the agent now idles awaiting input.
+                // A text-only turn means the agent now idles awaiting input — the
+                // orchestrator finished synthesizing, so settle the roster.
                 if !had_tool_calls {
                     self.running = false;
+                    self.agents_settle();
                 }
             }
-            Msg::ToolStarted { id, name, input } => {
+            Msg::ToolStarted {
+                id,
+                name,
+                input,
+                agent,
+            } => {
                 self.finalize_active(); // the assistant preamble (if any) is done
+                self.agent_set_working(&agent, &name);
                 let idx = self.history.len();
                 self.tool_index.insert(id, idx);
                 self.history.push(Cell::Tool {
@@ -200,8 +292,32 @@ impl App {
                     status: ToolStatus::Running,
                     output: None,
                     duration_ms: None,
+                    agent: self.agent_badge(&agent),
                 });
                 self.scroll = 0;
+            }
+            Msg::AgentsDispatched(names) => {
+                for n in &names {
+                    self.agent_set_working(n, "dispatched");
+                }
+                if !names.is_empty() {
+                    self.history.push(Cell::Notice(format!(
+                        "→ delegating to {}",
+                        names.join(", ")
+                    )));
+                }
+            }
+            Msg::SubAgentDone {
+                agent,
+                success,
+                tokens,
+            } => self.agent_finish(&agent, success, tokens),
+            Msg::AgentSpawned { name, task } => {
+                self.agent_set_working(&name, "spawned");
+                self.history.push(Cell::Notice(format!(
+                    "✦ spawned {name}: {}",
+                    first_words(&task, 60)
+                )));
             }
             Msg::ToolCompleted {
                 id,
@@ -338,6 +454,7 @@ impl App {
         self.history.push(Cell::User(text.clone()));
         self.running = true;
         self.scroll = 0;
+        self.agents.clear(); // fresh roster for this turn
         self.effects.push(Effect::SendInput(text));
     }
 
@@ -670,6 +787,17 @@ impl App {
             KeyCode::Esc => self.modal = None,
             _ => {}
         }
+    }
+}
+
+/// First `max` chars of the first line of `s`, ellipsized — for compact summaries.
+fn first_words(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() > max {
+        let t: String = line.chars().take(max).collect();
+        format!("{t}…")
+    } else {
+        line.to_string()
     }
 }
 
@@ -1066,6 +1194,101 @@ mod tests {
         );
     }
 
+    /// An app in multi-agent mode (roster tracking active).
+    fn multi() -> App {
+        let mut app = keyed();
+        app.multi_agent = true;
+        app
+    }
+    fn tool_started(agent: &str, name: &str) -> Msg {
+        Msg::ToolStarted {
+            id: format!("{agent}-{name}"),
+            name: name.into(),
+            input: "{}".into(),
+            agent: agent.into(),
+        }
+    }
+
+    #[test]
+    fn roster_tracks_dispatch_work_and_done() {
+        let mut app = multi();
+        app.update(Msg::AgentsDispatched(vec![
+            "worker".into(),
+            "researcher".into(),
+        ]));
+        assert_eq!(app.agents.len(), 2);
+        assert!(app.agents.iter().all(|r| r.state == AgentState::Working));
+        // the delegation line is shown in the transcript
+        assert!(app.history.iter().any(
+            |c| matches!(c, Cell::Notice(n) if n.contains("delegating to worker, researcher"))
+        ),);
+        // worker starts a tool → activity reflects it
+        app.update(tool_started("worker", "write"));
+        let w = app.agents.iter().find(|r| r.name == "worker").unwrap();
+        assert_eq!(w.activity, "write");
+        assert_eq!(w.state, AgentState::Working);
+        // worker completes with a token cost
+        app.update(Msg::SubAgentDone {
+            agent: "worker".into(),
+            success: true,
+            tokens: 1234,
+        });
+        let w = app.agents.iter().find(|r| r.name == "worker").unwrap();
+        assert_eq!(w.state, AgentState::Done);
+        assert_eq!(w.tokens, 1234);
+    }
+
+    #[test]
+    fn roster_orchestrator_appears_and_settles_on_text_turn() {
+        let mut app = multi();
+        app.update(tool_started("orchestrator", "delegate_task"));
+        assert_eq!(app.agents[0].name, "orchestrator");
+        assert_eq!(app.agents[0].state, AgentState::Working);
+        // a final text-only turn settles all still-working agents to Done
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+        });
+        assert_eq!(app.agents[0].state, AgentState::Done);
+    }
+
+    #[test]
+    fn roster_is_inert_in_single_agent_mode() {
+        let mut app = keyed(); // multi_agent = false
+        app.update(tool_started("heartbit", "bash"));
+        app.update(Msg::AgentsDispatched(vec!["x".into()]));
+        assert!(app.agents.is_empty(), "no roster tracking in single mode");
+    }
+
+    #[test]
+    fn roster_clears_on_new_user_turn() {
+        let mut app = multi();
+        app.update(Msg::AgentsDispatched(vec!["worker".into()]));
+        assert_eq!(app.agents.len(), 1);
+        typed(&mut app, "next task");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.agents.is_empty(),
+            "each turn starts with a fresh roster"
+        );
+    }
+
+    #[test]
+    fn tool_cell_carries_agent_badge_only_in_multi_mode() {
+        let mut app = multi();
+        app.update(tool_started("worker", "write"));
+        assert!(matches!(
+            app.history.last(),
+            Some(Cell::Tool { agent: Some(a), .. }) if a == "worker"
+        ));
+        let mut single = keyed();
+        single.update(tool_started("heartbit", "write"));
+        assert!(matches!(
+            single.history.last(),
+            Some(Cell::Tool { agent: None, .. })
+        ));
+    }
+
     #[test]
     fn slash_help_and_unknown_emit_notices_not_sends() {
         let mut app = keyed();
@@ -1164,6 +1387,7 @@ mod tests {
             id: "t1".into(),
             name: "bash".into(),
             input: "{}".into(),
+            agent: "heartbit".into(),
         });
         assert!(matches!(
             app.history.last(),
@@ -1201,6 +1425,7 @@ mod tests {
             id: "t1".into(),
             name: "read".into(),
             input: "{}".into(),
+            agent: "heartbit".into(),
         });
         // The streamed preamble became an Agent cell, then the tool cell.
         assert!(matches!(app.history.first(), Some(Cell::Agent(t)) if t == "let me check"));

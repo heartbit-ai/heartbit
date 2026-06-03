@@ -26,9 +26,29 @@ pub enum Cell {
         status: ToolStatus,
         output: Option<String>,
         duration_ms: Option<u64>,
+        /// The sub-agent that ran it (multi-agent mode) — rendered as a colored
+        /// badge so the transcript shows who did what. `None` in single mode.
+        agent: Option<String>,
     },
     /// A small framework notice (guardrail / retry / compaction / error).
     Notice(String),
+}
+
+/// A stable identity color for an agent name (consistent across the transcript
+/// and the roster panel) — hashed into a small distinct palette (AgentPipe-style).
+pub fn agent_color(name: &str) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Cyan,
+        Color::Magenta,
+        Color::Green,
+        Color::Blue,
+        Color::LightYellow,
+        Color::LightRed,
+    ];
+    let h = name
+        .bytes()
+        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    PALETTE[(h as usize) % PALETTE.len()]
 }
 
 fn first_line(s: &str, max: usize) -> String {
@@ -114,6 +134,7 @@ impl Cell {
                 status,
                 output,
                 duration_ms,
+                agent,
             } => {
                 let (marker, color) = match status {
                     ToolStatus::Running => ("⏳", Color::Yellow),
@@ -127,10 +148,20 @@ impl Cell {
                 // "Compact" preview: one line — marker + name + timing + a short
                 // input summary + a short output summary. Never a multi-line dump
                 // (the agent sees the full output; the user wants only an aperçu).
-                let mut spans = vec![Span::styled(
+                let mut spans = Vec::new();
+                // Multi-agent: a colored per-agent badge so you see WHO ran it.
+                if let Some(a) = agent {
+                    spans.push(Span::styled(
+                        format!("{a} "),
+                        Style::default()
+                            .fg(agent_color(a))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(Span::styled(
                     format!("{marker} {name}{timing}"),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )];
+                ));
                 let in_sum = summarize_input(input);
                 if !in_sum.is_empty() {
                     spans.push(Span::styled(format!("  {in_sum}"), dim));
@@ -219,6 +250,7 @@ mod tests {
             status: ToolStatus::Running,
             output: None,
             duration_ms: None,
+            agent: None,
         };
         let s = plain(&cell.to_lines());
         assert!(s.contains("bash"), "got: {s}");
@@ -233,6 +265,7 @@ mod tests {
             status: ToolStatus::Ok,
             output: Some("file contents".into()),
             duration_ms: Some(42),
+            agent: None,
         };
         let s = plain(&cell.to_lines());
         assert!(s.contains('✓'));
@@ -248,6 +281,7 @@ mod tests {
             status: ToolStatus::Failed,
             output: Some("boom".into()),
             duration_ms: Some(10),
+            agent: None,
         };
         assert!(plain(&cell.to_lines()).contains('✗'));
     }
@@ -266,6 +300,7 @@ mod tests {
             status: ToolStatus::Ok,
             output: Some(out),
             duration_ms: Some(1200),
+            agent: None,
         };
         let lines = cell.to_lines();
         assert_eq!(
@@ -292,6 +327,7 @@ mod tests {
             status: ToolStatus::Running,
             output: None,
             duration_ms: None,
+            agent: None,
         };
         let s = plain(&cell.to_lines());
         assert!(s.contains("ls -la /tmp"), "command not summarised: {s}");

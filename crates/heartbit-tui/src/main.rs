@@ -283,8 +283,11 @@ async fn build_engine(
         Arc::new(move |e: AgentEvent| {
             // Opt-in diagnostics (HEARTBIT_TUI_DEBUG): surface tool dispatch +
             // multi-agent delegation, which the TUI owns the terminal so can't show.
-            if let AgentEvent::ToolCallStarted { tool_name, .. } = &e {
-                tracing::info!(target: "heartbit::interrupt", tool_started = %tool_name, "tool dispatched");
+            if let AgentEvent::ToolCallStarted {
+                tool_name, agent, ..
+            } = &e
+            {
+                tracing::info!(target: "heartbit::interrupt", tool_started = %tool_name, agent = %agent, "tool dispatched");
             }
             if let AgentEvent::SubAgentsDispatched { agents, .. } = &e {
                 tracing::info!(target: "heartbit::interrupt", ?agents, "sub-agents dispatched");

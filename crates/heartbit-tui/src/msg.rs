@@ -38,12 +38,27 @@ pub enum Msg {
         id: String,
         name: String,
         input: String,
+        /// Which agent ran the tool (the orchestrator or a named sub-agent).
+        agent: String,
     },
     ToolCompleted {
         id: String,
         is_error: bool,
         output: String,
         duration_ms: u64,
+    },
+    /// The orchestrator delegated a task to these sub-agents (parallel fan-out).
+    AgentsDispatched(Vec<String>),
+    /// A sub-agent finished (with its accumulated token cost).
+    SubAgentDone {
+        agent: String,
+        success: bool,
+        tokens: u32,
+    },
+    /// The orchestrator dynamically spawned a sub-agent with a scoped task.
+    AgentSpawned {
+        name: String,
+        task: String,
     },
     Notice(String),
     RunCompleted,
@@ -83,11 +98,28 @@ impl Msg {
                 tool_name,
                 tool_call_id,
                 input,
-                ..
+                agent,
             } => Some(Msg::ToolStarted {
                 id: tool_call_id,
                 name: tool_name,
                 input,
+                agent,
+            }),
+            AgentEvent::SubAgentsDispatched { agents, .. } => Some(Msg::AgentsDispatched(agents)),
+            AgentEvent::SubAgentCompleted {
+                agent,
+                success,
+                usage,
+            } => Some(Msg::SubAgentDone {
+                agent,
+                success,
+                tokens: usage.input_tokens + usage.output_tokens,
+            }),
+            AgentEvent::AgentSpawned {
+                spawned_name, task, ..
+            } => Some(Msg::AgentSpawned {
+                name: spawned_name,
+                task,
             }),
             AgentEvent::ToolCallCompleted {
                 tool_call_id,
@@ -139,10 +171,16 @@ mod tests {
             input: "{\"command\":\"ls\"}".into(),
         };
         match Msg::from_event(ev) {
-            Some(Msg::ToolStarted { id, name, input }) => {
+            Some(Msg::ToolStarted {
+                id,
+                name,
+                input,
+                agent,
+            }) => {
                 assert_eq!(id, "tc1");
                 assert_eq!(name, "bash");
                 assert!(input.contains("ls"));
+                assert_eq!(agent, "a", "the agent identity must be threaded through");
             }
             _ => panic!("expected ToolStarted"),
         }
