@@ -250,9 +250,26 @@ async fn build_runner(
         })
     };
 
+    // Load project context (AGENTS.md / CLAUDE.md / HEARTBIT.md) by walking up to
+    // the git root + the global config — like Claude Code's CLAUDE.md, but the
+    // cross-tool AGENTS.md standard takes priority. Injected into the system prompt.
+    let context_paths = heartbit_core::discover_instruction_files(&cwd);
+    let project_context = heartbit_core::load_instructions(&context_paths).unwrap_or_default();
+    if !project_context.is_empty() {
+        let names: Vec<String> = context_paths
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        let _ = ui_tx.send(Msg::Notice(format!(
+            "loaded project context: {}",
+            names.join(", ")
+        )));
+    }
+
     let runner = AgentRunner::builder(provider)
         .name("heartbit")
         .system_prompt(SYSTEM_PROMPT)
+        .instruction_text(project_context)
         .tools(tools)
         .max_turns(300)
         .workspace(cwd)
