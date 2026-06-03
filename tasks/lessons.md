@@ -165,3 +165,18 @@ never checked.
    wiring (`pub mod`) is the load-bearing part; verify it explicitly.
 4. When edits to the same file keep "not landing," re-Read immediately before each
    edit and confirm the change with a grep AFTER — the file-state race is real.
+
+## 2026-06-03 — Terminal Enter can arrive as Char('\r')/('\n'), not KeyCode::Enter (TUI)
+
+**What happened:** the `/` slash-command autocomplete menu showed and filtered,
+but the user reported "selecting just closes the menu, the command doesn't run."
+My unit tests + pty repro passed (crossterm maps `\r` → `KeyCode::Enter`), so I
+couldn't reproduce — but some terminals deliver Enter as a raw CR/LF *character*.
+That fell through the menu's `KeyCode::Enter` arm, got inserted as whitespace,
+ended the `/command` token → menu closed, command never ran.
+
+**Rule:** in TUI key interception (crossterm), don't assume Enter == `KeyCode::Enter`.
+Accept `KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')`. More generally:
+when a real-terminal key "does nothing" but the logic + pty repro pass, suspect the
+key ENCODING differs from your harness — log the raw event to a FILE
+(`HEARTBIT_TUI_DEBUG`, since the TUI owns the terminal) rather than re-deriving.
