@@ -167,10 +167,7 @@ pub fn view(frame: &mut Frame, app: &App) {
     // --- modal overlays ---
     match &app.modal {
         Some(Modal::Approval(modal)) => {
-            let w = area.width.min(72);
-            let h = (modal.tools.len() as u16 + 5).min(area.height);
-            let rect = centered(area, w, h);
-            frame.render_widget(Clear, rect);
+            let w = area.width.min(84);
             let mut mlines = vec![Line::from(Span::styled(
                 "The agent wants to run:",
                 Style::default()
@@ -178,14 +175,32 @@ pub fn view(frame: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ))];
             for t in &modal.tools {
-                let summary: String = t.input.chars().take(48).collect();
-                mlines.push(Line::raw(format!("  • {}  {}", t.name, summary)));
+                mlines.push(Line::from(Span::styled(
+                    format!("  • {}", t.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                // For a file edit, show the colored diff so the user reviews the
+                // exact change; otherwise show the FULL input (no blind approval).
+                let diff = crate::cells::diff_preview(&t.name, &t.input, 16);
+                if !diff.is_empty() {
+                    mlines.extend(diff);
+                } else {
+                    for l in t.input.lines().take(8) {
+                        mlines.push(Line::from(Span::styled(
+                            format!("    {l}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
             }
             mlines.push(Line::raw(""));
             mlines.push(Line::from(Span::styled(
                 "[y] allow   [a] always allow   [n] deny",
                 Style::default().fg(Color::Cyan),
             )));
+            let h = (mlines.len() as u16 + 2).min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
             let modal_widget = Paragraph::new(mlines)
                 .block(Block::default().borders(Borders::ALL).title(" approve? "))
                 .wrap(Wrap { trim: false });
@@ -630,6 +645,33 @@ mod tests {
         assert!(text.contains("approve"), "modal title missing:\n{text}");
         assert!(text.contains("bash"), "tool name missing:\n{text}");
         assert!(text.contains("allow"), "approval options missing:\n{text}");
+        // full input shown (no 48-char blind truncation)
+        assert!(
+            text.contains("rm -rf /tmp/x"),
+            "full command missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn approval_modal_shows_a_diff_for_an_edit() {
+        use crate::msg::PendingTool;
+        use std::sync::mpsc::sync_channel;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        let (tx, _rx) = sync_channel(1);
+        app.update(crate::msg::Msg::Approval {
+            tools: vec![PendingTool {
+                name: "edit".into(),
+                input: r#"{"file_path":"f.rs","old_string":"old code","new_string":"new code"}"#
+                    .into(),
+            }],
+            reply: tx,
+        });
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("-old code"), "diff removal missing:\n{text}");
+        assert!(text.contains("+new code"), "diff addition missing:\n{text}");
     }
 
     #[test]
