@@ -79,6 +79,10 @@ pub enum Msg {
     ModelsFailed(String),
     /// The project file index (walked async for `@`-mention autocomplete).
     FilesLoaded(Vec<String>),
+    /// Saved sessions listed for the `/resume` picker.
+    SessionsListed(Vec<crate::session::SessionMeta>),
+    /// A resumed session's transcript (replaces the current history).
+    SessionLoaded(Vec<crate::cells::Cell>),
 
     // ---- the synchronous approval round-trip ----
     Approval {

@@ -419,6 +419,46 @@ pub fn view(frame: &mut Frame, app: &App) {
                 .wrap(Wrap { trim: false });
             frame.render_widget(widget, rect);
         }
+        Some(Modal::SessionPicker(p)) => {
+            let w = area.width.min(80);
+            let h = (p.sessions.len() as u16 + 4).min(area.height).min(16);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let mut mlines = vec![
+                Line::from(Span::styled(
+                    "Resume a session:",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::raw(""),
+            ];
+            let sel = p.sel.min(p.sessions.len().saturating_sub(1));
+            for (i, s) in p.sessions.iter().take(h as usize - 4).enumerate() {
+                let label: String = s.preview.chars().take(w as usize - 14).collect::<String>();
+                let line = format!("{label}  ({} turns)", s.turns);
+                if i == sel {
+                    mlines.push(Line::from(Span::styled(
+                        format!(" ▸ {line} "),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    )));
+                } else {
+                    mlines.push(Line::from(Span::styled(
+                        format!("   {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            mlines.push(Line::raw(""));
+            mlines.push(Line::from(Span::styled(
+                "↑↓ select · Enter resume · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let widget = Paragraph::new(mlines)
+                .block(Block::default().borders(Borders::ALL).title(" resume "))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(widget, rect);
+        }
         None => {
             // Show the text cursor in the composer when no modal is up.
             let (crow, ccol) = app.composer.cursor();

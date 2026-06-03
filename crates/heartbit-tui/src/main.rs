@@ -25,6 +25,7 @@ mod diff;
 mod markdown;
 mod models;
 mod msg;
+mod session;
 mod ui;
 
 use std::path::PathBuf;
@@ -128,6 +129,15 @@ async fn main() -> anyhow::Result<()> {
     // Shared permission posture (0=default,1=accept-edits,2=plan,3=auto), cycled
     // by the UI (Shift+Tab) and read live by the agent thread's `on_approval`.
     let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    // A per-launch session id (time + pid) for transcript persistence.
+    let session_id = format!(
+        "{:x}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::process::id()
+    );
 
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
@@ -144,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         cwd,
         interrupt,
         perm_mode,
+        session_id,
     )
     .await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -585,9 +596,12 @@ async fn run_ui(
     cwd: PathBuf,
     interrupt: InterruptHandle,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
+    session_id: String,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
+    // Auto-save bookkeeping: persist when the transcript grows while idle.
+    let mut last_saved_len = 0usize;
     // Monotonic spawn epoch: each agent thread carries one, so a stale exit from a
     // thread we already replaced (e.g. on an `/agents` restart) can be ignored.
     let mut agent_epoch: u64 = 0;
@@ -705,6 +719,30 @@ async fn run_ui(
                     // Apply live to the shared gate the agent's on_approval reads.
                     perm_mode.store(m, std::sync::atomic::Ordering::Relaxed);
                 }
+                Effect::ExportSession => {
+                    let md = session::to_markdown(&app.history);
+                    let path = cwd.join(format!("heartbit-session-{session_id}.md"));
+                    match std::fs::write(&path, md) {
+                        Ok(()) => app
+                            .history
+                            .push(Cell::Notice(format!("exported to {}", path.display()))),
+                        Err(e) => app
+                            .history
+                            .push(Cell::Notice(format!("export failed: {e}"))),
+                    }
+                }
+                Effect::ListSessions => {
+                    let metas = session::list(&session::sessions_dir());
+                    let _ = ui_tx.send(Msg::SessionsListed(metas));
+                }
+                Effect::ResumeSession(id) => match session::load(&session::sessions_dir(), &id) {
+                    Ok(s) => {
+                        let _ = ui_tx.send(Msg::SessionLoaded(s.history));
+                    }
+                    Err(e) => app
+                        .history
+                        .push(Cell::Notice(format!("could not resume: {e}"))),
+                },
                 Effect::SaveMultiAgent(on) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.multi_agent = on;
@@ -774,9 +812,27 @@ async fn run_ui(
             }
         }
 
+        // Auto-save the transcript at turn boundaries (idle + changed) so the
+        // session is always resumable; and once more on quit.
+        if !app.running && app.history.len() != last_saved_len {
+            save_session(&session_id, &app.history);
+            last_saved_len = app.history.len();
+        }
+
         if app.should_quit {
+            save_session(&session_id, &app.history);
             break;
         }
     }
     Ok(())
+}
+
+/// Persist the current transcript under the session id (best-effort, silent).
+fn save_session(id: &str, history: &[crate::cells::Cell]) {
+    let s = session::Session {
+        id: id.to_string(),
+        created: id.to_string(),
+        history: history.to_vec(),
+    };
+    let _ = session::save(&session::sessions_dir(), &s);
 }

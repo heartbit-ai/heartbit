@@ -128,6 +128,9 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "show or set the model"),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
+    ("/clear", "clear the transcript"),
+    ("/resume", "reopen a saved session"),
+    ("/export", "export the transcript to Markdown"),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -151,6 +154,12 @@ pub enum Effect {
     SaveMultiAgent(bool),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
     SetPermissionMode(u8),
+    /// Export the current transcript (read from `App.history`) to a Markdown file.
+    ExportSession,
+    /// List saved sessions (for the `/resume` picker).
+    ListSessions,
+    /// Load a saved session by id.
+    ResumeSession(String),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
     /// Tear down and exit.
@@ -184,12 +193,20 @@ pub struct HistorySearch {
     pub sel: usize,
 }
 
+/// The `/resume` session picker: the saved-session list + highlighted row.
+#[derive(Default)]
+pub struct SessionPicker {
+    pub sessions: Vec<crate::session::SessionMeta>,
+    pub sel: usize,
+}
+
 /// A modal overlay.
 pub enum Modal {
     Approval(ApprovalModal),
     KeyEntry(KeyEntryModal),
     ModelPicker(ModelPicker),
     HistorySearch(HistorySearch),
+    SessionPicker(SessionPicker),
 }
 
 /// The full UI state.
@@ -372,7 +389,7 @@ impl App {
                     h.query.push_str(&s.replace(['\n', '\r'], ""));
                     h.sel = 0;
                 }
-                Some(Modal::Approval(_)) => {}
+                Some(Modal::Approval(_)) | Some(Modal::SessionPicker(_)) => {}
                 None => self.composer.insert_str(&s),
             },
             Msg::Key(key) => {
@@ -506,6 +523,20 @@ impl App {
                 self.models_loading = false;
             }
             Msg::FilesLoaded(files) => self.file_index = files,
+            Msg::SessionsListed(sessions) => {
+                if sessions.is_empty() {
+                    self.history
+                        .push(Cell::Notice("no saved sessions yet".into()));
+                } else {
+                    self.modal = Some(Modal::SessionPicker(SessionPicker { sessions, sel: 0 }));
+                }
+            }
+            Msg::SessionLoaded(history) => {
+                self.history = history;
+                self.scroll = 0;
+                self.history
+                    .push(Cell::Notice("— session resumed —".into()));
+            }
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
                 // Only notify when the fetch was USER-initiated (the picker is
@@ -673,6 +704,16 @@ impl App {
             }
             "mcp" => self.handle_mcp(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
+            "clear" | "new" => {
+                self.history.clear();
+                self.todos.clear();
+                self.agents.clear();
+                self.scroll = 0;
+                self.history
+                    .push(Cell::Notice("— transcript cleared —".into()));
+            }
+            "export" => self.effects.push(Effect::ExportSession),
+            "resume" => self.effects.push(Effect::ListSessions),
             "help" => {
                 self.history.push(Cell::Notice(
                     "commands: /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
@@ -952,7 +993,43 @@ impl App {
             Some(Modal::KeyEntry(_)) => self.handle_key_entry(key),
             Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
             Some(Modal::HistorySearch(_)) => self.handle_history_search_key(key),
+            Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
             None => {}
+        }
+    }
+
+    /// `/resume` picker keys: ↑/↓ select, Enter load, Esc cancel.
+    fn handle_session_picker_key(&mut self, key: KeyEvent) {
+        let n = match &self.modal {
+            Some(Modal::SessionPicker(p)) => p.sessions.len(),
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up if n > 0 => {
+                if let Some(Modal::SessionPicker(p)) = &mut self.modal {
+                    p.sel = (p.sel.min(n - 1) + n - 1) % n;
+                }
+            }
+            KeyCode::Down if n > 0 => {
+                if let Some(Modal::SessionPicker(p)) = &mut self.modal {
+                    p.sel = (p.sel.min(n - 1) + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let id = match &self.modal {
+                    Some(Modal::SessionPicker(p)) => p
+                        .sessions
+                        .get(p.sel.min(n.saturating_sub(1)))
+                        .map(|s| s.id.clone()),
+                    _ => None,
+                };
+                self.modal = None;
+                if let Some(id) = id {
+                    self.effects.push(Effect::ResumeSession(id));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1904,6 +1981,63 @@ mod tests {
         app.update(key(KeyCode::Enter));
         assert_eq!(app.composer.text(), "fix the parser");
         assert!(app.modal.is_none(), "Enter closes the search");
+    }
+
+    #[test]
+    fn slash_clear_empties_transcript_and_panels() {
+        let mut app = keyed();
+        app.history.push(Cell::User("hi".into()));
+        app.todos = vec![TodoRow {
+            content: "x".into(),
+            status: TodoStatus::Pending,
+        }];
+        typed(&mut app, "/clear");
+        app.update(key(KeyCode::Enter));
+        assert!(app.todos.is_empty());
+        // only the "cleared" notice remains
+        assert_eq!(app.history.len(), 1);
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("cleared")));
+    }
+
+    #[test]
+    fn slash_export_and_resume_emit_effects() {
+        let mut app = keyed();
+        typed(&mut app, "/export");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::ExportSession));
+        typed(&mut app, "/resume");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::ListSessions));
+    }
+
+    #[test]
+    fn session_picker_loads_selected_session() {
+        use crate::session::SessionMeta;
+        let mut app = keyed();
+        app.update(Msg::SessionsListed(vec![
+            SessionMeta {
+                id: "a".into(),
+                preview: "first".into(),
+                turns: 1,
+            },
+            SessionMeta {
+                id: "b".into(),
+                preview: "second".into(),
+                turns: 2,
+            },
+        ]));
+        assert!(matches!(app.modal, Some(Modal::SessionPicker(_))));
+        app.update(key(KeyCode::Down)); // select "b"
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::ResumeSession("b".into())));
+        assert!(app.modal.is_none());
+        // and loading replaces history
+        app.update(Msg::SessionLoaded(vec![Cell::User("restored".into())]));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::User(t) if t == "restored"))
+        );
     }
 
     #[test]

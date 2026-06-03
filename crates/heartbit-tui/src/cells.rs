@@ -3,9 +3,10 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde::{Deserialize, Serialize};
 
 /// Lifecycle of a tool call in the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Running,
     Ok,
@@ -13,7 +14,7 @@ pub enum ToolStatus {
 }
 
 /// One entry in the conversation transcript.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Cell {
     /// A user message.
     User(String),
