@@ -77,6 +77,8 @@ pub enum Msg {
     // ---- OpenRouter model catalog (fetched async for the model picker) ----
     ModelsLoaded(Vec<crate::models::ModelEntry>),
     ModelsFailed(String),
+    /// The project file index (walked async for `@`-mention autocomplete).
+    FilesLoaded(Vec<String>),
 
     // ---- the synchronous approval round-trip ----
     Approval {

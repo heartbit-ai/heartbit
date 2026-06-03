@@ -186,6 +186,45 @@ pub fn view(frame: &mut Frame, app: &App) {
                 .title(" commands · ↑↓ Tab Enter "),
         );
         frame.render_widget(menu, rect);
+    } else {
+        // --- @-mention file autocomplete (floats above the composer) ---
+        let files = app.mention_candidates();
+        if !files.is_empty() {
+            let h = (files.len() as u16 + 2).min(area.height).min(10);
+            let w = 60.min(area.width);
+            let rect = Rect {
+                x: chunks[2].x,
+                y: chunks[2].y.saturating_sub(h),
+                width: w,
+                height: h,
+            };
+            frame.render_widget(Clear, rect);
+            let sel = app.menu_selected.min(files.len() - 1);
+            let items: Vec<Line> = files
+                .iter()
+                .take(h as usize - 2)
+                .enumerate()
+                .map(|(i, f)| {
+                    if i == sel {
+                        Line::from(Span::styled(
+                            format!(" ▸ {f} "),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        ))
+                    } else {
+                        Line::from(Span::styled(
+                            format!("   {f}"),
+                            Style::default().fg(Color::Cyan),
+                        ))
+                    }
+                })
+                .collect();
+            let menu = Paragraph::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" files · ↑↓ Tab Enter "),
+            );
+            frame.render_widget(menu, rect);
+        }
     }
 
     // --- modal overlays ---
@@ -328,6 +367,56 @@ pub fn view(frame: &mut Frame, app: &App) {
                     .borders(Borders::ALL)
                     .title(" select model "),
             );
+            frame.render_widget(widget, rect);
+        }
+        Some(Modal::HistorySearch(h)) => {
+            let matches = app.history_matches(&h.query);
+            let w = area.width.min(80);
+            let h_box = 9u16.min(area.height);
+            let rect = centered(area, w, h_box);
+            frame.render_widget(Clear, rect);
+            let mut mlines = vec![
+                Line::from(vec![
+                    Span::styled("(reverse-search) ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        h.query.clone(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::raw(""),
+            ];
+            if matches.is_empty() {
+                mlines.push(Line::from(Span::styled(
+                    "(no matching prompt)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let sel = h.sel.min(matches.len() - 1);
+                for (i, m) in matches.iter().take(4).enumerate() {
+                    let line: String = m.replace('\n', " ").chars().take(w as usize - 4).collect();
+                    if i == sel {
+                        mlines.push(Line::from(Span::styled(
+                            format!(" ▸ {line} "),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        )));
+                    } else {
+                        mlines.push(Line::from(Span::styled(
+                            format!("   {line}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+            mlines.push(Line::raw(""));
+            mlines.push(Line::from(Span::styled(
+                "Ctrl+R next · Enter use · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let widget = Paragraph::new(mlines)
+                .block(Block::default().borders(Borders::ALL).title(" history "))
+                .wrap(Wrap { trim: false });
             frame.render_widget(widget, rect);
         }
         None => {

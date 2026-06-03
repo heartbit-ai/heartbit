@@ -145,6 +145,8 @@ pub enum Effect {
     SaveMcp(Vec<McpServerSpec>),
     /// Fetch the OpenRouter model catalog (async, for the model picker).
     FetchModels,
+    /// Walk the project tree (async) to build the `@`-mention file index.
+    WalkFiles,
     /// Persist the multi-agent (orchestrator) mode flag to the config file.
     SaveMultiAgent(bool),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
@@ -175,11 +177,19 @@ pub struct ModelPicker {
     pub selected: usize,
 }
 
+/// Reverse history search (Ctrl+R): a query + the highlighted match index.
+#[derive(Default)]
+pub struct HistorySearch {
+    pub query: String,
+    pub sel: usize,
+}
+
 /// A modal overlay.
 pub enum Modal {
     Approval(ApprovalModal),
     KeyEntry(KeyEntryModal),
     ModelPicker(ModelPicker),
+    HistorySearch(HistorySearch),
 }
 
 /// The full UI state.
@@ -211,6 +221,10 @@ pub struct App {
     pub todos: Vec<TodoRow>,
     /// Global permission posture (Shift+Tab cycles it).
     pub permission_mode: PermissionMode,
+    /// Project file paths for `@`-mention autocomplete (walked lazily on first `@`).
+    pub file_index: Vec<String>,
+    /// True once a file-index walk has been requested (so we don't re-walk).
+    pub files_requested: bool,
     /// Current context fill (latest request's input tokens) — for the status bar.
     pub context_tokens: u32,
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
@@ -245,6 +259,8 @@ impl App {
             agents: Vec::new(),
             todos: Vec::new(),
             permission_mode: PermissionMode::Default,
+            file_index: Vec::new(),
+            files_requested: false,
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
@@ -351,6 +367,10 @@ impl App {
                 Some(Modal::ModelPicker(p)) => {
                     p.query.push_str(&s.replace(['\n', '\r'], ""));
                     p.selected = 0;
+                }
+                Some(Modal::HistorySearch(h)) => {
+                    h.query.push_str(&s.replace(['\n', '\r'], ""));
+                    h.sel = 0;
                 }
                 Some(Modal::Approval(_)) => {}
                 None => self.composer.insert_str(&s),
@@ -485,6 +505,7 @@ impl App {
                 self.models = models;
                 self.models_loading = false;
             }
+            Msg::FilesLoaded(files) => self.file_index = files,
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
                 // Only notify when the fetch was USER-initiated (the picker is
@@ -518,9 +539,43 @@ impl App {
             .collect()
     }
 
-    /// Whether the `/` command menu is currently showing.
+    /// File-path candidates for `@`-mention autocomplete given the `@token` at
+    /// the cursor, filtered from the project file index (empty if no `@` or the
+    /// index isn't loaded yet).
+    pub fn mention_candidates(&self) -> Vec<String> {
+        let Some(prefix) = self.composer.mention_prefix() else {
+            return Vec::new();
+        };
+        if self.modal.is_some() {
+            return Vec::new();
+        }
+        let p = prefix.to_lowercase();
+        self.file_index
+            .iter()
+            .filter(|f| f.to_lowercase().contains(&p))
+            .take(20)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a completion menu (commands OR `@`-mentions) is currently showing.
     pub fn menu_open(&self) -> bool {
-        !self.command_candidates().is_empty()
+        !self.command_candidates().is_empty() || !self.mention_candidates().is_empty()
+    }
+
+    /// True when the active completion menu is `@`-mentions (vs slash commands).
+    fn menu_is_mentions(&self) -> bool {
+        self.command_candidates().is_empty() && !self.mention_candidates().is_empty()
+    }
+
+    /// Number of items in the active completion menu.
+    fn menu_len(&self) -> usize {
+        let c = self.command_candidates().len();
+        if c > 0 {
+            c
+        } else {
+            self.mention_candidates().len()
+        }
     }
 
     fn menu_selected_command(&self) -> Option<&'static str> {
@@ -533,7 +588,7 @@ impl App {
 
     /// Move the menu highlight (wrapping).
     fn menu_move(&mut self, delta: isize) {
-        let n = self.command_candidates().len();
+        let n = self.menu_len();
         if n == 0 {
             return;
         }
@@ -541,17 +596,26 @@ impl App {
         self.menu_selected = (cur + delta).rem_euclid(n as isize) as usize;
     }
 
-    /// Tab: complete to the selected command + a trailing space (ready for args).
+    /// Tab: complete the selected item. Commands → `/cmd ` (ready for args);
+    /// `@`-mentions → the file path + a space.
     fn menu_complete(&mut self) {
-        if let Some(name) = self.menu_selected_command() {
+        if self.menu_is_mentions() {
+            let cands = self.mention_candidates();
+            if let Some(path) = cands.get(self.menu_selected.min(cands.len().saturating_sub(1))) {
+                self.composer.complete_mention(path);
+                self.menu_selected = 0;
+            }
+        } else if let Some(name) = self.menu_selected_command() {
             self.composer.set_text(&format!("{name} "));
             self.menu_selected = 0;
         }
     }
 
-    /// Enter on the menu: complete to the selected command and run it now.
+    /// Enter on the menu: complete an `@`-mention, or run the selected command.
     fn menu_run(&mut self) {
-        if let Some(name) = self.menu_selected_command() {
+        if self.menu_is_mentions() {
+            self.menu_complete();
+        } else if let Some(name) = self.menu_selected_command() {
             self.composer.set_text(name);
             self.submit();
             self.menu_selected = 0;
@@ -837,9 +901,18 @@ impl App {
                 )));
             }
             KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
+            // Ctrl+R: reverse-search the submit history.
+            KeyCode::Char('r') if ctrl => {
+                self.modal = Some(Modal::HistorySearch(HistorySearch::default()));
+            }
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.composer.insert_char(c);
                 self.menu_selected = 0; // re-filter from the top
+                // First `@`: lazily kick off the project file-index walk.
+                if self.composer.mention_prefix().is_some() && !self.files_requested {
+                    self.files_requested = true;
+                    self.effects.push(Effect::WalkFiles);
+                }
             }
             KeyCode::Backspace => {
                 self.composer.backspace();
@@ -878,7 +951,67 @@ impl App {
             Some(Modal::Approval(_)) => self.handle_approval_key(key),
             Some(Modal::KeyEntry(_)) => self.handle_key_entry(key),
             Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
+            Some(Modal::HistorySearch(_)) => self.handle_history_search_key(key),
             None => {}
+        }
+    }
+
+    /// Submit-history entries containing `query` (case-insensitive), newest-first
+    /// and de-duplicated — the reverse-search match list.
+    pub fn history_matches(&self, query: &str) -> Vec<String> {
+        let q = query.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in self.composer.history().iter().rev() {
+            if (q.is_empty() || e.to_lowercase().contains(&q)) && seen.insert(e.clone()) {
+                out.push(e.clone());
+            }
+        }
+        out
+    }
+
+    /// Ctrl+R modal keys: type to filter, Ctrl+R cycles matches, Enter loads the
+    /// selected prompt into the composer, Esc cancels.
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let query = match &self.modal {
+            Some(Modal::HistorySearch(h)) => h.query.clone(),
+            _ => return,
+        };
+        let matches = self.history_matches(&query);
+        let n = matches.len();
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Char('r') if ctrl => {
+                if let Some(Modal::HistorySearch(h)) = &mut self.modal
+                    && n > 0
+                {
+                    h.sel = (h.sel + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let sel = match &self.modal {
+                    Some(Modal::HistorySearch(h)) => h.sel,
+                    _ => 0,
+                };
+                if let Some(m) = matches.get(sel.min(n.saturating_sub(1))) {
+                    self.composer.set_text(m);
+                }
+                self.modal = None;
+            }
+            KeyCode::Backspace => {
+                if let Some(Modal::HistorySearch(h)) = &mut self.modal {
+                    h.query.pop();
+                    h.sel = 0;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(Modal::HistorySearch(h)) = &mut self.modal {
+                    h.query.push(c);
+                    h.sel = 0;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1717,6 +1850,60 @@ mod tests {
         assert!(parse_todos("not json").is_empty());
         assert!(parse_todos(r#"{"x":1}"#).is_empty());
         assert!(parse_todos(r#"{"todos":"nope"}"#).is_empty());
+    }
+
+    #[test]
+    fn at_sign_triggers_file_walk_and_shows_mentions() {
+        let mut app = keyed();
+        app.file_index = vec![
+            "src/main.rs".into(),
+            "src/app.rs".into(),
+            "README.md".into(),
+        ];
+        // typing '@' requests the walk once
+        typed(&mut app, "look at @");
+        assert!(app.files_requested);
+        assert!(app.effects.contains(&Effect::WalkFiles));
+        // a partial filters the index
+        typed(&mut app, "app");
+        let c = app.mention_candidates();
+        assert_eq!(c, vec!["src/app.rs"]);
+        assert!(app.menu_open(), "mention menu should be open");
+    }
+
+    #[test]
+    fn mention_tab_completes_the_path_in_place() {
+        let mut app = keyed();
+        app.file_index = vec!["src/app.rs".into()];
+        typed(&mut app, "edit @ap");
+        // Tab completes the @token to the file path + a space
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(app.composer.text(), "edit src/app.rs ");
+        assert!(!app.menu_open(), "completion closes the menu");
+    }
+
+    #[test]
+    fn ctrl_r_reverse_search_finds_and_loads_a_prior_prompt() {
+        let mut app = keyed();
+        // build some history
+        for cmd in ["fix the parser", "add a test", "fix the renderer"] {
+            typed(&mut app, cmd);
+            app.update(key(KeyCode::Enter));
+        }
+        // open reverse search, type "fix"
+        app.update(ctrl('r'));
+        assert!(matches!(app.modal, Some(Modal::HistorySearch(_))));
+        for c in "fix".chars() {
+            app.update(key(KeyCode::Char(c)));
+        }
+        // newest-first: "fix the renderer" is the first match
+        let m = app.history_matches("fix");
+        assert_eq!(m, vec!["fix the renderer", "fix the parser"]);
+        // Ctrl+R cycles to the 2nd match, Enter loads it
+        app.update(ctrl('r'));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.composer.text(), "fix the parser");
+        assert!(app.modal.is_none(), "Enter closes the search");
     }
 
     #[test]

@@ -458,6 +458,34 @@ fn default_permissions() -> PermissionRuleset {
     ])
 }
 
+/// Walk the project for `@`-mention autocomplete: relative file paths, skipping
+/// dot-dirs and common build/vendor dirs, capped so huge repos stay responsive.
+fn walk_project_files(root: &std::path::Path) -> Vec<String> {
+    const SKIP: [&str; 6] = [".git", "target", "node_modules", ".venv", "dist", "build"];
+    const CAP: usize = 8000;
+    let mut out = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .max_depth(12)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            // skip hidden dirs and known build/vendor dirs (but allow files)
+            !(e.file_type().is_dir() && (name.starts_with('.') || SKIP.contains(&name.as_ref())))
+        });
+    for entry in walker.flatten() {
+        if entry.file_type().is_file()
+            && let Ok(rel) = entry.path().strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().into_owned());
+            if out.len() >= CAP {
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Translate a raw crossterm event into a [`Msg`] (or ignore it).
 fn translate(event: Event) -> Option<Msg> {
     use crossterm::event::MouseEventKind;
@@ -714,6 +742,17 @@ async fn run_ui(
                             Err(e) => Msg::ModelsFailed(e.to_string()),
                         };
                         let _ = tx.send(msg);
+                    });
+                }
+                Effect::WalkFiles => {
+                    // Build the @-mention file index off the UI thread.
+                    let tx = ui_tx.clone();
+                    let root = cwd.clone();
+                    tokio::spawn(async move {
+                        let files = tokio::task::spawn_blocking(move || walk_project_files(&root))
+                            .await
+                            .unwrap_or_default();
+                        let _ = tx.send(Msg::FilesLoaded(files));
                     });
                 }
                 Effect::Interrupt => {

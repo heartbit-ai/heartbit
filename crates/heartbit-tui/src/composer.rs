@@ -54,6 +54,36 @@ impl Composer {
         (self.row, self.col)
     }
 
+    /// The submit-history entries (oldest→newest) — for Ctrl+R reverse search.
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    /// The `@token` being typed immediately before the cursor on the current
+    /// line (without the `@`), for file-mention autocomplete — or `None`.
+    pub fn mention_prefix(&self) -> Option<String> {
+        let line = &self.lines[self.row];
+        let before: String = line[..self.col].iter().collect();
+        let tok = before.rsplit(char::is_whitespace).next().unwrap_or("");
+        tok.strip_prefix('@').map(|s| s.to_string())
+    }
+
+    /// Replace the `@token` before the cursor with `path` + a trailing space.
+    pub fn complete_mention(&mut self, path: &str) {
+        let line = &self.lines[self.row];
+        let before: String = line[..self.col].iter().collect();
+        let after: Vec<char> = line[self.col..].to_vec();
+        // strip the trailing `@token`
+        let cut = before.rfind('@').unwrap_or(before.len());
+        let mut head: Vec<char> = before[..cut].chars().collect();
+        head.extend(format!("{path} ").chars());
+        let new_col = head.len();
+        head.extend(after);
+        self.lines[self.row] = head;
+        self.col = new_col;
+        self.hist_pos = None;
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.hist_pos = None;
         self.lines[self.row].insert(self.col, c);
@@ -271,6 +301,27 @@ mod tests {
         let _ = c.take();
         c.history_prev();
         assert_eq!(c.text(), "", "blank entry must not enter history");
+    }
+
+    #[test]
+    fn mention_prefix_detects_at_token_at_cursor() {
+        let mut c = Composer::new();
+        c.insert_str("see @src/ma");
+        assert_eq!(c.mention_prefix().as_deref(), Some("src/ma"));
+        c.insert_char(' ');
+        assert_eq!(c.mention_prefix(), None, "a space ends the @token");
+    }
+
+    #[test]
+    fn complete_mention_replaces_the_token() {
+        let mut c = Composer::new();
+        c.insert_str("open @ap and go");
+        // cursor is at end; move it back to just after "ap"
+        for _ in 0.." and go".len() {
+            c.move_left();
+        }
+        c.complete_mention("src/app.rs");
+        assert_eq!(c.text(), "open src/app.rs  and go");
     }
 
     #[test]
