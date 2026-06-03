@@ -125,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let interrupt = InterruptHandle::new();
+    // Shared permission posture (0=default,1=accept-edits,2=plan,3=auto), cycled
+    // by the UI (Shift+Tab) and read live by the agent thread's `on_approval`.
+    let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
@@ -140,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         input_rx,
         cwd,
         interrupt,
+        perm_mode,
     )
     .await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -256,6 +260,7 @@ async fn build_engine(
     interrupt: InterruptHandle,
     mcp_servers: Vec<config::McpServerSpec>,
     multi_agent: bool,
+    perm_mode: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<Engine> {
     let provider = build_provider(api_key, model)?;
 
@@ -309,9 +314,21 @@ async fn build_engine(
     };
     let on_approval: Arc<OnApproval> = {
         let tx = ui_tx.clone();
+        let perm_mode = perm_mode.clone();
         Arc::new(move |calls: &[heartbit_core::llm::types::ToolCall]| {
             for c in calls {
                 tracing::info!(target: "heartbit::interrupt", approval_for = %c.name, "on_approval");
+            }
+            // Permission posture gates the prompt (read live, cross-thread):
+            //   auto → allow all; accept-edits → allow if the whole batch is edits;
+            //   plan → deny any mutating tool (read-only); default → ask (modal).
+            let is_edit = |n: &str| matches!(n, "edit" | "write" | "patch");
+            let is_mutating = |n: &str| matches!(n, "edit" | "write" | "patch" | "bash");
+            match perm_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                3 => return ApprovalDecision::Allow,
+                1 if calls.iter().all(|c| is_edit(&c.name)) => return ApprovalDecision::Allow,
+                2 if calls.iter().any(|c| is_mutating(&c.name)) => return ApprovalDecision::Deny,
+                _ => {}
             }
             let tools = calls
                 .iter()
@@ -466,6 +483,7 @@ fn translate(event: Event) -> Option<Msg> {
 /// first user message on the same channel `on_input` uses, runs `execute`, and
 /// `on_input` feeds subsequent turns. A multi_thread runtime keeps a blocking
 /// tool from starving the interrupt's cancellation poll.
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     app: &App,
     ui_tx: &UnboundedSender<Msg>,
@@ -473,6 +491,7 @@ fn spawn_agent(
     cwd: &std::path::Path,
     interrupt: &InterruptHandle,
     epoch: u64,
+    perm_mode: &Arc<std::sync::atomic::AtomicU8>,
 ) -> bool {
     if app.api_key.is_none() && !app.has_fallback_provider {
         return false; // no provider yet — wait until a key is set
@@ -486,6 +505,7 @@ fn spawn_agent(
     let input_rx = input_rx.clone();
     let cwd = cwd.to_path_buf();
     let interrupt = interrupt.clone();
+    let perm_mode = perm_mode.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -502,6 +522,7 @@ fn spawn_agent(
                 interrupt,
                 mcp_servers,
                 multi_agent,
+                perm_mode,
             )
             .await
             {
@@ -535,6 +556,7 @@ async fn run_ui(
     mut input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
+    perm_mode: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
@@ -544,7 +566,15 @@ async fn run_ui(
     // Eager start: if a provider is already configured (env/config/fallback),
     // spawn the agent now so MCP servers connect at STARTUP, before any message.
     agent_epoch += 1;
-    let mut agent_started = spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
+    let mut agent_started = spawn_agent(
+        app,
+        &ui_tx,
+        &input_rx,
+        &cwd,
+        &interrupt,
+        agent_epoch,
+        &perm_mode,
+    );
 
     loop {
         terminal.draw(|f| ui::view(f, app))?;
@@ -594,8 +624,15 @@ async fn run_ui(
                     // — the thread consumes it before `execute`.
                     if !agent_started {
                         agent_epoch += 1;
-                        agent_started =
-                            spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
+                        agent_started = spawn_agent(
+                            app,
+                            &ui_tx,
+                            &input_rx,
+                            &cwd,
+                            &interrupt,
+                            agent_epoch,
+                            &perm_mode,
+                        );
                     }
                     let _ = input_tx.send(text);
                 }
@@ -609,8 +646,15 @@ async fn run_ui(
                     // A key was just set → connect the agent (and MCP) eagerly now.
                     if !agent_started {
                         agent_epoch += 1;
-                        agent_started =
-                            spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
+                        agent_started = spawn_agent(
+                            app,
+                            &ui_tx,
+                            &input_rx,
+                            &cwd,
+                            &interrupt,
+                            agent_epoch,
+                            &perm_mode,
+                        );
                     }
                 }
                 Effect::SaveModel(model) => {
@@ -628,6 +672,10 @@ async fn run_ui(
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
                     }
+                }
+                Effect::SetPermissionMode(m) => {
+                    // Apply live to the shared gate the agent's on_approval reads.
+                    perm_mode.store(m, std::sync::atomic::Ordering::Relaxed);
                 }
                 Effect::SaveMultiAgent(on) => {
                     let mut cfg = config::TuiConfig::load();

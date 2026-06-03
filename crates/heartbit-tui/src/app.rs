@@ -77,6 +77,51 @@ pub fn parse_todos(input_json: &str) -> Vec<TodoRow> {
         .collect()
 }
 
+/// Global permission posture, cycled with Shift+Tab (Claude Code style). Gates
+/// the `on_approval` bridge so the user can pre-set how consequential tool calls
+/// are handled for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Ask (the approval modal) for tools that aren't silently allowed by rules.
+    Default,
+    /// Auto-allow file edits (edit/write/patch); still ask for bash & others.
+    AcceptEdits,
+    /// Read-only posture: auto-deny mutating tools (edit/write/patch/bash).
+    Plan,
+    /// Auto-allow everything (bypass).
+    Auto,
+}
+
+impl PermissionMode {
+    /// Next mode in the Shift+Tab cycle.
+    pub fn next(self) -> Self {
+        match self {
+            PermissionMode::Default => PermissionMode::AcceptEdits,
+            PermissionMode::AcceptEdits => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Default,
+        }
+    }
+    /// Compact wire value shared with the (cross-thread) approval gate.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            PermissionMode::Default => 0,
+            PermissionMode::AcceptEdits => 1,
+            PermissionMode::Plan => 2,
+            PermissionMode::Auto => 3,
+        }
+    }
+    /// Short status-line label.
+    pub fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "accept-edits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::Auto => "auto",
+        }
+    }
+}
+
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
@@ -102,6 +147,8 @@ pub enum Effect {
     FetchModels,
     /// Persist the multi-agent (orchestrator) mode flag to the config file.
     SaveMultiAgent(bool),
+    /// Apply the permission mode to the shared (cross-thread) approval gate.
+    SetPermissionMode(u8),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
     /// Tear down and exit.
@@ -162,6 +209,8 @@ pub struct App {
     pub agents: Vec<AgentRow>,
     /// Live task list mirrored from the agent's latest `todowrite` call.
     pub todos: Vec<TodoRow>,
+    /// Global permission posture (Shift+Tab cycles it).
+    pub permission_mode: PermissionMode,
     /// Current context fill (latest request's input tokens) — for the status bar.
     pub context_tokens: u32,
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
@@ -195,6 +244,7 @@ impl App {
             multi_agent: false,
             agents: Vec::new(),
             todos: Vec::new(),
+            permission_mode: PermissionMode::Default,
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
@@ -775,6 +825,17 @@ impl App {
                 }
             }
             KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit(),
+            // Shift+Tab cycles the permission posture (default → accept-edits →
+            // plan → auto), applied live to the approval gate.
+            KeyCode::BackTab => {
+                self.permission_mode = self.permission_mode.next();
+                self.effects
+                    .push(Effect::SetPermissionMode(self.permission_mode.as_u8()));
+                self.history.push(Cell::Notice(format!(
+                    "permission mode: {}",
+                    self.permission_mode.label()
+                )));
+            }
             KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.composer.insert_char(c);
@@ -1656,6 +1717,28 @@ mod tests {
         assert!(parse_todos("not json").is_empty());
         assert!(parse_todos(r#"{"x":1}"#).is_empty());
         assert!(parse_todos(r#"{"todos":"nope"}"#).is_empty());
+    }
+
+    #[test]
+    fn shift_tab_cycles_permission_mode_and_emits_effect() {
+        let mut app = keyed();
+        assert_eq!(app.permission_mode, PermissionMode::Default);
+        app.update(key(KeyCode::BackTab));
+        assert_eq!(app.permission_mode, PermissionMode::AcceptEdits);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(1)));
+        app.update(key(KeyCode::BackTab)); // Plan
+        app.update(key(KeyCode::BackTab)); // Auto
+        assert_eq!(app.permission_mode, PermissionMode::Auto);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(3)));
+        app.update(key(KeyCode::BackTab)); // wraps to Default
+        assert_eq!(app.permission_mode, PermissionMode::Default);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(0)));
+        // a notice records the change
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("permission mode")))
+        );
     }
 
     #[test]

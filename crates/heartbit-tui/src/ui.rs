@@ -102,6 +102,18 @@ pub fn view(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ));
     }
+    // Permission posture — only when not the default (keeps the line clean).
+    if app.permission_mode != crate::app::PermissionMode::Default {
+        let c = match app.permission_mode {
+            crate::app::PermissionMode::Auto => Color::Red,
+            crate::app::PermissionMode::Plan => Color::Blue,
+            _ => Color::Yellow,
+        };
+        status.push(Span::styled(
+            format!("· {} ", app.permission_mode.label()),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
+        ));
+    }
     status.push(Span::styled(
         format!("· {state} "),
         Style::default().fg(if app.running {
@@ -752,6 +764,24 @@ mod tests {
         assert!(
             !text.contains('%'),
             "no percent without a known limit:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_permission_mode_when_not_default() {
+        use crate::app::PermissionMode;
+        let backend = TestBackend::new(100, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        // default → not shown
+        terminal.draw(|f| view(f, &app)).unwrap();
+        assert!(!buffer_text(terminal.backend().buffer()).contains("accept-edits"));
+        // accept-edits → shown
+        app.permission_mode = PermissionMode::AcceptEdits;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        assert!(
+            buffer_text(terminal.backend().buffer()).contains("accept-edits"),
+            "permission mode should show in the status line"
         );
     }
 
