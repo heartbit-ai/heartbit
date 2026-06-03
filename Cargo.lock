@@ -2130,6 +2130,7 @@ dependencies = [
  "futures",
  "heartbit",
  "heartbit-core",
+ "pulldown-cmark",
  "ratatui",
  "serde",
  "serde_json",

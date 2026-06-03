@@ -21,6 +21,7 @@ mod app;
 mod cells;
 mod composer;
 mod config;
+mod markdown;
 mod msg;
 mod ui;
 

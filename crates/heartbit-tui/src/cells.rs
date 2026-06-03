@@ -105,7 +105,9 @@ impl Cell {
                     })
                     .collect()
             }
-            Cell::Agent(text) => text.split('\n').map(|l| Line::raw(l.to_string())).collect(),
+            // The assistant answers in Markdown — render it styled (headings,
+            // bold, code, lists) instead of showing raw syntax.
+            Cell::Agent(text) => crate::markdown::render(text),
             Cell::Tool {
                 name,
                 input,
@@ -187,6 +189,26 @@ mod tests {
         let lines = Cell::Agent("line1\nline2".into()).to_lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(plain(&lines), "line1\nline2");
+    }
+
+    #[test]
+    fn agent_cell_renders_markdown_styled() {
+        let lines = Cell::Agent("# Heading\n\nsome **bold** text".into()).to_lines();
+        let heading = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("Heading"));
+        assert!(
+            heading
+                .map(|s| s.style.add_modifier.contains(Modifier::BOLD))
+                .unwrap_or(false),
+            "an agent Markdown heading must render bold"
+        );
+        let text = plain(&lines);
+        assert!(
+            !text.contains('#') && !text.contains('*'),
+            "raw Markdown syntax must not be shown: {text}"
+        );
     }
 
     #[test]
