@@ -437,13 +437,16 @@ impl App {
             }
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
-                // Close the picker and fall back to `/model <name>`.
+                // Only notify when the fetch was USER-initiated (the picker is
+                // open). The eager startup fetch fails SILENTLY — the user never
+                // asked for it, and the context bar already falls back to a raw
+                // token count without the catalog.
                 if matches!(self.modal, Some(Modal::ModelPicker(_))) {
                     self.modal = None;
+                    self.history.push(Cell::Notice(format!(
+                        "could not load models: {err} — use /model <name>"
+                    )));
                 }
-                self.history.push(Cell::Notice(format!(
-                    "could not load models: {err} — use /model <name>"
-                )));
             }
         }
     }
@@ -1231,6 +1234,19 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Cell::Notice(n) if n.contains("could not load models"))),
             "must fall back with a notice"
+        );
+    }
+
+    #[test]
+    fn eager_models_failure_is_silent_no_notice() {
+        // The startup catalog fetch (no picker open) must NOT push a notice — the
+        // user never asked for it; the context bar falls back to a raw count.
+        let mut app = keyed();
+        app.update(Msg::ModelsFailed("offline".into()));
+        assert!(!app.models_loading);
+        assert!(
+            app.history.is_empty(),
+            "an unrequested startup fetch failure must be silent"
         );
     }
 
