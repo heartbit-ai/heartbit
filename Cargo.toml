@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core", "crates/heartbit-sensors", "crates/heartbit-telegram", "crates/heartbit-ghost", "crates/heartbit-tui"]
+members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "crates/heartbit-gateway", "crates/heartbit-core", "crates/heartbit-sensors", "crates/heartbit-telegram", "crates/heartbit-ghost", "crates/heartbit-tui", "mini-crm"]
+# NOTE: `mini-crm` is a WIP app that inherits workspace deps, so it must stay a
+# member (it can't build if `exclude`d). It is, however, kept OUT of the quality
+# gate while WIP — run the gate with `--exclude mini-crm`:
+#   cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings
+#   cargo test   --workspace --exclude mini-crm
 
 [workspace.package]
 version = "2026.507.4"
