@@ -525,6 +525,9 @@ impl DaemonMetrics {
                         .inc_by(cost);
                 }
             }
+            AgentEvent::Reasoning { .. } => {
+                // No metric — chain-of-thought is informational only.
+            }
             AgentEvent::ToolCallStarted { .. } => {
                 // No metric — we track completion + duration which is more useful.
             }

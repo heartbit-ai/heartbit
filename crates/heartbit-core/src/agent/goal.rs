@@ -377,6 +377,7 @@ mod tests {
                     text: self.text.clone(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -399,6 +400,7 @@ mod tests {
                     text: self.0.to_string(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,

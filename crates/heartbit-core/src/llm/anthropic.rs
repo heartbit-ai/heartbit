@@ -661,6 +661,7 @@ impl SseResponseState {
         CompletionResponse {
             content: self.content,
             stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
+            reasoning: None,
             usage: self.usage,
             model: None,
         }
@@ -815,6 +816,7 @@ fn into_completion_response(api: ApiResponse) -> CompletionResponse {
     CompletionResponse {
         content,
         stop_reason: parse_stop_reason(&api.stop_reason),
+        reasoning: None,
         usage: TokenUsage {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,

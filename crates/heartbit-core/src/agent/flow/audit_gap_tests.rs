@@ -85,6 +85,7 @@ impl LlmProvider for CountingProvider {
                 text: format!("live-{n}"),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -115,6 +116,7 @@ impl LlmProvider for RespondProvider {
                 input: self.payload.clone(),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -556,6 +558,7 @@ impl LlmProvider for AlwaysNoJudge {
                 text: "GOAL_MET: NO: keep going".to_string(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 1,
                 output_tokens: 1,

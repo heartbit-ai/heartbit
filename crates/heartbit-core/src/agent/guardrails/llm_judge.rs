@@ -347,6 +347,7 @@ mod tests {
                     text: self.response_text.clone(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })
@@ -397,6 +398,7 @@ mod tests {
                 text: text.to_string(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }
@@ -556,6 +558,7 @@ mod tests {
         let mut response = CompletionResponse {
             content: vec![],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -579,6 +582,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -822,6 +826,7 @@ mod tests {
                         text: "VERDICT: SAFE".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })

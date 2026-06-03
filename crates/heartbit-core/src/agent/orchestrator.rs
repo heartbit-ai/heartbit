@@ -2758,6 +2758,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2782,6 +2783,7 @@ mod tests {
             CompletionResponse {
                 content: vec![ContentBlock::Text { text: t.into() }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }
@@ -2820,6 +2822,7 @@ mod tests {
             CompletionResponse {
                 content: vec![ContentBlock::Text { text: t.into() }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }
@@ -2984,6 +2987,7 @@ mod tests {
                 text: "Simple answer.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -3021,6 +3025,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -3034,6 +3039,7 @@ mod tests {
                     text: "Rust is fast and safe.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -3047,6 +3053,7 @@ mod tests {
                     text: "Strengths: memory safety, performance.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 10,
@@ -3060,6 +3067,7 @@ mod tests {
                     text: "Based on research: Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
@@ -3096,6 +3104,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3105,6 +3114,7 @@ mod tests {
                     text: "No such agent available.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3129,6 +3139,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3137,6 +3148,7 @@ mod tests {
                     text: "Sorry, let me respond directly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3162,6 +3174,7 @@ mod tests {
                     input: json!({"tasks": []}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3171,6 +3184,7 @@ mod tests {
                     text: "Let me try again properly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3196,6 +3210,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3205,6 +3220,7 @@ mod tests {
                     text: "I need to format correctly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3236,6 +3252,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3245,6 +3262,7 @@ mod tests {
                     text: "Research result here.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3254,6 +3272,7 @@ mod tests {
                     text: "Done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3317,6 +3336,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3326,6 +3346,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3335,6 +3356,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3443,6 +3465,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3452,6 +3475,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3461,6 +3485,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3502,6 +3527,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -3517,6 +3543,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -3532,6 +3559,7 @@ mod tests {
                     text: "Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
@@ -3573,6 +3601,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -3586,6 +3615,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 10,
@@ -3603,6 +3633,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 25,
@@ -3616,6 +3647,7 @@ mod tests {
                     text: "More info.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 8,
@@ -3677,6 +3709,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3686,6 +3719,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -3699,6 +3733,7 @@ mod tests {
                     text: "Summary: Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3803,6 +3838,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3812,6 +3848,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3821,6 +3858,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3948,6 +3986,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3957,6 +3996,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3966,6 +4006,7 @@ mod tests {
                         text: "Synthesized.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -4162,6 +4203,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -4171,6 +4213,7 @@ mod tests {
                         text: "Done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -4186,6 +4229,7 @@ mod tests {
                         text: "Cheap work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,
@@ -4254,6 +4298,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4263,6 +4308,7 @@ mod tests {
                     text: "Work done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4272,6 +4318,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4392,6 +4439,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4405,6 +4453,7 @@ mod tests {
                     text: "Rust is fast and safe.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -4418,6 +4467,7 @@ mod tests {
                     text: "Strengths: memory safety.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 10,
@@ -4431,6 +4481,7 @@ mod tests {
                     text: "Final: Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4467,6 +4518,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4480,6 +4532,7 @@ mod tests {
                     text: "Done A.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -4493,6 +4546,7 @@ mod tests {
                     text: "Done B.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 6,
@@ -4506,6 +4560,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4553,6 +4608,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4562,6 +4618,7 @@ mod tests {
                     text: "No such agent available.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4592,6 +4649,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4601,6 +4659,7 @@ mod tests {
                     text: "Using delegate_task instead.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4632,6 +4691,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4641,6 +4701,7 @@ mod tests {
                     text: "Fixed duplicate issue.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4676,6 +4737,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4685,6 +4747,7 @@ mod tests {
                     text: "Written to squad blackboard.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4694,6 +4757,7 @@ mod tests {
                     text: "Also written.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4703,6 +4767,7 @@ mod tests {
                     text: "Done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4759,6 +4824,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4772,6 +4838,7 @@ mod tests {
                     text: "Done A.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -4785,6 +4852,7 @@ mod tests {
                     text: "Squad failed, falling back.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4873,6 +4941,7 @@ mod tests {
                     text: "Direct answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }]),
@@ -4943,6 +5012,7 @@ mod tests {
                     text: "Direct answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }]),
@@ -5044,6 +5114,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5053,6 +5124,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5062,6 +5134,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5166,6 +5239,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 40,
@@ -5186,6 +5260,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
@@ -5199,6 +5274,7 @@ mod tests {
                     text: "Rust uses async/await with tokio for concurrency.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
@@ -5219,6 +5295,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 8,
@@ -5232,6 +5309,7 @@ mod tests {
                     text: "The main.rs contains the entry point.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 12,
@@ -5245,6 +5323,7 @@ mod tests {
                     text: "Combined analysis: Rust async is great for concurrency.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 200,
                     output_tokens: 50,
@@ -5308,6 +5387,7 @@ mod tests {
                 AgentEvent::RunStarted { agent, .. }
                 | AgentEvent::TurnStarted { agent, .. }
                 | AgentEvent::LlmResponse { agent, .. }
+                | AgentEvent::Reasoning { agent, .. }
                 | AgentEvent::ToolCallStarted { agent, .. }
                 | AgentEvent::ToolCallCompleted { agent, .. }
                 | AgentEvent::RunCompleted { agent, .. }
@@ -5657,6 +5737,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5779,6 +5860,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 40,
@@ -5794,6 +5876,7 @@ mod tests {
                     text: "Plan: Step 1 gather data, Step 2 compute, Step 3 review.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 15,
@@ -5815,6 +5898,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 12,
@@ -5828,6 +5912,7 @@ mod tests {
                     text: "Computation result: 714. Analysis complete.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 35,
                     output_tokens: 18,
@@ -5842,6 +5927,7 @@ mod tests {
                     text: "Squad partial success: plan and computation done, review failed.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 200,
                     output_tokens: 60,
@@ -5993,6 +6079,7 @@ mod tests {
                 AgentEvent::RunStarted { agent, .. }
                 | AgentEvent::TurnStarted { agent, .. }
                 | AgentEvent::LlmResponse { agent, .. }
+                | AgentEvent::Reasoning { agent, .. }
                 | AgentEvent::ToolCallStarted { agent, .. }
                 | AgentEvent::ToolCallCompleted { agent, .. }
                 | AgentEvent::RunCompleted { agent, .. }
@@ -6028,6 +6115,7 @@ mod tests {
                 AgentEvent::RunStarted { .. } => "RunStarted",
                 AgentEvent::TurnStarted { .. } => "TurnStarted",
                 AgentEvent::LlmResponse { .. } => "LlmResponse",
+                AgentEvent::Reasoning { .. } => "Reasoning",
                 AgentEvent::ToolCallStarted { .. } => "ToolCallStarted",
                 AgentEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
                 AgentEvent::RunCompleted { .. } => "RunCompleted",
@@ -6353,6 +6441,7 @@ mod tests {
                         text: "Task complete.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -6399,6 +6488,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6410,6 +6500,7 @@ mod tests {
                     input: json!({"command": "echo hello"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6419,6 +6510,7 @@ mod tests {
                     text: "Bash was denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6428,6 +6520,7 @@ mod tests {
                     text: "Worker reported bash was denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6496,6 +6589,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6507,6 +6601,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6516,6 +6611,7 @@ mod tests {
                     text: "Bash denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6525,6 +6621,7 @@ mod tests {
                     text: "Hello!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6534,6 +6631,7 @@ mod tests {
                     text: "Squad done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6786,6 +6884,7 @@ mod tests {
                 ..Default::default()
             },
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -6857,6 +6956,7 @@ mod tests {
                 }],
                 usage: TokenUsage::default(),
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 model: None,
             },
             // Second response shouldn't be needed
@@ -6920,6 +7020,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
         let mut config = make_spawn_config();
@@ -7028,6 +7129,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -7066,6 +7168,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -7219,6 +7322,7 @@ model = "claude-sonnet-4-20250514"
                 }],
                 usage: TokenUsage::default(),
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 model: None,
             },
         ]));
@@ -7289,6 +7393,7 @@ model = "claude-sonnet-4-20250514"
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 5,
@@ -7302,6 +7407,7 @@ model = "claude-sonnet-4-20250514"
                     text: "Work done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 400,
                     output_tokens: 100,
@@ -7315,6 +7421,7 @@ model = "claude-sonnet-4-20250514"
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 2,
                     output_tokens: 2,

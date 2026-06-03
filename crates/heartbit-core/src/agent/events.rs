@@ -62,6 +62,17 @@ pub enum AgentEvent {
         time_to_first_token_ms: u64,
     },
 
+    /// The model emitted chain-of-thought before its answer (reasoning models
+    /// only — qwen3-thinking, deepseek-r1). Carried separately from the answer
+    /// text so a UI can render it distinctly (dimmed/collapsible).
+    Reasoning {
+        agent: String,
+        turn: usize,
+        /// Truncated reasoning text.
+        #[serde(default)]
+        text: String,
+    },
+
     /// Tool execution started.
     ToolCallStarted {
         agent: String,
@@ -308,6 +319,7 @@ impl AgentEvent {
             Self::RunStarted { .. } => "run_started",
             Self::TurnStarted { .. } => "turn_started",
             Self::LlmResponse { .. } => "llm_response",
+            Self::Reasoning { .. } => "reasoning",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::ApprovalRequested { .. } => "approval_requested",

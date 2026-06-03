@@ -205,6 +205,10 @@ pub struct CompletionResponse {
     /// Model that produced this response. Set by cascading/routing providers.
     /// `None` when the model is known statically from the provider.
     pub model: Option<String>,
+    /// Chain-of-thought emitted by a reasoning model (qwen3-thinking, deepseek-r1),
+    /// captured separately from the answer in `content`. `None` for models that
+    /// don't expose reasoning, or providers that don't surface it.
+    pub reasoning: Option<String>,
 }
 
 impl CompletionResponse {
@@ -352,6 +356,7 @@ mod tests {
                 },
             ],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -379,6 +384,7 @@ mod tests {
                 },
             ],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -647,6 +653,7 @@ mod tests {
         let response = CompletionResponse {
             content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -658,6 +665,7 @@ mod tests {
         let response = CompletionResponse {
             content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: Some("anthropic/claude-3.5-haiku".into()),
         };

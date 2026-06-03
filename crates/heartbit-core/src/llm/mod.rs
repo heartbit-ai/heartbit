@@ -322,6 +322,7 @@ mod tests {
                     text: "fake".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })
@@ -347,6 +348,7 @@ mod tests {
                     text: "hello world".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })
@@ -505,6 +507,7 @@ mod tests {
                         text: "counted".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })

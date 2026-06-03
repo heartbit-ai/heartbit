@@ -336,6 +336,7 @@ mod tests {
                 text: "Here is the key: AKIAIOSFODNN7EXAMPLE".into(),
             }],
             stop_reason: crate::llm::types::StopReason::EndTurn,
+            reasoning: None,
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };
@@ -351,6 +352,7 @@ mod tests {
                 text: "Hello, how can I help?".into(),
             }],
             stop_reason: crate::llm::types::StopReason::EndTurn,
+            reasoning: None,
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };

@@ -254,6 +254,7 @@ mod tests {
         CompletionResponse {
             content: vec![crate::llm::types::ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,

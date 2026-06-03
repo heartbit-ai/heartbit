@@ -441,6 +441,7 @@ mod tests {
                 text: "Contact john@example.com or 415-555-0142 for help".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -479,6 +480,7 @@ mod tests {
                 text: original.clone(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -500,6 +502,7 @@ mod tests {
                 text: "SSN: 123-45-6789".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };

@@ -525,6 +525,7 @@ fn parse_gemini_response(resp: GeminiResponse) -> Result<CompletionResponse, Err
         stop_reason,
         usage,
         model: None,
+        reasoning: None,
     })
 }
 
@@ -686,6 +687,7 @@ where
         stop_reason,
         usage,
         model: None,
+        reasoning: None,
     })
 }
 

@@ -141,6 +141,7 @@ mod tests {
         CompletionResponse {
             content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }

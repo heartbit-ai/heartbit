@@ -752,6 +752,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                             text: "[interrupted by user]".into(),
                                         }],
                                         stop_reason: crate::llm::types::StopReason::EndTurn,
+                                        reasoning: None,
                                         usage: TokenUsage::default(),
                                         model: None,
                                     })
@@ -984,6 +985,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                         partial_usage: total_usage,
                     });
                     return Err((err, total_usage));
+                }
+
+                // Surface the model's chain-of-thought (reasoning models only)
+                // as a distinct event, ahead of the answer.
+                if let Some(reasoning) = &response.reasoning
+                    && !reasoning.is_empty()
+                {
+                    self.emit(AgentEvent::Reasoning {
+                        agent: self.name.clone(),
+                        turn: ctx.current_turn(),
+                        text: truncate_for_event(reasoning, EVENT_MAX_PAYLOAD_BYTES),
+                    });
                 }
 
                 self.emit(AgentEvent::LlmResponse {
@@ -2530,6 +2543,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -2671,6 +2685,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2903,6 +2918,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 20,

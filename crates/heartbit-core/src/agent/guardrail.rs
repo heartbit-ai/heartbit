@@ -263,6 +263,7 @@ mod tests {
         let mut response = CompletionResponse {
             content: vec![],
             stop_reason: crate::llm::types::StopReason::EndTurn,
+            reasoning: None,
             usage: crate::llm::types::TokenUsage::default(),
             model: None,
         };

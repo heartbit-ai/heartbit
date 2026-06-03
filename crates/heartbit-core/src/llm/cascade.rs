@@ -284,6 +284,7 @@ mod tests {
         CompletionResponse {
             content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 output_tokens,
                 ..Default::default()
@@ -300,6 +301,7 @@ mod tests {
                 input: json!({"q": "rust"}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 output_tokens: 20,
                 ..Default::default()
@@ -314,6 +316,7 @@ mod tests {
                 text: "truncated...".into(),
             }],
             stop_reason: StopReason::MaxTokens,
+            reasoning: None,
             usage: TokenUsage {
                 output_tokens: 100,
                 ..Default::default()
@@ -436,6 +439,7 @@ mod tests {
                 input: json!({"verdict": "verified"}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 output_tokens: 20,
                 ..Default::default()
@@ -788,6 +792,7 @@ mod tests {
                         text: "streamed response".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         output_tokens: 20,
                         ..Default::default()

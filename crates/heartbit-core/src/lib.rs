@@ -230,6 +230,7 @@ pub mod __bench {
                 response: CompletionResponse {
                     content: vec![ContentBlock::Text { text: text.into() }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 64,
                         output_tokens: 16,

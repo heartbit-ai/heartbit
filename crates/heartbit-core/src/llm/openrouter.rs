@@ -335,6 +335,9 @@ struct OpenAiChoice {
 struct OpenAiMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Chain-of-thought (non-streaming) from reasoning models.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
 }
@@ -370,6 +373,19 @@ pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<Completion
     })?;
 
     let mut content = Vec::new();
+
+    let reasoning = choice
+        .message
+        .reasoning
+        .filter(|r| !r.is_empty())
+        .map(|mut r| {
+            let boundary = crate::tool::builtins::floor_char_boundary(
+                &r,
+                std::cmp::min(r.len(), super::STREAM_MAX_TEXT_BYTES),
+            );
+            r.truncate(boundary);
+            r
+        });
 
     // Text content
     if let Some(text) = choice.message.content
@@ -434,6 +450,7 @@ pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<Completion
         stop_reason,
         usage,
         model: None,
+        reasoning,
     })
 }
 
@@ -459,6 +476,10 @@ struct StreamingChoice {
 struct StreamingDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Chain-of-thought from reasoning models (qwen3-thinking, deepseek-r1),
+    /// streamed separately from `content`.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamingToolCallDelta>>,
 }
@@ -503,6 +524,7 @@ where
     let mut parser = SseParser::new();
     let mut utf8_buf: Vec<u8> = Vec::new();
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut usage = TokenUsage::default();
@@ -526,6 +548,7 @@ where
                     &event.data,
                     on_text,
                     &mut text,
+                    &mut reasoning,
                     &mut tool_calls,
                     &mut finish_reason,
                     &mut usage,
@@ -544,6 +567,7 @@ where
                 &event.data,
                 on_text,
                 &mut text,
+                &mut reasoning,
                 &mut tool_calls,
                 &mut finish_reason,
                 &mut usage,
@@ -556,6 +580,7 @@ where
             &event.data,
             on_text,
             &mut text,
+            &mut reasoning,
             &mut tool_calls,
             &mut finish_reason,
             &mut usage,
@@ -620,13 +645,16 @@ where
         stop_reason,
         usage,
         model: None,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_openai_event(
     data: &str,
     on_text: &super::OnText,
     text: &mut String,
+    reasoning: &mut String,
     tool_calls: &mut Vec<AccumulatedToolCall>,
     finish_reason: &mut Option<String>,
     usage: &mut TokenUsage,
@@ -662,6 +690,17 @@ fn process_openai_event(
                     "OpenAI-format streaming text exceeded cap; truncated"
                 );
             }
+        }
+
+        // Reasoning (chain-of-thought) accumulates separately from the answer,
+        // under the same per-response cap as content (F-LLM-4: unbounded growth).
+        if let Some(ref r) = choice.delta.reasoning
+            && reasoning.len() < super::STREAM_MAX_TEXT_BYTES
+        {
+            let remaining = super::STREAM_MAX_TEXT_BYTES - reasoning.len();
+            let take = std::cmp::min(remaining, r.len());
+            let boundary = crate::tool::builtins::floor_char_boundary(r, take);
+            reasoning.push_str(&r[..boundary]);
         }
 
         if let Some(ref tcs) = choice.delta.tool_calls {
@@ -851,6 +890,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -875,6 +915,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Let me search.".into()),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_abc".into(),
@@ -909,6 +950,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("truncated...".into()),
                     tool_calls: None,
                 },
@@ -942,6 +984,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: None,
                     tool_calls: Some(vec![
                         OpenAiToolCall {
@@ -979,6 +1022,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: None,
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".into(),
@@ -1332,6 +1376,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -1376,6 +1421,7 @@ mod tests {
         let response1 = into_completion_response(OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Searching...".into()),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".into(),
@@ -1452,6 +1498,33 @@ mod tests {
 
         let texts = received.lock().expect("lock");
         assert_eq!(*texts, vec!["Hello", " world"]);
+    }
+
+    #[tokio::test]
+    async fn stream_accumulates_reasoning_separately_from_content() {
+        // Thinking models (qwen3-*-thinking, deepseek-r1) stream their chain of
+        // thought in `delta.reasoning`, separate from the answer in `delta.content`.
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"reasoning":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"think."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}"#,
+        ]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        // Reasoning is captured but does NOT leak into the answer text.
+        assert_eq!(response.text(), "42");
+        assert_eq!(response.reasoning.as_deref(), Some("Let me think."));
+    }
+
+    #[tokio::test]
+    async fn stream_without_reasoning_leaves_it_none() {
+        let sse =
+            make_sse_data(&[r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.reasoning, None);
     }
 
     #[tokio::test]
@@ -1545,6 +1618,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -1571,6 +1645,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
