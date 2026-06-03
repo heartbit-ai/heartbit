@@ -228,7 +228,7 @@ impl App {
                 self.tool_index.remove(&id);
             }
             Msg::Notice(text) => self.history.push(Cell::Notice(text)),
-            Msg::RunCompleted => {
+            Msg::RunCompleted | Msg::AgentExited(_) => {
                 self.finalize_active();
                 self.running = false;
             }
@@ -479,10 +479,10 @@ impl App {
         self.multi_agent = new;
         self.effects.push(Effect::SaveMultiAgent(new));
         self.history.push(Cell::Notice(format!(
-            "multi-agent workflow {} — active on next start{}",
+            "multi-agent workflow {}{}",
             if new { "ON" } else { "OFF" },
             if new {
-                " (orchestrator delegates to a worker/researcher squad)"
+                " — orchestrator delegates to a worker/researcher squad"
             } else {
                 ""
             }

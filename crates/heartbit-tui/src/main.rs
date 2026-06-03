@@ -451,6 +451,7 @@ fn spawn_agent(
     input_rx: &Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: &std::path::Path,
     interrupt: &InterruptHandle,
+    epoch: u64,
 ) -> bool {
     if app.api_key.is_none() && !app.has_fallback_provider {
         return false; // no provider yet — wait until a key is set
@@ -495,8 +496,9 @@ fn spawn_agent(
                     let _ = done_tx.send(Msg::Notice(format!("cannot start agent: {e}")));
                 }
             }
-            // Reset `agent_started` in the UI loop (covers build failure / session end).
-            let _ = done_tx.send(Msg::RunCompleted);
+            // Signal this thread's exit (with its epoch) so the UI can respawn —
+            // ignoring a stale exit if the engine was already replaced.
+            let _ = done_tx.send(Msg::AgentExited(epoch));
         });
     });
     true
@@ -507,17 +509,21 @@ async fn run_ui(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     mut ui_rx: UnboundedReceiver<Msg>,
-    input_tx: UnboundedSender<String>,
+    mut input_tx: UnboundedSender<String>,
     ui_tx: UnboundedSender<Msg>,
-    input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
+    mut input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
+    // Monotonic spawn epoch: each agent thread carries one, so a stale exit from a
+    // thread we already replaced (e.g. on an `/agents` restart) can be ignored.
+    let mut agent_epoch: u64 = 0;
     // Eager start: if a provider is already configured (env/config/fallback),
     // spawn the agent now so MCP servers connect at STARTUP, before any message.
-    let mut agent_started = spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt);
+    agent_epoch += 1;
+    let mut agent_started = spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
 
     loop {
         terminal.draw(|f| ui::view(f, app))?;
@@ -533,13 +539,18 @@ async fn run_ui(
             maybe_msg = ui_rx.recv() => {
                 if let Some(m) = maybe_msg {
                     // The agent thread exited (build failure or session end) → allow
-                    // the next message to rebuild the runner (and reconnect MCP).
-                    if matches!(m, Msg::RunCompleted) {
+                    // the next message to rebuild the runner. Ignore a stale exit
+                    // whose epoch we already superseded (an `/agents` restart).
+                    if let Msg::AgentExited(e) = m
+                        && e == agent_epoch
+                    {
                         agent_started = false;
                     }
                     app.update(m);
                     while let Ok(m2) = ui_rx.try_recv() {
-                        if matches!(m2, Msg::RunCompleted) {
+                        if let Msg::AgentExited(e) = m2
+                            && e == agent_epoch
+                        {
                             agent_started = false;
                         }
                         app.update(m2);
@@ -561,7 +572,9 @@ async fn run_ui(
                     // message reaches the agent over the same channel `on_input` uses
                     // — the thread consumes it before `execute`.
                     if !agent_started {
-                        agent_started = spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt);
+                        agent_epoch += 1;
+                        agent_started =
+                            spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
                     }
                     let _ = input_tx.send(text);
                 }
@@ -574,7 +587,9 @@ async fn run_ui(
                     }
                     // A key was just set → connect the agent (and MCP) eagerly now.
                     if !agent_started {
-                        agent_started = spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt);
+                        agent_epoch += 1;
+                        agent_started =
+                            spawn_agent(app, &ui_tx, &input_rx, &cwd, &interrupt, agent_epoch);
                     }
                 }
                 Effect::SaveModel(model) => {
@@ -599,6 +614,25 @@ async fn run_ui(
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                    // Activate the new mode NOW if the agent is idle: end the parked
+                    // idle thread by replacing the input channel (its `on_input`
+                    // recv() returns None → it exits), bump the epoch so its stale
+                    // exit is ignored, and clear `agent_started` so the next message
+                    // respawns in the new mode. (A running turn applies on next start.)
+                    if agent_started && !app.running {
+                        agent_epoch += 1; // supersede the idle thread
+                        let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                        input_tx = ntx; // drop the old sender → idle on_input → None → exit
+                        input_rx = Arc::new(Mutex::new(nrx));
+                        agent_started = false;
+                        app.history.push(Cell::Notice(
+                            "restarting agent to apply the new mode — send a message".into(),
+                        ));
+                    } else if app.running {
+                        app.history.push(Cell::Notice(
+                            "a task is running — toggle again once it finishes to apply".into(),
+                        ));
                     }
                 }
                 Effect::FetchModels => {

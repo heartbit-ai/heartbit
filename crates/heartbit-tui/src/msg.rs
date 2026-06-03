@@ -47,6 +47,10 @@ pub enum Msg {
     },
     Notice(String),
     RunCompleted,
+    /// The agent thread (of a given spawn epoch) has exited — its `execute`/`run`
+    /// returned (session ended or build failed). The epoch lets the UI ignore a
+    /// stale exit from a thread it already replaced (e.g. on an `/agents` restart).
+    AgentExited(u64),
     RunFailed(String),
 
     // ---- OpenRouter model catalog (fetched async for the model picker) ----
