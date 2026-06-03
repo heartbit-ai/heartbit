@@ -22,6 +22,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/model", "show or set the model"),
     ("/mcp", "list / add / clear MCP servers"),
+    ("/agents", "toggle multi-agent workflow mode"),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -39,6 +40,8 @@ pub enum Effect {
     SaveMcp(Vec<McpServerSpec>),
     /// Fetch the OpenRouter model catalog (async, for the model picker).
     FetchModels,
+    /// Persist the multi-agent (orchestrator) mode flag to the config file.
+    SaveMultiAgent(bool),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
     /// Tear down and exit.
@@ -92,6 +95,8 @@ pub struct App {
     pub models: Vec<ModelEntry>,
     /// True while the catalog fetch is in flight.
     pub models_loading: bool,
+    /// Multi-agent orchestrator mode (applies on next agent start).
+    pub multi_agent: bool,
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
@@ -118,6 +123,7 @@ impl App {
             mcp_servers: Vec::new(),
             models: Vec::new(),
             models_loading: false,
+            multi_agent: false,
             running: false,
             scroll: 0,
             menu_selected: 0,
@@ -358,6 +364,7 @@ impl App {
                 }
             }
             "mcp" => self.handle_mcp(arg),
+            "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
             "help" => {
                 self.history.push(Cell::Notice(
                     "commands: /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
@@ -450,6 +457,35 @@ impl App {
         self.effects.push(Effect::SaveModel(model.clone()));
         self.history.push(Cell::Notice(format!(
             "model set to {model} — active on next start"
+        )));
+    }
+
+    /// `/agents [on|off]` — toggle multi-agent orchestrator mode (dynamic
+    /// delegation + squads). Persisted; applies on the next agent start.
+    fn toggle_multi_agent(&mut self, arg: String) {
+        let new = match arg.trim().to_lowercase().as_str() {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            "" => !self.multi_agent,
+            other => {
+                self.history.push(Cell::Notice(format!(
+                    "usage: /agents [on|off] (currently {})",
+                    if self.multi_agent { "on" } else { "off" }
+                )));
+                let _ = other;
+                return;
+            }
+        };
+        self.multi_agent = new;
+        self.effects.push(Effect::SaveMultiAgent(new));
+        self.history.push(Cell::Notice(format!(
+            "multi-agent workflow {} — active on next start{}",
+            if new { "ON" } else { "OFF" },
+            if new {
+                " (orchestrator delegates to a worker/researcher squad)"
+            } else {
+                ""
+            }
         )));
     }
 
@@ -993,6 +1029,40 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Cell::Notice(n) if n.contains("could not load models"))),
             "must fall back with a notice"
+        );
+    }
+
+    #[test]
+    fn slash_agents_toggles_and_saves() {
+        let mut app = keyed();
+        assert!(!app.multi_agent);
+        typed(&mut app, "/agents");
+        app.update(key(KeyCode::Enter));
+        assert!(app.multi_agent, "bare /agents toggles on");
+        assert!(app.effects.contains(&Effect::SaveMultiAgent(true)));
+        // explicit off
+        typed(&mut app, "/agents off");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.multi_agent);
+        assert!(app.effects.contains(&Effect::SaveMultiAgent(false)));
+    }
+
+    #[test]
+    fn slash_agents_on_is_idempotent_and_notices() {
+        let mut app = keyed();
+        typed(&mut app, "/agents on");
+        app.update(key(KeyCode::Enter));
+        assert!(app.multi_agent);
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("multi-agent workflow ON"))),
+        );
+        // a pure config command must never start a run
+        assert!(
+            app.effects
+                .iter()
+                .all(|e| !matches!(e, Effect::SendInput(_)))
         );
     }
 

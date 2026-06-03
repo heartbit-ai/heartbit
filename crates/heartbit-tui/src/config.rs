@@ -76,6 +76,10 @@ pub struct TuiConfig {
     /// MCP servers to connect when the agent starts (builtins still take priority).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Run as a multi-agent orchestrator (dynamic delegation + squads) instead of
+    /// a single agent. Toggled in-TUI via `/agents`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_agent: bool,
 }
 
 impl TuiConfig {
@@ -204,6 +208,27 @@ mod tests {
         assert_eq!(loaded.mcp_servers[1].command.as_deref(), Some("npx"));
         assert_eq!(loaded.mcp_servers[1].args, vec!["-y", "some-mcp"]);
         assert_eq!(loaded.mcp_servers[0].label(), "preset:chrome-devtools");
+    }
+
+    #[test]
+    fn roundtrip_multi_agent_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        TuiConfig {
+            multi_agent: true,
+            ..Default::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        assert!(TuiConfig::load_from(&path).multi_agent);
+        // default-false is omitted from the file
+        let path2 = dir.path().join("t2.toml");
+        TuiConfig::default().save_to(&path2).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path2)
+                .unwrap()
+                .contains("multi_agent")
+        );
     }
 
     #[test]

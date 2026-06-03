@@ -36,8 +36,8 @@ use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
     AgentEvent, AgentRunner, ApprovalDecision, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
-    OnInput, OnText, OpenRouterProvider, PermissionAction, PermissionRule, PermissionRuleset,
-    RetryingProvider,
+    OnInput, OnText, OpenRouterProvider, Orchestrator, PermissionAction, PermissionRule,
+    PermissionRuleset, RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     app.api_key = api_key;
     app.has_fallback_provider = has_anthropic;
     app.mcp_servers = cfg.mcp_servers.clone();
+    app.multi_agent = cfg.multi_agent;
     // No provider configured at all → open the key prompt immediately.
     if app.api_key.is_none() && !has_anthropic {
         app.modal = Some(app::Modal::KeyEntry(app::KeyEntryModal::default()));
@@ -165,10 +166,78 @@ fn build_provider(
     anyhow::bail!("no OpenRouter API key configured (set one with /key or OPENROUTER_API_KEY)")
 }
 
-/// Build the agent runner, wiring the synchronous callbacks to the UI channels.
-/// The OpenRouter token is passed only to the provider, never into the tool
-/// environment (bash gets a no-secrets env allowlist).
-async fn build_runner(
+/// The agent engine the TUI drives: a single [`AgentRunner`], or a multi-agent
+/// [`Orchestrator`] (dynamic delegation + squads). Both expose the same
+/// interactive loop (one call drives a whole `on_input` multi-turn session).
+enum Engine {
+    Single(Box<AgentRunner<BoxedProvider>>),
+    Multi(Box<Orchestrator<BoxedProvider>>),
+}
+
+impl Engine {
+    /// Run the (multi-turn) session, starting with `first`.
+    async fn run(&mut self, first: &str) -> anyhow::Result<()> {
+        match self {
+            Engine::Single(r) => {
+                r.execute(first).await?;
+            }
+            Engine::Multi(o) => {
+                o.run(first).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A fresh set of workspace-rooted builtin tools (each call gets its own
+/// `FileTracker` etc.). The API key never enters the tool env (safe allowlist).
+fn fresh_builtins(cwd: &std::path::Path) -> Vec<Arc<dyn heartbit_core::tool::Tool>> {
+    let mut tool_cfg = BuiltinToolsConfig::default();
+    tool_cfg.workspace = Some(cwd.to_path_buf());
+    tool_cfg.dangerous_tools = true;
+    tool_cfg.env_policy = heartbit_core::workspace::EnvPolicy::default();
+    builtin_tools(tool_cfg)
+}
+
+/// Two capable generalist sub-agents (≥2 → dynamic squads auto-enable). Each gets
+/// fresh builtins + a clone of the connected MCP tools, so delegated work can
+/// actually read/edit/run, not just talk. Distinct descriptions guide routing.
+fn default_sub_agents(
+    cwd: &std::path::Path,
+    mcp_tools: &[Arc<dyn heartbit_core::tool::Tool>],
+) -> Vec<SubAgentConfig> {
+    let make = |name: &str, description: &str, prompt: &str| {
+        let mut tools = fresh_builtins(cwd);
+        tools.extend(mcp_tools.iter().cloned());
+        SubAgentConfig {
+            name: name.into(),
+            description: description.into(),
+            system_prompt: prompt.into(),
+            tools,
+            max_turns: Some(60),
+            max_tokens: Some(8192),
+            ..Default::default()
+        }
+    };
+    vec![
+        make(
+            "worker",
+            "General implementation agent: reads, searches, edits, and runs code in the workspace. Use for concrete file changes, builds, tests, and command execution.",
+            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result.",
+        ),
+        make(
+            "researcher",
+            "Investigation agent: explores the codebase and gathers facts (search, read files, run read-only commands). Use to understand, locate, or analyze before changes.",
+            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked.",
+        ),
+    ]
+}
+
+/// Build the agent engine (single or multi-agent), wiring the synchronous
+/// callbacks to the UI channels. The OpenRouter token is passed only to the
+/// provider, never into the tool environment (bash gets a no-secrets allowlist).
+#[allow(clippy::too_many_arguments)]
+async fn build_engine(
     api_key: Option<String>,
     model: &str,
     ui_tx: UnboundedSender<Msg>,
@@ -176,33 +245,32 @@ async fn build_runner(
     cwd: PathBuf,
     interrupt: InterruptHandle,
     mcp_servers: Vec<config::McpServerSpec>,
-) -> anyhow::Result<AgentRunner<BoxedProvider>> {
+    multi_agent: bool,
+) -> anyhow::Result<Engine> {
     let provider = build_provider(api_key, model)?;
 
-    let mut tool_cfg = BuiltinToolsConfig::default();
-    tool_cfg.workspace = Some(cwd.clone());
-    tool_cfg.dangerous_tools = true;
-    // Do NOT inherit the host env into the agent's bash: the safe allowlist
-    // (PATH/HOME/… , no secrets) keeps the API key out of the tool environment.
-    tool_cfg.env_policy = heartbit_core::workspace::EnvPolicy::default();
-    // Builtins FIRST so a connected MCP server cannot shadow a trusted builtin.
-    // MCP connection happens here (on the agent thread's runtime) because the
-    // stdio transport binds to its spawning runtime.
-    let mut tools = builtin_tools(tool_cfg);
+    // Connect MCP once (on this thread's runtime — the stdio transport binds to
+    // its spawn runtime). The tools are Arc, shared across agents.
+    let mut mcp_tools: Vec<Arc<dyn heartbit_core::tool::Tool>> = Vec::new();
     for spec in &mcp_servers {
         let label = spec.label();
         let _ = ui_tx.send(Msg::Notice(format!("connecting MCP {label}…")));
         match connect_mcp(spec).await {
-            Ok(mcp_tools) => {
-                let n = mcp_tools.len();
-                tools.extend(mcp_tools);
-                let _ = ui_tx.send(Msg::Notice(format!("MCP {label}: connected ({n} tools)")));
+            Ok(t) => {
+                let _ = ui_tx.send(Msg::Notice(format!(
+                    "MCP {label}: connected ({} tools)",
+                    t.len()
+                )));
+                mcp_tools.extend(t);
             }
             Err(e) => {
                 let _ = ui_tx.send(Msg::Notice(format!("MCP {label}: failed — {e}")));
             }
         }
     }
+    // The single agent's tools: builtins FIRST so MCP can't shadow a trusted one.
+    let mut tools = fresh_builtins(&cwd);
+    tools.extend(mcp_tools.iter().cloned());
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();
@@ -213,6 +281,14 @@ async fn build_runner(
     let on_event: Arc<OnEvent> = {
         let tx = ui_tx.clone();
         Arc::new(move |e: AgentEvent| {
+            // Opt-in diagnostics (HEARTBIT_TUI_DEBUG): surface tool dispatch +
+            // multi-agent delegation, which the TUI owns the terminal so can't show.
+            if let AgentEvent::ToolCallStarted { tool_name, .. } = &e {
+                tracing::info!(target: "heartbit::interrupt", tool_started = %tool_name, "tool dispatched");
+            }
+            if let AgentEvent::SubAgentsDispatched { agents, .. } = &e {
+                tracing::info!(target: "heartbit::interrupt", ?agents, "sub-agents dispatched");
+            }
             if let Some(m) = Msg::from_event(e) {
                 let _ = tx.send(m);
             }
@@ -221,6 +297,9 @@ async fn build_runner(
     let on_approval: Arc<OnApproval> = {
         let tx = ui_tx.clone();
         Arc::new(move |calls: &[heartbit_core::llm::types::ToolCall]| {
+            for c in calls {
+                tracing::info!(target: "heartbit::interrupt", approval_for = %c.name, "on_approval");
+            }
             let tools = calls
                 .iter()
                 .map(|c| PendingTool {
@@ -266,21 +345,46 @@ async fn build_runner(
         )));
     }
 
-    let runner = AgentRunner::builder(provider)
-        .name("heartbit")
-        .system_prompt(SYSTEM_PROMPT)
-        .instruction_text(project_context)
-        .tools(tools)
-        .max_turns(300)
-        .workspace(cwd)
-        .permission_rules(default_permissions())
-        .on_text(on_text)
-        .on_event(on_event)
-        .on_approval(on_approval)
-        .on_input(on_input)
-        .interrupt(interrupt)
-        .build()?;
-    Ok(runner)
+    if multi_agent {
+        // Multi-agent: an Orchestrator that dynamically delegates to a squad of
+        // capable sub-agents (delegate_task / form_squad). The orchestrator agent
+        // is a router; the sub-agents hold the tools. Same callbacks + interrupt
+        // as the single agent (one run() drives the whole multi-turn session).
+        let _ = ui_tx.send(Msg::Notice(
+            "multi-agent workflow ON — orchestrator + worker/researcher squad".into(),
+        ));
+        let mut builder = Orchestrator::builder(provider)
+            .max_turns(300)
+            .workspace(cwd.clone())
+            .instruction_text(project_context)
+            .permission_rules(default_permissions())
+            .on_text(on_text)
+            .on_event(on_event)
+            .on_approval(on_approval)
+            .on_input(on_input)
+            .interrupt(interrupt);
+        for cfg in default_sub_agents(&cwd, &mcp_tools) {
+            builder = builder.sub_agent_full(cfg);
+        }
+        let orch = builder.build()?;
+        Ok(Engine::Multi(Box::new(orch)))
+    } else {
+        let runner = AgentRunner::builder(provider)
+            .name("heartbit")
+            .system_prompt(SYSTEM_PROMPT)
+            .instruction_text(project_context)
+            .tools(tools)
+            .max_turns(300)
+            .workspace(cwd)
+            .permission_rules(default_permissions())
+            .on_text(on_text)
+            .on_event(on_event)
+            .on_approval(on_approval)
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()?;
+        Ok(Engine::Single(Box::new(runner)))
+    }
 }
 
 /// Connect one configured MCP server and return its tools. A preset spins up its
@@ -354,6 +458,7 @@ fn spawn_agent(
     let api_key = app.api_key.clone();
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
+    let multi_agent = app.multi_agent;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -366,7 +471,7 @@ fn spawn_agent(
             .build()
             .expect("agent runtime");
         rt.block_on(async move {
-            match build_runner(
+            match build_engine(
                 api_key,
                 &model,
                 runner_tx,
@@ -374,15 +479,16 @@ fn spawn_agent(
                 cwd,
                 interrupt,
                 mcp_servers,
+                multi_agent,
             )
             .await
             {
-                Ok(runner) => {
+                Ok(mut engine) => {
                     // MCP is now connected (eagerly). Wait for the first user message,
                     // then run; `on_input` feeds the rest from the same channel.
                     let first = input_rx.lock().await.recv().await;
                     if let Some(first) = first {
-                        let _ = runner.execute(&first).await;
+                        let _ = engine.run(&first).await;
                     }
                 }
                 Err(e) => {
@@ -482,6 +588,14 @@ async fn run_ui(
                 Effect::SaveMcp(servers) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.mcp_servers = servers;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
+                Effect::SaveMultiAgent(on) => {
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.multi_agent = on;
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
