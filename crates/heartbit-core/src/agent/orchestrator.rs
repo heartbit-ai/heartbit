@@ -233,6 +233,8 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             knowledge_base: None,
             on_text: None,
             on_approval: None,
+            on_input: None,
+            interrupt: None,
             on_event: None,
             guardrails: Vec::new(),
             on_question: None,
@@ -1780,6 +1782,8 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     on_text: Option<Arc<crate::llm::OnText>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
+    on_input: Option<Arc<crate::agent::OnInput>>,
+    interrupt: Option<super::interrupt::InterruptHandle>,
     guardrails: Vec<Arc<dyn Guardrail>>,
     on_question: Option<Arc<OnQuestion>>,
     run_timeout: Option<Duration>,
@@ -2017,6 +2021,24 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// callback — only the orchestrator's decisions are gated.
     pub fn on_approval(mut self, callback: Arc<crate::llm::OnApproval>) -> Self {
         self.on_approval = Some(callback);
+        self
+    }
+
+    /// Set the `on_input` callback for interactive multi-turn sessions. Forwarded
+    /// to the orchestrator's inner runner: when the orchestrator finishes a turn
+    /// with no tool calls, it awaits the next message (history preserved), exactly
+    /// like a single [`AgentRunner`]. A single [`run`](Orchestrator::run) then
+    /// drives the whole multi-turn session.
+    pub fn on_input(mut self, callback: Arc<crate::agent::OnInput>) -> Self {
+        self.on_input = Some(callback);
+        self
+    }
+
+    /// Set a per-turn [`InterruptHandle`](super::interrupt::InterruptHandle),
+    /// forwarded to the inner runner so a caller can abandon the current turn
+    /// (LLM generation or tool/delegation batch) without ending the session.
+    pub fn interrupt(mut self, handle: super::interrupt::InterruptHandle) -> Self {
+        self.interrupt = Some(handle);
         self
     }
 
@@ -2456,6 +2478,15 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if let Some(on_approval) = self.on_approval {
             runner_builder = runner_builder.on_approval(on_approval);
         }
+        // Forward interactive multi-turn + interrupt to the inner runner so the
+        // orchestrator behaves like a single AgentRunner (one `run` = a full
+        // session) with delegation available.
+        if let Some(on_input) = self.on_input {
+            runner_builder = runner_builder.on_input(on_input);
+        }
+        if let Some(interrupt) = self.interrupt {
+            runner_builder = runner_builder.interrupt(interrupt);
+        }
         if let Some(learned) = self.learned_permissions {
             runner_builder = runner_builder.learned_permissions(learned);
         }
@@ -2740,6 +2771,85 @@ mod tests {
         assert_eq!(output.result, "done");
         // The system prompt should NOT mention form_squad
         // (indirectly verifies squads were disabled)
+    }
+
+    #[tokio::test]
+    async fn orchestrator_runs_multi_turn_via_on_input() {
+        // With `on_input` forwarded to the inner runner, a SINGLE `run()` drives a
+        // whole multi-turn session: turn 1 answers, the runner awaits the next
+        // message, turn 2 answers, then `on_input` ends the session.
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![text("first"), text("second")]));
+        let inputs = Arc::new(std::sync::Mutex::new(vec![Some("again".to_string()), None]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("a", "Agent A", "prompt a")
+            .sub_agent("b", "Agent B", "prompt b")
+            .on_input(on_input)
+            .build()
+            .unwrap();
+        let output = orch.run("start").await.unwrap();
+        assert_eq!(
+            output.result, "second",
+            "a single run() drives the full multi-turn session via on_input"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_interrupt_ends_turn_then_continues() {
+        // A pre-triggered interrupt makes the inner runner's biased select abandon
+        // the first turn; the follow-up (via on_input) then produces the answer.
+        use crate::agent::interrupt::InterruptHandle;
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![text("real answer")]));
+        let interrupt = InterruptHandle::new();
+        interrupt.interrupt();
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("a", "Agent A", "prompt a")
+            .sub_agent("b", "Agent B", "prompt b")
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+        let output = orch.run("start").await.unwrap();
+        assert_eq!(output.result, "real answer");
     }
 
     #[test]
