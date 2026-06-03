@@ -40,15 +40,16 @@ pub fn view(frame: &mut Frame, app: &App) {
     ])
     .split(area);
 
-    // --- transcript (+ agent roster panel in multi-agent mode) ---
-    // In multi-agent mode with a populated roster, split off a right-hand panel
-    // listing every agent and what it's doing now. The transcript then gets the
-    // remaining width — which MUST feed `line_count` below, or the scroll offset
-    // (computed from a stale full width) would clip the newest content.
-    // Only while the turn is actually running — the live panel disappears once the
-    // agents stop (the transcript keeps the per-agent record).
+    // --- transcript (+ a right-hand side panel) ---
+    // Pick ONE side panel for the right column (they share the slot, so they
+    // can't fight over the width): the live agent roster takes precedence while a
+    // multi-agent turn is running (it disappears once agents stop); otherwise the
+    // task list. The transcript gets the REMAINING width, which MUST feed
+    // `line_count`, or the scroll offset (from a stale full width) clips the newest.
     let show_roster = app.multi_agent && app.running && !app.agents.is_empty();
-    let (transcript_area, roster_area) = if show_roster && chunks[0].width >= 50 {
+    let show_todos = !show_roster && !app.todos.is_empty();
+    let want_panel = show_roster || show_todos;
+    let (transcript_area, panel_area) = if want_panel && chunks[0].width >= 50 {
         let w = (chunks[0].width / 3).clamp(22, 36);
         let split =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(w)]).split(chunks[0]);
@@ -65,8 +66,12 @@ pub fn view(frame: &mut Frame, app: &App) {
     let max_off = total.saturating_sub(view_h);
     let offset = max_off.saturating_sub(app.scroll);
     frame.render_widget(transcript.scroll((offset, 0)), transcript_area);
-    if let Some(rect) = roster_area {
-        render_roster(frame, app, rect);
+    if let Some(rect) = panel_area {
+        if show_roster {
+            render_roster(frame, app, rect);
+        } else {
+            render_todos(frame, app, rect);
+        }
     }
 
     // --- status line ---
@@ -315,6 +320,49 @@ pub fn view(frame: &mut Frame, app: &App) {
             ));
         }
     }
+}
+
+/// Render the live task list (mirrors the agent's `todowrite`): a checkbox per
+/// task — ✓ done / ⠹ in-progress / ○ pending — with a "N/M done" title.
+fn render_todos(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::app::TodoStatus;
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let cap = (area.height as usize).saturating_sub(2).max(1);
+    let done = app
+        .todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let spin = SPINNER[app.spinner % SPINNER.len()];
+    let mut lines: Vec<Line> = Vec::new();
+    for t in app.todos.iter().take(cap) {
+        let (icon, style) = match t.status {
+            TodoStatus::Completed => (
+                "✓".to_string(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            TodoStatus::InProgress => (spin.to_string(), Style::default().fg(Color::Yellow)),
+            TodoStatus::Pending => ("○".to_string(), Style::default().fg(Color::DarkGray)),
+        };
+        let text: String = t.content.chars().take(inner_w).collect();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{icon} "), style),
+            Span::styled(text, style),
+        ]));
+    }
+    if app.todos.len() > cap {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more", app.todos.len() - cap),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let title = format!(" tasks · {done}/{} done ", app.todos.len());
+    let panel = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
 }
 
 /// Render the live agent roster: one row per agent with a state icon (animated
@@ -609,6 +657,63 @@ mod tests {
         assert!(
             !text.contains("agents ·"),
             "roster panel must hide when no agent is running:\n{text}"
+        );
+    }
+
+    #[test]
+    fn todo_panel_renders_tasks_and_progress() {
+        use crate::app::{TodoRow, TodoStatus};
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.running = true;
+        app.todos = vec![
+            TodoRow {
+                content: "implement diffs".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoRow {
+                content: "todo panel".into(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("tasks"), "todo title missing:\n{text}");
+        assert!(text.contains("1/2 done"), "progress count missing:\n{text}");
+        assert!(
+            text.contains("implement diffs") && text.contains("todo panel"),
+            "task content missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn roster_takes_panel_priority_over_todos_while_running() {
+        use crate::app::{AgentRow, AgentState, TodoRow, TodoStatus};
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.multi_agent = true;
+        app.running = true;
+        app.agents = vec![AgentRow {
+            name: "worker".into(),
+            state: AgentState::Working,
+            activity: "write".into(),
+            tokens: 0,
+        }];
+        app.todos = vec![TodoRow {
+            content: "a task".into(),
+            status: TodoStatus::Pending,
+        }];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("agents"),
+            "roster should win while running:\n{text}"
+        );
+        assert!(
+            !text.contains("tasks ·"),
+            "todo panel must yield to roster:\n{text}"
         );
     }
 

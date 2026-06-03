@@ -41,6 +41,42 @@ pub struct AgentRow {
     pub tokens: u32,
 }
 
+/// A task in the live todo panel (mirrors the agent's `todowrite` tool, which
+/// always sends the COMPLETE list — so the panel just reflects the latest call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoRow {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Parse a `todowrite` tool input's `todos[]` into rows (empty if malformed).
+pub fn parse_todos(input_json: &str) -> Vec<TodoRow> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input_json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("todos").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            let content = t.get("content")?.as_str()?.to_string();
+            let status = match t.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => TodoStatus::Completed,
+                Some("in_progress") => TodoStatus::InProgress,
+                _ => TodoStatus::Pending,
+            };
+            Some(TodoRow { content, status })
+        })
+        .collect()
+}
+
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
@@ -124,6 +160,8 @@ pub struct App {
     /// Live roster of agents for the current turn (multi-agent mode): who was
     /// instantiated and what each is doing right now. Ordered by first-seen.
     pub agents: Vec<AgentRow>,
+    /// Live task list mirrored from the agent's latest `todowrite` call.
+    pub todos: Vec<TodoRow>,
     pub running: bool,
     /// Lines scrolled up from the bottom (0 = pinned to newest).
     pub scroll: u16,
@@ -152,6 +190,7 @@ impl App {
             models_loading: false,
             multi_agent: false,
             agents: Vec::new(),
+            todos: Vec::new(),
             running: false,
             scroll: 0,
             menu_selected: 0,
@@ -290,6 +329,10 @@ impl App {
             } => {
                 self.finalize_active(); // the assistant preamble (if any) is done
                 self.agent_set_working(&agent, &name);
+                // Mirror the agent's task list into the live todo panel.
+                if name == "todowrite" {
+                    self.todos = parse_todos(&input);
+                }
                 let idx = self.history.len();
                 self.tool_index.insert(id, idx);
                 self.history.push(Cell::Tool {
@@ -1532,6 +1575,42 @@ mod tests {
         app.update(Msg::RunFailed("boom".into()));
         assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("boom")));
+    }
+
+    #[test]
+    fn todowrite_populates_the_todo_panel_model() {
+        let mut app = keyed();
+        app.update(Msg::ToolStarted {
+            id: "t".into(),
+            name: "todowrite".into(),
+            input: serde_json::json!({"todos":[
+                {"content":"build the thing","status":"in_progress","priority":"high"},
+                {"content":"write tests","status":"pending","priority":"medium"},
+                {"content":"done already","status":"completed","priority":"low"},
+            ]})
+            .to_string(),
+            agent: "heartbit".into(),
+        });
+        assert_eq!(app.todos.len(), 3);
+        assert_eq!(app.todos[0].content, "build the thing");
+        assert_eq!(app.todos[0].status, TodoStatus::InProgress);
+        assert_eq!(app.todos[2].status, TodoStatus::Completed);
+        // a later todowrite replaces the list wholesale
+        app.update(Msg::ToolStarted {
+            id: "t2".into(),
+            name: "todowrite".into(),
+            input: serde_json::json!({"todos":[{"content":"only one","status":"pending","priority":"low"}]}).to_string(),
+            agent: "heartbit".into(),
+        });
+        assert_eq!(app.todos.len(), 1);
+        assert_eq!(app.todos[0].content, "only one");
+    }
+
+    #[test]
+    fn parse_todos_is_robust_to_malformed_input() {
+        assert!(parse_todos("not json").is_empty());
+        assert!(parse_todos(r#"{"x":1}"#).is_empty());
+        assert!(parse_todos(r#"{"todos":"nope"}"#).is_empty());
     }
 
     #[test]
