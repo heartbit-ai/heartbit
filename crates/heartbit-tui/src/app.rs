@@ -427,7 +427,12 @@ impl App {
                 KeyCode::Up => return self.menu_move(-1),
                 KeyCode::Down => return self.menu_move(1),
                 KeyCode::Tab => return self.menu_complete(),
-                KeyCode::Enter if !shift && !alt => return self.menu_run(),
+                // Run the highlighted command. Some terminals deliver Enter as a
+                // raw CR/LF char rather than KeyCode::Enter — accept both so a
+                // selection ALWAYS runs (else the char would just close the menu).
+                KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                    return self.menu_run();
+                }
                 KeyCode::Esc => return self.composer.clear(),
                 _ => {}
             }
@@ -756,6 +761,37 @@ mod tests {
         app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert_eq!(app.composer.text(), "/model ");
         assert!(!app.menu_open(), "completion closes the menu");
+    }
+
+    #[test]
+    fn menu_enter_runs_navigated_command() {
+        let mut app = keyed();
+        typed(&mut app, "/"); // all commands, selected = 0 (/help)
+        app.update(key(KeyCode::Down)); // selected = 1 (/model)
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("model:"))),
+            "navigated /model must run, not /help"
+        );
+    }
+
+    #[test]
+    fn menu_runs_when_enter_arrives_as_cr_char() {
+        // Some terminals deliver Enter as a raw CR/LF character.
+        let mut app = keyed();
+        typed(&mut app, "/he");
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('\r'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("commands"))),
+            "CR-as-char Enter must still run the command"
+        );
     }
 
     #[test]
