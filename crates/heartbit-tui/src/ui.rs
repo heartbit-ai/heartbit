@@ -60,13 +60,13 @@ pub fn view(frame: &mut Frame, app: &App) {
     .split(area);
 
     // --- transcript (+ a right-hand side panel) ---
-    // Pick ONE side panel for the right column (they share the slot, so they
-    // can't fight over the width): the live agent roster takes precedence while a
-    // multi-agent turn is running (it disappears once agents stop); otherwise the
-    // task list. The transcript gets the REMAINING width, which MUST feed
-    // `line_count`, or the scroll offset (from a stale full width) clips the newest.
+    // The right column holds the live agent roster (while a multi-agent turn is
+    // running) and/or the task list. They STACK vertically inside one fixed-width
+    // column — so they never fight over width, and the transcript width (which
+    // MUST feed `line_count`, or a stale full width clips the newest line) is
+    // unchanged whether one or both panels show.
     let show_roster = app.multi_agent && app.running && !app.agents.is_empty();
-    let show_todos = !show_roster && !app.todos.is_empty();
+    let show_todos = !app.todos.is_empty();
     let want_panel = show_roster || show_todos;
     let (transcript_area, panel_area) = if want_panel && chunks[0].width >= 50 {
         let w = (chunks[0].width / 3).clamp(22, 36);
@@ -89,7 +89,14 @@ pub fn view(frame: &mut Frame, app: &App) {
     let offset = app.scroll_offset(max_off);
     frame.render_widget(transcript.scroll((offset, 0)), transcript_area);
     if let Some(rect) = panel_area {
-        if show_roster {
+        if show_roster && show_todos {
+            // Both visible: roster on top, task list below — stacked in the same
+            // column so the task list is visible DURING the run (not only after).
+            let halves = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rect);
+            render_roster(frame, app, halves[0]);
+            render_todos(frame, app, halves[1]);
+        } else if show_roster {
             render_roster(frame, app, rect);
         } else {
             render_todos(frame, app, rect);
@@ -592,11 +599,13 @@ fn render_roster(frame: &mut Frame, app: &App, area: Rect) {
     use crate::app::AgentState;
     let inner_w = area.width.saturating_sub(2) as usize;
     let mut rows: Vec<&crate::app::AgentRow> = app.agents.iter().collect();
-    // Working first, then done/failed — preserving first-seen order within a group.
+    // Working first, then done/failed, then still-idle (available) — preserving
+    // first-seen order within a group.
     rows.sort_by_key(|r| match r.state {
         AgentState::Working => 0,
         AgentState::Done => 1,
         AgentState::Failed => 2,
+        AgentState::Idle => 3,
     });
     let spin = SPINNER[app.spinner % SPINNER.len()];
     let mut lines: Vec<Line> = Vec::new();
@@ -605,6 +614,7 @@ fn render_roster(frame: &mut Frame, app: &App, area: Rect) {
             AgentState::Working => (spin.to_string(), Style::default().fg(Color::Yellow)),
             AgentState::Done => ("✓".to_string(), Style::default().fg(Color::Green)),
             AgentState::Failed => ("✗".to_string(), Style::default().fg(Color::Red)),
+            AgentState::Idle => ("·".to_string(), Style::default().fg(Color::DarkGray)),
         };
         let name_style = Style::default()
             .fg(crate::cells::agent_color(&r.name))
@@ -738,6 +748,38 @@ mod tests {
         let r_pos = joined.find("step one").unwrap();
         let a_pos = joined.find("partial answer").unwrap();
         assert!(r_pos < a_pos, "reasoning renders above the answer");
+    }
+
+    #[test]
+    fn roster_and_todos_both_visible_during_a_multi_agent_run() {
+        use crate::app::{AgentRow, AgentState, TodoRow, TodoStatus};
+        // The reported bug: the task list only appeared AFTER stopping, because the
+        // roster owned the whole side column while running. They must now stack.
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.multi_agent = true;
+        app.running = true;
+        app.agents = vec![AgentRow {
+            name: "worker".into(),
+            state: AgentState::Working,
+            activity: "editing".into(),
+            tokens: 0,
+        }];
+        app.todos = vec![TodoRow {
+            content: "PLAN_ITEM_ONE".into(),
+            status: TodoStatus::InProgress,
+        }];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("worker"),
+            "roster must show during the run:\n{text}"
+        );
+        assert!(
+            text.contains("PLAN_ITEM_ONE"),
+            "the task list must ALSO be visible during the run, not only after stopping:\n{text}"
+        );
     }
 
     #[test]
@@ -991,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn roster_takes_panel_priority_over_todos_while_running() {
+    fn roster_and_todos_stack_in_the_panel_column_while_running() {
         use crate::app::{AgentRow, AgentState, TodoRow, TodoStatus};
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1010,13 +1052,15 @@ mod tests {
         }];
         terminal.draw(|f| view(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
+        // Both panels share the column (stacked) — the task list is no longer
+        // hidden by the roster during the run.
         assert!(
             text.contains("agents"),
-            "roster should win while running:\n{text}"
+            "roster shows while running:\n{text}"
         );
         assert!(
-            !text.contains("tasks ·"),
-            "todo panel must yield to roster:\n{text}"
+            text.contains("tasks"),
+            "the task list must ALSO show, stacked under the roster:\n{text}"
         );
     }
 

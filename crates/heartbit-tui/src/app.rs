@@ -19,9 +19,16 @@ const SCROLL_STEP: u16 = 8;
 /// How many transcript lines one mouse-wheel notch moves.
 const WHEEL_STEP: u16 = 3;
 
+/// Names of the default sub-agent pool — single source of truth shared by
+/// `main::default_sub_agents` (what's actually built) and the TUI roster (the
+/// available squad shown as Idle), so the two can't drift apart.
+pub const DEFAULT_SQUAD: [&str; 2] = ["worker", "researcher"];
+
 /// Live state of one agent in the multi-agent roster panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
+    /// Available in the squad but not (yet) dispatched this turn.
+    Idle,
     /// Actively working (a tool is running, or synthesizing).
     Working,
     /// Finished successfully.
@@ -235,6 +242,10 @@ pub struct App {
     pub models_loading: bool,
     /// Multi-agent orchestrator mode (applies on next agent start).
     pub multi_agent: bool,
+    /// The available sub-agent pool (multi-agent mode), seeded into the roster as
+    /// Idle at the start of each turn so the user always sees the whole squad —
+    /// and can tell when only some of it actually gets dispatched.
+    pub squad: Vec<String>,
     /// Live roster of agents for the current turn (multi-agent mode): who was
     /// instantiated and what each is doing right now. Ordered by first-seen.
     pub agents: Vec<AgentRow>,
@@ -289,6 +300,7 @@ impl App {
             models: Vec::new(),
             models_loading: false,
             multi_agent: false,
+            squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),
             permission_mode: PermissionMode::Default,
@@ -386,8 +398,11 @@ impl App {
         }
         let activity = activity.into();
         if let Some(row) = self.agents.iter_mut().find(|r| r.name == name) {
-            // Don't resurrect a finished agent from a late event.
-            if row.state == AgentState::Working {
+            // An available (Idle) agent becomes Working when it's dispatched or
+            // emits a tool event. Don't resurrect a finished (Done/Failed) agent
+            // from a late event.
+            if matches!(row.state, AgentState::Idle | AgentState::Working) {
+                row.state = AgentState::Working;
                 row.activity = activity;
             }
         } else {
@@ -424,6 +439,22 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Reset the roster for a new turn: seed the available squad as Idle so the
+    /// whole pool is visible from the start (dispatched agents then flip to
+    /// Working). In single-agent mode the squad is empty → roster stays empty.
+    fn seed_idle_squad(&mut self) {
+        self.agents = self
+            .squad
+            .iter()
+            .map(|name| AgentRow {
+                name: name.clone(),
+                state: AgentState::Idle,
+                activity: "available".into(),
+                tokens: 0,
+            })
+            .collect();
     }
 
     /// Mark every still-Working agent as Done (the turn produced a final answer).
@@ -752,7 +783,7 @@ impl App {
         self.history.push(Cell::User(text.clone()));
         self.running = true;
         self.follow = true; // jump back to the newest when the user sends
-        self.agents.clear(); // fresh roster for this turn
+        self.seed_idle_squad(); // fresh roster: the whole squad, available
         self.effects.push(Effect::SendInput(text));
     }
 
@@ -902,6 +933,12 @@ impl App {
             }
         };
         self.multi_agent = new;
+        // Keep the available-squad roster in sync with the mode toggle.
+        self.squad = if new {
+            DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
+        };
         self.effects.push(Effect::SaveMultiAgent(new));
         self.history.push(Cell::Notice(format!(
             "multi-agent workflow {}{}",
@@ -1635,6 +1672,7 @@ mod tests {
     fn multi() -> App {
         let mut app = keyed();
         app.multi_agent = true;
+        app.squad = DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect();
         app
     }
     fn tool_started(agent: &str, name: &str) -> Msg {
@@ -1699,15 +1737,37 @@ mod tests {
     }
 
     #[test]
-    fn roster_clears_on_new_user_turn() {
+    fn new_user_turn_reseeds_the_idle_squad() {
         let mut app = multi();
         app.update(Msg::AgentsDispatched(vec!["worker".into()]));
-        assert_eq!(app.agents.len(), 1);
+        // worker working + researcher idle-seeded? (no submit yet → just worker)
         typed(&mut app, "next task");
         app.update(key(KeyCode::Enter));
+        // A fresh turn shows the WHOLE squad again, all Idle (not a stale roster).
+        assert_eq!(app.agents.len(), 2);
         assert!(
-            app.agents.is_empty(),
-            "each turn starts with a fresh roster"
+            app.agents.iter().all(|r| r.state == AgentState::Idle),
+            "each turn restarts with the full squad available (idle)"
+        );
+    }
+
+    #[test]
+    fn multi_agent_turn_seeds_available_squad_then_dispatch_flips_one() {
+        let mut app = multi();
+        typed(&mut app, "do something");
+        app.update(key(KeyCode::Enter));
+        // The whole squad is visible up-front, available.
+        assert_eq!(app.agents.len(), 2);
+        assert!(app.agents.iter().all(|r| r.state == AgentState::Idle));
+        // The orchestrator dispatches to worker only…
+        app.update(Msg::AgentsDispatched(vec!["worker".into()]));
+        let worker = app.agents.iter().find(|r| r.name == "worker").unwrap();
+        let researcher = app.agents.iter().find(|r| r.name == "researcher").unwrap();
+        assert_eq!(worker.state, AgentState::Working);
+        assert_eq!(
+            researcher.state,
+            AgentState::Idle,
+            "an undispatched squad member stays visible as idle (so the user sees what DIDN'T run)"
         );
     }
 

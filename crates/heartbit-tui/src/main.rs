@@ -116,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
     app.has_fallback_provider = has_anthropic;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
+    // Seed the roster's available squad so the full pool is visible in the TUI
+    // (and the user can see when only part of it is actually dispatched).
+    if cfg.multi_agent {
+        app.squad = app::DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect();
+    }
     // Fetch the OpenRouter catalog at startup (public endpoint) so the status-line
     // context bar knows the model's window and the /model picker is pre-warmed.
     app.models_loading = true;
@@ -246,12 +251,12 @@ fn default_sub_agents(
     };
     vec![
         make(
-            "worker",
+            app::DEFAULT_SQUAD[0],
             "General implementation agent: reads, searches, edits, and runs code in the workspace. Use for concrete file changes, builds, tests, and command execution.",
             "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result.",
         ),
         make(
-            "researcher",
+            app::DEFAULT_SQUAD[1],
             "Investigation agent: explores the codebase and gathers facts (search, read files, run read-only commands). Use to understand, locate, or analyze before changes.",
             "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked.",
         ),
