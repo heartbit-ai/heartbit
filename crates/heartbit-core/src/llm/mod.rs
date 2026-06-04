@@ -95,6 +95,11 @@ use crate::llm::types::{CompletionRequest, CompletionResponse};
 /// Callback invoked with each text delta during streaming.
 pub type OnText = dyn Fn(&str) + Send + Sync;
 
+/// Callback invoked with each reasoning (chain-of-thought) delta during
+/// streaming, for reasoning models (qwen3-thinking, deepseek-r1). Separate from
+/// [`OnText`] so a UI can render thinking distinctly from the answer.
+pub type OnReasoning = dyn Fn(&str) + Send + Sync;
+
 /// Decision returned by the `OnApproval` callback.
 ///
 /// `Allow` and `Deny` behave like the previous `true`/`false` return.
@@ -168,6 +173,24 @@ pub trait LlmProvider: Send + Sync {
         self.complete(request)
     }
 
+    /// Stream a completion, additionally calling `on_reasoning` for each
+    /// chain-of-thought delta (reasoning models). The answer still arrives via
+    /// `on_text`; reasoning is a separate channel.
+    ///
+    /// Default: delegates to [`stream_complete`](Self::stream_complete),
+    /// ignoring `on_reasoning` (providers that don't stream reasoning, and the
+    /// non-streaming fallback, are unaffected — `CompletionResponse.reasoning`
+    /// still carries the post-hoc accumulation).
+    fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &OnText,
+        on_reasoning: &OnReasoning,
+    ) -> impl Future<Output = Result<CompletionResponse, Error>> + Send {
+        let _ = on_reasoning;
+        self.stream_complete(request, on_text)
+    }
+
     /// Return the model identifier, if known.
     ///
     /// Used for audit trail events. Default returns `None`.
@@ -203,6 +226,21 @@ pub trait DynLlmProvider: Send + Sync {
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
 
+    /// Boxed-future version of [`LlmProvider::stream_complete_with_reasoning`].
+    ///
+    /// Default delegates to [`stream_complete`](Self::stream_complete), ignoring
+    /// reasoning — so direct `DynLlmProvider` impls (e.g. test mocks) need not
+    /// implement it. The blanket impl overrides this to forward reasoning.
+    fn stream_complete_with_reasoning<'a>(
+        &'a self,
+        request: CompletionRequest,
+        on_text: &'a OnText,
+        on_reasoning: &'a OnReasoning,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
+        let _ = on_reasoning;
+        self.stream_complete(request, on_text)
+    }
+
     /// Return the model identifier, if known.
     fn model_name(&self) -> Option<&str>;
 }
@@ -221,6 +259,20 @@ impl<P: LlmProvider> DynLlmProvider for P {
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
         Box::pin(LlmProvider::stream_complete(self, request, on_text))
+    }
+
+    fn stream_complete_with_reasoning<'a>(
+        &'a self,
+        request: CompletionRequest,
+        on_text: &'a OnText,
+        on_reasoning: &'a OnReasoning,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
+        Box::pin(LlmProvider::stream_complete_with_reasoning(
+            self,
+            request,
+            on_text,
+            on_reasoning,
+        ))
     }
 
     fn model_name(&self) -> Option<&str> {
@@ -280,6 +332,17 @@ impl BoxedProvider {
                 self.0.stream_complete(request, on_text).await
             }
 
+            async fn stream_complete_with_reasoning(
+                &self,
+                request: CompletionRequest,
+                on_text: &OnText,
+                on_reasoning: &OnReasoning,
+            ) -> Result<CompletionResponse, Error> {
+                self.0
+                    .stream_complete_with_reasoning(request, on_text, on_reasoning)
+                    .await
+            }
+
             fn model_name(&self) -> Option<&str> {
                 self.0.model_name()
             }
@@ -300,6 +363,17 @@ impl LlmProvider for BoxedProvider {
         on_text: &OnText,
     ) -> Result<CompletionResponse, Error> {
         self.0.stream_complete(request, on_text).await
+    }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &OnText,
+        on_reasoning: &OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        self.0
+            .stream_complete_with_reasoning(request, on_text, on_reasoning)
+            .await
     }
 
     fn model_name(&self) -> Option<&str> {

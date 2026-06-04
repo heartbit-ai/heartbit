@@ -214,6 +214,10 @@ pub struct App {
     pub history: Vec<Cell>,
     /// Assistant text being streamed for the current turn (not yet finalized).
     pub active: Option<String>,
+    /// Chain-of-thought being streamed for the current LLM call (reasoning
+    /// models). Rendered live, dimmed, then flushed to a `Cell::Reasoning` ahead
+    /// of the answer when the answer/tool starts (`finalize_active`).
+    pub active_reasoning: Option<String>,
     pub composer: Composer,
     pub modal: Option<Modal>,
     pub model: String,
@@ -274,6 +278,7 @@ impl App {
         Self {
             history: Vec::new(),
             active: None,
+            active_reasoning: None,
             composer: Composer::new(),
             modal: None,
             model: model.into(),
@@ -315,6 +320,15 @@ impl App {
 
     /// Finalize the streamed assistant text into a transcript cell.
     fn finalize_active(&mut self) {
+        // Flush any streamed reasoning FIRST, so a `Cell::Reasoning` lands above
+        // the answer/tool it preceded (covers the tool-loop: each LLM call's
+        // thinking settles above its own output).
+        if let Some(reasoning) = self.active_reasoning.take() {
+            let trimmed = reasoning.trim();
+            if !trimmed.is_empty() {
+                self.history.push(Cell::Reasoning(trimmed.to_string()));
+            }
+        }
         if let Some(text) = self.active.take() {
             let trimmed = text.trim_end();
             if !trimmed.is_empty() {
@@ -461,10 +475,13 @@ impl App {
                 // pinned to the bottom; when the user scrolled up we must NOT yank.
                 self.active.get_or_insert_with(String::new).push_str(&s);
             }
-            // The model's chain-of-thought for this turn — pushed as a distinct
-            // dimmed cell ahead of the answer (a reasoning model only).
-            Msg::Reasoning(text) => {
-                self.history.push(Cell::Reasoning(text));
+            // Live chain-of-thought (reasoning models): append to the in-progress
+            // reasoning buffer, rendered dimmed above the answer as it streams.
+            Msg::ReasoningDelta(s) => {
+                self.running = true;
+                self.active_reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(&s);
             }
             Msg::LlmDone {
                 usage,
@@ -1764,15 +1781,32 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_msg_pushes_a_distinct_reasoning_cell() {
+    fn reasoning_streams_live_then_flushes_above_the_answer() {
         let mut app = App::new("m");
-        app.update(Msg::Reasoning("let me think".into()));
+        // Reasoning streams first into its own buffer (rendered live, dimmed)…
+        app.update(Msg::ReasoningDelta("let me ".into()));
+        app.update(Msg::ReasoningDelta("think".into()));
+        assert_eq!(app.active_reasoning.as_deref(), Some("let me think"));
         assert!(
-            matches!(app.history.last(), Some(Cell::Reasoning(t)) if t == "let me think"),
-            "a Reasoning msg must push a Cell::Reasoning"
+            app.history.is_empty(),
+            "still streaming — nothing finalized yet"
         );
-        // It does NOT touch the streaming answer buffer (separate channel).
-        assert_eq!(app.active, None);
+        // …then the answer streams; on finalize, reasoning lands ABOVE the answer.
+        app.update(Msg::StreamDelta("the answer".into()));
+        app.update(Msg::LlmDone {
+            had_tool_calls: false,
+            usage: TokenUsage::default(),
+            ttft_ms: 0,
+        });
+        assert!(
+            matches!(&app.history[0], Cell::Reasoning(t) if t == "let me think"),
+            "reasoning cell must come first"
+        );
+        assert!(
+            matches!(&app.history[1], Cell::Agent(t) if t == "the answer"),
+            "the answer cell follows the reasoning"
+        );
+        assert_eq!(app.active_reasoning, None, "buffer cleared after flush");
     }
 
     #[test]
@@ -2181,6 +2215,50 @@ mod tests {
             !app.follow,
             "streaming must not re-pin the view while the user is reading history"
         );
+    }
+
+    #[test]
+    fn scrolled_up_stays_put_while_reasoning_streams_verbosely() {
+        // The exact scenario the user reported: scroll up mid-turn while a
+        // reasoning model streams a long chain-of-thought at the bottom. Drives
+        // both new features together — streaming growth + the scroll model.
+        let mut app = App::new("m");
+        app.scroll_offset(100); // a frame: following, max_off = 100
+        app.update(Msg::WheelUp); // park the view up
+        assert!(!app.follow);
+        let parked = app.scroll_offset(100);
+        // 30 lines of reasoning stream in, growing the transcript at the bottom…
+        for _ in 0..30 {
+            app.update(Msg::ReasoningDelta("a thinking line\n".into()));
+        }
+        // …a later frame sees far more content (max_off jumps to 200).
+        let after = app.scroll_offset(200);
+        assert!(!app.follow, "must remain unpinned while reasoning streams");
+        assert_eq!(
+            parked, after,
+            "top-anchored: the read position must not move as reasoning streams below"
+        );
+    }
+
+    #[test]
+    fn failed_turn_flushes_reasoning_and_does_not_leak_into_next_turn() {
+        let mut app = App::new("m");
+        app.update(Msg::ReasoningDelta("turn-one thought".into()));
+        // The turn fails before the answer — the buffer must be flushed, not kept.
+        app.update(Msg::RunFailed("boom".into()));
+        assert_eq!(
+            app.active_reasoning, None,
+            "a failed turn must not leave reasoning buffered for the next turn"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Reasoning(t) if t == "turn-one thought")),
+            "the partial thinking settles into history rather than vanishing"
+        );
+        // The next turn's reasoning starts clean (no concatenation onto stale text).
+        app.update(Msg::ReasoningDelta("turn-two thought".into()));
+        assert_eq!(app.active_reasoning.as_deref(), Some("turn-two thought"));
     }
 
     #[test]

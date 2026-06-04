@@ -18,6 +18,25 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         lines.extend(cell.to_lines());
         lines.push(Line::raw(""));
     }
+    // Live chain-of-thought (reasoning models) renders dimmed above the answer,
+    // matching the finalized `Cell::Reasoning` look, so streaming→settled is
+    // seamless.
+    if let Some(reasoning) = &app.active_reasoning {
+        lines.push(Line::from(Span::styled(
+            "💭 thinking",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::ITALIC),
+        )));
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        lines.extend(
+            reasoning
+                .split('\n')
+                .map(|l| Line::from(Span::styled(format!("  {l}"), dim))),
+        );
+    }
     if let Some(active) = &app.active {
         // The streaming reply renders PLAIN — Markdown is applied only when the
         // cell finalizes into history, so partial markup (e.g. an unclosed `**`)
@@ -700,6 +719,25 @@ mod tests {
             !t.contains('#') && !t.contains('*'),
             "finalized cell must render markdown: {t}"
         );
+    }
+
+    #[test]
+    fn live_reasoning_renders_dimmed_above_streaming_answer() {
+        let mut app = App::new("m");
+        app.active_reasoning = Some("step one".into());
+        app.active = Some("partial answer".into());
+        let lines = transcript_lines(&app);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(joined.contains("thinking"), "live reasoning shows a header");
+        assert!(joined.contains("step one"), "live reasoning body shows");
+        // Reasoning must come before the answer in the flattened lines.
+        let r_pos = joined.find("step one").unwrap();
+        let a_pos = joined.find("partial answer").unwrap();
+        assert!(r_pos < a_pos, "reasoning renders above the answer");
     }
 
     #[test]

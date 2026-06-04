@@ -86,6 +86,29 @@ impl LlmProvider for OpenRouterProvider {
         request: CompletionRequest,
         on_text: &crate::llm::OnText,
     ) -> Result<CompletionResponse, Error> {
+        fn noop(_: &str) {}
+        self.stream_inner(request, on_text, &noop).await
+    }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        self.stream_inner(request, on_text, on_reasoning).await
+    }
+}
+
+impl OpenRouterProvider {
+    /// Shared streaming body: build the request, POST it, and parse the SSE,
+    /// routing text deltas to `on_text` and reasoning deltas to `on_reasoning`.
+    async fn stream_inner(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
         let mut body = build_openai_request(&self.model, &request)?;
         body["stream"] = serde_json::json!(true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
@@ -103,7 +126,7 @@ impl LlmProvider for OpenRouterProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        parse_openai_stream(response.bytes_stream(), on_text).await
+        parse_openai_stream_with_reasoning(response.bytes_stream(), on_text, on_reasoning).await
     }
 }
 
@@ -514,9 +537,27 @@ struct AccumulatedToolCall {
 /// Reuses the `SseParser` from the Anthropic module for SSE framing.
 /// The JSON payload format differs: OpenAI uses `choices[].delta` with
 /// incremental content and tool call fragments.
+/// Parse an OpenAI-format SSE stream (text deltas only). Thin wrapper over
+/// [`parse_openai_stream_with_reasoning`] with a no-op reasoning sink — keeps the
+/// streaming tests terse (production paths use the reasoning-aware variant).
+#[cfg(test)]
 pub(crate) async fn parse_openai_stream<S>(
     stream: S,
     on_text: &super::OnText,
+) -> Result<CompletionResponse, Error>
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    fn noop(_: &str) {}
+    parse_openai_stream_with_reasoning(stream, on_text, &noop).await
+}
+
+/// Parse an OpenAI-format SSE stream, routing text deltas to `on_text` and
+/// reasoning (chain-of-thought) deltas to `on_reasoning` as they arrive.
+pub(crate) async fn parse_openai_stream_with_reasoning<S>(
+    stream: S,
+    on_text: &super::OnText,
+    on_reasoning: &super::OnReasoning,
 ) -> Result<CompletionResponse, Error>
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -547,6 +588,7 @@ where
                 process_openai_event(
                     &event.data,
                     on_text,
+                    on_reasoning,
                     &mut text,
                     &mut reasoning,
                     &mut tool_calls,
@@ -566,6 +608,7 @@ where
             process_openai_event(
                 &event.data,
                 on_text,
+                on_reasoning,
                 &mut text,
                 &mut reasoning,
                 &mut tool_calls,
@@ -579,6 +622,7 @@ where
         process_openai_event(
             &event.data,
             on_text,
+            on_reasoning,
             &mut text,
             &mut reasoning,
             &mut tool_calls,
@@ -653,6 +697,7 @@ where
 fn process_openai_event(
     data: &str,
     on_text: &super::OnText,
+    on_reasoning: &super::OnReasoning,
     text: &mut String,
     reasoning: &mut String,
     tool_calls: &mut Vec<AccumulatedToolCall>,
@@ -693,14 +738,17 @@ fn process_openai_event(
         }
 
         // Reasoning (chain-of-thought) accumulates separately from the answer,
-        // under the same per-response cap as content (F-LLM-4: unbounded growth).
+        // under the same per-response cap as content (F-LLM-4: unbounded growth),
+        // and streams live via `on_reasoning`.
         if let Some(ref r) = choice.delta.reasoning
             && reasoning.len() < super::STREAM_MAX_TEXT_BYTES
         {
             let remaining = super::STREAM_MAX_TEXT_BYTES - reasoning.len();
             let take = std::cmp::min(remaining, r.len());
             let boundary = crate::tool::builtins::floor_char_boundary(r, take);
-            reasoning.push_str(&r[..boundary]);
+            let safe = &r[..boundary];
+            reasoning.push_str(safe);
+            on_reasoning(safe);
         }
 
         if let Some(ref tcs) = choice.delta.tool_calls {
@@ -1515,6 +1563,28 @@ mod tests {
         // Reasoning is captured but does NOT leak into the answer text.
         assert_eq!(response.text(), "42");
         assert_eq!(response.reasoning.as_deref(), Some("Let me think."));
+    }
+
+    #[tokio::test]
+    async fn stream_calls_on_reasoning_with_each_delta_live() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"reasoning":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"think."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}"#,
+        ]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let r_deltas = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rd = r_deltas.clone();
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let on_reasoning: &crate::llm::OnReasoning =
+            &move |r: &str| rd.lock().expect("lock").push(r.to_string());
+        let response = parse_openai_stream_with_reasoning(stream, on_text, on_reasoning)
+            .await
+            .unwrap();
+        // Reasoning streamed live AND is accumulated on the response.
+        assert_eq!(*r_deltas.lock().expect("lock"), vec!["Let me ", "think."]);
+        assert_eq!(response.reasoning.as_deref(), Some("Let me think."));
+        assert_eq!(response.text(), "42");
     }
 
     #[tokio::test]

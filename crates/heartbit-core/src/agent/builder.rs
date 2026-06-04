@@ -43,6 +43,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) memory: Option<Arc<dyn Memory>>,
     pub(super) knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
+    pub(super) on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     pub(super) on_approval: Option<Arc<crate::llm::OnApproval>>,
     pub(super) tool_timeout: Option<Duration>,
     pub(super) max_tool_output_bytes: Option<usize>,
@@ -178,6 +179,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// through the agent loop and abort the run.
     pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
         self.on_text = Some(callback);
+        self
+    }
+
+    /// Set a callback invoked with each reasoning (chain-of-thought) delta during
+    /// streaming, for reasoning models. Separate from [`on_text`](Self::on_text)
+    /// so a UI can render thinking live and distinctly from the answer. Only
+    /// honored on the streaming path (when `on_text` is also set).
+    pub fn on_reasoning(mut self, callback: Arc<crate::llm::OnReasoning>) -> Self {
+        self.on_reasoning = Some(callback);
         self
     }
 
@@ -713,6 +723,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
             on_text: self.on_text,
+            on_reasoning: self.on_reasoning,
             on_approval: self.on_approval,
             tool_timeout: self.tool_timeout,
             max_tool_output_bytes: self.max_tool_output_bytes,

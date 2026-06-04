@@ -143,6 +143,8 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) summarize_threshold: Option<u32>,
     /// Optional callback for streaming text output.
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
+    /// Optional callback for streaming reasoning (chain-of-thought) output.
+    pub(super) on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     /// Optional callback for human-in-the-loop approval before tool execution.
     pub(super) on_approval: Option<Arc<crate::llm::OnApproval>>,
     /// Optional timeout for individual tool executions.
@@ -282,6 +284,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             memory: None,
             knowledge_base: None,
             on_text: None,
+            on_reasoning: None,
             on_approval: None,
             tool_timeout: None,
             max_tool_output_bytes: None,
@@ -727,7 +730,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                                             .ok();
                                         inner_cb(text);
                                     });
-                                self.provider.stream_complete(request, &*wrapper).await
+                                // Reasoning models: stream chain-of-thought live via
+                                // the dedicated channel when a callback is wired.
+                                match &self.on_reasoning {
+                                    Some(rcb) => {
+                                        let rcb = rcb.clone();
+                                        let reasoning_wrapper: Box<crate::llm::OnReasoning> =
+                                            Box::new(move |r: &str| rcb(r));
+                                        self.provider
+                                            .stream_complete_with_reasoning(
+                                                request,
+                                                &*wrapper,
+                                                &*reasoning_wrapper,
+                                            )
+                                            .await
+                                    }
+                                    None => self.provider.stream_complete(request, &*wrapper).await,
+                                }
                             }
                             None => self.provider.complete(request).await,
                         }

@@ -40,8 +40,9 @@ pub enum Msg {
         ttft_ms: u64,
     },
     StreamDelta(String),
-    /// The model emitted chain-of-thought (reasoning models) for this turn.
-    Reasoning(String),
+    /// A live chain-of-thought delta (reasoning models) — streamed into the
+    /// in-progress reasoning buffer as it arrives, ahead of the answer.
+    ReasoningDelta(String),
     ToolStarted {
         id: String,
         name: String,
@@ -121,7 +122,10 @@ impl Msg {
                 input,
                 agent,
             }),
-            AgentEvent::Reasoning { text, .. } => Some(Msg::Reasoning(text)),
+            // Reasoning is streamed live via the `on_reasoning` callback (→
+            // ReasoningDelta), so the post-hoc event is ignored here to avoid a
+            // duplicate cell. (The event remains for non-streaming consumers.)
+            AgentEvent::Reasoning { .. } => None,
             AgentEvent::SubAgentsDispatched { agents, .. } => Some(Msg::AgentsDispatched(agents)),
             AgentEvent::SubAgentCompleted {
                 agent,
@@ -254,13 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_event_maps_to_reasoning_msg() {
+    fn post_hoc_reasoning_event_is_not_mapped_streaming_is_the_source() {
+        // The TUI streams reasoning live via the on_reasoning callback, so the
+        // post-hoc event must NOT also map to a Msg (it would double-render).
         let ev = AgentEvent::Reasoning {
             agent: "a".into(),
             turn: 1,
             text: "thinking hard".into(),
         };
-        assert!(matches!(Msg::from_event(ev), Some(Msg::Reasoning(t)) if t == "thinking hard"));
+        assert!(Msg::from_event(ev).is_none());
     }
 
     #[test]

@@ -304,6 +304,14 @@ async fn build_engine(
             let _ = tx.send(Msg::StreamDelta(s.to_string()));
         })
     };
+    // Reasoning models stream their chain-of-thought separately — surface it live
+    // (dimmed) ahead of the answer.
+    let on_reasoning: Arc<heartbit_core::OnReasoning> = {
+        let tx = ui_tx.clone();
+        Arc::new(move |s: &str| {
+            let _ = tx.send(Msg::ReasoningDelta(s.to_string()));
+        })
+    };
     let on_event: Arc<OnEvent> = {
         let tx = ui_tx.clone();
         Arc::new(move |e: AgentEvent| {
@@ -419,6 +427,7 @@ async fn build_engine(
             .workspace(cwd)
             .permission_rules(default_permissions())
             .on_text(on_text)
+            .on_reasoning(on_reasoning)
             .on_event(on_event)
             .on_approval(on_approval)
             .on_input(on_input)

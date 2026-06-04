@@ -228,6 +228,56 @@ impl LlmProvider for CascadingProvider {
         }
         unreachable!("cascade stream_complete exhausted all tiers without returning")
     }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &OnText,
+        on_reasoning: &super::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        // Single tier: stream directly, forwarding reasoning.
+        if self.tiers.len() == 1 {
+            let mut resp = self.tiers[0]
+                .provider
+                .stream_complete_with_reasoning(request, on_text, on_reasoning)
+                .await?;
+            resp.model = Some(self.tiers[0].label.clone());
+            return Ok(resp);
+        }
+
+        for (i, tier) in self.tiers.iter().enumerate() {
+            let is_last = i == self.tiers.len() - 1;
+            if is_last {
+                let mut resp = tier
+                    .provider
+                    .stream_complete_with_reasoning(request, on_text, on_reasoning)
+                    .await?;
+                resp.model = Some(tier.label.clone());
+                return Ok(resp);
+            }
+            match tier.provider.complete(request.clone()).await {
+                Ok(mut response) if self.gate.accept(&request, &response) => {
+                    response.model = Some(tier.label.clone());
+                    // Non-streaming tier: emit reasoning then text as single chunks.
+                    if let Some(r) = response.reasoning.as_deref()
+                        && !r.is_empty()
+                    {
+                        on_reasoning(r);
+                    }
+                    let text = response.text();
+                    if !text.is_empty() {
+                        on_text(&text);
+                    }
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(tier = %tier.label, error = %e, "cascade: tier failed, escalating");
+                }
+            }
+        }
+        unreachable!("cascade stream_complete_with_reasoning exhausted all tiers without returning")
+    }
 }
 
 /// Builder for [`CascadingProvider`].

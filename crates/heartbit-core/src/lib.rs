@@ -119,6 +119,7 @@ pub use knowledge::{Chunk, DocumentSource, KnowledgeBase, KnowledgeQuery, Search
 pub use llm::ApprovalDecision;
 pub use llm::LlmProvider;
 pub use llm::OnApproval;
+pub use llm::OnReasoning;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};

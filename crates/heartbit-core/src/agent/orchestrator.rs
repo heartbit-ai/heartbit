@@ -232,6 +232,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             blackboard: None,
             knowledge_base: None,
             on_text: None,
+            on_reasoning: None,
             on_approval: None,
             on_input: None,
             interrupt: None,
@@ -1780,6 +1781,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     blackboard: Option<Arc<dyn Blackboard>>,
     knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_text: Option<Arc<crate::llm::OnText>>,
+    on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
     on_input: Option<Arc<crate::agent::OnInput>>,
@@ -2013,6 +2015,13 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// final synthesis are emitted incrementally.
     pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
         self.on_text = Some(callback);
+        self
+    }
+
+    /// Set a callback for streaming reasoning (chain-of-thought) on the
+    /// orchestrator's LLM calls, forwarded to its own runner alongside `on_text`.
+    pub fn on_reasoning(mut self, callback: Arc<crate::llm::OnReasoning>) -> Self {
+        self.on_reasoning = Some(callback);
         self
     }
 
@@ -2474,6 +2483,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         }
         if let Some(on_text) = self.on_text {
             runner_builder = runner_builder.on_text(on_text);
+        }
+        if let Some(on_reasoning) = self.on_reasoning {
+            runner_builder = runner_builder.on_reasoning(on_reasoning);
         }
         if let Some(on_approval) = self.on_approval {
             runner_builder = runner_builder.on_approval(on_approval);
