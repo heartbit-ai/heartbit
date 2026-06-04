@@ -64,7 +64,10 @@ pub fn view(frame: &mut Frame, app: &App) {
     // Count VISUAL rows (post-wrap) at the TRANSCRIPT width, not logical lines.
     let total = transcript.line_count(transcript_area.width) as u16;
     let max_off = total.saturating_sub(view_h);
-    let offset = max_off.saturating_sub(app.scroll);
+    // Follow-the-bottom by default; top-anchored once the user scrolls up (so
+    // streaming output never yanks or drifts the view). `view()` feeds `max_off`
+    // back so the wheel handlers can anchor a fresh scroll.
+    let offset = app.scroll_offset(max_off);
     frame.render_widget(transcript.scroll((offset, 0)), transcript_area);
     if let Some(rect) = panel_area {
         if show_roster {

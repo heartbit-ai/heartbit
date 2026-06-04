@@ -247,8 +247,19 @@ pub struct App {
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
     pub last_ttft_ms: u64,
     pub running: bool,
-    /// Lines scrolled up from the bottom (0 = pinned to newest).
-    pub scroll: u16,
+    /// When `true`, the transcript stays pinned to the newest content (the
+    /// default). The user un-pins by scrolling up; scrolling back to the bottom
+    /// re-pins. While un-pinned, the view is anchored from the TOP (see
+    /// `scroll_top`) so streaming output growing at the bottom never drifts the
+    /// read position.
+    pub follow: bool,
+    /// Absolute rows hidden ABOVE the viewport when un-pinned (`!follow`).
+    /// Top-anchored so bottom growth doesn't move it.
+    pub scroll_top: u16,
+    /// Last `max_off` (total rows − viewport height) the renderer computed, fed
+    /// back so the wheel handler can convert a follow→scrolled transition into a
+    /// top-anchored offset. Interior-mutable: written from `view()` (`&App`).
+    last_max_off: std::cell::Cell<u16>,
     /// Highlighted row in the `/` command-autocomplete menu.
     pub menu_selected: usize,
     pub spinner: usize,
@@ -281,7 +292,9 @@ impl App {
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
-            scroll: 0,
+            follow: true,
+            scroll_top: 0,
+            last_max_off: std::cell::Cell::new(0),
             menu_selected: 0,
             spinner: 0,
             should_quit: false,
@@ -307,6 +320,47 @@ impl App {
             if !trimmed.is_empty() {
                 self.history.push(Cell::Agent(trimmed.to_string()));
             }
+        }
+    }
+
+    /// Compute the renderer's vertical scroll offset (rows hidden above the
+    /// viewport) for a given `max_off` (= total wrapped rows − viewport height),
+    /// and cache `max_off` so the wheel handlers can anchor a fresh scroll. When
+    /// `follow` (the default), the view tracks the bottom; once the user scrolls
+    /// up it's TOP-anchored at `scroll_top`, so content growing at the bottom
+    /// never drifts the read position. Called once per frame by `view()`.
+    pub fn scroll_offset(&self, max_off: u16) -> u16 {
+        self.last_max_off.set(max_off);
+        if self.follow {
+            max_off
+        } else {
+            self.scroll_top.min(max_off)
+        }
+    }
+
+    /// Scroll the transcript up by `step` rows, un-pinning from the bottom. The
+    /// first step off the bottom converts the current bottom offset into a
+    /// top-anchored position (using the last rendered `max_off`).
+    fn scroll_up(&mut self, step: u16) {
+        if self.follow {
+            self.follow = false;
+            self.scroll_top = self.last_max_off.get().saturating_sub(step);
+        } else {
+            self.scroll_top = self.scroll_top.saturating_sub(step);
+        }
+    }
+
+    /// Scroll the transcript down by `step` rows. Reaching the bottom re-pins to
+    /// `follow` (so new output auto-scrolls again).
+    fn scroll_down(&mut self, step: u16) {
+        if self.follow {
+            return;
+        }
+        let next = self.scroll_top.saturating_add(step);
+        if next >= self.last_max_off.get() {
+            self.follow = true;
+        } else {
+            self.scroll_top = next;
         }
     }
 
@@ -375,8 +429,8 @@ impl App {
             Msg::Resize => {}
             // Mouse wheel scrolls the transcript (output history). Over-scrolling
             // is harmless — the renderer clamps the offset to the top.
-            Msg::WheelUp => self.scroll = self.scroll.saturating_add(WHEEL_STEP),
-            Msg::WheelDown => self.scroll = self.scroll.saturating_sub(WHEEL_STEP),
+            Msg::WheelUp => self.scroll_up(WHEEL_STEP),
+            Msg::WheelDown => self.scroll_down(WHEEL_STEP),
             Msg::Paste(s) => match &mut self.modal {
                 // Pasting into a prompt must land in that field, not the composer
                 // hidden behind the modal.
@@ -403,13 +457,13 @@ impl App {
             Msg::TurnStarted => self.running = true,
             Msg::StreamDelta(s) => {
                 self.running = true;
-                self.scroll = 0; // autoscroll to newest while streaming
+                // No manual scroll reset: when `follow` is set the view is already
+                // pinned to the bottom; when the user scrolled up we must NOT yank.
                 self.active.get_or_insert_with(String::new).push_str(&s);
             }
             // The model's chain-of-thought for this turn — pushed as a distinct
             // dimmed cell ahead of the answer (a reasoning model only).
             Msg::Reasoning(text) => {
-                self.scroll = 0;
                 self.history.push(Cell::Reasoning(text));
             }
             Msg::LlmDone {
@@ -461,7 +515,6 @@ impl App {
                     duration_ms: None,
                     agent: self.agent_badge(&agent),
                 });
-                self.scroll = 0;
             }
             Msg::AgentsDispatched(names) => {
                 for n in &names {
@@ -539,7 +592,7 @@ impl App {
             }
             Msg::SessionLoaded(history) => {
                 self.history = history;
-                self.scroll = 0;
+                self.follow = true;
                 self.history
                     .push(Cell::Notice("— session resumed —".into()));
             }
@@ -681,7 +734,7 @@ impl App {
         let text = self.composer.take();
         self.history.push(Cell::User(text.clone()));
         self.running = true;
-        self.scroll = 0;
+        self.follow = true; // jump back to the newest when the user sends
         self.agents.clear(); // fresh roster for this turn
         self.effects.push(Effect::SendInput(text));
     }
@@ -714,7 +767,7 @@ impl App {
                 self.history.clear();
                 self.todos.clear();
                 self.agents.clear();
-                self.scroll = 0;
+                self.follow = true;
                 self.history
                     .push(Cell::Notice("— transcript cleared —".into()));
             }
@@ -969,8 +1022,8 @@ impl App {
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Up => self.composer.history_prev(),
             KeyCode::Down => self.composer.history_next(),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(SCROLL_STEP),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(SCROLL_STEP),
+            KeyCode::PageUp => self.scroll_up(SCROLL_STEP),
+            KeyCode::PageDown => self.scroll_down(SCROLL_STEP),
             // Esc interrupts a running turn; when idle it just clears the composer.
             KeyCode::Esc => {
                 if self.running {
@@ -2087,25 +2140,79 @@ mod tests {
         typed(&mut app, "earlier");
         app.update(key(KeyCode::Enter));
         let composed_before = app.composer.text();
-        // wheel up scrolls the transcript output, leaving the composer untouched
+        // A frame establishes the viewport height (max_off = 100 hidden rows).
+        app.scroll_offset(100);
+        // Wheel up scrolls the transcript output, leaving the composer untouched.
         app.update(Msg::WheelUp);
         app.update(Msg::WheelUp);
-        assert_eq!(app.scroll, 2 * WHEEL_STEP);
+        assert!(!app.follow, "scrolling up unpins from the bottom");
         assert_eq!(
             app.composer.text(),
             composed_before,
             "the wheel must NOT touch the composer (command history stays on ↑/↓)"
         );
-        app.update(Msg::WheelDown);
-        assert_eq!(app.scroll, WHEEL_STEP);
     }
 
     #[test]
     fn pageup_scrolls_back_pagedown_returns() {
         let mut app = App::new("m");
+        app.scroll_offset(100);
         app.update(key(KeyCode::PageUp));
-        assert_eq!(app.scroll, SCROLL_STEP);
-        app.update(key(KeyCode::PageDown));
-        assert_eq!(app.scroll, 0);
+        assert!(!app.follow, "PageUp unpins");
+        // Page back down to the bottom re-pins to follow.
+        for _ in 0..20 {
+            app.scroll_offset(100);
+            app.update(key(KeyCode::PageDown));
+        }
+        assert!(app.follow, "reaching the bottom re-pins to follow");
+    }
+
+    #[test]
+    fn streaming_does_not_yank_view_when_user_scrolled_up() {
+        let mut app = App::new("m");
+        app.scroll_offset(100);
+        app.update(Msg::WheelUp);
+        assert!(!app.follow);
+        // Answer deltas stream in — the view must STAY where the user parked it
+        // (no snap to bottom).
+        app.update(Msg::StreamDelta("answer".into()));
+        app.update(Msg::StreamDelta(" more".into()));
+        assert!(
+            !app.follow,
+            "streaming must not re-pin the view while the user is reading history"
+        );
+    }
+
+    #[test]
+    fn scrolled_up_view_does_not_drift_as_content_grows() {
+        let mut app = App::new("m");
+        app.scroll_offset(100);
+        app.update(Msg::WheelUp);
+        let off_before = app.scroll_offset(100);
+        // A long reasoning stream adds 50 rows at the bottom.
+        let off_after = app.scroll_offset(150);
+        assert_eq!(
+            off_before, off_after,
+            "top-anchored while scrolled up: the read position must not drift down"
+        );
+    }
+
+    #[test]
+    fn following_stays_pinned_to_bottom_as_content_grows() {
+        let app = App::new("m");
+        // Following (default) → offset tracks the bottom regardless of growth.
+        assert_eq!(app.scroll_offset(100), 100);
+        assert_eq!(app.scroll_offset(150), 150);
+    }
+
+    #[test]
+    fn sending_a_message_re_pins_to_bottom() {
+        let mut app = keyed();
+        app.scroll_offset(100);
+        app.update(Msg::WheelUp);
+        assert!(!app.follow);
+        typed(&mut app, "hello");
+        app.update(key(KeyCode::Enter));
+        assert!(app.follow, "submitting a message jumps back to the newest");
     }
 }
