@@ -143,10 +143,10 @@ pub fn view(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    // Permission posture — only when not the default (keeps the line clean).
-    if app.permission_mode != crate::app::PermissionMode::Default {
+    // Execution mode — only when not Normal (keeps the line clean).
+    if app.permission_mode != crate::app::PermissionMode::Normal {
         let c = match app.permission_mode {
-            crate::app::PermissionMode::Auto => Color::Red,
+            crate::app::PermissionMode::Yolo => Color::Red,
             crate::app::PermissionMode::Plan => Color::Blue,
             _ => Color::Yellow,
         };
@@ -997,15 +997,15 @@ mod tests {
         let backend = TestBackend::new(100, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("m");
-        // default → not shown
+        // Normal → not shown
         terminal.draw(|f| view(f, &app)).unwrap();
-        assert!(!buffer_text(terminal.backend().buffer()).contains("accept-edits"));
-        // accept-edits → shown
-        app.permission_mode = PermissionMode::AcceptEdits;
+        assert!(!buffer_text(terminal.backend().buffer()).contains("YOLO"));
+        // YOLO → shown
+        app.permission_mode = PermissionMode::Yolo;
         terminal.draw(|f| view(f, &app)).unwrap();
         assert!(
-            buffer_text(terminal.backend().buffer()).contains("accept-edits"),
-            "permission mode should show in the status line"
+            buffer_text(terminal.backend().buffer()).contains("YOLO"),
+            "execution mode should show in the status line"
         );
     }
 

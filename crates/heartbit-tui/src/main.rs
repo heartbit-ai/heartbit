@@ -412,15 +412,13 @@ async fn build_engine(
             for c in calls {
                 tracing::info!(target: "heartbit::interrupt", approval_for = %c.name, "on_approval");
             }
-            // Permission posture gates the prompt (read live, cross-thread):
-            //   auto → allow all; accept-edits → allow if the whole batch is edits;
-            //   plan → deny any mutating tool (read-only); default → ask (modal).
-            let is_edit = |n: &str| matches!(n, "edit" | "write" | "patch");
+            // Execution mode gates the prompt (read live, cross-thread; u8 from
+            // PermissionMode::as_u8): 2=YOLO → allow all; 1=Plan → deny any
+            // mutating tool (read-only); 0=Normal → ask (modal).
             let is_mutating = |n: &str| matches!(n, "edit" | "write" | "patch" | "bash");
             match perm_mode.load(std::sync::atomic::Ordering::Relaxed) {
-                3 => return ApprovalDecision::Allow,
-                1 if calls.iter().all(|c| is_edit(&c.name)) => return ApprovalDecision::Allow,
-                2 if calls.iter().any(|c| is_mutating(&c.name)) => return ApprovalDecision::Deny,
+                2 => return ApprovalDecision::Allow,
+                1 if calls.iter().any(|c| is_mutating(&c.name)) => return ApprovalDecision::Deny,
                 _ => {}
             }
             let tools = calls

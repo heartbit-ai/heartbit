@@ -84,47 +84,61 @@ pub fn parse_todos(input_json: &str) -> Vec<TodoRow> {
         .collect()
 }
 
-/// Global permission posture, cycled with Shift+Tab (Claude Code style). Gates
-/// the `on_approval` bridge so the user can pre-set how consequential tool calls
-/// are handled for the session.
+/// Global execution mode, cycled with Shift+Tab (Claude Code style) or set with
+/// `/mode`. Gates the `on_approval` bridge so the user controls how autonomously
+/// the agent acts this session. Three modes: Normal · Plan · YOLO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
-    /// Ask (the approval modal) for tools that aren't silently allowed by rules.
-    Default,
-    /// Auto-allow file edits (edit/write/patch); still ask for bash & others.
-    AcceptEdits,
-    /// Read-only posture: auto-deny mutating tools (edit/write/patch/bash).
+    /// **Normal** — ask (the approval modal) before consequential tool calls.
+    Normal,
+    /// **Plan** — read-only: the agent investigates and proposes, but cannot
+    /// modify (edit/write/patch/bash are auto-denied). Switch to Normal/YOLO to
+    /// execute the plan.
     Plan,
-    /// Auto-allow everything (bypass).
-    Auto,
+    /// **YOLO** — auto-allow everything; no interruptions. You only live once.
+    Yolo,
 }
 
 impl PermissionMode {
-    /// Next mode in the Shift+Tab cycle.
+    /// Next mode in the Shift+Tab cycle: Normal → Plan → YOLO → Normal.
     pub fn next(self) -> Self {
         match self {
-            PermissionMode::Default => PermissionMode::AcceptEdits,
-            PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Auto,
-            PermissionMode::Auto => PermissionMode::Default,
+            PermissionMode::Normal => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::Yolo,
+            PermissionMode::Yolo => PermissionMode::Normal,
         }
     }
     /// Compact wire value shared with the (cross-thread) approval gate.
     pub fn as_u8(self) -> u8 {
         match self {
-            PermissionMode::Default => 0,
-            PermissionMode::AcceptEdits => 1,
-            PermissionMode::Plan => 2,
-            PermissionMode::Auto => 3,
+            PermissionMode::Normal => 0,
+            PermissionMode::Plan => 1,
+            PermissionMode::Yolo => 2,
         }
     }
     /// Short status-line label.
     pub fn label(self) -> &'static str {
         match self {
-            PermissionMode::Default => "default",
-            PermissionMode::AcceptEdits => "accept-edits",
+            PermissionMode::Normal => "normal",
             PermissionMode::Plan => "plan",
-            PermissionMode::Auto => "auto",
+            PermissionMode::Yolo => "YOLO",
+        }
+    }
+    /// One-line description for `/mode` feedback.
+    pub fn describe(self) -> &'static str {
+        match self {
+            PermissionMode::Normal => "asks before consequential actions",
+            PermissionMode::Plan => "read-only — investigates and proposes, never modifies",
+            PermissionMode::Yolo => "auto-allows everything, no interruptions",
+        }
+    }
+    /// Parse a `/mode` argument (accepts the old names too).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "normal" | "default" => Some(PermissionMode::Normal),
+            "plan" => Some(PermissionMode::Plan),
+            "yolo" | "auto" => Some(PermissionMode::Yolo),
+            _ => None,
         }
     }
 }
@@ -132,6 +146,7 @@ impl PermissionMode {
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
+    ("/mode", "set execution mode: normal | plan | yolo"),
     ("/model", "show or set the model"),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
@@ -318,7 +333,7 @@ impl App {
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),
-            permission_mode: PermissionMode::Default,
+            permission_mode: PermissionMode::Normal,
             file_index: Vec::new(),
             files_requested: false,
             context_tokens: 0,
@@ -832,6 +847,7 @@ impl App {
                 }
             }
             "mcp" => self.handle_mcp(arg),
+            "mode" => self.set_mode(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
             "context-recall" | "recall" => self.toggle_context_recall(arg),
             "verify" => self.set_verify_command(arg),
@@ -847,7 +863,7 @@ impl App {
             "resume" => self.effects.push(Effect::ListSessions),
             "help" => {
                 self.history.push(Cell::Notice(
-                    "commands: /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
+                    "commands: /mode [normal|plan|yolo] · /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(
@@ -938,6 +954,36 @@ impl App {
         self.history.push(Cell::Notice(format!(
             "model set to {model} — active on next start"
         )));
+    }
+
+    /// `/mode [normal|plan|yolo]` — set the execution mode (same as Shift+Tab).
+    /// Bare `/mode` reports the current one. Applied live to the approval gate.
+    fn set_mode(&mut self, arg: String) {
+        if arg.trim().is_empty() {
+            self.history.push(Cell::Notice(format!(
+                "mode: {} — {} (set with /mode normal|plan|yolo, or Shift+Tab)",
+                self.permission_mode.label(),
+                self.permission_mode.describe()
+            )));
+            return;
+        }
+        match PermissionMode::parse(&arg) {
+            Some(mode) => {
+                self.permission_mode = mode;
+                self.effects.push(Effect::SetPermissionMode(mode.as_u8()));
+                self.history.push(Cell::Notice(format!(
+                    "{} mode — {}",
+                    mode.label(),
+                    mode.describe()
+                )));
+            }
+            None => {
+                self.history.push(Cell::Notice(format!(
+                    "usage: /mode [normal|plan|yolo] (currently {})",
+                    self.permission_mode.label()
+                )));
+            }
+        }
     }
 
     /// `/agents` — informational. The static multi-agent mode was removed: the
@@ -1099,15 +1145,16 @@ impl App {
                 }
             }
             KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit(),
-            // Shift+Tab cycles the permission posture (default → accept-edits →
-            // plan → auto), applied live to the approval gate.
+            // Shift+Tab cycles the execution mode (Normal → Plan → YOLO),
+            // applied live to the approval gate.
             KeyCode::BackTab => {
                 self.permission_mode = self.permission_mode.next();
                 self.effects
                     .push(Effect::SetPermissionMode(self.permission_mode.as_u8()));
                 self.history.push(Cell::Notice(format!(
-                    "permission mode: {}",
-                    self.permission_mode.label()
+                    "{} mode — {}",
+                    self.permission_mode.label(),
+                    self.permission_mode.describe()
                 )));
             }
             KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
@@ -1508,9 +1555,12 @@ mod tests {
         let mut app = keyed();
         typed(&mut app, "/m");
         let names: Vec<&str> = app.command_candidates().iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"/model") && names.contains(&"/mcp"));
+        assert!(names.contains(&"/mode") && names.contains(&"/model") && names.contains(&"/mcp"));
         assert!(!names.contains(&"/help"));
-        typed(&mut app, "o"); // "/mo" → only /model
+        typed(&mut app, "o"); // "/mo" → /mode and /model (shared prefix)
+        let names: Vec<&str> = app.command_candidates().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["/mode", "/model"]);
+        typed(&mut app, "del"); // "/model" → only /model
         let names: Vec<&str> = app.command_candidates().iter().map(|(n, _)| *n).collect();
         assert_eq!(names, vec!["/model"]);
     }
@@ -1538,9 +1588,9 @@ mod tests {
     #[test]
     fn menu_tab_completes_with_trailing_space() {
         let mut app = keyed();
-        typed(&mut app, "/mo"); // → /model
+        typed(&mut app, "/mod"); // → [/mode, /model]; selected=0 → /mode
         app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
-        assert_eq!(app.composer.text(), "/model ");
+        assert_eq!(app.composer.text(), "/mode ");
         assert!(!app.menu_open(), "completion closes the menu");
     }
 
@@ -1548,7 +1598,8 @@ mod tests {
     fn menu_enter_runs_navigated_command() {
         let mut app = keyed();
         typed(&mut app, "/"); // all commands, selected = 0 (/help)
-        app.update(key(KeyCode::Down)); // selected = 1 (/model)
+        app.update(key(KeyCode::Down)); // selected = 1 (/mode)
+        app.update(key(KeyCode::Down)); // selected = 2 (/model)
         app.update(key(KeyCode::Enter));
         // /model opens the picker — proving the NAVIGATED command ran, not /help.
         assert!(
@@ -2289,22 +2340,45 @@ mod tests {
     #[test]
     fn shift_tab_cycles_permission_mode_and_emits_effect() {
         let mut app = keyed();
-        assert_eq!(app.permission_mode, PermissionMode::Default);
-        app.update(key(KeyCode::BackTab));
-        assert_eq!(app.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        app.update(key(KeyCode::BackTab)); // → Plan
+        assert_eq!(app.permission_mode, PermissionMode::Plan);
         assert!(app.effects.contains(&Effect::SetPermissionMode(1)));
-        app.update(key(KeyCode::BackTab)); // Plan
-        app.update(key(KeyCode::BackTab)); // Auto
-        assert_eq!(app.permission_mode, PermissionMode::Auto);
-        assert!(app.effects.contains(&Effect::SetPermissionMode(3)));
-        app.update(key(KeyCode::BackTab)); // wraps to Default
-        assert_eq!(app.permission_mode, PermissionMode::Default);
+        app.update(key(KeyCode::BackTab)); // → YOLO
+        assert_eq!(app.permission_mode, PermissionMode::Yolo);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(2)));
+        app.update(key(KeyCode::BackTab)); // wraps to Normal
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
         assert!(app.effects.contains(&Effect::SetPermissionMode(0)));
         // a notice records the change
         assert!(
             app.history
                 .iter()
-                .any(|c| matches!(c, Cell::Notice(n) if n.contains("permission mode")))
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("mode")))
+        );
+    }
+
+    #[test]
+    fn slash_mode_sets_named_mode() {
+        let mut app = keyed();
+        typed(&mut app, "/mode yolo");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Yolo);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(2)));
+        typed(&mut app, "/mode plan");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Plan);
+        typed(&mut app, "/mode normal");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        // bad arg → a usage notice, mode unchanged
+        typed(&mut app, "/mode bogus");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("usage: /mode")))
         );
     }
 
