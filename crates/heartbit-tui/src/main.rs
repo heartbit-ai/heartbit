@@ -294,6 +294,7 @@ async fn build_engine(
     mcp_servers: Vec<config::McpServerSpec>,
     multi_agent: bool,
     context_recall: bool,
+    context_window: Option<u32>,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<Engine> {
     let provider = build_provider(api_key, model)?;
@@ -470,6 +471,14 @@ async fn build_engine(
                 "context restore-on-demand ON — old tool outputs are recoverable via fetch_full_output / recall_context".into(),
             ));
         }
+        // Proactive compaction backstop: engage at 70% of the model's context
+        // window. The window comes from the catalog and may be unknown at the
+        // eager startup spawn (catalog still loading) — in that case the backstop
+        // simply doesn't engage this spawn; it engages on the next (re)spawn once
+        // the window is known (e.g. after /model). The 0.70 fraction is the default.
+        if let Some(window) = context_window {
+            rb = rb.context_window_tokens(window);
+        }
         let runner = rb.build()?;
         Ok(Engine::Single(Box::new(runner)))
     }
@@ -587,6 +596,7 @@ fn spawn_agent(
     let mcp_servers = app.mcp_servers.clone();
     let multi_agent = app.multi_agent;
     let context_recall = app.context_recall;
+    let context_window = app.context_limit().map(|w| w.min(u32::MAX as u64) as u32);
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -610,6 +620,7 @@ fn spawn_agent(
                 mcp_servers,
                 multi_agent,
                 context_recall,
+                context_window,
                 perm_mode,
             )
             .await
