@@ -82,6 +82,9 @@ pub use agent::workflow::{
     LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
     SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
+pub use agent::workflow_tool::{
+    RunWorkflowTool, WorkflowRecipe, WorkflowRegistry, default_registry,
+};
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, InterruptHandle, OnInput};
 // Deterministic verify→repair: runs a build/test command and reports
 // VERIFY_RESULT: PASS/FAIL — reusable beyond the codegen builder so any agent can

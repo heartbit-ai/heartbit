@@ -37,6 +37,7 @@ pub mod token_estimator;
 pub mod tool_filter;
 pub mod voting;
 pub mod workflow;
+pub mod workflow_tool;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
