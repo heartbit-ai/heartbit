@@ -175,4 +175,61 @@ mod tests {
             "a long output's snippet must be capped at exactly SNIPPET_CHARS"
         );
     }
+
+    #[tokio::test]
+    async fn pruned_then_restored_by_marker_ref_roundtrips() {
+        use crate::agent::pruner::{SessionPruneConfig, prune_old_tool_results};
+        use crate::llm::types::{ContentBlock, Message, Role};
+
+        // 1. A big tool output is produced and indexed under its id.
+        let store = ContextRecallStore::new();
+        let big = "RESTORE_ME ".repeat(500); // well above the default 200-byte prune cap
+        store.index("tc_abc", "bash", &big).await;
+
+        // 2. The pruner truncates it in a request view; the marker names the ref.
+        //    Build a message list where the ToolResult(id "tc_abc") is OLD enough
+        //    to be pruned (followed by enough recent messages to push it out of the
+        //    kept tail). With default keep_recent_n=2, last 4 messages are kept;
+        //    index 1 (ToolResult) falls outside the recent window and gets pruned.
+        let messages = vec![
+            Message::user("task"),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tc_abc".into(),
+                    content: big.clone(),
+                    is_error: false,
+                }],
+            },
+            Message::user("r1"),
+            Message::assistant("r2"),
+            Message::user("r3"),
+            Message::assistant("r4"),
+        ];
+        let (pruned, stats) = prune_old_tool_results(&messages, &SessionPruneConfig::default());
+        assert!(stats.did_prune());
+        let marker: String = pruned
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            marker.contains("tc_abc"),
+            "the pruned marker must name the ref"
+        );
+        assert!(
+            marker.len() < big.len(),
+            "the result was actually shortened"
+        );
+
+        // 3. Restore the exact original content by the ref from the store.
+        assert_eq!(
+            store.get("tc_abc").await.as_deref(),
+            Some(big.as_str()),
+            "the full content is restorable by the marker's ref"
+        );
+    }
 }
