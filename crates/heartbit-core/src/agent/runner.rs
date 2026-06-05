@@ -3114,9 +3114,9 @@ mod tests {
                 )
             })
             .count();
-        assert!(
-            summarized >= 1,
-            "expected at least 1 ContextSummarized event, got {summarized}"
+        assert_eq!(
+            summarized, 1,
+            "expected exactly 1 ContextSummarized event, got {summarized}"
         );
     }
 
