@@ -2,6 +2,7 @@
 
 mod bash;
 mod edit;
+mod fetch_full_output;
 mod file_tracker;
 mod glob;
 mod grep;
