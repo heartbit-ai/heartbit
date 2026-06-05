@@ -743,6 +743,10 @@ struct FormSquadTool {
     allow_shared_write: bool,
     /// Optional per-tenant token tracker propagated to all squad member runners.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// SECURITY (F-AGENT-2): orchestrator-level guardrails, combined with each
+    /// squad member's own so squad work can't bypass the orchestrator's defenses
+    /// (the `delegate_task` path already does this; `form_squad` used to skip it).
+    guardrails: Vec<Arc<dyn Guardrail>>,
 }
 
 impl Tool for FormSquadTool {
@@ -848,6 +852,8 @@ impl Tool for FormSquadTool {
                 let observability_mode = self.observability_mode;
                 let allow_shared_write = self.allow_shared_write;
                 let tenant_tracker = self.tenant_tracker.clone();
+                // SECURITY (F-AGENT-2): propagate orchestrator guardrails to squad members.
+                let squad_guardrails = self.guardrails.clone();
 
                 info!(agent = %agent_def.name, task = %task.task, "spawning squad member");
 
@@ -874,8 +880,12 @@ impl Tool for FormSquadTool {
                     if let Some(schema) = agent_def.response_schema {
                         builder = builder.structured_schema(schema);
                     }
-                    if !agent_def.guardrails.is_empty() {
-                        builder = builder.guardrails(agent_def.guardrails);
+                    // SECURITY (F-AGENT-2): combine orchestrator + member guardrails
+                    // so squad work runs under the orchestrator's defenses too.
+                    let mut combined_guardrails = squad_guardrails;
+                    combined_guardrails.extend(agent_def.guardrails);
+                    if !combined_guardrails.is_empty() {
+                        builder = builder.guardrails(combined_guardrails);
                     }
                     if let Some(timeout) = agent_def.run_timeout {
                         builder = builder.run_timeout(timeout);
@@ -2417,6 +2427,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 observability_mode: resolved_mode,
                 allow_shared_write: self.allow_shared_write,
                 tenant_tracker: self.tenant_tracker.clone(),
+                guardrails: self.guardrails.clone(),
             });
             runner_builder = runner_builder.tool(form_squad_tool);
         }
@@ -4077,6 +4088,135 @@ mod tests {
             systems[1].contains("[ORCH_GUARD_ACTIVE]"),
             "sub-agent system prompt should contain orchestrator guardrail marker; got: {}",
             systems[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_guardrails_propagate_to_form_squad_members() {
+        // SECURITY (F-AGENT-2): the form_squad path must combine orchestrator
+        // guardrails with each member's own, exactly like delegate_task.
+        use crate::agent::guardrail::Guardrail;
+        use crate::llm::types::CompletionRequest;
+
+        struct MarkerGuardrail;
+        impl Guardrail for MarkerGuardrail {
+            fn pre_llm(
+                &self,
+                request: &mut CompletionRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), crate::error::Error>> + Send + '_>,
+            > {
+                request.system = format!("{} [ORCH_GUARD_ACTIVE]", request.system);
+                Box::pin(async { Ok(()) })
+            }
+        }
+        struct CapturingProvider {
+            responses: Mutex<Vec<CompletionResponse>>,
+            systems_seen: Mutex<Vec<String>>,
+        }
+        impl LlmProvider for CapturingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::Error> {
+                self.systems_seen
+                    .lock()
+                    .unwrap()
+                    .push(request.system.clone());
+                let mut r = self.responses.lock().unwrap();
+                if r.is_empty() {
+                    return Err(crate::error::Error::Agent("no more responses".into()));
+                }
+                Ok(r.remove(0))
+            }
+        }
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        fn bare_sub_agent(name: &str) -> SubAgentConfig {
+            SubAgentConfig {
+                name: name.into(),
+                description: format!("{name} agent"),
+                system_prompt: "You work.".into(),
+                tools: vec![],
+                context_strategy: None,
+                summarize_threshold: None,
+                tool_timeout: None,
+                max_tool_output_bytes: None,
+                max_turns: None,
+                max_tokens: None,
+                response_schema: None,
+                run_timeout: None,
+                guardrails: vec![], // NO member guardrails — protection comes only from the orchestrator
+                provider: None,
+                reasoning_effort: None,
+                enable_reflection: None,
+                tool_output_compression_threshold: None,
+                max_tools_per_turn: None,
+                tool_profile: None,
+                max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
+                session_prune_config: None,
+                enable_recursive_summarization: None,
+                reflection_threshold: None,
+                consolidate_on_exit: None,
+                workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
+            }
+        }
+
+        let provider = Arc::new(CapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator forms a 2-member squad
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "form_squad".into(),
+                        input: json!({"tasks": [
+                            {"agent": "worker", "task": "do A"},
+                            {"agent": "helper", "task": "do B"}
+                        ]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text("A done."),      // 2: squad member
+                text("B done."),      // 3: squad member
+                text("Synthesized."), // 4: orchestrator synthesis
+            ]),
+            systems_seen: Mutex::new(vec![]),
+        });
+
+        let guardrail: Arc<dyn Guardrail> = Arc::new(MarkerGuardrail);
+        let mut orch = Orchestrator::builder(provider.clone())
+            .guardrail(guardrail)
+            .sub_agent_full(bare_sub_agent("worker"))
+            .sub_agent_full(bare_sub_agent("helper"))
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let systems = provider.systems_seen.lock().unwrap();
+        // At least one squad-member call must carry the orchestrator guardrail marker.
+        assert!(
+            systems
+                .iter()
+                .skip(1)
+                .any(|s| s.contains("[ORCH_GUARD_ACTIVE]")),
+            "a form_squad member's system prompt must contain the orchestrator guardrail marker; got: {systems:?}"
         );
     }
 
