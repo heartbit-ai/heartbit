@@ -65,7 +65,9 @@ pub fn view(frame: &mut Frame, app: &App) {
     // column — so they never fight over width, and the transcript width (which
     // MUST feed `line_count`, or a stale full width clips the newest line) is
     // unchanged whether one or both panels show.
-    let show_roster = app.multi_agent && app.running && !app.agents.is_empty();
+    // The unified agent delegates as needed — show the roster whenever sub-agents
+    // are actually dispatched (no static mode gate).
+    let show_roster = app.running && !app.agents.is_empty();
     let show_todos = !app.todos.is_empty();
     let want_panel = show_roster || show_todos;
     let (transcript_area, panel_area) = if want_panel && chunks[0].width >= 50 {

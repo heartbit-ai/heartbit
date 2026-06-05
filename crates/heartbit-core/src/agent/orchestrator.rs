@@ -1682,6 +1682,8 @@ pub fn build_entry_agent_prompt(
          ## Principles\n\
          - Prefer the SIMPLEST path. Never delegate work you can finish yourself in a few steps. \
            Never force-split a simple task across agents.\n\
+         - When you change code, make the smallest correct change and verify it. Be concise and \
+           direct; show your work through tool use rather than narrating it.\n\
          - Each delegated task must be self-contained (include all needed context).\n\n\
          ## Available Sub-Agents\n{agent_list}{workflow_block}"
     )
@@ -2637,7 +2639,16 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 runner_builder = runner_builder.context_window_tokens(window);
             }
             if let Some(store) = cx.context_recall_store {
-                runner_builder = runner_builder.context_recall_store(store);
+                // Pair restore-on-demand with a gentle pruner so old tool
+                // outputs truncate to a restorable marker (otherwise no marker
+                // is ever produced).
+                runner_builder = runner_builder
+                    .context_recall_store(store)
+                    .session_prune_config(crate::agent::pruner::SessionPruneConfig {
+                        keep_recent_n: 3,
+                        pruned_tool_result_max_bytes: 1024,
+                        ..Default::default()
+                    });
             }
         }
 

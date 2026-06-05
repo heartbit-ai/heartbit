@@ -37,9 +37,9 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
-    AgentEvent, AgentRunner, ApprovalDecision, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
-    OnInput, OnText, OpenRouterProvider, Orchestrator, PermissionAction, PermissionRule,
-    PermissionRuleset, RetryingProvider, SubAgentConfig,
+    AgentEvent, ApprovalDecision, BoxedProvider, InterruptHandle, OnApproval, OnEvent, OnInput,
+    OnText, OpenRouterProvider, Orchestrator, PermissionAction, PermissionRule, PermissionRuleset,
+    RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -47,11 +47,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::app::{App, Effect};
 use crate::cells::Cell;
 use crate::msg::{Msg, PendingTool};
-
-const SYSTEM_PROMPT: &str = "You are Heartbit, an expert software engineering assistant running in a \
-terminal UI, with tools to read, search, edit, and run code in the user's workspace. Be concise and \
-direct. When you change code, make the smallest correct change, then verify it. Prefer showing your \
-work through tool use over describing it. When a task is done, say so briefly.";
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
 
@@ -118,11 +113,10 @@ async fn main() -> anyhow::Result<()> {
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
-    // Seed the roster's available squad so the full pool is visible in the TUI
-    // (and the user can see when only part of it is actually dispatched).
-    if cfg.multi_agent {
-        app.squad = app::DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect();
-    }
+    // The unified entry agent can ALWAYS delegate (the squad is always available),
+    // so seed the roster's available squad unconditionally — it shows when the
+    // agent actually dispatches sub-agents.
+    app.squad = app::DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect();
     // Fetch the OpenRouter catalog at startup (public endpoint) so the status-line
     // context bar knows the model's window and the /model picker is pre-warmed.
     app.models_loading = true;
@@ -198,25 +192,17 @@ fn build_provider(
     anyhow::bail!("no OpenRouter API key configured (set one with /key or OPENROUTER_API_KEY)")
 }
 
-/// The agent engine the TUI drives: a single [`AgentRunner`], or a multi-agent
-/// [`Orchestrator`] (dynamic delegation + squads). Both expose the same
-/// interactive loop (one call drives a whole `on_input` multi-turn session).
-enum Engine {
-    Single(Box<AgentRunner<BoxedProvider>>),
-    Multi(Box<Orchestrator<BoxedProvider>>),
-}
+/// The unified entry agent the TUI drives (option C): the [`Orchestrator`]
+/// evolved into ONE capable agent that decides per request — answer directly,
+/// do simple work, delegate to the squad, or run a workflow. A thin newtype so
+/// the run loop has a stable handle; one call drives a whole `on_input`
+/// multi-turn session.
+struct Engine(Box<Orchestrator<BoxedProvider>>);
 
 impl Engine {
     /// Run the (multi-turn) session, starting with `first`.
     async fn run(&mut self, first: &str) -> anyhow::Result<()> {
-        match self {
-            Engine::Single(r) => {
-                r.execute(first).await?;
-            }
-            Engine::Multi(o) => {
-                o.run(first).await?;
-            }
-        }
+        self.0.run(first).await?;
         Ok(())
     }
 }
@@ -335,7 +321,6 @@ async fn build_engine(
     cwd: PathBuf,
     interrupt: InterruptHandle,
     mcp_servers: Vec<config::McpServerSpec>,
-    multi_agent: bool,
     context_recall: bool,
     context_window: Option<u32>,
     verify_command: Option<String>,
@@ -362,17 +347,14 @@ async fn build_engine(
             }
         }
     }
-    // Context restore-on-demand (single-agent path only): a per-run store that
-    // indexes every tool output so the gentle pruner's truncation is reversible
-    // (the model restores via fetch_full_output / recall_context).
-    let recall_store = (context_recall && !multi_agent)
-        .then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
-    // Long-horizon planning (single-agent path): a shared todo store the runner
-    // recites at the context tail each turn, kept in sync with todowrite/read.
-    let todo_store =
-        (!multi_agent).then(|| Arc::new(heartbit_core::tool::builtins::TodoStore::new()));
-    // The single agent's tools: builtins FIRST so MCP can't shadow a trusted one.
-    let mut tools = fresh_builtins(&cwd, recall_store.as_ref(), todo_store.as_ref());
+    // Unified entry agent (option C): ONE capable agent that decides per request
+    // — answer directly, do simple work, delegate, or run a workflow. It ALWAYS
+    // gets its own context stack (recitation + restore-on-demand) and the
+    // run_workflow tool; the squad stays available for delegation.
+    let recall_store = context_recall.then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
+    let todo_store = Arc::new(heartbit_core::tool::builtins::TodoStore::new());
+    // The entry agent's direct tools: builtins FIRST so MCP can't shadow a trusted one.
+    let mut tools = fresh_builtins(&cwd, recall_store.as_ref(), Some(&todo_store));
     tools.extend(mcp_tools.iter().cloned());
     // Self-verification (opt-in via /verify): a deterministic `verify` tool that
     // runs the project's build/test command (VERIFY_RESULT: PASS/FAIL).
@@ -382,6 +364,13 @@ async fn build_engine(
             vec![cmd.to_string()],
         )));
     }
+    // run_workflow: named recipes (parallel_review, …) reachable by the agent.
+    let registry = heartbit_core::default_registry();
+    let recipe_meta = registry.meta();
+    tools.push(Arc::new(heartbit_core::RunWorkflowTool::new(
+        registry,
+        provider.clone(),
+    )));
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();
@@ -479,100 +468,63 @@ async fn build_engine(
         )));
     }
 
-    if multi_agent {
-        // Multi-agent: an Orchestrator that dynamically delegates to a squad of
-        // capable sub-agents (delegate_task / form_squad). The orchestrator agent
-        // is a router; the sub-agents hold the tools. Same callbacks + interrupt
-        // as the single agent (one run() drives the whole multi-turn session).
+    // Unified entry agent (option C): ALWAYS built, no static mode flag. The
+    // orchestrator evolved into ONE capable agent — it holds direct tools +
+    // delegation tools (delegate_task / form_squad) + run_workflow, and decides
+    // per request via tool choice (answer directly / do simple work / delegate /
+    // run a workflow). One run() drives the whole multi-turn session.
+    let _ = ui_tx.send(Msg::Notice(
+        "unified agent — answers directly, delegates, or runs a workflow as the task warrants"
+            .into(),
+    ));
+    let replan = verify_command.as_deref().is_some_and(|c| !c.is_empty());
+    if recall_store.is_some() {
         let _ = ui_tx.send(Msg::Notice(
-            "multi-agent workflow ON — orchestrator + worker/researcher squad".into(),
+            "context restore-on-demand ON — old tool outputs recoverable via fetch_full_output / recall_context".into(),
         ));
-        let mut builder = Orchestrator::builder(provider)
-            .max_turns(300)
-            .workspace(cwd.clone())
-            .instruction_text(project_context)
-            .permission_rules(default_permissions())
-            .on_text(on_text)
-            .on_event(on_event)
-            .on_approval(on_approval)
-            .on_input(on_input)
-            .interrupt(interrupt);
-        // Multi-agent context enablement: thread the context flags so each
-        // sub-agent gets its own recitation / restore-on-demand / proactive
-        // compaction / replan, matching the single-agent path.
-        let sub_replan = verify_command.as_deref().is_some_and(|c| !c.is_empty());
-        for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, sub_replan)
-        {
-            builder = builder.sub_agent_full(cfg);
-        }
-        let orch = builder.build()?;
-        Ok(Engine::Multi(Box::new(orch)))
-    } else {
-        // Self-verify nudge: when a verify command is set, instruct the agent to
-        // run `verify` after code changes and treat VERIFY_RESULT as truth.
-        let sys_prompt = match verify_command.as_deref().filter(|c| !c.is_empty()) {
-            Some(cmd) => format!(
-                "{SYSTEM_PROMPT}\n\nWhen you change code, run the `verify` tool (it runs `{cmd}`) and \
-                 FIX any failures before saying you're done. The verify tool's VERIFY_RESULT: PASS/FAIL \
-                 is the source of truth — never claim success without a PASS."
-            ),
-            None => SYSTEM_PROMPT.to_string(),
-        };
-        let mut rb = AgentRunner::builder(provider)
-            .name("heartbit")
-            .system_prompt(sys_prompt)
-            .instruction_text(project_context)
-            .tools(tools)
-            .max_turns(300)
-            .workspace(cwd)
-            .permission_rules(default_permissions())
-            .on_text(on_text)
-            .on_reasoning(on_reasoning)
-            .on_event(on_event)
-            .on_approval(on_approval)
-            .on_input(on_input)
-            .interrupt(interrupt);
-        // Long-horizon planning: recite the live plan (open todos) at the
-        // context tail every turn. Self-gates to nothing until the agent writes
-        // todos, so trivial chats pay zero overhead.
-        if let Some(store) = &todo_store {
-            rb = rb.todo_store(store.clone());
-        }
-        // When /verify is active, also gate completion on a GREEN verify: a RED
-        // VERIFY_RESULT: FAIL re-injects a fix-it nudge (bounded) instead of
-        // letting the agent declare done on red ("replan on out-of-plan").
-        if verify_command.as_deref().is_some_and(|c| !c.is_empty()) {
-            rb = rb.replan_on_verify_fail(true);
-        }
-        // Restore-on-demand: share the SAME store for indexing, and pair it with a
-        // gentle pruner so old tool outputs truncate to a restorable marker.
-        if let Some(store) = &recall_store {
-            rb = rb
-                .context_recall_store(store.clone())
-                .session_prune_config(gentle_prune_config());
-            let _ = ui_tx.send(Msg::Notice(
-                "context restore-on-demand ON — old tool outputs are recoverable via fetch_full_output / recall_context".into(),
-            ));
-        }
-        // Proactive compaction backstop: engage at 70% of the model's context
-        // window. The window comes from the catalog and may be unknown at the
-        // eager startup spawn (catalog still loading) — in that case the backstop
-        // simply doesn't engage this spawn; it engages on the next (re)spawn once
-        // the window is known (e.g. after /model). The 0.70 fraction is the default.
-        if let Some(window) = context_window {
-            rb = rb.context_window_tokens(window);
-            // Test mode: compact at 15% of the window so the backstop fires within
-            // a few turns instead of needing a full long session.
-            if context_debug_mode() {
-                rb = rb.compaction_threshold_fraction(0.15);
-                let _ = ui_tx.send(Msg::Notice(
-                    "HEARTBIT_CONTEXT_DEBUG: aggressive pruning + compaction at 15% window".into(),
-                ));
-            }
-        }
-        let runner = rb.build()?;
-        Ok(Engine::Single(Box::new(runner)))
     }
+    if context_window.is_some() && context_debug_mode() {
+        let _ = ui_tx.send(Msg::Notice(
+            "HEARTBIT_CONTEXT_DEBUG: proactive compaction at the model window".into(),
+        ));
+    }
+    // Verify nudge: when /verify is active, instruct the agent (via the appended
+    // instruction text) to run `verify` after code changes and treat
+    // VERIFY_RESULT as truth — paired with the bounded replan gate below.
+    let instructions = match verify_command.as_deref().filter(|c| !c.is_empty()) {
+        Some(cmd) => format!(
+            "{project_context}\n\nWhen you change code, run the `verify` tool (it runs `{cmd}`) and \
+             FIX any failures before saying you're done. VERIFY_RESULT: PASS/FAIL is the source of \
+             truth — never claim success without a PASS."
+        ),
+        None => project_context,
+    };
+    let mut builder = Orchestrator::builder(provider)
+        .entry_agent(tools)
+        .entry_workflow_recipes(recipe_meta)
+        .entry_context(heartbit_core::SubAgentContextConfig {
+            todo_store: Some(todo_store),
+            context_recall_store: recall_store,
+            context_window_tokens: context_window,
+            replan_on_verify_fail: replan,
+        })
+        .max_turns(300)
+        .workspace(cwd.clone())
+        .instruction_text(instructions)
+        .permission_rules(default_permissions())
+        .on_text(on_text)
+        .on_reasoning(on_reasoning)
+        .on_event(on_event)
+        .on_approval(on_approval)
+        .on_input(on_input)
+        .interrupt(interrupt);
+    // The squad available for delegation: each sub-agent gets its own context
+    // stack (recitation / restore-on-demand / compaction / replan).
+    for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
+        builder = builder.sub_agent_full(cfg);
+    }
+    let orch = builder.build()?;
+    Ok(Engine(Box::new(orch)))
 }
 
 /// Connect one configured MCP server and return its tools. A preset spins up its
@@ -685,7 +637,6 @@ fn spawn_agent(
     let api_key = app.api_key.clone();
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
-    let multi_agent = app.multi_agent;
     let context_recall = app.context_recall;
     let context_window = app.context_limit().map(|w| w.min(u32::MAX as u64) as u32);
     let verify_command = app.verify_command.clone();
@@ -710,7 +661,6 @@ fn spawn_agent(
                 cwd,
                 interrupt,
                 mcp_servers,
-                multi_agent,
                 context_recall,
                 context_window,
                 verify_command,
@@ -743,9 +693,9 @@ async fn run_ui(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     mut ui_rx: UnboundedReceiver<Msg>,
-    mut input_tx: UnboundedSender<String>,
+    input_tx: UnboundedSender<String>,
     ui_tx: UnboundedSender<Msg>,
-    mut input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
+    input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -912,33 +862,6 @@ async fn run_ui(
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
-                    }
-                }
-                Effect::SaveMultiAgent(on) => {
-                    let mut cfg = config::TuiConfig::load();
-                    cfg.multi_agent = on;
-                    if let Err(e) = cfg.save() {
-                        app.history
-                            .push(Cell::Notice(format!("could not save config: {e}")));
-                    }
-                    // Activate the new mode NOW if the agent is idle: end the parked
-                    // idle thread by replacing the input channel (its `on_input`
-                    // recv() returns None → it exits), bump the epoch so its stale
-                    // exit is ignored, and clear `agent_started` so the next message
-                    // respawns in the new mode. (A running turn applies on next start.)
-                    if agent_started && !app.running {
-                        agent_epoch += 1; // supersede the idle thread
-                        let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                        input_tx = ntx; // drop the old sender → idle on_input → None → exit
-                        input_rx = Arc::new(Mutex::new(nrx));
-                        agent_started = false;
-                        app.history.push(Cell::Notice(
-                            "restarting agent to apply the new mode — send a message".into(),
-                        ));
-                    } else if app.running {
-                        app.history.push(Cell::Notice(
-                            "a task is running — toggle again once it finishes to apply".into(),
-                        ));
                     }
                 }
                 Effect::FetchModels => {

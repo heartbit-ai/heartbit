@@ -163,7 +163,6 @@ pub enum Effect {
     /// Walk the project tree (async) to build the `@`-mention file index.
     WalkFiles,
     /// Persist the multi-agent (orchestrator) mode flag to the config file.
-    SaveMultiAgent(bool),
     SaveContextRecall(bool),
     SaveVerifyCommand(Option<String>),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
@@ -941,39 +940,16 @@ impl App {
         )));
     }
 
-    /// `/agents [on|off]` — toggle multi-agent orchestrator mode (dynamic
-    /// delegation + squads). Persisted; applies on the next agent start.
-    fn toggle_multi_agent(&mut self, arg: String) {
-        let new = match arg.trim().to_lowercase().as_str() {
-            "on" | "true" | "1" => true,
-            "off" | "false" | "0" => false,
-            "" => !self.multi_agent,
-            other => {
-                self.history.push(Cell::Notice(format!(
-                    "usage: /agents [on|off] (currently {})",
-                    if self.multi_agent { "on" } else { "off" }
-                )));
-                let _ = other;
-                return;
-            }
-        };
-        self.multi_agent = new;
-        // Keep the available-squad roster in sync with the mode toggle.
-        self.squad = if new {
-            DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect()
-        } else {
-            Vec::new()
-        };
-        self.effects.push(Effect::SaveMultiAgent(new));
-        self.history.push(Cell::Notice(format!(
-            "multi-agent workflow {}{}",
-            if new { "ON" } else { "OFF" },
-            if new {
-                " — orchestrator delegates to a worker/researcher squad"
-            } else {
-                ""
-            }
-        )));
+    /// `/agents` — informational. The static multi-agent mode was removed: the
+    /// entry agent is now ALWAYS unified — it answers directly, does simple work
+    /// itself, delegates to the squad, or runs a workflow, deciding per request.
+    fn toggle_multi_agent(&mut self, _arg: String) {
+        self.history.push(Cell::Notice(
+            "the agent is always unified now — it answers directly, delegates to \
+             the worker/researcher squad, or runs a workflow as the task warrants. \
+             No mode to toggle."
+                .into(),
+        ));
     }
 
     /// Toggle context restore-on-demand (single-agent path). Persisted; applies on
@@ -1715,18 +1691,17 @@ mod tests {
     }
 
     #[test]
-    fn slash_agents_toggles_and_saves() {
+    fn slash_agents_is_informational() {
         let mut app = keyed();
-        assert!(!app.multi_agent);
         typed(&mut app, "/agents");
         app.update(key(KeyCode::Enter));
-        assert!(app.multi_agent, "bare /agents toggles on");
-        assert!(app.effects.contains(&Effect::SaveMultiAgent(true)));
-        // explicit off
-        typed(&mut app, "/agents off");
-        app.update(key(KeyCode::Enter));
-        assert!(!app.multi_agent);
-        assert!(app.effects.contains(&Effect::SaveMultiAgent(false)));
+        // No mode to toggle anymore — it just prints an informational notice.
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("always unified"))),
+            "/agents should print the unified-agent notice"
+        );
     }
 
     #[test]
@@ -1762,17 +1737,11 @@ mod tests {
     }
 
     #[test]
-    fn slash_agents_on_is_idempotent_and_notices() {
+    fn slash_agents_never_starts_a_run() {
         let mut app = keyed();
         typed(&mut app, "/agents on");
         app.update(key(KeyCode::Enter));
-        assert!(app.multi_agent);
-        assert!(
-            app.history
-                .iter()
-                .any(|c| matches!(c, Cell::Notice(n) if n.contains("multi-agent workflow ON"))),
-        );
-        // a pure config command must never start a run
+        // a pure informational command must never start a run
         assert!(
             app.effects
                 .iter()
