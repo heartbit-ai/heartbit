@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
+    app.verify_command = cfg.verify_command.clone();
     // Seed the roster's available squad so the full pool is visible in the TUI
     // (and the user can see when only part of it is actually dispatched).
     if cfg.multi_agent {
@@ -314,6 +315,7 @@ async fn build_engine(
     multi_agent: bool,
     context_recall: bool,
     context_window: Option<u32>,
+    verify_command: Option<String>,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<Engine> {
     let provider = build_provider(api_key, model)?;
@@ -345,6 +347,14 @@ async fn build_engine(
     // The single agent's tools: builtins FIRST so MCP can't shadow a trusted one.
     let mut tools = fresh_builtins(&cwd, recall_store.as_ref());
     tools.extend(mcp_tools.iter().cloned());
+    // Self-verification (opt-in via /verify): a deterministic `verify` tool that
+    // runs the project's build/test command (VERIFY_RESULT: PASS/FAIL).
+    if let Some(cmd) = verify_command.as_deref().filter(|c| !c.is_empty()) {
+        tools.push(Arc::new(heartbit_core::VerifyCommandTool::new(
+            cwd.clone(),
+            vec![cmd.to_string()],
+        )));
+    }
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();
@@ -466,9 +476,19 @@ async fn build_engine(
         let orch = builder.build()?;
         Ok(Engine::Multi(Box::new(orch)))
     } else {
+        // Self-verify nudge: when a verify command is set, instruct the agent to
+        // run `verify` after code changes and treat VERIFY_RESULT as truth.
+        let sys_prompt = match verify_command.as_deref().filter(|c| !c.is_empty()) {
+            Some(cmd) => format!(
+                "{SYSTEM_PROMPT}\n\nWhen you change code, run the `verify` tool (it runs `{cmd}`) and \
+                 FIX any failures before saying you're done. The verify tool's VERIFY_RESULT: PASS/FAIL \
+                 is the source of truth — never claim success without a PASS."
+            ),
+            None => SYSTEM_PROMPT.to_string(),
+        };
         let mut rb = AgentRunner::builder(provider)
             .name("heartbit")
-            .system_prompt(SYSTEM_PROMPT)
+            .system_prompt(sys_prompt)
             .instruction_text(project_context)
             .tools(tools)
             .max_turns(300)
@@ -624,6 +644,7 @@ fn spawn_agent(
     let multi_agent = app.multi_agent;
     let context_recall = app.context_recall;
     let context_window = app.context_limit().map(|w| w.min(u32::MAX as u64) as u32);
+    let verify_command = app.verify_command.clone();
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -648,6 +669,7 @@ fn spawn_agent(
                 multi_agent,
                 context_recall,
                 context_window,
+                verify_command,
                 perm_mode,
             )
             .await
@@ -835,6 +857,14 @@ async fn run_ui(
                     // set + pruner, so we don't hot-swap a running engine).
                     let mut cfg = config::TuiConfig::load();
                     cfg.context_recall = on;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
+                Effect::SaveVerifyCommand(cmd) => {
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.verify_command = cmd;
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));

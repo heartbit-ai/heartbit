@@ -136,6 +136,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
     ("/context-recall", "toggle context restore-on-demand"),
+    (
+        "/verify",
+        "set the project verify command (self-verify + repair)",
+    ),
     ("/clear", "clear the transcript"),
     ("/resume", "reopen a saved session"),
     ("/export", "export the transcript to Markdown"),
@@ -161,6 +165,7 @@ pub enum Effect {
     /// Persist the multi-agent (orchestrator) mode flag to the config file.
     SaveMultiAgent(bool),
     SaveContextRecall(bool),
+    SaveVerifyCommand(Option<String>),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
     SetPermissionMode(u8),
     /// Export the current transcript (read from `App.history`) to a Markdown file.
@@ -248,6 +253,9 @@ pub struct App {
     /// session pruner so old tool results truncate to a restorable marker. ON by
     /// default; toggled via `/context-recall`, applies on next start.
     pub context_recall: bool,
+    /// Optional project verification command (`/verify <cmd>`). When set, the
+    /// agent gets a `verify` tool + a self-verify prompt nudge. Applies next start.
+    pub verify_command: Option<String>,
     /// The available sub-agent pool (multi-agent mode), seeded into the roster as
     /// Idle at the start of each turn so the user always sees the whole squad —
     /// and can tell when only some of it actually gets dispatched.
@@ -307,6 +315,7 @@ impl App {
             models_loading: false,
             multi_agent: false,
             context_recall: true,
+            verify_command: None,
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),
@@ -819,6 +828,7 @@ impl App {
             "mcp" => self.handle_mcp(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
             "context-recall" | "recall" => self.toggle_context_recall(arg),
+            "verify" => self.set_verify_command(arg),
             "clear" | "new" => {
                 self.history.clear();
                 self.todos.clear();
@@ -986,6 +996,32 @@ impl App {
                 ""
             }
         )));
+    }
+
+    /// Set (or clear with `off`/empty) the project verification command. When set,
+    /// the agent gets a `verify` tool running it + a self-verify prompt nudge.
+    /// Persisted; applies on the next agent start.
+    fn set_verify_command(&mut self, arg: String) {
+        let arg = arg.trim();
+        let new = match arg {
+            "" => {
+                let cur = self.verify_command.as_deref().unwrap_or("(unset)");
+                self.history.push(Cell::Notice(format!(
+                    "usage: /verify <command>  ·  /verify off  (currently: {cur})"
+                )));
+                return;
+            }
+            "off" | "none" | "clear" => None,
+            cmd => Some(cmd.to_string()),
+        };
+        self.verify_command = new.clone();
+        self.effects.push(Effect::SaveVerifyCommand(new.clone()));
+        self.history.push(Cell::Notice(match &new {
+            Some(c) => format!(
+                "verify command set to `{c}` (applies on next start) — the agent will self-verify after code changes"
+            ),
+            None => "verify command cleared (applies on next start)".into(),
+        }));
     }
 
     /// Open the OpenRouter model picker, fetching the catalog on first use.
@@ -1699,6 +1735,23 @@ mod tests {
         app.update(key(KeyCode::Enter));
         assert!(app.context_recall);
         assert!(app.effects.contains(&Effect::SaveContextRecall(true)));
+    }
+
+    #[test]
+    fn slash_verify_sets_and_clears_the_command() {
+        let mut app = keyed();
+        assert!(app.verify_command.is_none());
+        typed(&mut app, "/verify cargo test");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.verify_command.as_deref(), Some("cargo test"));
+        assert!(
+            app.effects
+                .contains(&Effect::SaveVerifyCommand(Some("cargo test".into())))
+        );
+        typed(&mut app, "/verify off");
+        app.update(key(KeyCode::Enter));
+        assert!(app.verify_command.is_none());
+        assert!(app.effects.contains(&Effect::SaveVerifyCommand(None)));
     }
 
     #[test]

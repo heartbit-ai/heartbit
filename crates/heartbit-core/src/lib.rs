@@ -81,6 +81,11 @@ pub use agent::workflow::{
     SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
 pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, InterruptHandle, OnInput};
+// Deterministic verify→repair: runs a build/test command and reports
+// VERIFY_RESULT: PASS/FAIL — reusable beyond the codegen builder so any agent can
+// self-verify (pair with a GoalCondition for an autonomous repair loop, or the
+// tool + a prompt nudge for interactive self-correction).
+pub use codegen::verify::VerifyCommandTool;
 
 // --- Dynamic-workflow combinator core (P1) ---
 // The free functions (`agent`, `parallel`, `pipeline`, `phase`, `log`, `thunk`)

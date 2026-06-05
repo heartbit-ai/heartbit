@@ -86,6 +86,12 @@ pub struct TuiConfig {
     /// toggled in-TUI via `/context-recall`. Single-agent path only.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub context_recall: bool,
+    /// Optional project verification command (e.g. `cargo test`). When set, the
+    /// agent gets a `verify` tool that runs it (deterministic VERIFY_RESULT:
+    /// PASS/FAIL) plus a prompt nudge to self-verify after code changes. Set via
+    /// `/verify <cmd>`; off when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_command: Option<String>,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -107,6 +113,7 @@ impl Default for TuiConfig {
             mcp_servers: Vec::new(),
             multi_agent: false,
             context_recall: true,
+            verify_command: None,
         }
     }
 }
