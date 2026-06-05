@@ -89,6 +89,138 @@ pub(crate) async fn write_no_follow(path: &std::path::Path, bytes: &[u8]) -> std
     }
 }
 
+/// Write `bytes` to `target` by walking down from the trusted, canonical
+/// `root` one path component at a time, opening EACH component with
+/// `O_NOFOLLOW`. No component — intermediate directory OR final file — may be
+/// a symlink; the first that is fails the write.
+///
+/// SECURITY (F-FS-1): `write_no_follow` only guards the *trailing* component,
+/// so a parallel tool call (e.g. bash dispatched alongside write via
+/// `tokio::JoinSet`) could swap an *intermediate* directory for a symlink
+/// after the policy check and the write would follow it outside the
+/// workspace. This walk closes that window: each directory is opened
+/// relative to a pinned parent fd (`openat`), so even a swap landing between
+/// two steps cannot redirect us — the previously-opened fd still refers to
+/// the real inode, and a freshly-swapped symlink component is rejected by
+/// `O_NOFOLLOW`. The write becomes self-protecting; no check→write gap
+/// remains. `target` must be a canonical path beneath `root` (the value from
+/// [`crate::sandbox::CorePathPolicy::check_path_for_create`]); its
+/// intermediate directories must already exist (they do, since the parent was
+/// just canonicalized). On non-Unix this falls back to [`write_no_follow`].
+#[cfg(unix)]
+pub(crate) async fn write_beneath_root(
+    root: &std::path::Path,
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let rel = target
+        .strip_prefix(root)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "target is not beneath the root"))?;
+    // Only plain `Normal` components are allowed — no `..`, `.`, root or
+    // prefix components may sneak through.
+    let mut comps: Vec<CString> = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => comps.push(
+                CString::new(p.as_bytes())
+                    .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in path component"))?,
+            ),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "target has a non-normal path component",
+                ));
+            }
+        }
+    }
+    if comps.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "target equals the root (no file component)",
+        ));
+    }
+
+    let root_c = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in root path"))?;
+    let bytes = bytes.to_vec();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        // Open the trusted root directory itself. Its own ancestry is
+        // operator-configured and canonical, so it is trusted; O_NOFOLLOW
+        // still guards the root's final component.
+        let fd = unsafe {
+            libc::open(
+                root_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        let mut parent = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let last = comps.len() - 1;
+        for (i, comp) in comps.iter().enumerate() {
+            if i == last {
+                // Final component: the file itself. O_NOFOLLOW rejects an
+                // existing symlink here (ELOOP); O_CREAT|O_TRUNC otherwise.
+                let ffd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        comp.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_TRUNC
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o644 as libc::c_uint,
+                    )
+                };
+                if ffd < 0 {
+                    return Err(Error::last_os_error());
+                }
+                let mut file = unsafe { std::fs::File::from_raw_fd(ffd) };
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                return Ok(());
+            }
+            // Intermediate component: must be a real directory, never a
+            // symlink. O_NOFOLLOW makes a swapped symlink fail (ELOOP).
+            let dfd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    comp.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if dfd < 0 {
+                return Err(Error::last_os_error());
+            }
+            parent = unsafe { OwnedFd::from_raw_fd(dfd) };
+        }
+        unreachable!("loop returns on the final component");
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("spawn_blocking failed: {e}")))?
+}
+
+/// Non-Unix fallback: no `O_NOFOLLOW`/`openat` walk available; delegate to the
+/// plain writer (the policy parent-canonicalize check still applies).
+#[cfg(not(unix))]
+pub(crate) async fn write_beneath_root(
+    _root: &std::path::Path,
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    write_no_follow(target, bytes).await
+}
+
 /// Resolve a file path with workspace jail enforcement and protected path checks.
 pub(crate) fn resolve_path(
     path: &str,
@@ -383,6 +515,68 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_writes_into_real_subdir() {
+        let root = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        std::fs::create_dir(root_c.join("sub")).unwrap();
+        write_beneath_root(&root_c, &root_c.join("sub/ok.txt"), b"hi")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root_c.join("sub/ok.txt")).unwrap(), b"hi");
+    }
+
+    // SECURITY (F-FS-1): the heart of the fix. An INTERMEDIATE directory
+    // component swapped for a symlink (the classic TOCTOU that O_NOFOLLOW on
+    // the final component alone does NOT catch) must make the write fail, with
+    // nothing written outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_refuses_symlinked_intermediate_component() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+
+        // Real intermediate dir, then swap it for a symlink pointing outside.
+        std::fs::create_dir(root_c.join("sub")).unwrap();
+        std::fs::remove_dir(root_c.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside_c, root_c.join("sub")).unwrap();
+
+        let result = write_beneath_root(&root_c, &root_c.join("sub/evil.txt"), b"pwn").await;
+        assert!(
+            result.is_err(),
+            "write through a symlinked intermediate component must be refused"
+        );
+        assert!(
+            !outside_c.join("evil.txt").exists(),
+            "write escaped the root into the symlink target"
+        );
+    }
+
+    // A symlink at the FINAL component must also be refused (no overwrite of
+    // whatever it points to).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_refuses_symlinked_final_component() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+        let victim = outside_c.join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        std::os::unix::fs::symlink(&victim, root_c.join("link.txt")).unwrap();
+        let result = write_beneath_root(&root_c, &root_c.join("link.txt"), b"pwn").await;
+        assert!(result.is_err(), "write onto a symlink must be refused");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "symlink target was overwritten"
+        );
+    }
 
     #[test]
     fn floor_char_boundary_ascii() {

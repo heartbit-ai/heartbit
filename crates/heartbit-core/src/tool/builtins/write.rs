@@ -99,29 +99,35 @@ impl Tool for WriteTool {
                 Err(msg) => return Ok(ToolOutput::error(msg)),
             };
 
-            if let Some(policy) = &self.path_policy {
-                // SECURITY (F-FS-1): canonicalize the parent and recompose
-                // `parent.canonical + filename`. The previous "walk up to first
-                // existing ancestor, check, then write the original path"
-                // pattern left a TOCTOU window: a parallel tool call (bash
-                // dispatched alongside write via tokio::JoinSet) could replace
-                // an intermediate component with a symlink pointing outside the
-                // workspace between the check and the open. The new method
-                // binds the path to the *real* parent and `O_NOFOLLOW` on the
-                // open closes the race entirely.
-                if let Err(e) = policy.check_path_for_create(&path) {
-                    return Ok(ToolOutput::error(format!("path policy: {e}")));
-                }
-            }
+            // SECURITY (F-FS-1): when a policy is configured, canonicalize the
+            // parent and recompose `parent.canonical + filename` to get the
+            // *real* target, then write it via the symlink-safe component walk
+            // (`write_beneath_root`). The previous code discarded the canonical
+            // path and wrote the original via `write_no_follow`, which only
+            // guards the trailing component — leaving an intermediate-directory
+            // symlink swap (by a parallel tool call dispatched via
+            // tokio::JoinSet) able to redirect the write outside the workspace.
+            let (target, write_root) = match &self.path_policy {
+                Some(policy) => match policy.check_path_for_create(&path) {
+                    Ok(canonical) => {
+                        let root = policy
+                            .allowed_root_for(&canonical)
+                            .map(std::path::Path::to_path_buf);
+                        (canonical, root)
+                    }
+                    Err(e) => return Ok(ToolOutput::error(format!("path policy: {e}"))),
+                },
+                None => (path.clone(), None),
+            };
 
             // If file exists, enforce read-before-write guard
-            if path.exists() {
-                if let Err(msg) = self.file_tracker.check_unmodified(&path) {
+            if target.exists() {
+                if let Err(msg) = self.file_tracker.check_unmodified(&target) {
                     return Ok(ToolOutput::error(msg));
                 }
 
                 // Skip write if content identical
-                if let Ok(existing) = tokio::fs::read_to_string(&path).await
+                if let Ok(existing) = tokio::fs::read_to_string(&target).await
                     && existing == content
                 {
                     return Ok(ToolOutput::success(format!(
@@ -130,26 +136,33 @@ impl Tool for WriteTool {
                 }
             }
 
-            // Create parent directories
-            if let Some(parent) = path.parent()
-                && !parent.exists()
-            {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| Error::Agent(format!("Cannot create directories: {e}")))?;
+            let bytes = content.len();
+            match write_root {
+                // Policy active: symlink-safe walk from the trusted root. The
+                // canonical parent already exists, so no dir creation needed.
+                Some(root) => {
+                    super::write_beneath_root(&root, &target, content.as_bytes())
+                        .await
+                        .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
+                }
+                // No policy: preserve prior behaviour (create parents, then
+                // O_NOFOLLOW write of the trailing component).
+                None => {
+                    if let Some(parent) = target.parent()
+                        && !parent.exists()
+                    {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| Error::Agent(format!("Cannot create directories: {e}")))?;
+                    }
+                    super::write_no_follow(&target, content.as_bytes())
+                        .await
+                        .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
+                }
             }
 
-            // Write the file with O_NOFOLLOW (Unix) so the open syscall fails
-            // if any component of `path` is a symlink. This neutralises the
-            // residual TOCTOU window where a parallel tool call could have
-            // replaced the path between policy check and open.
-            let bytes = content.len();
-            super::write_no_follow(&path, content.as_bytes())
-                .await
-                .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
-
             // Update tracker (so subsequent edits pass the guard)
-            let _ = self.file_tracker.record_read(&path);
+            let _ = self.file_tracker.record_read(&target);
 
             Ok(ToolOutput::success(format!(
                 "File written: {file_path} ({bytes} bytes)"
@@ -423,6 +436,58 @@ mod tests {
         assert_eq!(
             after, "ORIGINAL CONTENT",
             "victim file was modified despite symlink rejection"
+        );
+    }
+
+    // SECURITY (F-FS-1): end-to-end through WriteTool. An INTERMEDIATE
+    // directory swapped for a symlink (the TOCTOU that O_NOFOLLOW-on-the-final-
+    // component alone misses) must be refused and must not write outside the
+    // workspace. Before the fix the canonical target was discarded and the
+    // original path written via write_no_follow, letting the write escape.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_tool_refuses_intermediate_symlink_escape() {
+        use crate::sandbox::CorePathPolicy;
+        use std::os::unix::fs::symlink;
+
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let allowed_c = allowed.path().canonicalize().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+
+        // A real intermediate dir inside the workspace, swapped for a symlink
+        // pointing outside it.
+        std::fs::create_dir(allowed_c.join("sub")).unwrap();
+        std::fs::remove_dir(allowed_c.join("sub")).unwrap();
+        symlink(&outside_c, allowed_c.join("sub")).unwrap();
+
+        let policy = Arc::new(
+            CorePathPolicy::builder()
+                .allow_dir(&allowed_c)
+                .build()
+                .unwrap(),
+        );
+        let tool = WriteTool::new(Arc::new(FileTracker::new()), None, Arc::new(Vec::new()))
+            .with_path_policy(policy);
+
+        let target = allowed_c.join("sub/evil.txt");
+        let outcome = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({
+                    "file_path": target.to_string_lossy(),
+                    "content": "PWNED"
+                }),
+            )
+            .await;
+        // Either a policy reject (Ok error) or a failed open (Err) — both prove
+        // the invariant. The decisive assertion is that nothing escaped.
+        if let Ok(r) = outcome {
+            assert!(r.is_error, "expected error; got success: {:?}", r.content);
+        }
+        assert!(
+            !outside_c.join("evil.txt").exists(),
+            "write escaped the workspace through a symlinked intermediate dir"
         );
     }
 }
