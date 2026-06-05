@@ -77,7 +77,7 @@ impl LlmProvider for OpenRouterProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: OpenAiResponse = response.json().await?;
+        let api_response: OpenAiResponse = super::read_json_capped(response).await?;
         into_completion_response(api_response)
     }
 

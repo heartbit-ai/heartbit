@@ -122,7 +122,8 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: super::openrouter::OpenAiResponse = response.json().await?;
+        let api_response: super::openrouter::OpenAiResponse =
+            super::read_json_capped(response).await?;
         super::openrouter::into_completion_response(api_response)
     }
 

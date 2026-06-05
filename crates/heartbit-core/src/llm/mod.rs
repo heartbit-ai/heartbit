@@ -25,6 +25,33 @@ pub(crate) const STREAM_MAX_TOOL_ARGS_BYTES: usize = 1 << 20; // 1 MiB
 /// of `u32::MAX` triggering a multi-billion-entry Vec allocation.
 pub(crate) const STREAM_MAX_TOOL_CALLS: usize = 256;
 
+/// SECURITY (F-LLM-5): hard cap on a NON-streaming success body. A hostile or
+/// compromised provider can stream gigabytes to a `200 OK` just as easily as
+/// to an error, OOMing the agent before `serde_json` ever runs. 16 MiB is far
+/// above any real completion JSON (max-tokens × bytes/token) yet bounds the
+/// allocation.
+pub(crate) const SUCCESS_BODY_MAX_BYTES: usize = 16 << 20; // 16 MiB
+
+/// Deserialize a successful response body as JSON, capped at
+/// [`SUCCESS_BODY_MAX_BYTES`]. Use instead of `response.json().await?`, which
+/// buffers the entire (potentially unbounded) body first.
+pub(crate) async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
+    let (bytes, truncated) =
+        crate::http::read_body_capped(response, SUCCESS_BODY_MAX_BYTES).await?;
+    if truncated {
+        return Err(Error::Api {
+            status: 200,
+            message: format!("response body exceeded {SUCCESS_BODY_MAX_BYTES}-byte cap"),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::Api {
+        status: 200,
+        message: format!("failed to parse response JSON: {e}"),
+    })
+}
+
 /// Build an `Error::Api` from a failed HTTP response, sanitizing auth errors.
 ///
 /// For 401/403 responses, the body is NOT read to avoid leaking API key

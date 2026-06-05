@@ -9,7 +9,21 @@ use crate::error::Error;
 use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
+use super::audit::{AuditRecord, AuditTrail};
 use super::blackboard::Blackboard;
+
+/// Audit context for blackboard writes (F-AGENT-7). When present, every
+/// `blackboard_write` emits an [`AuditRecord`] so cross-agent state mutations
+/// are attributable (caller / key / tenant).
+#[derive(Clone)]
+pub struct BlackboardAudit {
+    /// Where to persist the record.
+    pub trail: Arc<dyn AuditTrail>,
+    /// Authenticated user on whose behalf the write happens, if known.
+    pub user_id: Option<String>,
+    /// Tenant for multi-tenant isolation, if known.
+    pub tenant_id: Option<String>,
+}
 
 /// Create blackboard tools for sub-agent access to the shared key-value store.
 ///
@@ -24,7 +38,11 @@ use super::blackboard::Blackboard;
 /// orchestrator's automatic per-agent result writes; sub-agents cannot
 /// shadow each other's results by writing `agent:other_worker`. The read
 /// tool stays unnamespaced so sub-agents can read peers' published results.
-pub fn blackboard_tools(blackboard: Arc<dyn Blackboard>, caller: &str) -> Vec<Arc<dyn Tool>> {
+pub fn blackboard_tools(
+    blackboard: Arc<dyn Blackboard>,
+    caller: &str,
+    audit: Option<BlackboardAudit>,
+) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BlackboardReadTool {
             blackboard: blackboard.clone(),
@@ -32,6 +50,7 @@ pub fn blackboard_tools(blackboard: Arc<dyn Blackboard>, caller: &str) -> Vec<Ar
         Arc::new(BlackboardWriteTool {
             blackboard: blackboard.clone(),
             caller: caller.to_string(),
+            audit,
         }),
         Arc::new(BlackboardListTool { blackboard }),
     ]
@@ -108,6 +127,7 @@ impl Tool for BlackboardReadTool {
 struct BlackboardWriteTool {
     blackboard: Arc<dyn Blackboard>,
     caller: String,
+    audit: Option<BlackboardAudit>,
 }
 
 #[derive(Deserialize)]
@@ -164,7 +184,31 @@ impl Tool for BlackboardWriteTool {
             // discovery via blackboard_list, but prepend the caller scope so
             // two agents writing the same logical key don't collide.
             let key = format!("{}{}", caller_namespace(&self.caller), input.key);
+            let value_bytes = serde_json::to_vec(&input.value)
+                .map(|v| v.len())
+                .unwrap_or(0);
             self.blackboard.write(&key, input.value).await?;
+
+            // SECURITY (F-AGENT-7): emit an attributable audit record for the
+            // cross-agent state mutation (caller / key / tenant). Best-effort —
+            // a trail failure must never abort the write that already happened.
+            if let Some(ref audit) = self.audit {
+                let record = AuditRecord {
+                    agent: self.caller.clone(),
+                    turn: 0,
+                    event_type: "blackboard_write".into(),
+                    payload: json!({ "key": key, "value_bytes": value_bytes }),
+                    usage: Default::default(),
+                    timestamp: chrono::Utc::now(),
+                    user_id: audit.user_id.clone(),
+                    tenant_id: audit.tenant_id.clone(),
+                    delegation_chain: Vec::new(),
+                };
+                if let Err(e) = audit.trail.record(record).await {
+                    tracing::warn!(error = %e, key = %key, "blackboard_write audit record failed");
+                }
+            }
+
             Ok(ToolOutput::success(format!(
                 "Written to blackboard key '{key}'."
             )))
@@ -222,7 +266,7 @@ mod tests {
 
     fn setup() -> (Arc<dyn Blackboard>, Vec<Arc<dyn Tool>>) {
         let bb: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
-        let tools = blackboard_tools(bb.clone(), "test_agent");
+        let tools = blackboard_tools(bb.clone(), "test_agent", None);
         (bb, tools)
     }
 
@@ -231,6 +275,45 @@ mod tests {
             .iter()
             .find(|t| t.definition().name == name)
             .unwrap_or_else(|| panic!("tool {name} not found"))
+    }
+
+    // SECURITY (F-AGENT-7): a blackboard write must emit an attributable audit
+    // record (caller / key / tenant) when an audit trail is configured.
+    #[tokio::test]
+    async fn write_emits_audit_record() {
+        use crate::agent::audit::{AuditTrail, InMemoryAuditTrail};
+        use crate::auth::tenant::TenantScope;
+
+        let bb: Arc<dyn Blackboard> = Arc::new(InMemoryBlackboard::new());
+        let trail = Arc::new(InMemoryAuditTrail::new());
+        let audit = BlackboardAudit {
+            trail: trail.clone(),
+            user_id: Some("alice".into()),
+            tenant_id: Some("acme".into()),
+        };
+        let tools = blackboard_tools(bb.clone(), "worker", Some(audit));
+        let write = find_tool(&tools, "blackboard_write");
+
+        write
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"key": "notes", "value": {"x": 1}}),
+            )
+            .await
+            .unwrap();
+
+        let scope = TenantScope::new("acme");
+        let records = trail.entries(&scope, 10).await.unwrap();
+        assert_eq!(records.len(), 1, "expected one audit record");
+        let r = &records[0];
+        assert_eq!(r.event_type, "blackboard_write");
+        assert_eq!(r.agent, "worker");
+        assert_eq!(r.user_id.as_deref(), Some("alice"));
+        assert_eq!(r.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(
+            r.payload.get("key").and_then(|k| k.as_str()),
+            Some("caller:worker/notes")
+        );
     }
 
     #[test]

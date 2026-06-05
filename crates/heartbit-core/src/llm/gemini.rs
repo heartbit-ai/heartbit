@@ -554,7 +554,7 @@ impl LlmProvider for GeminiProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: GeminiResponse = response.json().await?;
+        let api_response: GeminiResponse = super::read_json_capped(response).await?;
         parse_gemini_response(api_response)
     }
 
@@ -712,11 +712,35 @@ fn process_gemini_event(
             for part in &content.parts {
                 match part {
                     GeminiPart::Text { text } if !text.is_empty() => {
-                        all_text.push_str(text);
+                        // SECURITY (F-LLM-4): cap accumulated streaming text so
+                        // a drip-fed sequence of text parts cannot grow the
+                        // buffer without bound. Mirrors the openrouter parser.
+                        if all_text.len().saturating_add(text.len()) <= super::STREAM_MAX_TEXT_BYTES
+                        {
+                            all_text.push_str(text);
+                        } else if all_text.len() < super::STREAM_MAX_TEXT_BYTES {
+                            let remaining = super::STREAM_MAX_TEXT_BYTES - all_text.len();
+                            let take = crate::tool::builtins::floor_char_boundary(text, remaining);
+                            all_text.push_str(&text[..take]);
+                            warn!(
+                                limit = super::STREAM_MAX_TEXT_BYTES,
+                                "gemini stream text truncated at cap"
+                            );
+                        }
                         on_text(text);
                     }
                     GeminiPart::FunctionCall { function_call } => {
-                        tool_calls.push((function_call.name.clone(), function_call.args.clone()));
+                        // SECURITY (F-LLM-4): bound the number of tool calls a
+                        // single streaming response may emit.
+                        if tool_calls.len() < super::STREAM_MAX_TOOL_CALLS {
+                            tool_calls
+                                .push((function_call.name.clone(), function_call.args.clone()));
+                        } else {
+                            warn!(
+                                limit = super::STREAM_MAX_TOOL_CALLS,
+                                "gemini stream tool-call count hit cap, dropping extra"
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -746,6 +770,39 @@ mod tests {
     use super::*;
     use crate::llm::types::{Message, ToolDefinition};
     use serde_json::json;
+
+    // SECURITY (F-LLM-4): a streaming response emitting more than
+    // STREAM_MAX_TOOL_CALLS function calls must be capped, not accumulated
+    // without bound.
+    #[test]
+    fn gemini_stream_tool_call_count_is_capped() {
+        let on_text: Box<crate::llm::OnText> = Box::new(|_: &str| {});
+        let mut all_text = String::new();
+        let mut tool_calls: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut usage = TokenUsage::default();
+
+        // One chunk carrying far more function calls than the cap.
+        let parts: Vec<serde_json::Value> = (0..super::super::STREAM_MAX_TOOL_CALLS + 50)
+            .map(|i| json!({"functionCall": {"name": format!("f{i}"), "args": {}}}))
+            .collect();
+        let data = json!({"candidates": [{"content": {"parts": parts}}]}).to_string();
+
+        process_gemini_event(
+            &data,
+            &on_text,
+            &mut all_text,
+            &mut tool_calls,
+            &mut finish_reason,
+            &mut usage,
+        );
+
+        assert_eq!(
+            tool_calls.len(),
+            super::super::STREAM_MAX_TOOL_CALLS,
+            "tool-call count must be capped at STREAM_MAX_TOOL_CALLS"
+        );
+    }
 
     #[test]
     fn generate_url_correct() {

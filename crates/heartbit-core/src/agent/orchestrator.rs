@@ -496,7 +496,7 @@ impl DelegateTaskTool {
                 if let Some(max) = agent_def.max_total_tokens {
                     builder = builder.max_total_tokens(max);
                 }
-                if let Some(trail) = agent_def.audit_trail {
+                if let Some(trail) = agent_def.audit_trail.clone() {
                     builder = builder.audit_trail(trail);
                 }
                 if let Some(uid) = &agent_def.audit_user_id
@@ -565,7 +565,15 @@ impl DelegateTaskTool {
                 // caller-namespaced (`caller:{name}/...`) and the reserved
                 // `agent:` prefix is denied to sub-agents.
                 if let Some(ref bb) = blackboard {
-                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
+                    let bb_audit = agent_def.audit_trail.clone().map(|trail| {
+                        crate::agent::blackboard_tools::BlackboardAudit {
+                            trail,
+                            user_id: agent_def.audit_user_id.clone(),
+                            tenant_id: agent_def.audit_tenant_id.clone(),
+                        }
+                    });
+                    builder =
+                        builder.tools(blackboard_tools(bb.clone(), &agent_def.name, bb_audit));
                 }
 
                 // Add knowledge tools if knowledge base is configured
@@ -932,7 +940,7 @@ impl Tool for FormSquadTool {
                     if let Some(max) = agent_def.max_total_tokens {
                         builder = builder.max_total_tokens(max);
                     }
-                    if let Some(trail) = agent_def.audit_trail {
+                    if let Some(trail) = agent_def.audit_trail.clone() {
                         builder = builder.audit_trail(trail);
                     }
                     if let Some(uid) = &agent_def.audit_user_id
@@ -999,7 +1007,15 @@ impl Tool for FormSquadTool {
                     // Add blackboard tools using the PRIVATE blackboard.
                     // SECURITY (F-AGENT-7): caller-namespaced; reserved
                     // `agent:` prefix denied to sub-agents.
-                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
+                    let bb_audit = agent_def.audit_trail.clone().map(|trail| {
+                        crate::agent::blackboard_tools::BlackboardAudit {
+                            trail,
+                            user_id: agent_def.audit_user_id.clone(),
+                            tenant_id: agent_def.audit_tenant_id.clone(),
+                        }
+                    });
+                    builder =
+                        builder.tools(blackboard_tools(bb.clone(), &agent_def.name, bb_audit));
 
                     // Add knowledge tools if knowledge base is configured
                     if let Some(ref kb) = knowledge_base {
