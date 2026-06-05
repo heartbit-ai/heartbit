@@ -11,6 +11,7 @@ mod list;
 mod patch;
 mod question;
 mod read;
+mod recall_context;
 mod skill;
 mod todo;
 mod tts;
