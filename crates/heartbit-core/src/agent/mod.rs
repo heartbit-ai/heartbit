@@ -7,6 +7,7 @@ pub(crate) mod blackboard_tools;
 mod builder;
 pub mod cache;
 pub mod context;
+pub mod context_recall;
 pub mod dag;
 pub mod debate;
 mod doom_loop;
