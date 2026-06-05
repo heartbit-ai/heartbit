@@ -67,7 +67,11 @@ All additive/opt-in: `entry_mode=false` and an empty workflow registry reproduce
 
 ## Out of scope (documented follow-ups)
 
-Daemon/Restate unification (TUI only this pass); more recipes beyond the first; LLM-authored workflows (locked out — no DSL/IR); retiring `routing.rs` (left in core, unwired); auto-tuning the squad size.
+Daemon/Restate unification (TUI only this pass); more recipes beyond the first; LLM-authored workflows (locked out — no DSL/IR); retiring `routing.rs` (left in core, unwired); auto-tuning the squad size. **Test-mode compaction fraction (0.15):** the single-agent path set `compaction_threshold_fraction(0.15)` under `HEARTBIT_CONTEXT_DEBUG`; there is no `OrchestratorBuilder` setter for the entry runner's fraction, so the entry agent uses the 0.70 default even in debug mode — acceptable, noted here so it isn't lost. **Large tool surface:** the entry agent carries ~14 builtins + delegate_task + form_squad + run_workflow + any MCP tools — a lot for a weak model (qwen); if it over-delegates or mis-picks, `tool_profile` / `max_tools_per_turn` are the knobs.
+
+## Live verification (PENDING — cannot run in a unit harness)
+
+The original trigger ("que sais-tu" → orchestrator self-describes / force-delegates) is fixed at the prompt + tool level and proven by unit tests, but the behavioral fix with the actual model is a LIVE check: launch the TUI, ask "que sais-tu", confirm a DIRECT prose answer with no spurious `delegate_task` / `run_workflow`; then confirm a genuinely multi-part task does delegate, and "review X from several angles" picks `run_workflow`.
 
 ## Sequencing (implementation order, each its own commit)
 

@@ -4436,6 +4436,89 @@ mod tests {
         );
     }
 
+    // Option C, the SHIPPED config: an entry-mode orchestrator must keep BOTH
+    // its direct tools AND delegate_task on the same runner (i.e. `entry_agent`'s
+    // `.tools()` appends, it does not replace the delegation tool). Mock returns
+    // a noop tool_use, then a delegate_task, then finishes.
+    #[tokio::test]
+    async fn entry_agent_can_both_act_and_delegate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountTool(Arc<AtomicUsize>);
+        impl Tool for CountTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "no-op".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: entry agent uses its OWN direct tool
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: entry agent ALSO delegates (proves delegate_task survived
+                // alongside the appended direct tools)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "d1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({"tasks": [{"agent": "worker", "task": "do it"}]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("worker done"), // sub-agent finishes
+                text_end("synth"),       // entry agent synthesizes
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(provider.clone())
+            .entry_agent(vec![Arc::new(CountTool(direct_calls.clone()))])
+            .sub_agent("worker", "does work", "you work")
+            .build()
+            .unwrap();
+        let out = orch.run("act then delegate").await.unwrap();
+        assert_eq!(out.result, "synth");
+        assert_eq!(
+            direct_calls.load(Ordering::SeqCst),
+            1,
+            "entry agent ran its own direct tool"
+        );
+        // The sub-agent ran too → there were ≥3 LLM calls (entry act, entry
+        // delegate, sub-agent, entry synth). If delegate_task had been wiped, the
+        // delegate tool_use would have errored instead of spawning the worker.
+        assert!(
+            provider.tails.lock().unwrap().len() >= 4,
+            "delegate_task must still be present and spawn the sub-agent"
+        );
+    }
+
     #[test]
     fn sub_agent_context_config_default_is_empty() {
         let cx = SubAgentContextConfig::default();
