@@ -46,6 +46,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) max_tokens: u32,
     pub(super) context_strategy: Option<ContextStrategy>,
     pub(super) summarize_threshold: Option<u32>,
+    pub(super) context_window_tokens: Option<u32>,
+    pub(super) compaction_threshold_fraction: f32,
     pub(super) memory: Option<Arc<dyn Memory>>,
     pub(super) knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
@@ -161,6 +163,19 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// Set the token threshold at which to trigger automatic summarization.
     pub fn summarize_threshold(mut self, threshold: u32) -> Self {
         self.summarize_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the model context window (tokens) to enable the proactive compaction
+    /// backstop (triggers on real prompt tokens crossing the threshold fraction).
+    pub fn context_window_tokens(mut self, tokens: u32) -> Self {
+        self.context_window_tokens = Some(tokens);
+        self
+    }
+
+    /// Fraction of the context window at which to proactively compact (default 0.70).
+    pub fn compaction_threshold_fraction(mut self, fraction: f32) -> Self {
+        self.compaction_threshold_fraction = fraction;
         self
     }
 
@@ -747,6 +762,8 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_tokens: self.max_tokens,
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
+            context_window_tokens: self.context_window_tokens,
+            compaction_threshold_fraction: self.compaction_threshold_fraction,
             on_text: self.on_text,
             on_reasoning: self.on_reasoning,
             on_approval: self.on_approval,

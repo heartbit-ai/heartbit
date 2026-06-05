@@ -141,6 +141,17 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) context_strategy: ContextStrategy,
     /// Token threshold at which to trigger summarization. `None` = no summarization.
     pub(super) summarize_threshold: Option<u32>,
+    /// Model context window (tokens) for the proactive-compaction backstop. When
+    /// `Some`, compaction triggers on real `usage.input_tokens` crossing
+    /// `compaction_threshold_fraction * window`. `None` -> fall back to the
+    /// `summarize_threshold` estimate path.
+    // Task 1 plumbing — read in Task 2 when the trigger logic is wired.
+    #[allow(dead_code)]
+    pub(super) context_window_tokens: Option<u32>,
+    /// Fraction of the context window at which the backstop fires (default 0.70).
+    // Task 1 plumbing — read in Task 2 when the trigger logic is wired.
+    #[allow(dead_code)]
+    pub(super) compaction_threshold_fraction: f32,
     /// Optional callback for streaming text output.
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
     /// Optional callback for streaming reasoning (chain-of-thought) output.
@@ -284,6 +295,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             max_tokens: 4096,
             context_strategy: None,
             summarize_threshold: None,
+            context_window_tokens: None,
+            compaction_threshold_fraction: 0.70,
             memory: None,
             knowledge_base: None,
             on_text: None,
