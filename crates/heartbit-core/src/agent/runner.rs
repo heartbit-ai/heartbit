@@ -73,6 +73,13 @@ pub struct ToolCallRecord {
     pub duration_ms: u64,
 }
 
+/// Whether `input_tokens` has reached `fraction` of the context `window`.
+/// Returns false for a zero window (unknown → no trigger). `fraction` is
+/// clamped to [0.0, 1.0] defensively.
+fn over_window_fraction(input_tokens: u32, window: u32, fraction: f32) -> bool {
+    window > 0 && input_tokens as f32 >= fraction.clamp(0.0, 1.0) * window as f32
+}
+
 /// Output of a completed agent run.
 ///
 /// Returned by [`AgentRunner::execute`] on success. Contains the agent's
@@ -145,12 +152,8 @@ pub struct AgentRunner<P: LlmProvider> {
     /// `Some`, compaction triggers on real `usage.input_tokens` crossing
     /// `compaction_threshold_fraction * window`. `None` -> fall back to the
     /// `summarize_threshold` estimate path.
-    // Task 1 plumbing — read in Task 2 when the trigger logic is wired.
-    #[allow(dead_code)]
     pub(super) context_window_tokens: Option<u32>,
     /// Fraction of the context window at which the backstop fires (default 0.70).
-    // Task 1 plumbing — read in Task 2 when the trigger logic is wired.
-    #[allow(dead_code)]
     pub(super) compaction_threshold_fraction: f32,
     /// Optional callback for streaming text output.
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
@@ -595,6 +598,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Prevents infinite compaction loops: set true after compaction,
             // cleared at the start of each normal iteration.
             let mut compacted_last_turn = false;
+            // Anti-thrash guard for proactive compaction: never fire two turns running.
+            let mut proactive_compacted_last_turn = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -927,6 +932,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 };
                 total_usage += response.usage;
+                // Real post-prune input token count for the proactive compaction backstop.
+                let last_input_tokens = response.usage.input_tokens;
 
                 // Reconcile per-tenant in-flight token estimate with actual usage.
                 // Uses cumulative `total_usage` (not per-turn) so the tracker always
@@ -1769,14 +1776,25 @@ impl<P: LlmProvider> AgentRunner<P> {
                     );
                 }
 
-                // Summarization: if threshold is set and context exceeds it, compress.
-                // Guard on message count: inject_summary(keep_last_n=4) is a no-op
-                // when total messages <= 5 (1 first + 4 kept), so skip the LLM call.
-                if !tool_interrupted
-                    && let Some(threshold) = self.summarize_threshold
+                // Proactive compaction backstop. Prefer the REAL post-prune token
+                // count vs the window fraction; fall back to the chars/4 estimate
+                // vs summarize_threshold when no window is known. Never compact two
+                // turns running (anti-thrash).
+                let proactive_trigger = match self.context_window_tokens {
+                    Some(window) => over_window_fraction(
+                        last_input_tokens,
+                        window,
+                        self.compaction_threshold_fraction,
+                    ),
+                    None => self
+                        .summarize_threshold
+                        .is_some_and(|t| ctx.needs_compaction(t)),
+                };
+                let do_proactive_compact = !tool_interrupted
                     && ctx.message_count() > 5
-                    && ctx.needs_compaction(threshold)
-                {
+                    && !proactive_compacted_last_turn
+                    && proactive_trigger;
+                if do_proactive_compact {
                     debug!(agent = %self.name, "context exceeds threshold, summarizing");
                     let summarize_span = info_span!(
                         "heartbit.agent.summarize",
@@ -1807,6 +1825,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         });
                     }
                 }
+                proactive_compacted_last_turn = do_proactive_compact;
             }
         }
         .instrument(run_span.clone())
@@ -3022,6 +3041,178 @@ mod tests {
         assert!(
             !found_full,
             "FULL_BLOB_DATA_XYZ should NOT be in conversation history sent to LLM"
+        );
+    }
+
+    #[test]
+    fn over_window_fraction_triggers_at_or_above_budget() {
+        assert!(super::over_window_fraction(700, 1000, 0.70));
+        assert!(super::over_window_fraction(800, 1000, 0.70));
+        assert!(!super::over_window_fraction(699, 1000, 0.70));
+        assert!(!super::over_window_fraction(10, 0, 0.70)); // unknown window -> no trigger
+    }
+
+    /// Helper to build a tool-use response where the LLM reports `input_tokens`.
+    fn tool_use_with_tokens(input_tokens: u32) -> crate::llm::types::CompletionResponse {
+        crate::llm::types::CompletionResponse {
+            content: vec![crate::llm::types::ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "noop".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_fires_when_real_tokens_cross_window_fraction() {
+        // window=1000, fraction=0.70 → budget=700. Three tool-use turns drive
+        // message_count to 7 (>5) while reporting 800 input tokens (>= 700).
+        // Proactive compaction fires on turn 3, consuming the summary response.
+        // Turn 4 is a terminal text response.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),                         // turn 1 main LLM
+            tool_use_with_tokens(800),                         // turn 2 main LLM
+            tool_use_with_tokens(800),                         // turn 3 main LLM — fires compaction
+            MockProvider::text_response("summary text", 1, 1), // summary call
+            MockProvider::text_response("done", 800, 1),       // turn 4 main LLM
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert!(
+            summarized >= 1,
+            "expected at least 1 ContextSummarized event, got {summarized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_does_not_fire_below_fraction() {
+        // Same shape but input_tokens=600 (< 700 budget) → ZERO ContextSummarized.
+        // Three tool-use turns still needed so message_count crosses 5.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(600),                   // turn 1
+            tool_use_with_tokens(600),                   // turn 2
+            tool_use_with_tokens(600),                   // turn 3 — 600 < 700, no compact
+            MockProvider::text_response("done", 600, 1), // turn 4 terminal
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 0,
+            "expected 0 ContextSummarized events below fraction, got {summarized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_does_not_thrash_two_turns_running() {
+        // Turns 1-3 drive message_count >5. Turn 3 fires compaction (consuming
+        // the summary response). Turn 4 is also a high-token tool-use turn but
+        // is suppressed by the anti-thrash flag. Turn 5 is a terminal text
+        // response. Net result: exactly 1 ContextSummarized.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),                         // turn 1 main LLM
+            tool_use_with_tokens(800),                         // turn 2 main LLM
+            tool_use_with_tokens(800),                         // turn 3 main LLM — fires compaction
+            MockProvider::text_response("summary text", 1, 1), // summary call (turn 3)
+            tool_use_with_tokens(800), // turn 4 main LLM — suppressed by anti-thrash
+            MockProvider::text_response("done", 800, 1), // turn 5 terminal
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 1,
+            "anti-thrash guard must cap at exactly 1 ContextSummarized, got {summarized}"
         );
     }
 }
