@@ -5900,4 +5900,66 @@ mod tests {
             "exactly one tool call should be recorded (denied)"
         );
     }
+
+    #[tokio::test]
+    async fn tool_output_is_indexed_into_the_context_recall_store() {
+        use crate::agent::context_recall::ContextRecallStore;
+        use crate::tool::builtins::{BuiltinToolsConfig, builtin_tools};
+
+        let store = Arc::new(ContextRecallStore::new());
+
+        // Turn 1: call glob with id "tc_x" (glob runs without approval).
+        // Turn 2: return final text.
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tc_x".into(),
+                    name: "glob".into(),
+                    input: json!({"pattern": "*.rs"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage {
+                    input_tokens: 15,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            },
+        ]));
+
+        let tools = builtin_tools(BuiltinToolsConfig {
+            context_recall_store: Some(store.clone()),
+            ..Default::default()
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("idx")
+            .system_prompt("sys")
+            .tools(tools)
+            .context_recall_store(store.clone())
+            .max_turns(3)
+            .build()
+            .unwrap();
+
+        runner.execute("go").await.unwrap();
+
+        assert!(
+            store.get("tc_x").await.is_some(),
+            "the tool output should be indexed by tool_call_id"
+        );
+    }
 }

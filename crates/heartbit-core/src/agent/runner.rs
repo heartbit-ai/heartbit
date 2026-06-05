@@ -213,6 +213,9 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) session_prune_config: Option<pruner::SessionPruneConfig>,
     /// Optional memory store reference for pre-compaction flush.
     pub(super) memory: Option<Arc<dyn Memory>>,
+    /// Optional per-run context recall store. When set, every tool output is
+    /// indexed by `tool_call_id` so pruned results can be restored on demand.
+    pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
     /// When true, use recursive (cluster-then-summarize) summarization for
     /// long conversations instead of single-shot.
     pub(super) enable_recursive_summarization: bool,
@@ -322,6 +325,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             audit_delegation_chain: Vec::new(),
             response_cache_size: None,
             tenant_tracker: None,
+            context_recall_store: None,
         }
     }
 
@@ -2452,6 +2456,14 @@ impl<P: LlmProvider> AgentRunner<P> {
                 delegation_chain: self.audit_delegation_chain.clone(),
             })
             .await;
+
+            // Index every tool output into the context recall store so pruned
+            // results can be restored on demand via `fetch_full_output`.
+            if let Some(store) = &self.context_recall_store {
+                store
+                    .index(&call_ids[idx], &call_names[idx], &output.content)
+                    .await;
+            }
 
             // Capture FULL post-guardrail content for AgentOutput.tool_call_results.
             // This is the raw output as the caller would expect to see it; the

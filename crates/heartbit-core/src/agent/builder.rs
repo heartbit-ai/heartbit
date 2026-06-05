@@ -22,6 +22,12 @@ use super::pruner;
 use super::runner::{AgentRunner, OnInput, RESOURCEFULNESS_GUIDELINES};
 use super::tool_filter;
 
+/// Appended to the system prompt when restore-on-demand is enabled, so the model
+/// knows to act on a pruned marker.
+const CONTEXT_RECALL_HINT: &str = "\n\nNote: old tool outputs may be truncated with a \
+    '[pruned: … id=<ref>]' marker. Call fetch_full_output(<ref>) to restore the exact content, \
+    or recall_context(<query>) to find older outputs by meaning.";
+
 /// Builder for [`AgentRunner`].
 ///
 /// Construct via [`AgentRunner::builder`], configure the agent with chainable
@@ -97,6 +103,9 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     /// actual usage against the estimate. Has no effect when `audit_tenant_id`
     /// is unset.
     pub(super) tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Optional per-run context recall store. When set, every tool output is
+    /// indexed by `tool_call_id` so pruned results can be restored on demand.
+    pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -546,6 +555,17 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Enable restore-on-demand: share a `ContextRecallStore` so tool outputs are
+    /// indexed for `fetch_full_output` / `recall_context`. Pass the SAME store
+    /// into `BuiltinToolsConfig.context_recall_store` so the tools are registered.
+    pub fn context_recall_store(
+        mut self,
+        store: Arc<crate::agent::context_recall::ContextRecallStore>,
+    ) -> Self {
+        self.context_recall_store = Some(store);
+        self
+    }
+
     /// Validate the builder and produce a ready-to-run [`AgentRunner`].
     ///
     /// Returns [`Error::Config`] for mis-configured runners (empty name, zero `max_turns`,
@@ -712,6 +732,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             Utc::now().format("%A, %B %-d, %Y %H:%M")
         ));
 
+        // When restore-on-demand is enabled, tell the model it can fetch pruned results.
+        if self.context_recall_store.is_some() {
+            system_prompt.push_str(CONTEXT_RECALL_HINT);
+        }
+
         Ok(AgentRunner {
             provider: self.provider,
             name: self.name,
@@ -762,6 +787,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             audit_delegation_chain: self.audit_delegation_chain,
             response_cache: self.response_cache_size.map(cache::ResponseCache::new),
             tenant_tracker: self.tenant_tracker,
+            context_recall_store: self.context_recall_store,
             cumulative_actual_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }
