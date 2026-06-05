@@ -11,8 +11,6 @@ use crate::tool::{Tool, ToolOutput};
 
 /// Restores the exact untruncated content of a past tool result by its ref
 /// (the `tool_call_id`), e.g. after the pruner truncated it.
-// Will be wired into `builtin_tools` in Task 7; suppress dead-code until then.
-#[allow(dead_code)]
 pub(crate) struct FetchFullOutputTool {
     pub(crate) store: Arc<ContextRecallStore>,
 }

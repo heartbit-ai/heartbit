@@ -206,6 +206,10 @@ pub struct BuiltinToolsConfig {
     /// Level-1 catalog is built from, so the catalog never advertises a skill the
     /// tool cannot load. Empty (default) = conventional discovery only.
     pub skill_dirs: Vec<PathBuf>,
+    /// When present, registers the `fetch_full_output` / `recall_context` tools
+    /// and is shared with the runner for indexing. `None` = feature off (zero
+    /// overhead: tools not registered, no indexing).
+    pub context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
 }
 
 /// Sensible default `protected_paths` patterns for filesystem builtins.
@@ -260,6 +264,7 @@ impl Default for BuiltinToolsConfig {
             allowlist: None,
             path_policy: None,
             skill_dirs: Vec::new(),
+            context_recall_store: None,
         }
     }
 }
@@ -352,6 +357,15 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
     #[cfg(feature = "ghost-domain-config")]
     if let Some(creds) = config.twitter_credentials {
         tools.push(Arc::new(twitter_post::TwitterPostTool::new(creds)));
+    }
+
+    if let Some(store) = &config.context_recall_store {
+        tools.push(Arc::new(fetch_full_output::FetchFullOutputTool {
+            store: store.clone(),
+        }));
+        tools.push(Arc::new(recall_context::RecallContextTool {
+            store: store.clone(),
+        }));
     }
 
     if let Some(ref allowed) = config.allowlist {
@@ -579,5 +593,31 @@ mod tests {
         };
         let tools = builtin_tools(config);
         assert_eq!(tools.len(), 0);
+    }
+
+    #[test]
+    fn context_recall_tools_registered_only_when_store_present() {
+        use std::sync::Arc;
+        // Off: no store -> tools absent.
+        let off = builtin_tools(BuiltinToolsConfig::default());
+        assert!(
+            !off.iter()
+                .any(|t| t.definition().name == "fetch_full_output")
+        );
+        assert!(!off.iter().any(|t| t.definition().name == "recall_context"));
+
+        // On: store present -> both tools registered.
+        let cfg = BuiltinToolsConfig {
+            context_recall_store: Some(Arc::new(
+                crate::agent::context_recall::ContextRecallStore::new(),
+            )),
+            ..Default::default()
+        };
+        let on = builtin_tools(cfg);
+        assert!(
+            on.iter()
+                .any(|t| t.definition().name == "fetch_full_output")
+        );
+        assert!(on.iter().any(|t| t.definition().name == "recall_context"));
     }
 }

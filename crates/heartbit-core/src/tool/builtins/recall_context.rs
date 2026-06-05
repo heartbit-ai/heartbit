@@ -12,8 +12,6 @@ use crate::tool::{Tool, ToolOutput};
 /// Semantically find earlier tool outputs by meaning (when you don't remember
 /// the exact ref). Returns ranked refs + snippets; restore the full body with
 /// fetch_full_output(ref).
-// Will be wired into `builtin_tools` in Task 7; suppress dead-code until then.
-#[allow(dead_code)]
 pub(crate) struct RecallContextTool {
     pub(crate) store: Arc<ContextRecallStore>,
 }
