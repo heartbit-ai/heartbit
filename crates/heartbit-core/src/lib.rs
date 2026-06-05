@@ -40,6 +40,7 @@ pub use agent::batch::{BatchConfig, BatchExecutor, BatchExecutorBuilder, BatchRe
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::cache::ResponseCache;
 pub use agent::context::ContextStrategy;
+pub use agent::context_recall::{ContextRecallStore, RecallHit};
 pub use agent::dag::{DagAgent, DagAgentBuilder};
 pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
