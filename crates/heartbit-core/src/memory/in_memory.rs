@@ -160,6 +160,11 @@ impl InMemoryStore {
         self.max_entries = max_entries;
         self
     }
+
+    /// Exact lookup of a stored entry by id (no recall scoring, no reinforcement).
+    pub fn get(&self, id: &str) -> Option<MemoryEntry> {
+        self.entries.read().get(id).cloned()
+    }
 }
 
 impl Default for InMemoryStore {
@@ -1104,6 +1109,18 @@ mod tests {
     fn is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryStore>();
+    }
+
+    #[tokio::test]
+    async fn get_returns_entry_by_id_or_none() {
+        let store = InMemoryStore::new();
+        let scope = test_scope();
+        let entry = make_entry("e1", "test", "hello world", "fact");
+        store.store(&scope, entry).await.unwrap();
+
+        let got = store.get("e1").expect("entry e1 should exist");
+        assert_eq!(got.content, "hello world");
+        assert!(store.get("missing").is_none());
     }
 
     #[tokio::test]
