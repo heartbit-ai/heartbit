@@ -135,6 +135,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "show or set the model"),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
+    ("/context-recall", "toggle context restore-on-demand"),
     ("/clear", "clear the transcript"),
     ("/resume", "reopen a saved session"),
     ("/export", "export the transcript to Markdown"),
@@ -159,6 +160,7 @@ pub enum Effect {
     WalkFiles,
     /// Persist the multi-agent (orchestrator) mode flag to the config file.
     SaveMultiAgent(bool),
+    SaveContextRecall(bool),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
     SetPermissionMode(u8),
     /// Export the current transcript (read from `App.history`) to a Markdown file.
@@ -242,6 +244,10 @@ pub struct App {
     pub models_loading: bool,
     /// Multi-agent orchestrator mode (applies on next agent start).
     pub multi_agent: bool,
+    /// Context restore-on-demand (single-agent path): index tool outputs + gentle
+    /// session pruner so old tool results truncate to a restorable marker. ON by
+    /// default; toggled via `/context-recall`, applies on next start.
+    pub context_recall: bool,
     /// The available sub-agent pool (multi-agent mode), seeded into the roster as
     /// Idle at the start of each turn so the user always sees the whole squad —
     /// and can tell when only some of it actually gets dispatched.
@@ -300,6 +306,7 @@ impl App {
             models: Vec::new(),
             models_loading: false,
             multi_agent: false,
+            context_recall: true,
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),
@@ -811,6 +818,7 @@ impl App {
             }
             "mcp" => self.handle_mcp(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
+            "context-recall" | "recall" => self.toggle_context_recall(arg),
             "clear" | "new" => {
                 self.history.clear();
                 self.todos.clear();
@@ -945,6 +953,35 @@ impl App {
             if new { "ON" } else { "OFF" },
             if new {
                 " — orchestrator delegates to a worker/researcher squad"
+            } else {
+                ""
+            }
+        )));
+    }
+
+    /// Toggle context restore-on-demand (single-agent path). Persisted; applies on
+    /// the next agent start.
+    fn toggle_context_recall(&mut self, arg: String) {
+        let new = match arg.trim().to_lowercase().as_str() {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            "" => !self.context_recall,
+            other => {
+                self.history.push(Cell::Notice(format!(
+                    "usage: /context-recall [on|off] (currently {})",
+                    if self.context_recall { "on" } else { "off" }
+                )));
+                let _ = other;
+                return;
+            }
+        };
+        self.context_recall = new;
+        self.effects.push(Effect::SaveContextRecall(new));
+        self.history.push(Cell::Notice(format!(
+            "context restore-on-demand {} (applies on next start){}",
+            if new { "ON" } else { "OFF" },
+            if new {
+                " — old tool outputs prune to a restorable marker (fetch_full_output / recall_context)"
             } else {
                 ""
             }
@@ -1647,6 +1684,21 @@ mod tests {
         app.update(key(KeyCode::Enter));
         assert!(!app.multi_agent);
         assert!(app.effects.contains(&Effect::SaveMultiAgent(false)));
+    }
+
+    #[test]
+    fn slash_context_recall_toggles_and_saves() {
+        let mut app = keyed();
+        assert!(app.context_recall, "context-recall is ON by default");
+        typed(&mut app, "/context-recall off");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.context_recall, "explicit off disables it");
+        assert!(app.effects.contains(&Effect::SaveContextRecall(false)));
+        // bare toggle flips it back on
+        typed(&mut app, "/context-recall");
+        app.update(key(KeyCode::Enter));
+        assert!(app.context_recall);
+        assert!(app.effects.contains(&Effect::SaveContextRecall(true)));
     }
 
     #[test]

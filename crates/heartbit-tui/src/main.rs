@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
     app.has_fallback_provider = has_anthropic;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
+    app.context_recall = cfg.context_recall;
     // Seed the roster's available squad so the full pool is visible in the TUI
     // (and the user can see when only part of it is actually dispatched).
     if cfg.multi_agent {
@@ -221,12 +222,28 @@ impl Engine {
 
 /// A fresh set of workspace-rooted builtin tools (each call gets its own
 /// `FileTracker` etc.). The API key never enters the tool env (safe allowlist).
-fn fresh_builtins(cwd: &std::path::Path) -> Vec<Arc<dyn heartbit_core::tool::Tool>> {
+fn fresh_builtins(
+    cwd: &std::path::Path,
+    context_recall_store: Option<&Arc<heartbit_core::ContextRecallStore>>,
+) -> Vec<Arc<dyn heartbit_core::tool::Tool>> {
     let mut tool_cfg = BuiltinToolsConfig::default();
     tool_cfg.workspace = Some(cwd.to_path_buf());
     tool_cfg.dangerous_tools = true;
     tool_cfg.env_policy = heartbit_core::workspace::EnvPolicy::default();
+    // When present, registers fetch_full_output / recall_context for restore-on-demand.
+    tool_cfg.context_recall_store = context_recall_store.cloned();
     builtin_tools(tool_cfg)
+}
+
+/// A gentle session-prune config paired with context-recall: keep the last few
+/// turns at full fidelity, truncate older tool results to ~1KB (each carrying a
+/// `fetch_full_output(<id>)` marker so the full content is recoverable).
+fn gentle_prune_config() -> heartbit_core::SessionPruneConfig {
+    heartbit_core::SessionPruneConfig {
+        keep_recent_n: 3,
+        pruned_tool_result_max_bytes: 1024,
+        preserve_task: true,
+    }
 }
 
 /// Two capable generalist sub-agents (≥2 → dynamic squads auto-enable). Each gets
@@ -237,7 +254,7 @@ fn default_sub_agents(
     mcp_tools: &[Arc<dyn heartbit_core::tool::Tool>],
 ) -> Vec<SubAgentConfig> {
     let make = |name: &str, description: &str, prompt: &str| {
-        let mut tools = fresh_builtins(cwd);
+        let mut tools = fresh_builtins(cwd, None);
         tools.extend(mcp_tools.iter().cloned());
         SubAgentConfig {
             name: name.into(),
@@ -276,6 +293,7 @@ async fn build_engine(
     interrupt: InterruptHandle,
     mcp_servers: Vec<config::McpServerSpec>,
     multi_agent: bool,
+    context_recall: bool,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
 ) -> anyhow::Result<Engine> {
     let provider = build_provider(api_key, model)?;
@@ -299,8 +317,13 @@ async fn build_engine(
             }
         }
     }
+    // Context restore-on-demand (single-agent path only): a per-run store that
+    // indexes every tool output so the gentle pruner's truncation is reversible
+    // (the model restores via fetch_full_output / recall_context).
+    let recall_store = (context_recall && !multi_agent)
+        .then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
     // The single agent's tools: builtins FIRST so MCP can't shadow a trusted one.
-    let mut tools = fresh_builtins(&cwd);
+    let mut tools = fresh_builtins(&cwd, recall_store.as_ref());
     tools.extend(mcp_tools.iter().cloned());
 
     let on_text: Arc<OnText> = {
@@ -423,7 +446,7 @@ async fn build_engine(
         let orch = builder.build()?;
         Ok(Engine::Multi(Box::new(orch)))
     } else {
-        let runner = AgentRunner::builder(provider)
+        let mut rb = AgentRunner::builder(provider)
             .name("heartbit")
             .system_prompt(SYSTEM_PROMPT)
             .instruction_text(project_context)
@@ -436,8 +459,18 @@ async fn build_engine(
             .on_event(on_event)
             .on_approval(on_approval)
             .on_input(on_input)
-            .interrupt(interrupt)
-            .build()?;
+            .interrupt(interrupt);
+        // Restore-on-demand: share the SAME store for indexing, and pair it with a
+        // gentle pruner so old tool outputs truncate to a restorable marker.
+        if let Some(store) = &recall_store {
+            rb = rb
+                .context_recall_store(store.clone())
+                .session_prune_config(gentle_prune_config());
+            let _ = ui_tx.send(Msg::Notice(
+                "context restore-on-demand ON — old tool outputs are recoverable via fetch_full_output / recall_context".into(),
+            ));
+        }
+        let runner = rb.build()?;
         Ok(Engine::Single(Box::new(runner)))
     }
 }
@@ -553,6 +586,7 @@ fn spawn_agent(
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
     let multi_agent = app.multi_agent;
+    let context_recall = app.context_recall;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -575,6 +609,7 @@ fn spawn_agent(
                 interrupt,
                 mcp_servers,
                 multi_agent,
+                context_recall,
                 perm_mode,
             )
             .await
@@ -757,6 +792,16 @@ async fn run_ui(
                         .history
                         .push(Cell::Notice(format!("could not resume: {e}"))),
                 },
+                Effect::SaveContextRecall(on) => {
+                    // Persist; applies on the next agent start (it changes the tool
+                    // set + pruner, so we don't hot-swap a running engine).
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.context_recall = on;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
                 Effect::SaveMultiAgent(on) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.multi_agent = on;

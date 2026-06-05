@@ -65,7 +65,7 @@ impl McpServerSpec {
 }
 
 /// Persisted TUI settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     /// The OpenRouter API token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +80,35 @@ pub struct TuiConfig {
     /// a single agent. Toggled in-TUI via `/agents`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multi_agent: bool,
+    /// Context restore-on-demand: index tool outputs + enable a gentle session
+    /// pruner so old tool results are truncated (with a restorable marker) and
+    /// recoverable via `fetch_full_output` / `recall_context`. ON by default;
+    /// toggled in-TUI via `/context-recall`. Single-agent path only.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub context_recall: bool,
+}
+
+/// serde default for `context_recall` (ON unless the config explicitly disables it).
+fn default_true() -> bool {
+    true
+}
+
+/// `skip_serializing_if` for `context_recall`: only persist the non-default (off).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            openrouter_api_key: None,
+            model: None,
+            mcp_servers: Vec::new(),
+            multi_agent: false,
+            context_recall: true,
+        }
+    }
 }
 
 impl TuiConfig {
