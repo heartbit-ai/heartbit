@@ -285,7 +285,8 @@ pub use image_generate::ImageGenerateTool;
 pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
-pub use todo::{TodoPriority, TodoStatus, TodoStore};
+pub(crate) use todo::recite_open_todos;
+pub use todo::{TodoPriority, TodoStatus, TodoStore, todo_tools};
 #[cfg(feature = "ghost-domain-config")]
 pub use twitter_post::TwitterCredentials;
 pub use webfetch::WebFetchTool;

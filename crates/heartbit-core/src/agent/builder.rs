@@ -108,6 +108,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     /// Optional per-run context recall store. When set, every tool output is
     /// indexed by `tool_call_id` so pruned results can be restored on demand.
     pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Optional shared to-do store for long-horizon-planning recitation.
+    pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -581,6 +583,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the shared [`TodoStore`](crate::tool::builtins::TodoStore) so the
+    /// runner recites open plan items at the context tail each turn. Pass the
+    /// SAME store that backs the `todowrite`/`todoread` tools.
+    pub fn todo_store(mut self, store: Arc<crate::tool::builtins::TodoStore>) -> Self {
+        self.todo_store = Some(store);
+        self
+    }
+
     /// Validate the builder and produce a ready-to-run [`AgentRunner`].
     ///
     /// Returns [`Error::Config`] for mis-configured runners (empty name, zero `max_turns`,
@@ -805,6 +815,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             response_cache: self.response_cache_size.map(cache::ResponseCache::new),
             tenant_tracker: self.tenant_tracker,
             context_recall_store: self.context_recall_store,
+            todo_store: self.todo_store,
             cumulative_actual_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }

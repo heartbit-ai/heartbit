@@ -226,6 +226,7 @@ impl Engine {
 fn fresh_builtins(
     cwd: &std::path::Path,
     context_recall_store: Option<&Arc<heartbit_core::ContextRecallStore>>,
+    todo_store: Option<&Arc<heartbit_core::tool::builtins::TodoStore>>,
 ) -> Vec<Arc<dyn heartbit_core::tool::Tool>> {
     let mut tool_cfg = BuiltinToolsConfig::default();
     tool_cfg.workspace = Some(cwd.to_path_buf());
@@ -233,6 +234,11 @@ fn fresh_builtins(
     tool_cfg.env_policy = heartbit_core::workspace::EnvPolicy::default();
     // When present, registers fetch_full_output / recall_context for restore-on-demand.
     tool_cfg.context_recall_store = context_recall_store.cloned();
+    // Share the SAME todo store the runner recites from (long-horizon planning),
+    // so todowrite/todoread and the per-turn recitation see one list.
+    if let Some(store) = todo_store {
+        tool_cfg.todo_store = store.clone();
+    }
     builtin_tools(tool_cfg)
 }
 
@@ -274,7 +280,7 @@ fn default_sub_agents(
     mcp_tools: &[Arc<dyn heartbit_core::tool::Tool>],
 ) -> Vec<SubAgentConfig> {
     let make = |name: &str, description: &str, prompt: &str| {
-        let mut tools = fresh_builtins(cwd, None);
+        let mut tools = fresh_builtins(cwd, None, None);
         tools.extend(mcp_tools.iter().cloned());
         SubAgentConfig {
             name: name.into(),
@@ -344,8 +350,12 @@ async fn build_engine(
     // (the model restores via fetch_full_output / recall_context).
     let recall_store = (context_recall && !multi_agent)
         .then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
+    // Long-horizon planning (single-agent path): a shared todo store the runner
+    // recites at the context tail each turn, kept in sync with todowrite/read.
+    let todo_store =
+        (!multi_agent).then(|| Arc::new(heartbit_core::tool::builtins::TodoStore::new()));
     // The single agent's tools: builtins FIRST so MCP can't shadow a trusted one.
-    let mut tools = fresh_builtins(&cwd, recall_store.as_ref());
+    let mut tools = fresh_builtins(&cwd, recall_store.as_ref(), todo_store.as_ref());
     tools.extend(mcp_tools.iter().cloned());
     // Self-verification (opt-in via /verify): a deterministic `verify` tool that
     // runs the project's build/test command (VERIFY_RESULT: PASS/FAIL).
@@ -500,6 +510,12 @@ async fn build_engine(
             .on_approval(on_approval)
             .on_input(on_input)
             .interrupt(interrupt);
+        // Long-horizon planning: recite the live plan (open todos) at the
+        // context tail every turn. Self-gates to nothing until the agent writes
+        // todos, so trivial chats pay zero overhead.
+        if let Some(store) = &todo_store {
+            rb = rb.todo_store(store.clone());
+        }
         // Restore-on-demand: share the SAME store for indexing, and pair it with a
         // gentle pruner so old tool outputs truncate to a restorable marker.
         if let Some(store) = &recall_store {

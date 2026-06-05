@@ -246,6 +246,12 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Optional per-run context recall store. When set, every tool output is
     /// indexed by `tool_call_id` so pruned results can be restored on demand.
     pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Optional shared to-do store. When set, the runner recites the open
+    /// (Pending/InProgress) items at the context tail each turn — the
+    /// long-horizon-planning "recitation" mechanism that keeps the live plan in
+    /// recent attention and lets it survive compaction (re-recited from the
+    /// store, not a lossy summary).
+    pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
     /// When true, use recursive (cluster-then-summarize) summarization for
     /// long conversations instead of single-shot.
     pub(super) enable_recursive_summarization: bool,
@@ -358,6 +364,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             response_cache_size: None,
             tenant_tracker: None,
             context_recall_store: None,
+            todo_store: None,
         }
     }
 
@@ -669,6 +676,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 } else {
                     ctx.to_request()
                 };
+
+                // Long-horizon planning (recitation): re-surface the live plan
+                // (open todos, read from the actual store) at the context tail
+                // each turn. This keeps the plan in recent attention (counters
+                // lost-in-the-middle) and means it survives compaction — the
+                // next turn re-recites from the store, not a lossy summary.
+                // Self-gating: no open todos (trivial/chat tasks) → no block.
+                // Appended to the LAST message (a user/tool-result), NOT the
+                // system prompt or a new message, so prompt-cache prefixes and
+                // role alternation are untouched.
+                if let Some(ref store) = self.todo_store
+                    && let Some(block) =
+                        crate::tool::builtins::recite_open_todos(&store.open_items())
+                    && let Some(last) = request.messages.last_mut()
+                {
+                    last.content.push(ContentBlock::Text { text: block });
+                }
 
                 // Tool profile pre-filter: narrow tool set based on query classification
                 if let Some(profile) = self.tool_profile {
@@ -2590,6 +2614,87 @@ mod tests {
 
     use super::super::test_helpers::MockProvider;
     use super::AgentRunner;
+
+    // Long-horizon planning (recitation): when a todo_store has open items,
+    // the runner appends a plan block to the tail of the last message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recites_open_todos_at_context_tail() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        // Populate via the tool so we exercise the real store path.
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        let write = tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap();
+        write
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"todos": [
+                    {"content": "finish the parser", "status": "in_progress", "priority": "high"},
+                    {"content": "write the docs", "status": "pending", "priority": "medium"}
+                ]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 1, 1,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .todo_store(store)
+            .max_turns(1)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let last_msg = reqs[0].messages.last().expect("at least one message");
+        let tail_text: String = last_msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            tail_text.contains("[plan — open items"),
+            "recitation block missing from tail: {tail_text:?}"
+        );
+        assert!(tail_text.contains("[>] finish the parser"), "{tail_text:?}");
+        assert!(tail_text.contains("[ ] write the docs"), "{tail_text:?}");
+    }
+
+    // No open todos → no recitation block (trivial tasks pay nothing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_recitation_when_no_open_todos() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new()); // empty
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 1, 1,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .todo_store(store)
+            .max_turns(1)
+            .build()
+            .unwrap();
+        runner.execute("hi").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let has_plan = reqs[0].messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[plan — open items")),
+            )
+        });
+        assert!(
+            !has_plan,
+            "no plan block expected when there are no open todos"
+        );
+    }
 
     /// Trivial no-op tool so the runner can dispatch a tool_use response.
     struct NoopTool;
