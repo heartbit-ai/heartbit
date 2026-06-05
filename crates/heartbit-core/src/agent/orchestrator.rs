@@ -4218,6 +4218,16 @@ mod tests {
         }
     }
 
+    fn text_end(t: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: t.into() }],
+            stop_reason: StopReason::EndTurn,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        }
+    }
+
     fn delegate_then_finish() -> Vec<CompletionResponse> {
         vec![
             // 1: orchestrator delegates to "worker"
@@ -4328,6 +4338,164 @@ mod tests {
         assert!(
             !tails.iter().any(|t| t.contains("[plan — open items")),
             "default-context sub-agent must not recite; tails: {tails:?}"
+        );
+    }
+
+    // Multi-agent enablement: the form_squad path forwards context too. F-AGENT-2
+    // proved this path can silently diverge from delegate_task in THIS file, so
+    // it gets its own test (not "the blocks are identical, one test covers it").
+    #[tokio::test]
+    async fn recitation_propagates_to_form_squad_member() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap()
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"todos": [{"content": "ship the feature", "status": "in_progress", "priority": "high"}]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator forms a 2-member squad (form_squad needs ≥2).
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "form_squad".into(),
+                        input: json!({"tasks": [
+                            {"agent": "worker", "task": "do A"},
+                            {"agent": "helper", "task": "do B"}
+                        ]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("A done"),
+                text_end("B done"),
+                text_end("synth"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        // Only "worker" carries a populated todo store.
+        let worker = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            context: SubAgentContextConfig {
+                todo_store: Some(store),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let helper = SubAgentConfig {
+            name: "helper".into(),
+            description: "Helper".into(),
+            system_prompt: "You help.".into(),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(worker)
+            .sub_agent_full(helper)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("[>] ship the feature")),
+            "a form_squad member must recite its plan; tails: {tails:?}"
+        );
+    }
+
+    // Multi-agent enablement: `replan_on_verify_fail` must also propagate — a
+    // delegated sub-agent whose verify is RED gets the corrective nudge re-injected
+    // (instead of finishing on red).
+    #[tokio::test]
+    async fn replan_propagates_to_delegated_sub_agent() {
+        struct FailVerify;
+        impl Tool for FailVerify {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "verify".into(),
+                    description: "verify".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async {
+                    Ok(ToolOutput::success(
+                        "VERIFY_RESULT: FAIL exit_code=1 command=cargo test".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator delegates
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({"tasks": [{"agent": "worker", "task": "do work"}]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: sub-agent runs verify (→ RED)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "v1".into(),
+                        name: "verify".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 3..: sub-agent tries to finish (RED → replan nudge), then more
+                text_end("done"),
+                text_end("done"),
+                text_end("synth"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let worker = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            tools: vec![Arc::new(FailVerify)],
+            context: SubAgentContextConfig {
+                replan_on_verify_fail: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(worker)
+            .build()
+            .unwrap();
+        let _ = orch.run("do work").await;
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("Verification is RED")),
+            "the delegated sub-agent must get the replan nudge on a RED verify; tails: {tails:?}"
         );
     }
 

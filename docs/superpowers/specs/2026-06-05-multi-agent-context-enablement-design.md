@@ -52,17 +52,16 @@ pub struct SubAgentContextConfig {
     /// When true, a RED verify blocks the sub-agent's natural completion
     /// (bounded replan).
     pub replan_on_verify_fail: bool,
-    /// Optional session-prune config to pair with restore-on-demand (the
-    /// gentle pruner). When `None` and `context_recall_store` is `Some`, the
-    /// orchestrator applies the same gentle default the single-agent path uses.
-    pub session_prune_config: Option<crate::agent::pruner::SessionPruneConfig>,
 }
 ```
 
-> Note `session_prune_config` is included so restore-on-demand is actually
-> exercised (a recall store with no pruning never produces a restore marker).
-> The caller can pass its own, or leave `None` and let the orchestrator apply a
-> gentle default when a recall store is present.
+> **Session-prune pairing (impl decision):** the struct holds 4 fields, NOT 5.
+> Restore-on-demand needs pruning to produce restore markers, but rather than
+> duplicate a `session_prune_config` here, the caller sets the EXISTING
+> `SubAgentConfig::session_prune_config` field (already forwarded by the
+> orchestrator). The TUI pairs the recall store with `gentle_prune_config()`
+> there. Reusing the existing field keeps the new struct minimal and the
+> caller-wired invariant intact.
 
 ### 2. `SubAgentConfig` gains ONE field
 
@@ -77,24 +76,21 @@ In the per-sub-agent `builder = builder.X(...)` assembly (alongside the existing
 audit/permission/lsp/tenant forwards), add:
 
 ```rust
-let cx = agent_def.context;            // moved/cloned out of agent_def
-if let Some(store) = cx.todo_store { builder = builder.todo_store(store); }
-if cx.replan_on_verify_fail { builder = builder.replan_on_verify_fail(true); }
-if let Some(window) = cx.context_window_tokens { builder = builder.context_window_tokens(window); }
-if let Some(store) = cx.context_recall_store {
-    builder = builder
-        .context_recall_store(store)
-        .session_prune_config(cx.session_prune_config.unwrap_or_else(default_gentle_prune));
-}
+// agent_def.context fields are Option<Arc>/bool (cheap); clone per field.
+if let Some(store) = agent_def.context.todo_store.clone() { builder = builder.todo_store(store); }
+if agent_def.context.replan_on_verify_fail { builder = builder.replan_on_verify_fail(true); }
+if let Some(w) = agent_def.context.context_window_tokens { builder = builder.context_window_tokens(w); }
+if let Some(store) = agent_def.context.context_recall_store.clone() { builder = builder.context_recall_store(store); }
 ```
 
-The same block must be applied on BOTH sub-agent build paths if there are two
-(the single-agent fast path in `build_orchestrator_from_config` is NOT a
-sub-agent path; the sub-agent runner build is the one block that forwards
-audit/permission — confirm there is exactly one and edit it). `default_gentle_prune`
-mirrors the TUI's `gentle_prune_config` (keep_recent_n=3, max_bytes=1024); since
-core has no such helper today, add a small `pub(crate)` one in `pruner.rs` or
-inline the `SessionPruneConfig` literal.
+The prune pairing is NOT here — the caller sets the existing
+`SubAgentConfig::session_prune_config`, already forwarded earlier in the same
+block. There are **two** sub-agent build paths (`delegate_task` ~540 and
+`form_squad` ~1000 — confirmed: F-AGENT-2 showed they diverge, so the block is
+added to BOTH and each gets its own propagation test). The forwarding also
+requires threading `context` through the internal `SubAgentDef` (struct field +
+`new()` + `From<SubAgentConfig>` conversion), since the orchestrator builds
+runners from `SubAgentDef`, not `SubAgentConfig`.
 
 ### 4. Callers
 
