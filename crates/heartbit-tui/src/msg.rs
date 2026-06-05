@@ -169,8 +169,14 @@ impl Msg {
                 tool_name.as_deref().unwrap_or("tool")
             ))),
             AgentEvent::AutoCompactionTriggered { .. } => {
-                Some(Msg::Notice("context auto-compacted".into()))
+                Some(Msg::Notice("context auto-compacted (overflow)".into()))
             }
+            // Proactive compaction backstop (#2/#3) fired — surface it so the user
+            // can see the working set was summarized (dropped content stays
+            // restorable via fetch_full_output / recall_context).
+            AgentEvent::ContextSummarized { .. } => Some(Msg::Notice(
+                "🗜 context compacted — older turns summarized (restorable)".into(),
+            )),
             AgentEvent::DoomLoopDetected { .. } => {
                 Some(Msg::Notice("doom-loop detected — intervening".into()))
             }
@@ -267,6 +273,19 @@ mod tests {
             text: "thinking hard".into(),
         };
         assert!(Msg::from_event(ev).is_none());
+    }
+
+    #[test]
+    fn context_summarized_event_surfaces_a_notice() {
+        let ev = AgentEvent::ContextSummarized {
+            agent: "a".into(),
+            turn: 7,
+            usage: TokenUsage::default(),
+        };
+        assert!(
+            matches!(Msg::from_event(ev), Some(Msg::Notice(n)) if n.contains("compacted")),
+            "ContextSummarized must surface a compaction notice"
+        );
     }
 
     #[test]

@@ -235,14 +235,33 @@ fn fresh_builtins(
     builtin_tools(tool_cfg)
 }
 
+/// Test mode: `HEARTBIT_CONTEXT_DEBUG=1` lowers the pruning + compaction
+/// thresholds so both fire within a few turns (instead of needing a full long
+/// session), making the context-management behaviour observable for live testing.
+fn context_debug_mode() -> bool {
+    std::env::var("HEARTBIT_CONTEXT_DEBUG")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 /// A gentle session-prune config paired with context-recall: keep the last few
 /// turns at full fidelity, truncate older tool results to ~1KB (each carrying a
-/// `fetch_full_output(<id>)` marker so the full content is recoverable).
+/// `fetch_full_output(<id>)` marker so the full content is recoverable). In
+/// `HEARTBIT_CONTEXT_DEBUG` mode it's aggressive (keep 1 turn, 200B) so pruning
+/// is visible immediately.
 fn gentle_prune_config() -> heartbit_core::SessionPruneConfig {
-    heartbit_core::SessionPruneConfig {
-        keep_recent_n: 3,
-        pruned_tool_result_max_bytes: 1024,
-        preserve_task: true,
+    if context_debug_mode() {
+        heartbit_core::SessionPruneConfig {
+            keep_recent_n: 1,
+            pruned_tool_result_max_bytes: 200,
+            preserve_task: true,
+        }
+    } else {
+        heartbit_core::SessionPruneConfig {
+            keep_recent_n: 3,
+            pruned_tool_result_max_bytes: 1024,
+            preserve_task: true,
+        }
     }
 }
 
@@ -478,6 +497,14 @@ async fn build_engine(
         // the window is known (e.g. after /model). The 0.70 fraction is the default.
         if let Some(window) = context_window {
             rb = rb.context_window_tokens(window);
+            // Test mode: compact at 15% of the window so the backstop fires within
+            // a few turns instead of needing a full long session.
+            if context_debug_mode() {
+                rb = rb.compaction_threshold_fraction(0.15);
+                let _ = ui_tx.send(Msg::Notice(
+                    "HEARTBIT_CONTEXT_DEBUG: aggressive pruning + compaction at 15% window".into(),
+                ));
+            }
         }
         let runner = rb.build()?;
         Ok(Engine::Single(Box::new(runner)))
