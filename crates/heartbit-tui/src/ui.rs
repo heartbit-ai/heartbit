@@ -125,6 +125,16 @@ pub fn view(frame: &mut Frame, app: &App) {
         ),
         Style::default().fg(Color::DarkGray),
     ));
+    // Cache-hit metric: surface cumulative prompt-cache reads (green = savings).
+    if app.tokens.cache_read_input_tokens > 0 {
+        status.push(Span::styled(
+            format!(
+                "· {} cached ",
+                human_tokens(app.tokens.cache_read_input_tokens)
+            ),
+            Style::default().fg(Color::Green),
+        ));
+    }
     if app.last_ttft_ms > 0 {
         status.push(Span::styled(
             format!("· {} ttft ", human_ms(app.last_ttft_ms)),

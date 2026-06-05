@@ -542,6 +542,13 @@ impl App {
                     .tokens
                     .output_tokens
                     .saturating_add(usage.output_tokens);
+                // Cache-hit metric (context observability): accumulate prompt-cache
+                // reads so the status line shows how much of the prompt was served
+                // from cache rather than re-billed as fresh input.
+                self.tokens.cache_read_input_tokens = self
+                    .tokens
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_read_input_tokens);
                 // The latest request's input tokens ≈ current context fill (the
                 // whole conversation is the prompt), not summed — for the bar.
                 if usage.input_tokens > 0 {
