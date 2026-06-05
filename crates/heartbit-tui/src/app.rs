@@ -817,11 +817,24 @@ impl App {
             return;
         }
         let text = self.composer.take();
-        self.history.push(Cell::User(text.clone()));
+        self.history.push(Cell::User(text.clone())); // display the user's text verbatim
         self.running = true;
         self.follow = true; // jump back to the newest when the user sends
         self.seed_idle_squad(); // fresh roster: the whole squad, available
-        self.effects.push(Effect::SendInput(text));
+        // Plan mode: prefix a read-only directive so the agent PRODUCES A PLAN
+        // instead of attempting edits and getting silently denied by the gate.
+        // Per-turn (reflects the mode at send time); the display stays clean.
+        let sent = if self.permission_mode == PermissionMode::Plan {
+            format!(
+                "[PLAN MODE — you are READ-ONLY this turn. Investigate with read/search tools, \
+                 then present a concise, numbered PLAN of what you WOULD do. Do NOT edit/write/\
+                 patch files or run mutating commands — they will be blocked. Ask me to switch to \
+                 normal/YOLO mode to execute.]\n\n{text}"
+            )
+        } else {
+            text
+        };
+        self.effects.push(Effect::SendInput(sent));
     }
 
     fn handle_slash(&mut self, cmd: String) {
@@ -2356,6 +2369,43 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Cell::Notice(n) if n.contains("mode")))
         );
+    }
+
+    #[test]
+    fn plan_mode_prefixes_a_read_only_directive_but_keeps_display_clean() {
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        typed(&mut app, "refactor the parser");
+        app.update(key(KeyCode::Enter));
+        // The SENT text carries the plan directive...
+        let sent = app
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SendInput(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a message was sent");
+        assert!(
+            sent.contains("PLAN MODE"),
+            "sent text gets the plan directive"
+        );
+        assert!(sent.contains("refactor the parser"));
+        // ...but the transcript shows the user's text verbatim (no directive).
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::User(t) if t == "refactor the parser")),
+            "display stays clean"
+        );
+    }
+
+    #[test]
+    fn normal_mode_sends_text_unmodified() {
+        let mut app = keyed();
+        typed(&mut app, "hello");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::SendInput("hello".into())));
     }
 
     #[test]
