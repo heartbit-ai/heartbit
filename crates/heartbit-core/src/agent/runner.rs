@@ -252,6 +252,13 @@ pub struct AgentRunner<P: LlmProvider> {
     /// recent attention and lets it survive compaction (re-recited from the
     /// store, not a lossy summary).
     pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// When true, a RED verification (`VERIFY_RESULT: FAIL` as the latest
+    /// canonical sentinel in the transcript) blocks natural completion: the
+    /// runner re-injects a corrective nudge and continues (bounded by
+    /// `MAX_VERIFY_REPLANS`) instead of finishing on red. The long-horizon
+    /// "replan on out-of-plan" signal for the no-goal path (a `GoalCondition`,
+    /// if present, already gates on the same evidence via its judge).
+    pub(super) replan_on_verify_fail: bool,
     /// When true, use recursive (cluster-then-summarize) summarization for
     /// long conversations instead of single-shot.
     pub(super) enable_recursive_summarization: bool,
@@ -365,6 +372,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             tenant_tracker: None,
             context_recall_store: None,
             todo_store: None,
+            replan_on_verify_fail: false,
         }
     }
 
@@ -614,6 +622,10 @@ impl<P: LlmProvider> AgentRunner<P> {
             // turn counter on `ctx` is the other bound — a goal continuation goes
             // through the loop top, so it consumes a turn and respects max_turns.
             let mut goal_continuations_used: u32 = 0;
+            // Long-horizon "replan on out-of-plan": bounded count of verify-fail
+            // continuations so a permanently-red verify can't loop forever.
+            let mut verify_replans_used: u32 = 0;
+            const MAX_VERIFY_REPLANS: u32 = 8;
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
@@ -1344,6 +1356,35 @@ impl<P: LlmProvider> AgentRunner<P> {
                         && !next_message.trim().is_empty()
                     {
                         ctx.add_user_message(next_message);
+                        continue;
+                    }
+
+                    // Long-horizon "replan on out-of-plan": a RED verification is
+                    // the canonical out-of-plan signal. Before allowing natural
+                    // completion, if opted in and the latest canonical
+                    // VERIFY_RESULT is FAIL, re-inject a corrective nudge and
+                    // continue (bounded) instead of finishing on red. Deterministic
+                    // — no judge call; a green/absent verify falls through. A
+                    // GoalCondition, if present, gates on the same evidence via its
+                    // judge, so this is the cheap pre-gate for the no-goal path.
+                    if self.replan_on_verify_fail
+                        && verify_replans_used < MAX_VERIFY_REPLANS
+                        && let Some(outcome) =
+                            crate::codegen::parse_latest_verify(&ctx.conversation_text())
+                        && !outcome.passed
+                    {
+                        verify_replans_used += 1;
+                        debug!(
+                            agent = %self.name,
+                            replan = verify_replans_used,
+                            "verification RED; replanning before completion"
+                        );
+                        ctx.add_user_message(
+                            "Verification is RED (VERIFY_RESULT: FAIL) — do NOT finish yet. \
+                             Update your plan/todos, fix the underlying failure, then re-run the \
+                             verify tool until it reports VERIFY_RESULT: PASS before completing."
+                                .to_string(),
+                        );
                         continue;
                     }
 
@@ -2693,6 +2734,97 @@ mod tests {
         assert!(
             !has_plan,
             "no plan block expected when there are no open todos"
+        );
+    }
+
+    /// A "verify" tool that always reports RED (for the replan gate tests).
+    struct FailingVerifyTool;
+    impl Tool for FailingVerifyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "verify".into(),
+                description: "Runs verification.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            Box::pin(async {
+                Ok(ToolOutput::success(
+                    "VERIFY_RESULT: FAIL exit_code=1 command=cargo test".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn verify_tool_call() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "v1".into(),
+                name: "verify".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        }
+    }
+
+    // Long-horizon "replan on out-of-plan": with the gate ON, a RED verify
+    // blocks natural completion — the runner re-injects a nudge and continues,
+    // BOUNDED (≤ MAX_VERIFY_REPLANS = 8 replans) so it can't loop forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replan_on_verify_fail_blocks_completion_but_is_bounded() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..12 {
+            responses.push(MockProvider::text_response("done", 1, 1));
+        }
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .replan_on_verify_fail(true)
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "done", "completes after the bound is hit");
+        // 1 verify tool call + 9 completion attempts (8 replans, then fall-through).
+        let n = provider.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            n, 10,
+            "expected 8 bounded replans before completion; got {n} provider calls"
+        );
+    }
+
+    // With the gate OFF (default), a RED verify does NOT block completion: the
+    // agent finishes on the first EndTurn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_replan_when_gate_disabled() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..12 {
+            responses.push(MockProvider::text_response("done", 1, 1));
+        }
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "done");
+        let n = provider.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            n, 2,
+            "without the gate, completes on the first EndTurn (got {n})"
         );
     }
 

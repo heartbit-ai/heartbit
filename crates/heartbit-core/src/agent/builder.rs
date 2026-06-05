@@ -110,6 +110,8 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
     /// Optional shared to-do store for long-horizon-planning recitation.
     pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// When true, a RED verification blocks natural completion (replan nudge).
+    pub(super) replan_on_verify_fail: bool,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -591,6 +593,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// When enabled, a RED verification (`VERIFY_RESULT: FAIL` as the latest
+    /// canonical sentinel) blocks natural completion: the runner re-injects a
+    /// corrective nudge and continues (bounded) instead of declaring done on
+    /// red. Long-horizon "replan on out-of-plan" for the no-goal path.
+    pub fn replan_on_verify_fail(mut self, enabled: bool) -> Self {
+        self.replan_on_verify_fail = enabled;
+        self
+    }
+
     /// Validate the builder and produce a ready-to-run [`AgentRunner`].
     ///
     /// Returns [`Error::Config`] for mis-configured runners (empty name, zero `max_turns`,
@@ -816,6 +827,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tenant_tracker: self.tenant_tracker,
             context_recall_store: self.context_recall_store,
             todo_store: self.todo_store,
+            replan_on_verify_fail: self.replan_on_verify_fail,
             cumulative_actual_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }

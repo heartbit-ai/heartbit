@@ -31,7 +31,9 @@ In the per-turn request assembly (runner.rs ~612, where the pruned `request` is 
 
 When the proactive/reactive compaction fires (`inject_summary`), ensure the post-compaction context carries the *current* `TodoStore` open items (so the plan survives a summary from the store, not the lossy text). Simplest: the recitation in Task 2 already re-injects every turn from the store — so a post-compaction turn re-recites automatically. **Verify** this composes: a forced compaction followed by a turn still shows the plan block (sourced from the store). Test: trigger compaction, assert the next request still has the plan block. (If recitation already covers it, this task is a test + a doc note — no new code.)
 
-## Task 4 (follow-on): replan trigger on out-of-plan
+> **STATUS 2026-06-05 — IMPLEMENTED.** Tasks 1-3: `TodoStore::open_items()` + pure `recite_open_todos()`; `AgentRunner`/`Builder.todo_store()`; per-turn recitation at the message tail; survives compaction by construction (store-sourced, decoupled from ctx); wired in TUI single-agent path. Commit fcda792. Task 4: `replan_on_verify_fail` bounded gate (below) — commit pending. All TDD-tested; workspace gate green.
+
+## Task 4 (follow-on): replan trigger on out-of-plan — DONE
 
 A `verify` tool result of `VERIFY_RESULT: FAIL` (or `DoomLoopTracker` firing) is the out-of-plan signal. On it: (a) leave a continuation guidance ("verification failed — revise the plan/todos and fix before finishing") so the agent doesn't natural-complete on red. The cleanest seam: when a `GoalCondition` is present, a verify-fail in the transcript already keeps it "not met"; for the no-goal interactive path, add a lightweight check that a `VERIFY_RESULT: FAIL` since the last `PASS` blocks "done" with a re-injected nudge. Scope/observe before building — this is the most behavioral piece; gate it behind opt-in and a test that a failed verify forces a continuation.
 

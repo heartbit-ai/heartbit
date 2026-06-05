@@ -516,6 +516,12 @@ async fn build_engine(
         if let Some(store) = &todo_store {
             rb = rb.todo_store(store.clone());
         }
+        // When /verify is active, also gate completion on a GREEN verify: a RED
+        // VERIFY_RESULT: FAIL re-injects a fix-it nudge (bounded) instead of
+        // letting the agent declare done on red ("replan on out-of-plan").
+        if verify_command.as_deref().is_some_and(|c| !c.is_empty()) {
+            rb = rb.replan_on_verify_fail(true);
+        }
         // Restore-on-demand: share the SAME store for indexing, and pair it with a
         // gentle pruner so old tool outputs truncate to a restorable marker.
         if let Some(store) = &recall_store {
