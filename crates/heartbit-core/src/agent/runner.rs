@@ -46,6 +46,22 @@ Before claiming you cannot do something or lack access to a tool:\n\
 - Try alternative approaches when the first attempt fails.\n\
 Never say \"I don't have access\" or \"I can't\" without evidence. Investigate first.";
 
+/// System prompt for context compaction. Unlike a generic summary, it pins the
+/// load-bearing state an agent needs to keep working — replacing the old
+/// positional "keep the last N messages" heuristic, which drops the weakest
+/// attention position (the middle) where that state often lives. Kept compact
+/// (bullets, no padding) so the summary itself doesn't reintroduce bloat.
+pub(crate) const COMPACTION_SUMMARY_SYSTEM: &str = "You are compacting an agent's working \
+conversation to free up context WITHOUT losing anything the agent needs to continue. Produce a \
+summary that preserves, explicitly and completely:\n\
+1. GOAL: the original task/objective and any refinements to it.\n\
+2. FILES: every file created, modified, or deleted (exact paths) and what changed in each.\n\
+3. TODOS: all tasks still open or in progress.\n\
+4. UNRESOLVED: errors, test failures, blockers, and open questions not yet resolved.\n\
+5. DECISIONS: key decisions and WHY, including approaches tried and abandoned (and the reason).\n\
+Then a brief narrative of progress so far. Be COMPLETE on items 1-5 — omitting one loses work the \
+agent must redo. Be concise elsewhere: compact bullet points, no preamble, no padding.";
+
 /// One tool execution record. Captures the full input + untruncated output
 /// of a single tool call.
 ///
@@ -1873,13 +1889,13 @@ impl<P: LlmProvider> AgentRunner<P> {
     /// Single-shot summarization of a text block.
     async fn summarize_text(&self, text: &str) -> Result<(Option<String>, TokenUsage), Error> {
         let summary_request = CompletionRequest {
-            system: "You are a summarization assistant. Summarize the following conversation \
-                     concisely, preserving key facts, decisions, and tool results. \
-                     Focus on information that would be needed to continue the conversation."
-                .into(),
+            system: COMPACTION_SUMMARY_SYSTEM.into(),
             messages: vec![Message::user(text.to_string())],
             tools: vec![],
-            max_tokens: 1024,
+            // Headroom for the structured schema (goal/files/todos/errors/decisions
+            // + narrative). A summary that hits MaxTokens is dropped (returns None
+            // below), silently skipping compaction — so don't starve it.
+            max_tokens: 2048,
             tool_choice: None,
             reasoning_effort: None,
         };
@@ -3050,6 +3066,47 @@ mod tests {
         assert!(super::over_window_fraction(800, 1000, 0.70));
         assert!(!super::over_window_fraction(699, 1000, 0.70));
         assert!(!super::over_window_fraction(10, 0, 0.70)); // unknown window -> no trigger
+    }
+
+    #[test]
+    fn compaction_summary_prompt_pins_the_preservation_schema() {
+        // Guards the structured schema against accidental gutting. (Content guard;
+        // summary QUALITY is verified live, not by a unit test.)
+        let p = super::COMPACTION_SUMMARY_SYSTEM;
+        for marker in ["GOAL", "FILES", "TODOS", "UNRESOLVED", "DECISIONS"] {
+            assert!(p.contains(marker), "compaction prompt must pin {marker}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_sends_the_structured_summary_prompt() {
+        // Trigger one proactive compaction and confirm the summary request carried
+        // the structured preservation prompt. Both compaction paths (single-shot +
+        // recursive) route through `summarize_text`, so this covers both. Proves
+        // PLUMBING (the prompt is sent), not summary quality.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),
+            tool_use_with_tokens(800),
+            tool_use_with_tokens(800), // fires compaction
+            MockProvider::text_response("summary text", 1, 1), // the summary call
+            MockProvider::text_response("done", 800, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let _ = runner.execute("do things").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().expect("lock");
+        assert!(
+            reqs.iter()
+                .any(|r| r.system.contains("GOAL") && r.system.contains("DECISIONS")),
+            "the summary call must use the structured preservation prompt"
+        );
     }
 
     /// Helper to build a tool-use response where the LLM reports `input_tokens`.
