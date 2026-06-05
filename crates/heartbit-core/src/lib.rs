@@ -63,7 +63,9 @@ pub use agent::instructions::{
 };
 pub use agent::mixture::{MixtureOfAgentsAgent, MixtureOfAgentsAgentBuilder};
 pub use agent::observability::ObservabilityMode;
-pub use agent::orchestrator::{Orchestrator, OrchestratorBuilder, SubAgentConfig};
+pub use agent::orchestrator::{
+    Orchestrator, OrchestratorBuilder, SubAgentConfig, SubAgentContextConfig,
+};
 pub use agent::permission::{
     LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
 };

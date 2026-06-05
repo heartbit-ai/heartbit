@@ -278,9 +278,19 @@ fn gentle_prune_config() -> heartbit_core::SessionPruneConfig {
 fn default_sub_agents(
     cwd: &std::path::Path,
     mcp_tools: &[Arc<dyn heartbit_core::tool::Tool>],
+    context_recall: bool,
+    context_window: Option<u32>,
+    replan_on_verify_fail: bool,
 ) -> Vec<SubAgentConfig> {
     let make = |name: &str, description: &str, prompt: &str| {
-        let mut tools = fresh_builtins(cwd, None, None);
+        // Multi-agent context enablement: each sub-agent gets its OWN context
+        // stores (per-agent isolation) — it recites/restores only its own plan
+        // and tool outputs. The recall store is paired with the gentle pruner so
+        // restore markers are produced; recitation is always on (self-gates to
+        // nothing until the agent writes todos).
+        let recall = context_recall.then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
+        let todo = Arc::new(heartbit_core::tool::builtins::TodoStore::new());
+        let mut tools = fresh_builtins(cwd, recall.as_ref(), Some(&todo));
         tools.extend(mcp_tools.iter().cloned());
         SubAgentConfig {
             name: name.into(),
@@ -289,6 +299,13 @@ fn default_sub_agents(
             tools,
             max_turns: Some(60),
             max_tokens: Some(8192),
+            session_prune_config: recall.as_ref().map(|_| gentle_prune_config()),
+            context: heartbit_core::SubAgentContextConfig {
+                todo_store: Some(todo),
+                context_recall_store: recall,
+                context_window_tokens: context_window,
+                replan_on_verify_fail,
+            },
             ..Default::default()
         }
     };
@@ -480,7 +497,12 @@ async fn build_engine(
             .on_approval(on_approval)
             .on_input(on_input)
             .interrupt(interrupt);
-        for cfg in default_sub_agents(&cwd, &mcp_tools) {
+        // Multi-agent context enablement: thread the context flags so each
+        // sub-agent gets its own recitation / restore-on-demand / proactive
+        // compaction / replan, matching the single-agent path.
+        let sub_replan = verify_command.as_deref().is_some_and(|c| !c.is_empty());
+        for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, sub_replan)
+        {
             builder = builder.sub_agent_full(cfg);
         }
         let orch = builder.build()?;

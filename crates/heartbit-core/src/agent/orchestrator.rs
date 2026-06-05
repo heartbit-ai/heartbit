@@ -88,6 +88,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (propagated from orchestrator).
     pub(crate) audit_delegation_chain: Vec<String>,
+    /// Per-sub-agent context-management wiring (multi-agent enablement).
+    pub(crate) context: SubAgentContextConfig,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -141,6 +143,7 @@ impl SubAgentDef {
             audit_user_id: None,
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
+            context: SubAgentContextConfig::default(),
         }
     }
 }
@@ -180,6 +183,7 @@ impl From<SubAgentConfig> for SubAgentDef {
             audit_user_id: def.audit_user_id,
             audit_tenant_id: def.audit_tenant_id,
             audit_delegation_chain: def.audit_delegation_chain,
+            context: def.context,
         }
     }
 }
@@ -535,6 +539,23 @@ impl DelegateTaskTool {
                 // Forward on_text so sub-agent streaming text is visible
                 if let Some(ref on_text) = on_text {
                     builder = builder.on_text(on_text.clone());
+                }
+
+                // Multi-agent context enablement: forward this sub-agent's
+                // context wiring (recitation, restore-on-demand, proactive
+                // compaction, replan). Each field is opt-in; unset → no-op, so
+                // sub-agents with a default `context` are unaffected.
+                if let Some(store) = agent_def.context.todo_store.clone() {
+                    builder = builder.todo_store(store);
+                }
+                if agent_def.context.replan_on_verify_fail {
+                    builder = builder.replan_on_verify_fail(true);
+                }
+                if let Some(window) = agent_def.context.context_window_tokens {
+                    builder = builder.context_window_tokens(window);
+                }
+                if let Some(store) = agent_def.context.context_recall_store.clone() {
+                    builder = builder.context_recall_store(store);
                 }
 
                 // Add memory tools if shared memory is configured
@@ -979,6 +1000,22 @@ impl Tool for FormSquadTool {
                     // Forward on_text so sub-agent streaming text is visible
                     if let Some(ref on_text) = on_text {
                         builder = builder.on_text(on_text.clone());
+                    }
+
+                    // Multi-agent context enablement (form_squad path): forward
+                    // this squad member's context wiring, mirroring the delegate
+                    // path. Opt-in; unset → no-op.
+                    if let Some(store) = agent_def.context.todo_store.clone() {
+                        builder = builder.todo_store(store);
+                    }
+                    if agent_def.context.replan_on_verify_fail {
+                        builder = builder.replan_on_verify_fail(true);
+                    }
+                    if let Some(window) = agent_def.context.context_window_tokens {
+                        builder = builder.context_window_tokens(window);
+                    }
+                    if let Some(store) = agent_def.context.context_recall_store.clone() {
+                        builder = builder.context_recall_store(store);
                     }
 
                     // Add memory tools if shared memory is configured
@@ -1706,6 +1743,31 @@ pub(crate) fn build_form_squad_tool_schema(agents: &[(&str, &str, &[String])]) -
     }
 }
 
+/// Per-sub-agent context-management wiring (multi-agent enablement).
+///
+/// All fields are opt-in: [`Default`] reproduces today's behavior exactly. The
+/// caller creates the stores, builds the sub-agent's tools FROM them, and sets
+/// the SAME stores here; the orchestrator forwards each to the sub-agent's
+/// [`AgentRunnerBuilder`](crate::agent::builder::AgentRunnerBuilder). The
+/// session-prune config that pairs with restore-on-demand reuses the existing
+/// [`SubAgentConfig::session_prune_config`] (a gentle default is applied when a
+/// recall store is set but no prune config is).
+#[derive(Clone, Default)]
+pub struct SubAgentContextConfig {
+    /// Shared todo store the sub-agent recites at the context tail each turn
+    /// (long-horizon recitation). MUST be the same store backing the
+    /// sub-agent's `todowrite`/`todoread` tools.
+    pub todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// Per-run recall store for restore-on-demand. MUST be the same store
+    /// passed into the sub-agent's `BuiltinToolsConfig.context_recall_store`.
+    pub context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Model context window (tokens) for the proactive compaction backstop.
+    pub context_window_tokens: Option<u32>,
+    /// When true, a RED verify blocks the sub-agent's natural completion
+    /// (bounded replan).
+    pub replan_on_verify_fail: bool,
+}
+
 /// Configuration for adding a sub-agent to the orchestrator.
 ///
 /// Used by `OrchestratorBuilder::sub_agent_full` to avoid a long parameter list.
@@ -1780,6 +1842,9 @@ pub struct SubAgentConfig {
     /// Delegation chain for audit records (propagated to sub-agents).
     #[allow(dead_code)]
     pub audit_delegation_chain: Vec<String>,
+    /// Context-management wiring (recitation, restore-on-demand, proactive
+    /// compaction, replan). Opt-in; `Default` preserves current behavior.
+    pub context: SubAgentContextConfig,
 }
 
 /// Builder for [`Orchestrator`].
@@ -2974,6 +3039,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -3939,6 +4005,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4090,6 +4157,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4104,6 +4172,162 @@ mod tests {
             systems[1].contains("[ORCH_GUARD_ACTIVE]"),
             "sub-agent system prompt should contain orchestrator guardrail marker; got: {}",
             systems[1]
+        );
+    }
+
+    #[test]
+    fn sub_agent_context_config_default_is_empty() {
+        let cx = SubAgentContextConfig::default();
+        assert!(cx.todo_store.is_none());
+        assert!(cx.context_recall_store.is_none());
+        assert!(cx.context_window_tokens.is_none());
+        assert!(!cx.replan_on_verify_fail);
+    }
+
+    /// Captures the tail (last-message text) of every LLM request, for the
+    /// multi-agent context-enablement tests.
+    struct TailCapturingProvider {
+        responses: Mutex<Vec<CompletionResponse>>,
+        tails: Mutex<Vec<String>>,
+    }
+    impl LlmProvider for TailCapturingProvider {
+        async fn complete(
+            &self,
+            request: crate::llm::types::CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::Error> {
+            let tail = request
+                .messages
+                .last()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            self.tails.lock().unwrap().push(tail);
+            let mut r = self.responses.lock().unwrap();
+            if r.is_empty() {
+                return Err(crate::error::Error::Agent("no more responses".into()));
+            }
+            Ok(r.remove(0))
+        }
+    }
+
+    fn delegate_then_finish() -> Vec<CompletionResponse> {
+        vec![
+            // 1: orchestrator delegates to "worker"
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({"tasks": [{"agent": "worker", "task": "do work"}]}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 2: the sub-agent finishes
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 3: orchestrator synthesis
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "synth".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]
+    }
+
+    // Multi-agent enablement: a sub-agent whose `context.todo_store` has open
+    // items recites the plan at its OWN context tail when the orchestrator
+    // delegates to it.
+    #[tokio::test]
+    async fn recitation_propagates_to_delegated_sub_agent() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap()
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"todos": [{"content": "finish the parser", "status": "in_progress", "priority": "high"}]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(delegate_then_finish()),
+            tails: Mutex::new(vec![]),
+        });
+        let cfg = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            context: SubAgentContextConfig {
+                todo_store: Some(store),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(cfg)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("[plan — open items")),
+            "the delegated sub-agent must recite its plan; tails: {tails:?}"
+        );
+        assert!(
+            tails.iter().any(|t| t.contains("[>] finish the parser")),
+            "recitation should carry the open item; tails: {tails:?}"
+        );
+    }
+
+    // Regression: a sub-agent with a DEFAULT context recites nothing (existing
+    // behavior unchanged).
+    #[tokio::test]
+    async fn default_context_means_no_recitation_for_sub_agent() {
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(delegate_then_finish()),
+            tails: Mutex::new(vec![]),
+        });
+        let cfg = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            ..Default::default() // context defaults to empty
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(cfg)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            !tails.iter().any(|t| t.contains("[plan — open items")),
+            "default-context sub-agent must not recite; tails: {tails:?}"
         );
     }
 
@@ -4189,6 +4413,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             }
         }
 
@@ -4273,6 +4498,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build();
 
@@ -4322,6 +4548,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build();
 
@@ -4442,6 +4669,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4526,6 +4754,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -5065,6 +5294,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -5961,6 +6191,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -6162,6 +6393,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)
