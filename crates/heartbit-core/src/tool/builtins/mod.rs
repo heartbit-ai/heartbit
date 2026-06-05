@@ -254,7 +254,11 @@ impl Default for BuiltinToolsConfig {
             on_question: None,
             workspace: None,
             dangerous_tools: false,
-            env_policy: crate::workspace::EnvPolicy::Inherit,
+            // SECURITY (F-FS-2): default to the no-secrets allowlist, NOT Inherit —
+            // otherwise a caller using `BuiltinToolsConfig::default()` + dangerous
+            // bash (e.g. the CLI) silently leaks ANTHROPIC_API_KEY/AWS_*/GITHUB_TOKEN
+            // into the agent's shell. Opt into Inherit explicitly if truly needed.
+            env_policy: crate::workspace::EnvPolicy::default(),
             // SECURITY (F-FS-9): default protected paths populated.
             protected_paths: default_protected_paths(),
             #[cfg(all(target_os = "linux", feature = "sandbox"))]

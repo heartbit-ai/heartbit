@@ -915,9 +915,13 @@ impl TokenExchangeAuthProvider {
         agent_token: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            // SECURITY (F-NET-2): the token-exchange IdP is operator-configured but
+            // its host could DNS-rebind; `vendor_client_builder()` installs a
+            // SafeDnsResolver (+ redirect-none, no_proxy, connect-timeout) so the
+            // agent token can't be exfiltrated to a rebound private IP. Internal
+            // IdPs opt out via HEARTBIT_ALLOW_PRIVATE_IPS.
+            client: crate::http::vendor_client_builder()
                 .timeout(TOKEN_EXCHANGE_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             exchange_url,
@@ -2050,12 +2054,13 @@ impl McpClient {
         // rejects literal/resolved private IPs under `IpPolicy::default()`.
         let safe = crate::http::SafeUrl::parse(endpoint, crate::http::IpPolicy::default()).await?;
 
-        let client = reqwest::Client::builder()
+        // SECURITY (F-MCP-1): `safe_client_builder()` installs a `SafeDnsResolver`
+        // that re-validates resolved IPs at CONNECT time — closing the DNS-rebind
+        // window that `SafeUrl::parse` (parse-time only) leaves open — plus
+        // redirect(none) and no_proxy. A bare client would resolve a benign host
+        // to 169.254.169.254 between parse and connect, leaking the auth header.
+        let client = crate::http::safe_client_builder()
             .timeout(REQUEST_TIMEOUT)
-            // Disable redirect following — `SafeUrl` validates parse-time, but a
-            // redirect to a private IP would bypass that. Refusing all redirects
-            // closes the bypass entirely.
-            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let transport = Arc::new(Transport::Http(HttpTransport {
