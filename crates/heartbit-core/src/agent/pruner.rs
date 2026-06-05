@@ -303,7 +303,9 @@ mod tests {
 
         let config = SessionPruneConfig {
             keep_recent_n: 0,
-            pruned_tool_result_max_bytes: 50,
+            // Large enough that the head budget (max - marker) leaves a real
+            // multi-byte content head to slice at a char boundary.
+            pruned_tool_result_max_bytes: 120,
             preserve_task: true,
         };
         let (pruned, _stats) = prune_old_tool_results(&messages, &config);
@@ -311,6 +313,8 @@ mod tests {
         // Should not panic and content should be valid UTF-8
         if let ContentBlock::ToolResult { content, .. } = &pruned[2].content[0] {
             assert!(content.is_char_boundary(0));
+            // A real emoji head must survive (the char-boundary slice ran).
+            assert!(content.starts_with('🦀'));
             // Verify it's valid UTF-8 by iterating
             for _ in content.chars() {}
         }
@@ -422,7 +426,7 @@ mod tests {
     fn truncate_with_marker_long_content() {
         let content = "a".repeat(1000);
         let result = truncate_with_marker(&content, 100, "tc_x");
-        assert!(result.len() <= 400); // head + marker (marker now longer due to id)
+        assert!(result.len() <= 200); // head + marker
         assert!(result.contains("[pruned:"));
         assert!(result.contains("bytes omitted"));
         assert!(result.contains("id=tc_x"));
