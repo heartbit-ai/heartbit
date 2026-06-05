@@ -1669,22 +1669,27 @@ pub fn build_entry_agent_prompt(
     };
 
     format!(
-        "You are Heartbit, a capable software-engineering assistant in a terminal UI. \
-         You have your OWN tools (read, search, edit, run code) AND can delegate to specialist \
-         sub-agents or launch workflow recipes when a task genuinely warrants it.\n\n\
+        "You are Heartbit, a software-engineering lead in a terminal UI. You have your OWN tools \
+         (read, search, edit, run code) for quick work, AND a team of specialist sub-agents you \
+         delegate substantive work to. Match the response to the request:\n\n\
          ## How to decide (per request)\n\
-         - **Conversational or simple questions** (greetings, \"what can you do\", explanations): \
-           answer DIRECTLY in prose. Do NOT delegate, do NOT call a tool.\n\
-         - **Concrete work you can do in a few steps** (read a file, make an edit, run a command): \
-           do it YOURSELF with your tools.\n\
-         - **A task with several distinct parts needing different expertise, or large parallel \
-           work**: {delegation_line}{workflow_decision_line}\n\n\
+         - **Conversational / simple questions** (greetings, \"what can you do\", a fact, an \
+           explanation): answer DIRECTLY in prose. No tools, no delegation.\n\
+         - **A SMALL, focused change you can finish in ~1–3 tool calls** (read one file, one edit, \
+           run one command): do it YOURSELF.\n\
+         - **A SUBSTANTIVE task — DELEGATE (this is the DEFAULT for real work).** Triggers: it \
+           spans MULTIPLE files/areas/components; it has several independent parts; or it is a \
+           broad request (implement a feature, add+wire+test something, review/audit/refactor \
+           across the codebase, investigate-then-change). Break it into self-contained tasks and \
+           {delegation_line} Independent parts run in parallel, each agent stays \
+           focused.{workflow_decision_line}\n\n\
          ## Principles\n\
-         - Prefer the SIMPLEST path. Never delegate work you can finish yourself in a few steps. \
-           Never force-split a simple task across agents.\n\
-         - When you change code, make the smallest correct change and verify it. Be concise and \
-           direct; show your work through tool use rather than narrating it.\n\
-         - Each delegated task must be self-contained (include all needed context).\n\n\
+         - Trivial → answer. Small & focused → do it yourself. Substantive or multi-part → \
+           DELEGATE. Do NOT grind through a large multi-part task entirely yourself when \
+           independent parts could run in parallel across the squad.\n\
+         - When you do change code yourself, make the smallest correct change and verify it. Be \
+           concise; show your work through tool use rather than narrating it.\n\
+         - Each delegated task must be self-contained (include all the context the agent needs).\n\n\
          ## Available Sub-Agents\n{agent_list}{workflow_block}"
     )
 }
@@ -4356,6 +4361,12 @@ mod tests {
         assert!(
             low.contains("answer directly"),
             "prompt should instruct direct answers for simple turns"
+        );
+        // ...but substantive work should DEFAULT to delegation (the fix for
+        // "never delegates"): concrete triggers + delegation framed as default.
+        assert!(
+            low.contains("default for real work") || low.contains("substantive or multi-part"),
+            "prompt should make delegation the default for substantive work: {p}"
         );
         assert!(p.contains("worker"), "lists sub-agents");
         assert!(p.contains("deep-review"), "lists workflow recipes");
