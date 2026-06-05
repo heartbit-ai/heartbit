@@ -268,6 +268,10 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             spawn_config: None,
             spawn_builtin_tools: Vec::new(),
             tenant_tracker: None,
+            entry_mode: false,
+            entry_direct_tools: Vec::new(),
+            entry_workflow_recipes: Vec::new(),
+            entry_context: SubAgentContextConfig::default(),
         }
     }
 
@@ -1602,6 +1606,87 @@ pub fn build_system_prompt(
     )
 }
 
+/// System prompt for the UNIFIED entry agent (option C).
+///
+/// Unlike [`build_system_prompt`] — a pure router that MUST always delegate and
+/// is forbidden from answering directly — the entry agent holds its own direct
+/// tools and decides per request: answer directly, do the work itself,
+/// delegate to specialists, or launch a workflow recipe. This is the
+/// emergent-routing contract (the LLM routes by choosing tools).
+pub fn build_entry_agent_prompt(
+    agents: &[(&str, &str, &[String])],
+    squads_enabled: bool,
+    dispatch_mode: DispatchMode,
+    workflow_recipes: &[(&str, &str)],
+) -> String {
+    let agent_list: String = if agents.is_empty() {
+        "(none configured — handle everything yourself with your own tools)".to_string()
+    } else {
+        agents
+            .iter()
+            .map(|(name, desc, tools)| {
+                if tools.is_empty() {
+                    format!("- **{name}**: {desc}\n  Tools: (none)")
+                } else {
+                    format!("- **{name}**: {desc}\n  Tools: {}", tools.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let delegation_line = match (squads_enabled, dispatch_mode) {
+        (_, DispatchMode::Sequential) => {
+            "delegate ONE specialist at a time with **delegate_task** (wait for each result)."
+        }
+        (true, DispatchMode::Parallel) => {
+            "delegate independent parts with **delegate_task** (isolated, parallel) or \
+             **form_squad** (parallel + shared blackboard), then synthesize."
+        }
+        (false, DispatchMode::Parallel) => {
+            "delegate independent parts with **delegate_task** (parallel), then synthesize."
+        }
+    };
+
+    let (workflow_decision_line, workflow_block) = if workflow_recipes.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let list = workflow_recipes
+            .iter()
+            .map(|(name, desc)| format!("- **{name}**: {desc}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            "\n         - **A structured repeatable job matching a recipe**: use run_workflow \
+             (see below)."
+                .to_string(),
+            format!(
+                "\n\n## Workflow Recipes\n\
+                 For a structured, repeatable, multi-step job, launch a recipe with \
+                 **run_workflow** (give the recipe name + args). Available recipes:\n{list}"
+            ),
+        )
+    };
+
+    format!(
+        "You are Heartbit, a capable software-engineering assistant in a terminal UI. \
+         You have your OWN tools (read, search, edit, run code) AND can delegate to specialist \
+         sub-agents or launch workflow recipes when a task genuinely warrants it.\n\n\
+         ## How to decide (per request)\n\
+         - **Conversational or simple questions** (greetings, \"what can you do\", explanations): \
+           answer DIRECTLY in prose. Do NOT delegate, do NOT call a tool.\n\
+         - **Concrete work you can do in a few steps** (read a file, make an edit, run a command): \
+           do it YOURSELF with your tools.\n\
+         - **A task with several distinct parts needing different expertise, or large parallel \
+           work**: {delegation_line}{workflow_decision_line}\n\n\
+         ## Principles\n\
+         - Prefer the SIMPLEST path. Never delegate work you can finish yourself in a few steps. \
+           Never force-split a simple task across agents.\n\
+         - Each delegated task must be self-contained (include all needed context).\n\n\
+         ## Available Sub-Agents\n{agent_list}{workflow_block}"
+    )
+}
+
 /// Build the delegate_task tool definition.
 ///
 /// Shared between standalone and Restate paths. Takes `(name, description, tool_names)` triples.
@@ -1921,9 +2006,46 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     /// and SpawnAgentTool. When set, multi-agent token usage is correctly accounted
     /// per tenant so the per-tenant cap applies to the combined run.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Unified entry-agent mode (option C). When true, the orchestrator's OWN
+    /// runner uses the non-absolute [`build_entry_agent_prompt`] and is given
+    /// `entry_direct_tools` so it can answer directly / do simple work itself,
+    /// in addition to delegating. Default false = pure router (unchanged).
+    entry_mode: bool,
+    /// Direct tools for the entry agent's own runner (builtins + MCP + the
+    /// `run_workflow` tool). Only used when `entry_mode`.
+    entry_direct_tools: Vec<Arc<dyn Tool>>,
+    /// `(name, description)` of the workflow recipes advertised in the entry
+    /// prompt (the `run_workflow` tool itself is supplied via `entry_direct_tools`).
+    entry_workflow_recipes: Vec<(String, String)>,
+    /// Context-management wiring for the entry agent's OWN runner (recitation,
+    /// restore-on-demand, proactive compaction, replan). Opt-in.
+    entry_context: SubAgentContextConfig,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
+    /// Turn this orchestrator into the unified **entry agent** (option C): its
+    /// own runner gets `direct_tools` (builtins/MCP/run_workflow) and a
+    /// non-absolute prompt, so it answers conversational turns directly, does
+    /// simple work itself, delegates multi-part work, and launches workflow
+    /// recipes — deciding per request via tool choice.
+    pub fn entry_agent(mut self, direct_tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.entry_mode = true;
+        self.entry_direct_tools = direct_tools;
+        self
+    }
+
+    /// Advertise workflow recipes (name + description) in the entry prompt.
+    pub fn entry_workflow_recipes(mut self, recipes: Vec<(String, String)>) -> Self {
+        self.entry_workflow_recipes = recipes;
+        self
+    }
+
+    /// Context-management wiring for the entry agent's own runner.
+    pub fn entry_context(mut self, context: SubAgentContextConfig) -> Self {
+        self.entry_context = context;
+        self
+    }
+
     /// Add a sub-agent with the given name, description, and system prompt.
     pub fn sub_agent(
         mut self,
@@ -2383,7 +2505,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .zip(tool_names.iter())
             .map(|(a, names)| (a.name.as_str(), a.description.as_str(), names.as_slice()))
             .collect();
-        let mut system = build_system_prompt(&triples, squads_enabled, self.dispatch_mode);
+        let mut system = if self.entry_mode {
+            // Unified entry agent (option C): non-absolute prompt that lets the
+            // agent answer directly / do simple work / delegate / run a workflow.
+            let recipes: Vec<(&str, &str)> = self
+                .entry_workflow_recipes
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_str()))
+                .collect();
+            build_entry_agent_prompt(&triples, squads_enabled, self.dispatch_mode, &recipes)
+        } else {
+            build_system_prompt(&triples, squads_enabled, self.dispatch_mode)
+        };
         // Append user identity context so the orchestrator knows who it is serving.
         if let (Some(uid), Some(tid)) = (&self.audit_user_id, &self.audit_tenant_id) {
             system.push_str(&format!(
@@ -2485,6 +2618,28 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .tool(delegate_tool)
             .max_turns(self.max_turns)
             .max_tokens(self.max_tokens);
+
+        // Unified entry agent (option C): give the orchestrator's OWN runner its
+        // direct tools (builtins/MCP/run_workflow) + the context-management stack
+        // so it can answer/do/delegate/run-workflow in one loop. Opt-in.
+        if self.entry_mode {
+            if !self.entry_direct_tools.is_empty() {
+                runner_builder = runner_builder.tools(std::mem::take(&mut self.entry_direct_tools));
+            }
+            let cx = std::mem::take(&mut self.entry_context);
+            if let Some(store) = cx.todo_store {
+                runner_builder = runner_builder.todo_store(store);
+            }
+            if cx.replan_on_verify_fail {
+                runner_builder = runner_builder.replan_on_verify_fail(true);
+            }
+            if let Some(window) = cx.context_window_tokens {
+                runner_builder = runner_builder.context_window_tokens(window);
+            }
+            if let Some(store) = cx.context_recall_store {
+                runner_builder = runner_builder.context_recall_store(store);
+            }
+        }
 
         // Register form_squad tool when enabled
         if let Some(agent_pool) = agent_pool {
@@ -4172,6 +4327,101 @@ mod tests {
             systems[1].contains("[ORCH_GUARD_ACTIVE]"),
             "sub-agent system prompt should contain orchestrator guardrail marker; got: {}",
             systems[1]
+        );
+    }
+
+    #[test]
+    fn entry_agent_prompt_allows_direct_answers() {
+        let tools = ["bash".to_string()];
+        let agents: Vec<(&str, &str, &[String])> = vec![("worker", "does work", &tools)];
+        let recipes = [("deep-review", "review the diff")];
+        let p = build_entry_agent_prompt(&agents, true, DispatchMode::Parallel, &recipes);
+        // The whole point: the entry agent is NOT forbidden from answering directly.
+        assert!(
+            !p.contains("Never respond to the user directly"),
+            "entry agent must be allowed to answer directly"
+        );
+        let low = p.to_lowercase();
+        assert!(
+            low.contains("answer directly"),
+            "prompt should instruct direct answers for simple turns"
+        );
+        assert!(p.contains("worker"), "lists sub-agents");
+        assert!(p.contains("deep-review"), "lists workflow recipes");
+        assert!(p.contains("run_workflow"), "mentions the workflow tool");
+    }
+
+    #[test]
+    fn entry_agent_prompt_without_recipes_omits_workflow_block() {
+        let agents: Vec<(&str, &str, &[String])> = vec![];
+        let p = build_entry_agent_prompt(&agents, false, DispatchMode::Parallel, &[]);
+        assert!(
+            !p.contains("run_workflow"),
+            "no recipes → no workflow block"
+        );
+        assert!(
+            p.contains("none configured"),
+            "empty squad → 'handle everything yourself'"
+        );
+    }
+
+    // Option C: an entry-mode orchestrator's OWN runner holds direct tools and
+    // can execute them itself (not just delegate).
+    #[tokio::test]
+    async fn entry_agent_runs_its_own_direct_tools() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountTool(Arc<AtomicUsize>);
+        impl Tool for CountTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "no-op".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // entry agent uses its OWN tool (not delegate_task)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("done"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(provider)
+            .entry_agent(vec![Arc::new(CountTool(calls.clone()))])
+            .sub_agent("worker", "does work", "you work")
+            .build()
+            .unwrap();
+        let out = orch.run("do a thing").await.unwrap();
+        assert_eq!(out.result, "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "entry agent must execute its own direct tool on its own runner"
         );
     }
 
