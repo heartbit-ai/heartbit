@@ -14,6 +14,7 @@ const DEFAULT_MAX_ENTRIES: usize = 256;
 
 /// Max characters of head-content returned per recall hit (generous, so the
 /// snippet often answers the question without a follow-up fetch).
+// 280 ≈ one paragraph — generous enough to answer most queries without a full fetch.
 pub const SNIPPET_CHARS: usize = 280;
 
 /// One ranked match from `recall`: the ref to fetch, which tool produced it,
@@ -159,5 +160,19 @@ mod tests {
     async fn recall_on_empty_store_is_empty() {
         let store = ContextRecallStore::new();
         assert!(store.recall("anything", 5).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_snippet_is_truncated_to_the_cap() {
+        let store = ContextRecallStore::new();
+        let long = "alpha ".repeat(200); // ~1200 chars, all matching the query term
+        store.index("tc_long", "bash", &long).await;
+        let hits = store.recall("alpha", 1).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].snippet.chars().count(),
+            SNIPPET_CHARS,
+            "a long output's snippet must be capped at exactly SNIPPET_CHARS"
+        );
     }
 }
