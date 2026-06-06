@@ -55,6 +55,10 @@ pub enum UiEvent {
         mcp_servers: Vec<String>,
         context_recall: bool,
         verify_command: Option<String>,
+        /// Number of learned lessons injected this launch (0 = none).
+        /// `#[serde(default)]` per the envelope evolution rule.
+        #[serde(default)]
+        lessons_loaded: usize,
     },
     /// A user message submitted to the agent (slash commands excluded).
     UserInput { text: String },
@@ -507,6 +511,7 @@ mod tests {
                     mcp_servers: vec![],
                     context_recall: false,
                     verify_command: None,
+                    lessons_loaded: 0,
                 },
                 "session_started",
                 &[
@@ -517,6 +522,7 @@ mod tests {
                     "mcp_servers",
                     "context_recall",
                     "verify_command",
+                    "lessons_loaded",
                 ],
             ),
             (

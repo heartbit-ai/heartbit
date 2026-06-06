@@ -177,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Config snapshot at launch — the trace's first record (init_tracing runs
     // after this so its captured banner can't claim seq 0).
+    let lessons_loaded = lessons::load_lessons()
+        .map(|c| lessons::lesson_count(&c))
+        .unwrap_or(0);
     trace_handle.record_ui(&trace::UiEvent::SessionStarted {
         version: env!("CARGO_PKG_VERSION").into(),
         session_id: session_id.clone(),
@@ -185,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_servers: cfg.mcp_servers.iter().map(|s| s.label()).collect(),
         context_recall: app.context_recall,
         verify_command: app.verify_command.clone(),
+        lessons_loaded,
     });
     init_tracing(trace_handle.clone());
 
@@ -601,6 +605,16 @@ async fn build_engine(
              truth — never claim success without a PASS."
         ),
         None => project_context,
+    };
+    // Learned lessons (self-improvement rung 2): inject the distilled lessons
+    // as standing guidance, after project context + verify nudge.
+    let instructions = match lessons::load_lessons() {
+        Some(lessons) => {
+            let n = lessons::lesson_count(&lessons);
+            let _ = ui_tx.send(Msg::Notice(format!("loaded {n} learned lessons")));
+            format!("{instructions}\n\n## Learned lessons (self-improvement — /learn)\n{lessons}")
+        }
+        None => instructions,
     };
     let mut builder = Orchestrator::builder(provider)
         .entry_agent(tools)
