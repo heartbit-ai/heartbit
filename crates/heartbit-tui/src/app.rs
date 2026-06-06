@@ -401,6 +401,10 @@ pub struct App {
     /// `(name, description)` of the registered workflow recipes — set by main
     /// from the same registry the agent gets, listed by `/workflows`.
     pub workflow_recipes: Vec<(String, String)>,
+    /// Model for the "fast" role (workflow stages); falls back to the main model.
+    pub fast_model: Option<String>,
+    /// Model for the "frontier" role (the advisor); falls back to the main model.
+    pub frontier_model: Option<String>,
     pub should_quit: bool,
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
@@ -443,6 +447,8 @@ impl App {
             spinner: 0,
             splash: None,
             workflow_recipes: Vec::new(),
+            fast_model: None,
+            frontier_model: None,
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),

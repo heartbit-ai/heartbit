@@ -79,6 +79,9 @@ pub(crate) fn recipe() -> WorkflowRecipe {
                     .unwrap_or(DEFAULT_ANGLES);
 
                 // Stage 1 — plan (talk-only; parse is fallback-guaranteed).
+                // Decomposition is cheap classification work → the "fast" role
+                // (dynamic model-by-task; degrades to the default without a
+                // host factory).
                 let plan = agent(
                     &ctx,
                     format!(
@@ -90,6 +93,7 @@ pub(crate) fn recipe() -> WorkflowRecipe {
                     ),
                 )
                 .label("research:plan")
+                .model("fast")
                 .run()
                 .await?
                 .unwrap_or_default();
@@ -364,5 +368,40 @@ mod tests {
     fn registry_includes_deep_research() {
         let reg = crate::agent::workflow_tool::default_registry();
         assert!(reg.get("deep_research").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_stage_runs_on_the_fast_model_when_a_factory_exists() {
+        use crate::agent::flow::ProviderFactory;
+
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let roles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(BoxedProvider::from_arc(Arc::new(RoutedProvider {
+            captured: cap.clone(),
+        })));
+        let factory: Arc<ProviderFactory> = {
+            let roles = Arc::clone(&roles);
+            let provider = Arc::clone(&provider);
+            Arc::new(move |role: &str| {
+                roles.lock().expect("lock").push(role.to_string());
+                // Same routed mock — the test asserts WHICH role was asked for.
+                Ok(Arc::clone(&provider))
+            })
+        };
+        let ctx = WorkflowCtx::builder(provider.clone())
+            .provider_factory(factory)
+            .build()
+            .expect("ctx");
+        let r = recipe();
+        let report = (r.run)(ctx, serde_json::json!({"question": "q", "angles": 2}))
+            .await
+            .unwrap();
+        assert!(report.contains("## Sources"), "{report}");
+        let roles = roles.lock().expect("lock");
+        assert_eq!(
+            roles.as_slice(),
+            ["fast"],
+            "exactly the PLAN stage resolves through the factory"
+        );
     }
 }

@@ -113,6 +113,14 @@ pub struct TuiConfig {
     /// `splash = false` in tui.toml.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub splash: bool,
+    /// Model for the "fast" role — cheap classification/extraction stages in
+    /// workflows (falls back to the main model when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+    /// Model for the "frontier" role — the advisor reviewer (falls back to
+    /// the main model when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_model: Option<String>,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -140,6 +148,8 @@ impl Default for TuiConfig {
             brave_api_key: None,
             prompt_caching: true,
             splash: true,
+            fast_model: None,
+            frontier_model: None,
         }
     }
 }
@@ -225,6 +235,16 @@ fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_roles_parse_and_default_to_none() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.fast_model.is_none() && cfg.frontier_model.is_none());
+        let cfg: TuiConfig =
+            toml::from_str("fast_model = \"q/light\"\nfrontier_model = \"a/opus\"").unwrap();
+        assert_eq!(cfg.fast_model.as_deref(), Some("q/light"));
+        assert_eq!(cfg.frontier_model.as_deref(), Some("a/opus"));
+    }
 
     #[test]
     fn splash_defaults_on_and_parses_off() {

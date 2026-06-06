@@ -83,6 +83,7 @@ pub struct RunWorkflowTool {
     registry: WorkflowRegistry,
     provider: Arc<BoxedProvider>,
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
+    provider_factory: Option<Arc<super::flow::ProviderFactory>>,
 }
 
 impl RunWorkflowTool {
@@ -93,6 +94,7 @@ impl RunWorkflowTool {
             registry,
             provider,
             agent_events: None,
+            provider_factory: None,
         }
     }
 
@@ -101,6 +103,13 @@ impl RunWorkflowTool {
     /// a recipe run is a single opaque tool call to any observer.
     pub fn with_agent_events(mut self, sink: Arc<crate::agent::events::OnEvent>) -> Self {
         self.agent_events = Some(sink);
+        self
+    }
+
+    /// Install the per-call model resolver threaded into every recipe ctx —
+    /// lets recipes run stages on role-named models (`.model("fast")`).
+    pub fn with_provider_factory(mut self, factory: Arc<super::flow::ProviderFactory>) -> Self {
+        self.provider_factory = Some(factory);
         self
     }
 }
@@ -168,6 +177,7 @@ impl Tool for RunWorkflowTool {
         let recipe = self.registry.get(&recipe_name).cloned();
         let provider = self.provider.clone();
         let agent_events = self.agent_events.clone();
+        let provider_factory = self.provider_factory.clone();
         Box::pin(async move {
             let Some(recipe) = recipe else {
                 return Ok(ToolOutput::error(format!(
@@ -180,6 +190,9 @@ impl Tool for RunWorkflowTool {
             }
             if let Some(n) = budget {
                 builder = builder.budget(n);
+            }
+            if let Some(factory) = provider_factory {
+                builder = builder.provider_factory(factory);
             }
             let ctx = match builder.build() {
                 Ok(c) => c,

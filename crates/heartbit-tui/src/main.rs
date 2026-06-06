@@ -187,6 +187,8 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.splash = cfg.splash.then_some(0);
     // Same deterministic registry the engine builds — /workflows lists it.
     app.workflow_recipes = heartbit_core::default_registry().meta();
+    app.fast_model = cfg.fast_model.clone();
+    app.frontier_model = cfg.frontier_model.clone();
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
     // agent actually dispatches sub-agents.
@@ -423,6 +425,8 @@ async fn build_engine(
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
     trace: trace::TraceHandle,
     prompt_caching: bool,
+    fast_model: Option<String>,
+    frontier_model: Option<String>,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -464,7 +468,7 @@ async fn build_engine(
             },
         )
     };
-    let provider = build_provider(api_key, model, on_retry, prompt_caching)?;
+    let provider = build_provider(api_key.clone(), model, on_retry.clone(), prompt_caching)?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -504,6 +508,30 @@ async fn build_engine(
     // run_workflow: named recipes (parallel_review, …) reachable by the agent.
     let registry = heartbit_core::default_registry();
     let recipe_meta = registry.meta();
+    // Model-role resolver shared by workflow stages ("fast") and the advisor
+    // ("frontier"): roles map to configured models, anything else is a raw
+    // model id; resolving to the main model reuses the session provider.
+    let provider_factory: Arc<heartbit_core::ProviderFactory> = {
+        let api_key = api_key.clone();
+        let on_retry = on_retry.clone();
+        let main_provider = provider.clone();
+        let main_model = model.to_string();
+        let fast = fast_model.clone();
+        let frontier = frontier_model.clone();
+        Arc::new(move |role: &str| {
+            let resolved = match role {
+                "main" | "" => return Ok(main_provider.clone()),
+                "fast" => fast.clone().unwrap_or_else(|| main_model.clone()),
+                "frontier" => frontier.clone().unwrap_or_else(|| main_model.clone()),
+                other => other.to_string(),
+            };
+            if resolved == main_model {
+                return Ok(main_provider.clone());
+            }
+            build_provider(api_key.clone(), &resolved, on_retry.clone(), true)
+                .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
+        })
+    };
     // Recipe-internal agents stream their events to the TRACE ONLY — not to
     // the UI Msg plane: an inner runner's text-only LlmDone / RunCompleted
     // would flip `running=false` (and commit staged lessons) mid-recipe. The
@@ -512,7 +540,8 @@ async fn build_engine(
     let recipe_trace = trace.clone();
     tools.push(Arc::new(
         heartbit_core::RunWorkflowTool::new(registry, provider.clone())
-            .with_agent_events(Arc::new(move |e: AgentEvent| recipe_trace.record_agent(&e))),
+            .with_agent_events(Arc::new(move |e: AgentEvent| recipe_trace.record_agent(&e)))
+            .with_provider_factory(provider_factory.clone()),
     ));
 
     let on_text: Arc<OnText> = {
@@ -831,6 +860,8 @@ fn spawn_agent(
     let context_window = app.context_limit().map(|w| w.min(u32::MAX as u64) as u32);
     let verify_command = app.verify_command.clone();
     let prompt_caching = app.prompt_caching;
+    let fast_model = app.fast_model.clone();
+    let frontier_model = app.frontier_model.clone();
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -859,6 +890,8 @@ fn spawn_agent(
                 perm_mode,
                 trace,
                 prompt_caching,
+                fast_model,
+                frontier_model,
             )
             .await
             {
