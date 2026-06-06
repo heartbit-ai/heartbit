@@ -2,7 +2,7 @@
 //! transcript flattening is verified with a `TestBackend` render test.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -69,6 +69,31 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
 /// approval modal overlay when present.
 pub fn view(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    // Startup splash: a full-frame overlay that pre-empts EVERYTHING — no
+    // transcript, status, composer, or modal renders beneath it. Dismissal
+    // (timer / any key) lives in the reducer; this is pure paint.
+    if let Some(tick) = app.splash {
+        let lines = if area.height < 16 || area.width < 44 {
+            vec![Line::from(Span::styled(
+                format!("♥ heartbit v{}", env!("CARGO_PKG_VERSION")),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ))]
+        } else {
+            crate::splash::splash_lines(tick, &app.model)
+        };
+        let h = (lines.len() as u16).min(area.height);
+        let top = area.height.saturating_sub(h) / 2;
+        let rect = Rect {
+            x: area.x,
+            y: area.y + top,
+            width: area.width,
+            height: h,
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rect);
+        return;
+    }
     // Composer height comes from WRAPPED rows (char-exact, the same math the
     // cursor uses) — logical lines under-count once a line exceeds the inner
     // width, clipping the typed text at the border (the transcript scroll
@@ -760,6 +785,61 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    #[test]
+    fn splash_overlay_replaces_everything() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.splash = Some(0);
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("▄▄██▄▄"), "heart art visible:\n{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(
+            !text.contains("Type a message"),
+            "composer hidden during splash:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_hides_modals_and_clears_after() {
+        use crate::app::KeyEntryModal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.modal = Some(Modal::KeyEntry(KeyEntryModal::default()));
+        app.splash = Some(0);
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let during = buffer_text(terminal.backend().buffer());
+        assert!(
+            !during.contains("OpenRouter API key"),
+            "modal hidden under splash:\n{during}"
+        );
+        app.splash = None;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let after = buffer_text(terminal.backend().buffer());
+        assert!(
+            after.contains("OpenRouter API key"),
+            "modal appears at dissolution:\n{after}"
+        );
+        assert!(!after.contains("▄▄██▄▄"), "art gone:\n{after}");
+    }
+
+    #[test]
+    fn splash_small_terminal_falls_back_to_one_liner() {
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.splash = Some(0);
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("♥ heartbit"), "{text}");
+        assert!(
+            !text.contains("▄▄██▄▄"),
+            "no art on tiny terminals:\n{text}"
+        );
     }
 
     // A fresh session shows a small identity header (campaign frame evidence:
