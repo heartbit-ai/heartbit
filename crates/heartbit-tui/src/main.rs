@@ -103,8 +103,34 @@ fn legacy_debug_file() -> Option<std::fs::File> {
         .ok()
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Config loads FIRST, on the still-single-threaded main: search-provider
+    // keys from tui.toml are exported to the process env here, BEFORE any
+    // thread exists (`std::env::set_var` is unsafe once threads run — the
+    // tokio runtime and the trace writer both spawn them). Live finding: a
+    // key parked in .env never reached the process and search silently fell
+    // back to scraped DuckDuckGo.
+    let cfg = config::TuiConfig::load();
+    for (var, val) in [
+        ("EXA_API_KEY", &cfg.exa_api_key),
+        ("TAVILY_API_KEY", &cfg.tavily_api_key),
+        ("BRAVE_API_KEY", &cfg.brave_api_key),
+    ] {
+        if std::env::var_os(var).is_none()
+            && let Some(v) = val.as_deref().filter(|v| !v.is_empty())
+        {
+            // SAFETY: no threads have been spawned yet (no tokio runtime, no
+            // trace writer) — mutating the environment is race-free here.
+            unsafe { std::env::set_var(var, v) };
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cfg))
+}
+
+async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     // A per-launch session id (time + pid) for transcript persistence — it
     // also keys the execution trace.
     let session_id = format!(
@@ -132,7 +158,6 @@ async fn main() -> anyhow::Result<()> {
     // NOTE: init_tracing is deliberately called AFTER the session_started
     // record below — its banner line is captured by the bridge and would
     // otherwise claim seq 0 (the trace must START with session_started).
-    let cfg = config::TuiConfig::load();
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -589,6 +614,13 @@ async fn build_engine(
     // run a workflow). One run() drives the whole multi-turn session. (The
     // blurb lives in /help now — startup stays one compact summary line.)
     let replan = verify_command.as_deref().is_some_and(|c| !c.is_empty());
+    // Which search backend Auto mode will actually use — surfaced so a
+    // missing API key is visible BEFORE a session degrades to the scraped
+    // DuckDuckGo fallback (which bot-walls under repeated queries).
+    summary_parts.push(format!(
+        "search: {}",
+        heartbit_core::tool::builtins::search_provider_label()
+    ));
     if recall_store.is_some() {
         summary_parts.push("recall ON".into());
     }

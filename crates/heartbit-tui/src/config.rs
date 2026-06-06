@@ -92,6 +92,16 @@ pub struct TuiConfig {
     /// `/verify <cmd>`; off when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<String>,
+    /// Search-provider API keys (websearch builtin). Loaded into the process
+    /// env at startup (before any thread) when the env vars are absent —
+    /// without one of these, search falls back to scraped DuckDuckGo, which
+    /// bot-walls under repeated queries (live finding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exa_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tavily_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brave_api_key: Option<String>,
     /// OpenRouter prompt-caching breakpoints (`cache_control`). ON by default —
     /// supporting routes (Anthropic, Alibaba/Qwen, Gemini) serve later turns at
     /// 0.25× input cost; non-supporting routes strip the markers (verified
@@ -121,6 +131,9 @@ impl Default for TuiConfig {
             multi_agent: false,
             context_recall: true,
             verify_command: None,
+            exa_api_key: None,
+            tavily_api_key: None,
+            brave_api_key: None,
             prompt_caching: true,
         }
     }
@@ -224,6 +237,27 @@ mod tests {
         );
         let loaded = TuiConfig::load_from(&path);
         assert_eq!(loaded, cfg);
+    }
+
+    // Live finding: the user's EXA_API_KEY lived in .env, which nothing
+    // sources for the TUI — search silently fell back to scraped DuckDuckGo
+    // (which bot-walls). Search keys are now first-class config, like the
+    // OpenRouter key.
+    #[test]
+    fn roundtrip_search_provider_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        let cfg = TuiConfig {
+            exa_api_key: Some("exa-1".into()),
+            tavily_api_key: Some("tv-2".into()),
+            brave_api_key: Some("br-3".into()),
+            ..Default::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(TuiConfig::load_from(&path), cfg);
+        // Absent keys stay absent (not serialized, default None).
+        let bare = TuiConfig::default();
+        assert!(bare.exa_api_key.is_none());
     }
 
     #[test]

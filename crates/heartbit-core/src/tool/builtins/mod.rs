@@ -308,7 +308,7 @@ pub use todo::{TodoPriority, TodoStatus, TodoStore, todo_tools};
 #[cfg(feature = "ghost-domain-config")]
 pub use twitter_post::TwitterCredentials;
 pub use webfetch::WebFetchTool;
-pub use websearch::WebSearchTool;
+pub use websearch::{WebSearchTool, search_provider_label};
 
 /// Risk classification for builtin tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

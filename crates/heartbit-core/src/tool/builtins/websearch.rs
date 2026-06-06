@@ -329,6 +329,19 @@ struct SearchResult {
     text: String,
 }
 
+/// Human label for the search backend `Auto` mode will actually use — lets a
+/// UI surface "search: ddg-only" BEFORE a session silently degrades to the
+/// scraped fallback (live finding: a missing key was invisible until every
+/// query returned bot-walled empties).
+pub fn search_provider_label() -> &'static str {
+    match detect_providers().first() {
+        Some(SearchProvider::Exa) => "exa",
+        Some(SearchProvider::Tavily) => "tavily",
+        Some(SearchProvider::Brave) => "brave",
+        _ => "ddg-only (no search API key)",
+    }
+}
+
 fn detect_providers() -> Vec<SearchProvider> {
     let mut providers = Vec::new();
     if std::env::var("EXA_API_KEY").is_ok() {
