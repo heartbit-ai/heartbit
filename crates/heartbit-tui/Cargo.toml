@@ -29,6 +29,7 @@ futures = { workspace = true }
 pulldown-cmark = { workspace = true }
 reqwest = { workspace = true }
 walkdir = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

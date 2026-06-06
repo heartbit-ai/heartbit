@@ -26,6 +26,7 @@ mod markdown;
 mod models;
 mod msg;
 mod session;
+mod trace;
 mod ui;
 
 use std::path::PathBuf;

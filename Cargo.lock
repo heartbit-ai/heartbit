@@ -2125,6 +2125,7 @@ name = "heartbit-tui"
 version = "2026.507.4"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "futures",
