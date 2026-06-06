@@ -82,13 +82,26 @@ impl WorkflowRegistry {
 pub struct RunWorkflowTool {
     registry: WorkflowRegistry,
     provider: Arc<BoxedProvider>,
+    agent_events: Option<Arc<crate::agent::events::OnEvent>>,
 }
 
 impl RunWorkflowTool {
     /// Build the tool over a registry and the shared provider used to run the
     /// recipe's `flow/` agents.
     pub fn new(registry: WorkflowRegistry, provider: Arc<BoxedProvider>) -> Self {
-        Self { registry, provider }
+        Self {
+            registry,
+            provider,
+            agent_events: None,
+        }
+    }
+
+    /// Forward every recipe-internal agent's event stream (tool calls, LLM
+    /// responses, run lifecycle) to `sink` — e.g. the TUI trace. Without this,
+    /// a recipe run is a single opaque tool call to any observer.
+    pub fn with_agent_events(mut self, sink: Arc<crate::agent::events::OnEvent>) -> Self {
+        self.agent_events = Some(sink);
+        self
     }
 }
 
@@ -146,13 +159,18 @@ impl Tool for RunWorkflowTool {
 
         let recipe = self.registry.get(&recipe_name).cloned();
         let provider = self.provider.clone();
+        let agent_events = self.agent_events.clone();
         Box::pin(async move {
             let Some(recipe) = recipe else {
                 return Ok(ToolOutput::error(format!(
                     "unknown workflow recipe '{recipe_name}'"
                 )));
             };
-            let ctx = match WorkflowCtx::builder(provider).build() {
+            let mut builder = WorkflowCtx::builder(provider);
+            if let Some(sink) = agent_events {
+                builder = builder.on_agent_event(sink);
+            }
+            let ctx = match builder.build() {
                 Ok(c) => c,
                 Err(e) => return Ok(ToolOutput::error(format!("workflow setup failed: {e}"))),
             };
@@ -354,5 +372,52 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error, "missing target must error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_event_sink_observes_recipe_internal_agents() {
+        use crate::agent::events::{AgentEvent, OnEvent};
+        use std::sync::Mutex;
+
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<OnEvent> = {
+            let captured = Arc::clone(&captured);
+            Arc::new(move |ev| captured.lock().expect("lock").push(ev))
+        };
+        let tool = RunWorkflowTool::new(default_registry(), provider()).with_agent_events(sink);
+        let out = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({"recipe": "parallel_review", "args": {"target": "fn foo() {}", "lenses": ["a", "b"]}}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "got: {}", out.content);
+
+        let events = captured.lock().expect("lock");
+        // Each lens agent's full runner lifecycle must reach the sink, keyed by
+        // its flow label (the trace's `agent` field).
+        for lens in ["a", "b"] {
+            let label = format!("review:{lens}");
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, AgentEvent::RunCompleted { agent, .. } if *agent == label)
+                ),
+                "missing RunCompleted for {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_sink_recipes_still_run() {
+        let tool = RunWorkflowTool::new(default_registry(), provider());
+        let out = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({"recipe": "parallel_review", "args": {"target": "x", "lenses": ["a"]}}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
     }
 }

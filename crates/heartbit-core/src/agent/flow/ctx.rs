@@ -88,6 +88,12 @@ struct CtxInner {
     journal: Option<Arc<RunJournal>>,
     /// Optional workflow event sink.
     events: Option<Arc<OnWorkflowEvent>>,
+    /// Optional [`AgentEvent`](crate::agent::events::AgentEvent) sink wired
+    /// into every inner [`AgentRunner`](crate::agent::AgentRunner) the leaves
+    /// build — surfaces recipe-internal tool calls / LLM responses to a host
+    /// (e.g. the TUI trace). Distinct from `events`, which carries the
+    /// workflow-level lifecycle.
+    agent_events: Option<Arc<crate::agent::events::OnEvent>>,
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
     cancel: CancellationToken,
     /// Default phase for subsequently-issued agents. `std` lock: never held
@@ -122,6 +128,7 @@ impl WorkflowCtx {
             budget: None,
             journal: None,
             events: None,
+            agent_events: None,
             cancel: None,
         }
     }
@@ -180,6 +187,10 @@ impl WorkflowCtx {
 
     /// The ctx's default tool set (cloned `Vec`), if any. Used by an agent leaf
     /// that supplies no per-call tools.
+    pub(crate) fn agent_events(&self) -> Option<Arc<crate::agent::events::OnEvent>> {
+        self.inner.agent_events.clone()
+    }
+
     pub(crate) fn base_tools(&self) -> Option<Vec<Arc<dyn crate::tool::Tool>>> {
         self.inner.base_tools.as_ref().map(|t| t.as_ref().clone())
     }
@@ -252,6 +263,7 @@ impl WorkflowCtx {
                 control: Arc::clone(&self.inner.control),
                 journal: self.inner.journal.clone(),
                 events: self.inner.events.clone(),
+                agent_events: self.inner.agent_events.clone(),
                 cancel: self.inner.cancel.clone(),
                 default_phase: RwLock::new(None),
                 depth: self.inner.depth + 1,
@@ -300,6 +312,7 @@ pub struct WorkflowCtxBuilder {
     budget: Option<Budget>,
     journal: Option<Arc<RunJournal>>,
     events: Option<Arc<OnWorkflowEvent>>,
+    agent_events: Option<Arc<crate::agent::events::OnEvent>>,
     cancel: Option<CancellationToken>,
 }
 
@@ -367,6 +380,16 @@ impl WorkflowCtxBuilder {
         self
     }
 
+    /// Install an [`AgentEvent`](crate::agent::events::AgentEvent) sink: every
+    /// inner `AgentRunner` built by the agent leaves forwards its full event
+    /// stream (tool calls, LLM responses, run lifecycle) here. Lets a host
+    /// (e.g. the TUI trace) observe recipe-internal activity that would
+    /// otherwise stay invisible behind the tool boundary.
+    pub fn on_agent_event(mut self, callback: Arc<crate::agent::events::OnEvent>) -> Self {
+        self.agent_events = Some(callback);
+        self
+    }
+
     /// Provide an external cancellation token (defaults to a fresh one).
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -401,6 +424,7 @@ impl WorkflowCtxBuilder {
                 control: Arc::new(Mutex::new(None)),
                 journal: self.journal,
                 events: self.events,
+                agent_events: self.agent_events,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),
                 depth: 0,

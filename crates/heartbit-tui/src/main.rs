@@ -500,10 +500,16 @@ async fn build_engine(
     // run_workflow: named recipes (parallel_review, …) reachable by the agent.
     let registry = heartbit_core::default_registry();
     let recipe_meta = registry.meta();
-    tools.push(Arc::new(heartbit_core::RunWorkflowTool::new(
-        registry,
-        provider.clone(),
-    )));
+    // Recipe-internal agents stream their events to the TRACE ONLY — not to
+    // the UI Msg plane: an inner runner's text-only LlmDone / RunCompleted
+    // would flip `running=false` (and commit staged lessons) mid-recipe. The
+    // trace tap is what /stats and /analyze read, which is where a recipe run
+    // was previously a single opaque tool call.
+    let recipe_trace = trace.clone();
+    tools.push(Arc::new(
+        heartbit_core::RunWorkflowTool::new(registry, provider.clone())
+            .with_agent_events(Arc::new(move |e: AgentEvent| recipe_trace.record_agent(&e))),
+    ));
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();

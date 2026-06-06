@@ -336,6 +336,12 @@ async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<Ag
     if let Some(label) = &opts.label {
         builder = builder.name(label.clone());
     }
+    // Surface the inner runner's full event stream (tool calls, LLM responses,
+    // run lifecycle) to the host's sink when one is installed on the ctx —
+    // otherwise recipe-internal activity is invisible behind the tool boundary.
+    if let Some(sink) = ctx.agent_events() {
+        builder = builder.on_event(sink);
+    }
     if let Some(schema) = &opts.schema {
         builder = builder.structured_schema(schema.clone());
     }
@@ -430,6 +436,58 @@ mod tests {
         assert_eq!(out.as_deref(), Some("mock text"));
         // The provider was actually invoked exactly once.
         assert_eq!(mock.captured_requests.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_event_sink_receives_inner_runner_events() {
+        use crate::agent::events::{AgentEvent, OnEvent};
+        use std::sync::Mutex;
+
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "hi", 1, 1,
+        )]));
+        let captured: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<OnEvent> = {
+            let captured = Arc::clone(&captured);
+            Arc::new(move |ev| captured.lock().expect("lock").push(ev))
+        };
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(mock)))
+            .on_agent_event(sink)
+            .build()
+            .expect("build ctx");
+
+        let out = agent(&ctx, "do it")
+            .label("lane:1")
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(out.as_deref(), Some("hi"));
+
+        let events = captured.lock().expect("lock");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RunStarted { agent, .. } if agent == "lane:1")),
+            "inner runner's RunStarted must reach the sink with the label as agent name"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RunCompleted { agent, .. } if agent == "lane:1")),
+            "inner runner's RunCompleted must reach the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_agent_event_sink_means_no_events_and_no_failure() {
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "ok", 1, 1,
+        )]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(mock)))
+            .build()
+            .expect("build ctx");
+        let out = agent(&ctx, "go").run().await.expect("run ok");
+        assert_eq!(out.as_deref(), Some("ok"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
