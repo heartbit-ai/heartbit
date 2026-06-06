@@ -2,6 +2,31 @@
 //! terminal I/O, so it is fully unit-testable. Lines are stored as `Vec<char>`
 //! to make cursor math char-correct (no byte/UTF-8 boundary bugs).
 
+/// Greedy display-cell packing of one logical line into rows of at most
+/// `width` cells: returns char-index ranges. A wide char never splits across
+/// a boundary; an exactly-full final row yields a trailing empty range (the
+/// fresh-input row the cursor lands on). Zero-width chars pack freely.
+fn pack_line(line: &[char], width: usize) -> Vec<(usize, usize)> {
+    use unicode_width::UnicodeWidthChar;
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (i, ch) in line.iter().enumerate() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width && used > 0 {
+            rows.push((start, i));
+            start = i;
+            used = 0;
+        }
+        used += w;
+    }
+    rows.push((start, line.len()));
+    if used >= width {
+        rows.push((line.len(), line.len()));
+    }
+    rows
+}
+
 /// A multiline editor with a cursor and submit-history recall.
 #[derive(Debug)]
 pub struct Composer {
@@ -58,35 +83,46 @@ impl Composer {
         (self.row, self.col)
     }
 
-    /// Char-exact wrap of the buffer into visual rows of at most `width`
-    /// chars — the SAME math `visual_cursor` uses, so the rendered text and
-    /// the cursor can never disagree. Each logical line takes `len/width + 1`
-    /// rows: a fresh, empty input row appears the moment a line fills (the
-    /// `+1` phantom row), which is where continued typing lands.
+    /// Display-cell wrap of the buffer into visual rows of at most `width`
+    /// CELLS (wide CJK/emoji chars take 2) — the SAME math `visual_cursor`
+    /// uses, so the rendered text and the cursor can never disagree. A wide
+    /// char never splits across rows; an exactly-full row grows a fresh,
+    /// empty row (where continued typing lands).
     pub fn wrap_lines(&self, width: usize) -> Vec<String> {
         let width = width.max(1);
         let mut rows = Vec::new();
         for line in &self.lines {
-            let n_rows = line.len() / width + 1;
-            for r in 0..n_rows {
-                let start = r * width;
-                let end = (start + width).min(line.len());
-                rows.push(line[start..end].iter().collect());
+            for (s, e) in pack_line(line, width) {
+                rows.push(line[s..e].iter().collect());
             }
         }
         rows
     }
 
-    /// Cursor position in WRAPPED rows for a given width (same wrap rule as
-    /// [`Self::wrap_lines`]): rows of all logical lines above, plus the
-    /// cursor's row within its own wrapped line.
+    /// Cursor position in WRAPPED rows for a given width — (visual row,
+    /// display-cell column), same packing rule as [`Self::wrap_lines`].
     pub fn visual_cursor(&self, width: usize) -> (usize, usize) {
+        use unicode_width::UnicodeWidthChar;
         let width = width.max(1);
         let rows_above: usize = self.lines[..self.row]
             .iter()
-            .map(|l| l.len() / width + 1)
+            .map(|l| pack_line(l, width).len())
             .sum();
-        (rows_above + self.col / width, self.col % width)
+        let line = &self.lines[self.row];
+        let packs = pack_line(line, width);
+        let mut row_in_line = packs.len() - 1;
+        for (r, &(_, e)) in packs.iter().enumerate() {
+            if self.col < e || (self.col == e && r == packs.len() - 1) {
+                row_in_line = r;
+                break;
+            }
+        }
+        let (start, _) = packs[row_in_line];
+        let cell: usize = line[start..self.col]
+            .iter()
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
+        (rows_above + row_in_line, cell)
     }
 
     /// The submit-history entries (oldest→newest) — for Ctrl+R reverse search.
@@ -310,6 +346,38 @@ mod tests {
         // Degenerate width never panics.
         let _ = c.wrap_lines(0);
         let _ = c.visual_cursor(0);
+    }
+
+    // Wide chars (CJK, emoji) occupy 2 terminal cells: the wrap and the
+    // cursor must count DISPLAY CELLS, not chars — char-based math drifted
+    // the cursor and overflowed rows for non-ASCII input.
+    #[test]
+    fn wide_chars_wrap_by_display_cells() {
+        let mut c = Composer::new();
+        c.insert_str("日本語のテスト"); // 7 chars × 2 cells = 14 cells
+        // width 10 → 5 wide chars (10 cells) per row.
+        assert_eq!(
+            c.wrap_lines(10),
+            vec!["日本語のテ".to_string(), "スト".to_string()]
+        );
+        // Cursor at end: row 1, after 2 wide chars = cell column 4.
+        assert_eq!(c.visual_cursor(10), (1, 4));
+    }
+
+    #[test]
+    fn wide_char_never_splits_across_a_row_boundary() {
+        let mut c = Composer::new();
+        c.insert_str("aaa許"); // 3+2 = 5 cells; width 4 leaves 1 cell — 許 must move down
+        assert_eq!(c.wrap_lines(4), vec!["aaa".to_string(), "許".to_string()]);
+        assert_eq!(c.visual_cursor(4), (1, 2));
+    }
+
+    #[test]
+    fn exact_full_wide_row_grows_a_fresh_row() {
+        let mut c = Composer::new();
+        c.insert_str("ab🙂"); // 1+1+2 = 4 cells, exactly full at width 4
+        assert_eq!(c.wrap_lines(4), vec!["ab🙂".to_string(), String::new()]);
+        assert_eq!(c.visual_cursor(4), (1, 0), "cursor lands on the fresh row");
     }
 
     #[test]

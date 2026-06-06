@@ -39,6 +39,7 @@ opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.29"
 walkdir = "2"
+unicode-width = "0.2"
 regex = "1"
 a2a-sdk = "0.7.0"
 rdkafka = { version = "0.37", features = ["cmake-build", "tokio"] }
