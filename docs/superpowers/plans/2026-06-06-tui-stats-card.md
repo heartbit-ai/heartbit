@@ -16,7 +16,7 @@ Verified anchors: `main.rs:1138` `Ok::<String, String>(trace_stats::compute(file
 
 ### Task 1: cache aggregation + derives in `trace_stats.rs`
 
-- [ ] **Step 1 (red):** test beside the existing compute tests:
+- [x] **Step 1 (red):** test beside the existing compute tests:
 
 ```rust
     #[test]
@@ -31,12 +31,12 @@ Verified anchors: `main.rs:1138` `Ok::<String, String>(trace_stats::compute(file
 (Match the EXACT envelope shape the existing compute tests use — copy one of
 their fixture lines and add the `cache_read_input_tokens` values.)
 
-- [ ] **Step 2:** field `pub total_cache_read_tokens: u64` on `TraceStats`; sum it where `total_input_tokens` is summed from `llm_response.usage`; add `Clone, Serialize, Deserialize` (and `Default` if absent) to `TraceStats` AND `ToolStat` derives.
-- [ ] **Step 3:** `cargo test -p heartbit-tui trace_stats` PASS. Commit `feat(tui): stats aggregate cache-read tokens + serde derives`.
+- [x] **Step 2:** field `pub total_cache_read_tokens: u64` on `TraceStats`; sum it where `total_input_tokens` is summed from `llm_response.usage`; add `Clone, Serialize, Deserialize` (and `Default` if absent) to `TraceStats` AND `ToolStat` derives.
+- [x] **Step 3:** `cargo test -p heartbit-tui trace_stats` PASS. Commit `feat(tui): stats aggregate cache-read tokens + serde derives`.
 
 ### Task 2: helpers + `Cell::Stats` card renderer in `cells.rs`
 
-- [ ] **Step 1 (red):** tests:
+- [x] **Step 1 (red):** tests:
 
 ```rust
     #[test]
@@ -92,7 +92,7 @@ their fixture lines and add the `cache_read_input_tokens` values.)
 (`ToolStat` field names: verify against trace_stats.rs and adapt. `TraceStats`
 needs `Default` — Task 1 added it.)
 
-- [ ] **Step 2:** implement in `cells.rs`:
+- [x] **Step 2:** implement in `cells.rs`:
 
 ```rust
 /// `982` · `4.4k` · `1.2M` — compact token counts.
@@ -140,11 +140,11 @@ Variant (Box to keep `Cell` small): `Stats { label: String, stats: Box<crate::tr
 
 `to_lines()` arm — build the card per the spec visual: header line (`▎ stats — session {label} · {fmt_ms(duration_ms)} · {llm_calls} llm calls`, marker+title magenta bold, meta dim); blank; `tokens` / `context` (+ `sparkline(&turn_input_tokens, 24)` dim, row skipped when `turn_input_tokens.len() < 2`) / `latency` / `runs` (failed red when > 0) / `friction` ("none" green, else the non-zero counters joined with ` · ` yellow) / `approvals` ("instant" when mean < 100ms); blank; tools header row dim + one aligned row per tool (`{:<14} {:<4} {:<5} {:<7} {}`), err column `—` dim or `{n} ⚠` red. Section labels (`tokens`, `context`, …) dim, `{:<10}`-padded; values default-styled.
 
-- [ ] **Step 3:** PASS + commit `feat(tui): Cell::Stats styled card — human units, sparkline, error highlighting`.
+- [x] **Step 3:** PASS + commit `feat(tui): Cell::Stats styled card — human units, sparkline, error highlighting`.
 
 ### Task 3: wiring — msg, edge, reducer, export
 
-- [ ] **Step 1 (red):** update the reducer test at app.rs:2609 to the new shape:
+- [x] **Step 1 (red):** update the reducer test at app.rs:2609 to the new shape:
 
 ```rust
         app.update(Msg::StatsReady(Ok((
@@ -156,13 +156,13 @@ Variant (Box to keep `Cell` small): `Stats { label: String, stats: Box<crate::tr
 
 …and an export test in session.rs tests: a `Cell::Stats` exports a fenced block containing `tools:`.
 
-- [ ] **Step 2:** `msg.rs`: `StatsReady(Result<(String, Box<crate::trace_stats::TraceStats>), String>)`. `main.rs:1138`: `Ok::<_, String>((label.clone(), Box::new(trace_stats::compute(file))))` — `label` = the resolved trace id already computed in that handler (verify its variable name in context; derive from the path stem if absent). `app.rs:809`: push `Cell::Stats { label, stats }`. `session.rs` export arm: `Cell::Stats { label, stats } => out.push_str(&format!("**stats — {label}**\n\n```\n{}```\n\n", stats.render()))`.
-- [ ] **Step 3:** `cargo test -p heartbit-tui` ALL PASS. Commit `feat(tui): /stats renders the styled card — struct through the Msg, plain render for export`.
+- [x] **Step 2:** `msg.rs`: `StatsReady(Result<(String, Box<crate::trace_stats::TraceStats>), String>)`. `main.rs:1138`: `Ok::<_, String>((label.clone(), Box::new(trace_stats::compute(file))))` — `label` = the resolved trace id already computed in that handler (verify its variable name in context; derive from the path stem if absent). `app.rs:809`: push `Cell::Stats { label, stats }`. `session.rs` export arm: `Cell::Stats { label, stats } => out.push_str(&format!("**stats — {label}**\n\n```\n{}```\n\n", stats.render()))`.
+- [x] **Step 3:** `cargo test -p heartbit-tui` ALL PASS. Commit `feat(tui): /stats renders the styled card — struct through the Msg, plain render for export`.
 
 ### Task 4: gate + live pty
 
-- [ ] Full workspace gate green.
-- [ ] `cargo build -p heartbit-tui`; pty against the bridged research trace (`/stats 6a2473a4-2570678` with `HEARTBIT_TUI_CONFIG` pointing at `/tmp/claude-1000/tuitracebridge-nxc6ed2i/isolated-tui.toml`): settled frame contains `▎ stats`, `webfetch`, `⚠`, sparkline glyphs. Mark checkboxes; report.
+- [x] Full workspace gate green.
+- [x] `cargo build -p heartbit-tui`; pty against the bridged research trace (`/stats 6a2473a4-2570678` with `HEARTBIT_TUI_CONFIG` pointing at `/tmp/claude-1000/tuitracebridge-nxc6ed2i/isolated-tui.toml`): settled frame contains `▎ stats`, `webfetch`, `⚠`, sparkline glyphs. Mark checkboxes; report.
 
 ## Self-review
 
