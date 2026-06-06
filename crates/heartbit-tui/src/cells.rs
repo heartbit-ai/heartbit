@@ -36,6 +36,52 @@ pub enum Cell {
     /// The model's chain-of-thought (reasoning models only) — rendered dimmed
     /// and distinct from the answer.
     Reasoning(String),
+    /// A `/stats` card: the computed trace summary, rendered styled (human
+    /// units, sparkline, error highlighting). Boxed to keep `Cell` small.
+    Stats {
+        label: String,
+        stats: Box<crate::trace_stats::TraceStats>,
+    },
+}
+
+/// `982` · `4.4k` · `1.2M` — compact token counts.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// `2ms` · `19.8s` · `1m47s` — human durations.
+fn fmt_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1_000)
+    }
+}
+
+/// Downsample to ≤ `width` buckets (mean), scale to the max, render ▁▂▃▄▅▆▇█.
+fn sparkline(values: &[u64], width: usize) -> String {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() || width == 0 {
+        return String::new();
+    }
+    let chunk = values.len().div_ceil(width);
+    let buckets: Vec<u64> = values
+        .chunks(chunk)
+        .map(|c| c.iter().sum::<u64>() / c.len() as u64)
+        .collect();
+    let max = buckets.iter().copied().max().unwrap_or(0).max(1);
+    buckets
+        .iter()
+        .map(|&v| GLYPHS[((v * 7) / max) as usize])
+        .collect()
 }
 
 /// Max diff lines shown inline before truncation (compact "aperçu" philosophy).
@@ -240,13 +286,219 @@ impl Cell {
                 );
                 lines
             }
+            Cell::Stats { label, stats } => stats_card(label, stats),
         }
     }
+}
+
+/// Build the `/stats` card: colored section rows, human units, a context
+/// sparkline, red error highlighting. Pure — fully covered by unit tests.
+fn stats_card(label: &str, s: &crate::trace_stats::TraceStats) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let title = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let lbl = |name: &str| Span::styled(format!("  {name:<10} "), dim);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("▎ ", title),
+            Span::styled(format!("stats — session {label}"), title),
+            Span::styled(
+                format!(" · {} · {} llm calls", fmt_ms(s.duration_ms), s.llm_calls),
+                dim,
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    // tokens — cache % over total input (0% is still signal: caching is off).
+    let cache_pct = s.total_cache_read_tokens * 100 / s.total_input_tokens.max(1);
+    lines.push(Line::from(vec![
+        lbl("tokens"),
+        Span::raw(format!(
+            "in {} · out {} · cache {cache_pct}%",
+            fmt_tokens(s.total_input_tokens),
+            fmt_tokens(s.total_output_tokens)
+        )),
+    ]));
+    // context growth — needs at least two calls to be a curve.
+    if s.turn_input_tokens.len() >= 2 {
+        let first = *s.turn_input_tokens.first().unwrap_or(&0);
+        let last = *s.turn_input_tokens.last().unwrap_or(&0);
+        let max = s.turn_input_tokens.iter().copied().max().unwrap_or(0);
+        lines.push(Line::from(vec![
+            lbl("context"),
+            Span::raw(format!(
+                "{} → {} /call (max {})  ",
+                fmt_tokens(first),
+                fmt_tokens(last),
+                fmt_tokens(max)
+            )),
+            Span::styled(sparkline(&s.turn_input_tokens, 24), dim),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        lbl("latency"),
+        Span::raw(format!(
+            "llm p50 {} p95 {} · ttft {}/{}",
+            fmt_ms(s.llm_latency_p50_ms),
+            fmt_ms(s.llm_latency_p95_ms),
+            fmt_ms(s.ttft_p50_ms),
+            fmt_ms(s.ttft_p95_ms)
+        )),
+    ]));
+    let failed_style = if s.run_failed > 0 {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
+    lines.push(Line::from(vec![
+        lbl("runs"),
+        Span::raw(format!("{} ok · ", s.run_completed)),
+        Span::styled(format!("{} failed", s.run_failed), failed_style),
+    ]));
+    // friction — green "none", or the non-zero counters in yellow.
+    let friction: Vec<String> = [
+        (s.retries, "retries"),
+        (s.doom_loops, "doom-loops"),
+        (s.guardrail_denied, "guardrail-denied"),
+        (s.guardrail_warned, "guardrail-warned"),
+        (s.interrupts, "interrupts"),
+        (s.compactions, "compactions"),
+        (s.prunes, "prunes"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, name)| format!("{name} {n}"))
+    .collect();
+    lines.push(Line::from(vec![
+        lbl("friction"),
+        if friction.is_empty() {
+            Span::styled("none".to_string(), Style::default().fg(Color::Green))
+        } else {
+            Span::styled(friction.join(" · "), Style::default().fg(Color::Yellow))
+        },
+    ]));
+    let human = if s.approval_mean_latency_ms < 100 {
+        "instant".to_string()
+    } else {
+        fmt_ms(s.approval_mean_latency_ms)
+    };
+    lines.push(Line::from(vec![
+        lbl("approvals"),
+        Span::raw(format!(
+            "{} ({} denied) · {human}",
+            s.approvals, s.approval_denials
+        )),
+    ]));
+    if !s.tools.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:<14} {:<5} {:<6} {:<8} {}",
+                "tool", "×", "err", "p50", "p95"
+            ),
+            dim,
+        )));
+        for (name, t) in &s.tools {
+            let err = if t.errors > 0 {
+                Span::styled(
+                    format!("{:<6} ", format!("{} ⚠", t.errors)),
+                    Style::default().fg(Color::Red),
+                )
+            } else {
+                Span::styled(format!("{:<7}", "—"), dim)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<14} {:<5} ", name, t.count)),
+                err,
+                Span::raw(format!("{:<8} {}", fmt_ms(t.p50_ms), fmt_ms(t.p95_ms))),
+            ]));
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_units_format() {
+        assert_eq!(fmt_tokens(982), "982");
+        assert_eq!(fmt_tokens(4_400), "4.4k");
+        assert_eq!(fmt_tokens(1_200_000), "1.2M");
+        assert_eq!(fmt_ms(2), "2ms");
+        assert_eq!(fmt_ms(355), "355ms");
+        assert_eq!(fmt_ms(19_822), "19.8s");
+        assert_eq!(fmt_ms(71_100), "1m11s");
+        assert_eq!(fmt_ms(107_000), "1m47s");
+    }
+
+    #[test]
+    fn sparkline_scales_and_downsamples() {
+        assert_eq!(sparkline(&[0, 7], 8), "▁█");
+        let s = sparkline(&(0..100u64).collect::<Vec<_>>(), 8);
+        assert_eq!(s.chars().count(), 8, "{s}");
+        assert!(s.ends_with('█'), "{s}");
+        assert_eq!(sparkline(&[], 8), "");
+    }
+
+    #[test]
+    fn stats_cell_renders_the_card() {
+        let mut stats = crate::trace_stats::TraceStats {
+            llm_calls: 21,
+            duration_ms: 107_000,
+            total_input_tokens: 86_700,
+            total_output_tokens: 6_900,
+            total_cache_read_tokens: 35_000,
+            turn_input_tokens: vec![4_400, 5_000, 7_100, 13_250, 7_126],
+            run_completed: 8,
+            ..Default::default()
+        };
+        stats.tools.insert(
+            "webfetch".into(),
+            crate::trace_stats::ToolStat {
+                count: 11,
+                errors: 2,
+                p50_ms: 355,
+                p95_ms: 2_957,
+                ..Default::default()
+            },
+        );
+        let cell = Cell::Stats {
+            label: "abc-1".into(),
+            stats: Box::new(stats),
+        };
+        let text = plain(&cell.to_lines());
+        assert!(text.contains("stats — session abc-1"), "{text}");
+        assert!(text.contains("21 llm calls"), "{text}");
+        assert!(text.contains("86.7k"), "{text}");
+        assert!(text.contains("cache 40%"), "{text}");
+        assert!(text.contains("webfetch"), "{text}");
+        assert!(text.contains("2 ⚠"), "{text}");
+        assert!(
+            text.contains('█') || text.contains('▁'),
+            "sparkline:\n{text}"
+        );
+        assert!(text.contains("8 ok"), "{text}");
+        assert!(text.contains("none"), "friction none:\n{text}");
+    }
+
+    #[test]
+    fn stats_cell_skips_sparkline_under_two_calls() {
+        let stats = crate::trace_stats::TraceStats {
+            turn_input_tokens: vec![4_400],
+            ..Default::default()
+        };
+        let text = plain(
+            &Cell::Stats {
+                label: "x".into(),
+                stats: Box::new(stats),
+            }
+            .to_lines(),
+        );
+        assert!(!text.contains("context"), "{text}");
+    }
 
     fn plain(lines: &[Line<'static>]) -> String {
         lines

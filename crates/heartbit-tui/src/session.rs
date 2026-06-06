@@ -127,6 +127,13 @@ pub fn to_markdown(history: &[Cell]) -> String {
                 out.push_str(t);
                 out.push_str("\n\n</details>\n\n");
             }
+            // Markdown can't carry the card's colors — export the plain table.
+            Cell::Stats { label, stats } => {
+                out.push_str(&format!(
+                    "**stats — {label}**\n\n```\n{}```\n\n",
+                    stats.render()
+                ));
+            }
         }
     }
     out
@@ -149,6 +156,10 @@ mod tests {
             },
             Cell::Agent("Done — fixed it.".into()),
             Cell::Notice("interrupted".into()),
+            Cell::Stats {
+                label: "t-9".into(),
+                stats: Box::new(crate::trace_stats::TraceStats::default()),
+            },
         ]
     }
 
@@ -160,6 +171,9 @@ mod tests {
         assert!(md.contains("`✓ edit (5ms)`"));
         assert!(md.contains("Done — fixed it."));
         assert!(md.contains("> _interrupted_"));
+        // The stats card exports as the plain fenced table.
+        assert!(md.contains("**stats — t-9**"), "{md}");
+        assert!(md.contains("tools") || md.contains("records"), "{md}");
     }
 
     #[test]
@@ -172,7 +186,7 @@ mod tests {
         };
         save(dir.path(), &s).unwrap();
         let loaded = load(dir.path(), "abc123").unwrap();
-        assert_eq!(loaded.history.len(), 4);
+        assert_eq!(loaded.history.len(), 5);
         let metas = list(dir.path());
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].id, "abc123");

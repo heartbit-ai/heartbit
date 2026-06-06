@@ -1135,7 +1135,15 @@ async fn run_ui(
                             let dir = session::sessions_dir();
                             let path = trace::resolve_trace_target(&dir, &sid, target.as_deref())?;
                             let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-                            Ok::<String, String>(trace_stats::compute(file).render())
+                            // "abc-1.trace.jsonl" → "abc-1" — the card's label.
+                            let label = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .trim_end_matches(".jsonl")
+                                .trim_end_matches(".trace")
+                                .to_string();
+                            Ok::<_, String>((label, Box::new(trace_stats::compute(file))))
                         })
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()));

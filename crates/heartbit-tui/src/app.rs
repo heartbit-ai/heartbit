@@ -806,8 +806,8 @@ impl App {
                 self.history
                     .push(Cell::Notice("— session resumed —".into()));
             }
-            Msg::StatsReady(Ok(table)) => {
-                self.history.push(Cell::Agent(format!("```\n{table}```")));
+            Msg::StatsReady(Ok((label, stats))) => {
+                self.history.push(Cell::Stats { label, stats });
             }
             Msg::StatsReady(Err(e)) => {
                 self.history.push(Cell::Notice(format!("stats: {e}")));
@@ -2604,10 +2604,13 @@ mod tests {
     }
 
     #[test]
-    fn stats_ready_renders_into_transcript() {
+    fn stats_ready_renders_a_stats_card() {
         let mut app = keyed();
-        app.update(Msg::StatsReady(Ok("turns 3\n".into())));
-        assert!(matches!(app.history.last(), Some(Cell::Agent(t)) if t.contains("turns 3")));
+        app.update(Msg::StatsReady(Ok((
+            "t1".into(),
+            Box::new(crate::trace_stats::TraceStats::default()),
+        ))));
+        assert!(matches!(app.history.last(), Some(Cell::Stats { label, .. }) if label == "t1"));
         app.update(Msg::StatsReady(Err("no trace".into())));
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
     }

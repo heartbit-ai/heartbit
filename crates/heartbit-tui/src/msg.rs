@@ -85,7 +85,7 @@ pub enum Msg {
     /// Saved sessions listed for the `/resume` picker.
     SessionsListed(Vec<crate::session::SessionMeta>),
     /// Trace stats computed (rendered table) — or why they couldn't be.
-    StatsReady(Result<String, String>),
+    StatsReady(Result<(String, Box<crate::trace_stats::TraceStats>), String>),
     /// `/analyze` prepared: show `display` as the user cell, send `task` to
     /// the agent (the Plan-mode `sent ≠ displayed` precedent).
     AnalyzeReady {
