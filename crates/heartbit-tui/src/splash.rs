@@ -8,6 +8,9 @@ use ratatui::text::{Line, Span};
 /// Total splash duration in 120ms ticks (~3s — four heartbeats; any key
 /// skips, so generous beats are low-cost).
 pub const SPLASH_TICKS: u8 = 25;
+// ~3s at 120ms/tick — long enough to actually see it (user feedback:
+// the original 13 ticks / 1.5s felt too short). Compile-time guard.
+const _: () = assert!(SPLASH_TICKS >= 25);
 
 /// Large (systole) heart frame, 7 rows of half-block art.
 const HEART_LARGE: [&str; 7] = [
@@ -97,8 +100,6 @@ mod tests {
         for t in [4u8, 5, 10, 11, 16, 22] {
             assert!(!is_large(t), "tick {t} must be the SMALL frame");
         }
-        // ~3s at 120ms/tick — long enough to actually see it.
-        assert!(SPLASH_TICKS >= 25, "splash must run ~3s");
     }
 
     #[test]
