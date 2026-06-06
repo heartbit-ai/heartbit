@@ -54,6 +54,9 @@ pub struct TraceStats {
     /// Wall-clock span of the trace: first record `ts` → last record `ts`,
     /// in milliseconds (0 when fewer than two parseable timestamps).
     pub duration_ms: u64,
+    /// Input tokens per LLM call, in trace order — the context-growth curve
+    /// (the rung-3 measurement substrate; /analyze gets it in the JSON).
+    pub turn_input_tokens: Vec<u64>,
 }
 
 /// Nearest-rank percentile over a SORTED slice (0 for empty).
@@ -117,7 +120,9 @@ pub fn compute(reader: impl std::io::Read) -> TraceStats {
             ("agent", "turn_started") => s.turns += 1,
             ("agent", "llm_response") => {
                 s.llm_calls += 1;
-                s.total_input_tokens += ev["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                let inp = ev["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                s.turn_input_tokens.push(inp);
+                s.total_input_tokens += inp;
                 s.total_output_tokens += ev["usage"]["output_tokens"].as_u64().unwrap_or(0);
                 llm_latencies.push(ev["latency_ms"].as_u64().unwrap_or(0));
                 let ttft = ev["time_to_first_token_ms"].as_u64().unwrap_or(0);
@@ -193,6 +198,16 @@ impl TraceStats {
             "tokens  in {} / out {}\n",
             self.total_input_tokens, self.total_output_tokens
         ));
+        if let (Some(first), Some(last)) = (
+            self.turn_input_tokens.first(),
+            self.turn_input_tokens.last(),
+        ) {
+            let max = self.turn_input_tokens.iter().max().copied().unwrap_or(0);
+            out.push_str(&format!(
+                "context growth: {first} → {last} per call (max {max}) over {} calls\n",
+                self.turn_input_tokens.len()
+            ));
+        }
         out.push_str(&format!(
             "llm latency p50/p95  {}ms / {}ms   ttft p50/p95  {}ms / {}ms\n",
             self.llm_latency_p50_ms, self.llm_latency_p95_ms, self.ttft_p50_ms, self.ttft_p95_ms
@@ -278,6 +293,9 @@ mod tests {
         assert_eq!(s.doom_loops, 0);
         // wall-clock: first ts 10:00:00.000Z → last ts 10:00:09.300Z = 9300ms
         assert_eq!(s.duration_ms, 9300);
+        // per-turn input tokens (the context-growth curve — rung-3 substrate)
+        assert_eq!(s.turn_input_tokens, vec![1000, 1200]);
+        assert!(s.render().contains("context growth"), "{}", s.render());
         // bash: 1 error out of 2 calls
         let bash = s.tools.get("bash").expect("bash stats");
         assert!((bash.error_rate - 0.5).abs() < f64::EPSILON);
