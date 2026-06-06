@@ -159,6 +159,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "reopen a saved session"),
     ("/export", "export the transcript to Markdown"),
     ("/stats", "trace stats — this session, `last`, or <id>"),
+    (
+        "/analyze",
+        "agent diagnosis of a trace — this session, `last`, or <id>",
+    ),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -193,6 +197,8 @@ pub enum Effect {
     Interrupt,
     /// Compute trace stats (None = current session; "last" | <id> otherwise).
     ComputeStats(Option<String>),
+    /// Prepare an `/analyze` run (resolve trace, compute stats, build prompt).
+    Analyze(Option<String>),
     /// Tear down and exit.
     Quit,
 }
@@ -215,6 +221,7 @@ impl Effect {
             Effect::ResumeSession(_) => "resume_session",
             Effect::Interrupt => "interrupt",
             Effect::ComputeStats(_) => "compute_stats",
+            Effect::Analyze(_) => "analyze",
             Effect::Quit => "quit",
         }
     }
@@ -713,6 +720,16 @@ impl App {
             Msg::StatsReady(Err(e)) => {
                 self.history.push(Cell::Notice(format!("stats: {e}")));
             }
+            Msg::AnalyzeReady { display, task } => {
+                self.history.push(Cell::User(display));
+                self.running = true;
+                self.follow = true;
+                self.seed_idle_squad();
+                self.effects.push(Effect::SendInput(task));
+            }
+            Msg::AnalyzeFailed(e) => {
+                self.history.push(Cell::Notice(format!("analyze: {e}")));
+            }
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
                 // Only notify when the fetch was USER-initiated (the picker is
@@ -909,6 +926,10 @@ impl App {
             "stats" => {
                 let target = if arg.is_empty() { None } else { Some(arg) };
                 self.effects.push(Effect::ComputeStats(target));
+            }
+            "analyze" => {
+                let target = if arg.is_empty() { None } else { Some(arg) };
+                self.effects.push(Effect::Analyze(target));
             }
             "help" => {
                 self.history.push(Cell::Notice(
@@ -2383,6 +2404,40 @@ mod tests {
         app.update(Msg::StatsReady(Ok("turns 3\n".into())));
         assert!(matches!(app.history.last(), Some(Cell::Agent(t)) if t.contains("turns 3")));
         app.update(Msg::StatsReady(Err("no trace".into())));
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
+    }
+
+    #[test]
+    fn slash_analyze_pushes_analyze_effect() {
+        let mut app = keyed();
+        typed(&mut app, "/analyze");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::Analyze(None)));
+        typed(&mut app, "/analyze last");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::Analyze(Some("last".into()))));
+    }
+
+    #[test]
+    fn analyze_ready_starts_a_run_with_the_task() {
+        let mut app = keyed();
+        app.update(Msg::AnalyzeReady {
+            display: "analyzing session s1".into(),
+            task: "the big prompt".into(),
+        });
+        assert!(matches!(app.history.last(), Some(Cell::User(t)) if t.contains("s1")));
+        assert!(app.running);
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("the big prompt".into()))
+        );
+    }
+
+    #[test]
+    fn analyze_failed_is_a_notice_not_a_run() {
+        let mut app = keyed();
+        app.update(Msg::AnalyzeFailed("no trace".into()));
+        assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
     }
 

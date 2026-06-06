@@ -86,6 +86,14 @@ pub enum Msg {
     SessionsListed(Vec<crate::session::SessionMeta>),
     /// Trace stats computed (rendered table) — or why they couldn't be.
     StatsReady(Result<String, String>),
+    /// `/analyze` prepared: show `display` as the user cell, send `task` to
+    /// the agent (the Plan-mode `sent ≠ displayed` precedent).
+    AnalyzeReady {
+        display: String,
+        task: String,
+    },
+    /// `/analyze` could not prepare (no trace, stats error…).
+    AnalyzeFailed(String),
     /// A resumed session's transcript (replaces the current history).
     SessionLoaded(Vec<crate::cells::Cell>),
 

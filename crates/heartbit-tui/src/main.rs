@@ -1061,6 +1061,44 @@ async fn run_ui(
                         let _ = tx.send(Msg::StatsReady(result));
                     });
                 }
+                Effect::Analyze(target) => {
+                    let tx = ui_tx.clone();
+                    let sid = session_id.clone();
+                    let workdir = cwd.clone();
+                    tokio::spawn(async move {
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            let dir = session::sessions_dir();
+                            let path = trace::resolve_trace_target(&dir, &sid, target.as_deref())?;
+                            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                            let stats = trace_stats::compute(file);
+                            let stats_json =
+                                serde_json::to_string_pretty(&stats).map_err(|e| e.to_string())?;
+                            let id = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .and_then(|n| n.strip_suffix(".trace.jsonl"))
+                                .unwrap_or("session")
+                                .to_string();
+                            // Stage a snapshot into the workspace: the agent's
+                            // builtins (read/grep/write) REJECT absolute paths
+                            // when workspace-rooted, and the copy freezes the
+                            // current session's still-growing trace.
+                            let staged = format!("heartbit-trace-{id}.jsonl");
+                            std::fs::copy(&path, workdir.join(&staged))
+                                .map_err(|e| e.to_string())?;
+                            Ok::<(String, String), String>((
+                                format!("analyzing session {id} (staged: {staged})"),
+                                trace::build_analyze_prompt(&staged, &id, &stats_json),
+                            ))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(match prepared {
+                            Ok((display, task)) => Msg::AnalyzeReady { display, task },
+                            Err(e) => Msg::AnalyzeFailed(e),
+                        });
+                    });
+                }
                 Effect::Quit => app.should_quit = true,
             }
             trace.record_ui(&trace::UiEvent::Effect {

@@ -265,6 +265,64 @@ pub fn resolve_trace_target(
     }
 }
 
+/// The `/analyze` task template. Why a prompt const and not a SKILL.md:
+/// skills are progressive disclosure for when the AGENT decides; here the
+/// COMMAND knows the guidance is needed, every time. Promotable later.
+///
+/// `staged_trace` is a WORKSPACE-RELATIVE path (e.g. `heartbit-trace-s1.jsonl`)
+/// — the edge stages a snapshot copy into cwd because the workspace-rooted
+/// builtins reject absolute paths (resolve_path, F-FS containment).
+pub fn build_analyze_prompt(staged_trace: &str, session_id: &str, stats_json: &str) -> String {
+    format!(
+        r#"Analyze this heartbit-tui execution trace and produce a diagnosis report.
+
+## Inputs
+- Trace file (JSONL, one record per line), in the current directory: {staged_trace}
+  (a frozen snapshot of session {session_id} — safe to grep, it won't change)
+- Deterministic stats (already computed — trust these numbers):
+```json
+{stats_json}
+```
+
+## Trace format reference (envelope v1)
+Each line: {{"v":1,"seq":N,"ts":"<rfc3339>","src":"agent|ui|core_trace","event":{{...}}}}
+- src="agent": raw framework events, tagged by event.type — turn_started,
+  llm_response (usage/latency_ms/time_to_first_token_ms/stop_reason),
+  tool_call_started/tool_call_completed (tool_name/is_error/duration_ms/output),
+  retry_attempt, doom_loop_detected, guardrail_denied/warned, approval_requested,
+  sub_agents_dispatched, run_completed/run_failed, context_summarized, …
+- src="ui": session_started (config snapshot), user_input, agent_spawned
+  (epoch/reason), mode_changed, approval (decision/latency_ms/mode), effect,
+  interrupt_requested, session_resumed, error.
+- src="core_trace": raw interrupt-chain log mirror — ignore unless diagnosing interrupts.
+
+## How to investigate (IMPORTANT: do not read the whole file — it can be huge)
+Prefer the `grep` and `read` tools (they run silently); use bash/jq only when
+you need aggregation. Targeted spots, e.g.:
+- errors:        grep "\"is_error\":true" in {staged_trace}
+- one tool call: grep "\"tool_call_id\":\"<id>\"" in {staged_trace}
+- retries:       grep "\"type\":\"retry_attempt\"" in {staged_trace}
+- slowest LLM (bash): jq -r 'select(.event.type=="llm_response") | "\(.event.latency_ms) seq=\(.seq)"' {staged_trace} | sort -rn | head
+- a moment in time: grep "\"seq\":42," in {staged_trace} (seq is monotonic — read neighbors for context)
+
+## Diagnosis dimensions
+1. Errors & root chains (failed tools → what the agent did next; did it recover?)
+2. Loops & waste (doom loops, repeated similar calls, token-heavy turns)
+3. Latency outliers (slow LLM calls / tools; TTFT anomalies)
+4. Approval friction (denials, long human latencies, modal interruptions)
+5. Interrupts (user Esc — what was the agent doing that prompted it?)
+6. Config issues (spawn reasons/epochs, mode changes mid-session, MCP failures)
+
+## Deliverable
+1. Present the findings concisely in your answer (cite seq numbers as evidence).
+2. Write the full report to heartbit-diagnosis-{session_id}.md (current
+   directory) with sections: Summary, Findings (each: evidence seq refs +
+   impact), Recommendations (ranked, concrete — config/prompt/code), Stats
+   appendix.
+"#
+    )
+}
+
 /// The target core's interrupt-chain checkpoints (CP3/CP4) and the TUI's
 /// legacy diagnostics log under. The bridge mirrors that target into the
 /// trace as `core_trace` records — the legacy `HEARTBIT_TUI_DEBUG` file is
@@ -750,5 +808,19 @@ mod tests {
         // missing id → error mentions it
         let e = resolve_trace_target(dir.path(), "cur-3", Some("nope")).unwrap_err();
         assert!(e.contains("nope"));
+    }
+
+    #[test]
+    fn analyze_prompt_embeds_staged_path_stats_and_deliverable() {
+        let p = build_analyze_prompt("heartbit-trace-s1.jsonl", "s1", "{\"turns\":2}");
+        assert!(p.contains("heartbit-trace-s1.jsonl"));
+        assert!(p.contains("{\"turns\":2}"));
+        assert!(p.contains("heartbit-diagnosis-s1.md"));
+        assert!(p.contains("\"v\":"), "format reference present");
+        assert!(p.to_lowercase().contains("do not read the whole file"));
+        assert!(
+            !p.contains("/.config/"),
+            "must reference only workspace-relative paths — builtins reject absolute paths"
+        );
     }
 }
