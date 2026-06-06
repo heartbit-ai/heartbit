@@ -220,6 +220,75 @@ pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> 
     handle
 }
 
+/// The target core's interrupt-chain checkpoints (CP3/CP4) and the TUI's
+/// legacy diagnostics log under. The bridge mirrors that target into the
+/// trace as `core_trace` records — the legacy `HEARTBIT_TUI_DEBUG` file is
+/// untouched (additive, per spec).
+pub const INTERRUPT_TARGET: &str = "heartbit::interrupt";
+
+/// A `tracing` layer that mirrors [`INTERRUPT_TARGET`] events into the trace.
+pub struct TracingBridge {
+    handle: TraceHandle,
+}
+
+impl TracingBridge {
+    pub fn new(handle: TraceHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingBridge {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != INTERRUPT_TARGET {
+            return;
+        }
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.handle.record(
+            TraceSrc::CoreTrace,
+            serde_json::json!({
+                "type": "log",
+                "target": INTERRUPT_TARGET,
+                "level": event.metadata().level().to_string(),
+                "fields": serde_json::Value::Object(visitor.fields),
+            }),
+        );
+    }
+}
+
+/// Collects a tracing event's fields into a JSON map (the free-text message
+/// arrives as the field named `message`).
+#[derive(Default)]
+struct FieldVisitor {
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields.insert(
+            field.name().into(),
+            serde_json::Value::String(format!("{value:?}")),
+        );
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields
+            .insert(field.name().into(), serde_json::Value::String(value.into()));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields.insert(field.name().into(), value.into());
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields.insert(field.name().into(), value.into());
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields.insert(field.name().into(), value.into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +640,36 @@ mod tests {
             .collect();
         seqs.sort_unstable();
         assert_eq!(seqs, (0..100).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn tracing_bridge_captures_interrupt_target_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.trace.jsonl");
+        let handle = spawn_writer(path.clone(), Box::new(|_| {}));
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::registry(),
+            TracingBridge::new(handle),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "heartbit::interrupt",
+                checkpoint = "CP3_tool_cancel_arm_fired",
+                turn = 4u64,
+                "cancel armed"
+            );
+            tracing::info!(target: "some::other", "must NOT be captured");
+        });
+        let lines = wait_for_lines(&path, 1);
+        assert_eq!(lines.len(), 1, "exactly the interrupt-target event");
+        let rec: TraceRecord = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(rec.src, TraceSrc::CoreTrace);
+        assert_eq!(rec.event["type"], "log");
+        assert_eq!(
+            rec.event["fields"]["checkpoint"],
+            "CP3_tool_cancel_arm_fired"
+        );
+        assert_eq!(rec.event["fields"]["turn"], 4);
+        assert_eq!(rec.event["fields"]["message"], "cancel armed");
     }
 }
