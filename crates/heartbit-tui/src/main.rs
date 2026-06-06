@@ -22,6 +22,7 @@ mod cells;
 mod composer;
 mod config;
 mod diff;
+mod lessons;
 mod markdown;
 mod models;
 mod msg;
