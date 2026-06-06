@@ -85,6 +85,7 @@ pub struct RunWorkflowTool {
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
     provider_factory: Option<Arc<super::flow::ProviderFactory>>,
     journal_dir: Option<std::path::PathBuf>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl RunWorkflowTool {
@@ -97,6 +98,7 @@ impl RunWorkflowTool {
             agent_events: None,
             provider_factory: None,
             journal_dir: None,
+            workspace: None,
         }
     }
 
@@ -112,6 +114,13 @@ impl RunWorkflowTool {
     /// lets recipes run stages on role-named models (`.model("fast")`).
     pub fn with_provider_factory(mut self, factory: Arc<super::flow::ProviderFactory>) -> Self {
         self.provider_factory = Some(factory);
+        self
+    }
+
+    /// Workspace (git repo root) threaded into every recipe ctx — required
+    /// for recipes whose agents ask for `Isolation::Worktree`.
+    pub fn with_workspace(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace = Some(root);
         self
     }
 
@@ -203,6 +212,7 @@ impl Tool for RunWorkflowTool {
         let agent_events = self.agent_events.clone();
         let provider_factory = self.provider_factory.clone();
         let journal_dir = self.journal_dir.clone();
+        let workspace = self.workspace.clone();
         Box::pin(async move {
             let Some(recipe) = recipe else {
                 return Ok(ToolOutput::error(format!(
@@ -218,6 +228,9 @@ impl Tool for RunWorkflowTool {
             }
             if let Some(factory) = provider_factory {
                 builder = builder.provider_factory(factory);
+            }
+            if let Some(root) = workspace {
+                builder = builder.workspace(root);
             }
             if let Some(dir) = journal_dir {
                 if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -607,6 +620,63 @@ mod tests {
             4,
             "changed args must NOT replay the old journal"
         );
+    }
+
+    /// A recipe whose single agent asks for worktree isolation.
+    fn isolated_recipe() -> WorkflowRecipe {
+        WorkflowRecipe {
+            name: "isolated".into(),
+            description: "test".into(),
+            args_schema: json!({"type": "object"}),
+            run: Arc::new(|ctx, _args| {
+                Box::pin(async move {
+                    let out = agent(&ctx, "mutate")
+                        .isolation(crate::Isolation::Worktree)
+                        .run()
+                        .await?
+                        .unwrap_or_default();
+                    Ok(out)
+                })
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worktree_recipes_are_reachable_through_the_tool() {
+        // Fixture repo (worktrees need a HEAD).
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+            vec!["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(dir.path())
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let registry = WorkflowRegistry::new().register(isolated_recipe());
+        // WITH workspace: the isolated agent runs.
+        let tool = RunWorkflowTool::new(registry.clone(), provider())
+            .with_workspace(dir.path().to_path_buf());
+        let out = tool
+            .execute(&ExecutionContext::default(), json!({"recipe": "isolated"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // WITHOUT workspace: the leaf's Config error surfaces honestly.
+        let bare = RunWorkflowTool::new(registry, provider());
+        let out = bare
+            .execute(&ExecutionContext::default(), json!({"recipe": "isolated"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("workspace"), "{}", out.content);
     }
 
     #[tokio::test]

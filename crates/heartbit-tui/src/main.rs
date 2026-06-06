@@ -546,12 +546,23 @@ async fn build_engine(
             .with_provider_factory(provider_factory.clone())
             // Session-scoped resume: re-asking the SAME workflow in this
             // session replays completed agents; new session = fresh.
-            .with_journal_dir(workflow_journal_dir),
+            .with_journal_dir(workflow_journal_dir)
+            // Repo root for Isolation::Worktree recipes.
+            .with_workspace(cwd.clone()),
     ));
     // The advisor: a frontier-model reviewer over the FULL transcript (the
     // runner snapshots it into ExecutionContext at every tool dispatch).
     match provider_factory("frontier") {
-        Ok(frontier) => tools.push(Arc::new(heartbit_core::AdvisorTool::new(frontier))),
+        Ok(frontier) => {
+            tools.push(Arc::new(heartbit_core::AdvisorTool::new(frontier)));
+            summary_parts.push(match &frontier_model {
+                Some(m) => format!("advisor: {m}"),
+                // A same-model self-review is a weaker advisor — say so.
+                None => {
+                    "advisor: main model (set frontier_model for a stronger reviewer)".to_string()
+                }
+            });
+        }
         Err(e) => {
             let _ = ui_tx.send(Msg::Notice(format!("advisor disabled: {e}")));
         }
