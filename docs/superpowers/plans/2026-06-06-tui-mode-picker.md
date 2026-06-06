@@ -20,7 +20,7 @@ Verified anchors: `set_mode` at app.rs:1184 (bare-arg branch pushes a notice tod
 - Modify: `crates/heartbit-tui/src/app.rs`
 - Test: `app.rs` tests module
 
-- [ ] **Step 1: failing tests** (beside the other slash tests):
+- [x] **Step 1: failing tests** (beside the other slash tests):
 
 ```rust
     #[test]
@@ -64,9 +64,9 @@ Verified anchors: `set_mode` at app.rs:1184 (bare-arg branch pushes a notice tod
     }
 ```
 
-- [ ] **Step 2:** Run `cargo test -p heartbit-tui mode_picker bare_mode` — FAIL (no `ModePicker` variant).
+- [x] **Step 2:** Run `cargo test -p heartbit-tui mode_picker bare_mode` — FAIL (no `ModePicker` variant).
 
-- [ ] **Step 3: implement** in `app.rs`:
+- [x] **Step 3: implement** in `app.rs`:
 
 Add the variant to `Modal`:
 
@@ -141,9 +141,9 @@ Add the handler (below `handle_session_picker_key`):
     }
 ```
 
-- [ ] **Step 4:** `cargo test -p heartbit-tui` — ALL PASS. (One existing test may assert the OLD bare-`/mode` notice — if so, update it to assert the picker opens instead; that behavior change is the feature.)
+- [x] **Step 4:** `cargo test -p heartbit-tui` — ALL PASS. (One existing test may assert the OLD bare-`/mode` notice — if so, update it to assert the picker opens instead; that behavior change is the feature.)
 
-- [ ] **Step 5: Commit** `feat(tui): /mode opens a mode picker modal — reducer`
+- [x] **Step 5: Commit** `feat(tui): /mode opens a mode picker modal — reducer`
 
 ---
 
@@ -153,7 +153,7 @@ Add the handler (below `handle_session_picker_key`):
 - Modify: `crates/heartbit-tui/src/ui.rs` (beside the SessionPicker arm at ~533)
 - Test: `ui.rs` tests module
 
-- [ ] **Step 1: failing test**:
+- [x] **Step 1: failing test**:
 
 ```rust
     #[test]
@@ -171,9 +171,9 @@ Add the handler (below `handle_session_picker_key`):
     }
 ```
 
-- [ ] **Step 2:** Run — FAIL (non-exhaustive match or nothing rendered).
+- [x] **Step 2:** Run — FAIL (non-exhaustive match or nothing rendered).
 
-- [ ] **Step 3: implement** the render arm beside SessionPicker (match its centering/Block conventions — reuse the same helper the picker uses for the centered rect). One `Line` per mode: `●`/space current-marker + `label` + ` — ` + `describe()`; the `sel` row styled `Modifier::REVERSED`; block title ` mode `; bottom hint line `↑↓ · Enter · Esc` dimmed.
+- [x] **Step 3: implement** the render arm beside SessionPicker (match its centering/Block conventions — reuse the same helper the picker uses for the centered rect). One `Line` per mode: `●`/space current-marker + `label` + ` — ` + `describe()`; the `sel` row styled `Modifier::REVERSED`; block title ` mode `; bottom hint line `↑↓ · Enter · Esc` dimmed.
 
 ```rust
         Some(Modal::ModePicker { sel }) => {
@@ -206,17 +206,17 @@ Add the handler (below `handle_session_picker_key`):
 
 (Adapt to the SessionPicker arm's exact rendering shell when writing it — same Block style, same Clear.)
 
-- [ ] **Step 4:** `cargo test -p heartbit-tui` — ALL PASS.
+- [x] **Step 4:** `cargo test -p heartbit-tui` — ALL PASS.
 
-- [ ] **Step 5: Commit** `feat(tui): /mode picker modal rendering`
+- [x] **Step 5: Commit** `feat(tui): /mode picker modal rendering`
 
 ---
 
 ### Task 3: gate + live pty
 
-- [ ] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — green.
-- [ ] `cargo build -p heartbit-tui`, then pty: type `/mode` + Enter → settled frame shows the three labels + `read-only`; send ↓ then Enter → frame's status line shows `Plan`; trace/no-crash sanity. Esc path: reopen, Esc → no mode change.
-- [ ] Mark plan checkboxes; report.
+- [x] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — green.
+- [x] `cargo build -p heartbit-tui`, then pty: type `/mode` + Enter → settled frame shows the three labels + `read-only`; send ↓ then Enter → frame's status line shows `Plan`; trace/no-crash sanity. Esc path: reopen, Esc → no mode change.
+- [x] Mark plan checkboxes; report.
 
 ## Self-review
 
