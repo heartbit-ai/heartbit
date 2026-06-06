@@ -247,10 +247,13 @@ pub fn view(frame: &mut Frame, app: &App) {
             .map(Line::raw)
             .collect()
     };
-    let title = if app.modal.is_some() {
-        " approval pending — answer the prompt ".to_string()
-    } else {
-        " Enter send · Shift+Enter newline · ↑↓ history · Ctrl+C quit ".to_string()
+    let title = match &app.modal {
+        // Only the approval modal is actually "pending" — pickers and prompts
+        // get a neutral hint (live pty finding: the mode picker showed
+        // "approval pending", which lies).
+        Some(Modal::Approval(_)) => " approval pending — answer the prompt ".to_string(),
+        Some(_) => " answer the prompt above — Esc cancels ".to_string(),
+        None => " Enter send · Shift+Enter newline · ↑↓ history · Ctrl+C quit ".to_string(),
     };
     let composer = Paragraph::new(comp_text)
         .scroll((comp_scroll as u16, 0))
