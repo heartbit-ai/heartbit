@@ -84,6 +84,31 @@ pub fn parse_todos(input_json: &str) -> Vec<TodoRow> {
         .collect()
 }
 
+/// Workspace-safe slug for `/research` artifacts: lowercase alphanumerics
+/// joined by single dashes, capped at 40 chars; degenerate input → "research".
+fn research_slug(question: &str) -> String {
+    let mut slug = String::new();
+    let mut dash = false;
+    for c in question.chars().take(80).flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            dash = false;
+        } else if !dash && !slug.is_empty() {
+            slug.push('-');
+            dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "research".into()
+    } else {
+        slug
+    }
+}
+
 /// Global execution mode, cycled with Shift+Tab (Claude Code style) or set with
 /// `/mode`. Gates the `on_approval` bridge so the user controls how autonomously
 /// the agent acts this session. Three modes: Normal · Plan · YOLO.
@@ -167,6 +192,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/learn",
         "distill /analyze findings into persistent lessons",
     ),
+    ("/research", "deep research — fan-out, verify, cited report"),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -1003,10 +1029,40 @@ impl App {
                 }
                 self.effects.push(Effect::Learn);
             }
+            "research" => {
+                if arg.is_empty() {
+                    self.history.push(Cell::Notice(
+                        "usage: /research <question> — fan-out research, cross-verify, cited report"
+                            .into(),
+                    ));
+                    return;
+                }
+                if self.api_key.is_none() && !self.has_fallback_provider {
+                    self.open_key_modal();
+                    return;
+                }
+                let slug = research_slug(&arg);
+                let task = format!(
+                    "Call the run_workflow tool now with name=\"deep_research\" and \
+                     args={{\"question\": {q}}}. Do NOT search, browse, or implement \
+                     anything yourself before the workflow returns. When it returns, \
+                     write the report verbatim to research-{slug}.md (workspace-relative \
+                     path) with the write tool, then give a 5-10 line summary of the key \
+                     findings and sources. If the workflow returns an error, report it — \
+                     do not improvise your own research.",
+                    q = serde_json::to_string(&arg).unwrap_or_else(|_| format!("\"{arg}\"")),
+                );
+                self.history.push(Cell::User(format!("researching: {arg}")));
+                self.running = true;
+                self.follow = true;
+                self.seed_idle_squad();
+                self.effects.push(Effect::SendInput(task));
+            }
             "help" => {
                 self.history.push(Cell::Notice(
                     "commands: /mode [normal|plan|yolo] · /model [name] · /mcp [list|add …|clear] · \
-                     /stats · /analyze · /learn · /verify <cmd> · /clear · /resume · /export · /key · /quit"
+                     /stats · /analyze · /learn · /research <question> · /verify <cmd> · /clear · \
+                     /resume · /export · /key · /quit"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(
@@ -2811,6 +2867,54 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
         assert!(!app.running);
         assert!(!app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn research_slug_is_safe_and_bounded() {
+        assert_eq!(
+            research_slug("How does Plate Solving work?"),
+            "how-does-plate-solving-work"
+        );
+        assert_eq!(research_slug("éàç!!"), "research");
+        assert!(research_slug(&"x".repeat(200)).len() <= 40);
+    }
+
+    #[test]
+    fn slash_research_builds_the_imperative_task() {
+        let mut app = keyed();
+        typed(&mut app, "/research plate solving algorithms");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.history.last(), Some(Cell::User(t)) if t.contains("researching")));
+        assert!(app.running);
+        let task = app
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SendInput(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("task sent");
+        assert!(task.contains("run_workflow"), "{task}");
+        assert!(task.contains("deep_research"), "{task}");
+        assert!(
+            task.contains("research-plate-solving-algorithms.md"),
+            "{task}"
+        );
+        assert!(task.to_lowercase().contains("do not improvise"), "{task}");
+    }
+
+    #[test]
+    fn slash_research_empty_arg_is_usage_no_key_is_modal() {
+        let mut app = keyed();
+        typed(&mut app, "/research");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("usage")));
+        assert!(!app.running);
+        let mut app = App::new("m");
+        typed(&mut app, "/research topic");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
+        assert!(!app.running);
     }
 
     #[test]

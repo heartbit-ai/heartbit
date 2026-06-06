@@ -44,9 +44,10 @@ rust_version.txt
 .wrangler/
 .vercel/
 
-# heartbit-tui cwd artifacts (/export, /analyze)
+# heartbit-tui cwd artifacts (/export, /analyze, /research)
 heartbit-session-*.md
 heartbit-trace-*.jsonl
 heartbit-diagnosis-*.md
 heartbit-lessons.md
 
+research-*.md
