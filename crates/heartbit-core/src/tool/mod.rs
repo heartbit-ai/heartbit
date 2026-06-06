@@ -163,7 +163,19 @@ pub fn validate_tool_input(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(format!("Input validation failed: {}", errors.join("; ")))
+        let mut msg = format!("Input validation failed: {}", errors.join("; "));
+        // An EMPTY input object with required properties is the signature of a
+        // model that put its payload in the text channel instead of the tool
+        // call (live /analyze finding: write({}) alongside a 4000-token text
+        // response, repeated). Name the actual mistake so it can self-correct.
+        if input.as_object().is_some_and(|o| o.is_empty()) {
+            msg.push_str(
+                ". You sent NO arguments — parameters must be passed in the \
+                 tool call's arguments (e.g. file content goes in the tool's \
+                 input fields), not in your text response.",
+            );
+        }
+        Err(msg)
     }
 }
 
@@ -177,6 +189,34 @@ mod tests {
         let output = ToolOutput::success("result data");
         assert_eq!(output.content, "result data");
         assert!(!output.is_error);
+    }
+
+    // Live /analyze finding: a model generated 4000-token file bodies in its
+    // TEXT response and called write with input={} — twice, identically. The
+    // bare "is a required property" error never told it the load-bearing
+    // fact: arguments go in the tool call, not the text channel.
+    #[test]
+    fn empty_input_validation_error_names_the_channel() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"}
+            },
+            "required": ["file_path", "content"]
+        });
+        let err = validate_tool_input(&schema, &json!({})).unwrap_err();
+        assert!(err.contains("required property"), "got: {err}");
+        assert!(
+            err.contains("tool call's arguments") && err.contains("not in your text"),
+            "empty input must carry the channel hint, got: {err}"
+        );
+        // Non-empty-but-invalid input keeps the plain error (no hint spam).
+        let err = validate_tool_input(&schema, &json!({"file_path": "x"})).unwrap_err();
+        assert!(
+            !err.contains("text response"),
+            "partial input must not get the empty-args hint: {err}"
+        );
     }
 
     #[test]
