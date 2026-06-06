@@ -405,6 +405,8 @@ pub struct App {
     pub fast_model: Option<String>,
     /// Model for the "frontier" role (the advisor); falls back to the main model.
     pub frontier_model: Option<String>,
+    /// Session-scoped dir for run_workflow resume journals.
+    pub workflow_journal_dir: std::path::PathBuf,
     pub should_quit: bool,
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
@@ -449,6 +451,7 @@ impl App {
             workflow_recipes: Vec::new(),
             fast_model: None,
             frontier_model: None,
+            workflow_journal_dir: std::path::PathBuf::new(),
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),

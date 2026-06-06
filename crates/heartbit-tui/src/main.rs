@@ -189,6 +189,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.workflow_recipes = heartbit_core::default_registry().meta();
     app.fast_model = cfg.fast_model.clone();
     app.frontier_model = cfg.frontier_model.clone();
+    app.workflow_journal_dir = session::sessions_dir().join("journals").join(&session_id);
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
     // agent actually dispatches sub-agents.
@@ -427,6 +428,7 @@ async fn build_engine(
     prompt_caching: bool,
     fast_model: Option<String>,
     frontier_model: Option<String>,
+    workflow_journal_dir: PathBuf,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -541,7 +543,10 @@ async fn build_engine(
     tools.push(Arc::new(
         heartbit_core::RunWorkflowTool::new(registry, provider.clone())
             .with_agent_events(Arc::new(move |e: AgentEvent| recipe_trace.record_agent(&e)))
-            .with_provider_factory(provider_factory.clone()),
+            .with_provider_factory(provider_factory.clone())
+            // Session-scoped resume: re-asking the SAME workflow in this
+            // session replays completed agents; new session = fresh.
+            .with_journal_dir(workflow_journal_dir),
     ));
     // The advisor: a frontier-model reviewer over the FULL transcript (the
     // runner snapshots it into ExecutionContext at every tool dispatch).
@@ -870,6 +875,7 @@ fn spawn_agent(
     let prompt_caching = app.prompt_caching;
     let fast_model = app.fast_model.clone();
     let frontier_model = app.frontier_model.clone();
+    let workflow_journal_dir = app.workflow_journal_dir.clone();
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -900,6 +906,7 @@ fn spawn_agent(
                 prompt_caching,
                 fast_model,
                 frontier_model,
+                workflow_journal_dir,
             )
             .await
             {

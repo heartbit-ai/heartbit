@@ -84,6 +84,7 @@ pub struct RunWorkflowTool {
     provider: Arc<BoxedProvider>,
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
     provider_factory: Option<Arc<super::flow::ProviderFactory>>,
+    journal_dir: Option<std::path::PathBuf>,
 }
 
 impl RunWorkflowTool {
@@ -95,6 +96,7 @@ impl RunWorkflowTool {
             provider,
             agent_events: None,
             provider_factory: None,
+            journal_dir: None,
         }
     }
 
@@ -112,6 +114,28 @@ impl RunWorkflowTool {
         self.provider_factory = Some(factory);
         self
     }
+
+    /// Enable resume: each run journals its agent outputs under `dir`, keyed
+    /// by recipe + canonicalized args. Re-invoking the SAME call replays the
+    /// completed agents at zero cost and continues the rest — an interrupted
+    /// workflow picks up where it left off (scope the dir per session to avoid
+    /// stale cross-session replays).
+    pub fn with_journal_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.journal_dir = Some(dir);
+        self
+    }
+}
+
+/// `wf-{recipe}-{sha256(canonical args)[..12]}.jsonl` — content-addressed so a
+/// re-ask with identical inputs resumes, while ANY args change runs fresh.
+fn journal_file_name(recipe: &str, args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = super::flow::journal::canonical_json(args);
+    let mut h = Sha256::new();
+    h.update(canonical.to_string().as_bytes());
+    let digest = h.finalize();
+    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("wf-{recipe}-{hex}.jsonl")
 }
 
 impl Tool for RunWorkflowTool {
@@ -178,6 +202,7 @@ impl Tool for RunWorkflowTool {
         let provider = self.provider.clone();
         let agent_events = self.agent_events.clone();
         let provider_factory = self.provider_factory.clone();
+        let journal_dir = self.journal_dir.clone();
         Box::pin(async move {
             let Some(recipe) = recipe else {
                 return Ok(ToolOutput::error(format!(
@@ -193,6 +218,18 @@ impl Tool for RunWorkflowTool {
             }
             if let Some(factory) = provider_factory {
                 builder = builder.provider_factory(factory);
+            }
+            if let Some(dir) = journal_dir {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    return Ok(ToolOutput::error(format!("workflow journal dir: {e}")));
+                }
+                let path = dir.join(journal_file_name(&recipe_name, &args));
+                builder = match builder.journal(&path, super::flow::journal::ResumeMode::Resume) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Ok(ToolOutput::error(format!("workflow journal: {e}")));
+                    }
+                };
             }
             let ctx = match builder.build() {
                 Ok(c) => c,
@@ -504,6 +541,72 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.content, "x+x");
+    }
+
+    /// Counts provider calls — the resume test's whole point is that the
+    /// SECOND invocation makes ZERO new ones.
+    struct CountingText(Arc<std::sync::atomic::AtomicUsize>);
+    impl LlmProvider for CountingText {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text { text: "out".into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerunning_the_same_call_replays_from_the_journal() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkflowRegistry::new().register(two_step_recipe());
+        let tool = RunWorkflowTool::new(
+            registry,
+            Arc::new(BoxedProvider::from_arc(Arc::new(CountingText(
+                calls.clone(),
+            )))),
+        )
+        .with_journal_dir(dir.path().to_path_buf());
+
+        let input = json!({"recipe": "two_step", "args": {"k": "v"}});
+        let first = tool
+            .execute(&ExecutionContext::default(), input.clone())
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.content);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Re-invocation: same recipe+args → both agents replay, zero new calls.
+        let second = tool
+            .execute(&ExecutionContext::default(), input)
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.content);
+        assert_eq!(second.content, first.content, "identical replayed output");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the resumed run must make ZERO new provider calls"
+        );
+
+        // DIFFERENT args → different journal → fresh run.
+        let third = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({"recipe": "two_step", "args": {"k": "other"}}),
+            )
+            .await
+            .unwrap();
+        assert!(!third.is_error);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "changed args must NOT replay the old journal"
+        );
     }
 
     #[tokio::test]
