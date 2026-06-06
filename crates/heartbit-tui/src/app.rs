@@ -989,6 +989,14 @@ impl App {
                     self.open_key_modal();
                     return;
                 }
+                // Refuse mid-run / re-entrant learns: the in-flight turn's
+                // text-only LlmDone would consume the digest EARLY and the
+                // real learn result would be silently dropped.
+                if self.running || self.learning.is_some() {
+                    self.history
+                        .push(Cell::Notice("finish the current turn before /learn".into()));
+                    return;
+                }
                 self.effects.push(Effect::Learn);
             }
             "help" => {
@@ -2763,6 +2771,25 @@ mod tests {
         typed(&mut app, "/learn");
         app.update(key(KeyCode::Enter));
         assert!(app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn slash_learn_mid_run_or_reentrant_is_refused() {
+        // While a turn is in flight, the in-flight LlmDone would consume the
+        // learn digest EARLY and the real learn result would be silently
+        // dropped — /learn must refuse instead.
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "/learn");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.effects.contains(&Effect::Learn));
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("current turn")));
+        // Re-entry while a learn is already armed is refused too.
+        let mut app = keyed();
+        app.learning = Some(1);
+        typed(&mut app, "/learn");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.effects.contains(&Effect::Learn));
     }
 
     #[test]
