@@ -128,7 +128,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }),
     );
-    init_tracing(trace_handle.clone());
+    // NOTE: init_tracing is deliberately called AFTER the session_started
+    // record below — its banner line is captured by the bridge and would
+    // otherwise claim seq 0 (the trace must START with session_started).
     let cfg = config::TuiConfig::load();
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .ok()
@@ -172,7 +174,8 @@ async fn main() -> anyhow::Result<()> {
     // (Shift+Tab) and read live by the agent thread's `on_approval`.
     let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
-    // Config snapshot at launch — the trace's first record.
+    // Config snapshot at launch — the trace's first record (init_tracing runs
+    // after this so its captured banner can't claim seq 0).
     trace_handle.record_ui(&trace::UiEvent::SessionStarted {
         version: env!("CARGO_PKG_VERSION").into(),
         session_id: session_id.clone(),
@@ -182,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         context_recall: app.context_recall,
         verify_command: app.verify_command.clone(),
     });
+    init_tracing(trace_handle.clone());
 
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
@@ -485,27 +489,32 @@ async fn build_engine(
             for c in calls {
                 tracing::info!(target: "heartbit::interrupt", approval_for = %c.name, "on_approval");
             }
+            // Load the mode ONCE: the gate and every trace record below must
+            // agree (a Plan-mode read-only batch falls through to the modal —
+            // its record must still say "plan", not "normal").
+            let mode = perm_mode.load(std::sync::atomic::Ordering::Relaxed);
+            let mode_str = trace::mode_label(mode);
             // Every gate resolution is traced with the human think-time and the
             // mode in effect (rung-2 learning gold).
-            let record = |decision: &ApprovalDecision, mode: &str, latency_ms: u64| {
+            let record = |decision: &ApprovalDecision, latency_ms: u64| {
                 trace_approvals.record_ui(&trace::UiEvent::Approval {
                     tools: names.clone(),
                     decision: trace::decision_label(decision).into(),
                     latency_ms,
-                    mode: mode.into(),
+                    mode: mode_str.into(),
                 });
             };
-            // Execution mode gates the prompt (read live, cross-thread; u8 from
-            // PermissionMode::as_u8): 2=YOLO → allow all; 1=Plan → deny any
-            // mutating tool (read-only); 0=Normal → ask (modal).
+            // Execution mode gates the prompt (u8 from PermissionMode::as_u8):
+            // 2=YOLO → allow all; 1=Plan → deny any mutating tool (read-only
+            // batches still ask via the modal); 0=Normal → ask (modal).
             let is_mutating = |n: &str| matches!(n, "edit" | "write" | "patch" | "bash");
-            match perm_mode.load(std::sync::atomic::Ordering::Relaxed) {
+            match mode {
                 2 => {
-                    record(&ApprovalDecision::Allow, "yolo", 0);
+                    record(&ApprovalDecision::Allow, 0);
                     return ApprovalDecision::Allow;
                 }
                 1 if calls.iter().any(|c| is_mutating(&c.name)) => {
-                    record(&ApprovalDecision::Deny, "plan", 0);
+                    record(&ApprovalDecision::Deny, 0);
                     return ApprovalDecision::Deny;
                 }
                 _ => {}
@@ -525,13 +534,12 @@ async fn build_engine(
                 })
                 .is_err()
             {
-                record(&ApprovalDecision::Deny, "normal", 0);
+                record(&ApprovalDecision::Deny, 0);
                 return ApprovalDecision::Deny;
             }
             let decision = reply_rx.recv().unwrap_or(ApprovalDecision::Deny);
             record(
                 &decision,
-                "normal",
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
             decision
