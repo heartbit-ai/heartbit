@@ -184,6 +184,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
     app.prompt_caching = cfg.prompt_caching;
+    app.splash = cfg.splash.then_some(0);
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
     // agent actually dispatches sub-agents.

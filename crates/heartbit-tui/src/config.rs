@@ -109,6 +109,10 @@ pub struct TuiConfig {
     /// `prompt_caching = false` in tui.toml.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub prompt_caching: bool,
+    /// Show the startup splash (the beating heart). Disable with
+    /// `splash = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub splash: bool,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -135,6 +139,7 @@ impl Default for TuiConfig {
             tavily_api_key: None,
             brave_api_key: None,
             prompt_caching: true,
+            splash: true,
         }
     }
 }
@@ -220,6 +225,15 @@ fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splash_defaults_on_and_parses_off() {
+        assert!(TuiConfig::default().splash);
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.splash, "missing key means ON");
+        let cfg: TuiConfig = toml::from_str("splash = false").unwrap();
+        assert!(!cfg.splash);
+    }
 
     #[test]
     fn roundtrip_key_and_model() {
