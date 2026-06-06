@@ -16,7 +16,21 @@ use crate::llm::types::ToolDefinition;
 use crate::tool::{Tool, ToolOutput};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-request MCP timeout: 30s default, overridable via
+/// `HEARTBIT_MCP_TIMEOUT_SECS` (live finding: chrome-devtools' cold start
+/// blew the fixed 30s twice before working). Clamped to 5..=600s; junk
+/// values fall back to the default. Resolved once per process.
+static REQUEST_TIMEOUT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    mcp_timeout_from(std::env::var("HEARTBIT_MCP_TIMEOUT_SECS").ok().as_deref())
+});
+
+fn mcp_timeout_from(val: Option<&str>) -> Duration {
+    let secs = val
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(30, |s| s.clamp(5, 600));
+    Duration::from_secs(secs)
+}
 
 // --- JSON-RPC types ---
 
@@ -1444,7 +1458,7 @@ impl StdioTransport {
         // Timeout covers the entire write+read cycle to prevent hangs from
         // both unresponsive writes (server stopped reading stdin) and slow reads.
         let mut io = self.io.lock().await;
-        let json_str = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let json_str = tokio::time::timeout(*REQUEST_TIMEOUT, async {
             io.stdin
                 .write_all(line.as_bytes())
                 .await
@@ -1458,7 +1472,8 @@ impl StdioTransport {
         .await
         .map_err(|_| {
             Error::Mcp(format!(
-                "MCP stdio server timed out after {}s for request {id}",
+                "MCP stdio server timed out after {}s for request {id} — slow server \
+                 startup? Raise HEARTBIT_MCP_TIMEOUT_SECS.",
                 REQUEST_TIMEOUT.as_secs()
             ))
         })??;
@@ -1474,7 +1489,7 @@ impl StdioTransport {
         let line = serde_json::to_string(&notification)? + "\n";
 
         let mut io = self.io.lock().await;
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        tokio::time::timeout(*REQUEST_TIMEOUT, async {
             io.stdin
                 .write_all(line.as_bytes())
                 .await
@@ -2060,7 +2075,7 @@ impl McpClient {
         // redirect(none) and no_proxy. A bare client would resolve a benign host
         // to 169.254.169.254 between parse and connect, leaking the auth header.
         let client = crate::http::safe_client_builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(*REQUEST_TIMEOUT)
             .build()?;
 
         let transport = Arc::new(Transport::Http(HttpTransport {
@@ -2528,6 +2543,21 @@ impl Default for McpTransportPool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Live finding: chrome-devtools' cold start blew the fixed 30s request
+    // timeout twice before working. The timeout is now overridable via
+    // HEARTBIT_MCP_TIMEOUT_SECS (clamped to a sane range; junk ignored).
+    #[test]
+    fn mcp_timeout_resolution() {
+        assert_eq!(mcp_timeout_from(None), Duration::from_secs(30));
+        assert_eq!(mcp_timeout_from(Some("90")), Duration::from_secs(90));
+        // Clamped: too small and too large snap to the bounds.
+        assert_eq!(mcp_timeout_from(Some("1")), Duration::from_secs(5));
+        assert_eq!(mcp_timeout_from(Some("10000")), Duration::from_secs(600));
+        // Junk falls back to the default.
+        assert_eq!(mcp_timeout_from(Some("abc")), Duration::from_secs(30));
+        assert_eq!(mcp_timeout_from(Some("")), Duration::from_secs(30));
+    }
 
     // --- JSON-RPC tests ---
 
