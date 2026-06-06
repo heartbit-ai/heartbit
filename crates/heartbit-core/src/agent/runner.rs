@@ -1797,6 +1797,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                             tool_count = allowed_calls.len(),
                             "tool-batch interrupt race armed"
                         );
+                        // Snapshot once per batch — introspection tools (the
+                        // advisor) read it from ExecutionContext.transcript.
+                        let transcript = Some(Arc::new(ctx.messages().to_vec()));
                         tokio::select! {
                             biased;
                             _ = token.cancelled() => {
@@ -1810,12 +1813,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 self.synthesize_interrupted_tool_batch(&allowed_calls)
                             }
                             r = self
-                                .execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                                .execute_tools_parallel(&allowed_calls, ctx.current_turn(), transcript)
                                 .instrument(tool_batch_span) => r,
                         }
                     }
                     None => {
-                        self.execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                        let transcript = Some(Arc::new(ctx.messages().to_vec()));
+                        self.execute_tools_parallel(&allowed_calls, ctx.current_turn(), transcript)
                             .instrument(tool_batch_span)
                             .await
                     }
@@ -2392,6 +2396,7 @@ impl<P: LlmProvider> AgentRunner<P> {
         &self,
         calls: &[ToolCall],
         turn: usize,
+        transcript: Option<Arc<Vec<Message>>>,
     ) -> (Vec<ToolResult>, Vec<ToolCallRecord>) {
         let call_ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
         let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
@@ -2406,6 +2411,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             workspace: None,
             credentials: None,
             audit_sink: None,
+            transcript,
         };
 
         for (idx, call) in calls.iter().enumerate() {
@@ -3168,12 +3174,77 @@ mod tests {
             name: "ctx_capture".into(),
             input: serde_json::json!({}),
         }];
-        let (_results, _records) = runner.execute_tools_parallel(&calls, 0).await;
+        let (_results, _records) = runner.execute_tools_parallel(&calls, 0, None).await;
 
         assert_eq!(
             captured.lock().unwrap().as_deref(),
             Some("test-tenant"),
             "tool did not receive the tenant_id from ExecutionContext"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_snapshot_reaches_the_tool() {
+        use std::sync::Mutex;
+
+        use crate::ExecutionContext;
+        use crate::llm::types::ToolCall;
+
+        struct TranscriptCapturingTool {
+            seen: Arc<Mutex<Option<usize>>>,
+        }
+
+        impl Tool for TranscriptCapturingTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "advisor_probe".into(),
+                    description: "Counts the transcript messages it can see.".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                let seen = self.seen.clone();
+                let n = ctx.transcript.as_ref().map(|t| t.len());
+                Box::pin(async move {
+                    *seen.lock().unwrap() = n;
+                    Ok(ToolOutput::success("ok"))
+                })
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let tool = Arc::new(TranscriptCapturingTool { seen: seen.clone() });
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .max_turns(1)
+            .tools(vec![tool as Arc<dyn Tool>])
+            .build()
+            .unwrap();
+
+        let calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "advisor_probe".into(),
+            input: serde_json::json!({}),
+        }];
+        let transcript = Arc::new(vec![
+            crate::llm::types::Message::user("hello"),
+            crate::llm::types::Message::user("second message"),
+        ]);
+        let (_r, _rec) = runner
+            .execute_tools_parallel(&calls, 0, Some(transcript))
+            .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(2),
+            "the tool must see the 2-message transcript snapshot"
         );
     }
 

@@ -26,6 +26,10 @@ pub struct ExecutionContext {
     pub credentials: Option<Arc<dyn CredentialResolver>>,
     /// Sink for tool-level audit records. `None` when no audit sink is configured.
     pub audit_sink: Option<Arc<dyn AuditSink>>,
+    /// Snapshot of the conversation at tool-dispatch time. `None` outside an
+    /// agent run. Lets introspection tools (e.g. the advisor) see the full
+    /// history the way Claude Code forwards it to its advisor.
+    pub transcript: Option<Arc<Vec<crate::llm::types::Message>>>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -111,6 +115,7 @@ mod tests {
             workspace: Some(PathBuf::from("/tmp/ws")),
             credentials: None,
             audit_sink: None,
+            transcript: None,
         };
         let cloned = ctx.clone();
         assert_eq!(cloned.tenant_id.as_deref(), Some("tenant-1"));

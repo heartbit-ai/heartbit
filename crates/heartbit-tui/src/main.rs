@@ -543,6 +543,14 @@ async fn build_engine(
             .with_agent_events(Arc::new(move |e: AgentEvent| recipe_trace.record_agent(&e)))
             .with_provider_factory(provider_factory.clone()),
     ));
+    // The advisor: a frontier-model reviewer over the FULL transcript (the
+    // runner snapshots it into ExecutionContext at every tool dispatch).
+    match provider_factory("frontier") {
+        Ok(frontier) => tools.push(Arc::new(heartbit_core::AdvisorTool::new(frontier))),
+        Err(e) => {
+            let _ = ui_tx.send(Msg::Notice(format!("advisor disabled: {e}")));
+        }
+    }
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();

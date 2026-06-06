@@ -180,6 +180,7 @@ pub use persona::{
 // --- Tool re-exports ---
 #[cfg(feature = "a2a")]
 pub use tool::a2a::A2aClient;
+pub use tool::advisor::AdvisorTool;
 #[cfg(feature = "ghost-domain-config")]
 pub use tool::builtins::TwitterCredentials;
 pub use tool::builtins::{

@@ -118,6 +118,12 @@ impl AgentContext {
         self
     }
 
+    /// The live conversation — snapshotted at tool dispatch for
+    /// `ExecutionContext.transcript` (introspection tools like the advisor).
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
     pub(crate) fn message_count(&self) -> usize {
         self.messages.len()
     }
