@@ -1001,7 +1001,14 @@ impl App {
             }
             "help" => {
                 self.history.push(Cell::Notice(
-                    "commands: /mode [normal|plan|yolo] · /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
+                    "commands: /mode [normal|plan|yolo] · /model [name] · /mcp [list|add …|clear] · \
+                     /stats · /analyze · /learn · /verify <cmd> · /clear · /resume · /export · /key · /quit"
+                        .into(),
+                ));
+                self.history.push(Cell::Notice(
+                    "unified agent — answers directly, delegates to the worker/researcher squad, or \
+                     runs a workflow as the task warrants · old tool outputs stay recoverable via \
+                     fetch_full_output / recall_context"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(

@@ -14,6 +14,24 @@ const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 /// Flatten the transcript (history + the live streaming reply) into lines.
 pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // Fresh session: a small identity header instead of a bare wall of
+    // notices (cleared the moment the conversation starts).
+    if app.history.is_empty() && app.active.is_none() && app.active_reasoning.is_none() {
+        let dim = Style::default().fg(Color::DarkGray);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ♥ heartbit v{}", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(format!("    {}", app.model), dim)));
+        lines.push(Line::from(Span::styled(
+            "    /help · Shift+Tab mode · Esc interrupt · @ files · / commands",
+            dim,
+        )));
+        lines.push(Line::raw(""));
+    }
     for cell in &app.history {
         lines.extend(cell.to_lines());
         lines.push(Line::raw(""));
@@ -70,9 +88,15 @@ pub fn view(frame: &mut Frame, app: &App) {
     // column — so they never fight over width, and the transcript width (which
     // MUST feed `line_count`, or a stale full width clips the newest line) is
     // unchanged whether one or both panels show.
-    // The unified agent delegates as needed — show the roster whenever sub-agents
-    // are actually dispatched (no static mode gate).
-    let show_roster = app.running && !app.agents.is_empty();
+    // The unified agent delegates as needed — show the roster only when a
+    // sub-agent is actually dispatched (any non-Idle row). Every submit seeds
+    // the squad as Idle; an idle-only roster on a pure-chat turn would eat a
+    // third of the width for nothing (campaign round-1 frame evidence).
+    let show_roster = app.running
+        && app
+            .agents
+            .iter()
+            .any(|a| !matches!(a.state, crate::app::AgentState::Idle));
     let show_todos = !app.todos.is_empty();
     let want_panel = show_roster || show_todos;
     let (transcript_area, panel_area) = if want_panel && chunks[0].width >= 50 {
@@ -146,6 +170,14 @@ pub fn view(frame: &mut Frame, app: &App) {
         status.push(Span::styled(
             format!("· {} ttft ", human_ms(app.last_ttft_ms)),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Un-pinned transcript: say so, and how to get back (streaming keeps
+    // appending out of sight — silent drift reads as a hang).
+    if !app.follow {
+        status.push(Span::styled(
+            "· ↑ scrolled — wheel down to follow ",
+            Style::default().fg(Color::Yellow),
         ));
     }
     // Execution mode — only when not Normal (keeps the line clean).
@@ -727,6 +759,94 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    // A fresh session shows a small identity header (campaign frame evidence:
+    // the app opened as a bare wall of notices — no name, no orientation).
+    #[test]
+    fn empty_transcript_shows_welcome_header() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new("m");
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("heartbit"), "product name missing:\n{text}");
+        assert!(text.contains("/help"), "help hint missing:\n{text}");
+        // …and it disappears once the conversation starts.
+        let mut app = App::new("m");
+        app.history.push(Cell::User("hi".into()));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("/help · Shift+Tab"),
+            "welcome must clear after first message:\n{text}"
+        );
+    }
+
+    // While un-pinned (user scrolled up), streaming continues out of sight —
+    // the status line must say so, and how to get back (UX: no silent drift).
+    #[test]
+    fn scrolled_up_shows_a_follow_hint_in_the_status_line() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        for i in 0..60 {
+            app.history.push(Cell::Agent(format!("line {i}")));
+        }
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("scrolled"),
+            "pinned view has no hint:\n{text}"
+        );
+        app.update(crate::msg::Msg::WheelUp);
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("scrolled"),
+            "un-pinned view must show the scrolled hint:\n{text}"
+        );
+    }
+
+    // Campaign round-1 frame evidence: the roster panel ate a third of the
+    // width on a one-word CHAT turn — every submit seeds the squad as Idle,
+    // and the panel showed for idle-only rosters. Display must wait until a
+    // sub-agent is actually dispatched (any non-Idle row).
+    #[test]
+    fn idle_only_roster_does_not_open_the_panel() {
+        use crate::app::{AgentRow, AgentState};
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.running = true;
+        app.agents = vec![
+            AgentRow {
+                name: "worker".into(),
+                state: AgentState::Idle,
+                activity: "available".into(),
+                tokens: 0,
+            },
+            AgentRow {
+                name: "researcher".into(),
+                state: AgentState::Idle,
+                activity: "available".into(),
+                tokens: 0,
+            },
+        ];
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("researcher"),
+            "idle-only roster must stay hidden (pure-chat turns keep full width):\n{text}"
+        );
+        // The moment one agent actually works, the panel appears.
+        app.agents[0].state = AgentState::Working;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("worker"),
+            "dispatched roster must show:\n{text}"
+        );
     }
 
     // User bug: typing past the right edge of the prompt box became invisible

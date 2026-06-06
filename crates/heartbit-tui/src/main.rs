@@ -427,17 +427,16 @@ async fn build_engine(
     let provider = build_provider(api_key, model, on_retry)?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
-    // its spawn runtime). The tools are Arc, shared across agents.
+    // its spawn runtime). The tools are Arc, shared across agents. Successes
+    // fold into the single startup summary line; failures stay loud.
     let mut mcp_tools: Vec<Arc<dyn heartbit_core::tool::Tool>> = Vec::new();
+    let mut summary_parts: Vec<String> = Vec::new();
     for spec in &mcp_servers {
         let label = spec.label();
         let _ = ui_tx.send(Msg::Notice(format!("connecting MCP {label}…")));
         match connect_mcp(spec).await {
             Ok(t) => {
-                let _ = ui_tx.send(Msg::Notice(format!(
-                    "MCP {label}: connected ({} tools)",
-                    t.len()
-                )));
+                summary_parts.push(format!("MCP {label} ({} tools)", t.len()));
                 mcp_tools.extend(t);
             }
             Err(e) => {
@@ -569,26 +568,21 @@ async fn build_engine(
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
-        let _ = ui_tx.send(Msg::Notice(format!(
-            "loaded project context: {}",
-            names.join(", ")
-        )));
+        summary_parts.push(format!("context: {}", names.join(", ")));
     }
 
     // Unified entry agent (option C): ALWAYS built, no static mode flag. The
     // orchestrator evolved into ONE capable agent — it holds direct tools +
     // delegation tools (delegate_task / form_squad) + run_workflow, and decides
     // per request via tool choice (answer directly / do simple work / delegate /
-    // run a workflow). One run() drives the whole multi-turn session.
-    let _ = ui_tx.send(Msg::Notice(
-        "unified agent — answers directly, delegates, or runs a workflow as the task warrants"
-            .into(),
-    ));
+    // run a workflow). One run() drives the whole multi-turn session. (The
+    // blurb lives in /help now — startup stays one compact summary line.)
     let replan = verify_command.as_deref().is_some_and(|c| !c.is_empty());
     if recall_store.is_some() {
-        let _ = ui_tx.send(Msg::Notice(
-            "context restore-on-demand ON — old tool outputs recoverable via fetch_full_output / recall_context".into(),
-        ));
+        summary_parts.push("recall ON".into());
+    }
+    if verify_command.as_deref().is_some_and(|c| !c.is_empty()) {
+        summary_parts.push("verify ON".into());
     }
     if context_window.is_some() && context_debug_mode() {
         let _ = ui_tx.send(Msg::Notice(
@@ -611,11 +605,21 @@ async fn build_engine(
     let instructions = match lessons::load_lessons() {
         Some(lessons) => {
             let n = lessons::lesson_count(&lessons);
-            let _ = ui_tx.send(Msg::Notice(format!("loaded {n} learned lessons")));
+            summary_parts.push(format!("{n} lessons"));
             format!("{instructions}\n\n## Learned lessons (self-improvement — /learn)\n{lessons}")
         }
         None => instructions,
     };
+    // ONE compact startup line instead of the old five-notice wall (campaign
+    // round-1 frame evidence). Failures above stay as their own loud notices.
+    let _ = ui_tx.send(Msg::Notice(format!(
+        "ready — {}",
+        if summary_parts.is_empty() {
+            "builtins only".to_string()
+        } else {
+            summary_parts.join(" · ")
+        }
+    )));
     let mut builder = Orchestrator::builder(provider)
         .entry_agent(tools)
         .entry_workflow_recipes(recipe_meta)
