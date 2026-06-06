@@ -39,7 +39,7 @@
 
 **Files:** Create `crates/heartbit-core/src/agent/deep_research.rs`; modify `crates/heartbit-core/src/agent/mod.rs` (add `mod deep_research;` alongside the other private agent modules).
 
-- [ ] **Step 1: failing tests.** Create the file:
+- [x] **Step 1: failing tests.** Create the file:
 
 ```rust
 //! The `deep_research` workflow recipe: plan → parallel search/read (each
@@ -127,11 +127,11 @@ mod tests {
 
 In `crates/heartbit-core/src/agent/mod.rs`, add `mod deep_research;` next to the other `mod` lines (alphabetical placement near `mod doom_loop;`).
 
-- [ ] **Step 2:** Run `cargo test -p heartbit-core deep_research::tests` — the file as written above already contains the impl, so write tests FIRST in your working copy (paste the tests module + a `todo!()`-free stub? NO): to honour TDD, create the file with ONLY the module doc, the consts, an EMPTY `parse_angles` body returning `Vec::new()`, and the tests — observe the assertion failures — then fill the real body shown above. Expected red: `parse_angles_accepts_numbered_and_bulleted` fails with left `[]`.
+- [x] **Step 2:** Run `cargo test -p heartbit-core deep_research::tests` — the file as written above already contains the impl, so write tests FIRST in your working copy (paste the tests module + a `todo!()`-free stub? NO): to honour TDD, create the file with ONLY the module doc, the consts, an EMPTY `parse_angles` body returning `Vec::new()`, and the tests — observe the assertion failures — then fill the real body shown above. Expected red: `parse_angles_accepts_numbered_and_bulleted` fails with left `[]`.
 
-- [ ] **Step 3:** Replace the stub body with the real implementation (shown in Step 1). Run again: 3 PASS. Note: the file has unused imports (`Arc`, `json`, `agent`…) until Task 2 — if clippy `-D warnings` complains at this point, keep ONLY the used imports now and add the rest in Task 2 (do not blanket-allow).
+- [x] **Step 3:** Replace the stub body with the real implementation (shown in Step 1). Run again: 3 PASS. Note: the file has unused imports (`Arc`, `json`, `agent`…) until Task 2 — if clippy `-D warnings` complains at this point, keep ONLY the used imports now and add the rest in Task 2 (do not blanket-allow).
 
-- [ ] **Step 4: commit**
+- [x] **Step 4: commit**
 
 ```bash
 git add crates/heartbit-core/src/agent/deep_research.rs crates/heartbit-core/src/agent/mod.rs
@@ -144,7 +144,7 @@ git commit -m "feat(core): deep_research angle parser (tolerant, fallback-guaran
 
 **Files:** Modify `crates/heartbit-core/src/agent/deep_research.rs`, `crates/heartbit-core/src/agent/workflow_tool.rs`.
 
-- [ ] **Step 1: failing tests.** Append to deep_research.rs tests (and add the test-support mock at the top of the tests module):
+- [x] **Step 1: failing tests.** Append to deep_research.rs tests (and add the test-support mock at the top of the tests module):
 
 ```rust
     use crate::BoxedProvider;
@@ -274,9 +274,9 @@ git commit -m "feat(core): deep_research angle parser (tolerant, fallback-guaran
 
 NOTE on helpers used above: check `BoxedProvider`'s constructor surface — if `new_from_arc` does not exist, wrap the mock the way workflow_tool tests do (`BoxedProvider::new(...)` consumes the provider by value; then capture must go through an `Arc<Mutex<…>>` HELD OUTSIDE and cloned into the mock: give `RoutedProvider` a `captured: Arc<Mutex<Vec<CompletionRequest>>>` field, keep a clone in the test before moving the provider into `BoxedProvider::new`). Likewise if `futures::executor::block_on` is unavailable, use `#[tokio::test]` + `.await` (the flow is tokio-based — PREFER `#[tokio::test(flavor = "multi_thread")]` and make `run_recipe` async). Adapt mechanically; the assertions are the contract.
 
-- [ ] **Step 2:** Run — red (`recipe` undefined, registry missing entry).
+- [x] **Step 2:** Run — red (`recipe` undefined, registry missing entry).
 
-- [ ] **Step 3: implement the recipe** in deep_research.rs:
+- [x] **Step 3: implement the recipe** in deep_research.rs:
 
 ```rust
 /// Build the `deep_research` recipe. Stage agents are talk-only EXCEPT the
@@ -429,7 +429,7 @@ pub(crate) fn recipe() -> WorkflowRecipe {
 
 Check visibility while wiring: `WorkflowRecipe`'s fields and `workflow_tool`'s module path (`pub(crate)` as needed — `default_registry` lives in `workflow_tool.rs` and must call `super::deep_research::recipe()` or `crate::agent::deep_research::recipe()`); `WebFetchTool` must be exported from `tool::builtins` (it is: check `pub use` list; if absent, add it beside `WebSearchTool`).
 
-- [ ] **Step 4:** Registry: in `workflow_tool.rs`, change `default_registry()`:
+- [x] **Step 4:** Registry: in `workflow_tool.rs`, change `default_registry()`:
 
 ```rust
 pub fn default_registry() -> WorkflowRegistry {
@@ -441,9 +441,9 @@ pub fn default_registry() -> WorkflowRegistry {
 
 …and extend the existing `registry_get_and_meta` test: `assert!(reg.get("deep_research").is_some());`.
 
-- [ ] **Step 5:** `cargo test -p heartbit-core deep_research` + `cargo test -p heartbit-core workflow_tool` — all PASS. Then `cargo clippy -p heartbit-core --all-targets -- -D warnings` + `cargo fmt --all`.
+- [x] **Step 5:** `cargo test -p heartbit-core deep_research` + `cargo test -p heartbit-core workflow_tool` — all PASS. Then `cargo clippy -p heartbit-core --all-targets -- -D warnings` + `cargo fmt --all`.
 
-- [ ] **Step 6: commit**
+- [x] **Step 6: commit**
 
 ```bash
 git add crates/heartbit-core/src/agent/deep_research.rs crates/heartbit-core/src/agent/workflow_tool.rs crates/heartbit-core/src/tool/builtins/mod.rs
@@ -456,7 +456,7 @@ git commit -m "feat(core): deep_research workflow recipe — plan, tooled angles
 
 **Files:** Modify `crates/heartbit-tui/src/app.rs`, `.gitignore`.
 
-- [ ] **Step 1: failing tests** (app.rs tests module):
+- [x] **Step 1: failing tests** (app.rs tests module):
 
 ```rust
     #[test]
@@ -502,9 +502,9 @@ git commit -m "feat(core): deep_research workflow recipe — plan, tooled angles
     }
 ```
 
-- [ ] **Step 2:** red (`research_slug` undefined, no arm).
+- [x] **Step 2:** red (`research_slug` undefined, no arm).
 
-- [ ] **Step 3: implement** in app.rs:
+- [x] **Step 3: implement** in app.rs:
 
 Slug helper (free function near the top-level helpers, with doc):
 
@@ -570,9 +570,9 @@ fn research_slug(question: &str) -> String {
 
 `.gitignore`: append `research-*.md` to the heartbit-tui artifacts block.
 
-- [ ] **Step 4:** `cargo test -p heartbit-tui` all PASS; fmt + clippy clean.
+- [x] **Step 4:** `cargo test -p heartbit-tui` all PASS; fmt + clippy clean.
 
-- [ ] **Step 5: commit**
+- [x] **Step 5: commit**
 
 ```bash
 git add crates/heartbit-tui/src/app.rs .gitignore
@@ -583,7 +583,7 @@ git commit -m "feat(tui): /research — deterministic deep_research trigger with
 
 ### Task 4: workspace gate
 
-- [ ] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — all green. Commit only if fixes were needed.
+- [x] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — all green. Commit only if fixes were needed.
 
 ---
 
@@ -591,10 +591,10 @@ git commit -m "feat(tui): /research — deterministic deep_research trigger with
 
 Per the project bar (settled frame, trace-grounded assertions). Requires the Exa key reaching the process: write it into `~/.config/heartbit/tui.toml` as `exa_api_key = "…"` (the seam shipped today) from `.env`, or export it into the pty env.
 
-- [ ] **Step 1:** `cargo build -p heartbit-tui`. Fresh temp cwd, real session, `/mode yolo`, then `/research what is plate solving in astrophotography` and wait (budget ≥ 300s — 4 angles × search+fetch + synthesis).
-- [ ] **Step 2:** Assert: `research-what-is-plate-solving-*.md` exists in the cwd, non-empty, contains `## Sources` and at least one `http` URL; the transcript's settled frame contains a summary (and NOT a fabricated-looking 404 wall); the trace contains a `run_workflow` tool_call with `is_error:false` and websearch/webfetch tool_calls from the recipe run.
-- [ ] **Step 3:** Degraded path: one session WITHOUT any search key (unset env, no tui.toml key) → `/research x` → the report or the error message must be HONEST (mentions blocked/failed search; no invented URLs). The startup line must show `search: ddg-only (no search API key)`.
-- [ ] **Step 4:** Restore the user's tui.toml to their preference; report results.
+- [x] **Step 1:** `cargo build -p heartbit-tui`. Fresh temp cwd, real session, `/mode yolo`, then `/research what is plate solving in astrophotography` and wait (budget ≥ 300s — 4 angles × search+fetch + synthesis).
+- [x] **Step 2:** Assert: `research-what-is-plate-solving-*.md` exists in the cwd, non-empty, contains `## Sources` and at least one `http` URL; the transcript's settled frame contains a summary (and NOT a fabricated-looking 404 wall); the trace contains a `run_workflow` tool_call with `is_error:false` and websearch/webfetch tool_calls from the recipe run.
+- [x] **Step 3:** Degraded path: one session WITHOUT any search key (unset env, no tui.toml key) → `/research x` → the report or the error message must be HONEST (mentions blocked/failed search; no invented URLs). The startup line must show `search: ddg-only (no search API key)`.
+- [x] **Step 4:** Restore the user's tui.toml to their preference; report results.
 
 ---
 
