@@ -313,6 +313,9 @@ pub struct App {
     /// Optional project verification command (`/verify <cmd>`). When set, the
     /// agent gets a `verify` tool + a self-verify prompt nudge. Applies next start.
     pub verify_command: Option<String>,
+    /// OpenRouter prompt-caching breakpoints (escape hatch in tui.toml; ON by
+    /// default — non-supporting routes strip the markers harmlessly).
+    pub prompt_caching: bool,
     /// The available sub-agent pool (multi-agent mode), seeded into the roster as
     /// Idle at the start of each turn so the user always sees the whole squad —
     /// and can tell when only some of it actually gets dispatched.
@@ -375,6 +378,7 @@ impl App {
             multi_agent: false,
             context_recall: true,
             verify_command: None,
+            prompt_caching: true,
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),

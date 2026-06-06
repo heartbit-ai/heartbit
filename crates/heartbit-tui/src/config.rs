@@ -92,6 +92,13 @@ pub struct TuiConfig {
     /// `/verify <cmd>`; off when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_command: Option<String>,
+    /// OpenRouter prompt-caching breakpoints (`cache_control`). ON by default —
+    /// supporting routes (Anthropic, Alibaba/Qwen, Gemini) serve later turns at
+    /// 0.25× input cost; non-supporting routes strip the markers (verified
+    /// live). Escape hatch in case some exotic route rejects them:
+    /// `prompt_caching = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub prompt_caching: bool,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -114,6 +121,7 @@ impl Default for TuiConfig {
             multi_agent: false,
             context_recall: true,
             verify_command: None,
+            prompt_caching: true,
         }
     }
 }

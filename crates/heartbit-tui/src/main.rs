@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
+    app.prompt_caching = cfg.prompt_caching;
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
     // agent actually dispatches sub-agents.
@@ -225,13 +226,18 @@ fn build_provider(
     openrouter_key: Option<String>,
     model: &str,
     on_retry: Arc<heartbit_core::OnRetry>,
+    prompt_caching: bool,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
     if let Some(key) = openrouter_key {
-        // Prompt caching ON: cache_control breakpoints land on the system
-        // prompt + conversation prefix. Qwen/Anthropic/Gemini routes honour
-        // them via OpenRouter (campaign evidence: 250K-token sessions ran at
-        // 0% cached); other routes have the markers stripped harmlessly.
-        let base = OpenRouterProvider::new(key, model).with_prompt_caching();
+        // Prompt caching (default ON): cache_control breakpoints land on the
+        // system prompt + conversation prefix. Qwen/Anthropic/Gemini routes
+        // honour them via OpenRouter (live: 99.7% of the prompt cached on
+        // qwen3.7-max); non-supporting routes strip them (verified live on
+        // qwen3-235b). Escape hatch: `prompt_caching = false` in tui.toml.
+        let mut base = OpenRouterProvider::new(key, model);
+        if prompt_caching {
+            base = base.with_prompt_caching();
+        }
         return Ok(Arc::new(BoxedProvider::new(
             RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
@@ -387,6 +393,7 @@ async fn build_engine(
     verify_command: Option<String>,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
     trace: trace::TraceHandle,
+    prompt_caching: bool,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -428,7 +435,7 @@ async fn build_engine(
             },
         )
     };
-    let provider = build_provider(api_key, model, on_retry)?;
+    let provider = build_provider(api_key, model, on_retry, prompt_caching)?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -781,6 +788,7 @@ fn spawn_agent(
     let context_recall = app.context_recall;
     let context_window = app.context_limit().map(|w| w.min(u32::MAX as u64) as u32);
     let verify_command = app.verify_command.clone();
+    let prompt_caching = app.prompt_caching;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -808,6 +816,7 @@ fn spawn_agent(
                 verify_command,
                 perm_mode,
                 trace,
+                prompt_caching,
             )
             .await
             {
