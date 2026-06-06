@@ -200,6 +200,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "distill /analyze findings into persistent lessons",
     ),
     ("/research", "deep research — fan-out, verify, cited report"),
+    (
+        "/workflows",
+        "list the registered workflow recipes (run_workflow)",
+    ),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -394,6 +398,9 @@ pub struct App {
     /// Startup splash tick counter — `Some(t)` while the splash overlay is up
     /// (armed by main from config); `None` once dismissed (timer or any key).
     pub splash: Option<u8>,
+    /// `(name, description)` of the registered workflow recipes — set by main
+    /// from the same registry the agent gets, listed by `/workflows`.
+    pub workflow_recipes: Vec<(String, String)>,
     pub should_quit: bool,
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
@@ -435,6 +442,7 @@ impl App {
             menu_selected: 0,
             spinner: 0,
             splash: None,
+            workflow_recipes: Vec::new(),
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),
@@ -1059,6 +1067,22 @@ impl App {
                     return;
                 }
                 self.effects.push(Effect::Learn);
+            }
+            "workflows" => {
+                if self.workflow_recipes.is_empty() {
+                    self.history
+                        .push(Cell::Notice("no workflow recipes registered".into()));
+                    return;
+                }
+                self.history.push(Cell::Notice(format!(
+                    "workflow recipes ({}) — the agent runs them via the run_workflow tool \
+                     when the task fits (or ask for one by name):",
+                    self.workflow_recipes.len()
+                )));
+                for (name, desc) in &self.workflow_recipes {
+                    self.history
+                        .push(Cell::Notice(format!("  • {name} — {desc}")));
+                }
             }
             "research" => {
                 if arg.is_empty() {
@@ -2939,6 +2963,38 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
         assert!(!app.running);
         assert!(!app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn slash_workflows_lists_recipes() {
+        let mut app = keyed();
+        app.workflow_recipes = vec![
+            ("parallel_review".into(), "Review a target.".into()),
+            ("deep_research".into(), "Research-first deep dive.".into()),
+        ];
+        typed(&mut app, "/workflows");
+        app.update(key(KeyCode::Enter));
+        let notices: Vec<String> = app
+            .history
+            .iter()
+            .filter_map(|c| match c {
+                Cell::Notice(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("parallel_review")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("deep_research")),
+            "{notices:?}"
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("run_workflow")),
+            "must say HOW they are reached: {notices:?}"
+        );
+        assert!(!app.running, "informational — no run starts");
     }
 
     #[test]
