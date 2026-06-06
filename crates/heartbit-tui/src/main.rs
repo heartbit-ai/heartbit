@@ -27,6 +27,7 @@ mod models;
 mod msg;
 mod session;
 mod trace;
+mod trace_stats;
 mod ui;
 
 use std::path::PathBuf;
