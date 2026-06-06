@@ -928,6 +928,13 @@ impl App {
                 self.effects.push(Effect::ComputeStats(target));
             }
             "analyze" => {
+                // Mirror submit()'s provider gate: `/analyze` starts a real run,
+                // so without a key (and no fallback) prompt for one instead of
+                // setting running=true against a no-op agent (spinner forever).
+                if self.api_key.is_none() && !self.has_fallback_provider {
+                    self.open_key_modal();
+                    return;
+                }
                 let target = if arg.is_empty() { None } else { Some(arg) };
                 self.effects.push(Effect::Analyze(target));
             }
@@ -2439,6 +2446,22 @@ mod tests {
         app.update(Msg::AnalyzeFailed("no trace".into()));
         assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
+    }
+
+    #[test]
+    fn slash_analyze_without_key_opens_key_modal_not_a_run() {
+        let mut app = App::new("m"); // no key, no fallback
+        typed(&mut app, "/analyze");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::KeyEntry(_))),
+            "no-key /analyze must open the key prompt, not start a run"
+        );
+        assert!(!app.running);
+        assert!(
+            !app.effects.iter().any(|e| matches!(e, Effect::Analyze(_))),
+            "must not prepare an analyze run without a provider"
+        );
     }
 
     #[test]

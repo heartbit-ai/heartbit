@@ -1069,23 +1069,26 @@ async fn run_ui(
                         let prepared = tokio::task::spawn_blocking(move || {
                             let dir = session::sessions_dir();
                             let path = trace::resolve_trace_target(&dir, &sid, target.as_deref())?;
-                            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-                            let stats = trace_stats::compute(file);
-                            let stats_json =
-                                serde_json::to_string_pretty(&stats).map_err(|e| e.to_string())?;
                             let id = path
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .and_then(|n| n.strip_suffix(".trace.jsonl"))
                                 .unwrap_or("session")
                                 .to_string();
-                            // Stage a snapshot into the workspace: the agent's
-                            // builtins (read/grep/write) REJECT absolute paths
-                            // when workspace-rooted, and the copy freezes the
-                            // current session's still-growing trace.
+                            // Stage a snapshot into the workspace FIRST, then
+                            // compute stats FROM THE COPY: the agent's builtins
+                            // (read/grep/write) REJECT absolute paths when
+                            // workspace-rooted, and snapshotting before reading
+                            // freezes a still-growing trace — stats and the file
+                            // the agent greps are the same instant (one open).
                             let staged = format!("heartbit-trace-{id}.jsonl");
-                            std::fs::copy(&path, workdir.join(&staged))
-                                .map_err(|e| e.to_string())?;
+                            let staged_path = workdir.join(&staged);
+                            std::fs::copy(&path, &staged_path).map_err(|e| e.to_string())?;
+                            let file =
+                                std::fs::File::open(&staged_path).map_err(|e| e.to_string())?;
+                            let stats = trace_stats::compute(file);
+                            let stats_json =
+                                serde_json::to_string_pretty(&stats).map_err(|e| e.to_string())?;
                             Ok::<(String, String), String>((
                                 format!("analyzing session {id} (staged: {staged})"),
                                 trace::build_analyze_prompt(&staged, &id, &stats_json),
