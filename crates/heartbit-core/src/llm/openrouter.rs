@@ -42,6 +42,7 @@ pub struct OpenRouterProvider {
     client: Client,
     api_key: String,
     model: String,
+    prompt_caching: bool,
 }
 
 impl OpenRouterProvider {
@@ -52,7 +53,18 @@ impl OpenRouterProvider {
                 .expect("failed to build hardened HTTPS client for OpenRouterProvider"),
             api_key: api_key.into(),
             model: model.into(),
+            prompt_caching: false,
         }
+    }
+
+    /// Enable prompt-caching breakpoints (`cache_control: ephemeral` on the
+    /// system message + the second-to-last user message). Providers that
+    /// support explicit caching via OpenRouter (Anthropic, Alibaba/Qwen,
+    /// Gemini) honour them; OpenRouter strips them elsewhere. Cache reads
+    /// come back via `prompt_tokens_details.cached_tokens` → [`TokenUsage`].
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
     }
 }
 
@@ -62,7 +74,10 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
-        let body = build_openai_request(&self.model, &request)?;
+        let mut body = build_openai_request(&self.model, &request)?;
+        if self.prompt_caching {
+            apply_cache_control(&mut body);
+        }
 
         let response = self
             .client
@@ -110,6 +125,9 @@ impl OpenRouterProvider {
         on_reasoning: &crate::llm::OnReasoning,
     ) -> Result<CompletionResponse, Error> {
         let mut body = build_openai_request(&self.model, &request)?;
+        if self.prompt_caching {
+            apply_cache_control(&mut body);
+        }
         body["stream"] = serde_json::json!(true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
@@ -127,6 +145,59 @@ impl OpenRouterProvider {
         }
 
         parse_openai_stream_with_reasoning(response.bytes_stream(), on_text, on_reasoning).await
+    }
+}
+
+// --- Prompt caching: cache_control breakpoints (OpenRouter post-pass) ---
+
+/// Convert a message's string `content` into the content-part array form and
+/// mark its last text part with `cache_control: {"type": "ephemeral"}`.
+/// Array-form content (media messages) gets the marker on its last text part.
+fn mark_cacheable(msg: &mut serde_json::Value) {
+    match &mut msg["content"] {
+        serde_json::Value::String(s) => {
+            let text = std::mem::take(s);
+            msg["content"] = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+        serde_json::Value::Array(parts) => {
+            if let Some(last_text) = parts.iter_mut().rev().find(|p| p["type"] == "text") {
+                last_text["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Insert OpenRouter prompt-caching breakpoints into a built request body:
+/// the SYSTEM message (the big stable prefix — tool defs + instructions) and
+/// the SECOND-TO-LAST user message (the conversation prefix, stable across
+/// the next call). Providers that support explicit caching (Anthropic,
+/// Alibaba/Qwen, Gemini) honour the markers; OpenRouter strips them for the
+/// rest. Mirrors the AnthropicProvider breakpoint strategy.
+pub(crate) fn apply_cache_control(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    let mut user_idx: Vec<usize> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        match m["role"].as_str() {
+            Some("system") => {} // handled below (index 0 by construction)
+            Some("user") => user_idx.push(i),
+            _ => {}
+        }
+    }
+    if let Some(first) = messages.first_mut()
+        && first["role"] == "system"
+    {
+        mark_cacheable(first);
+    }
+    if user_idx.len() >= 2 {
+        let idx = user_idx[user_idx.len() - 2];
+        mark_cacheable(&mut messages[idx]);
     }
 }
 
@@ -387,6 +458,36 @@ struct OpenAiUsage {
     cache_read_input_tokens: u32,
     #[serde(default)]
     reasoning_tokens: u32,
+    /// OpenAI-format cache reporting (what OpenRouter actually returns).
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
+}
+
+/// Map an OpenAI-format usage object to [`TokenUsage`], preferring the
+/// OpenAI-style `prompt_tokens_details` (what OpenRouter returns) over the
+/// Anthropic-style flat fields when present.
+fn usage_to_tokens(u: &OpenAiUsage) -> TokenUsage {
+    let (cache_read, cache_write) = match &u.prompt_tokens_details {
+        Some(d) if d.cached_tokens > 0 || d.cache_write_tokens > 0 => {
+            (d.cached_tokens, d.cache_write_tokens)
+        }
+        _ => (u.cache_read_input_tokens, u.cache_creation_input_tokens),
+    };
+    TokenUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: cache_write,
+        cache_read_input_tokens: cache_read,
+        reasoning_tokens: u.reasoning_tokens,
+    }
 }
 
 pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
@@ -460,13 +561,9 @@ pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<Completion
         None => StopReason::EndTurn,
     };
 
-    let usage = api.usage.map_or(TokenUsage::default(), |u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        reasoning_tokens: u.reasoning_tokens,
-    });
+    let usage = api
+        .usage
+        .map_or(TokenUsage::default(), |u| usage_to_tokens(&u));
 
     Ok(CompletionResponse {
         content,
@@ -789,13 +886,7 @@ fn process_openai_event(
     }
 
     if let Some(ref u) = chunk.usage {
-        *usage = TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cache_creation_input_tokens: u.cache_creation_input_tokens,
-            cache_read_input_tokens: u.cache_read_input_tokens,
-            reasoning_tokens: u.reasoning_tokens,
-        };
+        *usage = usage_to_tokens(u);
     }
 }
 
@@ -804,6 +895,79 @@ mod tests {
     use super::*;
     use crate::llm::types::Message;
     use serde_json::json;
+
+    // --- Prompt caching (cache_control post-pass) tests ---
+    // OpenRouter routes explicit `cache_control` breakpoints to providers that
+    // support them (Anthropic, Alibaba/Qwen, Gemini) — the TUI's 250K-token
+    // sessions ran at 0% cached without this.
+
+    fn req(system: &str, users: &[&str]) -> CompletionRequest {
+        CompletionRequest {
+            system: system.into(),
+            messages: users.iter().map(|u| Message::user(*u)).collect(),
+            tools: vec![],
+            max_tokens: 64,
+            tool_choice: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn cache_control_marks_system_and_second_to_last_user() {
+        let mut body =
+            build_openai_request("qwen/qwen3-max", &req("SYS", &["one", "two", "three"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // System: string content converted to a cache-controlled text part.
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][0]["text"], "SYS");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        // Second-to-last USER message ("two") carries the rolling breakpoint —
+        // the prefix up to the previous user turn is stable across calls.
+        assert_eq!(msgs[2]["content"][0]["text"], "two");
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // The last user message is NOT marked (it changes every call).
+        assert_eq!(msgs[3]["content"], "three");
+    }
+
+    #[test]
+    fn cache_control_single_user_marks_system_only() {
+        let mut body = build_openai_request("m", &req("SYS", &["only"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[1]["content"], "only");
+    }
+
+    #[test]
+    fn cache_control_without_system_still_marks_user_prefix() {
+        let mut body = build_openai_request("m", &req("", &["a", "b", "c"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["content"][0]["text"], "b");
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn usage_prefers_openai_prompt_tokens_details() {
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 10318,
+            "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 10000, "cache_write_tokens": 200 }
+        }))
+        .unwrap();
+        let t = usage_to_tokens(&u);
+        assert_eq!(t.input_tokens, 10318);
+        assert_eq!(t.cache_read_input_tokens, 10000);
+        assert_eq!(t.cache_creation_input_tokens, 200);
+        // Anthropic-style flat fields still work when details are absent.
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 5, "completion_tokens": 1, "cache_read_input_tokens": 4
+        }))
+        .unwrap();
+        assert_eq!(usage_to_tokens(&u).cache_read_input_tokens, 4);
+    }
 
     // --- Request building tests ---
 
@@ -1436,6 +1600,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 25,
+                prompt_tokens_details: None,
             }),
         };
         let response = into_completion_response(api).unwrap();
@@ -1700,6 +1865,7 @@ mod tests {
                 cache_creation_input_tokens: 80,
                 cache_read_input_tokens: 60,
                 reasoning_tokens: 0,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1727,6 +1893,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 0,
+                prompt_tokens_details: None,
             }),
         };
 

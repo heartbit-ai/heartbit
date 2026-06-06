@@ -227,7 +227,11 @@ fn build_provider(
     on_retry: Arc<heartbit_core::OnRetry>,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
     if let Some(key) = openrouter_key {
-        let base = OpenRouterProvider::new(key, model);
+        // Prompt caching ON: cache_control breakpoints land on the system
+        // prompt + conversation prefix. Qwen/Anthropic/Gemini routes honour
+        // them via OpenRouter (campaign evidence: 250K-token sessions ran at
+        // 0% cached); other routes have the markers stripped harmlessly.
+        let base = OpenRouterProvider::new(key, model).with_prompt_caching();
         return Ok(Arc::new(BoxedProvider::new(
             RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
