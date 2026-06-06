@@ -1848,6 +1848,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                     *usage_acc.lock().expect("usage lock poisoned") = total_usage;
                 }
 
+                // Error-aware fuzzy doom reset: a batch where every call
+                // succeeded is normal sequential work — only consecutive
+                // ERRORING same-name batches indicate a loop.
+                if !tool_interrupted && self.max_identical_tool_calls.is_some() {
+                    doom_tracker.note_batch_outcome(results.iter().any(|r| r.is_error));
+                }
+
                 ctx.add_tool_results(results);
 
                 // Reflection: inject a user-role prompt that nudges the LLM to assess
