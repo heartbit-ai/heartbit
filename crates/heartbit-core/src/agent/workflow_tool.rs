@@ -138,6 +138,13 @@ impl Tool for RunWorkflowTool {
                     "args": {
                         "type": "object",
                         "description": "Recipe-specific arguments (see the recipe description)."
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional hard token budget for the whole workflow \
+                                        (cost-weighted token-equivalents). Use when the user \
+                                        asks to cap spend, e.g. 'use 10k tokens' => 10000."
                     }
                 },
                 "required": ["recipe"]
@@ -157,6 +164,7 @@ impl Tool for RunWorkflowTool {
             .to_string();
         let args = input.get("args").cloned().unwrap_or_else(|| json!({}));
 
+        let budget = input.get("budget").and_then(|v| v.as_u64());
         let recipe = self.registry.get(&recipe_name).cloned();
         let provider = self.provider.clone();
         let agent_events = self.agent_events.clone();
@@ -170,11 +178,22 @@ impl Tool for RunWorkflowTool {
             if let Some(sink) = agent_events {
                 builder = builder.on_agent_event(sink);
             }
+            if let Some(n) = budget {
+                builder = builder.budget(n);
+            }
             let ctx = match builder.build() {
                 Ok(c) => c,
                 Err(e) => return Ok(ToolOutput::error(format!("workflow setup failed: {e}"))),
             };
-            match (recipe.run)(ctx, args).await {
+            let result = (recipe.run)(ctx.clone(), args).await;
+            // A run-level breach (budget / agent backstop) must surface even
+            // when the recipe collapsed the failed slots into degraded text.
+            if let Some(breach) = ctx.control_breach() {
+                return Ok(ToolOutput::error(format!(
+                    "workflow '{recipe_name}' halted by a run-level limit: {breach:?}"
+                )));
+            }
+            match result {
                 Ok(text) => Ok(ToolOutput::success(text)),
                 Err(e) => Ok(ToolOutput::error(format!(
                     "workflow '{recipe_name}' failed: {e}"
@@ -406,6 +425,72 @@ mod tests {
                 "missing RunCompleted for {label}"
             );
         }
+    }
+
+    /// A recipe with two SEQUENTIAL agents — deterministic budget breach: the
+    /// first call records its spend, the second is refused admission.
+    fn two_step_recipe() -> WorkflowRecipe {
+        WorkflowRecipe {
+            name: "two_step".into(),
+            description: "test recipe".into(),
+            args_schema: json!({"type": "object"}),
+            run: Arc::new(|ctx, _args| {
+                Box::pin(async move {
+                    let a = agent(&ctx, "step one").run().await?.unwrap_or_default();
+                    let b = agent(&ctx, "step two").run().await?.unwrap_or_default();
+                    Ok(format!("{a}+{b}"))
+                })
+            }),
+        }
+    }
+
+    /// Fixed text with REAL token usage (so the budget pool actually fills).
+    struct CostlyText;
+    impl LlmProvider for CostlyText {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text { text: "x".into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage {
+                    input_tokens: 800,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_arg_breaches_and_surfaces_as_tool_error() {
+        let registry = WorkflowRegistry::new().register(two_step_recipe());
+        let tool = RunWorkflowTool::new(registry, Arc::new(BoxedProvider::new(CostlyText)));
+        let out = tool
+            .execute(
+                &ExecutionContext::default(),
+                json!({"recipe": "two_step", "budget": 100}),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "breach must surface: {}", out.content);
+        assert!(
+            out.content.to_lowercase().contains("budget"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn without_budget_the_same_recipe_completes() {
+        let registry = WorkflowRegistry::new().register(two_step_recipe());
+        let tool = RunWorkflowTool::new(registry, Arc::new(BoxedProvider::new(CostlyText)));
+        let out = tool
+            .execute(&ExecutionContext::default(), json!({"recipe": "two_step"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "x+x");
     }
 
     #[tokio::test]
