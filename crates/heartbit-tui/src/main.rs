@@ -949,7 +949,11 @@ async fn run_ui(
                 }
             }
             _ = tick.tick() => {
-                if app.running {
+                // Ticks animate the spinner (while running) and advance the
+                // startup splash (while idle) — without the splash arm the
+                // overlay would never auto-dismiss on a quiet startup (live
+                // pty finding: key-skip worked, the timer never fired).
+                if app.running || app.splash.is_some() {
                     app.update(Msg::Tick);
                 }
             }

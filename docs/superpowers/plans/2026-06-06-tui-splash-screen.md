@@ -26,7 +26,7 @@ Verified code anchors (2026-06-06):
 - Modify: `crates/heartbit-tui/src/main.rs:20-32` (add `mod splash;` in the alphabetical mod list, between `mod session;` and `mod trace;`)
 - Test: same file, `#[cfg(test)] mod tests`
 
-- [ ] **Step 1: Write the failing tests** — create `crates/heartbit-tui/src/splash.rs` containing ONLY the tests + a doc comment:
+- [x] **Step 1: Write the failing tests** — create `crates/heartbit-tui/src/splash.rs` containing ONLY the tests + a doc comment:
 
 ```rust
 //! Startup splash: a beating block-art heart + `heartbit` lettering, rendered
@@ -79,9 +79,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2:** Add `mod splash;` to `main.rs` (between `mod session;` and `mod trace;`). Run: `cargo test -p heartbit-tui splash` — expected: FAIL to compile (`is_large`, `splash_lines` not found).
+- [x] **Step 2:** Add `mod splash;` to `main.rs` (between `mod session;` and `mod trace;`). Run: `cargo test -p heartbit-tui splash` — expected: FAIL to compile (`is_large`, `splash_lines` not found).
 
-- [ ] **Step 3: Implement** above the tests in `splash.rs`:
+- [x] **Step 3: Implement** above the tests in `splash.rs`:
 
 ```rust
 use ratatui::style::{Color, Modifier, Style};
@@ -164,9 +164,9 @@ pub fn splash_lines(tick: u8, model: &str) -> Vec<Line<'static>> {
 }
 ```
 
-- [ ] **Step 4:** Run: `cargo test -p heartbit-tui splash` — expected: 3 PASS. (`SPLASH_TICKS` is unused until Task 2 — if clippy complains at this point, ignore until Task 2 wires it; do not blanket-allow.)
+- [x] **Step 4:** Run: `cargo test -p heartbit-tui splash` — expected: 3 PASS. (`SPLASH_TICKS` is unused until Task 2 — if clippy complains at this point, ignore until Task 2 wires it; do not blanket-allow.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/heartbit-tui/src/splash.rs crates/heartbit-tui/src/main.rs
@@ -181,7 +181,7 @@ git commit -m "feat(tui): splash art module — beating heart frames + lettering
 - Modify: `crates/heartbit-tui/src/app.rs` (field near `pub spinner: usize` ~382, init near `spinner: 0` ~422, `Msg::Tick` arm ~579, `Msg::Key` arm ~600)
 - Test: `app.rs` tests module
 
-- [ ] **Step 1: Write the failing tests** (app.rs tests module, near the other `Msg` reducer tests):
+- [x] **Step 1: Write the failing tests** (app.rs tests module, near the other `Msg` reducer tests):
 
 ```rust
     #[test]
@@ -208,9 +208,9 @@ git commit -m "feat(tui): splash art module — beating heart frames + lettering
     }
 ```
 
-- [ ] **Step 2:** Run: `cargo test -p heartbit-tui splash_` — expected: FAIL to compile (no field `splash` on `App`).
+- [x] **Step 2:** Run: `cargo test -p heartbit-tui splash_` — expected: FAIL to compile (no field `splash` on `App`).
 
-- [ ] **Step 3: Implement** in `app.rs`:
+- [x] **Step 3: Implement** in `app.rs`:
 
 Next to `pub spinner: usize,` (~382):
 
@@ -249,9 +249,9 @@ In the `Msg::Key(key)` arm, FIRST (before the `self.modal` check):
                 if self.modal.is_some() {
 ```
 
-- [ ] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS (the two new tests + no regressions).
+- [x] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS (the two new tests + no regressions).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/heartbit-tui/src/app.rs
@@ -266,7 +266,7 @@ git commit -m "feat(tui): splash reducer — tick-driven auto-dismiss, key dismi
 - Modify: `crates/heartbit-tui/src/ui.rs:70-72` (top of `view()`); add `Alignment` to the `ratatui::layout` import at ui.rs:5
 - Test: `ui.rs` tests module (TestBackend pattern — see `empty_transcript_shows_welcome_header` at ~765)
 
-- [ ] **Step 1: Write the failing tests** (ui.rs tests module; mirror the existing TestBackend helper usage):
+- [x] **Step 1: Write the failing tests** (ui.rs tests module; mirror the existing TestBackend helper usage):
 
 ```rust
     #[test]
@@ -331,9 +331,9 @@ If `ui.rs` tests have no `buffer_text` helper, add one in the tests module:
 
 (Check first — the existing render tests likely already have an equivalent; reuse theirs and match its name.)
 
-- [ ] **Step 2:** Run: `cargo test -p heartbit-tui splash_overlay` — expected: FAIL (art not rendered; composer text present).
+- [x] **Step 2:** Run: `cargo test -p heartbit-tui splash_overlay` — expected: FAIL (art not rendered; composer text present).
 
-- [ ] **Step 3: Implement** at the very top of `view()` (right after `let area = frame.area();`), plus add `Alignment` to the `ratatui::layout` import:
+- [x] **Step 3: Implement** at the very top of `view()` (right after `let area = frame.area();`), plus add `Alignment` to the `ratatui::layout` import:
 
 ```rust
     // Startup splash: a full-frame overlay that pre-empts EVERYTHING — no
@@ -366,9 +366,9 @@ If `ui.rs` tests have no `buffer_text` helper, add one in the tests module:
     }
 ```
 
-- [ ] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS.
+- [x] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/heartbit-tui/src/ui.rs
@@ -384,7 +384,7 @@ git commit -m "feat(tui): splash overlay rendering — centered art, modals defe
 - Modify: `crates/heartbit-tui/src/main.rs` (config wiring block at ~182-185)
 - Test: `config.rs` tests module
 
-- [ ] **Step 1: Write the failing tests** (config.rs tests module, beside the existing default/roundtrip tests):
+- [x] **Step 1: Write the failing tests** (config.rs tests module, beside the existing default/roundtrip tests):
 
 ```rust
     #[test]
@@ -397,9 +397,9 @@ git commit -m "feat(tui): splash overlay rendering — centered art, modals defe
     }
 ```
 
-- [ ] **Step 2:** Run: `cargo test -p heartbit-tui splash_defaults` — expected: FAIL to compile (no field `splash`).
+- [x] **Step 2:** Run: `cargo test -p heartbit-tui splash_defaults` — expected: FAIL to compile (no field `splash`).
 
-- [ ] **Step 3: Implement** — in `TuiConfig` after `prompt_caching`:
+- [x] **Step 3: Implement** — in `TuiConfig` after `prompt_caching`:
 
 ```rust
     /// Show the startup splash (the beating heart). Disable with
@@ -416,9 +416,9 @@ In `main.rs` after `app.prompt_caching = cfg.prompt_caching;` (~185):
     app.splash = cfg.splash.then_some(0);
 ```
 
-- [ ] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS.
+- [x] **Step 4:** Run: `cargo test -p heartbit-tui` — expected: ALL PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/heartbit-tui/src/config.rs crates/heartbit-tui/src/main.rs
@@ -429,7 +429,7 @@ git commit -m "feat(tui): splash config flag (default on) + startup arming"
 
 ### Task 5: workspace gate
 
-- [ ] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — all green. Commit only if fixes were needed.
+- [x] `cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm` — all green. Commit only if fixes were needed.
 
 ---
 
@@ -437,10 +437,10 @@ git commit -m "feat(tui): splash config flag (default on) + startup arming"
 
 Per the project bar (settled frame, space-insensitive assertions). `cargo build -p heartbit-tui` FIRST (tests do not rebuild the binary).
 
-- [ ] **Step 1:** Default path: fresh pty session (isolated `HEARTBIT_TUI_CONFIG`, temp cwd, key in env). Capture at ~0.5s: the de-ANSI'd frame contains the lettering rows (`█▀█` etc.) and the version. Capture at ~3s: lettering gone, normal welcome header + composer visible.
-- [ ] **Step 2:** Key-skip path: new session, send a key at ~0.3s, capture at ~1s: lettering gone AND the composer is empty (the key was consumed).
-- [ ] **Step 3:** Opt-out path: write `splash = false` into the isolated tui.toml, new session, capture at ~0.5s: NO lettering, normal startup immediately.
-- [ ] **Step 4:** Report results; mark plan checkboxes.
+- [x] **Step 1:** Default path: fresh pty session (isolated `HEARTBIT_TUI_CONFIG`, temp cwd, key in env). Capture at ~0.5s: the de-ANSI'd frame contains the lettering rows (`█▀█` etc.) and the version. Capture at ~3s: lettering gone, normal welcome header + composer visible.
+- [x] **Step 2:** Key-skip path: new session, send a key at ~0.3s, capture at ~1s: lettering gone AND the composer is empty (the key was consumed).
+- [x] **Step 3:** Opt-out path: write `splash = false` into the isolated tui.toml, new session, capture at ~0.5s: NO lettering, normal startup immediately.
+- [x] **Step 4:** Report results; mark plan checkboxes.
 
 ---
 
