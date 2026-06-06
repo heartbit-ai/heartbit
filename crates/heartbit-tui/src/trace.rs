@@ -10,6 +10,9 @@
 //! Spec: docs/superpowers/specs/2026-06-06-tui-debug-trace-design.md.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Schema version of the trace envelope (the format contract for future
 /// agent consumers — bump on breaking changes).
@@ -111,6 +114,108 @@ pub fn decision_label(d: &heartbit_core::ApprovalDecision) -> &'static str {
         heartbit_core::ApprovalDecision::AlwaysAllow => "always_allow",
         heartbit_core::ApprovalDecision::AlwaysDeny => "always_deny",
     }
+}
+
+/// A clonable producer handle. Producers serialize + send; a dedicated thread
+/// owns the file. Cheap to clone across the UI loop, the agent thread's
+/// callbacks, and the tracing bridge.
+#[derive(Clone)]
+pub struct TraceHandle {
+    tx: std::sync::mpsc::Sender<String>,
+    seq: Arc<AtomicU64>,
+    disabled: Arc<AtomicBool>,
+}
+
+impl TraceHandle {
+    /// Record one event under the versioned envelope. Never blocks, never
+    /// panics; a no-op once the writer has self-disabled.
+    pub fn record(&self, src: TraceSrc, event: serde_json::Value) {
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let rec = TraceRecord {
+            v: TRACE_VERSION,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            ts: now_rfc3339_millis(),
+            src,
+            event,
+        };
+        if let Ok(line) = serde_json::to_string(&rec) {
+            let _ = self.tx.send(line);
+        }
+    }
+
+    /// Record a typed TUI-side event.
+    pub fn record_ui(&self, event: &UiEvent) {
+        if let Ok(v) = serde_json::to_value(event) {
+            self.record(TraceSrc::Ui, v);
+        }
+    }
+
+    /// Record a raw framework event (lossless; serde tag = "type").
+    pub fn record_agent(&self, event: &heartbit_core::AgentEvent) {
+        if let Ok(v) = serde_json::to_value(event) {
+            self.record(TraceSrc::Agent, v);
+        }
+    }
+
+    /// True once a write error permanently disabled this session's trace.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+}
+
+/// Spawn the writer thread for `path` (parent dirs created; file 0600,
+/// append-only, flushed per line). `on_error` fires AT MOST ONCE if the file
+/// can't be opened or written — the trace then self-disables for the session;
+/// it must never take down or block a run.
+pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> TraceHandle {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let disabled = Arc::new(AtomicBool::new(false));
+    let handle = TraceHandle {
+        tx,
+        seq: Arc::new(AtomicU64::new(0)),
+        disabled: disabled.clone(),
+    };
+    std::thread::spawn(move || {
+        use std::io::Write;
+        // Failure path: set the disable flag BEFORE firing the callback, then
+        // return so the thread exits. `on_error` is consumed at most once.
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            disabled.store(true, Ordering::Relaxed);
+            on_error(format!("trace disabled: {e}"));
+            return;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                disabled.store(true, Ordering::Relaxed);
+                on_error(format!("trace disabled: {e}"));
+                return;
+            }
+        };
+        while let Ok(line) = rx.recv() {
+            if writeln!(file, "{line}")
+                .and_then(|()| file.flush())
+                .is_err()
+            {
+                disabled.store(true, Ordering::Relaxed);
+                on_error("trace disabled: write failed".into());
+                return;
+            }
+        }
+        // All senders dropped → session over; file already flushed per line.
+    });
+    handle
 }
 
 #[cfg(test)]
@@ -339,5 +444,95 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["event", "seq", "src", "ts", "v"]);
+    }
+
+    fn read_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// Poll until the writer thread has flushed `n` lines (or time out).
+    fn wait_for_lines(path: &std::path::Path, n: usize) -> Vec<String> {
+        for _ in 0..100 {
+            let lines = read_lines(path);
+            if lines.len() >= n {
+                return lines;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        read_lines(path)
+    }
+
+    #[test]
+    fn writer_appends_jsonl_with_monotonic_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.trace.jsonl");
+        let handle = spawn_writer(path.clone(), Box::new(|_| {}));
+        handle.record_ui(&UiEvent::UserInput { text: "a".into() });
+        handle.record_ui(&UiEvent::UserInput { text: "b".into() });
+        handle.record_agent(&heartbit_core::AgentEvent::RunStarted {
+            agent: "entry".into(),
+            task: "t".into(),
+        });
+        let lines = wait_for_lines(&path, 3);
+        assert_eq!(lines.len(), 3);
+        let recs: Vec<TraceRecord> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs[0].seq, 0);
+        assert_eq!(recs[1].seq, 1);
+        assert_eq!(recs[2].seq, 2);
+        assert_eq!(recs[0].src, TraceSrc::Ui);
+        assert_eq!(recs[2].src, TraceSrc::Agent);
+        assert_eq!(recs[2].event["type"], "run_started");
+    }
+
+    #[test]
+    fn writer_creates_parent_dir_and_0600_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent "sessions" dir does NOT exist yet — first-launch case.
+        let path = dir.path().join("sessions").join("s2.trace.jsonl");
+        let handle = spawn_writer(path.clone(), Box::new(|_| {}));
+        handle.record_ui(&UiEvent::UserInput { text: "x".into() });
+        let lines = wait_for_lines(&path, 1);
+        assert_eq!(lines.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "trace file must be 0600");
+        }
+    }
+
+    #[test]
+    fn writer_self_disables_on_error_and_fires_callback_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // The target path IS a directory → open fails → self-disable.
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let errs = errors.clone();
+        let handle = spawn_writer(
+            dir.path().to_path_buf(),
+            Box::new(move |e| errs.lock().unwrap().push(e)),
+        );
+        // Give the writer thread time to fail the open.
+        for _ in 0..100 {
+            if handle.is_disabled() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_disabled(),
+            "writer must self-disable on open error"
+        );
+        assert_eq!(errors.lock().unwrap().len(), 1, "error callback fires once");
+        // Recording after disable is a silent no-op (must not panic).
+        handle.record_ui(&UiEvent::UserInput {
+            text: "ignored".into(),
+        });
     }
 }
