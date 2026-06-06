@@ -772,6 +772,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     response_text = tracing::field::Empty,
                     cache_hit = tracing::field::Empty,
                 );
+                // TTFT: captured by the on_text wrapper below; ALSO read at the
+                // LlmResponse event emission (not just the tracing span) — the
+                // event is what the TUI trace and /stats consume. Stays 0 for
+                // cache hits and non-streaming calls.
+                let ttft_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let llm_result = if let Some(cached) = cache_hit {
                     tracing::debug!(
                         agent = %self.name,
@@ -784,7 +789,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     Ok(cached)
                 } else {
                     // TTFT: wrap on_text to capture time-to-first-token
-                    let ttft_ms_inner = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let ttft_ms_inner = ttft_ms.clone();
                     let ttft_ref = ttft_ms_inner.clone();
                     let llm_future = async {
                         match &self.on_text {
@@ -1106,7 +1111,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         .model
                         .clone()
                         .or_else(|| self.provider.model_name().map(|s| s.to_string())),
-                    time_to_first_token_ms: 0,
+                    time_to_first_token_ms: ttft_ms.load(std::sync::atomic::Ordering::Relaxed),
                 });
 
                 // Audit: LLM response (untruncated)
@@ -3507,6 +3512,65 @@ mod tests {
         assert_eq!(
             summarized, 1,
             "anti-thrash guard must cap at exactly 1 ContextSummarized, got {summarized}"
+        );
+    }
+
+    /// A streaming mock that emits its first token after a measurable delay —
+    /// instant mocks would legitimately record a 0ms TTFT.
+    struct SlowStreamingProvider;
+
+    impl crate::llm::LlmProvider for SlowStreamingProvider {
+        async fn complete(
+            &self,
+            _request: crate::llm::types::CompletionRequest,
+        ) -> Result<CompletionResponse, Error> {
+            Ok(MockProvider::text_response("hi", 1, 1))
+        }
+
+        async fn stream_complete(
+            &self,
+            _request: crate::llm::types::CompletionRequest,
+            on_text: &crate::llm::OnText,
+        ) -> Result<CompletionResponse, Error> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            on_text("hi");
+            Ok(MockProvider::text_response("hi", 1, 1))
+        }
+    }
+
+    // TTFT regression (found by the TUI's own /analyze on a live trace): the
+    // LlmResponse EVENT hardcoded time_to_first_token_ms: 0 even though the
+    // on_text wrapper captured it — the value only ever reached the tracing
+    // span. The event is what the TUI trace and /stats consume.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_response_event_carries_streaming_ttft() {
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(Arc::new(SlowStreamingProvider))
+            .name("t")
+            .system_prompt("s")
+            .max_turns(1)
+            .on_text(Arc::new(|_| {}))
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let evs = events.lock().expect("lock");
+        let ttft = evs
+            .iter()
+            .find_map(|e| match e {
+                crate::agent::events::AgentEvent::LlmResponse {
+                    time_to_first_token_ms,
+                    ..
+                } => Some(*time_to_first_token_ms),
+                _ => None,
+            })
+            .expect("LlmResponse event emitted");
+        assert!(
+            ttft >= 10,
+            "streaming TTFT must reach the LlmResponse event, got {ttft}ms"
         );
     }
 }
