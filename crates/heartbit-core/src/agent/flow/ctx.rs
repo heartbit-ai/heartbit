@@ -102,6 +102,10 @@ struct CtxInner {
     /// Optional per-call model resolution (see [`ProviderFactory`]). Absent →
     /// `AgentCall::model()` degrades to the shared provider with a log line.
     provider_factory: Option<Arc<ProviderFactory>>,
+    /// Optional workspace (git repo root) — required by leaves that ask for
+    /// [`Isolation::Worktree`](super::agent::Isolation). Shared with nested
+    /// workflows.
+    workspace: Option<std::path::PathBuf>,
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
     cancel: CancellationToken,
     /// Default phase for subsequently-issued agents. `std` lock: never held
@@ -138,6 +142,7 @@ impl WorkflowCtx {
             events: None,
             agent_events: None,
             provider_factory: None,
+            workspace: None,
             cancel: None,
         }
     }
@@ -202,6 +207,10 @@ impl WorkflowCtx {
 
     pub(crate) fn provider_factory(&self) -> Option<Arc<ProviderFactory>> {
         self.inner.provider_factory.clone()
+    }
+
+    pub(crate) fn workspace(&self) -> Option<std::path::PathBuf> {
+        self.inner.workspace.clone()
     }
 
     pub(crate) fn base_tools(&self) -> Option<Vec<Arc<dyn crate::tool::Tool>>> {
@@ -278,6 +287,7 @@ impl WorkflowCtx {
                 events: self.inner.events.clone(),
                 agent_events: self.inner.agent_events.clone(),
                 provider_factory: self.inner.provider_factory.clone(),
+                workspace: self.inner.workspace.clone(),
                 cancel: self.inner.cancel.clone(),
                 default_phase: RwLock::new(None),
                 depth: self.inner.depth + 1,
@@ -328,6 +338,7 @@ pub struct WorkflowCtxBuilder {
     events: Option<Arc<OnWorkflowEvent>>,
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
     provider_factory: Option<Arc<ProviderFactory>>,
+    workspace: Option<std::path::PathBuf>,
     cancel: Option<CancellationToken>,
 }
 
@@ -412,6 +423,13 @@ impl WorkflowCtxBuilder {
         self
     }
 
+    /// Set the workspace (git repo root) — required for leaves that ask for
+    /// [`Isolation::Worktree`](super::agent::Isolation).
+    pub fn workspace(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace = Some(root.into());
+        self
+    }
+
     /// Provide an external cancellation token (defaults to a fresh one).
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -448,6 +466,7 @@ impl WorkflowCtxBuilder {
                 events: self.events,
                 agent_events: self.agent_events,
                 provider_factory: self.provider_factory,
+                workspace: self.workspace,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),
                 depth: 0,

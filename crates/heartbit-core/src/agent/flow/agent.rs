@@ -84,6 +84,24 @@ pub struct AgentOpts {
     /// the leaf degrades to the shared provider (with a log line). Set via
     /// [`AgentCall::model`].
     pub model: Option<String>,
+    /// Filesystem isolation for this leaf. [`Isolation::Worktree`] runs it in
+    /// its own git worktree of the ctx workspace (requires
+    /// [`WorkflowCtxBuilder::workspace`](super::ctx::WorkflowCtxBuilder::workspace)).
+    /// Set via [`AgentCall::isolation`].
+    pub isolation: Isolation,
+}
+
+/// Filesystem isolation level for one agent leaf.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Isolation {
+    /// Share the host filesystem (the default).
+    #[default]
+    None,
+    /// Run in a fresh git worktree of the ctx workspace; clean worktrees are
+    /// pruned afterwards, dirty ones are preserved on an `hb/<name>` branch.
+    /// Isolated calls are NEVER journaled/replayed (side effects are not
+    /// restored by a replay).
+    Worktree,
 }
 
 /// A fluent, owned builder for one [`agent`] leaf. Created by [`agent`].
@@ -132,6 +150,12 @@ impl<T> AgentCall<T> {
     /// model-by-task, the Claude Code way — the workflow decides per agent.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.opts.model = Some(model.into());
+        self
+    }
+
+    /// Isolate this leaf's filesystem effects (see [`Isolation`]).
+    pub fn isolation(mut self, isolation: Isolation) -> Self {
+        self.opts.isolation = isolation;
         self
     }
 
@@ -191,11 +215,19 @@ impl<T> AgentCall<T> {
         // 1. Resume journal (HIT = 0 work, 0 spend; MISS = run live then append).
         //    `journal_arc()` clones the Arc so no ctx borrow is held across the
         //    `self.run_live(..)` move below.
-        if let Some(journal) = self.ctx.journal_arc() {
-            // Hash the call's INPUTS only (never the output model). `model` is
-            // None until a per-call `.model()` exists; it is hashed now so the
-            // on-disk format is forward-stable.
-            let hash = journal::content_hash(&self.prompt, None, self.opts.schema.as_ref());
+        //    ISOLATED calls never participate: a replay restores the return
+        //    value but NOT the worktree side effects, so it would lie.
+        if self.opts.isolation == Isolation::None
+            && let Some(journal) = self.ctx.journal_arc()
+        {
+            // Hash the call's INPUTS only (never the output model) — including
+            // the REQUESTED per-call model: the same prompt on a different
+            // model is a different call.
+            let hash = journal::content_hash(
+                &self.prompt,
+                self.opts.model.as_deref(),
+                self.opts.schema.as_ref(),
+            );
             let occurrence = journal.next_occurrence(&hash);
             let key = journal::CallKey {
                 content_hash: hash,
@@ -245,14 +277,58 @@ impl<T> AgentCall<T> {
             phase,
         });
 
+        // 3b. Worktree isolation: create the leaf's own worktree BEFORE the
+        // cancel race; cleaned up on every exit path below.
+        let guard = match self.opts.isolation {
+            Isolation::None => None,
+            Isolation::Worktree => {
+                let root = self.ctx.workspace().ok_or_else(|| {
+                    Error::Config(
+                        "isolation: Worktree requires WorkflowCtxBuilder::workspace(repo root)"
+                            .into(),
+                    )
+                })?;
+                let name = format!(
+                    "hb-{}-{}",
+                    super::worktree::sanitize_name(&label),
+                    self.ctx.spawned()
+                );
+                Some(super::worktree::WorktreeGuard::create(&root, &name).await?)
+            }
+        };
+        let workspace_override = guard.as_ref().map(|g| g.path().to_path_buf());
+
         // 4. Race the agent run against cooperative cancellation.
         let output = tokio::select! {
             biased;
             _ = self.ctx.cancel_token().cancelled() => {
                 self.ctx.emit(WorkflowEvent::AgentSkipped { label });
+                if let Some(g) = guard {
+                    let _ = g.cleanup().await;
+                }
                 return Ok(None);
             }
-            result = run_one(&self.ctx, &self.prompt, &self.opts) => result?,
+            result = run_one(&self.ctx, &self.prompt, &self.opts, workspace_override.as_deref()) => {
+                // Cleanup happens for BOTH Ok and Err results before `?`.
+                if let Some(g) = guard {
+                    match g.cleanup().await {
+                        Ok(super::worktree::Disposition::Kept { branch }) => {
+                            self.ctx.emit(WorkflowEvent::LogLine {
+                                msg: format!(
+                                    "worktree of '{label}' had changes — preserved on branch {branch}"
+                                ),
+                            });
+                        }
+                        Ok(super::worktree::Disposition::Pruned) => {}
+                        Err(e) => {
+                            self.ctx.emit(WorkflowEvent::LogLine {
+                                msg: format!("worktree cleanup for '{label}' failed: {e}"),
+                            });
+                        }
+                    }
+                }
+                result?
+            }
         };
 
         // 5. Record the completed cost against the shared budget, then finish.
@@ -344,7 +420,12 @@ impl AgentCall<RawJson> {
 /// changing the leaf sequence. When `opts.schema` is set, the runner injects the
 /// `__respond__` tool, validates the payload against the schema, and retries on
 /// mismatch — the typed terminal then deserializes `AgentOutput.structured`.
-async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<AgentOutput, Error> {
+async fn run_one(
+    ctx: &WorkflowCtx,
+    prompt: &str,
+    opts: &AgentOpts,
+    workspace_override: Option<&std::path::Path>,
+) -> Result<AgentOutput, Error> {
     // Per-call model: resolve the role/id through the host factory. A missing
     // factory degrades to the shared provider (same answers, default cost) —
     // a recipe must not die because the host lacks the seam.
@@ -366,6 +447,10 @@ async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<Ag
     let mut builder = AgentRunner::builder(provider);
     if let Some(label) = &opts.label {
         builder = builder.name(label.clone());
+    }
+    // Worktree isolation: the leaf's runner works against ITS OWN worktree.
+    if let Some(ws) = workspace_override {
+        builder = builder.workspace(ws.to_path_buf());
     }
     // Surface the inner runner's full event stream (tool calls, LLM responses,
     // run lifecycle) to the host's sink when one is installed on the ctx —
@@ -578,6 +663,133 @@ mod tests {
             logs.iter()
                 .any(|l| l.contains("fast") && l.contains("factory")),
             "must log the degradation: {logs:?}"
+        );
+    }
+
+    /// A throwaway repo with one commit, for isolation tests.
+    async fn fixture_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+            vec!["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "fixture git {args:?}");
+        }
+        (dir, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worktree_isolation_runs_the_leaf_in_its_own_worktree() {
+        let (_keep, root) = fixture_repo().await;
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 1, 1,
+        )]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(Arc::clone(&mock))))
+            .workspace(root.clone())
+            .build()
+            .expect("ctx");
+        let out = agent(&ctx, "mutate files")
+            .label("iso-1")
+            .isolation(super::Isolation::Worktree)
+            .run()
+            .await
+            .expect("run ok");
+        assert_eq!(out.as_deref(), Some("done"));
+        // The runner saw the WORKTREE as its workspace (system-prompt hint),
+        // not the repo root.
+        let reqs = mock.captured_requests.lock().expect("lock");
+        let sys = &reqs[0].system;
+        assert!(
+            sys.contains("heartbit-worktrees")
+                && !sys.contains(&root.to_string_lossy().to_string()),
+            "leaf must run against the worktree, got system: {sys}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_without_ctx_workspace_is_a_config_error() {
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "x", 1, 1,
+        )]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(mock)))
+            .build()
+            .expect("ctx");
+        let err = agent(&ctx, "go")
+            .isolation(super::Isolation::Worktree)
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("workspace"),
+            "must name the missing seam: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn journal_refuses_isolated_calls() {
+        let (_keep, root) = fixture_repo().await;
+        let dir = tempfile::tempdir().unwrap();
+        let jpath = dir.path().join("j.jsonl");
+        let mock = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("a", 1, 1),
+            MockProvider::text_response("b", 1, 1),
+        ]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(Arc::clone(&mock))))
+            .workspace(root)
+            .journal(&jpath, super::super::journal::ResumeMode::Resume)
+            .expect("journal")
+            .build()
+            .expect("ctx");
+        for _ in 0..2 {
+            let _ = agent(&ctx, "same prompt")
+                .label("iso-j")
+                .isolation(super::Isolation::Worktree)
+                .run()
+                .await
+                .expect("run");
+        }
+        assert_eq!(
+            mock.captured_requests.lock().expect("lock").len(),
+            2,
+            "isolated calls must NEVER replay from the journal (side effects \
+             are not restored)"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_hash_includes_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpath = dir.path().join("j.jsonl");
+        let mock = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("a", 1, 1),
+            MockProvider::text_response("b", 1, 1),
+        ]));
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(Arc::clone(&mock))))
+            .journal(&jpath, super::super::journal::ResumeMode::Resume)
+            .expect("journal")
+            .build()
+            .expect("ctx");
+        // Same prompt, DIFFERENT model → must NOT collide in the journal.
+        let one = agent(&ctx, "same").run().await.expect("run");
+        let two = agent(&ctx, "same")
+            .model("other-model")
+            .run()
+            .await
+            .expect("run");
+        assert_eq!(one.as_deref(), Some("a"));
+        assert_eq!(
+            two.as_deref(),
+            Some("b"),
+            "a different model must be a journal MISS, not a replay of 'a'"
         );
     }
 

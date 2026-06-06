@@ -30,6 +30,7 @@ pub mod journal;
 pub mod parallel;
 pub mod pipeline;
 pub mod progress;
+pub mod worktree;
 
 #[cfg(test)]
 mod audit_gap_tests;
