@@ -16,6 +16,8 @@ use serde::Serialize;
 pub struct ToolStat {
     pub count: usize,
     pub errors: usize,
+    /// errors / count (0.0 for no calls) — the rung-3 measurement substrate.
+    pub error_rate: f64,
     pub p50_ms: u64,
     pub p95_ms: u64,
     #[serde(skip)]
@@ -49,6 +51,9 @@ pub struct TraceStats {
     pub prunes: usize,
     pub run_completed: usize,
     pub run_failed: usize,
+    /// Wall-clock span of the trace: first record `ts` → last record `ts`,
+    /// in milliseconds (0 when fewer than two parseable timestamps).
+    pub duration_ms: u64,
 }
 
 /// Nearest-rank percentile over a SORTED slice (0 for empty).
@@ -67,6 +72,10 @@ pub fn compute(reader: impl std::io::Read) -> TraceStats {
     let mut llm_latencies: Vec<u64> = Vec::new();
     let mut ttfts: Vec<u64> = Vec::new();
     let mut approval_latencies: Vec<u64> = Vec::new();
+    // Wall-clock span: min/max record timestamp (epoch ms). Order-independent
+    // (file order is not authoritative), tolerant of unparseable ts.
+    let mut ts_min: Option<i64> = None;
+    let mut ts_max: Option<i64> = None;
     for line in std::io::BufReader::new(reader).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -81,6 +90,14 @@ pub fn compute(reader: impl std::io::Read) -> TraceStats {
             continue;
         };
         s.records += 1;
+        if let Some(ts) = rec["ts"]
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        {
+            let ms = ts.timestamp_millis();
+            ts_min = Some(ts_min.map_or(ms, |m| m.min(ms)));
+            ts_max = Some(ts_max.map_or(ms, |m| m.max(ms)));
+        }
         let ty = ev["type"].as_str().unwrap_or("");
         match (src, ty) {
             ("ui", "user_input") => s.user_inputs += 1,
@@ -146,6 +163,12 @@ pub fn compute(reader: impl std::io::Read) -> TraceStats {
         stat.durations.sort_unstable();
         stat.p50_ms = pct(&stat.durations, 0.5);
         stat.p95_ms = pct(&stat.durations, 0.95);
+        if stat.count > 0 {
+            stat.error_rate = stat.errors as f64 / stat.count as f64;
+        }
+    }
+    if let (Some(min), Some(max)) = (ts_min, ts_max) {
+        s.duration_ms = u64::try_from(max - min).unwrap_or(0);
     }
     s
 }
@@ -159,8 +182,12 @@ impl TraceStats {
             self.records, self.skipped_lines, self.user_inputs
         ));
         out.push_str(&format!(
-            "turns   {:>6}   llm calls {:>4}   completed {} / failed {}\n",
-            self.turns, self.llm_calls, self.run_completed, self.run_failed
+            "turns   {:>6}   llm calls {:>4}   completed {} / failed {}   wall-clock {:.1}s\n",
+            self.turns,
+            self.llm_calls,
+            self.run_completed,
+            self.run_failed,
+            self.duration_ms as f64 / 1000.0
         ));
         out.push_str(&format!(
             "tokens  in {} / out {}\n",
@@ -249,6 +276,11 @@ mod tests {
         assert_eq!(s.run_completed, 1);
         assert_eq!(s.run_failed, 0);
         assert_eq!(s.doom_loops, 0);
+        // wall-clock: first ts 10:00:00.000Z → last ts 10:00:09.300Z = 9300ms
+        assert_eq!(s.duration_ms, 9300);
+        // bash: 1 error out of 2 calls
+        let bash = s.tools.get("bash").expect("bash stats");
+        assert!((bash.error_rate - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
