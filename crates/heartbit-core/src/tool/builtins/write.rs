@@ -62,7 +62,7 @@ impl Tool for WriteTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path, or relative to workspace"
+                        "description": super::path_param_description(self.workspace.as_deref())
                     },
                     "content": {
                         "type": "string",
@@ -180,6 +180,37 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         let tool = WriteTool::new(tracker, None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "write");
+    }
+
+    // The path description must match the actual policy: with a workspace set,
+    // absolute paths are REJECTED — the old "Absolute path, or relative to
+    // workspace" wording actively invited the failure (live /analyze finding:
+    // an agent burned 7 tool errors trying absolute /tmp paths).
+    #[test]
+    fn path_description_matches_workspace_policy() {
+        let tracker = Arc::new(FileTracker::new());
+        let sandboxed = WriteTool::new(
+            tracker.clone(),
+            Some(std::path::PathBuf::from("/ws")),
+            Arc::new(Vec::new()),
+        );
+        let desc = sandboxed.definition().input_schema["properties"]["file_path"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            desc.contains("relative to the workspace") && desc.contains("rejected"),
+            "workspace-set description must warn absolute is rejected: {desc}"
+        );
+        let open = WriteTool::new(tracker, None, Arc::new(Vec::new()));
+        let desc = open.definition().input_schema["properties"]["file_path"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            desc.contains("Absolute"),
+            "no-workspace description allows absolute: {desc}"
+        );
     }
 
     #[tokio::test]

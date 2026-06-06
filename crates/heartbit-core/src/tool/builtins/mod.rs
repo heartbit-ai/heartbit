@@ -221,6 +221,19 @@ pub(crate) async fn write_beneath_root(
     write_no_follow(target, bytes).await
 }
 
+/// Schema description for a `file_path` parameter, accurate to the policy
+/// `resolve_path` actually enforces. The old wording ("Absolute path, or
+/// relative to workspace") actively invited rejected absolute paths — a live
+/// `/analyze` diagnosis caught an agent burning 7 tool errors on exactly that.
+pub(crate) fn path_param_description(workspace: Option<&std::path::Path>) -> &'static str {
+    if workspace.is_some() {
+        "Path relative to the workspace root (absolute paths are rejected — \
+         create scratch files inside the workspace, not /tmp)"
+    } else {
+        "Absolute path, or relative to the current directory"
+    }
+}
+
 /// Resolve a file path with workspace jail enforcement and protected path checks.
 pub(crate) fn resolve_path(
     path: &str,
