@@ -8,8 +8,8 @@
 
 | Question | Decision |
 |---|---|
-| Form | **Full-screen splash with a beating heart** — block-art heart (2 pulses), `heartbit` block lettering, version + model line |
-| Dismissal | **Auto after ~1.5s OR any key** — never blocks the impatient, never interrogates the contemplative |
+| Form | **Full-screen splash with a beating heart** — block-art heart (cyclic pulses), `heartbit` block lettering, version + model line |
+| Dismissal | **Auto after ~3s OR any key** — never blocks the impatient, never interrogates the contemplative |
 | Opt-out | **`splash = true` in tui.toml** (default on; the `prompt_caching` config pattern) |
 
 ## Architecture
@@ -31,13 +31,14 @@ machinery beyond the 120ms `Msg::Tick` that already drives the spinner.
 - `heartbit` lettering (2 rows, half-block letters), version line
   (`v{CARGO_PKG_VERSION} · {model}`), dim hint line ("any key").
 - `splash_lines(tick: u8, model: &str) -> Vec<Line<'static>>` — pure: picks the
-  heart frame + color intensity from the tick. Beat rhythm over 13 ticks
-  (~1.56s): ticks 0-3 LARGE bright (magenta bold), 4-5 SMALL dim (red),
-  6-9 LARGE bright, 10-12 SMALL dim — two beats, then auto-dismiss.
+  heart frame + color intensity from the tick. Cyclic beat rhythm (period 6:
+  4 ticks LARGE bright magenta bold, 2 ticks SMALL dim red) over 25 ticks
+  (~3s) — four beats, then auto-dismiss. (Was 13 ticks/two beats; lengthened
+  on user feedback "il ne dure pas assez longtemps".)
 
 ### `app.rs`
 - Field `pub splash: Option<u8>` (default `None` in `App::new`).
-- `Msg::Tick`: if `Some(t)` → `t+1`; at `>= SPLASH_TICKS` (13) → `None`.
+- `Msg::Tick`: if `Some(t)` → `t+1`; at `>= SPLASH_TICKS` (25) → `None`.
 - `Msg::Key(_)` while `Some(_)`: set `None` and **consume the key** (return
   before composer/modal handling — composer stays empty).
 - All other messages reduce normally underneath (startup notices, MCP results

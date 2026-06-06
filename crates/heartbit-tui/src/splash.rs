@@ -5,8 +5,9 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Total splash duration in 120ms ticks (~1.56s — two heartbeats).
-pub const SPLASH_TICKS: u8 = 13;
+/// Total splash duration in 120ms ticks (~3s — four heartbeats; any key
+/// skips, so generous beats are low-cost).
+pub const SPLASH_TICKS: u8 = 25;
 
 /// Large (systole) heart frame, 7 rows of half-block art.
 const HEART_LARGE: [&str; 7] = [
@@ -36,9 +37,10 @@ const LETTERING: [&str; 2] = [
     "█▀█ ██▄ █▀█ █▀▄  █  █▄█ █  █ ",
 ];
 
-/// Beat rhythm: LARGE on ticks 0-3 and 6-9, SMALL on 4-5 and 10-12.
+/// Beat rhythm, period 6: four LARGE (bright) ticks then two SMALL (dim) —
+/// cyclic, so the heart beats for the whole splash whatever its duration.
 pub(crate) fn is_large(tick: u8) -> bool {
-    matches!(tick, 0..=3 | 6..=9)
+    tick % 6 < 4
 }
 
 /// The full splash as centered-ready lines: heart (beat frame by `tick`),
@@ -86,14 +88,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rhythm_is_two_beats() {
-        // Bright/large on 0-3 and 6-9; small/dim on 4-5 and 10-12.
-        for t in [0u8, 3, 6, 9] {
+    fn rhythm_beats_cyclically_for_the_whole_duration() {
+        // Period 6: four bright ticks, two dim — the heart keeps beating
+        // however long the splash lasts (user feedback: 1.5s was too short).
+        for t in [0u8, 3, 6, 9, 12, 18, 24] {
             assert!(is_large(t), "tick {t} must be the LARGE frame");
         }
-        for t in [4u8, 5, 10, 12] {
+        for t in [4u8, 5, 10, 11, 16, 22] {
             assert!(!is_large(t), "tick {t} must be the SMALL frame");
         }
+        // ~3s at 120ms/tick — long enough to actually see it.
+        assert!(SPLASH_TICKS >= 25, "splash must run ~3s");
     }
 
     #[test]
