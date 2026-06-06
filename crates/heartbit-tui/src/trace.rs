@@ -28,6 +28,8 @@ pub enum TraceSrc {
 }
 
 /// One line of the trace file.
+///
+/// Evolution rule: any future field on the envelope or a UiEvent variant MUST be Option or #[serde(default)] so new readers tolerate old traces.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TraceRecord {
     pub v: u8,
@@ -198,5 +200,144 @@ mod tests {
             decision_label(&heartbit_core::ApprovalDecision::AlwaysAllow),
             "always_allow"
         );
+    }
+
+    #[test]
+    fn wire_shape_is_pinned_for_all_variants() {
+        use serde_json::json;
+
+        // TraceSrc wire strings — the format contract for the `src` discriminant.
+        assert_eq!(
+            serde_json::to_value(TraceSrc::Agent).unwrap(),
+            json!("agent")
+        );
+        assert_eq!(serde_json::to_value(TraceSrc::Ui).unwrap(), json!("ui"));
+        assert_eq!(
+            serde_json::to_value(TraceSrc::CoreTrace).unwrap(),
+            json!("core_trace")
+        );
+
+        // Each UiEvent variant: pin its `type` tag and every field name.
+        let cases: Vec<(UiEvent, &str, &[&str])> = vec![
+            (
+                UiEvent::SessionStarted {
+                    version: "v".into(),
+                    session_id: "s".into(),
+                    model: "m".into(),
+                    permission_mode: "normal".into(),
+                    mcp_servers: vec![],
+                    context_recall: false,
+                    verify_command: None,
+                },
+                "session_started",
+                &[
+                    "version",
+                    "session_id",
+                    "model",
+                    "permission_mode",
+                    "mcp_servers",
+                    "context_recall",
+                    "verify_command",
+                ],
+            ),
+            (
+                UiEvent::UserInput { text: "hi".into() },
+                "user_input",
+                &["text"],
+            ),
+            (
+                UiEvent::AgentSpawned {
+                    epoch: 1,
+                    model: "m".into(),
+                    reason: "startup".into(),
+                    context_recall: false,
+                    verify_command: None,
+                },
+                "agent_spawned",
+                &[
+                    "epoch",
+                    "model",
+                    "reason",
+                    "context_recall",
+                    "verify_command",
+                ],
+            ),
+            (
+                UiEvent::ModeChanged {
+                    from: "normal".into(),
+                    to: "plan".into(),
+                },
+                "mode_changed",
+                &["from", "to"],
+            ),
+            (
+                UiEvent::Effect {
+                    name: "save".into(),
+                    duration_ms: 1,
+                },
+                "effect",
+                &["name", "duration_ms"],
+            ),
+            (
+                UiEvent::Approval {
+                    tools: vec!["bash".into()],
+                    decision: "allow".into(),
+                    latency_ms: 1,
+                    mode: "normal".into(),
+                },
+                "approval",
+                &["tools", "decision", "latency_ms", "mode"],
+            ),
+            (
+                UiEvent::InterruptRequested {
+                    checkpoint: "CP1".into(),
+                    running: true,
+                },
+                "interrupt_requested",
+                &["checkpoint", "running"],
+            ),
+            (
+                UiEvent::SessionResumed {
+                    from_id: "x".into(),
+                },
+                "session_resumed",
+                &["from_id"],
+            ),
+            (
+                UiEvent::Error {
+                    context: "save".into(),
+                    message: "boom".into(),
+                },
+                "error",
+                &["context", "message"],
+            ),
+        ];
+        assert_eq!(cases.len(), 9, "all UiEvent variants must be pinned");
+        for (ev, tag, fields) in &cases {
+            let val = serde_json::to_value(ev).unwrap();
+            let obj = val.as_object().unwrap();
+            assert_eq!(obj["type"], json!(tag), "wrong tag for {tag}");
+            for field in *fields {
+                assert!(obj.contains_key(*field), "{tag} missing field {field}");
+            }
+        }
+
+        // TraceRecord top-level shape: exactly these five keys, nothing else.
+        let rec = TraceRecord {
+            v: TRACE_VERSION,
+            seq: 0,
+            ts: now_rfc3339_millis(),
+            src: TraceSrc::Ui,
+            event: json!({}),
+        };
+        let val = serde_json::to_value(&rec).unwrap();
+        let mut keys: Vec<&str> = val
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["event", "seq", "src", "ts", "v"]);
     }
 }
