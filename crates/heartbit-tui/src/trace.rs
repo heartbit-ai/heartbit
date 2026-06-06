@@ -317,6 +317,23 @@ you need aggregation. Targeted spots, e.g.:
 5. Interrupts (user Esc — what was the agent doing that prompted it?)
 6. Config issues (spawn reasons/epochs, mode changes mid-session, MCP failures)
 
+## Known trace artifacts (do NOT report these as anomalies)
+- An llm_response with 0 input/output tokens right after interrupt_requested
+  records is the CANCELLED call's synthetic end-of-turn — not corruption.
+- effect.duration_ms measures only the DISPATCH of async work (fetch_models,
+  analyze, walk_files are ~0ms by design; the real work happens off-loop).
+- An `analyze` effect near the end of the trace is the /analyze command that
+  created this very snapshot.
+
+## Recommendation rules (hard requirements)
+- NEVER recommend disabling or weakening safety mechanisms: approval gates,
+  the workspace sandbox, path restrictions, or permission-mode defaults. If
+  reduced friction would genuinely help, present it as a TRADE-OFF for the
+  human to decide, with the risk named explicitly.
+- Only reference configuration keys, files, or code paths you have VERIFIED
+  exist (read them in this workspace). Anything unverified must be explicitly
+  marked "speculative".
+
 ## Deliverable
 1. Present the findings concisely in your answer (cite seq numbers as evidence).
 2. Write the full report to heartbit-diagnosis-{session_id}.md (current
@@ -827,6 +844,30 @@ mod tests {
         assert!(
             !p.contains("/.config/"),
             "must reference only workspace-relative paths — builtins reject absolute paths"
+        );
+    }
+
+    // Diagnosis-quality guardrails (added after a live report recommended
+    // auto-approving bash/write and whitelisting /tmp, hallucinated config
+    // keys, and misread the interrupt artifact as corruption).
+    #[test]
+    fn analyze_prompt_carries_diagnosis_guardrails() {
+        let p = build_analyze_prompt("heartbit-trace-s1.jsonl", "s1", "{}").to_lowercase();
+        assert!(
+            p.contains("never recommend disabling or weakening"),
+            "safety-gate rule missing"
+        );
+        assert!(
+            p.contains("speculative"),
+            "real-config-only rule missing (unverified keys must be marked speculative)"
+        );
+        assert!(
+            p.contains("known trace artifacts"),
+            "artifacts glossary missing"
+        );
+        assert!(
+            p.contains("interrupt_requested"),
+            "interrupt artifact explanation missing"
         );
     }
 }
