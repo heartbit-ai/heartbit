@@ -105,4 +105,82 @@ impl DoomLoopTracker {
         let fuzzy = !exact && fuzzy_threshold.is_some_and(|ft| self.fuzzy_count >= ft);
         (exact, fuzzy)
     }
+
+    /// Inform the tracker of the executed batch's outcome. A batch where every
+    /// call succeeded resets the FUZZY state: consecutive same-tool batches
+    /// that keep succeeding are normal sequential work (e.g. writing N files
+    /// looks like N consecutive `[write]` batches — live /analyze finding),
+    /// not a loop. The exact-match counter is deliberately left untouched:
+    /// byte-identical repeats are suspicious even when they "succeed" (true
+    /// no-progress loops often do).
+    pub(super) fn note_batch_outcome(&mut self, any_error: bool) {
+        if !any_error {
+            self.last_names_hash = None;
+            self.fuzzy_count = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(name: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "tc".into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    // Live /analyze finding: the fuzzy counter climbed across SUCCESSFUL
+    // writes — sequential same-tool batches (writing N files) are normal
+    // work, not a loop. A clean batch must reset the fuzzy state.
+    #[test]
+    fn fuzzy_resets_after_a_clean_batch() {
+        let mut t = DoomLoopTracker::new();
+        for i in 0..10 {
+            let batch = [call("write", json!({"file_path": format!("f{i}.md")}))];
+            let (exact, fuzzy) = t.record(&batch, 3, Some(3));
+            assert!(!exact && !fuzzy, "clean sequential writes must never trip");
+            t.note_batch_outcome(false); // batch succeeded
+        }
+        assert_eq!(t.fuzzy_count(), 0, "clean batches reset the fuzzy count");
+    }
+
+    #[test]
+    fn fuzzy_still_fires_on_consecutive_erroring_batches() {
+        let mut t = DoomLoopTracker::new();
+        let mut fired = false;
+        for i in 0..3 {
+            let batch = [call("write", json!({"attempt": i}))];
+            let (_, fuzzy) = t.record(&batch, 10, Some(3));
+            fired = fuzzy;
+            t.note_batch_outcome(true); // batch errored
+        }
+        assert!(
+            fired,
+            "3 consecutive erroring same-name batches must trip fuzzy"
+        );
+    }
+
+    #[test]
+    fn exact_counter_is_not_reset_by_clean_batches() {
+        // Byte-identical consecutive batches stay suspicious even when they
+        // succeed (true no-progress loops often "succeed"); only the fuzzy
+        // counter is outcome-aware.
+        let mut t = DoomLoopTracker::new();
+        let mut fired = false;
+        for _ in 0..3 {
+            let batch = [call("bash", json!({"command": "echo same"}))];
+            let (exact, _) = t.record(&batch, 3, Some(99));
+            fired = exact;
+            t.note_batch_outcome(false);
+        }
+        assert!(
+            fired,
+            "identical batches must still trip exact at threshold"
+        );
+    }
 }

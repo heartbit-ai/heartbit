@@ -88,6 +88,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) audit_tenant_id: Option<String>,
     /// Delegation chain for audit records (propagated from orchestrator).
     pub(crate) audit_delegation_chain: Vec<String>,
+    /// Per-sub-agent context-management wiring (multi-agent enablement).
+    pub(crate) context: SubAgentContextConfig,
 }
 
 impl std::fmt::Debug for SubAgentDef {
@@ -141,6 +143,7 @@ impl SubAgentDef {
             audit_user_id: None,
             audit_tenant_id: None,
             audit_delegation_chain: Vec::new(),
+            context: SubAgentContextConfig::default(),
         }
     }
 }
@@ -180,6 +183,7 @@ impl From<SubAgentConfig> for SubAgentDef {
             audit_user_id: def.audit_user_id,
             audit_tenant_id: def.audit_tenant_id,
             audit_delegation_chain: def.audit_delegation_chain,
+            context: def.context,
         }
     }
 }
@@ -232,7 +236,10 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             blackboard: None,
             knowledge_base: None,
             on_text: None,
+            on_reasoning: None,
             on_approval: None,
+            on_input: None,
+            interrupt: None,
             on_event: None,
             guardrails: Vec::new(),
             on_question: None,
@@ -261,6 +268,10 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             spawn_config: None,
             spawn_builtin_tools: Vec::new(),
             tenant_tracker: None,
+            entry_mode: false,
+            entry_direct_tools: Vec::new(),
+            entry_workflow_recipes: Vec::new(),
+            entry_context: SubAgentContextConfig::default(),
         }
     }
 
@@ -493,7 +504,7 @@ impl DelegateTaskTool {
                 if let Some(max) = agent_def.max_total_tokens {
                     builder = builder.max_total_tokens(max);
                 }
-                if let Some(trail) = agent_def.audit_trail {
+                if let Some(trail) = agent_def.audit_trail.clone() {
                     builder = builder.audit_trail(trail);
                 }
                 if let Some(uid) = &agent_def.audit_user_id
@@ -534,6 +545,23 @@ impl DelegateTaskTool {
                     builder = builder.on_text(on_text.clone());
                 }
 
+                // Multi-agent context enablement: forward this sub-agent's
+                // context wiring (recitation, restore-on-demand, proactive
+                // compaction, replan). Each field is opt-in; unset → no-op, so
+                // sub-agents with a default `context` are unaffected.
+                if let Some(store) = agent_def.context.todo_store.clone() {
+                    builder = builder.todo_store(store);
+                }
+                if agent_def.context.replan_on_verify_fail {
+                    builder = builder.replan_on_verify_fail(true);
+                }
+                if let Some(window) = agent_def.context.context_window_tokens {
+                    builder = builder.context_window_tokens(window);
+                }
+                if let Some(store) = agent_def.context.context_recall_store.clone() {
+                    builder = builder.context_recall_store(store);
+                }
+
                 // Add memory tools if shared memory is configured
                 if let Some(ref memory) = shared_memory {
                     let agent_ns = match &ns_prefix {
@@ -562,7 +590,15 @@ impl DelegateTaskTool {
                 // caller-namespaced (`caller:{name}/...`) and the reserved
                 // `agent:` prefix is denied to sub-agents.
                 if let Some(ref bb) = blackboard {
-                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
+                    let bb_audit = agent_def.audit_trail.clone().map(|trail| {
+                        crate::agent::blackboard_tools::BlackboardAudit {
+                            trail,
+                            user_id: agent_def.audit_user_id.clone(),
+                            tenant_id: agent_def.audit_tenant_id.clone(),
+                        }
+                    });
+                    builder =
+                        builder.tools(blackboard_tools(bb.clone(), &agent_def.name, bb_audit));
                 }
 
                 // Add knowledge tools if knowledge base is configured
@@ -740,6 +776,10 @@ struct FormSquadTool {
     allow_shared_write: bool,
     /// Optional per-tenant token tracker propagated to all squad member runners.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// SECURITY (F-AGENT-2): orchestrator-level guardrails, combined with each
+    /// squad member's own so squad work can't bypass the orchestrator's defenses
+    /// (the `delegate_task` path already does this; `form_squad` used to skip it).
+    guardrails: Vec<Arc<dyn Guardrail>>,
 }
 
 impl Tool for FormSquadTool {
@@ -845,6 +885,8 @@ impl Tool for FormSquadTool {
                 let observability_mode = self.observability_mode;
                 let allow_shared_write = self.allow_shared_write;
                 let tenant_tracker = self.tenant_tracker.clone();
+                // SECURITY (F-AGENT-2): propagate orchestrator guardrails to squad members.
+                let squad_guardrails = self.guardrails.clone();
 
                 info!(agent = %agent_def.name, task = %task.task, "spawning squad member");
 
@@ -871,8 +913,12 @@ impl Tool for FormSquadTool {
                     if let Some(schema) = agent_def.response_schema {
                         builder = builder.structured_schema(schema);
                     }
-                    if !agent_def.guardrails.is_empty() {
-                        builder = builder.guardrails(agent_def.guardrails);
+                    // SECURITY (F-AGENT-2): combine orchestrator + member guardrails
+                    // so squad work runs under the orchestrator's defenses too.
+                    let mut combined_guardrails = squad_guardrails;
+                    combined_guardrails.extend(agent_def.guardrails);
+                    if !combined_guardrails.is_empty() {
+                        builder = builder.guardrails(combined_guardrails);
                     }
                     if let Some(timeout) = agent_def.run_timeout {
                         builder = builder.run_timeout(timeout);
@@ -919,7 +965,7 @@ impl Tool for FormSquadTool {
                     if let Some(max) = agent_def.max_total_tokens {
                         builder = builder.max_total_tokens(max);
                     }
-                    if let Some(trail) = agent_def.audit_trail {
+                    if let Some(trail) = agent_def.audit_trail.clone() {
                         builder = builder.audit_trail(trail);
                     }
                     if let Some(uid) = &agent_def.audit_user_id
@@ -960,6 +1006,22 @@ impl Tool for FormSquadTool {
                         builder = builder.on_text(on_text.clone());
                     }
 
+                    // Multi-agent context enablement (form_squad path): forward
+                    // this squad member's context wiring, mirroring the delegate
+                    // path. Opt-in; unset → no-op.
+                    if let Some(store) = agent_def.context.todo_store.clone() {
+                        builder = builder.todo_store(store);
+                    }
+                    if agent_def.context.replan_on_verify_fail {
+                        builder = builder.replan_on_verify_fail(true);
+                    }
+                    if let Some(window) = agent_def.context.context_window_tokens {
+                        builder = builder.context_window_tokens(window);
+                    }
+                    if let Some(store) = agent_def.context.context_recall_store.clone() {
+                        builder = builder.context_recall_store(store);
+                    }
+
                     // Add memory tools if shared memory is configured
                     if let Some(ref memory) = shared_memory {
                         let agent_ns = match &ns_prefix {
@@ -986,7 +1048,15 @@ impl Tool for FormSquadTool {
                     // Add blackboard tools using the PRIVATE blackboard.
                     // SECURITY (F-AGENT-7): caller-namespaced; reserved
                     // `agent:` prefix denied to sub-agents.
-                    builder = builder.tools(blackboard_tools(bb.clone(), &agent_def.name));
+                    let bb_audit = agent_def.audit_trail.clone().map(|trail| {
+                        crate::agent::blackboard_tools::BlackboardAudit {
+                            trail,
+                            user_id: agent_def.audit_user_id.clone(),
+                            tenant_id: agent_def.audit_tenant_id.clone(),
+                        }
+                    });
+                    builder =
+                        builder.tools(blackboard_tools(bb.clone(), &agent_def.name, bb_audit));
 
                     // Add knowledge tools if knowledge base is configured
                     if let Some(ref kb) = knowledge_base {
@@ -1536,6 +1606,94 @@ pub fn build_system_prompt(
     )
 }
 
+/// System prompt for the UNIFIED entry agent (option C).
+///
+/// Unlike [`build_system_prompt`] — a pure router that MUST always delegate and
+/// is forbidden from answering directly — the entry agent holds its own direct
+/// tools and decides per request: answer directly, do the work itself,
+/// delegate to specialists, or launch a workflow recipe. This is the
+/// emergent-routing contract (the LLM routes by choosing tools).
+pub fn build_entry_agent_prompt(
+    agents: &[(&str, &str, &[String])],
+    squads_enabled: bool,
+    dispatch_mode: DispatchMode,
+    workflow_recipes: &[(&str, &str)],
+) -> String {
+    let agent_list: String = if agents.is_empty() {
+        "(none configured — handle everything yourself with your own tools)".to_string()
+    } else {
+        agents
+            .iter()
+            .map(|(name, desc, tools)| {
+                if tools.is_empty() {
+                    format!("- **{name}**: {desc}\n  Tools: (none)")
+                } else {
+                    format!("- **{name}**: {desc}\n  Tools: {}", tools.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let delegation_line = match (squads_enabled, dispatch_mode) {
+        (_, DispatchMode::Sequential) => {
+            "delegate ONE specialist at a time with **delegate_task** (wait for each result)."
+        }
+        (true, DispatchMode::Parallel) => {
+            "delegate independent parts with **delegate_task** (isolated, parallel) or \
+             **form_squad** (parallel + shared blackboard), then synthesize."
+        }
+        (false, DispatchMode::Parallel) => {
+            "delegate independent parts with **delegate_task** (parallel), then synthesize."
+        }
+    };
+
+    let (workflow_decision_line, workflow_block) = if workflow_recipes.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let list = workflow_recipes
+            .iter()
+            .map(|(name, desc)| format!("- **{name}**: {desc}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            "\n         - **A structured repeatable job matching a recipe**: use run_workflow \
+             (see below)."
+                .to_string(),
+            format!(
+                "\n\n## Workflow Recipes\n\
+                 For a structured, repeatable, multi-step job, launch a recipe with \
+                 **run_workflow** (give the recipe name + args). Available recipes:\n{list}"
+            ),
+        )
+    };
+
+    format!(
+        "You are Heartbit, a software-engineering lead in a terminal UI. You have your OWN tools \
+         (read, search, edit, run code) for quick work, AND a team of specialist sub-agents you \
+         delegate substantive work to. Match the response to the request:\n\n\
+         ## How to decide (per request)\n\
+         - **Conversational / simple questions** (greetings, \"what can you do\", a fact, an \
+           explanation): answer DIRECTLY in prose. No tools, no delegation.\n\
+         - **A SMALL, focused change you can finish in ~1–3 tool calls** (read one file, one edit, \
+           run one command): do it YOURSELF.\n\
+         - **A SUBSTANTIVE task — DELEGATE (this is the DEFAULT for real work).** Triggers: it \
+           spans MULTIPLE files/areas/components; it has several independent parts; or it is a \
+           broad request (implement a feature, add+wire+test something, review/audit/refactor \
+           across the codebase, investigate-then-change). Break it into self-contained tasks and \
+           {delegation_line} Independent parts run in parallel, each agent stays \
+           focused.{workflow_decision_line}\n\n\
+         ## Principles\n\
+         - Trivial → answer. Small & focused → do it yourself. Substantive or multi-part → \
+           DELEGATE. Do NOT grind through a large multi-part task entirely yourself when \
+           independent parts could run in parallel across the squad.\n\
+         - When you do change code yourself, make the smallest correct change and verify it. Be \
+           concise; show your work through tool use rather than narrating it.\n\
+         - Each delegated task must be self-contained (include all the context the agent needs).\n\n\
+         ## Available Sub-Agents\n{agent_list}{workflow_block}"
+    )
+}
+
 /// Build the delegate_task tool definition.
 ///
 /// Shared between standalone and Restate paths. Takes `(name, description, tool_names)` triples.
@@ -1677,6 +1835,31 @@ pub(crate) fn build_form_squad_tool_schema(agents: &[(&str, &str, &[String])]) -
     }
 }
 
+/// Per-sub-agent context-management wiring (multi-agent enablement).
+///
+/// All fields are opt-in: [`Default`] reproduces today's behavior exactly. The
+/// caller creates the stores, builds the sub-agent's tools FROM them, and sets
+/// the SAME stores here; the orchestrator forwards each to the sub-agent's
+/// [`AgentRunnerBuilder`](crate::agent::builder::AgentRunnerBuilder). The
+/// session-prune config that pairs with restore-on-demand reuses the existing
+/// [`SubAgentConfig::session_prune_config`] (a gentle default is applied when a
+/// recall store is set but no prune config is).
+#[derive(Clone, Default)]
+pub struct SubAgentContextConfig {
+    /// Shared todo store the sub-agent recites at the context tail each turn
+    /// (long-horizon recitation). MUST be the same store backing the
+    /// sub-agent's `todowrite`/`todoread` tools.
+    pub todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// Per-run recall store for restore-on-demand. MUST be the same store
+    /// passed into the sub-agent's `BuiltinToolsConfig.context_recall_store`.
+    pub context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Model context window (tokens) for the proactive compaction backstop.
+    pub context_window_tokens: Option<u32>,
+    /// When true, a RED verify blocks the sub-agent's natural completion
+    /// (bounded replan).
+    pub replan_on_verify_fail: bool,
+}
+
 /// Configuration for adding a sub-agent to the orchestrator.
 ///
 /// Used by `OrchestratorBuilder::sub_agent_full` to avoid a long parameter list.
@@ -1751,6 +1934,9 @@ pub struct SubAgentConfig {
     /// Delegation chain for audit records (propagated to sub-agents).
     #[allow(dead_code)]
     pub audit_delegation_chain: Vec<String>,
+    /// Context-management wiring (recitation, restore-on-demand, proactive
+    /// compaction, replan). Opt-in; `Default` preserves current behavior.
+    pub context: SubAgentContextConfig,
 }
 
 /// Builder for [`Orchestrator`].
@@ -1778,8 +1964,11 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     blackboard: Option<Arc<dyn Blackboard>>,
     knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_text: Option<Arc<crate::llm::OnText>>,
+    on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     on_approval: Option<Arc<crate::llm::OnApproval>>,
     on_event: Option<Arc<OnEvent>>,
+    on_input: Option<Arc<crate::agent::OnInput>>,
+    interrupt: Option<super::interrupt::InterruptHandle>,
     guardrails: Vec<Arc<dyn Guardrail>>,
     on_question: Option<Arc<OnQuestion>>,
     run_timeout: Option<Duration>,
@@ -1824,9 +2013,46 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     /// and SpawnAgentTool. When set, multi-agent token usage is correctly accounted
     /// per tenant so the per-tenant cap applies to the combined run.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Unified entry-agent mode (option C). When true, the orchestrator's OWN
+    /// runner uses the non-absolute [`build_entry_agent_prompt`] and is given
+    /// `entry_direct_tools` so it can answer directly / do simple work itself,
+    /// in addition to delegating. Default false = pure router (unchanged).
+    entry_mode: bool,
+    /// Direct tools for the entry agent's own runner (builtins + MCP + the
+    /// `run_workflow` tool). Only used when `entry_mode`.
+    entry_direct_tools: Vec<Arc<dyn Tool>>,
+    /// `(name, description)` of the workflow recipes advertised in the entry
+    /// prompt (the `run_workflow` tool itself is supplied via `entry_direct_tools`).
+    entry_workflow_recipes: Vec<(String, String)>,
+    /// Context-management wiring for the entry agent's OWN runner (recitation,
+    /// restore-on-demand, proactive compaction, replan). Opt-in.
+    entry_context: SubAgentContextConfig,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
+    /// Turn this orchestrator into the unified **entry agent** (option C): its
+    /// own runner gets `direct_tools` (builtins/MCP/run_workflow) and a
+    /// non-absolute prompt, so it answers conversational turns directly, does
+    /// simple work itself, delegates multi-part work, and launches workflow
+    /// recipes — deciding per request via tool choice.
+    pub fn entry_agent(mut self, direct_tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.entry_mode = true;
+        self.entry_direct_tools = direct_tools;
+        self
+    }
+
+    /// Advertise workflow recipes (name + description) in the entry prompt.
+    pub fn entry_workflow_recipes(mut self, recipes: Vec<(String, String)>) -> Self {
+        self.entry_workflow_recipes = recipes;
+        self
+    }
+
+    /// Context-management wiring for the entry agent's own runner.
+    pub fn entry_context(mut self, context: SubAgentContextConfig) -> Self {
+        self.entry_context = context;
+        self
+    }
+
     /// Add a sub-agent with the given name, description, and system prompt.
     pub fn sub_agent(
         mut self,
@@ -2012,11 +2238,36 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
+    /// Set a callback for streaming reasoning (chain-of-thought) on the
+    /// orchestrator's LLM calls, forwarded to its own runner alongside `on_text`.
+    pub fn on_reasoning(mut self, callback: Arc<crate::llm::OnReasoning>) -> Self {
+        self.on_reasoning = Some(callback);
+        self
+    }
+
     /// Set a callback for human-in-the-loop approval on the orchestrator's
     /// tool calls (i.e., delegate_task calls). Sub-agents do not use this
     /// callback — only the orchestrator's decisions are gated.
     pub fn on_approval(mut self, callback: Arc<crate::llm::OnApproval>) -> Self {
         self.on_approval = Some(callback);
+        self
+    }
+
+    /// Set the `on_input` callback for interactive multi-turn sessions. Forwarded
+    /// to the orchestrator's inner runner: when the orchestrator finishes a turn
+    /// with no tool calls, it awaits the next message (history preserved), exactly
+    /// like a single [`AgentRunner`]. A single [`run`](Orchestrator::run) then
+    /// drives the whole multi-turn session.
+    pub fn on_input(mut self, callback: Arc<crate::agent::OnInput>) -> Self {
+        self.on_input = Some(callback);
+        self
+    }
+
+    /// Set a per-turn [`InterruptHandle`](super::interrupt::InterruptHandle),
+    /// forwarded to the inner runner so a caller can abandon the current turn
+    /// (LLM generation or tool/delegation batch) without ending the session.
+    pub fn interrupt(mut self, handle: super::interrupt::InterruptHandle) -> Self {
+        self.interrupt = Some(handle);
         self
     }
 
@@ -2261,7 +2512,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .zip(tool_names.iter())
             .map(|(a, names)| (a.name.as_str(), a.description.as_str(), names.as_slice()))
             .collect();
-        let mut system = build_system_prompt(&triples, squads_enabled, self.dispatch_mode);
+        let mut system = if self.entry_mode {
+            // Unified entry agent (option C): non-absolute prompt that lets the
+            // agent answer directly / do simple work / delegate / run a workflow.
+            let recipes: Vec<(&str, &str)> = self
+                .entry_workflow_recipes
+                .iter()
+                .map(|(n, d)| (n.as_str(), d.as_str()))
+                .collect();
+            build_entry_agent_prompt(&triples, squads_enabled, self.dispatch_mode, &recipes)
+        } else {
+            build_system_prompt(&triples, squads_enabled, self.dispatch_mode)
+        };
         // Append user identity context so the orchestrator knows who it is serving.
         if let (Some(uid), Some(tid)) = (&self.audit_user_id, &self.audit_tenant_id) {
             system.push_str(&format!(
@@ -2364,6 +2626,37 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             .max_turns(self.max_turns)
             .max_tokens(self.max_tokens);
 
+        // Unified entry agent (option C): give the orchestrator's OWN runner its
+        // direct tools (builtins/MCP/run_workflow) + the context-management stack
+        // so it can answer/do/delegate/run-workflow in one loop. Opt-in.
+        if self.entry_mode {
+            if !self.entry_direct_tools.is_empty() {
+                runner_builder = runner_builder.tools(std::mem::take(&mut self.entry_direct_tools));
+            }
+            let cx = std::mem::take(&mut self.entry_context);
+            if let Some(store) = cx.todo_store {
+                runner_builder = runner_builder.todo_store(store);
+            }
+            if cx.replan_on_verify_fail {
+                runner_builder = runner_builder.replan_on_verify_fail(true);
+            }
+            if let Some(window) = cx.context_window_tokens {
+                runner_builder = runner_builder.context_window_tokens(window);
+            }
+            if let Some(store) = cx.context_recall_store {
+                // Pair restore-on-demand with a gentle pruner so old tool
+                // outputs truncate to a restorable marker (otherwise no marker
+                // is ever produced).
+                runner_builder = runner_builder
+                    .context_recall_store(store)
+                    .session_prune_config(crate::agent::pruner::SessionPruneConfig {
+                        keep_recent_n: 3,
+                        pruned_tool_result_max_bytes: 1024,
+                        ..Default::default()
+                    });
+            }
+        }
+
         // Register form_squad tool when enabled
         if let Some(agent_pool) = agent_pool {
             // SAFETY: form_squad_definition is always Some when agent_pool is Some
@@ -2386,6 +2679,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 observability_mode: resolved_mode,
                 allow_shared_write: self.allow_shared_write,
                 tenant_tracker: self.tenant_tracker.clone(),
+                guardrails: self.guardrails.clone(),
             });
             runner_builder = runner_builder.tool(form_squad_tool);
         }
@@ -2453,8 +2747,20 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if let Some(on_text) = self.on_text {
             runner_builder = runner_builder.on_text(on_text);
         }
+        if let Some(on_reasoning) = self.on_reasoning {
+            runner_builder = runner_builder.on_reasoning(on_reasoning);
+        }
         if let Some(on_approval) = self.on_approval {
             runner_builder = runner_builder.on_approval(on_approval);
+        }
+        // Forward interactive multi-turn + interrupt to the inner runner so the
+        // orchestrator behaves like a single AgentRunner (one `run` = a full
+        // session) with delegation available.
+        if let Some(on_input) = self.on_input {
+            runner_builder = runner_builder.on_input(on_input);
+        }
+        if let Some(interrupt) = self.interrupt {
+            runner_builder = runner_builder.interrupt(interrupt);
         }
         if let Some(learned) = self.learned_permissions {
             runner_builder = runner_builder.learned_permissions(learned);
@@ -2727,6 +3033,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2740,6 +3047,87 @@ mod tests {
         assert_eq!(output.result, "done");
         // The system prompt should NOT mention form_squad
         // (indirectly verifies squads were disabled)
+    }
+
+    #[tokio::test]
+    async fn orchestrator_runs_multi_turn_via_on_input() {
+        // With `on_input` forwarded to the inner runner, a SINGLE `run()` drives a
+        // whole multi-turn session: turn 1 answers, the runner awaits the next
+        // message, turn 2 answers, then `on_input` ends the session.
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![text("first"), text("second")]));
+        let inputs = Arc::new(std::sync::Mutex::new(vec![Some("again".to_string()), None]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("a", "Agent A", "prompt a")
+            .sub_agent("b", "Agent B", "prompt b")
+            .on_input(on_input)
+            .build()
+            .unwrap();
+        let output = orch.run("start").await.unwrap();
+        assert_eq!(
+            output.result, "second",
+            "a single run() drives the full multi-turn session via on_input"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_interrupt_ends_turn_then_continues() {
+        // A pre-triggered interrupt makes the inner runner's biased select abandon
+        // the first turn; the follow-up (via on_input) then produces the answer.
+        use crate::agent::interrupt::InterruptHandle;
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![text("real answer")]));
+        let interrupt = InterruptHandle::new();
+        interrupt.interrupt();
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("a", "Agent A", "prompt a")
+            .sub_agent("b", "Agent B", "prompt b")
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+        let output = orch.run("start").await.unwrap();
+        assert_eq!(output.result, "real answer");
     }
 
     #[test]
@@ -2822,6 +3210,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             }],
             shared_memory: None,
             memory_namespace_prefix: None,
@@ -2874,6 +3263,7 @@ mod tests {
                 text: "Simple answer.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2911,6 +3301,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -2924,6 +3315,7 @@ mod tests {
                     text: "Rust is fast and safe.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -2937,6 +3329,7 @@ mod tests {
                     text: "Strengths: memory safety, performance.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 10,
@@ -2950,6 +3343,7 @@ mod tests {
                     text: "Based on research: Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
@@ -2986,6 +3380,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2995,6 +3390,7 @@ mod tests {
                     text: "No such agent available.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3019,6 +3415,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3027,6 +3424,7 @@ mod tests {
                     text: "Sorry, let me respond directly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3052,6 +3450,7 @@ mod tests {
                     input: json!({"tasks": []}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3061,6 +3460,7 @@ mod tests {
                     text: "Let me try again properly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3086,6 +3486,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3095,6 +3496,7 @@ mod tests {
                     text: "I need to format correctly.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3126,6 +3528,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3135,6 +3538,7 @@ mod tests {
                     text: "Research result here.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3144,6 +3548,7 @@ mod tests {
                     text: "Done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3207,6 +3612,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3216,6 +3622,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3225,6 +3632,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3333,6 +3741,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3342,6 +3751,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3351,6 +3761,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3392,6 +3803,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -3407,6 +3819,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -3422,6 +3835,7 @@ mod tests {
                     text: "Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
@@ -3463,6 +3877,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -3476,6 +3891,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 10,
@@ -3493,6 +3909,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 25,
@@ -3506,6 +3923,7 @@ mod tests {
                     text: "More info.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 8,
@@ -3567,6 +3985,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3576,6 +3995,7 @@ mod tests {
                     text: "Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -3589,6 +4009,7 @@ mod tests {
                     text: "Summary: Rust is fast.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3693,6 +4114,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3702,6 +4124,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3711,6 +4134,7 @@ mod tests {
                         text: "All done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3752,6 +4176,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -3838,6 +4263,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3847,6 +4273,7 @@ mod tests {
                         text: "Work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3856,6 +4283,7 @@ mod tests {
                         text: "Synthesized.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3900,6 +4328,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -3914,6 +4343,644 @@ mod tests {
             systems[1].contains("[ORCH_GUARD_ACTIVE]"),
             "sub-agent system prompt should contain orchestrator guardrail marker; got: {}",
             systems[1]
+        );
+    }
+
+    #[test]
+    fn entry_agent_prompt_allows_direct_answers() {
+        let tools = ["bash".to_string()];
+        let agents: Vec<(&str, &str, &[String])> = vec![("worker", "does work", &tools)];
+        let recipes = [("deep-review", "review the diff")];
+        let p = build_entry_agent_prompt(&agents, true, DispatchMode::Parallel, &recipes);
+        // The whole point: the entry agent is NOT forbidden from answering directly.
+        assert!(
+            !p.contains("Never respond to the user directly"),
+            "entry agent must be allowed to answer directly"
+        );
+        let low = p.to_lowercase();
+        assert!(
+            low.contains("answer directly"),
+            "prompt should instruct direct answers for simple turns"
+        );
+        // ...but substantive work should DEFAULT to delegation (the fix for
+        // "never delegates"): concrete triggers + delegation framed as default.
+        assert!(
+            low.contains("default for real work") || low.contains("substantive or multi-part"),
+            "prompt should make delegation the default for substantive work: {p}"
+        );
+        assert!(p.contains("worker"), "lists sub-agents");
+        assert!(p.contains("deep-review"), "lists workflow recipes");
+        assert!(p.contains("run_workflow"), "mentions the workflow tool");
+    }
+
+    #[test]
+    fn entry_agent_prompt_without_recipes_omits_workflow_block() {
+        let agents: Vec<(&str, &str, &[String])> = vec![];
+        let p = build_entry_agent_prompt(&agents, false, DispatchMode::Parallel, &[]);
+        assert!(
+            !p.contains("run_workflow"),
+            "no recipes → no workflow block"
+        );
+        assert!(
+            p.contains("none configured"),
+            "empty squad → 'handle everything yourself'"
+        );
+    }
+
+    // Option C: an entry-mode orchestrator's OWN runner holds direct tools and
+    // can execute them itself (not just delegate).
+    #[tokio::test]
+    async fn entry_agent_runs_its_own_direct_tools() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountTool(Arc<AtomicUsize>);
+        impl Tool for CountTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "no-op".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // entry agent uses its OWN tool (not delegate_task)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("done"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(provider)
+            .entry_agent(vec![Arc::new(CountTool(calls.clone()))])
+            .sub_agent("worker", "does work", "you work")
+            .build()
+            .unwrap();
+        let out = orch.run("do a thing").await.unwrap();
+        assert_eq!(out.result, "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "entry agent must execute its own direct tool on its own runner"
+        );
+    }
+
+    // Option C, the SHIPPED config: an entry-mode orchestrator must keep BOTH
+    // its direct tools AND delegate_task on the same runner (i.e. `entry_agent`'s
+    // `.tools()` appends, it does not replace the delegation tool). Mock returns
+    // a noop tool_use, then a delegate_task, then finishes.
+    #[tokio::test]
+    async fn entry_agent_can_both_act_and_delegate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountTool(Arc<AtomicUsize>);
+        impl Tool for CountTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "no-op".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: entry agent uses its OWN direct tool
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: entry agent ALSO delegates (proves delegate_task survived
+                // alongside the appended direct tools)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "d1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({"tasks": [{"agent": "worker", "task": "do it"}]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("worker done"), // sub-agent finishes
+                text_end("synth"),       // entry agent synthesizes
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(provider.clone())
+            .entry_agent(vec![Arc::new(CountTool(direct_calls.clone()))])
+            .sub_agent("worker", "does work", "you work")
+            .build()
+            .unwrap();
+        let out = orch.run("act then delegate").await.unwrap();
+        assert_eq!(out.result, "synth");
+        assert_eq!(
+            direct_calls.load(Ordering::SeqCst),
+            1,
+            "entry agent ran its own direct tool"
+        );
+        // The sub-agent ran too → there were ≥3 LLM calls (entry act, entry
+        // delegate, sub-agent, entry synth). If delegate_task had been wiped, the
+        // delegate tool_use would have errored instead of spawning the worker.
+        assert!(
+            provider.tails.lock().unwrap().len() >= 4,
+            "delegate_task must still be present and spawn the sub-agent"
+        );
+    }
+
+    #[test]
+    fn sub_agent_context_config_default_is_empty() {
+        let cx = SubAgentContextConfig::default();
+        assert!(cx.todo_store.is_none());
+        assert!(cx.context_recall_store.is_none());
+        assert!(cx.context_window_tokens.is_none());
+        assert!(!cx.replan_on_verify_fail);
+    }
+
+    /// Captures the tail (last-message text) of every LLM request, for the
+    /// multi-agent context-enablement tests.
+    struct TailCapturingProvider {
+        responses: Mutex<Vec<CompletionResponse>>,
+        tails: Mutex<Vec<String>>,
+    }
+    impl LlmProvider for TailCapturingProvider {
+        async fn complete(
+            &self,
+            request: crate::llm::types::CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::Error> {
+            let tail = request
+                .messages
+                .last()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            self.tails.lock().unwrap().push(tail);
+            let mut r = self.responses.lock().unwrap();
+            if r.is_empty() {
+                return Err(crate::error::Error::Agent("no more responses".into()));
+            }
+            Ok(r.remove(0))
+        }
+    }
+
+    fn text_end(t: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text { text: t.into() }],
+            stop_reason: StopReason::EndTurn,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        }
+    }
+
+    fn delegate_then_finish() -> Vec<CompletionResponse> {
+        vec![
+            // 1: orchestrator delegates to "worker"
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({"tasks": [{"agent": "worker", "task": "do work"}]}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 2: the sub-agent finishes
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 3: orchestrator synthesis
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "synth".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]
+    }
+
+    // Multi-agent enablement: a sub-agent whose `context.todo_store` has open
+    // items recites the plan at its OWN context tail when the orchestrator
+    // delegates to it.
+    #[tokio::test]
+    async fn recitation_propagates_to_delegated_sub_agent() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap()
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"todos": [{"content": "finish the parser", "status": "in_progress", "priority": "high"}]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(delegate_then_finish()),
+            tails: Mutex::new(vec![]),
+        });
+        let cfg = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            context: SubAgentContextConfig {
+                todo_store: Some(store),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(cfg)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("[plan — open items")),
+            "the delegated sub-agent must recite its plan; tails: {tails:?}"
+        );
+        assert!(
+            tails.iter().any(|t| t.contains("[>] finish the parser")),
+            "recitation should carry the open item; tails: {tails:?}"
+        );
+    }
+
+    // Regression: a sub-agent with a DEFAULT context recites nothing (existing
+    // behavior unchanged).
+    #[tokio::test]
+    async fn default_context_means_no_recitation_for_sub_agent() {
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(delegate_then_finish()),
+            tails: Mutex::new(vec![]),
+        });
+        let cfg = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            ..Default::default() // context defaults to empty
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(cfg)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            !tails.iter().any(|t| t.contains("[plan — open items")),
+            "default-context sub-agent must not recite; tails: {tails:?}"
+        );
+    }
+
+    // Multi-agent enablement: the form_squad path forwards context too. F-AGENT-2
+    // proved this path can silently diverge from delegate_task in THIS file, so
+    // it gets its own test (not "the blocks are identical, one test covers it").
+    #[tokio::test]
+    async fn recitation_propagates_to_form_squad_member() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap()
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"todos": [{"content": "ship the feature", "status": "in_progress", "priority": "high"}]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator forms a 2-member squad (form_squad needs ≥2).
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "form_squad".into(),
+                        input: json!({"tasks": [
+                            {"agent": "worker", "task": "do A"},
+                            {"agent": "helper", "task": "do B"}
+                        ]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("A done"),
+                text_end("B done"),
+                text_end("synth"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        // Only "worker" carries a populated todo store.
+        let worker = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            context: SubAgentContextConfig {
+                todo_store: Some(store),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let helper = SubAgentConfig {
+            name: "helper".into(),
+            description: "Helper".into(),
+            system_prompt: "You help.".into(),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(worker)
+            .sub_agent_full(helper)
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("[>] ship the feature")),
+            "a form_squad member must recite its plan; tails: {tails:?}"
+        );
+    }
+
+    // Multi-agent enablement: `replan_on_verify_fail` must also propagate — a
+    // delegated sub-agent whose verify is RED gets the corrective nudge re-injected
+    // (instead of finishing on red).
+    #[tokio::test]
+    async fn replan_propagates_to_delegated_sub_agent() {
+        struct FailVerify;
+        impl Tool for FailVerify {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "verify".into(),
+                    description: "verify".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async {
+                    Ok(ToolOutput::success(
+                        "VERIFY_RESULT: FAIL exit_code=1 command=cargo test".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator delegates
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({"tasks": [{"agent": "worker", "task": "do work"}]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: sub-agent runs verify (→ RED)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "v1".into(),
+                        name: "verify".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 3..: sub-agent tries to finish (RED → replan nudge), then more
+                text_end("done"),
+                text_end("done"),
+                text_end("synth"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let worker = SubAgentConfig {
+            name: "worker".into(),
+            description: "Worker".into(),
+            system_prompt: "You work.".into(),
+            tools: vec![Arc::new(FailVerify)],
+            context: SubAgentContextConfig {
+                replan_on_verify_fail: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::builder(provider.clone())
+            .sub_agent_full(worker)
+            .build()
+            .unwrap();
+        let _ = orch.run("do work").await;
+
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("Verification is RED")),
+            "the delegated sub-agent must get the replan nudge on a RED verify; tails: {tails:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_guardrails_propagate_to_form_squad_members() {
+        // SECURITY (F-AGENT-2): the form_squad path must combine orchestrator
+        // guardrails with each member's own, exactly like delegate_task.
+        use crate::agent::guardrail::Guardrail;
+        use crate::llm::types::CompletionRequest;
+
+        struct MarkerGuardrail;
+        impl Guardrail for MarkerGuardrail {
+            fn pre_llm(
+                &self,
+                request: &mut CompletionRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), crate::error::Error>> + Send + '_>,
+            > {
+                request.system = format!("{} [ORCH_GUARD_ACTIVE]", request.system);
+                Box::pin(async { Ok(()) })
+            }
+        }
+        struct CapturingProvider {
+            responses: Mutex<Vec<CompletionResponse>>,
+            systems_seen: Mutex<Vec<String>>,
+        }
+        impl LlmProvider for CapturingProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, crate::error::Error> {
+                self.systems_seen
+                    .lock()
+                    .unwrap()
+                    .push(request.system.clone());
+                let mut r = self.responses.lock().unwrap();
+                if r.is_empty() {
+                    return Err(crate::error::Error::Agent("no more responses".into()));
+                }
+                Ok(r.remove(0))
+            }
+        }
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        fn bare_sub_agent(name: &str) -> SubAgentConfig {
+            SubAgentConfig {
+                name: name.into(),
+                description: format!("{name} agent"),
+                system_prompt: "You work.".into(),
+                tools: vec![],
+                context_strategy: None,
+                summarize_threshold: None,
+                tool_timeout: None,
+                max_tool_output_bytes: None,
+                max_turns: None,
+                max_tokens: None,
+                response_schema: None,
+                run_timeout: None,
+                guardrails: vec![], // NO member guardrails — protection comes only from the orchestrator
+                provider: None,
+                reasoning_effort: None,
+                enable_reflection: None,
+                tool_output_compression_threshold: None,
+                max_tools_per_turn: None,
+                tool_profile: None,
+                max_identical_tool_calls: None,
+                max_fuzzy_identical_tool_calls: None,
+                max_tool_calls_per_turn: None,
+                session_prune_config: None,
+                enable_recursive_summarization: None,
+                reflection_threshold: None,
+                consolidate_on_exit: None,
+                workspace: None,
+                max_total_tokens: None,
+                audit_trail: None,
+                audit_user_id: None,
+                audit_tenant_id: None,
+                audit_delegation_chain: Vec::new(),
+                context: Default::default(),
+            }
+        }
+
+        let provider = Arc::new(CapturingProvider {
+            responses: Mutex::new(vec![
+                // 1: orchestrator forms a 2-member squad
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "form_squad".into(),
+                        input: json!({"tasks": [
+                            {"agent": "worker", "task": "do A"},
+                            {"agent": "helper", "task": "do B"}
+                        ]}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text("A done."),      // 2: squad member
+                text("B done."),      // 3: squad member
+                text("Synthesized."), // 4: orchestrator synthesis
+            ]),
+            systems_seen: Mutex::new(vec![]),
+        });
+
+        let guardrail: Arc<dyn Guardrail> = Arc::new(MarkerGuardrail);
+        let mut orch = Orchestrator::builder(provider.clone())
+            .guardrail(guardrail)
+            .sub_agent_full(bare_sub_agent("worker"))
+            .sub_agent_full(bare_sub_agent("helper"))
+            .build()
+            .unwrap();
+        orch.run("do work").await.unwrap();
+
+        let systems = provider.systems_seen.lock().unwrap();
+        // At least one squad-member call must carry the orchestrator guardrail marker.
+        assert!(
+            systems
+                .iter()
+                .skip(1)
+                .any(|s| s.contains("[ORCH_GUARD_ACTIVE]")),
+            "a form_squad member's system prompt must contain the orchestrator guardrail marker; got: {systems:?}"
         );
     }
 
@@ -3954,6 +5021,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build();
 
@@ -4003,6 +5071,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build();
 
@@ -4052,6 +5121,7 @@ mod tests {
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -4061,6 +5131,7 @@ mod tests {
                         text: "Done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -4076,6 +5147,7 @@ mod tests {
                         text: "Cheap work done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 5,
                         output_tokens: 3,
@@ -4120,6 +5192,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4144,6 +5217,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4153,6 +5227,7 @@ mod tests {
                     text: "Work done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4162,6 +5237,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4201,6 +5277,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4282,6 +5359,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4295,6 +5373,7 @@ mod tests {
                     text: "Rust is fast and safe.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
@@ -4308,6 +5387,7 @@ mod tests {
                     text: "Strengths: memory safety.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 10,
@@ -4321,6 +5401,7 @@ mod tests {
                     text: "Final: Rust is excellent.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4357,6 +5438,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4370,6 +5452,7 @@ mod tests {
                     text: "Done A.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -4383,6 +5466,7 @@ mod tests {
                     text: "Done B.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 12,
                     output_tokens: 6,
@@ -4396,6 +5480,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4443,6 +5528,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4452,6 +5538,7 @@ mod tests {
                     text: "No such agent available.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4482,6 +5569,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4491,6 +5579,7 @@ mod tests {
                     text: "Using delegate_task instead.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4522,6 +5611,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4531,6 +5621,7 @@ mod tests {
                     text: "Fixed duplicate issue.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4566,6 +5657,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4575,6 +5667,7 @@ mod tests {
                     text: "Written to squad blackboard.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4584,6 +5677,7 @@ mod tests {
                     text: "Also written.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4593,6 +5687,7 @@ mod tests {
                     text: "Done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4649,6 +5744,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
@@ -4662,6 +5758,7 @@ mod tests {
                     text: "Done A.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -4675,6 +5772,7 @@ mod tests {
                     text: "Squad failed, falling back.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 25,
@@ -4719,6 +5817,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -4763,6 +5862,7 @@ mod tests {
                     text: "Direct answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }]),
@@ -4833,6 +5933,7 @@ mod tests {
                     text: "Direct answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }]),
@@ -4934,6 +6035,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4943,6 +6045,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4952,6 +6055,7 @@ mod tests {
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5056,6 +6160,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 40,
@@ -5076,6 +6181,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
@@ -5089,6 +6195,7 @@ mod tests {
                     text: "Rust uses async/await with tokio for concurrency.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
@@ -5109,6 +6216,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 8,
@@ -5122,6 +6230,7 @@ mod tests {
                     text: "The main.rs contains the entry point.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 12,
@@ -5135,6 +6244,7 @@ mod tests {
                     text: "Combined analysis: Rust async is great for concurrency.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 200,
                     output_tokens: 50,
@@ -5198,6 +6308,7 @@ mod tests {
                 AgentEvent::RunStarted { agent, .. }
                 | AgentEvent::TurnStarted { agent, .. }
                 | AgentEvent::LlmResponse { agent, .. }
+                | AgentEvent::Reasoning { agent, .. }
                 | AgentEvent::ToolCallStarted { agent, .. }
                 | AgentEvent::ToolCallCompleted { agent, .. }
                 | AgentEvent::RunCompleted { agent, .. }
@@ -5547,6 +6658,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5602,6 +6714,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .build()
             .unwrap();
@@ -5669,6 +6782,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 40,
@@ -5684,6 +6798,7 @@ mod tests {
                     text: "Plan: Step 1 gather data, Step 2 compute, Step 3 review.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 15,
@@ -5705,6 +6820,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 12,
@@ -5718,6 +6834,7 @@ mod tests {
                     text: "Computation result: 714. Analysis complete.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 35,
                     output_tokens: 18,
@@ -5732,6 +6849,7 @@ mod tests {
                     text: "Squad partial success: plan and computation done, review failed.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 200,
                     output_tokens: 60,
@@ -5798,6 +6916,7 @@ mod tests {
                 audit_user_id: None,
                 audit_tenant_id: None,
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             })
             .blackboard(outer_bb.clone())
             .on_event(on_event)
@@ -5883,6 +7002,7 @@ mod tests {
                 AgentEvent::RunStarted { agent, .. }
                 | AgentEvent::TurnStarted { agent, .. }
                 | AgentEvent::LlmResponse { agent, .. }
+                | AgentEvent::Reasoning { agent, .. }
                 | AgentEvent::ToolCallStarted { agent, .. }
                 | AgentEvent::ToolCallCompleted { agent, .. }
                 | AgentEvent::RunCompleted { agent, .. }
@@ -5918,6 +7038,7 @@ mod tests {
                 AgentEvent::RunStarted { .. } => "RunStarted",
                 AgentEvent::TurnStarted { .. } => "TurnStarted",
                 AgentEvent::LlmResponse { .. } => "LlmResponse",
+                AgentEvent::Reasoning { .. } => "Reasoning",
                 AgentEvent::ToolCallStarted { .. } => "ToolCallStarted",
                 AgentEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
                 AgentEvent::RunCompleted { .. } => "RunCompleted",
@@ -6243,6 +7364,7 @@ mod tests {
                         text: "Task complete.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -6289,6 +7411,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6300,6 +7423,7 @@ mod tests {
                     input: json!({"command": "echo hello"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6309,6 +7433,7 @@ mod tests {
                     text: "Bash was denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6318,6 +7443,7 @@ mod tests {
                     text: "Worker reported bash was denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6386,6 +7512,7 @@ mod tests {
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6397,6 +7524,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6406,6 +7534,7 @@ mod tests {
                     text: "Bash denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6415,6 +7544,7 @@ mod tests {
                     text: "Hello!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6424,6 +7554,7 @@ mod tests {
                     text: "Squad done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -6676,6 +7807,7 @@ mod tests {
                 ..Default::default()
             },
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -6747,6 +7879,7 @@ mod tests {
                 }],
                 usage: TokenUsage::default(),
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 model: None,
             },
             // Second response shouldn't be needed
@@ -6810,6 +7943,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
         let mut config = make_spawn_config();
@@ -6918,6 +8052,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -6956,6 +8091,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -7109,6 +8245,7 @@ model = "claude-sonnet-4-20250514"
                 }],
                 usage: TokenUsage::default(),
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 model: None,
             },
         ]));
@@ -7179,6 +8316,7 @@ model = "claude-sonnet-4-20250514"
                     }),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 5,
@@ -7192,6 +8330,7 @@ model = "claude-sonnet-4-20250514"
                     text: "Work done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 400,
                     output_tokens: 100,
@@ -7205,6 +8344,7 @@ model = "claude-sonnet-4-20250514"
                     text: "All done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 2,
                     output_tokens: 2,

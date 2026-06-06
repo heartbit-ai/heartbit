@@ -208,6 +208,7 @@ mod tests {
                     text: self.response_text.clone(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,

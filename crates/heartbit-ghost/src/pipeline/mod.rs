@@ -954,6 +954,7 @@ mod tests {
                     usage: TokenUsage::default(),
                     stop_reason,
                     model: None,
+                    reasoning: None,
                 })
             }
         }

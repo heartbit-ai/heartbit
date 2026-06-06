@@ -7,6 +7,7 @@ pub(crate) mod blackboard_tools;
 mod builder;
 pub mod cache;
 pub mod context;
+pub mod context_recall;
 pub mod dag;
 pub mod debate;
 mod doom_loop;
@@ -14,10 +15,13 @@ pub mod evaluator;
 pub mod events;
 pub mod flow;
 pub mod goal;
+#[cfg(test)]
+mod goal_live;
 pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;
 pub mod instructions;
+pub mod interrupt;
 pub mod mixture;
 pub mod observability;
 pub mod orchestrator;
@@ -27,16 +31,20 @@ pub mod pruner;
 pub mod routing;
 mod runner;
 pub mod tenant_tracker;
+#[cfg(test)]
+mod tetris_live;
 pub mod token_estimator;
 pub mod tool_filter;
 pub mod voting;
 pub mod workflow;
+pub mod workflow_tool;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
+pub use interrupt::InterruptHandle;
 pub use runner::{AgentOutput, AgentRunner, OnInput};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
@@ -158,6 +166,7 @@ mod tests {
                 text: "Hello!".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -192,6 +201,7 @@ mod tests {
                         text: "response".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 1000,
                         output_tokens: 500,
@@ -230,6 +240,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text { text: "hi".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -257,6 +268,7 @@ mod tests {
                     input: json!({"q": "rust"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
@@ -269,6 +281,7 @@ mod tests {
                     text: "Found it!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
@@ -302,6 +315,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -312,6 +326,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -350,6 +365,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -367,6 +383,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 120,
                     output_tokens: 60,
@@ -405,6 +422,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -413,6 +431,7 @@ mod tests {
                     text: "Sorry about that.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -447,6 +466,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -455,6 +475,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -480,6 +501,7 @@ mod tests {
                 text: "truncated...".into(),
             }],
             stop_reason: StopReason::MaxTokens,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -513,6 +535,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -521,6 +544,7 @@ mod tests {
                     text: "Tool failed, but I recovered.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -542,6 +566,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -670,6 +695,7 @@ mod tests {
                         text: "done".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -720,6 +746,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -741,6 +768,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -776,6 +804,7 @@ mod tests {
                         text: "non-stream".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -794,6 +823,7 @@ mod tests {
                         text: "streamed text".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -834,6 +864,7 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -862,6 +893,7 @@ mod tests {
                     input: json!({"q": "rust"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -870,6 +902,7 @@ mod tests {
                     text: "Found it!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -907,6 +940,7 @@ mod tests {
                     input: json!({"q": "rust"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -916,6 +950,7 @@ mod tests {
                     text: "I understand, I won't execute that.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -958,6 +993,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -966,6 +1002,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1026,6 +1063,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1034,6 +1072,7 @@ mod tests {
                     text: "Tool timed out, moving on.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1063,6 +1102,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1071,6 +1111,7 @@ mod tests {
                     text: "Got results!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1100,6 +1141,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1108,6 +1150,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1136,6 +1179,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1144,6 +1188,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1200,6 +1245,7 @@ mod tests {
                     input: json!({"wrong_field": 42}), // Missing "query"
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1209,6 +1255,7 @@ mod tests {
                     text: "I see the validation error.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1259,6 +1306,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1267,6 +1315,7 @@ mod tests {
                     text: "Got truncated result.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1304,6 +1353,7 @@ mod tests {
                 input: json!({"answer": "42", "confidence": 0.95}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 15,
@@ -1335,6 +1385,7 @@ mod tests {
                 text: "Hello!".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -1367,6 +1418,7 @@ mod tests {
                     input: json!({"q": "data"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1378,6 +1430,7 @@ mod tests {
                     input: json!({"result": "found it"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1446,6 +1499,7 @@ mod tests {
                 },
             ],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -1481,6 +1535,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1491,6 +1546,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1541,6 +1597,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1549,6 +1606,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1640,6 +1698,7 @@ mod tests {
                     text: "Here is the answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1685,6 +1744,7 @@ mod tests {
                         input: json!({"answer": "42"}),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -1767,6 +1827,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1822,6 +1883,7 @@ mod tests {
                     input: json!({"answer": "42"}), // missing required "confidence"
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1833,6 +1895,7 @@ mod tests {
                     input: json!({"answer": "42", "confidence": 0.95}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1872,6 +1935,7 @@ mod tests {
                     input: json!({"count": "not a number"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1883,6 +1947,7 @@ mod tests {
                     input: json!({"count": 42}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -1917,6 +1982,7 @@ mod tests {
                 input: json!({"result": "hello"}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -1960,6 +2026,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -1975,6 +2042,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -1990,6 +2058,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -2003,6 +2072,7 @@ mod tests {
                     text: "Summary of conversation so far.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -2018,6 +2088,7 @@ mod tests {
                     text: "Final answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -2071,6 +2142,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_response_emits_reasoning_event_before_llm_response() {
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "The answer is 42.".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            reasoning: Some("Let me think... 42.".into()),
+            usage: TokenUsage::default(),
+            model: None,
+        }]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("thinker")
+            .system_prompt("sys")
+            .on_event(Arc::new(move |e| {
+                events_clone.lock().unwrap().push(e);
+            }))
+            .build()
+            .unwrap();
+
+        runner.execute("what is the answer?").await.unwrap();
+
+        let events = events.lock().unwrap();
+        let reasoning_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Reasoning { .. }))
+            .expect("a Reasoning event must be emitted");
+        match &events[reasoning_idx] {
+            AgentEvent::Reasoning { agent, text, .. } => {
+                assert_eq!(agent, "thinker");
+                assert_eq!(text, "Let me think... 42.");
+            }
+            other => panic!("expected Reasoning, got: {other:?}"),
+        }
+        // It must come BEFORE the matching LlmResponse for that turn.
+        let llm_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::LlmResponse { .. }))
+            .expect("an LlmResponse event must be emitted");
+        assert!(
+            reasoning_idx < llm_idx,
+            "Reasoning must precede LlmResponse"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_reasoning_response_emits_no_reasoning_event() {
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let events_clone = events.clone();
+        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "plain answer".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        }]));
+        let runner = AgentRunner::builder(provider)
+            .name("plain")
+            .system_prompt("sys")
+            .on_event(Arc::new(move |e| {
+                events_clone.lock().unwrap().push(e);
+            }))
+            .build()
+            .unwrap();
+        runner.execute("hi").await.unwrap();
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Reasoning { .. })),
+            "no Reasoning event when the model returns none"
+        );
+    }
+
+    #[tokio::test]
     async fn on_event_emits_run_started_and_completed() {
         let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
             Arc::new(std::sync::Mutex::new(vec![]));
@@ -2081,6 +2235,7 @@ mod tests {
                 text: "Done.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2168,6 +2323,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2176,6 +2332,7 @@ mod tests {
                     text: "Result.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2245,6 +2402,7 @@ mod tests {
                 input: json!({}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2287,6 +2445,7 @@ mod tests {
                 text: "Done.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2335,6 +2494,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text { text: "ok".into() }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -2384,6 +2544,7 @@ mod tests {
                         text: format!("Response #{count}"),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -2461,6 +2622,7 @@ mod tests {
                         text: format!("Response #{count}"),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })
@@ -2552,6 +2714,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2560,6 +2723,7 @@ mod tests {
                     text: "OK, skipping dangerous tool.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2634,6 +2798,7 @@ mod tests {
                         input: json!({}),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -2642,6 +2807,7 @@ mod tests {
                         text: "Done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -2684,6 +2850,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2692,6 +2859,7 @@ mod tests {
                     text: "Denied.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2731,6 +2899,7 @@ mod tests {
                 text: "should not reach".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2767,6 +2936,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2775,6 +2945,7 @@ mod tests {
                     text: "Used safe, dangerous blocked.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2811,6 +2982,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2819,6 +2991,7 @@ mod tests {
                     text: "Found it.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2846,6 +3019,7 @@ mod tests {
                     text: "Hello! How can I help?".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2854,6 +3028,7 @@ mod tests {
                     text: "Sure, here you go.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -2894,6 +3069,7 @@ mod tests {
                 text: "Response.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -2938,12 +3114,14 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text { text: "OK.".into() }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3002,12 +3180,14 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text { text: "OK.".into() }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3051,6 +3231,7 @@ mod tests {
                 text: "Done.".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -3084,6 +3265,7 @@ mod tests {
                             input: json!({}),
                         }],
                         stop_reason: StopReason::ToolUse,
+                        reasoning: None,
                         usage: TokenUsage {
                             input_tokens: 100,
                             output_tokens: 50,
@@ -3171,6 +3353,7 @@ mod tests {
                             input: json!({}),
                         }],
                         stop_reason: StopReason::ToolUse,
+                        reasoning: None,
                         usage: TokenUsage {
                             input_tokens: 200,
                             output_tokens: 80,
@@ -3254,6 +3437,7 @@ mod tests {
                         input: json!({}),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3263,6 +3447,7 @@ mod tests {
                         text: "Done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3328,6 +3513,7 @@ mod tests {
                         input: json!({}),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3336,6 +3522,7 @@ mod tests {
                         text: "Done.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3396,6 +3583,7 @@ mod tests {
                     text: "Direct answer.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             }]),
@@ -3433,6 +3621,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3442,6 +3631,7 @@ mod tests {
                     text: "Done.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3495,6 +3685,7 @@ mod tests {
                         input: json!({}),
                     }],
                     stop_reason: StopReason::ToolUse,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3504,6 +3695,7 @@ mod tests {
                         text: "Compressed summary of large file.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 50,
                         output_tokens: 10,
@@ -3517,6 +3709,7 @@ mod tests {
                         text: "Here's the result.".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 },
@@ -3556,6 +3749,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3564,6 +3758,7 @@ mod tests {
                     text: "Tool failed.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -3841,6 +4036,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -3853,6 +4049,7 @@ mod tests {
                     text: "Done!".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 3,
@@ -3882,6 +4079,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
@@ -3894,6 +4092,7 @@ mod tests {
                     text: "Error handled".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 3,
@@ -3948,6 +4147,7 @@ mod tests {
         CompletionResponse {
             content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -3965,6 +4165,7 @@ mod tests {
                 input: json!({}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -4330,6 +4531,7 @@ mod tests {
                 input: json!({"key": "same_value"}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -4344,6 +4546,7 @@ mod tests {
                     text: "I'll try something different.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4377,6 +4580,7 @@ mod tests {
                     input: json!({"key": "value_a"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4387,6 +4591,7 @@ mod tests {
                     input: json!({"key": "value_a"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4398,6 +4603,7 @@ mod tests {
                     input: json!({"key": "value_b"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4408,6 +4614,7 @@ mod tests {
                     input: json!({"key": "value_b"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4416,6 +4623,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4448,6 +4656,7 @@ mod tests {
                 input: json!({"key": "same"}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };
@@ -4463,6 +4672,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4557,6 +4767,7 @@ mod tests {
                     input: json!({"path": "src/main.rs"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4565,6 +4776,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4606,6 +4818,7 @@ mod tests {
                     input: json!({"command": "rm -rf /"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4614,6 +4827,7 @@ mod tests {
                     text: "ok i won't do that".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4649,6 +4863,7 @@ mod tests {
                     input: json!({"command": "cargo test"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4657,6 +4872,7 @@ mod tests {
                     text: "tests passed".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4713,6 +4929,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4721,6 +4938,7 @@ mod tests {
                     text: "got it".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4764,6 +4982,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4772,6 +4991,7 @@ mod tests {
                     text: "denied".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4807,6 +5027,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4818,6 +5039,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4827,6 +5049,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4867,6 +5090,7 @@ mod tests {
                     input: json!({"command": "rm -rf /"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4878,6 +5102,7 @@ mod tests {
                     input: json!({"command": "rm -rf /"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4887,6 +5112,7 @@ mod tests {
                     text: "gave up".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4925,6 +5151,7 @@ mod tests {
                     input: json!({"command": "ls"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4936,6 +5163,7 @@ mod tests {
                     input: json!({"command": "rm -rf /"}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4945,6 +5173,7 @@ mod tests {
                     text: "blocked".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -4980,6 +5209,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]);
@@ -5003,6 +5233,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]);
@@ -5080,6 +5311,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 30000,
                     output_tokens: 30000,
@@ -5092,6 +5324,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 30000,
                     output_tokens: 30000,
@@ -5137,6 +5370,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 50,
                 output_tokens: 50,
@@ -5164,6 +5398,7 @@ mod tests {
                 text: "done".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 100,
@@ -5213,6 +5448,7 @@ mod tests {
                 ..Default::default()
             },
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: Some("test-model".into()),
         }]));
 
@@ -5257,6 +5493,7 @@ mod tests {
                     ..Default::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 model: None,
             },
             // Turn 2: final text
@@ -5270,6 +5507,7 @@ mod tests {
                     ..Default::default()
                 },
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 model: None,
             },
         ]));
@@ -5324,6 +5562,7 @@ mod tests {
             content: vec![ContentBlock::Text { text: "OK".into() }],
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             model: None,
         }]));
 
@@ -5393,6 +5632,7 @@ mod tests {
                 text: "answer".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -5447,6 +5687,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5455,6 +5696,7 @@ mod tests {
                     text: "Done with search.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5506,6 +5748,7 @@ mod tests {
                 },
             ],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }]));
@@ -5565,6 +5808,7 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5573,6 +5817,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5608,6 +5853,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5616,6 +5862,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             },
@@ -5652,6 +5899,68 @@ mod tests {
         assert_eq!(
             output.tool_calls_made, 1,
             "exactly one tool call should be recorded (denied)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_indexed_into_the_context_recall_store() {
+        use crate::agent::context_recall::ContextRecallStore;
+        use crate::tool::builtins::{BuiltinToolsConfig, builtin_tools};
+
+        let store = Arc::new(ContextRecallStore::new());
+
+        // Turn 1: call glob with id "tc_x" (glob runs without approval).
+        // Turn 2: return final text.
+        let provider = Arc::new(MockProvider::new(vec![
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tc_x".into(),
+                    name: "glob".into(),
+                    input: json!({"pattern": "*.rs"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            },
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage {
+                    input_tokens: 15,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                model: None,
+            },
+        ]));
+
+        let tools = builtin_tools(BuiltinToolsConfig {
+            context_recall_store: Some(store.clone()),
+            ..Default::default()
+        });
+
+        let runner = AgentRunner::builder(provider)
+            .name("idx")
+            .system_prompt("sys")
+            .tools(tools)
+            .context_recall_store(store.clone())
+            .max_turns(3)
+            .build()
+            .unwrap();
+
+        runner.execute("go").await.unwrap();
+
+        assert!(
+            store.get("tc_x").await.is_some(),
+            "the tool output should be indexed by tool_call_id"
         );
     }
 }

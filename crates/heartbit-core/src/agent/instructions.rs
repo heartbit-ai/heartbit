@@ -1,40 +1,52 @@
-//! Dynamic instruction loading from `.heartbit/INSTRUCTIONS.md` files.
+//! Project-context (agent instruction) loading. Walks up from the working
+//! directory to the git/filesystem root collecting one context file per
+//! directory, then the global config. Supports the cross-tool standards.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Discover `HEARTBIT.md` instruction files by walking up from `working_dir`
-/// to the filesystem root (or git repository root), then checking the global
-/// config directory.
+/// Project-context filenames, in priority order: the cross-tool `AGENTS.md`
+/// standard first, then Claude Code's `CLAUDE.md`, then heartbit's native
+/// `HEARTBIT.md`. Within a directory, the highest-priority present file is used.
+pub const CONTEXT_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", "HEARTBIT.md"];
+
+/// Pick the highest-priority context file present in `dir` (or `None`).
+fn context_file_in(dir: &Path) -> Option<PathBuf> {
+    CONTEXT_FILENAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Discover project-context files ([`CONTEXT_FILENAMES`]) by walking up from
+/// `working_dir` to the filesystem root (or git repository root), then the
+/// global config directory (`~/.config/heartbit/`).
 ///
-/// Returns paths in child-to-parent order (most specific first), then global.
+/// Returns paths in child-to-parent order (most specific first), then global;
+/// at most one file per directory (highest priority).
 pub fn discover_instruction_files(working_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // Walk up from working_dir to root (or git boundary)
+    // Walk up from working_dir to root (or git boundary).
     let mut dir = working_dir.to_path_buf();
     loop {
-        let candidate = dir.join("HEARTBIT.md");
-        if candidate.is_file() {
-            paths.push(candidate);
+        if let Some(found) = context_file_in(&dir) {
+            paths.push(found);
         }
-
-        // Stop at git root (directory containing .git)
+        // Stop at git root (directory containing .git).
         if dir.join(".git").exists() {
             break;
         }
-
         if !dir.pop() {
             break;
         }
     }
 
-    // Global config: ~/.config/heartbit/HEARTBIT.md
-    if let Some(home) = home_dir() {
-        let global = home.join(".config").join("heartbit").join("HEARTBIT.md");
-        if global.is_file() {
-            paths.push(global);
-        }
+    // Global config: ~/.config/heartbit/{AGENTS,CLAUDE,HEARTBIT}.md
+    if let Some(home) = home_dir()
+        && let Some(found) = context_file_in(&home.join(".config").join("heartbit"))
+    {
+        paths.push(found);
     }
 
     paths
@@ -144,6 +156,31 @@ mod tests {
 
         let paths = discover_instruction_files(dir.path());
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn discover_prefers_agents_md_over_claude_and_heartbit() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(dir.path().join("HEARTBIT.md"), "heartbit").unwrap();
+        let paths = discover_instruction_files(dir.path());
+        assert_eq!(paths.len(), 1, "at most one file per directory");
+        assert_eq!(paths[0], dir.path().join("AGENTS.md"));
+    }
+
+    #[test]
+    fn discover_falls_back_to_claude_then_heartbit() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(dir.path().join("HEARTBIT.md"), "heartbit").unwrap();
+        assert_eq!(
+            discover_instruction_files(dir.path()),
+            vec![dir.path().join("CLAUDE.md")],
+            "CLAUDE.md wins when no AGENTS.md"
+        );
     }
 
     #[test]

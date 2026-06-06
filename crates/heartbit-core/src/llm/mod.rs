@@ -25,6 +25,33 @@ pub(crate) const STREAM_MAX_TOOL_ARGS_BYTES: usize = 1 << 20; // 1 MiB
 /// of `u32::MAX` triggering a multi-billion-entry Vec allocation.
 pub(crate) const STREAM_MAX_TOOL_CALLS: usize = 256;
 
+/// SECURITY (F-LLM-5): hard cap on a NON-streaming success body. A hostile or
+/// compromised provider can stream gigabytes to a `200 OK` just as easily as
+/// to an error, OOMing the agent before `serde_json` ever runs. 16 MiB is far
+/// above any real completion JSON (max-tokens × bytes/token) yet bounds the
+/// allocation.
+pub(crate) const SUCCESS_BODY_MAX_BYTES: usize = 16 << 20; // 16 MiB
+
+/// Deserialize a successful response body as JSON, capped at
+/// [`SUCCESS_BODY_MAX_BYTES`]. Use instead of `response.json().await?`, which
+/// buffers the entire (potentially unbounded) body first.
+pub(crate) async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
+    let (bytes, truncated) =
+        crate::http::read_body_capped(response, SUCCESS_BODY_MAX_BYTES).await?;
+    if truncated {
+        return Err(Error::Api {
+            status: 200,
+            message: format!("response body exceeded {SUCCESS_BODY_MAX_BYTES}-byte cap"),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::Api {
+        status: 200,
+        message: format!("failed to parse response JSON: {e}"),
+    })
+}
+
 /// Build an `Error::Api` from a failed HTTP response, sanitizing auth errors.
 ///
 /// For 401/403 responses, the body is NOT read to avoid leaking API key
@@ -94,6 +121,11 @@ use crate::llm::types::{CompletionRequest, CompletionResponse};
 
 /// Callback invoked with each text delta during streaming.
 pub type OnText = dyn Fn(&str) + Send + Sync;
+
+/// Callback invoked with each reasoning (chain-of-thought) delta during
+/// streaming, for reasoning models (qwen3-thinking, deepseek-r1). Separate from
+/// [`OnText`] so a UI can render thinking distinctly from the answer.
+pub type OnReasoning = dyn Fn(&str) + Send + Sync;
 
 /// Decision returned by the `OnApproval` callback.
 ///
@@ -168,6 +200,24 @@ pub trait LlmProvider: Send + Sync {
         self.complete(request)
     }
 
+    /// Stream a completion, additionally calling `on_reasoning` for each
+    /// chain-of-thought delta (reasoning models). The answer still arrives via
+    /// `on_text`; reasoning is a separate channel.
+    ///
+    /// Default: delegates to [`stream_complete`](Self::stream_complete),
+    /// ignoring `on_reasoning` (providers that don't stream reasoning, and the
+    /// non-streaming fallback, are unaffected — `CompletionResponse.reasoning`
+    /// still carries the post-hoc accumulation).
+    fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &OnText,
+        on_reasoning: &OnReasoning,
+    ) -> impl Future<Output = Result<CompletionResponse, Error>> + Send {
+        let _ = on_reasoning;
+        self.stream_complete(request, on_text)
+    }
+
     /// Return the model identifier, if known.
     ///
     /// Used for audit trail events. Default returns `None`.
@@ -203,6 +253,21 @@ pub trait DynLlmProvider: Send + Sync {
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>>;
 
+    /// Boxed-future version of [`LlmProvider::stream_complete_with_reasoning`].
+    ///
+    /// Default delegates to [`stream_complete`](Self::stream_complete), ignoring
+    /// reasoning — so direct `DynLlmProvider` impls (e.g. test mocks) need not
+    /// implement it. The blanket impl overrides this to forward reasoning.
+    fn stream_complete_with_reasoning<'a>(
+        &'a self,
+        request: CompletionRequest,
+        on_text: &'a OnText,
+        on_reasoning: &'a OnReasoning,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
+        let _ = on_reasoning;
+        self.stream_complete(request, on_text)
+    }
+
     /// Return the model identifier, if known.
     fn model_name(&self) -> Option<&str>;
 }
@@ -221,6 +286,20 @@ impl<P: LlmProvider> DynLlmProvider for P {
         on_text: &'a OnText,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
         Box::pin(LlmProvider::stream_complete(self, request, on_text))
+    }
+
+    fn stream_complete_with_reasoning<'a>(
+        &'a self,
+        request: CompletionRequest,
+        on_text: &'a OnText,
+        on_reasoning: &'a OnReasoning,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, Error>> + Send + 'a>> {
+        Box::pin(LlmProvider::stream_complete_with_reasoning(
+            self,
+            request,
+            on_text,
+            on_reasoning,
+        ))
     }
 
     fn model_name(&self) -> Option<&str> {
@@ -280,6 +359,17 @@ impl BoxedProvider {
                 self.0.stream_complete(request, on_text).await
             }
 
+            async fn stream_complete_with_reasoning(
+                &self,
+                request: CompletionRequest,
+                on_text: &OnText,
+                on_reasoning: &OnReasoning,
+            ) -> Result<CompletionResponse, Error> {
+                self.0
+                    .stream_complete_with_reasoning(request, on_text, on_reasoning)
+                    .await
+            }
+
             fn model_name(&self) -> Option<&str> {
                 self.0.model_name()
             }
@@ -302,6 +392,17 @@ impl LlmProvider for BoxedProvider {
         self.0.stream_complete(request, on_text).await
     }
 
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &OnText,
+        on_reasoning: &OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        self.0
+            .stream_complete_with_reasoning(request, on_text, on_reasoning)
+            .await
+    }
+
     fn model_name(&self) -> Option<&str> {
         self.0.model_name()
     }
@@ -322,6 +423,7 @@ mod tests {
                     text: "fake".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })
@@ -347,6 +449,7 @@ mod tests {
                     text: "hello world".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })
@@ -505,6 +608,7 @@ mod tests {
                         text: "counted".into(),
                     }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage::default(),
                     model: None,
                 })

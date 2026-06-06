@@ -984,6 +984,7 @@ mod tests {
                     text: "the answer is 42".to_string(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 1000,
                     output_tokens: 100,

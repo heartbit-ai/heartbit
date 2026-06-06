@@ -356,6 +356,7 @@ mod tests {
         CompletionResponse {
             content: vec![],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         }
@@ -454,6 +455,7 @@ mod tests {
                 text: "Contact john@example.com about it".into(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage::default(),
             model: None,
         };

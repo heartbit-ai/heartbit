@@ -256,24 +256,46 @@ impl Tool for PatchTool {
                     result
                 };
 
-                // Create parent dirs for new files
-                if fp.is_new
-                    && let Some(parent) = path.parent()
-                    && !parent.exists()
-                {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| Error::Agent(format!("Cannot create directories: {e}")))?;
+                // SECURITY (F-FS-1): mirror write.rs. With a policy active,
+                // recompose the canonical target and write it via the
+                // symlink-safe component walk (`write_beneath_root`) so an
+                // intermediate-directory symlink swap (parallel tool-call race)
+                // cannot redirect the write outside the workspace. Without a
+                // policy, keep the prior create-parents + O_NOFOLLOW behaviour.
+                let (target, write_root) = match &self.path_policy {
+                    Some(policy) => match policy.check_path_for_create(path) {
+                        Ok(canonical) => {
+                            let root = policy
+                                .allowed_root_for(&canonical)
+                                .map(std::path::Path::to_path_buf);
+                            (canonical, root)
+                        }
+                        Err(e) => return Ok(ToolOutput::error(format!("path policy: {e}"))),
+                    },
+                    None => (path.clone(), None),
+                };
+                match write_root {
+                    Some(root) => {
+                        super::write_beneath_root(&root, &target, new_content.as_bytes())
+                            .await
+                            .map_err(|e| Error::Agent(format!("Cannot write {}: {e}", fp.path)))?;
+                    }
+                    None => {
+                        if fp.is_new
+                            && let Some(parent) = target.parent()
+                            && !parent.exists()
+                        {
+                            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                                Error::Agent(format!("Cannot create directories: {e}"))
+                            })?;
+                        }
+                        super::write_no_follow(&target, new_content.as_bytes())
+                            .await
+                            .map_err(|e| Error::Agent(format!("Cannot write {}: {e}", fp.path)))?;
+                    }
                 }
 
-                // SECURITY (F-FS-1): use O_NOFOLLOW (Unix) so the open syscall
-                // fails if any component of `path` was swapped to a symlink
-                // between policy check and now (parallel tool call race).
-                super::write_no_follow(path, new_content.as_bytes())
-                    .await
-                    .map_err(|e| Error::Agent(format!("Cannot write {}: {e}", fp.path)))?;
-
-                let _ = self.file_tracker.record_read(path);
+                let _ = self.file_tracker.record_read(&target);
                 files_changed += 1;
             }
 

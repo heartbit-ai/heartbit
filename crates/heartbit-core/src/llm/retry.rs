@@ -216,6 +216,48 @@ impl<P: LlmProvider> LlmProvider for RetryingProvider<P> {
 
         Err(last_err.expect("at least one attempt must have been made"))
     }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &super::OnText,
+        on_reasoning: &super::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        let mut last_err: Option<Error> = None;
+        // As in `stream_complete`: suppress both streams on retries so the user
+        // doesn't see doubled text/reasoning; the final response is complete.
+        fn noop_cb(_: &str) {}
+        let noop: &super::OnText = &noop_cb;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let delay = compute_delay(&self.config, attempt - 1);
+                let delay_ms = delay.as_millis() as u64;
+                let error_class =
+                    classify_for_retry(last_err.as_ref().expect("last_err set before retry"));
+                if let Some(ref cb) = self.on_retry {
+                    cb(attempt, self.config.max_retries, delay_ms, error_class);
+                }
+                tokio::time::sleep(delay).await;
+            }
+
+            let text_cb = if attempt == 0 { on_text } else { noop };
+            let reasoning_cb = if attempt == 0 { on_reasoning } else { noop };
+            match self
+                .inner
+                .stream_complete_with_reasoning(request.clone(), text_cb, reasoning_cb)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) if is_retryable(&e) => {
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.expect("at least one attempt must have been made"))
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +296,7 @@ mod tests {
         CompletionResponse {
             content: vec![crate::llm::types::ContentBlock::Text { text: "ok".into() }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -745,5 +788,48 @@ mod tests {
         }
         let provider = RetryingProvider::with_defaults(NamedProvider);
         assert_eq!(provider.model_name(), Some("my-model"));
+    }
+
+    #[tokio::test]
+    async fn forwards_reasoning_stream_to_inner_provider() {
+        // The TUI path is BoxedProvider → RetryingProvider → OpenRouter; if the
+        // retry wrapper doesn't forward `on_reasoning`, live reasoning is lost.
+        struct ReasoningProvider;
+        impl LlmProvider for ReasoningProvider {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                Ok(success_response())
+            }
+            async fn stream_complete_with_reasoning(
+                &self,
+                _request: CompletionRequest,
+                _on_text: &super::super::OnText,
+                on_reasoning: &super::super::OnReasoning,
+            ) -> Result<CompletionResponse, Error> {
+                on_reasoning("thinking…");
+                let mut r = success_response();
+                r.reasoning = Some("thinking…".into());
+                Ok(r)
+            }
+        }
+
+        let provider = RetryingProvider::with_defaults(ReasoningProvider);
+        let got = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let g = got.clone();
+        let on_text: &super::super::OnText = &|_| {};
+        let on_reasoning: &super::super::OnReasoning =
+            &move |r: &str| g.lock().unwrap().push_str(r);
+        let resp = provider
+            .stream_complete_with_reasoning(test_request(), on_text, on_reasoning)
+            .await
+            .unwrap();
+        assert_eq!(
+            *got.lock().unwrap(),
+            "thinking…",
+            "reasoning must reach the outer callback"
+        );
+        assert_eq!(resp.reasoning.as_deref(), Some("thinking…"));
     }
 }

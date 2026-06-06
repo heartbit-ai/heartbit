@@ -453,6 +453,7 @@ mod tests {
                     text: "partial".into(),
                 }],
                 stop_reason: StopReason::MaxTokens,
+                reasoning: None,
                 usage: TokenUsage::default(),
                 model: None,
             })

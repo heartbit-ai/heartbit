@@ -368,6 +368,26 @@ impl<P: super::LlmProvider> super::LlmProvider for CircuitBreakerProvider<P> {
         }
         result
     }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: super::types::CompletionRequest,
+        on_text: &super::OnText,
+        on_reasoning: &super::OnReasoning,
+    ) -> Result<super::types::CompletionResponse, Error> {
+        let circuit = self.tracker.circuit_for(&self.scope, &self.provider_name);
+        let permit = circuit.permit()?;
+        let result = self
+            .inner
+            .stream_complete_with_reasoning(request, on_text, on_reasoning)
+            .await;
+        match &result {
+            Ok(_) => permit.record_success(),
+            Err(e) if is_circuit_failure(e) => permit.record_failure(),
+            Err(_) => permit.record_success(),
+        }
+        result
+    }
 }
 
 #[cfg(test)]

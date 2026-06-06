@@ -71,6 +71,18 @@ impl CorePathPolicy {
         Ok(composed)
     }
 
+    /// Returns the canonicalized allowed root that `canonical` lives under,
+    /// if any. Used by the symlink-safe writer (`write_beneath_root`) to pick
+    /// the trusted directory it walks down from. `canonical` must already be a
+    /// validated, canonical path (e.g. the value returned by
+    /// [`check_path_for_create`]).
+    pub fn allowed_root_for(&self, canonical: &Path) -> Option<&Path> {
+        self.allowed_dirs
+            .iter()
+            .find(|root| canonical.starts_with(root))
+            .map(|p| p.as_path())
+    }
+
     fn check_canonical(&self, canonical: &Path) -> Result<(), Error> {
         let allowed = self
             .allowed_dirs

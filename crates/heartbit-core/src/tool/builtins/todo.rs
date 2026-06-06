@@ -121,6 +121,48 @@ impl TodoStore {
         let guard = self.todos.read().expect("todo store lock poisoned");
         guard.clone()
     }
+
+    /// Open (actionable) items — `Pending` or `InProgress` — in list order.
+    ///
+    /// Long-horizon planning (recitation): the agent loop reads this each turn
+    /// and re-surfaces the live plan at the context tail so it stays in recent
+    /// attention. Returns an empty Vec for trivial/chat tasks that never wrote
+    /// any todos, so recitation self-gates to zero overhead.
+    pub fn open_items(&self) -> Vec<TodoItem> {
+        self.todos
+            .read()
+            .expect("todo store lock poisoned")
+            .iter()
+            .filter(|t| matches!(t.status, TodoStatus::Pending | TodoStatus::InProgress))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Format open todo items as a compact recitation block to append at the
+/// context tail. Returns `None` when there are no open items (the caller then
+/// appends nothing — trivial tasks pay no cost).
+///
+/// Long-horizon planning: re-surfacing the *actual* plan (not a re-derived
+/// textual summary) every turn counters lost-in-the-middle and means the plan
+/// survives compaction automatically (next turn re-recites from the store).
+pub(crate) fn recite_open_todos(items: &[TodoItem]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut s = String::from("[plan — open items, stay on these until done]\n");
+    for item in items {
+        let mark = if item.status == TodoStatus::InProgress {
+            "[>]"
+        } else {
+            "[ ]"
+        };
+        s.push_str(mark);
+        s.push(' ');
+        s.push_str(&item.content);
+        s.push('\n');
+    }
+    Some(s)
 }
 
 // --- Tools ---
@@ -258,6 +300,55 @@ impl Tool for TodoReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status,
+            priority: TodoPriority::Medium,
+        }
+    }
+
+    #[test]
+    fn open_items_filters_done_and_keeps_order() {
+        let store = TodoStore::new();
+        store
+            .set(vec![
+                item("a", TodoStatus::Pending),
+                item("b", TodoStatus::Completed),
+                item("c", TodoStatus::InProgress),
+                item("d", TodoStatus::Cancelled),
+            ])
+            .unwrap();
+        let open = store.open_items();
+        let contents: Vec<&str> = open.iter().map(|i| i.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["a", "c"],
+            "only Pending/InProgress, in order"
+        );
+    }
+
+    #[test]
+    fn recite_empty_is_none() {
+        assert!(recite_open_todos(&[]).is_none());
+    }
+
+    #[test]
+    fn recite_formats_open_items_with_marks() {
+        let block = recite_open_todos(&[
+            item("write tests", TodoStatus::InProgress),
+            item("ship it", TodoStatus::Pending),
+        ])
+        .expect("non-empty");
+        assert!(
+            block.contains("[>] write tests"),
+            "in-progress marker: {block}"
+        );
+        assert!(block.contains("[ ] ship it"), "pending marker: {block}");
+        // in_progress comes before pending in the input order
+        assert!(block.find("write tests").unwrap() < block.find("ship it").unwrap());
+    }
 
     #[test]
     fn definition_names() {

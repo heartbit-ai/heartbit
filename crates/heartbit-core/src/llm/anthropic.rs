@@ -111,24 +111,15 @@ impl LlmProvider for AnthropicProvider {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            // Sanitize body for auth failures to avoid leaking API key fragments in logs
-            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
-                format!("authentication failed (HTTP {})", status.as_u16())
-            } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
-            };
-            return Err(Error::Api {
-                status: status.as_u16(),
-                message,
-            });
+        if !response.status().is_success() {
+            // SECURITY (F-LLM-5): route through the shared capped/sanitized
+            // helper instead of an unbounded `response.text()` — a hostile
+            // error body could OOM the agent or poison logs.
+            return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: ApiResponse = response.json().await?;
+        // SECURITY (F-LLM-5): cap the success body too.
+        let api_response: ApiResponse = super::read_json_capped(response).await?;
         Ok(into_completion_response(api_response))
     }
 
@@ -636,10 +627,24 @@ struct PartialToolUse {
 
 impl SseResponseState {
     fn flush_current_block(&mut self) {
-        if let Some(text) = self.current_text.take() {
+        // SECURITY (F-LLM-4): bound the number of content blocks (and thus
+        // tool calls) a single streaming response may accumulate. A hostile
+        // upstream could otherwise emit unbounded `content_block_start` events
+        // and grow `self.content` without limit.
+        let at_cap = self.content.len() >= super::STREAM_MAX_TOOL_CALLS;
+        if let Some(text) = self.current_text.take()
+            && !at_cap
+        {
             self.content.push(ContentBlock::Text { text });
         }
         if let Some(tool) = self.current_tool_use.take() {
+            if at_cap {
+                tracing::warn!(
+                    limit = super::STREAM_MAX_TOOL_CALLS,
+                    "anthropic stream content-block count hit cap, dropping extra block"
+                );
+                return;
+            }
             let input = serde_json::from_str(&tool.input_json).unwrap_or_else(|e| {
                 tracing::warn!(
                     tool = %tool.name,
@@ -661,6 +666,7 @@ impl SseResponseState {
         CompletionResponse {
             content: self.content,
             stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
+            reasoning: None,
             usage: self.usage,
             model: None,
         }
@@ -815,6 +821,7 @@ fn into_completion_response(api: ApiResponse) -> CompletionResponse {
     CompletionResponse {
         content,
         stop_reason: parse_stop_reason(&api.stop_reason),
+        reasoning: None,
         usage: TokenUsage {
             input_tokens: api.usage.input_tokens,
             output_tokens: api.usage.output_tokens,

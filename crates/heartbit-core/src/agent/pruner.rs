@@ -105,7 +105,7 @@ pub fn prune_old_tool_results(
                     } => {
                         stats.tool_results_total += 1;
                         let max = config.pruned_tool_result_max_bytes;
-                        let pruned = truncate_with_marker(content, max);
+                        let pruned = truncate_with_marker(content, max, tool_use_id);
                         if pruned.len() < content.len() {
                             stats.tool_results_pruned += 1;
                             stats.bytes_saved += content.len() - pruned.len();
@@ -129,16 +129,18 @@ pub fn prune_old_tool_results(
     (pruned, stats)
 }
 
-/// Truncate content to `max_bytes` with a `[pruned: N bytes]` marker.
+/// Truncate content to `max_bytes` with a `[pruned: N bytes omitted, id=… — call fetch_full_output(…)]` marker.
 ///
 /// If content fits within `max_bytes`, returns it unchanged.
 /// Otherwise, keeps head bytes up to a char boundary and appends marker.
-fn truncate_with_marker(content: &str, max_bytes: usize) -> String {
+fn truncate_with_marker(content: &str, max_bytes: usize, tool_use_id: &str) -> String {
     if content.len() <= max_bytes {
         return content.to_string();
     }
     let omitted = content.len() - max_bytes;
-    let marker = format!("\n[pruned: {omitted} bytes omitted]");
+    let marker = format!(
+        "\n[pruned: {omitted} bytes omitted, id={tool_use_id} — call fetch_full_output(\"{tool_use_id}\") to restore]"
+    );
     let head_budget = max_bytes.saturating_sub(marker.len());
     let boundary = floor_char_boundary(content, head_budget);
     let head = &content[..boundary];
@@ -301,7 +303,9 @@ mod tests {
 
         let config = SessionPruneConfig {
             keep_recent_n: 0,
-            pruned_tool_result_max_bytes: 50,
+            // Large enough that the head budget (max - marker) leaves a real
+            // multi-byte content head to slice at a char boundary.
+            pruned_tool_result_max_bytes: 120,
             preserve_task: true,
         };
         let (pruned, _stats) = prune_old_tool_results(&messages, &config);
@@ -309,6 +313,8 @@ mod tests {
         // Should not panic and content should be valid UTF-8
         if let ContentBlock::ToolResult { content, .. } = &pruned[2].content[0] {
             assert!(content.is_char_boundary(0));
+            // A real emoji head must survive (the char-boundary slice ran).
+            assert!(content.starts_with('🦀'));
             // Verify it's valid UTF-8 by iterating
             for _ in content.chars() {}
         }
@@ -370,18 +376,60 @@ mod tests {
     }
 
     #[test]
+    fn pruned_marker_includes_the_tool_use_id() {
+        let big = "x".repeat(5000);
+        // Build a message list where an old ToolResult (id "tc_abc", content `big`)
+        // is followed by enough recent user/assistant messages to push it out of the
+        // kept tail (keep_recent_n=2 → keeps last 4 messages).
+        let messages = vec![
+            Message::user("task"),
+            tool_use_msg("tc_abc", "fetch"),
+            tool_result_msg("tc_abc", &big), // index 2 — will be outside recent window
+            tool_use_msg("c2", "read"),
+            tool_result_msg("c2", "recent result 1"),
+            Message::assistant("response 1"),
+            Message::user("follow up"),
+            Message::assistant("final answer"),
+        ];
+        let config = SessionPruneConfig {
+            keep_recent_n: 2,
+            pruned_tool_result_max_bytes: 200,
+            preserve_task: true,
+        };
+        let (out, stats) = prune_old_tool_results(&messages, &config);
+        assert!(stats.did_prune());
+        let pruned_text: String = out
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            pruned_text.contains("tc_abc"),
+            "marker must name the ref: {pruned_text}"
+        );
+        assert!(
+            pruned_text.contains("pruned"),
+            "marker should still say pruned: {pruned_text}"
+        );
+    }
+
+    #[test]
     fn truncate_with_marker_short_content() {
-        let result = truncate_with_marker("hello", 100);
+        let result = truncate_with_marker("hello", 100, "tc_x");
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn truncate_with_marker_long_content() {
         let content = "a".repeat(1000);
-        let result = truncate_with_marker(&content, 100);
+        let result = truncate_with_marker(&content, 100, "tc_x");
         assert!(result.len() <= 200); // head + marker
         assert!(result.contains("[pruned:"));
-        assert!(result.contains("bytes omitted]"));
+        assert!(result.contains("bytes omitted"));
+        assert!(result.contains("id=tc_x"));
     }
 
     #[test]

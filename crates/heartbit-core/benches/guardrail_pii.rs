@@ -33,6 +33,7 @@ fn make_response(text: String) -> CompletionResponse {
         stop_reason: StopReason::EndTurn,
         usage: TokenUsage::default(),
         model: None,
+        reasoning: None,
     }
 }
 

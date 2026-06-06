@@ -35,6 +35,7 @@ impl MockProvider {
                 text: text.to_string(),
             }],
             stop_reason: StopReason::EndTurn,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens,
                 output_tokens,

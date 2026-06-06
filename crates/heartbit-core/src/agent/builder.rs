@@ -22,6 +22,12 @@ use super::pruner;
 use super::runner::{AgentRunner, OnInput, RESOURCEFULNESS_GUIDELINES};
 use super::tool_filter;
 
+/// Appended to the system prompt when restore-on-demand is enabled, so the model
+/// knows to act on a pruned marker.
+const CONTEXT_RECALL_HINT: &str = "\n\nNote: old tool outputs may be truncated with a \
+    '[pruned: … id=<ref>]' marker. Call fetch_full_output(<ref>) to restore the exact content, \
+    or recall_context(<query>) to find older outputs by meaning.";
+
 /// Builder for [`AgentRunner`].
 ///
 /// Construct via [`AgentRunner::builder`], configure the agent with chainable
@@ -40,9 +46,12 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) max_tokens: u32,
     pub(super) context_strategy: Option<ContextStrategy>,
     pub(super) summarize_threshold: Option<u32>,
+    pub(super) context_window_tokens: Option<u32>,
+    pub(super) compaction_threshold_fraction: f32,
     pub(super) memory: Option<Arc<dyn Memory>>,
     pub(super) knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
+    pub(super) on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     pub(super) on_approval: Option<Arc<crate::llm::OnApproval>>,
     pub(super) tool_timeout: Option<Duration>,
     pub(super) max_tool_output_bytes: Option<usize>,
@@ -51,6 +60,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) guardrails: Vec<Arc<dyn Guardrail>>,
     pub(super) on_question: Option<Arc<OnQuestion>>,
     pub(super) on_input: Option<Arc<OnInput>>,
+    pub(super) interrupt: Option<super::interrupt::InterruptHandle>,
     pub(super) run_timeout: Option<Duration>,
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
     pub(super) enable_reflection: bool,
@@ -95,6 +105,13 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     /// actual usage against the estimate. Has no effect when `audit_tenant_id`
     /// is unset.
     pub(super) tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Optional per-run context recall store. When set, every tool output is
+    /// indexed by `tool_call_id` so pruned results can be restored on demand.
+    pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Optional shared to-do store for long-horizon-planning recitation.
+    pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// When true, a RED verification blocks natural completion (replan nudge).
+    pub(super) replan_on_verify_fail: bool,
 }
 
 impl<P: LlmProvider> AgentRunnerBuilder<P> {
@@ -153,6 +170,19 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Set the model context window (tokens) to enable the proactive compaction
+    /// backstop (triggers on real prompt tokens crossing the threshold fraction).
+    pub fn context_window_tokens(mut self, tokens: u32) -> Self {
+        self.context_window_tokens = Some(tokens);
+        self
+    }
+
+    /// Fraction of the context window at which to proactively compact (default 0.70).
+    pub fn compaction_threshold_fraction(mut self, fraction: f32) -> Self {
+        self.compaction_threshold_fraction = fraction;
+        self
+    }
+
     /// Attach a memory store to the agent. Memory tools (store, recall, update,
     /// forget, consolidate) are created at `build()` time using the builder's `name`.
     ///
@@ -177,6 +207,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// through the agent loop and abort the run.
     pub fn on_text(mut self, callback: Arc<crate::llm::OnText>) -> Self {
         self.on_text = Some(callback);
+        self
+    }
+
+    /// Set a callback invoked with each reasoning (chain-of-thought) delta during
+    /// streaming, for reasoning models. Separate from [`on_text`](Self::on_text)
+    /// so a UI can render thinking live and distinctly from the answer. Only
+    /// honored on the streaming path (when `on_text` is also set).
+    pub fn on_reasoning(mut self, callback: Arc<crate::llm::OnReasoning>) -> Self {
+        self.on_reasoning = Some(callback);
         self
     }
 
@@ -257,6 +296,14 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// or `None` to end the session.
     pub fn on_input(mut self, callback: Arc<OnInput>) -> Self {
         self.on_input = Some(callback);
+        self
+    }
+
+    /// Attach a re-armable interrupt handle. Triggering it abandons the in-flight
+    /// turn (aborting LLM generation) and returns to awaiting input, preserving the
+    /// session. Only meaningful with `on_input` (the interactive path).
+    pub fn interrupt(mut self, handle: super::interrupt::InterruptHandle) -> Self {
+        self.interrupt = Some(handle);
         self
     }
 
@@ -527,6 +574,34 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Enable restore-on-demand: share a `ContextRecallStore` so tool outputs are
+    /// indexed for `fetch_full_output` / `recall_context`. Pass the SAME store
+    /// into `BuiltinToolsConfig.context_recall_store` so the tools are registered.
+    pub fn context_recall_store(
+        mut self,
+        store: Arc<crate::agent::context_recall::ContextRecallStore>,
+    ) -> Self {
+        self.context_recall_store = Some(store);
+        self
+    }
+
+    /// Set the shared [`TodoStore`](crate::tool::builtins::TodoStore) so the
+    /// runner recites open plan items at the context tail each turn. Pass the
+    /// SAME store that backs the `todowrite`/`todoread` tools.
+    pub fn todo_store(mut self, store: Arc<crate::tool::builtins::TodoStore>) -> Self {
+        self.todo_store = Some(store);
+        self
+    }
+
+    /// When enabled, a RED verification (`VERIFY_RESULT: FAIL` as the latest
+    /// canonical sentinel) blocks natural completion: the runner re-injects a
+    /// corrective nudge and continues (bounded) instead of declaring done on
+    /// red. Long-horizon "replan on out-of-plan" for the no-goal path.
+    pub fn replan_on_verify_fail(mut self, enabled: bool) -> Self {
+        self.replan_on_verify_fail = enabled;
+        self
+    }
+
     /// Validate the builder and produce a ready-to-run [`AgentRunner`].
     ///
     /// Returns [`Error::Config`] for mis-configured runners (empty name, zero `max_turns`,
@@ -693,6 +768,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             Utc::now().format("%A, %B %-d, %Y %H:%M")
         ));
 
+        // When restore-on-demand is enabled, tell the model it can fetch pruned results.
+        if self.context_recall_store.is_some() {
+            system_prompt.push_str(CONTEXT_RECALL_HINT);
+        }
+
         Ok(AgentRunner {
             provider: self.provider,
             name: self.name,
@@ -703,7 +783,10 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             max_tokens: self.max_tokens,
             context_strategy: self.context_strategy.unwrap_or(ContextStrategy::Unlimited),
             summarize_threshold: self.summarize_threshold,
+            context_window_tokens: self.context_window_tokens,
+            compaction_threshold_fraction: self.compaction_threshold_fraction,
             on_text: self.on_text,
+            on_reasoning: self.on_reasoning,
             on_approval: self.on_approval,
             tool_timeout: self.tool_timeout,
             max_tool_output_bytes: self.max_tool_output_bytes,
@@ -711,6 +794,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             on_event: self.on_event,
             guardrails: self.guardrails,
             on_input: self.on_input,
+            interrupt: self.interrupt,
             run_timeout: self.run_timeout,
             reasoning_effort: self.reasoning_effort,
             enable_reflection: self.enable_reflection,
@@ -741,6 +825,9 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             audit_delegation_chain: self.audit_delegation_chain,
             response_cache: self.response_cache_size.map(cache::ResponseCache::new),
             tenant_tracker: self.tenant_tracker,
+            context_recall_store: self.context_recall_store,
+            todo_store: self.todo_store,
+            replan_on_verify_fail: self.replan_on_verify_fail,
             cumulative_actual_tokens: std::sync::atomic::AtomicUsize::new(0),
         })
     }

@@ -405,6 +405,7 @@ mod tests {
                 ..Default::default()
             },
             model: None,
+            reasoning: None,
         };
         let resp: LlmCallResponse = cr.into();
         assert_eq!(resp.text(), "Done");

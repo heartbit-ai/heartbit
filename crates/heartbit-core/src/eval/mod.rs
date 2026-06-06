@@ -1768,6 +1768,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text { text }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: Default::default(),
                     model: None,
                 })
@@ -1808,6 +1809,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text { text: "ok".into() }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: Default::default(),
                     model: None,
                 })

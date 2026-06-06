@@ -829,6 +829,7 @@ mod tests {
                         StopReason::EndTurn
                     },
                     model: None,
+                    reasoning: None,
                 })
             }
         }

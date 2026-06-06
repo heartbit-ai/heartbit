@@ -1896,6 +1896,7 @@ impl<'a> RuntimeBuilder<'a> {
                 audit_user_id: self.audit_user_id.map(String::from),
                 audit_tenant_id: self.audit_tenant_id.map(String::from),
                 audit_delegation_chain: Vec::new(),
+                context: Default::default(),
             });
         }
 

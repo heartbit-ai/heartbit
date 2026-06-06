@@ -483,28 +483,19 @@ pub(super) async fn collect_tools(
             (label, result)
         });
     }
-    while let Some(Ok((label, result))) = join_set.join_next().await {
-        match result {
-            Ok(client) => tools.extend(client.into_tools()),
-            Err(e) => {
-                tracing::warn!(server = %label, error = %e, "failed to connect MCP server");
-            }
-        }
-    }
-
-    // Add builtin tools (filtered to requested names via allowlist)
+    // SECURITY (F-MCP-2): add the TRUSTED builtins FIRST, so the runner's
+    // first-wins dedup makes a hostile MCP server's `bash`/`write` shadow IMPOSSIBLE
+    // (the builtin is registered before any MCP tool of the same name).
     if !builtin_tool_names.is_empty() {
-        let env_policy = if workspace.is_some() {
-            // Use restrictive allowlist in runtime mode to prevent env var leaks
-            heartbit::workspace::EnvPolicy::Allowlist(
-                heartbit::workspace::DAEMON_ENV_ALLOWLIST
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect(),
-            )
-        } else {
-            heartbit::workspace::EnvPolicy::Inherit
-        };
+        // SECURITY (F-FS-2): the daemon NEVER inherits the parent env into the
+        // agent's bash (it would leak ANTHROPIC_API_KEY/AWS_*/GITHUB_TOKEN). Use
+        // the no-secrets allowlist regardless of whether a workspace is set.
+        let env_policy = heartbit::workspace::EnvPolicy::Allowlist(
+            heartbit::workspace::DAEMON_ENV_ALLOWLIST
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        );
         let mut bt_config = BuiltinToolsConfig::default();
         bt_config.dangerous_tools = builtin_tool_names.iter().any(|t| t == "bash");
         bt_config.workspace = workspace.map(|p| p.to_path_buf());
@@ -512,6 +503,16 @@ pub(super) async fn collect_tools(
         bt_config.twitter_credentials = twitter_credentials;
         bt_config.allowlist = Some(builtin_tool_names.to_vec());
         tools.extend(heartbit::builtin_tools(bt_config));
+    }
+
+    // MCP tools are collected AFTER the builtins (see F-MCP-2 above).
+    while let Some(Ok((label, result))) = join_set.join_next().await {
+        match result {
+            Ok(client) => tools.extend(client.into_tools()),
+            Err(e) => {
+                tracing::warn!(server = %label, error = %e, "failed to connect MCP server");
+            }
+        }
     }
 
     tools
@@ -1325,6 +1326,7 @@ mod tests {
                         stop_reason: StopReason::ToolUse,
                         usage: TokenUsage::default(),
                         model: None,
+                        reasoning: None,
                     }
                 } else {
                     CompletionResponse {
@@ -1334,6 +1336,7 @@ mod tests {
                         stop_reason: StopReason::EndTurn,
                         usage: TokenUsage::default(),
                         model: None,
+                        reasoning: None,
                     }
                 };
                 Ok(response)

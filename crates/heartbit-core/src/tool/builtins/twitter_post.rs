@@ -208,13 +208,18 @@ impl TwitterPostTool {
                 status.as_u16()
             )));
         }
-        let body = bytes_resp
-            .bytes()
+        // SECURITY (F-NET-1): cap the media body. The previous `.bytes().await`
+        // buffered the ENTIRE response before checking the 5 MB limit, so a
+        // hostile (or compromised) media_url serving a multi-GB body would OOM
+        // the process. `read_body_capped` streams and stops at the cap. We read
+        // one byte past the limit so an over-size body is detected (truncated).
+        const MEDIA_LIMIT: usize = 5 * 1024 * 1024;
+        let (body, truncated) = crate::http::read_body_capped(bytes_resp, MEDIA_LIMIT + 1)
             .await
             .map_err(|e| Error::Agent(format!("media body read failed: {e}")))?;
-        if body.len() > 5 * 1024 * 1024 {
+        if truncated || body.len() > MEDIA_LIMIT {
             return Err(Error::Agent(format!(
-                "media exceeds 5 MB limit (got {} bytes)",
+                "media exceeds 5 MB limit (read at least {} bytes)",
                 body.len()
             )));
         }

@@ -1,0 +1,14 @@
+[package]
+name = "mini-crm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Mini-CRM example demonstrating heartbit dynamic workflows for CRM operations."
+
+[dependencies]
+heartbit-core = { path = "../crates/heartbit-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

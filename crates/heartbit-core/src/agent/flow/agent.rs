@@ -401,6 +401,7 @@ mod tests {
                     text: "done".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -673,6 +674,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text { text: "ok".into() }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: self.input,
                     output_tokens: self.output,
@@ -760,6 +762,7 @@ mod tests {
                     input: self.payload.clone(),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 5,
@@ -991,6 +994,7 @@ mod tests {
                     ..Default::default()
                 },
                 model: None,
+                reasoning: None,
             })
         }
         fn model_name(&self) -> Option<&str> {
@@ -1102,6 +1106,7 @@ mod tests {
                     text: format!("live-{n}"),
                 }],
                 stop_reason: StopReason::EndTurn,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,

@@ -617,6 +617,7 @@ mod tests {
                     usage: TokenUsage::default(),
                     stop_reason: StopReason::EndTurn,
                     model: None,
+                    reasoning: None,
                 })
             }
         }

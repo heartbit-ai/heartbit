@@ -122,7 +122,8 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: super::openrouter::OpenAiResponse = response.json().await?;
+        let api_response: super::openrouter::OpenAiResponse =
+            super::read_json_capped(response).await?;
         super::openrouter::into_completion_response(api_response)
     }
 
@@ -130,6 +131,28 @@ impl LlmProvider for OpenAiCompatProvider {
         &self,
         request: CompletionRequest,
         on_text: &crate::llm::OnText,
+    ) -> Result<CompletionResponse, Error> {
+        fn noop(_: &str) {}
+        self.stream_inner(request, on_text, &noop).await
+    }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        self.stream_inner(request, on_text, on_reasoning).await
+    }
+}
+
+impl OpenAiCompatProvider {
+    /// Shared streaming body for both text-only and reasoning-aware streaming.
+    async fn stream_inner(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
     ) -> Result<CompletionResponse, Error> {
         let mut body = super::openrouter::build_openai_request(&self.model, &request)?;
         body["stream"] = serde_json::json!(true);
@@ -146,7 +169,12 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        super::openrouter::parse_openai_stream(response.bytes_stream(), on_text).await
+        super::openrouter::parse_openai_stream_with_reasoning(
+            response.bytes_stream(),
+            on_text,
+            on_reasoning,
+        )
+        .await
     }
 }
 

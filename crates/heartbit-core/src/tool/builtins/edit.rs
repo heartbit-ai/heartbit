@@ -61,7 +61,7 @@ impl Tool for EditTool {
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path, or relative to workspace"
+                        "description": super::path_param_description(self.workspace.as_deref())
                     },
                     "old_string": {
                         "type": "string",
@@ -215,6 +215,32 @@ mod tests {
         let tracker = Arc::new(FileTracker::new());
         let tool = EditTool::new(tracker, None, Arc::new(Vec::new()));
         assert_eq!(tool.definition().name, "edit");
+    }
+
+    // Description must match the policy (see write.rs counterpart): with a
+    // workspace set, absolute paths are rejected — say so.
+    #[test]
+    fn path_description_matches_workspace_policy() {
+        let tracker = Arc::new(FileTracker::new());
+        let sandboxed = EditTool::new(
+            tracker.clone(),
+            Some(std::path::PathBuf::from("/ws")),
+            Arc::new(Vec::new()),
+        );
+        let desc = sandboxed.definition().input_schema["properties"]["file_path"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            desc.contains("relative to the workspace") && desc.contains("rejected"),
+            "workspace-set description must warn absolute is rejected: {desc}"
+        );
+        let open = EditTool::new(tracker, None, Arc::new(Vec::new()));
+        let desc = open.definition().input_schema["properties"]["file_path"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(desc.contains("Absolute"), "{desc}");
     }
 
     #[tokio::test]

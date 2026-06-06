@@ -46,6 +46,22 @@ Before claiming you cannot do something or lack access to a tool:\n\
 - Try alternative approaches when the first attempt fails.\n\
 Never say \"I don't have access\" or \"I can't\" without evidence. Investigate first.";
 
+/// System prompt for context compaction. Unlike a generic summary, it pins the
+/// load-bearing state an agent needs to keep working — replacing the old
+/// positional "keep the last N messages" heuristic, which drops the weakest
+/// attention position (the middle) where that state often lives. Kept compact
+/// (bullets, no padding) so the summary itself doesn't reintroduce bloat.
+pub(crate) const COMPACTION_SUMMARY_SYSTEM: &str = "You are compacting an agent's working \
+conversation to free up context WITHOUT losing anything the agent needs to continue. Produce a \
+summary that preserves, explicitly and completely:\n\
+1. GOAL: the original task/objective and any refinements to it.\n\
+2. FILES: every file created, modified, or deleted (exact paths) and what changed in each.\n\
+3. TODOS: all tasks still open or in progress.\n\
+4. UNRESOLVED: errors, test failures, blockers, and open questions not yet resolved.\n\
+5. DECISIONS: key decisions and WHY, including approaches tried and abandoned (and the reason).\n\
+Then a brief narrative of progress so far. Be COMPLETE on items 1-5 — omitting one loses work the \
+agent must redo. Be concise elsewhere: compact bullet points, no preamble, no padding.";
+
 /// One tool execution record. Captures the full input + untruncated output
 /// of a single tool call.
 ///
@@ -71,6 +87,13 @@ pub struct ToolCallRecord {
     pub is_error: bool,
     /// Wall-clock duration of the tool's `execute` call.
     pub duration_ms: u64,
+}
+
+/// Whether `input_tokens` has reached `fraction` of the context `window`.
+/// Returns false for a zero window (unknown → no trigger). `fraction` is
+/// clamped to [0.0, 1.0] defensively.
+fn over_window_fraction(input_tokens: u32, window: u32, fraction: f32) -> bool {
+    window > 0 && input_tokens as f32 >= fraction.clamp(0.0, 1.0) * window as f32
 }
 
 /// Output of a completed agent run.
@@ -141,8 +164,17 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) context_strategy: ContextStrategy,
     /// Token threshold at which to trigger summarization. `None` = no summarization.
     pub(super) summarize_threshold: Option<u32>,
+    /// Model context window (tokens) for the proactive-compaction backstop. When
+    /// `Some`, compaction triggers on real `usage.input_tokens` crossing
+    /// `compaction_threshold_fraction * window`. `None` -> fall back to the
+    /// `summarize_threshold` estimate path.
+    pub(super) context_window_tokens: Option<u32>,
+    /// Fraction of the context window at which the backstop fires (default 0.70).
+    pub(super) compaction_threshold_fraction: f32,
     /// Optional callback for streaming text output.
     pub(super) on_text: Option<Arc<crate::llm::OnText>>,
+    /// Optional callback for streaming reasoning (chain-of-thought) output.
+    pub(super) on_reasoning: Option<Arc<crate::llm::OnReasoning>>,
     /// Optional callback for human-in-the-loop approval before tool execution.
     pub(super) on_approval: Option<Arc<crate::llm::OnApproval>>,
     /// Optional timeout for individual tool executions.
@@ -161,6 +193,10 @@ pub struct AgentRunner<P: LlmProvider> {
     /// text without tool calls, the callback is invoked to get the next user
     /// message instead of returning immediately.
     pub(super) on_input: Option<Arc<OnInput>>,
+    /// Optional re-armable per-turn interrupt. When set and triggered, the
+    /// in-flight LLM generation is aborted and the turn ends cleanly (the session
+    /// continues, awaiting the next `on_input` message).
+    pub(super) interrupt: Option<super::interrupt::InterruptHandle>,
     /// Optional wall-clock deadline for the entire run. When set, the full
     /// `execute` call (all turns) is wrapped in `tokio::time::timeout`.
     pub(super) run_timeout: Option<Duration>,
@@ -207,6 +243,22 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) session_prune_config: Option<pruner::SessionPruneConfig>,
     /// Optional memory store reference for pre-compaction flush.
     pub(super) memory: Option<Arc<dyn Memory>>,
+    /// Optional per-run context recall store. When set, every tool output is
+    /// indexed by `tool_call_id` so pruned results can be restored on demand.
+    pub(super) context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
+    /// Optional shared to-do store. When set, the runner recites the open
+    /// (Pending/InProgress) items at the context tail each turn — the
+    /// long-horizon-planning "recitation" mechanism that keeps the live plan in
+    /// recent attention and lets it survive compaction (re-recited from the
+    /// store, not a lossy summary).
+    pub(super) todo_store: Option<Arc<crate::tool::builtins::TodoStore>>,
+    /// When true, a RED verification (`VERIFY_RESULT: FAIL` as the latest
+    /// canonical sentinel in the transcript) blocks natural completion: the
+    /// runner re-injects a corrective nudge and continues (bounded by
+    /// `MAX_VERIFY_REPLANS`) instead of finishing on red. The long-horizon
+    /// "replan on out-of-plan" signal for the no-goal path (a `GoalCondition`,
+    /// if present, already gates on the same evidence via its judge).
+    pub(super) replan_on_verify_fail: bool,
     /// When true, use recursive (cluster-then-summarize) summarization for
     /// long conversations instead of single-shot.
     pub(super) enable_recursive_summarization: bool,
@@ -275,9 +327,12 @@ impl<P: LlmProvider> AgentRunner<P> {
             max_tokens: 4096,
             context_strategy: None,
             summarize_threshold: None,
+            context_window_tokens: None,
+            compaction_threshold_fraction: 0.70,
             memory: None,
             knowledge_base: None,
             on_text: None,
+            on_reasoning: None,
             on_approval: None,
             tool_timeout: None,
             max_tool_output_bytes: None,
@@ -286,6 +341,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             guardrails: Vec::new(),
             on_question: None,
             on_input: None,
+            interrupt: None,
             run_timeout: None,
             reasoning_effort: None,
             enable_reflection: false,
@@ -314,6 +370,9 @@ impl<P: LlmProvider> AgentRunner<P> {
             audit_delegation_chain: Vec::new(),
             response_cache_size: None,
             tenant_tracker: None,
+            context_recall_store: None,
+            todo_store: None,
+            replan_on_verify_fail: false,
         }
     }
 
@@ -563,6 +622,10 @@ impl<P: LlmProvider> AgentRunner<P> {
             // turn counter on `ctx` is the other bound — a goal continuation goes
             // through the loop top, so it consumes a turn and respects max_turns.
             let mut goal_continuations_used: u32 = 0;
+            // Long-horizon "replan on out-of-plan": bounded count of verify-fail
+            // continuations so a permanently-red verify can't loop forever.
+            let mut verify_replans_used: u32 = 0;
+            const MAX_VERIFY_REPLANS: u32 = 8;
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
@@ -570,6 +633,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Prevents infinite compaction loops: set true after compaction,
             // cleared at the start of each normal iteration.
             let mut compacted_last_turn = false;
+            // Anti-thrash guard for proactive compaction: never fire two turns running.
+            let mut proactive_compacted_last_turn = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -623,6 +688,23 @@ impl<P: LlmProvider> AgentRunner<P> {
                 } else {
                     ctx.to_request()
                 };
+
+                // Long-horizon planning (recitation): re-surface the live plan
+                // (open todos, read from the actual store) at the context tail
+                // each turn. This keeps the plan in recent attention (counters
+                // lost-in-the-middle) and means it survives compaction — the
+                // next turn re-recites from the store, not a lossy summary.
+                // Self-gating: no open todos (trivial/chat tasks) → no block.
+                // Appended to the LAST message (a user/tool-result), NOT the
+                // system prompt or a new message, so prompt-cache prefixes and
+                // role alternation are untouched.
+                if let Some(ref store) = self.todo_store
+                    && let Some(block) =
+                        crate::tool::builtins::recite_open_todos(&store.open_items())
+                    && let Some(last) = request.messages.last_mut()
+                {
+                    last.content.push(ContentBlock::Text { text: block });
+                }
 
                 // Tool profile pre-filter: narrow tool set based on query classification
                 if let Some(profile) = self.tool_profile {
@@ -690,6 +772,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     response_text = tracing::field::Empty,
                     cache_hit = tracing::field::Empty,
                 );
+                // TTFT: captured by the on_text wrapper below; ALSO read at the
+                // LlmResponse event emission (not just the tracing span) — the
+                // event is what the TUI trace and /stats consume. Stays 0 for
+                // cache hits and non-streaming calls.
+                let ttft_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let llm_result = if let Some(cached) = cache_hit {
                     tracing::debug!(
                         agent = %self.name,
@@ -702,9 +789,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                     Ok(cached)
                 } else {
                     // TTFT: wrap on_text to capture time-to-first-token
-                    let ttft_ms_inner = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let ttft_ms_inner = ttft_ms.clone();
                     let ttft_ref = ttft_ms_inner.clone();
-                    let result = async {
+                    let llm_future = async {
                         match &self.on_text {
                             Some(cb) => {
                                 let ttft_ref = ttft_ref.clone();
@@ -722,17 +809,62 @@ impl<P: LlmProvider> AgentRunner<P> {
                                             .ok();
                                         inner_cb(text);
                                     });
-                                self.provider.stream_complete(request, &*wrapper).await
+                                // Reasoning models: stream chain-of-thought live via
+                                // the dedicated channel when a callback is wired.
+                                match &self.on_reasoning {
+                                    Some(rcb) => {
+                                        let rcb = rcb.clone();
+                                        let reasoning_wrapper: Box<crate::llm::OnReasoning> =
+                                            Box::new(move |r: &str| rcb(r));
+                                        self.provider
+                                            .stream_complete_with_reasoning(
+                                                request,
+                                                &*wrapper,
+                                                &*reasoning_wrapper,
+                                            )
+                                            .await
+                                    }
+                                    None => self.provider.stream_complete(request, &*wrapper).await,
+                                }
                             }
                             None => self.provider.complete(request).await,
                         }
                     }
-                    .instrument(llm_span.clone())
-                    .await;
-                    // Store successful non-streaming responses in cache.
-                    // Only cache EndTurn responses — ToolUse responses trigger
-                    // side-effecting tool execution and must not be replayed.
-                    if let (Ok(resp), Some(key)) = (&result, cache_key)
+                    .instrument(llm_span.clone());
+                    // A triggered interrupt aborts the in-flight generation: race the
+                    // LLM call against the per-turn token. On interrupt, synthesize a
+                    // clean end-of-turn (non-empty text — providers reject empty
+                    // assistant content), rearm for the next turn, and let the
+                    // existing no-tool-calls path await the next `on_input` message.
+                    let mut interrupted = false;
+                    let result = match self.interrupt.as_ref() {
+                        Some(handle) => {
+                            let token = handle.token();
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {
+                                    handle.rearm();
+                                    interrupted = true;
+                                    Ok(crate::llm::types::CompletionResponse {
+                                        content: vec![crate::llm::types::ContentBlock::Text {
+                                            text: "[interrupted by user]".into(),
+                                        }],
+                                        stop_reason: crate::llm::types::StopReason::EndTurn,
+                                        reasoning: None,
+                                        usage: TokenUsage::default(),
+                                        model: None,
+                                    })
+                                }
+                                r = llm_future => r,
+                            }
+                        }
+                        None => llm_future.await,
+                    };
+                    // Store successful non-streaming responses in cache (never the
+                    // synthetic interrupt response). Only EndTurn responses are
+                    // cached — ToolUse responses trigger side-effecting execution.
+                    if !interrupted
+                        && let (Ok(resp), Some(key)) = (&result, cache_key)
                         && resp.stop_reason == crate::llm::types::StopReason::EndTurn
                         && let Some(ref c) = self.response_cache
                     {
@@ -857,6 +989,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 };
                 total_usage += response.usage;
+                // Real post-prune input token count for the proactive compaction backstop.
+                let last_input_tokens = response.usage.input_tokens;
 
                 // Reconcile per-tenant in-flight token estimate with actual usage.
                 // Uses cumulative `total_usage` (not per-turn) so the tracker always
@@ -953,6 +1087,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                     return Err((err, total_usage));
                 }
 
+                // Surface the model's chain-of-thought (reasoning models only)
+                // as a distinct event, ahead of the answer.
+                if let Some(reasoning) = &response.reasoning
+                    && !reasoning.is_empty()
+                {
+                    self.emit(AgentEvent::Reasoning {
+                        agent: self.name.clone(),
+                        turn: ctx.current_turn(),
+                        text: truncate_for_event(reasoning, EVENT_MAX_PAYLOAD_BYTES),
+                    });
+                }
+
                 self.emit(AgentEvent::LlmResponse {
                     agent: self.name.clone(),
                     turn: ctx.current_turn(),
@@ -965,7 +1111,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         .model
                         .clone()
                         .or_else(|| self.provider.model_name().map(|s| s.to_string())),
-                    time_to_first_token_ms: 0,
+                    time_to_first_token_ms: ttft_ms.load(std::sync::atomic::Ordering::Relaxed),
                 });
 
                 // Audit: LLM response (untruncated)
@@ -1215,6 +1361,35 @@ impl<P: LlmProvider> AgentRunner<P> {
                         && !next_message.trim().is_empty()
                     {
                         ctx.add_user_message(next_message);
+                        continue;
+                    }
+
+                    // Long-horizon "replan on out-of-plan": a RED verification is
+                    // the canonical out-of-plan signal. Before allowing natural
+                    // completion, if opted in and the latest canonical
+                    // VERIFY_RESULT is FAIL, re-inject a corrective nudge and
+                    // continue (bounded) instead of finishing on red. Deterministic
+                    // — no judge call; a green/absent verify falls through. A
+                    // GoalCondition, if present, gates on the same evidence via its
+                    // judge, so this is the cheap pre-gate for the no-goal path.
+                    if self.replan_on_verify_fail
+                        && verify_replans_used < MAX_VERIFY_REPLANS
+                        && let Some(outcome) =
+                            crate::codegen::parse_latest_verify(&ctx.conversation_text())
+                        && !outcome.passed
+                    {
+                        verify_replans_used += 1;
+                        debug!(
+                            agent = %self.name,
+                            replan = verify_replans_used,
+                            "verification RED; replanning before completion"
+                        );
+                        ctx.add_user_message(
+                            "Verification is RED (VERIFY_RESULT: FAIL) — do NOT finish yet. \
+                             Update your plan/todos, fix the underlying failure, then re-run the \
+                             verify tool until it reports VERIFY_RESULT: PASS before completing."
+                                .to_string(),
+                        );
                         continue;
                     }
 
@@ -1603,23 +1778,65 @@ impl<P: LlmProvider> AgentRunner<P> {
                     turn = ctx.current_turn(),
                     tool_count = allowed_calls.len(),
                 );
-                let (mut results, batch_records) = self
-                    .execute_tools_parallel(&allowed_calls, ctx.current_turn())
-                    .instrument(tool_batch_span)
-                    .await;
+                // A triggered interrupt abandons the in-flight tool batch: race
+                // the batch against the per-turn token. On interrupt, synthesize a
+                // result for EVERY allowed call (so no tool_use is left without a
+                // tool_result — providers reject that), drop the batch future (its
+                // JoinSet drop kills any in-flight subprocess via kill_on_drop), and
+                // leave the token CANCELLED so the next LLM call's own race ends the
+                // turn cleanly → await `on_input` (history preserved).
+                let mut tool_interrupted = false;
+                let (mut results, batch_records) = match self.interrupt.as_ref() {
+                    Some(handle) => {
+                        let token = handle.token();
+                        tracing::info!(
+                            target: "heartbit::interrupt",
+                            checkpoint = "CP4_before_tool_select",
+                            is_cancelled = token.is_cancelled(),
+                            turn = ctx.current_turn(),
+                            tool_count = allowed_calls.len(),
+                            "tool-batch interrupt race armed"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                tracing::info!(
+                                    target: "heartbit::interrupt",
+                                    checkpoint = "CP3_tool_cancel_arm_fired",
+                                    turn = ctx.current_turn(),
+                                    "tool-batch interrupted: synthesizing results, abandoning batch"
+                                );
+                                tool_interrupted = true;
+                                self.synthesize_interrupted_tool_batch(&allowed_calls)
+                            }
+                            r = self
+                                .execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                                .instrument(tool_batch_span) => r,
+                        }
+                    }
+                    None => {
+                        self.execute_tools_parallel(&allowed_calls, ctx.current_turn())
+                            .instrument(tool_batch_span)
+                            .await
+                    }
+                };
                 tool_call_records.extend(batch_records);
                 results.extend(denied_results);
                 results.extend(permission_denied_results);
 
                 // LSP diagnostics: after file-modifying tools, collect diagnostics
                 // and append to the tool result so the LLM sees errors immediately.
-                if let Some(ref lsp) = self.lsp_manager {
+                if !tool_interrupted
+                    && let Some(ref lsp) = self.lsp_manager
+                {
                     self.append_lsp_diagnostics(lsp, &allowed_calls, &mut results)
                         .await;
                 }
 
                 // Compress oversized tool outputs via LLM call
-                if let Some(threshold) = self.tool_output_compression_threshold {
+                if !tool_interrupted
+                    && let Some(threshold) = self.tool_output_compression_threshold
+                {
                     for result in &mut results {
                         if !result.is_error && result.content.len() > threshold {
                             let compressed = self
@@ -1631,11 +1848,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                     *usage_acc.lock().expect("usage lock poisoned") = total_usage;
                 }
 
+                // Error-aware fuzzy doom reset: a batch where every call
+                // succeeded is normal sequential work — only consecutive
+                // ERRORING same-name batches indicate a loop.
+                if !tool_interrupted && self.max_identical_tool_calls.is_some() {
+                    doom_tracker.note_batch_outcome(results.iter().any(|r| r.is_error));
+                }
+
                 ctx.add_tool_results(results);
 
                 // Reflection: inject a user-role prompt that nudges the LLM to assess
                 // tool results before deciding the next action (Reflexion/CRITIC pattern).
-                if self.enable_reflection {
+                if !tool_interrupted && self.enable_reflection {
                     ctx.add_user_message(
                         "Before proceeding, briefly reflect on the tool results above:\n\
                      1. Did you get the information you needed?\n\
@@ -1645,13 +1869,25 @@ impl<P: LlmProvider> AgentRunner<P> {
                     );
                 }
 
-                // Summarization: if threshold is set and context exceeds it, compress.
-                // Guard on message count: inject_summary(keep_last_n=4) is a no-op
-                // when total messages <= 5 (1 first + 4 kept), so skip the LLM call.
-                if let Some(threshold) = self.summarize_threshold
+                // Proactive compaction backstop. Prefer the REAL post-prune token
+                // count vs the window fraction; fall back to the chars/4 estimate
+                // vs summarize_threshold when no window is known. Never compact two
+                // turns running (anti-thrash).
+                let proactive_trigger = match self.context_window_tokens {
+                    Some(window) => over_window_fraction(
+                        last_input_tokens,
+                        window,
+                        self.compaction_threshold_fraction,
+                    ),
+                    None => self
+                        .summarize_threshold
+                        .is_some_and(|t| ctx.needs_compaction(t)),
+                };
+                let do_proactive_compact = !tool_interrupted
                     && ctx.message_count() > 5
-                    && ctx.needs_compaction(threshold)
-                {
+                    && !proactive_compacted_last_turn
+                    && proactive_trigger;
+                if do_proactive_compact {
                     debug!(agent = %self.name, "context exceeds threshold, summarizing");
                     let summarize_span = info_span!(
                         "heartbit.agent.summarize",
@@ -1682,6 +1918,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         });
                     }
                 }
+                proactive_compacted_last_turn = do_proactive_compact;
             }
         }
         .instrument(run_span.clone())
@@ -1729,13 +1966,13 @@ impl<P: LlmProvider> AgentRunner<P> {
     /// Single-shot summarization of a text block.
     async fn summarize_text(&self, text: &str) -> Result<(Option<String>, TokenUsage), Error> {
         let summary_request = CompletionRequest {
-            system: "You are a summarization assistant. Summarize the following conversation \
-                     concisely, preserving key facts, decisions, and tool results. \
-                     Focus on information that would be needed to continue the conversation."
-                .into(),
+            system: COMPACTION_SUMMARY_SYSTEM.into(),
             messages: vec![Message::user(text.to_string())],
             tools: vec![],
-            max_tokens: 1024,
+            // Headroom for the structured schema (goal/files/todos/errors/decisions
+            // + narrative). A summary that hits MaxTokens is dropped (returns None
+            // below), silently skipping compaction — so don't starve it.
+            max_tokens: 2048,
             tool_choice: None,
             reasoning_effort: None,
         };
@@ -2111,6 +2348,42 @@ impl<P: LlmProvider> AgentRunner<P> {
         }
     }
 
+    /// Synthesize results for a tool batch abandoned by a user interrupt.
+    ///
+    /// Emits a `ToolCallCompleted` (so a TUI's in-flight ⏳ cell finalizes) and
+    /// records an error `ToolResult`/`ToolCallRecord` for EVERY call — leaving no
+    /// `tool_use` without a matching `tool_result`, which providers reject. The
+    /// real batch future is dropped by the caller, killing any in-flight
+    /// subprocess via `kill_on_drop`.
+    fn synthesize_interrupted_tool_batch(
+        &self,
+        calls: &[ToolCall],
+    ) -> (Vec<ToolResult>, Vec<ToolCallRecord>) {
+        const MSG: &str = "Interrupted by user before completion.";
+        let mut results = Vec::with_capacity(calls.len());
+        let mut records = Vec::with_capacity(calls.len());
+        for call in calls {
+            self.emit(AgentEvent::ToolCallCompleted {
+                agent: self.name.clone(),
+                tool_name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                is_error: true,
+                duration_ms: 0,
+                output: MSG.to_string(),
+            });
+            results.push(ToolResult::error(call.id.clone(), MSG.to_string()));
+            records.push(ToolCallRecord {
+                tool_name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                input: call.input.clone(),
+                output: MSG.to_string(),
+                is_error: true,
+                duration_ms: 0,
+            });
+        }
+        (results, records)
+    }
+
     /// Execute tools in parallel via JoinSet, returning results in original call order.
     ///
     /// Panicked tasks produce an error `ToolResult` so the LLM always gets a
@@ -2309,6 +2582,14 @@ impl<P: LlmProvider> AgentRunner<P> {
             })
             .await;
 
+            // Index every tool output into the context recall store so pruned
+            // results can be restored on demand via `fetch_full_output`.
+            if let Some(store) = &self.context_recall_store {
+                store
+                    .index(&call_ids[idx], &call_names[idx], &output.content)
+                    .await;
+            }
+
             // Capture FULL post-guardrail content for AgentOutput.tool_call_results.
             // This is the raw output as the caller would expect to see it; the
             // redacted variant below is only what gets fed back to the LLM.
@@ -2387,6 +2668,178 @@ mod tests {
     use super::super::test_helpers::MockProvider;
     use super::AgentRunner;
 
+    // Long-horizon planning (recitation): when a todo_store has open items,
+    // the runner appends a plan block to the tail of the last message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recites_open_todos_at_context_tail() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new());
+        // Populate via the tool so we exercise the real store path.
+        let tools = crate::tool::builtins::todo_tools(store.clone());
+        let write = tools
+            .iter()
+            .find(|t| t.definition().name == "todowrite")
+            .unwrap();
+        write
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"todos": [
+                    {"content": "finish the parser", "status": "in_progress", "priority": "high"},
+                    {"content": "write the docs", "status": "pending", "priority": "medium"}
+                ]}),
+            )
+            .await
+            .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 1, 1,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .todo_store(store)
+            .max_turns(1)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let last_msg = reqs[0].messages.last().expect("at least one message");
+        let tail_text: String = last_msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            tail_text.contains("[plan — open items"),
+            "recitation block missing from tail: {tail_text:?}"
+        );
+        assert!(tail_text.contains("[>] finish the parser"), "{tail_text:?}");
+        assert!(tail_text.contains("[ ] write the docs"), "{tail_text:?}");
+    }
+
+    // No open todos → no recitation block (trivial tasks pay nothing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_recitation_when_no_open_todos() {
+        let store = Arc::new(crate::tool::builtins::TodoStore::new()); // empty
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "done", 1, 1,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .todo_store(store)
+            .max_turns(1)
+            .build()
+            .unwrap();
+        runner.execute("hi").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let has_plan = reqs[0].messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[plan — open items")),
+            )
+        });
+        assert!(
+            !has_plan,
+            "no plan block expected when there are no open todos"
+        );
+    }
+
+    /// A "verify" tool that always reports RED (for the replan gate tests).
+    struct FailingVerifyTool;
+    impl Tool for FailingVerifyTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "verify".into(),
+                description: "Runs verification.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            Box::pin(async {
+                Ok(ToolOutput::success(
+                    "VERIFY_RESULT: FAIL exit_code=1 command=cargo test".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn verify_tool_call() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "v1".into(),
+                name: "verify".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        }
+    }
+
+    // Long-horizon "replan on out-of-plan": with the gate ON, a RED verify
+    // blocks natural completion — the runner re-injects a nudge and continues,
+    // BOUNDED (≤ MAX_VERIFY_REPLANS = 8 replans) so it can't loop forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replan_on_verify_fail_blocks_completion_but_is_bounded() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..12 {
+            responses.push(MockProvider::text_response("done", 1, 1));
+        }
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .replan_on_verify_fail(true)
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "done", "completes after the bound is hit");
+        // 1 verify tool call + 9 completion attempts (8 replans, then fall-through).
+        let n = provider.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            n, 10,
+            "expected 8 bounded replans before completion; got {n} provider calls"
+        );
+    }
+
+    // With the gate OFF (default), a RED verify does NOT block completion: the
+    // agent finishes on the first EndTurn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_replan_when_gate_disabled() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..12 {
+            responses.push(MockProvider::text_response("done", 1, 1));
+        }
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "done");
+        let n = provider.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            n, 2,
+            "without the gate, completes on the first EndTurn (got {n})"
+        );
+    }
+
     /// Trivial no-op tool so the runner can dispatch a tool_use response.
     struct NoopTool;
 
@@ -2418,6 +2871,7 @@ mod tests {
                 input: serde_json::json!({}),
             }],
             stop_reason: StopReason::ToolUse,
+            reasoning: None,
             usage: TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -2459,6 +2913,170 @@ mod tests {
         drop(runner);
         let snap = tracker.snapshot();
         assert_eq!(snap[0].1.in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn interrupt_aborts_turn_then_continues_with_next_input() {
+        use crate::agent::interrupt::InterruptHandle;
+
+        // A single real response — it must only be consumed by the turn AFTER the
+        // interrupted one (proving the interrupted turn never called the provider).
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "real answer",
+            3,
+            2,
+        )]));
+
+        // Pre-trigger: the biased select takes the cancel arm on the first turn.
+        let interrupt = InterruptHandle::new();
+        interrupt.interrupt();
+
+        // on_input yields one follow-up message, then ends the session.
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+
+        let runner = AgentRunner::builder(provider)
+            .name("interruptible")
+            .max_turns(10)
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+
+        let out = runner.execute("hello").await.unwrap();
+
+        // The interrupted first turn produced no real assistant content; the
+        // follow-up turn produced the real answer, and the run ended cleanly.
+        assert_eq!(out.result, "real answer");
+        // Only the real turn's tokens count (the synthetic interrupt added none).
+        assert_eq!(out.tokens_used.input_tokens, 3);
+        assert_eq!(out.tokens_used.output_tokens, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_during_tool_batch_abandons_it_and_ends_turn() {
+        use crate::agent::interrupt::InterruptHandle;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A tool that signals when it starts running, sleeps, then records that
+        // it ran to completion. If the batch is interrupted, `finished` stays false.
+        struct SlowTool {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            finished: Arc<AtomicBool>,
+        }
+        impl Tool for SlowTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "slow".into(),
+                    description: "Sleeps for a while.".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                let started = self.started.clone();
+                let finished = self.finished.clone();
+                Box::pin(async move {
+                    let _ = started.send(());
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    finished.store(true, Ordering::SeqCst);
+                    Ok(ToolOutput::success("slept".to_string()))
+                })
+            }
+        }
+
+        let (start_tx, mut start_rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // turn 1: ask for the slow tool.
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-slow".into(),
+                    name: "slow".into(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // turn 2 (after the follow-up message): the real answer.
+            MockProvider::text_response("real answer", 3, 2),
+        ]));
+
+        let interrupt = InterruptHandle::new();
+        // Cancel the instant the slow tool starts — i.e. mid-batch.
+        let canceller = {
+            let interrupt = interrupt.clone();
+            tokio::spawn(async move {
+                start_rx.recv().await;
+                interrupt.interrupt();
+            })
+        };
+
+        // on_input yields one follow-up message, then ends the session.
+        let inputs = Arc::new(std::sync::Mutex::new(vec![
+            Some("follow up".to_string()),
+            None,
+        ]));
+        let on_input: Arc<crate::agent::OnInput> = {
+            let inputs = inputs.clone();
+            Arc::new(move || {
+                let inputs = inputs.clone();
+                Box::pin(async move {
+                    let mut g = inputs.lock().expect("lock");
+                    if g.is_empty() { None } else { g.remove(0) }
+                })
+            })
+        };
+
+        let runner = AgentRunner::builder(provider)
+            .name("interruptible")
+            .max_turns(10)
+            .tool(Arc::new(SlowTool {
+                started: start_tx,
+                finished: finished.clone(),
+            }))
+            .on_input(on_input)
+            .interrupt(interrupt)
+            .build()
+            .unwrap();
+
+        let out = runner.execute("please run slow").await.unwrap();
+        canceller.await.unwrap();
+
+        // The interrupt abandoned the running batch and ended the turn; the
+        // follow-up message was then answered normally (history preserved).
+        assert_eq!(out.result, "real answer");
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the tool batch must be abandoned, not awaited to completion"
+        );
+        // Every interrupted tool_use still gets a (synthetic) result, so the
+        // conversation stays valid (no orphan tool_use).
+        assert!(
+            out.tool_call_results
+                .iter()
+                .any(|r| r.is_error && r.output.contains("Interrupted")),
+            "the interrupted tool must record a synthetic result"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2628,6 +3246,7 @@ mod tests {
                     input: serde_json::json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                reasoning: None,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 20,
@@ -2687,6 +3306,278 @@ mod tests {
         assert!(
             !found_full,
             "FULL_BLOB_DATA_XYZ should NOT be in conversation history sent to LLM"
+        );
+    }
+
+    #[test]
+    fn over_window_fraction_triggers_at_or_above_budget() {
+        assert!(super::over_window_fraction(700, 1000, 0.70));
+        assert!(super::over_window_fraction(800, 1000, 0.70));
+        assert!(!super::over_window_fraction(699, 1000, 0.70));
+        assert!(!super::over_window_fraction(10, 0, 0.70)); // unknown window -> no trigger
+    }
+
+    #[test]
+    fn compaction_summary_prompt_pins_the_preservation_schema() {
+        // Guards the structured schema against accidental gutting. (Content guard;
+        // summary QUALITY is verified live, not by a unit test.)
+        let p = super::COMPACTION_SUMMARY_SYSTEM;
+        for marker in ["GOAL", "FILES", "TODOS", "UNRESOLVED", "DECISIONS"] {
+            assert!(p.contains(marker), "compaction prompt must pin {marker}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_sends_the_structured_summary_prompt() {
+        // Trigger one proactive compaction and confirm the summary request carried
+        // the structured preservation prompt. Both compaction paths (single-shot +
+        // recursive) route through `summarize_text`, so this covers both. Proves
+        // PLUMBING (the prompt is sent), not summary quality.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),
+            tool_use_with_tokens(800),
+            tool_use_with_tokens(800), // fires compaction
+            MockProvider::text_response("summary text", 1, 1), // the summary call
+            MockProvider::text_response("done", 800, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let _ = runner.execute("do things").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().expect("lock");
+        assert!(
+            reqs.iter()
+                .any(|r| r.system.contains("GOAL") && r.system.contains("DECISIONS")),
+            "the summary call must use the structured preservation prompt"
+        );
+    }
+
+    /// Helper to build a tool-use response where the LLM reports `input_tokens`.
+    fn tool_use_with_tokens(input_tokens: u32) -> crate::llm::types::CompletionResponse {
+        crate::llm::types::CompletionResponse {
+            content: vec![crate::llm::types::ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "noop".into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_fires_when_real_tokens_cross_window_fraction() {
+        // window=1000, fraction=0.70 → budget=700. Three tool-use turns drive
+        // message_count to 7 (>5) while reporting 800 input tokens (>= 700).
+        // Proactive compaction fires on turn 3, consuming the summary response.
+        // Turn 4 is a terminal text response.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),                         // turn 1 main LLM
+            tool_use_with_tokens(800),                         // turn 2 main LLM
+            tool_use_with_tokens(800),                         // turn 3 main LLM — fires compaction
+            MockProvider::text_response("summary text", 1, 1), // summary call
+            MockProvider::text_response("done", 800, 1),       // turn 4 main LLM
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 1,
+            "expected exactly 1 ContextSummarized event, got {summarized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_does_not_fire_below_fraction() {
+        // Same shape but input_tokens=600 (< 700 budget) → ZERO ContextSummarized.
+        // Three tool-use turns still needed so message_count crosses 5.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(600),                   // turn 1
+            tool_use_with_tokens(600),                   // turn 2
+            tool_use_with_tokens(600),                   // turn 3 — 600 < 700, no compact
+            MockProvider::text_response("done", 600, 1), // turn 4 terminal
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 0,
+            "expected 0 ContextSummarized events below fraction, got {summarized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_does_not_thrash_two_turns_running() {
+        // Turns 1-3 drive message_count >5. Turn 3 fires compaction (consuming
+        // the summary response). Turn 4 is also a high-token tool-use turn but
+        // is suppressed by the anti-thrash flag. Turn 5 is a terminal text
+        // response. Net result: exactly 1 ContextSummarized.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_with_tokens(800),                         // turn 1 main LLM
+            tool_use_with_tokens(800),                         // turn 2 main LLM
+            tool_use_with_tokens(800),                         // turn 3 main LLM — fires compaction
+            MockProvider::text_response("summary text", 1, 1), // summary call (turn 3)
+            tool_use_with_tokens(800), // turn 4 main LLM — suppressed by anti-thrash
+            MockProvider::text_response("done", 800, 1), // turn 5 terminal
+        ]));
+
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("test")
+            .tool(Arc::new(NoopTool))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+
+        let _output = runner.execute("do things").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 1,
+            "anti-thrash guard must cap at exactly 1 ContextSummarized, got {summarized}"
+        );
+    }
+
+    /// A streaming mock that emits its first token after a measurable delay —
+    /// instant mocks would legitimately record a 0ms TTFT.
+    struct SlowStreamingProvider;
+
+    impl crate::llm::LlmProvider for SlowStreamingProvider {
+        async fn complete(
+            &self,
+            _request: crate::llm::types::CompletionRequest,
+        ) -> Result<CompletionResponse, Error> {
+            Ok(MockProvider::text_response("hi", 1, 1))
+        }
+
+        async fn stream_complete(
+            &self,
+            _request: crate::llm::types::CompletionRequest,
+            on_text: &crate::llm::OnText,
+        ) -> Result<CompletionResponse, Error> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            on_text("hi");
+            Ok(MockProvider::text_response("hi", 1, 1))
+        }
+    }
+
+    // TTFT regression (found by the TUI's own /analyze on a live trace): the
+    // LlmResponse EVENT hardcoded time_to_first_token_ms: 0 even though the
+    // on_text wrapper captured it — the value only ever reached the tracing
+    // span. The event is what the TUI trace and /stats consume.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_response_event_carries_streaming_ttft() {
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(Arc::new(SlowStreamingProvider))
+            .name("t")
+            .system_prompt("s")
+            .max_turns(1)
+            .on_text(Arc::new(|_| {}))
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let evs = events.lock().expect("lock");
+        let ttft = evs
+            .iter()
+            .find_map(|e| match e {
+                crate::agent::events::AgentEvent::LlmResponse {
+                    time_to_first_token_ms,
+                    ..
+                } => Some(*time_to_first_token_ms),
+                _ => None,
+            })
+            .expect("LlmResponse event emitted");
+        assert!(
+            ttft >= 10,
+            "streaming TTFT must reach the LlmResponse event, got {ttft}ms"
         );
     }
 }

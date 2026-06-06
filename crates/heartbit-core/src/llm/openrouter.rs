@@ -42,6 +42,7 @@ pub struct OpenRouterProvider {
     client: Client,
     api_key: String,
     model: String,
+    prompt_caching: bool,
 }
 
 impl OpenRouterProvider {
@@ -52,7 +53,18 @@ impl OpenRouterProvider {
                 .expect("failed to build hardened HTTPS client for OpenRouterProvider"),
             api_key: api_key.into(),
             model: model.into(),
+            prompt_caching: false,
         }
+    }
+
+    /// Enable prompt-caching breakpoints (`cache_control: ephemeral` on the
+    /// system message + the second-to-last user message). Providers that
+    /// support explicit caching via OpenRouter (Anthropic, Alibaba/Qwen,
+    /// Gemini) honour them; OpenRouter strips them elsewhere. Cache reads
+    /// come back via `prompt_tokens_details.cached_tokens` → [`TokenUsage`].
+    pub fn with_prompt_caching(mut self) -> Self {
+        self.prompt_caching = true;
+        self
     }
 }
 
@@ -62,7 +74,10 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
-        let body = build_openai_request(&self.model, &request)?;
+        let mut body = build_openai_request(&self.model, &request)?;
+        if self.prompt_caching {
+            apply_cache_control(&mut body);
+        }
 
         let response = self
             .client
@@ -77,7 +92,7 @@ impl LlmProvider for OpenRouterProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        let api_response: OpenAiResponse = response.json().await?;
+        let api_response: OpenAiResponse = super::read_json_capped(response).await?;
         into_completion_response(api_response)
     }
 
@@ -86,7 +101,33 @@ impl LlmProvider for OpenRouterProvider {
         request: CompletionRequest,
         on_text: &crate::llm::OnText,
     ) -> Result<CompletionResponse, Error> {
+        fn noop(_: &str) {}
+        self.stream_inner(request, on_text, &noop).await
+    }
+
+    async fn stream_complete_with_reasoning(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
+        self.stream_inner(request, on_text, on_reasoning).await
+    }
+}
+
+impl OpenRouterProvider {
+    /// Shared streaming body: build the request, POST it, and parse the SSE,
+    /// routing text deltas to `on_text` and reasoning deltas to `on_reasoning`.
+    async fn stream_inner(
+        &self,
+        request: CompletionRequest,
+        on_text: &crate::llm::OnText,
+        on_reasoning: &crate::llm::OnReasoning,
+    ) -> Result<CompletionResponse, Error> {
         let mut body = build_openai_request(&self.model, &request)?;
+        if self.prompt_caching {
+            apply_cache_control(&mut body);
+        }
         body["stream"] = serde_json::json!(true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
@@ -103,7 +144,60 @@ impl LlmProvider for OpenRouterProvider {
             return Err(super::api_error_from_response(response).await);
         }
 
-        parse_openai_stream(response.bytes_stream(), on_text).await
+        parse_openai_stream_with_reasoning(response.bytes_stream(), on_text, on_reasoning).await
+    }
+}
+
+// --- Prompt caching: cache_control breakpoints (OpenRouter post-pass) ---
+
+/// Convert a message's string `content` into the content-part array form and
+/// mark its last text part with `cache_control: {"type": "ephemeral"}`.
+/// Array-form content (media messages) gets the marker on its last text part.
+fn mark_cacheable(msg: &mut serde_json::Value) {
+    match &mut msg["content"] {
+        serde_json::Value::String(s) => {
+            let text = std::mem::take(s);
+            msg["content"] = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+        serde_json::Value::Array(parts) => {
+            if let Some(last_text) = parts.iter_mut().rev().find(|p| p["type"] == "text") {
+                last_text["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Insert OpenRouter prompt-caching breakpoints into a built request body:
+/// the SYSTEM message (the big stable prefix — tool defs + instructions) and
+/// the SECOND-TO-LAST user message (the conversation prefix, stable across
+/// the next call). Providers that support explicit caching (Anthropic,
+/// Alibaba/Qwen, Gemini) honour the markers; OpenRouter strips them for the
+/// rest. Mirrors the AnthropicProvider breakpoint strategy.
+pub(crate) fn apply_cache_control(body: &mut serde_json::Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    let mut user_idx: Vec<usize> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        match m["role"].as_str() {
+            Some("system") => {} // handled below (index 0 by construction)
+            Some("user") => user_idx.push(i),
+            _ => {}
+        }
+    }
+    if let Some(first) = messages.first_mut()
+        && first["role"] == "system"
+    {
+        mark_cacheable(first);
+    }
+    if user_idx.len() >= 2 {
+        let idx = user_idx[user_idx.len() - 2];
+        mark_cacheable(&mut messages[idx]);
     }
 }
 
@@ -335,6 +429,9 @@ struct OpenAiChoice {
 struct OpenAiMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Chain-of-thought (non-streaming) from reasoning models.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCall>>,
 }
@@ -361,6 +458,36 @@ struct OpenAiUsage {
     cache_read_input_tokens: u32,
     #[serde(default)]
     reasoning_tokens: u32,
+    /// OpenAI-format cache reporting (what OpenRouter actually returns).
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
+}
+
+/// Map an OpenAI-format usage object to [`TokenUsage`], preferring the
+/// OpenAI-style `prompt_tokens_details` (what OpenRouter returns) over the
+/// Anthropic-style flat fields when present.
+fn usage_to_tokens(u: &OpenAiUsage) -> TokenUsage {
+    let (cache_read, cache_write) = match &u.prompt_tokens_details {
+        Some(d) if d.cached_tokens > 0 || d.cache_write_tokens > 0 => {
+            (d.cached_tokens, d.cache_write_tokens)
+        }
+        _ => (u.cache_read_input_tokens, u.cache_creation_input_tokens),
+    };
+    TokenUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        cache_creation_input_tokens: cache_write,
+        cache_read_input_tokens: cache_read,
+        reasoning_tokens: u.reasoning_tokens,
+    }
 }
 
 pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<CompletionResponse, Error> {
@@ -370,6 +497,19 @@ pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<Completion
     })?;
 
     let mut content = Vec::new();
+
+    let reasoning = choice
+        .message
+        .reasoning
+        .filter(|r| !r.is_empty())
+        .map(|mut r| {
+            let boundary = crate::tool::builtins::floor_char_boundary(
+                &r,
+                std::cmp::min(r.len(), super::STREAM_MAX_TEXT_BYTES),
+            );
+            r.truncate(boundary);
+            r
+        });
 
     // Text content
     if let Some(text) = choice.message.content
@@ -421,19 +561,16 @@ pub(crate) fn into_completion_response(api: OpenAiResponse) -> Result<Completion
         None => StopReason::EndTurn,
     };
 
-    let usage = api.usage.map_or(TokenUsage::default(), |u| TokenUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        reasoning_tokens: u.reasoning_tokens,
-    });
+    let usage = api
+        .usage
+        .map_or(TokenUsage::default(), |u| usage_to_tokens(&u));
 
     Ok(CompletionResponse {
         content,
         stop_reason,
         usage,
         model: None,
+        reasoning,
     })
 }
 
@@ -459,6 +596,10 @@ struct StreamingChoice {
 struct StreamingDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Chain-of-thought from reasoning models (qwen3-thinking, deepseek-r1),
+    /// streamed separately from `content`.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamingToolCallDelta>>,
 }
@@ -493,6 +634,10 @@ struct AccumulatedToolCall {
 /// Reuses the `SseParser` from the Anthropic module for SSE framing.
 /// The JSON payload format differs: OpenAI uses `choices[].delta` with
 /// incremental content and tool call fragments.
+/// Parse an OpenAI-format SSE stream (text deltas only). Thin wrapper over
+/// [`parse_openai_stream_with_reasoning`] with a no-op reasoning sink — keeps the
+/// streaming tests terse (production paths use the reasoning-aware variant).
+#[cfg(test)]
 pub(crate) async fn parse_openai_stream<S>(
     stream: S,
     on_text: &super::OnText,
@@ -500,9 +645,24 @@ pub(crate) async fn parse_openai_stream<S>(
 where
     S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
+    fn noop(_: &str) {}
+    parse_openai_stream_with_reasoning(stream, on_text, &noop).await
+}
+
+/// Parse an OpenAI-format SSE stream, routing text deltas to `on_text` and
+/// reasoning (chain-of-thought) deltas to `on_reasoning` as they arrive.
+pub(crate) async fn parse_openai_stream_with_reasoning<S>(
+    stream: S,
+    on_text: &super::OnText,
+    on_reasoning: &super::OnReasoning,
+) -> Result<CompletionResponse, Error>
+where
+    S: futures::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
     let mut parser = SseParser::new();
     let mut utf8_buf: Vec<u8> = Vec::new();
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut usage = TokenUsage::default();
@@ -525,7 +685,9 @@ where
                 process_openai_event(
                     &event.data,
                     on_text,
+                    on_reasoning,
                     &mut text,
+                    &mut reasoning,
                     &mut tool_calls,
                     &mut finish_reason,
                     &mut usage,
@@ -543,7 +705,9 @@ where
             process_openai_event(
                 &event.data,
                 on_text,
+                on_reasoning,
                 &mut text,
+                &mut reasoning,
                 &mut tool_calls,
                 &mut finish_reason,
                 &mut usage,
@@ -555,7 +719,9 @@ where
         process_openai_event(
             &event.data,
             on_text,
+            on_reasoning,
             &mut text,
+            &mut reasoning,
             &mut tool_calls,
             &mut finish_reason,
             &mut usage,
@@ -620,13 +786,17 @@ where
         stop_reason,
         usage,
         model: None,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_openai_event(
     data: &str,
     on_text: &super::OnText,
+    on_reasoning: &super::OnReasoning,
     text: &mut String,
+    reasoning: &mut String,
     tool_calls: &mut Vec<AccumulatedToolCall>,
     finish_reason: &mut Option<String>,
     usage: &mut TokenUsage,
@@ -662,6 +832,20 @@ fn process_openai_event(
                     "OpenAI-format streaming text exceeded cap; truncated"
                 );
             }
+        }
+
+        // Reasoning (chain-of-thought) accumulates separately from the answer,
+        // under the same per-response cap as content (F-LLM-4: unbounded growth),
+        // and streams live via `on_reasoning`.
+        if let Some(ref r) = choice.delta.reasoning
+            && reasoning.len() < super::STREAM_MAX_TEXT_BYTES
+        {
+            let remaining = super::STREAM_MAX_TEXT_BYTES - reasoning.len();
+            let take = std::cmp::min(remaining, r.len());
+            let boundary = crate::tool::builtins::floor_char_boundary(r, take);
+            let safe = &r[..boundary];
+            reasoning.push_str(safe);
+            on_reasoning(safe);
         }
 
         if let Some(ref tcs) = choice.delta.tool_calls {
@@ -702,13 +886,7 @@ fn process_openai_event(
     }
 
     if let Some(ref u) = chunk.usage {
-        *usage = TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cache_creation_input_tokens: u.cache_creation_input_tokens,
-            cache_read_input_tokens: u.cache_read_input_tokens,
-            reasoning_tokens: u.reasoning_tokens,
-        };
+        *usage = usage_to_tokens(u);
     }
 }
 
@@ -717,6 +895,79 @@ mod tests {
     use super::*;
     use crate::llm::types::Message;
     use serde_json::json;
+
+    // --- Prompt caching (cache_control post-pass) tests ---
+    // OpenRouter routes explicit `cache_control` breakpoints to providers that
+    // support them (Anthropic, Alibaba/Qwen, Gemini) — the TUI's 250K-token
+    // sessions ran at 0% cached without this.
+
+    fn req(system: &str, users: &[&str]) -> CompletionRequest {
+        CompletionRequest {
+            system: system.into(),
+            messages: users.iter().map(|u| Message::user(*u)).collect(),
+            tools: vec![],
+            max_tokens: 64,
+            tool_choice: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn cache_control_marks_system_and_second_to_last_user() {
+        let mut body =
+            build_openai_request("qwen/qwen3-max", &req("SYS", &["one", "two", "three"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // System: string content converted to a cache-controlled text part.
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][0]["text"], "SYS");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        // Second-to-last USER message ("two") carries the rolling breakpoint —
+        // the prefix up to the previous user turn is stable across calls.
+        assert_eq!(msgs[2]["content"][0]["text"], "two");
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // The last user message is NOT marked (it changes every call).
+        assert_eq!(msgs[3]["content"], "three");
+    }
+
+    #[test]
+    fn cache_control_single_user_marks_system_only() {
+        let mut body = build_openai_request("m", &req("SYS", &["only"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[1]["content"], "only");
+    }
+
+    #[test]
+    fn cache_control_without_system_still_marks_user_prefix() {
+        let mut body = build_openai_request("m", &req("", &["a", "b", "c"])).unwrap();
+        apply_cache_control(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["content"][0]["text"], "b");
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn usage_prefers_openai_prompt_tokens_details() {
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 10318,
+            "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 10000, "cache_write_tokens": 200 }
+        }))
+        .unwrap();
+        let t = usage_to_tokens(&u);
+        assert_eq!(t.input_tokens, 10318);
+        assert_eq!(t.cache_read_input_tokens, 10000);
+        assert_eq!(t.cache_creation_input_tokens, 200);
+        // Anthropic-style flat fields still work when details are absent.
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 5, "completion_tokens": 1, "cache_read_input_tokens": 4
+        }))
+        .unwrap();
+        assert_eq!(usage_to_tokens(&u).cache_read_input_tokens, 4);
+    }
 
     // --- Request building tests ---
 
@@ -851,6 +1102,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -875,6 +1127,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Let me search.".into()),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_abc".into(),
@@ -909,6 +1162,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("truncated...".into()),
                     tool_calls: None,
                 },
@@ -942,6 +1196,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: None,
                     tool_calls: Some(vec![
                         OpenAiToolCall {
@@ -979,6 +1234,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: None,
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".into(),
@@ -1332,6 +1588,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -1343,6 +1600,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 25,
+                prompt_tokens_details: None,
             }),
         };
         let response = into_completion_response(api).unwrap();
@@ -1376,6 +1634,7 @@ mod tests {
         let response1 = into_completion_response(OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Searching...".into()),
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".into(),
@@ -1452,6 +1711,55 @@ mod tests {
 
         let texts = received.lock().expect("lock");
         assert_eq!(*texts, vec!["Hello", " world"]);
+    }
+
+    #[tokio::test]
+    async fn stream_accumulates_reasoning_separately_from_content() {
+        // Thinking models (qwen3-*-thinking, deepseek-r1) stream their chain of
+        // thought in `delta.reasoning`, separate from the answer in `delta.content`.
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"reasoning":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"think."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}"#,
+        ]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        // Reasoning is captured but does NOT leak into the answer text.
+        assert_eq!(response.text(), "42");
+        assert_eq!(response.reasoning.as_deref(), Some("Let me think."));
+    }
+
+    #[tokio::test]
+    async fn stream_calls_on_reasoning_with_each_delta_live() {
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"reasoning":"Let me "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"think."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"42"},"finish_reason":"stop"}]}"#,
+        ]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let r_deltas = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rd = r_deltas.clone();
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let on_reasoning: &crate::llm::OnReasoning =
+            &move |r: &str| rd.lock().expect("lock").push(r.to_string());
+        let response = parse_openai_stream_with_reasoning(stream, on_text, on_reasoning)
+            .await
+            .unwrap();
+        // Reasoning streamed live AND is accumulated on the response.
+        assert_eq!(*r_deltas.lock().expect("lock"), vec!["Let me ", "think."]);
+        assert_eq!(response.reasoning.as_deref(), Some("Let me think."));
+        assert_eq!(response.text(), "42");
+    }
+
+    #[tokio::test]
+    async fn stream_without_reasoning_leaves_it_none() {
+        let sse =
+            make_sse_data(&[r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#]);
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &move |_t: &str| {};
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        assert_eq!(response.reasoning, None);
     }
 
     #[tokio::test]
@@ -1545,6 +1853,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -1556,6 +1865,7 @@ mod tests {
                 cache_creation_input_tokens: 80,
                 cache_read_input_tokens: 60,
                 reasoning_tokens: 0,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1571,6 +1881,7 @@ mod tests {
         let api = OpenAiResponse {
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
+                    reasoning: None,
                     content: Some("Hello!".into()),
                     tool_calls: None,
                 },
@@ -1582,6 +1893,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 0,
+                prompt_tokens_details: None,
             }),
         };
 

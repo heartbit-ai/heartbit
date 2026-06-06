@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,37 +140,67 @@ const UNAUTHORIZED: i64 = -32001;
 /// once the limit is reached, keeping memory bounded.
 const MAX_SESSIONS: usize = 256;
 
+/// Idle timeout after which an inactive session is evicted.
+///
+/// SECURITY (F-MCP-3): sessions that have not sent a request within this
+/// window are considered stale and removed from the session map, limiting
+/// the blast radius of session-fixation or session-hijack attacks and
+/// keeping memory bounded independently of the MAX_SESSIONS cap.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60); // 30 minutes
+
 /// MCP server that handles JSON-RPC requests.
 ///
 /// Exposes heartbit tools, resources, and prompts to external MCP clients.
 /// Designed to be mounted on an existing Axum router via `handle_request()`.
 ///
-/// # Security
+/// # Security — Fail-Closed Auth (F-MCP-3)
 ///
-/// **The caller is responsible for authentication.** This server does not
-/// authenticate JSON-RPC requests by default. When the server is reachable
-/// over an untrusted network, the integrator MUST either:
+/// **This server fails closed: without authentication, every JSON-RPC request
+/// returns an `Unauthorized` error by default.** To permit unauthenticated
+/// access (e.g., for single-process local testing), call
+/// [`McpServer::allow_unauthenticated`] explicitly on the builder.
 ///
-/// 1. Mount the server behind an HTTP middleware that rejects unauth'd
-///    requests before they reach `handle_request`, **or**
-/// 2. Wire an [`AuthCallback`] via [`McpServer::with_auth_callback`] which is
-///    consulted on every JSON-RPC call.
+/// For production deployments reachable over a network, the integrator MUST
+/// either:
 ///
-/// Without one of these, any network-reachable client can call `tools/call`
-/// with arbitrary tool names — including potentially destructive builtins
-/// like `bash`, `write`, or `patch` if those have been registered.
+/// 1. Wire an [`AuthCallback`] via [`McpServer::with_auth_callback`] which is
+///    consulted on every JSON-RPC call and passes the HTTP-level credentials
+///    extracted by the enclosing handler, **or**
+/// 2. Mount the server behind an HTTP middleware that rejects unauth'd
+///    requests *before* they reach `handle_request` **and** call
+///    [`McpServer::allow_unauthenticated`] to signal that outer-layer auth
+///    is the only gate.
+///
+/// Without one of these, any network-reachable client is rejected with
+/// UNAUTHORIZED (-32001).
 pub struct McpServer {
     config: McpServerConfig,
     tools: Vec<Arc<dyn Tool>>,
     resources: Vec<ServerResource>,
     resource_reader: Option<ResourceReader>,
-    sessions: parking_lot::RwLock<HashMap<String, ()>>,
+    /// Session map: session ID → last-active `Instant`.
+    ///
+    /// SECURITY (F-MCP-3): bounded by `MAX_SESSIONS`; entries older than
+    /// `SESSION_IDLE_TIMEOUT` are evicted to prevent stale-session accumulation.
+    sessions: parking_lot::RwLock<HashMap<String, Instant>>,
     auth_callback: Option<AuthCallback>,
+    /// SECURITY (F-MCP-3): when `false` (the default) the server rejects any
+    /// request that arrives with no `auth_callback` installed. Operators who
+    /// deliberately want open access (local testing, inner-loop dev) must set
+    /// this flag explicitly via [`McpServer::allow_unauthenticated`].
+    allow_unauthenticated: bool,
 }
 
 impl McpServer {
     /// Create a fresh server with the given config. No tools/resources are registered until
     /// [`McpServer::with_tools`] / [`McpServer::with_resources`] are called.
+    ///
+    /// # Security
+    ///
+    /// By default the server fails **closed**: every request returns
+    /// `Unauthorized` until either an [`AuthCallback`] is installed (via
+    /// [`McpServer::with_auth_callback`]) or unauthenticated access is
+    /// explicitly opted into (via [`McpServer::allow_unauthenticated`]).
     pub fn new(config: McpServerConfig) -> Self {
         Self {
             config,
@@ -180,6 +211,7 @@ impl McpServer {
             // see T2 in `tasks/performance-audit-heartbit-core-2026-05-06.md`.
             sessions: parking_lot::RwLock::new(HashMap::new()),
             auth_callback: None,
+            allow_unauthenticated: false,
         }
     }
 
@@ -211,25 +243,59 @@ impl McpServer {
         self
     }
 
-    /// Create or validate a session ID.
+    /// Opt into permitting requests without authentication.
+    ///
+    /// SECURITY (F-MCP-3): the default is **fail-closed** — any request that
+    /// arrives when no [`AuthCallback`] is installed is rejected with
+    /// `Unauthorized`. Call this method *only* when:
+    ///
+    /// - The process is single-tenant and runs locally (e.g. integration tests,
+    ///   local CLI dev loop), **or**
+    /// - An outer HTTP-middleware layer already enforces authentication and the
+    ///   inner MCP layer should treat all forwarded requests as pre-authorized.
+    ///
+    /// Do **not** call this on a server that is directly reachable over an
+    /// untrusted network without an [`AuthCallback`].
+    pub fn allow_unauthenticated(mut self) -> Self {
+        self.allow_unauthenticated = true;
+        self
+    }
+
+    /// Create or validate a session ID, refreshing the last-active timestamp.
+    ///
+    /// SECURITY (F-MCP-3): evicts sessions idle longer than
+    /// [`SESSION_IDLE_TIMEOUT`] before inserting a new one, so both the
+    /// count cap and the idle-timeout cap apply independently.
     fn ensure_session(&self, session_id: Option<&str>) -> String {
-        if let Some(sid) = session_id
-            && self.sessions.read().contains_key(sid)
-        {
-            return sid.to_string();
+        let now = Instant::now();
+
+        // Fast path: re-use an existing, non-expired session.
+        if let Some(sid) = session_id {
+            let mut sessions = self.sessions.write();
+            if let Some(last_active) = sessions.get_mut(sid) {
+                if now.duration_since(*last_active) < SESSION_IDLE_TIMEOUT {
+                    *last_active = now;
+                    return sid.to_string();
+                }
+                // Session expired — fall through to create a fresh one.
+                sessions.remove(sid);
+            }
         }
+
         let new_sid = Uuid::new_v4().to_string();
         let mut sessions = self.sessions.write();
-        // SECURITY (F-MCP-3): bound the session map. When at capacity,
-        // drop one existing entry before inserting the new one. Best-effort
-        // FIFO via HashMap iteration order; for higher-traffic deployments
-        // an LRU cache would be more appropriate.
+
+        // SECURITY (F-MCP-3): evict all TTL-expired sessions first.
+        sessions.retain(|_, last_active| now.duration_since(*last_active) < SESSION_IDLE_TIMEOUT);
+
+        // Then apply the count cap as a last-resort backstop.
         if sessions.len() >= MAX_SESSIONS
             && let Some(victim) = sessions.keys().next().cloned()
         {
             sessions.remove(&victim);
         }
-        sessions.insert(new_sid.clone(), ());
+
+        sessions.insert(new_sid.clone(), now);
         new_sid
     }
 
@@ -245,6 +311,13 @@ impl McpServer {
     /// Handle a JSON-RPC request with an explicit auth header (e.g. extracted
     /// from the upstream HTTP Authorization header). When an
     /// [`AuthCallback`] is installed, it receives this value.
+    ///
+    /// SECURITY (F-MCP-3): this method fails **closed**. If no
+    /// [`AuthCallback`] is installed and [`McpServer::allow_unauthenticated`]
+    /// was not called, every request is rejected with `Unauthorized` regardless
+    /// of method. Install an auth callback or explicitly opt into open access
+    /// via the builder before wiring this server into a network-accessible
+    /// endpoint.
     pub async fn handle_request_with_auth(
         &self,
         body: &str,
@@ -255,11 +328,16 @@ impl McpServer {
 
         let response = match serde_json::from_str::<JsonRpcRequest>(body) {
             Ok(req) => {
-                // SECURITY (F-MCP-3): authentication gate. Run BEFORE routing
-                // so unauthorized callers cannot probe or exercise tools.
-                if let Some(ref cb) = self.auth_callback
-                    && !cb(&req.method, session_id, auth_header)
-                {
+                // SECURITY (F-MCP-3): authentication gate — fail closed.
+                // Decision matrix:
+                //   auth_callback=Some(cb) → call cb; reject if it returns false
+                //   auth_callback=None + allow_unauthenticated=true  → allow
+                //   auth_callback=None + allow_unauthenticated=false → reject
+                let authorized = match &self.auth_callback {
+                    Some(cb) => cb(&req.method, session_id, auth_header),
+                    None => self.allow_unauthenticated,
+                };
+                if !authorized {
                     let id = req.id.clone().unwrap_or(Value::Null);
                     let err = JsonRpcResponse::error(id, UNAUTHORIZED, "Unauthorized");
                     serde_json::to_string(&err).unwrap_or_default()
@@ -553,6 +631,9 @@ mod tests {
         let fail: Arc<dyn Tool> = Arc::new(FailTool);
 
         McpServer::new(McpServerConfig::default())
+            // Tests run in-process — explicitly opt into unauthenticated access
+            // so the default fail-closed posture does not break the test suite.
+            .allow_unauthenticated()
             .with_tools(vec![echo, fail])
             .with_resources(
                 vec![
@@ -609,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_no_tools_capability_when_empty() {
-        let server = McpServer::new(McpServerConfig::default());
+        let server = McpServer::new(McpServerConfig::default()).allow_unauthenticated();
         let req = json!({
             "jsonrpc": "2.0",
             "method": "initialize",
@@ -664,6 +745,7 @@ mod tests {
             expose_tools: false,
             ..Default::default()
         })
+        .allow_unauthenticated()
         .with_tools(vec![Arc::new(EchoTool)]);
 
         let req = json!({"jsonrpc": "2.0", "method": "tools/list", "id": 1});
@@ -779,6 +861,7 @@ mod tests {
             expose_resources: false,
             ..Default::default()
         })
+        .allow_unauthenticated()
         .with_resources(
             vec![ServerResource {
                 uri: "test://x".into(),
@@ -1037,8 +1120,9 @@ mod tests {
         // Force the cap to fill — we do this by manipulating the lock directly.
         {
             let mut sessions = server.sessions.write();
+            let now = Instant::now();
             for i in 0..MAX_SESSIONS {
-                sessions.insert(format!("sid-{i}"), ());
+                sessions.insert(format!("sid-{i}"), now);
             }
             assert_eq!(sessions.len(), MAX_SESSIONS);
         }
@@ -1049,6 +1133,87 @@ mod tests {
             sessions.len() <= MAX_SESSIONS,
             "session map exceeded MAX_SESSIONS = {MAX_SESSIONS}: {}",
             sessions.len()
+        );
+    }
+
+    /// SECURITY (F-MCP-3): a server with no auth_callback and no
+    /// allow_unauthenticated must return UNAUTHORIZED for any request.
+    #[tokio::test]
+    async fn no_auth_callback_and_no_allow_unauth_returns_unauthorized() {
+        let echo: Arc<dyn Tool> = Arc::new(EchoTool);
+        // Default server: auth_callback=None, allow_unauthenticated=false → fail closed.
+        let server = McpServer::new(McpServerConfig::default()).with_tools(vec![echo]);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 1,
+            "params": {"name": "echo", "arguments": {"text": "should not run"}}
+        });
+        let (resp, _) = server.handle_request(&req.to_string(), None).await;
+        let parsed: Value = serde_json::from_str(&resp).unwrap();
+        assert!(
+            parsed["error"].is_object(),
+            "expected error when no auth installed; got: {parsed}"
+        );
+        assert_eq!(
+            parsed["error"]["code"].as_i64().unwrap_or_default(),
+            UNAUTHORIZED,
+            "expected UNAUTHORIZED code; got: {parsed}"
+        );
+    }
+
+    /// SECURITY (F-MCP-3): allow_unauthenticated() permits requests without
+    /// an auth_callback. This is the opt-in escape hatch for local/test usage.
+    #[tokio::test]
+    async fn allow_unauthenticated_permits_requests() {
+        let echo: Arc<dyn Tool> = Arc::new(EchoTool);
+        let server = McpServer::new(McpServerConfig::default())
+            .allow_unauthenticated()
+            .with_tools(vec![echo]);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 2,
+            "params": {"name": "echo", "arguments": {"text": "allowed"}}
+        });
+        let (resp, _) = server.handle_request(&req.to_string(), None).await;
+        let parsed: Value = serde_json::from_str(&resp).unwrap();
+        assert!(parsed["error"].is_null(), "expected success; got: {parsed}");
+        assert_eq!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default(),
+            "allowed"
+        );
+    }
+
+    /// SECURITY (F-MCP-3): sessions past their idle TTL must be evicted so
+    /// they cannot be reused after expiry (session fixation / long-lived orphan).
+    #[test]
+    fn expired_session_is_evicted() {
+        let server = McpServer::new(McpServerConfig::default());
+        let expired_sid = "old-session-id";
+        // Inject a session whose last-active timestamp is far in the past.
+        {
+            let mut sessions = server.sessions.write();
+            // Simulate a session created SESSION_IDLE_TIMEOUT + 1s ago.
+            let expired_at = Instant::now()
+                .checked_sub(SESSION_IDLE_TIMEOUT + Duration::from_secs(1))
+                .expect("subtraction should not underflow on any sane platform");
+            sessions.insert(expired_sid.to_string(), expired_at);
+        }
+        // ensure_session with the expired id must produce a *new* id.
+        let new_sid = server.ensure_session(Some(expired_sid));
+        assert_ne!(
+            new_sid, expired_sid,
+            "expired session must not be reused; got same sid back"
+        );
+        // The expired entry must no longer be in the map.
+        assert!(
+            !server.sessions.read().contains_key(expired_sid),
+            "expired session must be evicted from the map"
         );
     }
 }

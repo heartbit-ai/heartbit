@@ -2,6 +2,7 @@
 
 mod bash;
 mod edit;
+mod fetch_full_output;
 mod file_tracker;
 mod glob;
 mod grep;
@@ -10,6 +11,7 @@ mod list;
 mod patch;
 mod question;
 mod read;
+mod recall_context;
 mod skill;
 mod todo;
 mod tts;
@@ -87,6 +89,151 @@ pub(crate) async fn write_no_follow(path: &std::path::Path, bytes: &[u8]) -> std
     }
 }
 
+/// Write `bytes` to `target` by walking down from the trusted, canonical
+/// `root` one path component at a time, opening EACH component with
+/// `O_NOFOLLOW`. No component — intermediate directory OR final file — may be
+/// a symlink; the first that is fails the write.
+///
+/// SECURITY (F-FS-1): `write_no_follow` only guards the *trailing* component,
+/// so a parallel tool call (e.g. bash dispatched alongside write via
+/// `tokio::JoinSet`) could swap an *intermediate* directory for a symlink
+/// after the policy check and the write would follow it outside the
+/// workspace. This walk closes that window: each directory is opened
+/// relative to a pinned parent fd (`openat`), so even a swap landing between
+/// two steps cannot redirect us — the previously-opened fd still refers to
+/// the real inode, and a freshly-swapped symlink component is rejected by
+/// `O_NOFOLLOW`. The write becomes self-protecting; no check→write gap
+/// remains. `target` must be a canonical path beneath `root` (the value from
+/// [`crate::sandbox::CorePathPolicy::check_path_for_create`]); its
+/// intermediate directories must already exist (they do, since the parent was
+/// just canonicalized). On non-Unix this falls back to [`write_no_follow`].
+#[cfg(unix)]
+pub(crate) async fn write_beneath_root(
+    root: &std::path::Path,
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let rel = target
+        .strip_prefix(root)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "target is not beneath the root"))?;
+    // Only plain `Normal` components are allowed — no `..`, `.`, root or
+    // prefix components may sneak through.
+    let mut comps: Vec<CString> = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => comps.push(
+                CString::new(p.as_bytes())
+                    .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in path component"))?,
+            ),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "target has a non-normal path component",
+                ));
+            }
+        }
+    }
+    if comps.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "target equals the root (no file component)",
+        ));
+    }
+
+    let root_c = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in root path"))?;
+    let bytes = bytes.to_vec();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        // Open the trusted root directory itself. Its own ancestry is
+        // operator-configured and canonical, so it is trusted; O_NOFOLLOW
+        // still guards the root's final component.
+        let fd = unsafe {
+            libc::open(
+                root_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        let mut parent = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        let last = comps.len() - 1;
+        for (i, comp) in comps.iter().enumerate() {
+            if i == last {
+                // Final component: the file itself. O_NOFOLLOW rejects an
+                // existing symlink here (ELOOP); O_CREAT|O_TRUNC otherwise.
+                let ffd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        comp.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_TRUNC
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        0o644 as libc::c_uint,
+                    )
+                };
+                if ffd < 0 {
+                    return Err(Error::last_os_error());
+                }
+                let mut file = unsafe { std::fs::File::from_raw_fd(ffd) };
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                return Ok(());
+            }
+            // Intermediate component: must be a real directory, never a
+            // symlink. O_NOFOLLOW makes a swapped symlink fail (ELOOP).
+            let dfd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    comp.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if dfd < 0 {
+                return Err(Error::last_os_error());
+            }
+            parent = unsafe { OwnedFd::from_raw_fd(dfd) };
+        }
+        unreachable!("loop returns on the final component");
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("spawn_blocking failed: {e}")))?
+}
+
+/// Non-Unix fallback: no `O_NOFOLLOW`/`openat` walk available; delegate to the
+/// plain writer (the policy parent-canonicalize check still applies).
+#[cfg(not(unix))]
+pub(crate) async fn write_beneath_root(
+    _root: &std::path::Path,
+    target: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    write_no_follow(target, bytes).await
+}
+
+/// Schema description for a `file_path` parameter, accurate to the policy
+/// `resolve_path` actually enforces. The old wording ("Absolute path, or
+/// relative to workspace") actively invited rejected absolute paths — a live
+/// `/analyze` diagnosis caught an agent burning 7 tool errors on exactly that.
+pub(crate) fn path_param_description(workspace: Option<&std::path::Path>) -> &'static str {
+    if workspace.is_some() {
+        "Path relative to the workspace root (absolute paths are rejected — \
+         create scratch files inside the workspace, not /tmp)"
+    } else {
+        "Absolute path, or relative to the current directory"
+    }
+}
+
 /// Resolve a file path with workspace jail enforcement and protected path checks.
 pub(crate) fn resolve_path(
     path: &str,
@@ -151,7 +298,8 @@ pub use image_generate::ImageGenerateTool;
 pub use question::{
     OnQuestion, Question, QuestionOption, QuestionRequest, QuestionResponse, QuestionTool,
 };
-pub use todo::{TodoPriority, TodoStatus, TodoStore};
+pub(crate) use todo::recite_open_todos;
+pub use todo::{TodoPriority, TodoStatus, TodoStore, todo_tools};
 #[cfg(feature = "ghost-domain-config")]
 pub use twitter_post::TwitterCredentials;
 pub use webfetch::WebFetchTool;
@@ -204,6 +352,10 @@ pub struct BuiltinToolsConfig {
     /// Level-1 catalog is built from, so the catalog never advertises a skill the
     /// tool cannot load. Empty (default) = conventional discovery only.
     pub skill_dirs: Vec<PathBuf>,
+    /// When present, registers the `fetch_full_output` / `recall_context` tools
+    /// and is shared with the runner for indexing. `None` = feature off (zero
+    /// overhead: tools not registered, no indexing).
+    pub context_recall_store: Option<Arc<crate::agent::context_recall::ContextRecallStore>>,
 }
 
 /// Sensible default `protected_paths` patterns for filesystem builtins.
@@ -248,7 +400,11 @@ impl Default for BuiltinToolsConfig {
             on_question: None,
             workspace: None,
             dangerous_tools: false,
-            env_policy: crate::workspace::EnvPolicy::Inherit,
+            // SECURITY (F-FS-2): default to the no-secrets allowlist, NOT Inherit —
+            // otherwise a caller using `BuiltinToolsConfig::default()` + dangerous
+            // bash (e.g. the CLI) silently leaks ANTHROPIC_API_KEY/AWS_*/GITHUB_TOKEN
+            // into the agent's shell. Opt into Inherit explicitly if truly needed.
+            env_policy: crate::workspace::EnvPolicy::default(),
             // SECURITY (F-FS-9): default protected paths populated.
             protected_paths: default_protected_paths(),
             #[cfg(all(target_os = "linux", feature = "sandbox"))]
@@ -258,6 +414,7 @@ impl Default for BuiltinToolsConfig {
             allowlist: None,
             path_policy: None,
             skill_dirs: Vec::new(),
+            context_recall_store: None,
         }
     }
 }
@@ -352,6 +509,15 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
         tools.push(Arc::new(twitter_post::TwitterPostTool::new(creds)));
     }
 
+    if let Some(store) = &config.context_recall_store {
+        tools.push(Arc::new(fetch_full_output::FetchFullOutputTool {
+            store: store.clone(),
+        }));
+        tools.push(Arc::new(recall_context::RecallContextTool {
+            store: store.clone(),
+        }));
+    }
+
     if let Some(ref allowed) = config.allowlist {
         let set: std::collections::HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
         tools.retain(|t| set.contains(t.definition().name.as_str()));
@@ -363,6 +529,68 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_writes_into_real_subdir() {
+        let root = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        std::fs::create_dir(root_c.join("sub")).unwrap();
+        write_beneath_root(&root_c, &root_c.join("sub/ok.txt"), b"hi")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root_c.join("sub/ok.txt")).unwrap(), b"hi");
+    }
+
+    // SECURITY (F-FS-1): the heart of the fix. An INTERMEDIATE directory
+    // component swapped for a symlink (the classic TOCTOU that O_NOFOLLOW on
+    // the final component alone does NOT catch) must make the write fail, with
+    // nothing written outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_refuses_symlinked_intermediate_component() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+
+        // Real intermediate dir, then swap it for a symlink pointing outside.
+        std::fs::create_dir(root_c.join("sub")).unwrap();
+        std::fs::remove_dir(root_c.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside_c, root_c.join("sub")).unwrap();
+
+        let result = write_beneath_root(&root_c, &root_c.join("sub/evil.txt"), b"pwn").await;
+        assert!(
+            result.is_err(),
+            "write through a symlinked intermediate component must be refused"
+        );
+        assert!(
+            !outside_c.join("evil.txt").exists(),
+            "write escaped the root into the symlink target"
+        );
+    }
+
+    // A symlink at the FINAL component must also be refused (no overwrite of
+    // whatever it points to).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_beneath_root_refuses_symlinked_final_component() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+        let victim = outside_c.join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        std::os::unix::fs::symlink(&victim, root_c.join("link.txt")).unwrap();
+        let result = write_beneath_root(&root_c, &root_c.join("link.txt"), b"pwn").await;
+        assert!(result.is_err(), "write onto a symlink must be refused");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"original",
+            "symlink target was overwritten"
+        );
+    }
 
     #[test]
     fn floor_char_boundary_ascii() {
@@ -577,5 +805,31 @@ mod tests {
         };
         let tools = builtin_tools(config);
         assert_eq!(tools.len(), 0);
+    }
+
+    #[test]
+    fn context_recall_tools_registered_only_when_store_present() {
+        use std::sync::Arc;
+        // Off: no store -> tools absent.
+        let off = builtin_tools(BuiltinToolsConfig::default());
+        assert!(
+            !off.iter()
+                .any(|t| t.definition().name == "fetch_full_output")
+        );
+        assert!(!off.iter().any(|t| t.definition().name == "recall_context"));
+
+        // On: store present -> both tools registered.
+        let cfg = BuiltinToolsConfig {
+            context_recall_store: Some(Arc::new(
+                crate::agent::context_recall::ContextRecallStore::new(),
+            )),
+            ..Default::default()
+        };
+        let on = builtin_tools(cfg);
+        assert!(
+            on.iter()
+                .any(|t| t.definition().name == "fetch_full_output")
+        );
+        assert!(on.iter().any(|t| t.definition().name == "recall_context"));
     }
 }

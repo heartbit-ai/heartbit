@@ -12,6 +12,7 @@ pub mod agent;
 pub mod auth;
 pub mod browser;
 pub mod channel;
+pub mod codegen;
 pub mod config;
 pub mod error;
 pub mod eval;
@@ -39,6 +40,7 @@ pub use agent::batch::{BatchConfig, BatchExecutor, BatchExecutorBuilder, BatchRe
 pub use agent::blackboard::{Blackboard, InMemoryBlackboard};
 pub use agent::cache::ResponseCache;
 pub use agent::context::ContextStrategy;
+pub use agent::context_recall::{ContextRecallStore, RecallHit};
 pub use agent::dag::{DagAgent, DagAgentBuilder};
 pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
@@ -61,7 +63,9 @@ pub use agent::instructions::{
 };
 pub use agent::mixture::{MixtureOfAgentsAgent, MixtureOfAgentsAgentBuilder};
 pub use agent::observability::ObservabilityMode;
-pub use agent::orchestrator::{Orchestrator, OrchestratorBuilder, SubAgentConfig};
+pub use agent::orchestrator::{
+    Orchestrator, OrchestratorBuilder, SubAgentConfig, SubAgentContextConfig,
+};
 pub use agent::permission::{
     LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
 };
@@ -78,7 +82,15 @@ pub use agent::workflow::{
     LoopAgent, LoopAgentBuilder, ParallelAgent, ParallelAgentBuilder, SequentialAgent,
     SequentialAgentBuilder, WorkflowRouter, WorkflowType,
 };
-pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, OnInput};
+pub use agent::workflow_tool::{
+    RunWorkflowTool, WorkflowRecipe, WorkflowRegistry, default_registry,
+};
+pub use agent::{AgentOutput, AgentRunner, AgentRunnerBuilder, InterruptHandle, OnInput};
+// Deterministic verify→repair: runs a build/test command and reports
+// VERIFY_RESULT: PASS/FAIL — reusable beyond the codegen builder so any agent can
+// self-verify (pair with a GoalCondition for an autonomous repair loop, or the
+// tool + a prompt nudge for interactive self-correction).
+pub use codegen::verify::VerifyCommandTool;
 
 // --- Dynamic-workflow combinator core (P1) ---
 // The free functions (`agent`, `parallel`, `pipeline`, `phase`, `log`, `thunk`)
@@ -118,6 +130,7 @@ pub use knowledge::{Chunk, DocumentSource, KnowledgeBase, KnowledgeQuery, Search
 pub use llm::ApprovalDecision;
 pub use llm::LlmProvider;
 pub use llm::OnApproval;
+pub use llm::OnReasoning;
 pub use llm::OnText;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::cascade::{CascadingProvider, ConfidenceGate, HeuristicGate};
@@ -229,6 +242,7 @@ pub mod __bench {
                 response: CompletionResponse {
                     content: vec![ContentBlock::Text { text: text.into() }],
                     stop_reason: StopReason::EndTurn,
+                    reasoning: None,
                     usage: TokenUsage {
                         input_tokens: 64,
                         output_tokens: 16,
