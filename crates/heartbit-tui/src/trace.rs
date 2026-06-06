@@ -223,6 +223,48 @@ pub fn trace_path(dir: &std::path::Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.trace.jsonl"))
 }
 
+/// Resolve a `/stats` / `/analyze` target to a trace file path.
+/// `None` → the current session; `"last"` → the most recently modified trace
+/// EXCLUDING the current session; anything else → a session id.
+pub fn resolve_trace_target(
+    dir: &std::path::Path,
+    current_id: &str,
+    target: Option<&str>,
+) -> Result<PathBuf, String> {
+    let exists = |p: PathBuf| {
+        if p.is_file() {
+            Ok(p)
+        } else {
+            Err(format!("no trace at {}", p.display()))
+        }
+    };
+    match target {
+        None => exists(trace_path(dir, current_id)),
+        Some("last") => {
+            let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+            let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.ends_with(".trace.jsonl") || name == format!("{current_id}.trace.jsonl") {
+                    continue;
+                }
+                let mtime = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                    newest = Some((mtime, p));
+                }
+            }
+            newest
+                .map(|(_, p)| p)
+                .ok_or_else(|| "no previous session trace found".into())
+        }
+        Some(id) => exists(trace_path(dir, id)),
+    }
+}
+
 /// The target core's interrupt-chain checkpoints (CP3/CP4) and the TUI's
 /// legacy diagnostics log under. The bridge mirrors that target into the
 /// trace as `core_trace` records — the legacy `HEARTBIT_TUI_DEBUG` file is
@@ -683,5 +725,30 @@ mod tests {
             p,
             std::path::PathBuf::from("/tmp/sessions/abc-1.trace.jsonl")
         );
+    }
+
+    #[test]
+    fn resolve_target_current_last_and_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |id: &str| {
+            std::fs::write(trace_path(dir.path(), id), "{}\n").unwrap();
+        };
+        mk("aaa-1");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mk("bbb-2"); // newer
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mk("cur-3"); // the current session
+        // None → current session's own trace
+        let p = resolve_trace_target(dir.path(), "cur-3", None).unwrap();
+        assert!(p.ends_with("cur-3.trace.jsonl"));
+        // "last" → most recent EXCLUDING current
+        let p = resolve_trace_target(dir.path(), "cur-3", Some("last")).unwrap();
+        assert!(p.ends_with("bbb-2.trace.jsonl"), "got {p:?}");
+        // explicit id
+        let p = resolve_trace_target(dir.path(), "cur-3", Some("aaa-1")).unwrap();
+        assert!(p.ends_with("aaa-1.trace.jsonl"));
+        // missing id → error mentions it
+        let e = resolve_trace_target(dir.path(), "cur-3", Some("nope")).unwrap_err();
+        assert!(e.contains("nope"));
     }
 }

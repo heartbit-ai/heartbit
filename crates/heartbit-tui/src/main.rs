@@ -1046,6 +1046,21 @@ async fn run_ui(
                         running: app.running,
                     });
                 }
+                Effect::ComputeStats(target) => {
+                    let tx = ui_tx.clone();
+                    let sid = session_id.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let dir = session::sessions_dir();
+                            let path = trace::resolve_trace_target(&dir, &sid, target.as_deref())?;
+                            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                            Ok::<String, String>(trace_stats::compute(file).render())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(Msg::StatsReady(result));
+                    });
+                }
                 Effect::Quit => app.should_quit = true,
             }
             trace.record_ui(&trace::UiEvent::Effect {

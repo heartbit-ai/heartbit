@@ -84,6 +84,8 @@ pub enum Msg {
     FilesLoaded(Vec<String>),
     /// Saved sessions listed for the `/resume` picker.
     SessionsListed(Vec<crate::session::SessionMeta>),
+    /// Trace stats computed (rendered table) — or why they couldn't be.
+    StatsReady(Result<String, String>),
     /// A resumed session's transcript (replaces the current history).
     SessionLoaded(Vec<crate::cells::Cell>),
 

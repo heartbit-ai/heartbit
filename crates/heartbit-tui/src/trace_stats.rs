@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO(trace_stats): remove once Task 7 wires /stats
-
 //! Deterministic stats over a trace JSONL: streams line-by-line (never loads
 //! the whole file), tolerant of torn/malformed lines and unknown event types.
 //! This is the human `/stats` summary AND the measurement substrate the
@@ -217,6 +215,7 @@ mod tests {
             r#"{"v":1,"seq":8,"ts":"2026-06-06T10:00:09.000Z","src":"agent","event":{"type":"llm_response","agent":"entry","turn":2,"usage":{"input_tokens":1200,"output_tokens":80},"stop_reason":"end_turn","tool_call_count":0,"latency_ms":900,"time_to_first_token_ms":200}}"#,
             r#"{"v":1,"seq":9,"ts":"2026-06-06T10:00:09.100Z","src":"agent","event":{"type":"tool_call_completed","agent":"entry","tool_name":"bash","tool_call_id":"t2","is_error":true,"duration_ms":700,"output":"boom"}}"#,
             r#"{"v":1,"seq":10,"ts":"2026-06-06T10:00:09.200Z","src":"ui","event":{"type":"interrupt_requested","checkpoint":"cp1_effect_dequeued","running":true}}"#,
+            r#"{"v":1,"seq":12,"ts":"2026-06-06T10:00:09.250Z","src":"ui","event":{"type":"interrupt_requested","checkpoint":"cp2_handle_interrupted","running":true}}"#,
             r#"{"v":1,"seq":11,"ts":"2026-06-06T10:00:09.300Z","src":"agent","event":{"type":"run_completed","agent":"entry","total_usage":{"input_tokens":2200,"output_tokens":130},"tool_calls_made":2}}"#,
             "{ this line is torn garba",
         ];
@@ -226,7 +225,7 @@ mod tests {
     #[test]
     fn golden_fixture_computes_exact_stats() {
         let s = compute(fixture().as_bytes());
-        assert_eq!(s.records, 12);
+        assert_eq!(s.records, 13);
         assert_eq!(s.skipped_lines, 1);
         assert_eq!(s.user_inputs, 1);
         assert_eq!(s.turns, 2);

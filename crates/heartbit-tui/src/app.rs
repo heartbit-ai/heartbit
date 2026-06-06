@@ -158,6 +158,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear the transcript"),
     ("/resume", "reopen a saved session"),
     ("/export", "export the transcript to Markdown"),
+    ("/stats", "trace stats — this session, `last`, or <id>"),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -190,6 +191,8 @@ pub enum Effect {
     ResumeSession(String),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
+    /// Compute trace stats (None = current session; "last" | <id> otherwise).
+    ComputeStats(Option<String>),
     /// Tear down and exit.
     Quit,
 }
@@ -211,6 +214,7 @@ impl Effect {
             Effect::ListSessions => "list_sessions",
             Effect::ResumeSession(_) => "resume_session",
             Effect::Interrupt => "interrupt",
+            Effect::ComputeStats(_) => "compute_stats",
             Effect::Quit => "quit",
         }
     }
@@ -703,6 +707,12 @@ impl App {
                 self.history
                     .push(Cell::Notice("— session resumed —".into()));
             }
+            Msg::StatsReady(Ok(table)) => {
+                self.history.push(Cell::Agent(format!("```\n{table}```")));
+            }
+            Msg::StatsReady(Err(e)) => {
+                self.history.push(Cell::Notice(format!("stats: {e}")));
+            }
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
                 // Only notify when the fetch was USER-initiated (the picker is
@@ -896,6 +906,10 @@ impl App {
             }
             "export" => self.effects.push(Effect::ExportSession),
             "resume" => self.effects.push(Effect::ListSessions),
+            "stats" => {
+                let target = if arg.is_empty() { None } else { Some(arg) };
+                self.effects.push(Effect::ComputeStats(target));
+            }
             "help" => {
                 self.history.push(Cell::Notice(
                     "commands: /mode [normal|plan|yolo] · /key [token] · /model [name] · /mcp [list|add …|clear] · /help · /quit"
@@ -2347,6 +2361,29 @@ mod tests {
         typed(&mut app, "/resume");
         app.update(key(KeyCode::Enter));
         assert!(app.effects.contains(&Effect::ListSessions));
+    }
+
+    #[test]
+    fn slash_stats_pushes_compute_effect() {
+        let mut app = keyed();
+        typed(&mut app, "/stats");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::ComputeStats(None)));
+        typed(&mut app, "/stats last");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.effects
+                .contains(&Effect::ComputeStats(Some("last".into())))
+        );
+    }
+
+    #[test]
+    fn stats_ready_renders_into_transcript() {
+        let mut app = keyed();
+        app.update(Msg::StatsReady(Ok("turns 3\n".into())));
+        assert!(matches!(app.history.last(), Some(Cell::Agent(t)) if t.contains("turns 3")));
+        app.update(Msg::StatsReady(Err("no trace".into())));
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
     }
 
     #[test]
