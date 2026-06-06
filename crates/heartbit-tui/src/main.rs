@@ -1237,6 +1237,9 @@ async fn run_ui(
                     message: e.to_string(),
                 });
             }
+            // Drain the trace tail before exiting — the writer thread is
+            // detached, so without this the final records could vanish.
+            let _ = trace.flush_blocking(std::time::Duration::from_millis(750));
             break;
         }
     }

@@ -118,12 +118,21 @@ pub fn decision_label(d: &heartbit_core::ApprovalDecision) -> &'static str {
     }
 }
 
+/// What producers send to the writer thread.
+enum TraceMsg {
+    /// One serialized envelope line.
+    Line(String),
+    /// Flush rendezvous: the writer acks after every prior queued line is on
+    /// disk (FIFO), so a quitting UI can drain the tail deterministically.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
 /// A clonable producer handle. Producers serialize + send; a dedicated thread
 /// owns the file. Cheap to clone across the UI loop, the agent thread's
 /// callbacks, and the tracing bridge.
 #[derive(Clone)]
 pub struct TraceHandle {
-    tx: std::sync::mpsc::Sender<String>,
+    tx: std::sync::mpsc::Sender<TraceMsg>,
     seq: Arc<AtomicU64>,
     disabled: Arc<AtomicBool>,
 }
@@ -143,8 +152,22 @@ impl TraceHandle {
             event,
         };
         if let Ok(line) = serde_json::to_string(&rec) {
-            let _ = self.tx.send(line);
+            let _ = self.tx.send(TraceMsg::Line(line));
         }
+    }
+
+    /// Drain everything queued so far (quit path): blocks until the writer
+    /// acks or `timeout` elapses. Returns `false` on timeout/disabled —
+    /// best-effort, never panics, never blocks past the timeout.
+    pub fn flush_blocking(&self, timeout: std::time::Duration) -> bool {
+        if self.is_disabled() {
+            return false;
+        }
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        if self.tx.send(TraceMsg::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 
     /// Record a typed TUI-side event.
@@ -174,7 +197,7 @@ impl TraceHandle {
 /// the trace then self-disables for the session; it must never take down or
 /// block a run.
 pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> TraceHandle {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::channel::<TraceMsg>();
     let disabled = Arc::new(AtomicBool::new(false));
     let handle = TraceHandle {
         tx,
@@ -207,14 +230,23 @@ pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> 
                 return;
             }
         };
-        while let Ok(line) = rx.recv() {
-            if writeln!(file, "{line}")
-                .and_then(|()| file.flush())
-                .is_err()
-            {
-                disabled.store(true, Ordering::Relaxed);
-                on_error("trace disabled: write failed".into());
-                return;
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                TraceMsg::Line(line) => {
+                    if writeln!(file, "{line}")
+                        .and_then(|()| file.flush())
+                        .is_err()
+                    {
+                        disabled.store(true, Ordering::Relaxed);
+                        on_error("trace disabled: write failed".into());
+                        return;
+                    }
+                }
+                // FIFO guarantees every line queued before the flush is
+                // already written — just ack.
+                TraceMsg::Flush(ack) => {
+                    let _ = ack.send(());
+                }
             }
         }
         // All senders dropped → session over; file already flushed per line.
@@ -797,6 +829,38 @@ mod tests {
         );
         assert_eq!(rec.event["fields"]["turn"], 4);
         assert_eq!(rec.event["fields"]["message"], "cancel armed");
+    }
+
+    // Quit-path records used to race process exit (detached writer thread):
+    // flush_blocking drains everything queued BEFORE it returns, so the last
+    // effect/error records can't vanish.
+    #[test]
+    fn flush_blocking_drains_the_queue_without_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flush.trace.jsonl");
+        let handle = spawn_writer(path.clone(), Box::new(|_| {}));
+        for i in 0..200 {
+            handle.record_ui(&UiEvent::UserInput {
+                text: format!("m{i}"),
+            });
+        }
+        assert!(
+            handle.flush_blocking(std::time::Duration::from_secs(2)),
+            "flush must ack within the timeout"
+        );
+        // No wait_for_lines polling: everything must already be on disk.
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 200);
+    }
+
+    #[test]
+    fn flush_blocking_on_disabled_writer_returns_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        // Target is a directory → writer self-disables; flush must not hang.
+        let handle = spawn_writer(dir.path().to_path_buf(), Box::new(|_| {}));
+        let t0 = std::time::Instant::now();
+        let _ = handle.flush_blocking(std::time::Duration::from_millis(500));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
