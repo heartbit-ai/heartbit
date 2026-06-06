@@ -806,14 +806,24 @@ impl Tool for FormSquadTool {
                 ));
             }
 
-            // Validate: no duplicate agent names
+            // Validate: no duplicate agent names. Live finding: a model sent
+            // ["worker","worker"] wanting PARALLEL same-agent tasks and the
+            // bare error left it retrying — name the alternatives.
             {
                 let mut seen = std::collections::HashSet::new();
                 for t in &tasks {
                     if !seen.insert(&t.agent) {
                         return Ok(ToolOutput::error(format!(
-                            "Duplicate agent name in squad: '{}'",
-                            t.agent
+                            "Duplicate agent name in squad: '{}'. Each form_squad \
+                             task needs a DISTINCT agent (available: {}). To run \
+                             several tasks on the SAME agent in parallel, use \
+                             delegate_task with multiple tasks instead.",
+                            t.agent,
+                            self.agent_pool
+                                .iter()
+                                .map(|a| a.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )));
                     }
                 }
@@ -2846,18 +2856,26 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<Vec<CompletionResponse>>,
+        /// Every request received, for asserting what the LLM actually saw
+        /// (e.g. tool-result error texts).
+        captured_requests: Mutex<Vec<CompletionRequest>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<CompletionResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                captured_requests: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl LlmProvider for MockProvider {
-        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, Error> {
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
+            self.captured_requests
+                .lock()
+                .expect("capture lock poisoned")
+                .push(request);
             let mut responses = self.responses.lock().expect("mock lock poisoned");
             if responses.is_empty() {
                 return Err(Error::Agent("no more mock responses".into()));
@@ -5627,7 +5645,7 @@ mod tests {
             },
         ]));
 
-        let mut orch = Orchestrator::builder(provider)
+        let mut orch = Orchestrator::builder(provider.clone())
             .sub_agent("researcher", "Research", "prompt")
             .sub_agent("analyst", "Analysis", "prompt")
             .build()
@@ -5635,6 +5653,30 @@ mod tests {
 
         let output = orch.run("form squad with dupes").await.unwrap();
         assert_eq!(output.result, "Fixed duplicate issue.");
+
+        // Live finding (squad session): the model sent ["worker","worker"]
+        // wanting PARALLEL same-agent tasks, and the bare "Duplicate agent
+        // name" error left it retrying the same thing. The error must name
+        // the available agents and point at delegate_task for same-agent
+        // parallelism.
+        let reqs = provider.captured_requests.lock().unwrap();
+        let tool_result_text: String = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_result_text.contains("researcher") && tool_result_text.contains("analyst"),
+            "error must list the available agents: {tool_result_text}"
+        );
+        assert!(
+            tool_result_text.contains("delegate_task"),
+            "error must point at delegate_task for same-agent parallelism: {tool_result_text}"
+        );
     }
 
     #[tokio::test]

@@ -227,8 +227,9 @@ pub(crate) async fn write_beneath_root(
 /// `/analyze` diagnosis caught an agent burning 7 tool errors on exactly that.
 pub(crate) fn path_param_description(workspace: Option<&std::path::Path>) -> &'static str {
     if workspace.is_some() {
-        "Path relative to the workspace root (absolute paths are rejected — \
-         create scratch files inside the workspace, not /tmp)"
+        "Path relative to the workspace root (absolute paths are accepted only \
+         inside the workspace; outside paths are rejected — keep scratch files \
+         in the workspace, not /tmp)"
     } else {
         "Absolute path, or relative to the current directory"
     }
@@ -244,17 +245,21 @@ pub(crate) fn resolve_path(
 
     match workspace {
         Some(ws) => {
-            if p.is_absolute() {
-                return Err(format!(
-                    "Absolute paths are not allowed when workspace is set. \
-                     Use a relative path instead of '{path}'."
-                ));
-            }
-            let candidate = ws.join(p);
+            // Absolute paths are accepted ONLY when they already point inside
+            // the workspace — models naturally emit the absolute form of
+            // workspace paths (live finding), and the containment checks
+            // below enforce exactly the same jail either way. Anything
+            // outside is rejected with the actionable hint.
+            let candidate = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                ws.join(p)
+            };
             let normalized = crate::workspace::normalize_path(&candidate);
             if !normalized.starts_with(ws) {
                 return Err(format!(
-                    "Path '{path}' escapes the workspace root ({}).",
+                    "Path '{path}' escapes the workspace root ({}). \
+                     Use a path inside the workspace.",
                     ws.display()
                 ));
             }
@@ -608,17 +613,38 @@ mod tests {
         assert_eq!(floor_char_boundary(s, 5), 5);
     }
 
+    // Live finding (squad session): models naturally emit the ABSOLUTE form
+    // of workspace paths (`/repo/landpage-crm-temp/...`) — rejecting those
+    // wholesale created a recurring error class. Absolute paths are accepted
+    // when they point INSIDE the workspace (same containment checks as the
+    // relative form); anything outside stays rejected.
     #[test]
-    fn resolve_path_absolute_rejected_with_workspace() {
+    fn resolve_path_absolute_inside_workspace_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path();
-        let result = resolve_path("/absolute/path", Some(ws), &[]);
+        let ws = dir.path().canonicalize().unwrap();
+        let abs = ws.join("sub").join("notes.md");
+        let result = resolve_path(abs.to_str().unwrap(), Some(&ws), &[]);
+        assert_eq!(result.unwrap(), abs);
+    }
+
+    #[test]
+    fn resolve_path_absolute_outside_workspace_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("/etc/passwd", Some(&ws), &[]);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("Absolute paths are not allowed")
-        );
+        assert!(result.unwrap_err().contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn resolve_path_absolute_sneaky_traversal_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        // Absolute, workspace-prefixed, but escaping via `..`.
+        let sneaky = format!("{}/sub/../../etc/passwd", ws.display());
+        let result = resolve_path(&sneaky, Some(&ws), &[]);
+        assert!(result.is_err(), "got: {result:?}");
+        assert!(result.unwrap_err().contains("escapes the workspace"));
     }
 
     #[test]
