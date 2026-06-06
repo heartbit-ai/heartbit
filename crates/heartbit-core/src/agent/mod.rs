@@ -10,6 +10,7 @@ pub mod context;
 pub mod context_recall;
 pub mod dag;
 pub mod debate;
+mod deep_research;
 mod doom_loop;
 pub mod evaluator;
 pub mod events;
