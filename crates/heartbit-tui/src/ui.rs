@@ -480,6 +480,40 @@ pub fn view(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(widget, rect);
         }
+        Some(Modal::ModePicker { sel }) => {
+            let w = area.width.min(74);
+            let h = 7u16.min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let current = app.permission_mode;
+            let mut mlines: Vec<Line> = crate::app::MODES
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let marker = if *m == current { "●" } else { " " };
+                    let row = format!(" {marker} {:<7} {}", m.label(), m.describe());
+                    if i == *sel {
+                        Line::from(Span::styled(
+                            row,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::raw(row)
+                    }
+                })
+                .collect();
+            mlines.push(Line::raw(""));
+            mlines.push(Line::from(Span::styled(
+                " ↑↓ · Enter set · Esc",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let widget = Paragraph::new(mlines)
+                .block(Block::default().borders(Borders::ALL).title(" mode "));
+            frame.render_widget(widget, rect);
+        }
         Some(Modal::HistorySearch(h)) => {
             let matches = app.history_matches(&h.query);
             let w = area.width.min(80);
@@ -785,6 +819,23 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    #[test]
+    fn mode_picker_modal_lists_all_modes() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.modal = Some(Modal::ModePicker { sel: 1 });
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        for label in ["normal", "plan", "YOLO"] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert!(
+            text.contains("read-only"),
+            "plan description shown:\n{text}"
+        );
     }
 
     #[test]

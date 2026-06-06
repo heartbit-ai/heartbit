@@ -124,6 +124,13 @@ pub enum PermissionMode {
     Yolo,
 }
 
+/// Picker order — matches the Shift+Tab cycle.
+pub const MODES: [PermissionMode; 3] = [
+    PermissionMode::Normal,
+    PermissionMode::Plan,
+    PermissionMode::Yolo,
+];
+
 impl PermissionMode {
     /// Next mode in the Shift+Tab cycle: Normal → Plan → YOLO → Normal.
     pub fn next(self) -> Self {
@@ -302,6 +309,10 @@ pub enum Modal {
     Approval(ApprovalModal),
     KeyEntry(KeyEntryModal),
     ModelPicker(ModelPicker),
+    /// `/mode` picker: choose the execution mode (`sel` indexes [`MODES`]).
+    ModePicker {
+        sel: usize,
+    },
     HistorySearch(HistorySearch),
     SessionPicker(SessionPicker),
 }
@@ -604,7 +615,9 @@ impl App {
                     h.query.push_str(&s.replace(['\n', '\r'], ""));
                     h.sel = 0;
                 }
-                Some(Modal::Approval(_)) | Some(Modal::SessionPicker(_)) => {}
+                Some(Modal::Approval(_))
+                | Some(Modal::SessionPicker(_))
+                | Some(Modal::ModePicker { .. }) => {}
                 None => self.composer.insert_str(&s),
             },
             Msg::Key(key) => {
@@ -1183,11 +1196,12 @@ impl App {
     /// Bare `/mode` reports the current one. Applied live to the approval gate.
     fn set_mode(&mut self, arg: String) {
         if arg.trim().is_empty() {
-            self.history.push(Cell::Notice(format!(
-                "mode: {} — {} (set with /mode normal|plan|yolo, or Shift+Tab)",
-                self.permission_mode.label(),
-                self.permission_mode.describe()
-            )));
+            // Bare `/mode`: open the picker, preselected on the current mode.
+            let sel = MODES
+                .iter()
+                .position(|m| *m == self.permission_mode)
+                .unwrap_or(0);
+            self.modal = Some(Modal::ModePicker { sel });
             return;
         }
         match PermissionMode::parse(&arg) {
@@ -1434,7 +1448,44 @@ impl App {
             Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
             Some(Modal::HistorySearch(_)) => self.handle_history_search_key(key),
             Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
+            Some(Modal::ModePicker { .. }) => self.handle_mode_picker_key(key),
             None => {}
+        }
+    }
+
+    /// `/mode` picker keys: ↑/↓ select (wrap), Enter apply, Esc cancel.
+    fn handle_mode_picker_key(&mut self, key: KeyEvent) {
+        let n = MODES.len();
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up => {
+                if let Some(Modal::ModePicker { sel }) = &mut self.modal {
+                    *sel = (*sel + n - 1) % n;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(Modal::ModePicker { sel }) = &mut self.modal {
+                    *sel = (*sel + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let mode = match &self.modal {
+                    Some(Modal::ModePicker { sel }) => MODES.get(*sel).copied(),
+                    _ => None,
+                };
+                self.modal = None;
+                // Same application path as `/mode <arg>`.
+                if let Some(mode) = mode {
+                    self.permission_mode = mode;
+                    self.effects.push(Effect::SetPermissionMode(mode.as_u8()));
+                    self.history.push(Cell::Notice(format!(
+                        "{} mode — {}",
+                        mode.label(),
+                        mode.describe()
+                    )));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2885,6 +2936,50 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
         assert!(!app.running);
         assert!(!app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn bare_mode_opens_picker_preselected_on_current() {
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        typed(&mut app, "/mode");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::ModePicker { sel: 1 })),
+            "picker must open on the CURRENT mode (Plan = index 1)"
+        );
+    }
+
+    #[test]
+    fn mode_picker_enter_applies_esc_cancels_and_wraps() {
+        let mut app = keyed();
+        app.modal = Some(Modal::ModePicker { sel: 0 });
+        app.update(key(KeyCode::Up)); // wrap 0 → 2 (YOLO)
+        assert!(matches!(app.modal, Some(Modal::ModePicker { sel: 2 })));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Yolo);
+        assert!(app.modal.is_none());
+        assert!(app.effects.contains(&Effect::SetPermissionMode(2)));
+        // Esc path: no change, no effect.
+        let mut app = keyed();
+        app.modal = Some(Modal::ModePicker { sel: 2 });
+        app.update(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetPermissionMode(_)))
+        );
+    }
+
+    #[test]
+    fn mode_with_arg_still_sets_directly() {
+        let mut app = keyed();
+        typed(&mut app, "/mode yolo");
+        app.update(key(KeyCode::Enter));
+        assert!(app.modal.is_none(), "arg path must NOT open the picker");
+        assert_eq!(app.permission_mode, PermissionMode::Yolo);
     }
 
     #[test]
