@@ -79,6 +79,11 @@ pub struct AgentOpts {
     /// the goal's `max_continuations`). Each continuation's spend accrues into
     /// the leaf's single budget record. Set via [`AgentCall::goal`].
     pub goal: Option<crate::agent::goal::GoalCondition>,
+    /// Per-call model role or id, resolved by the ctx's
+    /// [`ProviderFactory`](super::ctx::ProviderFactory). No factory installed →
+    /// the leaf degrades to the shared provider (with a log line). Set via
+    /// [`AgentCall::model`].
+    pub model: Option<String>,
 }
 
 /// A fluent, owned builder for one [`agent`] leaf. Created by [`agent`].
@@ -119,6 +124,14 @@ impl<T> AgentCall<T> {
     /// Override the phase this call is grouped under.
     pub fn phase(mut self, phase: impl Into<String>) -> Self {
         self.opts.phase = Some(phase.into());
+        self
+    }
+
+    /// Run this leaf on a different model: a ROLE name ("fast", "frontier")
+    /// or a raw model id, resolved by the ctx's provider factory. Dynamic
+    /// model-by-task, the Claude Code way — the workflow decides per agent.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.opts.model = Some(model.into());
         self
     }
 
@@ -332,7 +345,25 @@ impl AgentCall<RawJson> {
 /// `__respond__` tool, validates the payload against the schema, and retries on
 /// mismatch — the typed terminal then deserializes `AgentOutput.structured`.
 async fn run_one(ctx: &WorkflowCtx, prompt: &str, opts: &AgentOpts) -> Result<AgentOutput, Error> {
-    let mut builder = AgentRunner::builder(ctx.provider());
+    // Per-call model: resolve the role/id through the host factory. A missing
+    // factory degrades to the shared provider (same answers, default cost) —
+    // a recipe must not die because the host lacks the seam.
+    let provider = match &opts.model {
+        Some(role) => match ctx.provider_factory() {
+            Some(factory) => factory(role)?,
+            None => {
+                ctx.emit(super::event::WorkflowEvent::LogLine {
+                    msg: format!(
+                        "model '{role}' requested but no provider factory installed — \
+                         using the default provider"
+                    ),
+                });
+                ctx.provider()
+            }
+        },
+        None => ctx.provider(),
+    };
+    let mut builder = AgentRunner::builder(provider);
     if let Some(label) = &opts.label {
         builder = builder.name(label.clone());
     }
@@ -475,6 +506,78 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::RunCompleted { agent, .. } if agent == "lane:1")),
             "inner runner's RunCompleted must reach the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_model_resolves_through_the_factory() {
+        // Two distinct mocks: the ctx default and the factory's "fast" model.
+        let default_mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "from-default",
+            1,
+            1,
+        )]));
+        let fast_mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "from-fast",
+            1,
+            1,
+        )]));
+        let fast_for_factory = Arc::clone(&fast_mock);
+        let factory: Arc<crate::agent::flow::ProviderFactory> = Arc::new(move |role: &str| {
+            assert_eq!(role, "fast");
+            Ok(Arc::new(BoxedProvider::from_arc(Arc::clone(
+                &fast_for_factory,
+            ))))
+        });
+        let ctx =
+            WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(Arc::clone(&default_mock))))
+                .provider_factory(factory)
+                .build()
+                .expect("ctx");
+
+        let out = agent(&ctx, "go").model("fast").run().await.expect("run");
+        assert_eq!(out.as_deref(), Some("from-fast"));
+        assert_eq!(
+            fast_mock.captured_requests.lock().expect("lock").len(),
+            1,
+            "the fast provider must take the call"
+        );
+        assert!(
+            default_mock
+                .captured_requests
+                .lock()
+                .expect("lock")
+                .is_empty(),
+            "the default provider must NOT be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_without_factory_degrades_to_default_with_a_log() {
+        use std::sync::Mutex;
+        let mock = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "ok", 1, 1,
+        )]));
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let logs = Arc::clone(&logs);
+            Arc::new(move |ev: super::super::event::WorkflowEvent| {
+                if let super::super::event::WorkflowEvent::LogLine { msg } = ev {
+                    logs.lock().expect("lock").push(msg);
+                }
+            })
+        };
+        let ctx = WorkflowCtx::builder(Arc::new(BoxedProvider::from_arc(Arc::clone(&mock))))
+            .on_event(sink)
+            .build()
+            .expect("ctx");
+        let out = agent(&ctx, "go").model("fast").run().await.expect("run");
+        assert_eq!(out.as_deref(), Some("ok"), "degraded, never fatal");
+        let logs = logs.lock().expect("lock");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("fast") && l.contains("factory")),
+            "must log the degradation: {logs:?}"
         );
     }
 

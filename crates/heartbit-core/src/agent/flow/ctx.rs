@@ -20,6 +20,11 @@ use super::budget::Budget;
 use super::event::{OnWorkflowEvent, WorkflowEvent};
 use super::journal::{ResumeMode, RunJournal};
 
+/// Host-supplied provider construction for per-call model selection: maps a
+/// model ROLE ("fast", "frontier") or a raw model id to a ready provider.
+/// String-keyed on purpose — the host decides what names mean.
+pub type ProviderFactory = dyn Fn(&str) -> Result<Arc<BoxedProvider>, Error> + Send + Sync;
+
 /// Hard upper bound on concurrently-running agents, matching Claude Code's
 /// `min(16, cores - 2)`.
 const MAX_CONCURRENCY_CAP: usize = 16;
@@ -94,6 +99,9 @@ struct CtxInner {
     /// (e.g. the TUI trace). Distinct from `events`, which carries the
     /// workflow-level lifecycle.
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
+    /// Optional per-call model resolution (see [`ProviderFactory`]). Absent →
+    /// `AgentCall::model()` degrades to the shared provider with a log line.
+    provider_factory: Option<Arc<ProviderFactory>>,
     /// Cooperative cancellation (pause/stop); P1 only races it to `Ok(None)`.
     cancel: CancellationToken,
     /// Default phase for subsequently-issued agents. `std` lock: never held
@@ -129,6 +137,7 @@ impl WorkflowCtx {
             journal: None,
             events: None,
             agent_events: None,
+            provider_factory: None,
             cancel: None,
         }
     }
@@ -189,6 +198,10 @@ impl WorkflowCtx {
     /// that supplies no per-call tools.
     pub(crate) fn agent_events(&self) -> Option<Arc<crate::agent::events::OnEvent>> {
         self.inner.agent_events.clone()
+    }
+
+    pub(crate) fn provider_factory(&self) -> Option<Arc<ProviderFactory>> {
+        self.inner.provider_factory.clone()
     }
 
     pub(crate) fn base_tools(&self) -> Option<Vec<Arc<dyn crate::tool::Tool>>> {
@@ -264,6 +277,7 @@ impl WorkflowCtx {
                 journal: self.inner.journal.clone(),
                 events: self.inner.events.clone(),
                 agent_events: self.inner.agent_events.clone(),
+                provider_factory: self.inner.provider_factory.clone(),
                 cancel: self.inner.cancel.clone(),
                 default_phase: RwLock::new(None),
                 depth: self.inner.depth + 1,
@@ -313,6 +327,7 @@ pub struct WorkflowCtxBuilder {
     journal: Option<Arc<RunJournal>>,
     events: Option<Arc<OnWorkflowEvent>>,
     agent_events: Option<Arc<crate::agent::events::OnEvent>>,
+    provider_factory: Option<Arc<ProviderFactory>>,
     cancel: Option<CancellationToken>,
 }
 
@@ -390,6 +405,13 @@ impl WorkflowCtxBuilder {
         self
     }
 
+    /// Install the per-call model resolver (see [`ProviderFactory`]): lets
+    /// `agent(&ctx, …).model("fast")` run a leaf on a different provider.
+    pub fn provider_factory(mut self, factory: Arc<ProviderFactory>) -> Self {
+        self.provider_factory = Some(factory);
+        self
+    }
+
     /// Provide an external cancellation token (defaults to a fresh one).
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -425,6 +447,7 @@ impl WorkflowCtxBuilder {
                 journal: self.journal,
                 events: self.events,
                 agent_events: self.agent_events,
+                provider_factory: self.provider_factory,
                 cancel: self.cancel.unwrap_or_default(),
                 default_phase: RwLock::new(None),
                 depth: 0,

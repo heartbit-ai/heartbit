@@ -39,7 +39,7 @@ mod audit_gap_tests;
 // function coexist (type vs value namespace), so `flow::agent` is the module in
 // path position and the function in call position.
 pub use agent::agent;
-pub use ctx::WorkflowCtx;
+pub use ctx::{ProviderFactory, WorkflowCtx};
 pub use event::{log, phase};
 pub use parallel::{parallel, thunk};
 pub use pipeline::pipeline;
