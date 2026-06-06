@@ -257,7 +257,9 @@ pub mod recipes {
 
 /// A default registry for the TUI entry agent: the built-in recipes.
 pub fn default_registry() -> WorkflowRegistry {
-    WorkflowRegistry::new().register(recipes::parallel_review())
+    WorkflowRegistry::new()
+        .register(recipes::parallel_review())
+        .register(crate::agent::deep_research::recipe())
 }
 
 #[cfg(test)]
@@ -274,6 +276,7 @@ mod tests {
         let reg = default_registry();
         assert!(!reg.is_empty());
         assert!(reg.get("parallel_review").is_some());
+        assert!(reg.get("deep_research").is_some());
         assert!(reg.get("nope").is_none());
         let meta = reg.meta();
         assert!(meta.iter().any(|(n, _)| n == "parallel_review"));
