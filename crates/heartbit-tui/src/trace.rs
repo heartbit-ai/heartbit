@@ -518,18 +518,20 @@ mod tests {
             dir.path().to_path_buf(),
             Box::new(move |e| errs.lock().unwrap().push(e)),
         );
-        // Give the writer thread time to fail the open.
+        // Poll for the asserted event (the callback push) — the mutex acquire
+        // on push establishes happens-before, so the prior Relaxed disable
+        // store is visible to is_disabled below (provably race-free).
         for _ in 0..100 {
-            if handle.is_disabled() {
+            if errors.lock().unwrap().len() == 1 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert_eq!(errors.lock().unwrap().len(), 1, "error callback fires once");
         assert!(
             handle.is_disabled(),
             "writer must self-disable on open error"
         );
-        assert_eq!(errors.lock().unwrap().len(), 1, "error callback fires once");
         // Recording after disable is a silent no-op (must not panic).
         handle.record_ui(&UiEvent::UserInput {
             text: "ignored".into(),
