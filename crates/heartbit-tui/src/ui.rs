@@ -50,8 +50,13 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
 /// approval modal overlay when present.
 pub fn view(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let comp_lines = app.composer.render_lines().len().max(1) as u16;
-    let comp_h = (comp_lines + 2).clamp(3, 8);
+    // Composer height comes from WRAPPED rows (char-exact, the same math the
+    // cursor uses) — logical lines under-count once a line exceeds the inner
+    // width, clipping the typed text at the border (the transcript scroll
+    // lesson, replayed on input).
+    let comp_inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let comp_rows = app.composer.wrap_lines(comp_inner_w).len().max(1) as u16;
+    let comp_h = (comp_rows + 2).clamp(3, 8);
     let chunks = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -166,6 +171,12 @@ pub fn view(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(status)), chunks[1]);
 
     // --- composer ---
+    // Pre-wrapped rows + a vertical scroll that keeps the cursor's row inside
+    // the (height-capped) box: when the draft outgrows the cap, the view
+    // follows the cursor instead of clipping it below the border.
+    let comp_inner_h = comp_h.saturating_sub(2).max(1) as usize;
+    let (cur_row, cur_col) = app.composer.visual_cursor(comp_inner_w);
+    let comp_scroll = cur_row.saturating_sub(comp_inner_h - 1);
     let comp_text: Vec<Line> = if app.composer.is_empty() && app.modal.is_none() {
         vec![Line::from(Span::styled(
             "Type a message and press Enter…",
@@ -173,7 +184,7 @@ pub fn view(frame: &mut Frame, app: &App) {
         ))]
     } else {
         app.composer
-            .render_lines()
+            .wrap_lines(comp_inner_w)
             .into_iter()
             .map(Line::raw)
             .collect()
@@ -183,8 +194,9 @@ pub fn view(frame: &mut Frame, app: &App) {
     } else {
         " Enter send · Shift+Enter newline · ↑↓ history · Ctrl+C quit ".to_string()
     };
-    let composer =
-        Paragraph::new(comp_text).block(Block::default().borders(Borders::ALL).title(title));
+    let composer = Paragraph::new(comp_text)
+        .scroll((comp_scroll as u16, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(composer, chunks[2]);
 
     // --- slash-command autocomplete menu (floats above the composer) ---
@@ -501,11 +513,11 @@ pub fn view(frame: &mut Frame, app: &App) {
             frame.render_widget(widget, rect);
         }
         None => {
-            // Show the text cursor in the composer when no modal is up.
-            let (crow, ccol) = app.composer.cursor();
+            // Show the text cursor in the composer when no modal is up — at
+            // its WRAPPED position, adjusted by the composer's scroll.
             frame.set_cursor_position(Position::new(
-                chunks[2].x + 1 + ccol as u16,
-                chunks[2].y + 1 + crow as u16,
+                chunks[2].x + 1 + cur_col as u16,
+                chunks[2].y + 1 + (cur_row - comp_scroll) as u16,
             ));
         }
     }
@@ -715,6 +727,56 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    // User bug: typing past the right edge of the prompt box became invisible
+    // — no wrap, logical-line height, logical-column cursor. The composer must
+    // wrap char-exactly, grow a row when the line fills, and keep the cursor
+    // inside the box.
+    #[test]
+    fn composer_wraps_long_input_and_grows() {
+        let backend = TestBackend::new(40, 16); // inner composer width = 38
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.composer.insert_str(&"x".repeat(50)); // 38 + 12 → two rows
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains(&"x".repeat(38)),
+            "first wrapped row missing:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{} ", "x".repeat(12))),
+            "wrapped tail row missing — input past the edge is invisible:\n{text}"
+        );
+        // The cursor must sit INSIDE the frame, after the last typed char.
+        // 2 wrapped rows → comp_h = 4 → box spans y 12..16; inner rows are
+        // y=13 (first) and y=14 (second, where the cursor lands at col 12).
+        let pos = terminal.get_cursor_position().unwrap();
+        assert_eq!(
+            (pos.x, pos.y),
+            (1 + 12, 14),
+            "cursor must track the wrapped position:\n{text}"
+        );
+    }
+
+    #[test]
+    fn composer_scrolls_when_input_exceeds_max_height() {
+        let backend = TestBackend::new(40, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        // 10 wrapped rows (38 chars each) — far beyond the 6-row inner cap.
+        app.composer.insert_str(&"y".repeat(38 * 9 + 5));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        // The newest row (the tail with the cursor) must be visible…
+        assert!(
+            text.contains(&format!("{} ", "y".repeat(5))),
+            "tail row must stay visible when the composer scrolls:\n{text}"
+        );
+        // …and the cursor must stay inside the terminal area.
+        let pos = terminal.get_cursor_position().unwrap();
+        assert!(pos.y < 16, "cursor escaped the area: {pos:?}");
     }
 
     #[test]

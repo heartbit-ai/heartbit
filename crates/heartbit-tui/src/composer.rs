@@ -44,14 +44,49 @@ impl Composer {
         self.lines.iter().all(|l| l.is_empty())
     }
 
-    /// The lines, for rendering.
+    /// The logical (unwrapped) lines — test-only since the renderer moved to
+    /// the wrap-aware [`Self::wrap_lines`].
+    #[cfg(test)]
     pub fn render_lines(&self) -> Vec<String> {
         self.lines.iter().map(|l| l.iter().collect()).collect()
     }
 
-    /// (row, col) cursor position in chars.
+    /// (row, col) LOGICAL cursor position in chars — test-only since the
+    /// renderer moved to the wrap-aware [`Self::visual_cursor`].
+    #[cfg(test)]
     pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.col)
+    }
+
+    /// Char-exact wrap of the buffer into visual rows of at most `width`
+    /// chars — the SAME math `visual_cursor` uses, so the rendered text and
+    /// the cursor can never disagree. Each logical line takes `len/width + 1`
+    /// rows: a fresh, empty input row appears the moment a line fills (the
+    /// `+1` phantom row), which is where continued typing lands.
+    pub fn wrap_lines(&self, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        let mut rows = Vec::new();
+        for line in &self.lines {
+            let n_rows = line.len() / width + 1;
+            for r in 0..n_rows {
+                let start = r * width;
+                let end = (start + width).min(line.len());
+                rows.push(line[start..end].iter().collect());
+            }
+        }
+        rows
+    }
+
+    /// Cursor position in WRAPPED rows for a given width (same wrap rule as
+    /// [`Self::wrap_lines`]): rows of all logical lines above, plus the
+    /// cursor's row within its own wrapped line.
+    pub fn visual_cursor(&self, width: usize) -> (usize, usize) {
+        let width = width.max(1);
+        let rows_above: usize = self.lines[..self.row]
+            .iter()
+            .map(|l| l.len() / width + 1)
+            .sum();
+        (rows_above + self.col / width, self.col % width)
     }
 
     /// The submit-history entries (oldest→newest) — for Ctrl+R reverse search.
@@ -224,6 +259,57 @@ mod tests {
         assert!(c.is_empty());
         assert_eq!(c.text(), "");
         assert_eq!(c.cursor(), (0, 0));
+    }
+
+    // User bug: typing past the right edge of the prompt box became invisible
+    // — the composer rendered LOGICAL lines unwrapped, sized its height from
+    // them, and placed the cursor at the logical column (outside the box).
+    // wrap_lines/visual_cursor are the char-exact wrap the renderer uses:
+    // each logical line takes len/width + 1 rows, so a fresh input row
+    // appears the moment the line fills.
+    #[test]
+    fn wrap_lines_char_wraps_long_lines() {
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(25));
+        assert_eq!(
+            c.wrap_lines(10),
+            vec!["a".repeat(10), "a".repeat(10), "a".repeat(5)]
+        );
+        // Empty buffer still renders one row.
+        assert_eq!(Composer::new().wrap_lines(10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_lines_full_line_grows_a_fresh_row() {
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(10));
+        // Exactly full → a new empty row appears for continued typing.
+        assert_eq!(c.wrap_lines(10), vec!["a".repeat(10), String::new()]);
+        assert_eq!(c.visual_cursor(10), (1, 0), "cursor sits on the fresh row");
+    }
+
+    #[test]
+    fn wrap_lines_covers_multiple_logical_lines() {
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(12));
+        c.newline();
+        c.insert_str("bb");
+        assert_eq!(
+            c.wrap_lines(10),
+            vec!["a".repeat(10), "aa".to_string(), "bb".to_string()]
+        );
+        // Cursor at end of "bb": first logical line takes 2 rows, so row 2.
+        assert_eq!(c.visual_cursor(10), (2, 2));
+    }
+
+    #[test]
+    fn visual_cursor_tracks_mid_wrap_position() {
+        let mut c = Composer::new();
+        c.insert_str(&"a".repeat(25));
+        assert_eq!(c.visual_cursor(10), (2, 5));
+        // Degenerate width never panics.
+        let _ = c.wrap_lines(0);
+        let _ = c.visual_cursor(0);
     }
 
     #[test]
