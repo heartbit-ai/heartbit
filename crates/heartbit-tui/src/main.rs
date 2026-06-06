@@ -1103,6 +1103,84 @@ async fn run_ui(
                         });
                     });
                 }
+                Effect::Learn => {
+                    let tx = ui_tx.clone();
+                    let workdir = cwd.clone();
+                    tokio::spawn(async move {
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            // Stage the global lessons (or the template) into cwd —
+                            // the agent's builtins reject absolute paths.
+                            let staged = workdir.join(lessons::STAGED_LESSONS);
+                            let current = lessons::load_lessons()
+                                .unwrap_or_else(|| lessons::LESSONS_TEMPLATE.to_string());
+                            std::fs::write(&staged, &current).map_err(|e| e.to_string())?;
+                            let digest = lessons::file_digest(&staged)
+                                .ok_or_else(|| "staged lessons unreadable".to_string())?;
+                            // Newest ≤ 3 diagnosis reports (by mtime).
+                            let mut diags: Vec<(std::time::SystemTime, String)> = Vec::new();
+                            let entries = std::fs::read_dir(&workdir).map_err(|e| e.to_string())?;
+                            for e in entries.flatten() {
+                                let name = e.file_name().to_string_lossy().into_owned();
+                                if name.starts_with("heartbit-diagnosis-") && name.ends_with(".md")
+                                {
+                                    let mtime = e
+                                        .metadata()
+                                        .and_then(|m| m.modified())
+                                        .unwrap_or(std::time::UNIX_EPOCH);
+                                    diags.push((mtime, name));
+                                }
+                            }
+                            if diags.is_empty() {
+                                return Err("no diagnosis found — run /analyze first".to_string());
+                            }
+                            diags.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+                            let names: Vec<String> =
+                                diags.into_iter().take(3).map(|(_, n)| n).collect();
+                            Ok::<(String, String, u64), String>((
+                                format!("learning from {} diagnosis report(s)", names.len()),
+                                lessons::build_learn_prompt(lessons::STAGED_LESSONS, &names),
+                                digest,
+                            ))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(match prepared {
+                            Ok((display, task, staged_digest)) => Msg::LearnReady {
+                                display,
+                                task,
+                                staged_digest,
+                            },
+                            Err(e) => Msg::LearnFailed(e),
+                        });
+                    });
+                }
+                Effect::CommitLessons(staged_digest) => {
+                    // Cheap + sync: re-hash, skip if the agent never rewrote it,
+                    // validate, then atomically promote to the global file.
+                    let staged = cwd.join(lessons::STAGED_LESSONS);
+                    match lessons::file_digest(&staged) {
+                        Some(d) if d == staged_digest => {
+                            app.history
+                                .push(Cell::Notice("lessons unchanged — nothing to commit".into()));
+                        }
+                        Some(_) => match lessons::validate_staged(&staged) {
+                            Ok(n) => match lessons::commit_lessons(&staged) {
+                                Ok(()) => app.history.push(Cell::Notice(format!(
+                                    "lessons updated ({n} lessons) — apply on next start"
+                                ))),
+                                Err(e) => app
+                                    .history
+                                    .push(Cell::Notice(format!("lessons NOT committed: {e}"))),
+                            },
+                            Err(e) => app
+                                .history
+                                .push(Cell::Notice(format!("lessons NOT committed: {e}"))),
+                        },
+                        None => app.history.push(Cell::Notice(
+                            "lessons NOT committed: staged file missing".into(),
+                        )),
+                    }
+                }
                 Effect::Quit => app.should_quit = true,
             }
             trace.record_ui(&trace::UiEvent::Effect {

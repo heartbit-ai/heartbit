@@ -163,6 +163,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/analyze",
         "agent diagnosis of a trace — this session, `last`, or <id>",
     ),
+    (
+        "/learn",
+        "distill /analyze findings into persistent lessons",
+    ),
     ("/key", "set the OpenRouter API key"),
     ("/quit", "exit the TUI"),
 ];
@@ -199,6 +203,10 @@ pub enum Effect {
     ComputeStats(Option<String>),
     /// Prepare an `/analyze` run (resolve trace, compute stats, build prompt).
     Analyze(Option<String>),
+    /// Prepare a `/learn` run (stage lessons, gather diagnoses, build prompt).
+    Learn,
+    /// Validate + commit the staged lessons (digest = value at stage time).
+    CommitLessons(u64),
     /// Tear down and exit.
     Quit,
 }
@@ -222,6 +230,8 @@ impl Effect {
             Effect::Interrupt => "interrupt",
             Effect::ComputeStats(_) => "compute_stats",
             Effect::Analyze(_) => "analyze",
+            Effect::Learn => "learn",
+            Effect::CommitLessons(_) => "commit_lessons",
             Effect::Quit => "quit",
         }
     }
@@ -323,6 +333,8 @@ pub struct App {
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
     pub last_ttft_ms: u64,
     pub running: bool,
+    /// In-flight /learn: staged-lessons digest at stage time (commit guard).
+    pub learning: Option<u64>,
     /// When `true`, the transcript stays pinned to the newest content (the
     /// default). The user un-pins by scrolling up; scrolling back to the bottom
     /// re-pins. While un-pinned, the view is anchored from the TOP (see
@@ -372,6 +384,7 @@ impl App {
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
+            learning: None,
             follow: true,
             scroll_top: 0,
             last_max_off: std::cell::Cell::new(0),
@@ -609,6 +622,10 @@ impl App {
                 if !had_tool_calls {
                     self.running = false;
                     self.agents_settle();
+                    // /learn turn finished → commit the staged lessons (digest-guarded).
+                    if let Some(digest) = self.learning.take() {
+                        self.effects.push(Effect::CommitLessons(digest));
+                    }
                 }
             }
             Msg::ToolStarted {
@@ -682,13 +699,27 @@ impl App {
                 self.tool_index.remove(&id);
             }
             Msg::Notice(text) => self.history.push(Cell::Notice(text)),
-            Msg::RunCompleted | Msg::AgentExited(_) => {
+            Msg::RunCompleted => {
                 self.finalize_active();
                 self.running = false;
+                // Backstop: a session ending right at the answer still commits the
+                // staged lessons (digest-guarded at the edge).
+                if let Some(digest) = self.learning.take() {
+                    self.effects.push(Effect::CommitLessons(digest));
+                }
+            }
+            Msg::AgentExited(_) => {
+                self.finalize_active();
+                self.running = false;
+                // An abnormal/early thread exit must NOT commit a half-rewritten
+                // file — and clearing here prevents a stale flag leaking into the
+                // next run's first text-only LlmDone.
+                self.learning = None;
             }
             Msg::RunFailed(error) => {
                 self.finalize_active();
                 self.running = false;
+                self.learning = None;
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
             }
@@ -729,6 +760,21 @@ impl App {
             }
             Msg::AnalyzeFailed(e) => {
                 self.history.push(Cell::Notice(format!("analyze: {e}")));
+            }
+            Msg::LearnReady {
+                display,
+                task,
+                staged_digest,
+            } => {
+                self.history.push(Cell::User(display));
+                self.running = true;
+                self.follow = true;
+                self.seed_idle_squad();
+                self.learning = Some(staged_digest);
+                self.effects.push(Effect::SendInput(task));
+            }
+            Msg::LearnFailed(e) => {
+                self.history.push(Cell::Notice(format!("learn: {e}")));
             }
             Msg::ModelsFailed(err) => {
                 self.models_loading = false;
@@ -937,6 +983,13 @@ impl App {
                 }
                 let target = if arg.is_empty() { None } else { Some(arg) };
                 self.effects.push(Effect::Analyze(target));
+            }
+            "learn" => {
+                if self.api_key.is_none() && !self.has_fallback_provider {
+                    self.open_key_modal();
+                    return;
+                }
+                self.effects.push(Effect::Learn);
             }
             "help" => {
                 self.history.push(Cell::Notice(
@@ -1274,6 +1327,7 @@ impl App {
     /// streamed, and return to idle. (Gated on `running` by the caller so a stray
     /// Esc while idle can't cancel the next, not-yet-started turn.)
     fn interrupt(&mut self) {
+        self.learning = None; // Esc aborts a /learn — never commit a half-rewritten file
         self.effects.push(Effect::Interrupt);
         self.finalize_active();
         self.history.push(Cell::Notice("interrupted".into()));
@@ -2701,5 +2755,125 @@ mod tests {
         typed(&mut app, "hello");
         app.update(key(KeyCode::Enter));
         assert!(app.follow, "submitting a message jumps back to the newest");
+    }
+
+    #[test]
+    fn slash_learn_pushes_learn_effect_with_key() {
+        let mut app = keyed();
+        typed(&mut app, "/learn");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn slash_learn_without_key_opens_key_modal_not_a_run() {
+        let mut app = App::new("m");
+        typed(&mut app, "/learn");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
+        assert!(!app.running);
+        assert!(!app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn learn_ready_starts_run_and_arms_the_commit() {
+        let mut app = keyed();
+        app.update(Msg::LearnReady {
+            display: "learning from 2 diagnoses".into(),
+            task: "the prompt".into(),
+            staged_digest: 42,
+        });
+        assert!(matches!(app.history.last(), Some(Cell::User(t)) if t.contains("diagnoses")));
+        assert!(app.running);
+        assert_eq!(app.learning, Some(42));
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("the prompt".into()))
+        );
+    }
+
+    #[test]
+    fn turn_idle_llmdone_commits_once_and_disarms() {
+        let mut app = keyed();
+        app.learning = Some(42);
+        app.running = true;
+        // tool-use turn must NOT commit
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: true,
+            ttft_ms: 0,
+        });
+        assert_eq!(app.learning, Some(42));
+        assert!(!app.effects.contains(&Effect::CommitLessons(42)));
+        // text-only turn (turn-idle) commits and disarms
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert_eq!(app.learning, None);
+        assert!(app.effects.contains(&Effect::CommitLessons(42)));
+        // a second idle turn must not commit again
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitLessons(_)))
+        );
+    }
+
+    #[test]
+    fn run_completed_is_a_commit_backstop() {
+        let mut app = keyed();
+        app.learning = Some(7);
+        app.update(Msg::RunCompleted);
+        assert_eq!(app.learning, None);
+        assert!(app.effects.contains(&Effect::CommitLessons(7)));
+    }
+
+    #[test]
+    fn run_failed_and_interrupt_disarm_without_commit() {
+        let mut app = keyed();
+        app.learning = Some(7);
+        app.update(Msg::RunFailed("boom".into()));
+        assert_eq!(app.learning, None);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitLessons(_)))
+        );
+        // Esc-interrupt: the synthetic LlmDone that follows must find the flag cleared
+        app.learning = Some(8);
+        app.running = true;
+        app.update(key(KeyCode::Esc));
+        assert_eq!(
+            app.learning, None,
+            "Esc must disarm before the synthetic LlmDone"
+        );
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitLessons(_)))
+        );
+    }
+
+    #[test]
+    fn learn_failed_is_a_notice_not_a_run() {
+        let mut app = keyed();
+        app.update(Msg::LearnFailed(
+            "no diagnosis found — run /analyze first".into(),
+        ));
+        assert!(!app.running);
+        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("/analyze")));
     }
 }

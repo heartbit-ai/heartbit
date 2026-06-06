@@ -94,6 +94,15 @@ pub enum Msg {
     },
     /// `/analyze` could not prepare (no trace, stats error…).
     AnalyzeFailed(String),
+    /// `/learn` prepared: show `display`, send `task`; `staged_digest` is the
+    /// staged lessons file's content hash at stage time (the commit guard).
+    LearnReady {
+        display: String,
+        task: String,
+        staged_digest: u64,
+    },
+    /// `/learn` could not prepare (no diagnosis, stage error…).
+    LearnFailed(String),
     /// A resumed session's transcript (replaces the current history).
     SessionLoaded(Vec<crate::cells::Cell>),
 

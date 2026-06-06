@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO(lessons): remove once Task 3 wires /learn
-
 //! Learned lessons (self-improvement rung 2): `/learn` distills `/analyze`
 //! diagnoses into `<config-dir>/lessons.md`, which is injected into the
 //! agent's system prompt at startup. The agent can only touch the WORKSPACE
