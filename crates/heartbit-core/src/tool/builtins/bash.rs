@@ -214,13 +214,14 @@ impl Tool for BashTool {
             }
 
             // Build the command: cd to tracked cwd, run user command, then print pwd.
-            // Detect trailing `&` to avoid `{ cmd &; }` syntax error
-            // (`&` is a command terminator — `&;` is invalid bash).
-            let wrapped = if command.trim_end().ends_with('&') {
-                format!("{{ {} }}", command)
-            } else {
-                format!("{{ {}; }}", command)
-            };
+            // The closing brace sits on its OWN LINE: a same-line `; }` glued
+            // onto a heredoc terminator (`EOF; }`) or after a trailing comment
+            // never closes the group — live /analyze finding: EVERY heredoc
+            // failed with "syntax error near unexpected token `;'". A newline
+            // terminates the last command just like `;` would, and it also
+            // covers a trailing `&` (previously a special case: `&;` is
+            // invalid bash).
+            let wrapped = format!("{{ {}\n}}", command);
             // SECURITY (F-FS-8): use a per-spawn nonce in the cwd marker so
             // the running command cannot forge it via `echo`. The previous
             // fixed `__HEARTBIT_CWD__=` was emit-able from any echo and let
@@ -455,6 +456,45 @@ mod tests {
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("hello"));
+        assert!(result.content.contains("exit code: 0"));
+    }
+
+    // Live /analyze finding: the `{ cmd; }` wrap glued `; }` onto the heredoc
+    // terminator (`EOF; }`), so the heredoc never closed and EVERY heredoc
+    // failed with "syntax error near unexpected token `;'". The closing brace
+    // must sit on its own line.
+    #[tokio::test]
+    async fn bash_heredoc_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let tool = BashTool::new();
+        let cmd = format!("cat > '{}' << 'EOF'\nhello heredoc\nEOF", path.display());
+        let result = tool
+            .execute(&crate::ExecutionContext::default(), json!({"command": cmd}))
+            .await
+            .unwrap();
+        assert!(!result.is_error, "heredoc failed: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hello heredoc\n",
+            "heredoc body must reach the file"
+        );
+    }
+
+    // Same root cause, different surface: a trailing comment used to swallow
+    // the same-line `; }` and break the wrapper.
+    #[tokio::test]
+    async fn bash_trailing_comment_is_safe() {
+        let tool = BashTool::new();
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo hi # trailing comment"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("hi"));
         assert!(result.content.contains("exit code: 0"));
     }
 
