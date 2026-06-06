@@ -180,6 +180,15 @@ impl Msg {
             AgentEvent::DoomLoopDetected { .. } => {
                 Some(Msg::Notice("doom-loop detected — intervening".into()))
             }
+            AgentEvent::RetryAttempt {
+                attempt,
+                max_retries,
+                delay_ms,
+                error_class,
+                ..
+            } => Some(Msg::Notice(format!(
+                "LLM retry {attempt}/{max_retries} in {delay_ms}ms ({error_class})"
+            ))),
             _ => None,
         }
     }
@@ -247,6 +256,24 @@ mod tests {
             partial_usage: TokenUsage::default(),
         };
         assert!(matches!(Msg::from_event(ev), Some(Msg::RunFailed(e)) if e == "kaboom"));
+    }
+
+    #[test]
+    fn retry_attempt_becomes_a_notice() {
+        let ev = AgentEvent::RetryAttempt {
+            agent: "(provider)".into(),
+            attempt: 2,
+            max_retries: 3,
+            delay_ms: 1500,
+            error_class: "rate_limited".into(),
+        };
+        match Msg::from_event(ev) {
+            Some(Msg::Notice(n)) => {
+                assert!(n.contains("2/3"), "got: {n}");
+                assert!(n.contains("rate_limited"), "got: {n}");
+            }
+            _ => panic!("expected Notice"),
+        }
     }
 
     #[test]
