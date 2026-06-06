@@ -634,7 +634,12 @@ async fn build_engine(
         .on_event(on_event)
         .on_approval(on_approval)
         .on_input(on_input)
-        .interrupt(interrupt);
+        .interrupt(interrupt)
+        // Doom-loop detection (live /analyze finding: a 7-error retry spiral
+        // ran unchecked — the infra existed in core but was never enabled
+        // here). Identical batches abort fast; near-duplicates get more rope.
+        .max_identical_tool_calls(3)
+        .max_fuzzy_identical_tool_calls(5);
     // The squad available for delegation: each sub-agent gets its own context
     // stack (recitation / restore-on-demand / compaction / replan).
     for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
