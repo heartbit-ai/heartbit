@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::io::BufRead;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-tool aggregate.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolStat {
     pub count: usize,
     pub errors: usize,
@@ -21,11 +21,13 @@ pub struct ToolStat {
     pub p50_ms: u64,
     pub p95_ms: u64,
     #[serde(skip)]
-    durations: Vec<u64>,
+    pub(crate) durations: Vec<u64>,
 }
 
 /// The deterministic summary of one trace file.
-#[derive(Debug, Default, Serialize)]
+/// `Clone + Deserialize` because it now travels inside [`crate::cells::Cell`]
+/// (session persistence round-trips the transcript as JSON).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceStats {
     pub records: usize,
     pub skipped_lines: usize,
@@ -33,6 +35,9 @@ pub struct TraceStats {
     pub turns: usize,
     pub llm_calls: usize,
     pub total_input_tokens: u64,
+    /// Prompt-cache reads summed across LLM calls (0 when caching is off) —
+    /// the cache hit-rate numerator for the `/stats` card.
+    pub total_cache_read_tokens: u64,
     pub total_output_tokens: u64,
     pub llm_latency_p50_ms: u64,
     pub llm_latency_p95_ms: u64,
@@ -124,6 +129,8 @@ pub fn compute(reader: impl std::io::Read) -> TraceStats {
                 s.turn_input_tokens.push(inp);
                 s.total_input_tokens += inp;
                 s.total_output_tokens += ev["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                s.total_cache_read_tokens +=
+                    ev["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0);
                 llm_latencies.push(ev["latency_ms"].as_u64().unwrap_or(0));
                 let ttft = ev["time_to_first_token_ms"].as_u64().unwrap_or(0);
                 if ttft > 0 {
@@ -262,6 +269,19 @@ mod tests {
             "{ this line is torn garba",
         ];
         lines.join("\n")
+    }
+
+    #[test]
+    fn compute_sums_cache_read_tokens() {
+        let trace = [
+            r#"{"v":1,"seq":0,"ts":"2026-06-06T10:00:00.000Z","src":"agent","event":{"type":"llm_response","agent":"o","turn":1,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":40},"tool_call_count":0,"latency_ms":10,"time_to_first_token_ms":5}}"#,
+            r#"{"v":1,"seq":1,"ts":"2026-06-06T10:00:01.000Z","src":"agent","event":{"type":"llm_response","agent":"o","turn":2,"usage":{"input_tokens":200,"output_tokens":10,"cache_read_input_tokens":150},"tool_call_count":0,"latency_ms":10,"time_to_first_token_ms":5}}"#,
+        ]
+        .join("\n");
+        let s = compute(trace.as_bytes());
+        assert_eq!(s.total_cache_read_tokens, 190);
+        // Absent field (the golden fixture has none) sums to 0 — no panic.
+        assert_eq!(compute(fixture().as_bytes()).total_cache_read_tokens, 0);
     }
 
     #[test]
