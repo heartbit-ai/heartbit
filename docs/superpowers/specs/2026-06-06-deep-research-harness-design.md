@@ -70,7 +70,7 @@ honestly.
   and the standard send path (`running`, `follow`, `seed_idle_squad`,
   `Effect::SendInput(task)`) with the imperative task:
 
-  > Call the `run_workflow` tool now with name="deep_research" and
+  > Call the `run_workflow` tool now with recipe="deep_research" and
   > args={"question": "<question>"}. Do NOT search, browse, or implement anything
   > yourself before the workflow returns. When it returns, write the report
   > verbatim to `research-<slug>.md` (workspace-relative path) with the write

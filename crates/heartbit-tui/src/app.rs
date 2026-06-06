@@ -1043,7 +1043,7 @@ impl App {
                 }
                 let slug = research_slug(&arg);
                 let task = format!(
-                    "Call the run_workflow tool now with name=\"deep_research\" and \
+                    "Call the run_workflow tool now with recipe=\"deep_research\" and \
                      args={{\"question\": {q}}}. Do NOT search, browse, or implement \
                      anything yourself before the workflow returns. When it returns, \
                      write the report verbatim to research-{slug}.md (workspace-relative \
@@ -2895,7 +2895,9 @@ mod tests {
             })
             .expect("task sent");
         assert!(task.contains("run_workflow"), "{task}");
-        assert!(task.contains("deep_research"), "{task}");
+        // The tool's schema param is `recipe` (required) — the template must
+        // name it exactly, not paraphrase it (a weaker model won't bridge it).
+        assert!(task.contains("recipe=\"deep_research\""), "{task}");
         assert!(
             task.contains("research-plate-solving-algorithms.md"),
             "{task}"
