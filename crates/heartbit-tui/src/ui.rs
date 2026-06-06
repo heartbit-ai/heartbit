@@ -56,10 +56,11 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         );
     }
     if let Some(active) = &app.active {
-        // The streaming reply renders PLAIN — Markdown is applied only when the
-        // cell finalizes into history, so partial markup (e.g. an unclosed `**`)
+        // Live Markdown while streaming: COMPLETED blocks (blank-line
+        // boundary, fence-aware) render styled immediately; only the
+        // in-flight tail stays raw — so partial markup (an unclosed `**`)
         // never flashes styled mid-stream.
-        lines.extend(active.split('\n').map(|l| Line::raw(l.to_string())));
+        lines.extend(crate::markdown::render_streaming(active));
     }
     lines
 }
@@ -900,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_renders_plain_finalized_renders_markdown() {
+    fn streaming_renders_completed_blocks_live_and_tail_raw() {
         fn joined(lines: &[Line<'static>]) -> String {
             lines
                 .iter()
@@ -908,14 +909,20 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         }
-        // Streaming `active`: raw Markdown shown as-is (no transient half-parsed markup).
+        // Streaming `active`: COMPLETED blocks render styled immediately;
+        // the in-flight tail stays raw (no transient half-parsed markup).
         let mut app = App::new("m");
-        app.active = Some("# Heading **bold**".into());
+        app.active = Some("# Done\n\nstill **typing".into());
+        let t = joined(&transcript_lines(&app));
         assert!(
-            joined(&transcript_lines(&app)).contains("# Heading **bold**"),
-            "streaming text must render plain"
+            !t.contains('#'),
+            "completed heading must render styled while streaming: {t}"
         );
-        // Finalized agent cell: Markdown rendered (markers gone).
+        assert!(
+            t.contains("**typing"),
+            "the in-flight tail must stay raw: {t}"
+        );
+        // Finalized agent cell: full Markdown rendered (markers gone).
         let mut app2 = App::new("m");
         app2.history.push(Cell::Agent("# Heading **bold**".into()));
         let t = joined(&transcript_lines(&app2));

@@ -65,6 +65,46 @@ impl Renderer {
     }
 }
 
+/// Byte index of the last SAFE block boundary for live streaming: the end of
+/// the last blank line that is OUTSIDE any open ``` fence. Everything before
+/// it is a completed Markdown block (stable across future deltas); everything
+/// after is the in-flight tail. 0 = nothing completed yet.
+fn safe_split(text: &str) -> usize {
+    let mut in_fence = false;
+    let mut split = 0usize;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        } else if trimmed.is_empty() && !in_fence && line.ends_with('\n') {
+            split = offset + line.len();
+        }
+        offset += line.len();
+    }
+    split
+}
+
+/// Live-streaming render: completed blocks styled, the in-flight tail raw —
+/// partial markers (`**term` before its close) never flash styled, which is
+/// what previously forced streaming to render all-plain.
+pub fn render_streaming(text: &str) -> Vec<Line<'static>> {
+    let split = safe_split(text);
+    let mut lines = if split > 0 {
+        render(&text[..split])
+    } else {
+        Vec::new()
+    };
+    let tail = &text[split..];
+    if !tail.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.extend(tail.split('\n').map(|l| Line::raw(l.to_string())));
+    }
+    lines
+}
+
 /// Render Markdown `text` into styled ratatui lines.
 pub fn render(text: &str) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
@@ -214,6 +254,58 @@ mod tests {
     #[test]
     fn plain_text_passthrough() {
         assert_eq!(all_text(&render("hello world")).trim(), "hello world");
+    }
+
+    // Live markdown while streaming: COMPLETED blocks (delimited by a blank
+    // line outside code fences) render styled immediately; only the in-flight
+    // tail stays raw — so partial markers (`**term` before its close) never
+    // flash styled, which is why streaming was previously all-plain.
+    #[test]
+    fn streaming_styles_completed_blocks_and_keeps_tail_raw() {
+        let lines = render_streaming("# Done Title\n\nnow **partial");
+        // The completed heading is styled (hashes dropped, coloured)…
+        let s = span_containing(&lines, "Done Title").expect("heading text");
+        assert_eq!(s.style.fg, Some(HEADING));
+        assert!(!all_text(&lines).contains('#'));
+        // …while the unfinished tail keeps its raw markers untouched.
+        assert!(
+            all_text(&lines).contains("**partial"),
+            "tail must stay raw: {}",
+            all_text(&lines)
+        );
+    }
+
+    #[test]
+    fn streaming_with_no_completed_block_is_all_raw() {
+        let lines = render_streaming("just **typing");
+        assert_eq!(all_text(&lines).trim(), "just **typing");
+    }
+
+    #[test]
+    fn streaming_open_fence_holds_the_whole_fence_raw() {
+        // A blank line INSIDE an open ``` fence is not a block boundary — the
+        // fence stays raw until it closes (else half a code block would
+        // render as styled prose).
+        let text = "intro\n\n```rust\nlet a = 1;\n\nlet b = 2;";
+        let lines = render_streaming(text);
+        let flat = all_text(&lines);
+        assert!(flat.contains("```rust"), "open fence stays raw: {flat}");
+        assert!(flat.contains("let b = 2;"));
+        // The completed intro before the fence is processed as markdown
+        // (passthrough text here).
+        assert!(flat.contains("intro"));
+    }
+
+    #[test]
+    fn streaming_closed_fence_renders_styled() {
+        let text = "```rust\nlet a = 1;\n```\n\ntail **wip";
+        let lines = render_streaming(text);
+        let flat = all_text(&lines);
+        // Fence markers are dropped by the renderer once the block completes…
+        assert!(!flat.contains("```"), "closed fence renders styled: {flat}");
+        assert!(flat.contains("let a = 1;"));
+        // …and the tail stays raw.
+        assert!(flat.contains("**wip"));
     }
 
     #[test]
