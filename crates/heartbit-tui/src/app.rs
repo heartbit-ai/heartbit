@@ -194,6 +194,28 @@ pub enum Effect {
     Quit,
 }
 
+impl Effect {
+    /// Stable name for the trace (`ui` `effect` records).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Effect::SendInput(_) => "send_input",
+            Effect::SaveKey(_) => "save_key",
+            Effect::SaveModel(_) => "save_model",
+            Effect::SaveMcp(_) => "save_mcp",
+            Effect::FetchModels => "fetch_models",
+            Effect::WalkFiles => "walk_files",
+            Effect::SaveContextRecall(_) => "save_context_recall",
+            Effect::SaveVerifyCommand(_) => "save_verify_command",
+            Effect::SetPermissionMode(_) => "set_permission_mode",
+            Effect::ExportSession => "export_session",
+            Effect::ListSessions => "list_sessions",
+            Effect::ResumeSession(_) => "resume_session",
+            Effect::Interrupt => "interrupt",
+            Effect::Quit => "quit",
+        }
+    }
+}
+
 /// A pending tool-approval prompt.
 pub struct ApprovalModal {
     pub tools: Vec<PendingTool>,
@@ -1417,6 +1439,13 @@ mod tests {
         let mut app = App::new("m");
         app.api_key = Some("sk-or-test".into());
         app
+    }
+
+    #[test]
+    fn effect_names_are_stable_snake_case() {
+        assert_eq!(Effect::FetchModels.name(), "fetch_models");
+        assert_eq!(Effect::SendInput("x".into()).name(), "send_input");
+        assert_eq!(Effect::Interrupt.name(), "interrupt");
     }
 
     #[test]

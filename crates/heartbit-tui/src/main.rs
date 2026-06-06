@@ -51,42 +51,83 @@ use crate::msg::{Msg, PendingTool};
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
 
-/// Opt-in file logging for diagnosing the interrupt chain. The TUI owns the
-/// terminal (alt-screen) so stderr is unusable; route `heartbit::interrupt`
-/// checkpoints to a file instead. Set `HEARTBIT_TUI_DEBUG=1` (→
-/// `/tmp/heartbit-tui-debug.log`) or `HEARTBIT_TUI_DEBUG=/path/to/log`.
-fn init_debug_logging() {
-    let Ok(val) = std::env::var("HEARTBIT_TUI_DEBUG") else {
-        return;
+/// Initialize tracing: the always-on trace bridge (`heartbit::interrupt` →
+/// `core_trace` records in the session trace) plus the legacy opt-in debug
+/// file (`HEARTBIT_TUI_DEBUG=1` → `/tmp/heartbit-tui-debug.log` — unchanged,
+/// additive). Both layers carry a `Targets` filter scoped to the interrupt
+/// target, so global span/event interest stays as narrow as before.
+fn init_tracing(trace_handle: trace::TraceHandle) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let target_filter = || {
+        tracing_subscriber::filter::Targets::new().with_target(
+            trace::INTERRUPT_TARGET,
+            tracing::level_filters::LevelFilter::INFO,
+        )
     };
+    let bridge = trace::TracingBridge::new(trace_handle).with_filter(target_filter());
+    let legacy = legacy_debug_file().map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_filter(target_filter())
+    });
+    let _ = tracing_subscriber::registry()
+        .with(bridge)
+        .with(legacy)
+        .try_init();
+    tracing::info!(target: "heartbit::interrupt", "--- heartbit-tui debug logging started ---");
+}
+
+/// The legacy `HEARTBIT_TUI_DEBUG` file, if requested. The TUI owns the
+/// terminal (alt-screen) so stderr is unusable; `HEARTBIT_TUI_DEBUG=1` routes
+/// `heartbit::interrupt` checkpoints to `/tmp/heartbit-tui-debug.log` (or a
+/// custom path). Same semantics as before the trace existed.
+fn legacy_debug_file() -> Option<std::fs::File> {
+    let val = std::env::var("HEARTBIT_TUI_DEBUG").ok()?;
     if val.is_empty() {
-        return;
+        return None;
     }
     let path = if val == "1" || val == "true" {
         "/tmp/heartbit-tui-debug.log".to_string()
     } else {
         val
     };
-    let Ok(file) = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-    else {
-        return;
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(file))
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "heartbit::interrupt=info",
-        ))
-        .try_init();
-    tracing::info!(target: "heartbit::interrupt", "--- heartbit-tui debug logging started ---");
+        .ok()
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_debug_logging();
+    // A per-launch session id (time + pid) for transcript persistence — it
+    // also keys the execution trace.
+    let session_id = format!(
+        "{:x}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    // agent -> UI (sync sends from callbacks); UI -> agent (async on_input feed).
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+    // Always-on execution trace (one JSONL per launch, next to the session
+    // JSON). A write error self-disables tracing and surfaces ONE notice —
+    // the trace must never take down or block the session.
+    let trace_handle = trace::spawn_writer(
+        trace::trace_path(&session::sessions_dir(), &session_id),
+        Box::new({
+            let tx = ui_tx.clone();
+            move |e| {
+                let _ = tx.send(Msg::Notice(e));
+            }
+        }),
+    );
+    init_tracing(trace_handle.clone());
     let cfg = config::TuiConfig::load();
     let api_key = std::env::var("OPENROUTER_API_KEY")
         .ok()
@@ -101,8 +142,6 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| !s.is_empty())
         .unwrap_or(false);
 
-    // agent -> UI (sync sends from callbacks); UI -> agent (async on_input feed).
-    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let input_rx = Arc::new(Mutex::new(input_rx));
     let cwd = std::env::current_dir()?;
@@ -128,18 +167,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let interrupt = InterruptHandle::new();
-    // Shared permission posture (0=default,1=accept-edits,2=plan,3=auto), cycled
-    // by the UI (Shift+Tab) and read live by the agent thread's `on_approval`.
+    // Shared permission posture (0=normal, 1=plan, 2=yolo), cycled by the UI
+    // (Shift+Tab) and read live by the agent thread's `on_approval`.
     let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    // A per-launch session id (time + pid) for transcript persistence.
-    let session_id = format!(
-        "{:x}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        std::process::id()
-    );
+
+    // Config snapshot at launch — the trace's first record.
+    trace_handle.record_ui(&trace::UiEvent::SessionStarted {
+        version: env!("CARGO_PKG_VERSION").into(),
+        session_id: session_id.clone(),
+        model: app.model.clone(),
+        permission_mode: app.permission_mode.label().to_lowercase(),
+        mcp_servers: cfg.mcp_servers.iter().map(|s| s.label()).collect(),
+        context_recall: app.context_recall,
+        verify_command: app.verify_command.clone(),
+    });
 
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
@@ -157,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         interrupt,
         perm_mode,
         session_id,
+        trace_handle,
     )
     .await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
@@ -166,14 +208,18 @@ async fn main() -> anyhow::Result<()> {
 
 /// Resolve a provider. OpenRouter is preferred (the project's qwen setup); an
 /// `ANTHROPIC_API_KEY` env var is a fallback when no OpenRouter key is configured.
+/// `on_retry` surfaces retry attempts as `AgentEvent::RetryAttempt` (mirrors
+/// heartbit-cli's `build_on_retry`) — retries are diagnostic gold and were
+/// previously invisible in the TUI.
 fn build_provider(
     openrouter_key: Option<String>,
     model: &str,
+    on_retry: Arc<heartbit_core::OnRetry>,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
     if let Some(key) = openrouter_key {
         let base = OpenRouterProvider::new(key, model);
         return Ok(Arc::new(BoxedProvider::new(
-            RetryingProvider::with_defaults(base),
+            RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
     }
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
@@ -187,7 +233,7 @@ fn build_provider(
         };
         let base = heartbit_core::AnthropicProvider::new(&key, anthropic_model);
         return Ok(Arc::new(BoxedProvider::new(
-            RetryingProvider::with_defaults(base),
+            RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
     }
     anyhow::bail!("no OpenRouter API key configured (set one with /key or OPENROUTER_API_KEY)")
@@ -326,8 +372,49 @@ async fn build_engine(
     context_window: Option<u32>,
     verify_command: Option<String>,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
+    trace: trace::TraceHandle,
 ) -> anyhow::Result<Engine> {
-    let provider = build_provider(api_key, model)?;
+    // on_event is defined BEFORE the provider so retry attempts can flow
+    // through the same path (event → trace tap + UI message).
+    let on_event: Arc<OnEvent> = {
+        let tx = ui_tx.clone();
+        let trace_events = trace.clone();
+        Arc::new(move |e: AgentEvent| {
+            // Lossless trace tap — BEFORE Msg::from_event (which drops a subset).
+            trace_events.record_agent(&e);
+            // Legacy opt-in diagnostics (HEARTBIT_TUI_DEBUG) — unchanged. These
+            // also land as `core_trace` records via the bridge; the canonical
+            // typed stream is `agent`/`ui`, so the redundancy is accepted.
+            if let AgentEvent::ToolCallStarted {
+                tool_name, agent, ..
+            } = &e
+            {
+                tracing::info!(target: "heartbit::interrupt", tool_started = %tool_name, agent = %agent, "tool dispatched");
+            }
+            if let AgentEvent::SubAgentsDispatched { agents, .. } = &e {
+                tracing::info!(target: "heartbit::interrupt", ?agents, "sub-agents dispatched");
+            }
+            if let Some(m) = Msg::from_event(e) {
+                let _ = tx.send(m);
+            }
+        })
+    };
+    // Wire RetryAttempt emission (mirrors heartbit-cli's build_on_retry).
+    let on_retry: Arc<heartbit_core::OnRetry> = {
+        let cb = on_event.clone();
+        Arc::new(
+            move |attempt: u32, max_retries: u32, delay_ms: u64, error_class: &str| {
+                cb(AgentEvent::RetryAttempt {
+                    agent: "(provider)".into(), // provider-level: agent name unavailable
+                    attempt,
+                    max_retries,
+                    delay_ms,
+                    error_class: error_class.to_string(),
+                });
+            },
+        )
+    };
+    let provider = build_provider(api_key, model, on_retry)?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents.
@@ -387,39 +474,39 @@ async fn build_engine(
             let _ = tx.send(Msg::ReasoningDelta(s.to_string()));
         })
     };
-    let on_event: Arc<OnEvent> = {
-        let tx = ui_tx.clone();
-        Arc::new(move |e: AgentEvent| {
-            // Opt-in diagnostics (HEARTBIT_TUI_DEBUG): surface tool dispatch +
-            // multi-agent delegation, which the TUI owns the terminal so can't show.
-            if let AgentEvent::ToolCallStarted {
-                tool_name, agent, ..
-            } = &e
-            {
-                tracing::info!(target: "heartbit::interrupt", tool_started = %tool_name, agent = %agent, "tool dispatched");
-            }
-            if let AgentEvent::SubAgentsDispatched { agents, .. } = &e {
-                tracing::info!(target: "heartbit::interrupt", ?agents, "sub-agents dispatched");
-            }
-            if let Some(m) = Msg::from_event(e) {
-                let _ = tx.send(m);
-            }
-        })
-    };
     let on_approval: Arc<OnApproval> = {
         let tx = ui_tx.clone();
         let perm_mode = perm_mode.clone();
+        let trace_approvals = trace.clone();
         Arc::new(move |calls: &[heartbit_core::llm::types::ToolCall]| {
+            let started = std::time::Instant::now();
+            let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
             for c in calls {
                 tracing::info!(target: "heartbit::interrupt", approval_for = %c.name, "on_approval");
             }
+            // Every gate resolution is traced with the human think-time and the
+            // mode in effect (rung-2 learning gold).
+            let record = |decision: &ApprovalDecision, mode: &str, latency_ms: u64| {
+                trace_approvals.record_ui(&trace::UiEvent::Approval {
+                    tools: names.clone(),
+                    decision: trace::decision_label(decision).into(),
+                    latency_ms,
+                    mode: mode.into(),
+                });
+            };
             // Execution mode gates the prompt (read live, cross-thread; u8 from
             // PermissionMode::as_u8): 2=YOLO → allow all; 1=Plan → deny any
             // mutating tool (read-only); 0=Normal → ask (modal).
             let is_mutating = |n: &str| matches!(n, "edit" | "write" | "patch" | "bash");
             match perm_mode.load(std::sync::atomic::Ordering::Relaxed) {
-                2 => return ApprovalDecision::Allow,
-                1 if calls.iter().any(|c| is_mutating(&c.name)) => return ApprovalDecision::Deny,
+                2 => {
+                    record(&ApprovalDecision::Allow, "yolo", 0);
+                    return ApprovalDecision::Allow;
+                }
+                1 if calls.iter().any(|c| is_mutating(&c.name)) => {
+                    record(&ApprovalDecision::Deny, "plan", 0);
+                    return ApprovalDecision::Deny;
+                }
                 _ => {}
             }
             let tools = calls
@@ -437,9 +524,16 @@ async fn build_engine(
                 })
                 .is_err()
             {
+                record(&ApprovalDecision::Deny, "normal", 0);
                 return ApprovalDecision::Deny;
             }
-            reply_rx.recv().unwrap_or(ApprovalDecision::Deny)
+            let decision = reply_rx.recv().unwrap_or(ApprovalDecision::Deny);
+            record(
+                &decision,
+                "normal",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            decision
         })
     };
     let on_input: Arc<OnInput> = {
@@ -629,10 +723,21 @@ fn spawn_agent(
     interrupt: &InterruptHandle,
     epoch: u64,
     perm_mode: &Arc<std::sync::atomic::AtomicU8>,
+    trace: &trace::TraceHandle,
+    reason: &'static str,
 ) -> bool {
     if app.api_key.is_none() && !app.has_fallback_provider {
         return false; // no provider yet — wait until a key is set
     }
+    // Snapshot the config that actually shapes the engine — the eager-spawn
+    // stale-config bug class is diagnosed from these records.
+    trace.record_ui(&trace::UiEvent::AgentSpawned {
+        epoch,
+        model: app.model.clone(),
+        reason: reason.into(),
+        context_recall: app.context_recall,
+        verify_command: app.verify_command.clone(),
+    });
     let api_key = app.api_key.clone();
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
@@ -645,6 +750,7 @@ fn spawn_agent(
     let cwd = cwd.to_path_buf();
     let interrupt = interrupt.clone();
     let perm_mode = perm_mode.clone();
+    let trace = trace.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -664,6 +770,7 @@ fn spawn_agent(
                 context_window,
                 verify_command,
                 perm_mode,
+                trace,
             )
             .await
             {
@@ -699,6 +806,7 @@ async fn run_ui(
     interrupt: InterruptHandle,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
     session_id: String,
+    trace: trace::TraceHandle,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
@@ -718,6 +826,8 @@ async fn run_ui(
         &interrupt,
         agent_epoch,
         &perm_mode,
+        &trace,
+        "startup",
     );
 
     loop {
@@ -760,8 +870,11 @@ async fn run_ui(
         }
 
         for effect in std::mem::take(&mut app.effects) {
+            let effect_name = effect.name();
+            let effect_started = std::time::Instant::now();
             match effect {
                 Effect::SendInput(text) => {
+                    trace.record_ui(&trace::UiEvent::UserInput { text: text.clone() });
                     // Spawn-if-not-started (covers the no-key-at-startup path and a
                     // re-spawn after a session ended via RunCompleted). The first
                     // message reaches the agent over the same channel `on_input` uses
@@ -776,6 +889,8 @@ async fn run_ui(
                             &interrupt,
                             agent_epoch,
                             &perm_mode,
+                            &trace,
+                            "respawn",
                         );
                     }
                     let _ = input_tx.send(text);
@@ -798,6 +913,8 @@ async fn run_ui(
                             &interrupt,
                             agent_epoch,
                             &perm_mode,
+                            &trace,
+                            "key_set",
                         );
                     }
                 }
@@ -819,7 +936,13 @@ async fn run_ui(
                 }
                 Effect::SetPermissionMode(m) => {
                     // Apply live to the shared gate the agent's on_approval reads.
-                    perm_mode.store(m, std::sync::atomic::Ordering::Relaxed);
+                    let old = perm_mode.swap(m, std::sync::atomic::Ordering::Relaxed);
+                    if old != m {
+                        trace.record_ui(&trace::UiEvent::ModeChanged {
+                            from: trace::mode_label(old).into(),
+                            to: trace::mode_label(m).into(),
+                        });
+                    }
                 }
                 Effect::ExportSession => {
                     let md = session::to_markdown(&app.history);
@@ -839,6 +962,9 @@ async fn run_ui(
                 }
                 Effect::ResumeSession(id) => match session::load(&session::sessions_dir(), &id) {
                     Ok(s) => {
+                        trace.record_ui(&trace::UiEvent::SessionResumed {
+                            from_id: id.clone(),
+                        });
                         let _ = ui_tx.send(Msg::SessionLoaded(s.history));
                     }
                     Err(e) => app
@@ -887,6 +1013,12 @@ async fn run_ui(
                     });
                 }
                 Effect::Interrupt => {
+                    // Typed ui records mirror CP1/CP2 (stats counts cp1); the
+                    // tracing lines stay for the legacy debug file + core_trace.
+                    trace.record_ui(&trace::UiEvent::InterruptRequested {
+                        checkpoint: "cp1_effect_dequeued".into(),
+                        running: app.running,
+                    });
                     tracing::info!(
                         target: "heartbit::interrupt",
                         checkpoint = "CP1_tui_effect_interrupt",
@@ -900,32 +1032,53 @@ async fn run_ui(
                         is_cancelled = interrupt.is_interrupted(),
                         "interrupt.interrupt() returned"
                     );
+                    trace.record_ui(&trace::UiEvent::InterruptRequested {
+                        checkpoint: "cp2_handle_interrupted".into(),
+                        running: app.running,
+                    });
                 }
                 Effect::Quit => app.should_quit = true,
             }
+            trace.record_ui(&trace::UiEvent::Effect {
+                name: effect_name.into(),
+                duration_ms: u64::try_from(effect_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            });
         }
 
         // Auto-save the transcript at turn boundaries (idle + changed) so the
-        // session is always resumable; and once more on quit.
+        // session is always resumable; and once more on quit. Failures used to
+        // be silent — they now surface as `error` trace records.
         if !app.running && app.history.len() != last_saved_len {
-            save_session(&session_id, &app.history);
+            if let Err(e) = save_session(&session_id, &app.history) {
+                trace.record_ui(&trace::UiEvent::Error {
+                    context: "session_save".into(),
+                    message: e.to_string(),
+                });
+            }
             last_saved_len = app.history.len();
         }
 
         if app.should_quit {
-            save_session(&session_id, &app.history);
+            if let Err(e) = save_session(&session_id, &app.history) {
+                trace.record_ui(&trace::UiEvent::Error {
+                    context: "session_save".into(),
+                    message: e.to_string(),
+                });
+            }
             break;
         }
     }
     Ok(())
 }
 
-/// Persist the current transcript under the session id (best-effort, silent).
-fn save_session(id: &str, history: &[crate::cells::Cell]) {
+/// Persist the current transcript under the session id (best-effort; errors
+/// surface as trace records at the call sites).
+fn save_session(id: &str, history: &[crate::cells::Cell]) -> std::io::Result<()> {
     let s = session::Session {
         id: id.to_string(),
         created: id.to_string(),
         history: history.to_vec(),
     };
-    let _ = session::save(&session::sessions_dir(), &s);
+    session::save(&session::sessions_dir(), &s)
 }

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO(trace): remove once Task 5 wires the module
-
 //! Always-on execution trace: one JSONL file per launch under
 //! `<config-dir>/sessions/<id>.trace.jsonl`. Three sources feed one versioned
 //! envelope: `agent` (raw [`heartbit_core::AgentEvent`]s, tapped before
@@ -130,7 +128,7 @@ impl TraceHandle {
     /// Record one event under the versioned envelope. Never blocks, never
     /// panics; a no-op once the writer has self-disabled.
     pub fn record(&self, src: TraceSrc, event: serde_json::Value) {
-        if self.disabled.load(Ordering::Relaxed) {
+        if self.is_disabled() {
             return;
         }
         let rec = TraceRecord {
@@ -218,6 +216,11 @@ pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> 
         // All senders dropped → session over; file already flushed per line.
     });
     handle
+}
+
+/// The trace file for a session id, under the sessions dir.
+pub fn trace_path(dir: &std::path::Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.trace.jsonl"))
 }
 
 /// The target core's interrupt-chain checkpoints (CP3/CP4) and the TUI's
@@ -671,5 +674,14 @@ mod tests {
         );
         assert_eq!(rec.event["fields"]["turn"], 4);
         assert_eq!(rec.event["fields"]["message"], "cancel armed");
+    }
+
+    #[test]
+    fn trace_path_is_sessions_id_trace_jsonl() {
+        let p = trace_path(std::path::Path::new("/tmp/sessions"), "abc-1");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/sessions/abc-1.trace.jsonl")
+        );
     }
 }
