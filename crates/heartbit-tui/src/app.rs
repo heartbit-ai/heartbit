@@ -380,6 +380,9 @@ pub struct App {
     /// Highlighted row in the `/` command-autocomplete menu.
     pub menu_selected: usize,
     pub spinner: usize,
+    /// Startup splash tick counter — `Some(t)` while the splash overlay is up
+    /// (armed by main from config); `None` once dismissed (timer or any key).
+    pub splash: Option<u8>,
     pub should_quit: bool,
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
@@ -420,6 +423,7 @@ impl App {
             last_max_off: std::cell::Cell::new(0),
             menu_selected: 0,
             spinner: 0,
+            splash: None,
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),
@@ -576,7 +580,13 @@ impl App {
     /// Apply a message, mutating state and queuing effects.
     pub fn update(&mut self, msg: Msg) {
         match msg {
-            Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
+            Msg::Tick => {
+                self.spinner = self.spinner.wrapping_add(1);
+                if let Some(t) = self.splash {
+                    let t = t.saturating_add(1);
+                    self.splash = (t < crate::splash::SPLASH_TICKS).then_some(t);
+                }
+            }
             Msg::Resize => {}
             // Mouse wheel scrolls the transcript (output history). Over-scrolling
             // is harmless — the renderer clamps the offset to the top.
@@ -598,6 +608,14 @@ impl App {
                 None => self.composer.insert_str(&s),
             },
             Msg::Key(key) => {
+                // Any key dismisses the splash and is CONSUMED — an impatient
+                // first keypress must not leak a stray char into the composer
+                // (nor reach a modal hidden beneath the overlay).
+                if self.splash.is_some() {
+                    self.splash = None;
+                    let _ = key;
+                    return;
+                }
                 if self.modal.is_some() {
                     self.handle_modal_key(key);
                 } else {
@@ -2867,6 +2885,29 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::KeyEntry(_))));
         assert!(!app.running);
         assert!(!app.effects.contains(&Effect::Learn));
+    }
+
+    #[test]
+    fn splash_auto_dismisses_after_its_ticks() {
+        let mut app = keyed();
+        app.splash = Some(0);
+        for _ in 0..(crate::splash::SPLASH_TICKS - 1) {
+            app.update(Msg::Tick);
+        }
+        assert!(app.splash.is_some(), "still up one tick before the end");
+        app.update(Msg::Tick);
+        assert_eq!(app.splash, None, "gone at SPLASH_TICKS");
+    }
+
+    #[test]
+    fn splash_key_dismisses_and_is_consumed() {
+        let mut app = keyed();
+        app.splash = Some(2);
+        app.update(key(KeyCode::Char('h')));
+        assert_eq!(app.splash, None, "any key dismisses");
+        assert_eq!(app.composer.text(), "", "the dismissing key must NOT type");
+        app.update(key(KeyCode::Char('h')));
+        assert_eq!(app.composer.text(), "h", "subsequent keys flow normally");
     }
 
     #[test]
