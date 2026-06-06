@@ -1687,21 +1687,33 @@ git commit -m "feat(tui): /stats — deterministic trace stats in the transcript
 - Modify: `crates/heartbit-tui/src/msg.rs`
 - Modify: `crates/heartbit-tui/src/main.rs`
 
+**CRITICAL path constraint (verified `builtins/mod.rs:225-238`):** with
+`workspace = Some(cwd)` — which the TUI sets — the `read`/`grep`/`write`
+builtins REJECT absolute paths. The agent cannot touch
+`~/.config/heartbit/sessions/` directly. Therefore the edge STAGES a snapshot
+copy of the trace into cwd (`heartbit-trace-<id>.jsonl`) before sending the
+prompt, and the diagnosis is written to cwd (`heartbit-diagnosis-<id>.md`,
+following the `/export`-writes-to-cwd precedent, main.rs:825). Bonus: the
+snapshot freezes the current session's trace, so the agent's greps don't race
+the live writer. And since `read`/`grep` carry silent Allow permission rules,
+investigation has ZERO approval friction (only the final `write` prompts once
+in Normal mode).
+
 - [ ] **Step 1: Write the failing prompt-builder test (trace.rs)**
 
 ```rust
     #[test]
-    fn analyze_prompt_embeds_path_stats_and_deliverable() {
-        let p = build_analyze_prompt(
-            std::path::Path::new("/tmp/sessions/s1.trace.jsonl"),
-            "s1",
-            "{\"turns\":2}",
-        );
-        assert!(p.contains("/tmp/sessions/s1.trace.jsonl"));
+    fn analyze_prompt_embeds_staged_path_stats_and_deliverable() {
+        let p = build_analyze_prompt("heartbit-trace-s1.jsonl", "s1", "{\"turns\":2}");
+        assert!(p.contains("heartbit-trace-s1.jsonl"));
         assert!(p.contains("{\"turns\":2}"));
-        assert!(p.contains("s1.diagnosis.md"));
+        assert!(p.contains("heartbit-diagnosis-s1.md"));
         assert!(p.contains("\"v\":"), "format reference present");
         assert!(p.to_lowercase().contains("do not read the whole file"));
+        assert!(
+            !p.contains("/.config/"),
+            "must reference only workspace-relative paths — builtins reject absolute paths"
+        );
     }
 ```
 
@@ -1713,14 +1725,17 @@ Run: `cargo test -p heartbit-tui trace::tests::analyze_prompt` → FAIL.
 /// The `/analyze` task template. Why a prompt const and not a SKILL.md:
 /// skills are progressive disclosure for when the AGENT decides; here the
 /// COMMAND knows the guidance is needed, every time. Promotable later.
-pub fn build_analyze_prompt(trace_path: &std::path::Path, session_id: &str, stats_json: &str) -> String {
-    let path = trace_path.display();
-    let dir = trace_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+///
+/// `staged_trace` is a WORKSPACE-RELATIVE path (e.g. `heartbit-trace-s1.jsonl`)
+/// — the edge stages a snapshot copy into cwd because the workspace-rooted
+/// builtins reject absolute paths (resolve_path, F-FS containment).
+pub fn build_analyze_prompt(staged_trace: &str, session_id: &str, stats_json: &str) -> String {
     format!(
         r#"Analyze this heartbit-tui execution trace and produce a diagnosis report.
 
 ## Inputs
-- Trace file (JSONL, one record per line): {path}
+- Trace file (JSONL, one record per line), in the current directory: {staged_trace}
+  (a frozen snapshot of session {session_id} — safe to grep, it won't change)
 - Deterministic stats (already computed — trust these numbers):
 ```json
 {stats_json}
@@ -1739,12 +1754,13 @@ Each line: {{"v":1,"seq":N,"ts":"<rfc3339>","src":"agent|ui|core_trace","event":
 - src="core_trace": raw interrupt-chain log mirror — ignore unless diagnosing interrupts.
 
 ## How to investigate (IMPORTANT: do not read the whole file — it can be huge)
-Use targeted greps/jq on specific spots, e.g.:
-- errors:        grep '"is_error":true' {path}
-- one tool call: grep '"tool_call_id":"<id>"' {path}
-- retries:       grep '"type":"retry_attempt"' {path}
-- slowest LLM:   jq -r 'select(.event.type=="llm_response") | "\(.event.latency_ms) seq=\(.seq)"' {path} | sort -rn | head
-- a time window: grep '"seq":12' -A0 {path} (seq is monotonic; use ranges via jq)
+Prefer the `grep` and `read` tools (they run silently); use bash/jq only when
+you need aggregation. Targeted spots, e.g.:
+- errors:        grep "\"is_error\":true" in {staged_trace}
+- one tool call: grep "\"tool_call_id\":\"<id>\"" in {staged_trace}
+- retries:       grep "\"type\":\"retry_attempt\"" in {staged_trace}
+- slowest LLM (bash): jq -r 'select(.event.type=="llm_response") | "\(.event.latency_ms) seq=\(.seq)"' {staged_trace} | sort -rn | head
+- a moment in time: grep "\"seq\":42," in {staged_trace} (seq is monotonic — read neighbors for context)
 
 ## Diagnosis dimensions
 1. Errors & root chains (failed tools → what the agent did next; did it recover?)
@@ -1756,9 +1772,10 @@ Use targeted greps/jq on specific spots, e.g.:
 
 ## Deliverable
 1. Present the findings concisely in your answer (cite seq numbers as evidence).
-2. Write the full report to {dir}/{session_id}.diagnosis.md with sections:
-   Summary, Findings (each: evidence seq refs + impact), Recommendations
-   (ranked, concrete — config/prompt/code), Stats appendix.
+2. Write the full report to heartbit-diagnosis-{session_id}.md (current
+   directory) with sections: Summary, Findings (each: evidence seq refs +
+   impact), Recommendations (ranked, concrete — config/prompt/code), Stats
+   appendix.
 "#
     )
 }
@@ -1856,6 +1873,7 @@ New effect arm:
                 Effect::Analyze(target) => {
                     let tx = ui_tx.clone();
                     let sid = session_id.clone();
+                    let workdir = cwd.clone();
                     tokio::spawn(async move {
                         let prepared = tokio::task::spawn_blocking(move || {
                             let dir = session::sessions_dir();
@@ -1872,9 +1890,16 @@ New effect arm:
                                 .and_then(|n| n.strip_suffix(".trace.jsonl"))
                                 .unwrap_or("session")
                                 .to_string();
+                            // Stage a snapshot into the workspace: the agent's
+                            // builtins (read/grep/write) REJECT absolute paths
+                            // when workspace-rooted, and the copy freezes the
+                            // current session's still-growing trace.
+                            let staged = format!("heartbit-trace-{id}.jsonl");
+                            std::fs::copy(&path, workdir.join(&staged))
+                                .map_err(|e| e.to_string())?;
                             Ok::<(String, String), String>((
-                                format!("analyzing session {id} (trace: {})", path.display()),
-                                trace::build_analyze_prompt(&path, &id, &stats_json),
+                                format!("analyzing session {id} (staged: {staged})"),
+                                trace::build_analyze_prompt(&staged, &id, &stats_json),
                             ))
                         })
                         .await
@@ -1958,17 +1983,22 @@ de-ANSI'd settled frame contains `turns` and `llm latency` (space-insensitive).
 
 - [ ] **Step 3: `/analyze` produces a diagnosis citing real facts**
 
-In the same session: `/analyze last` + Enter → the agent runs (approve any
-write modal). Wait for ready. Assert:
+In the same session: `/analyze last` + Enter → the agent runs (read/grep are
+silent; approve the final write modal). Wait for ready. Assert (in the cwd
+the TUI was launched from — staging + diagnosis both land there):
 
 ```bash
-D=$(ls -t ~/.config/heartbit/sessions/*.diagnosis.md | head -1)
-test -s "$D" && grep -qi "seq" "$D" && echo "diagnosis cites trace evidence OK"
+test -s heartbit-trace-*.jsonl && echo "trace staged into workspace OK"
+D=$(ls -t heartbit-diagnosis-*.md | head -1)
+test -s "$D" && grep -qi "seq" "$D" && echo "diagnosis exists and cites seq evidence"
+# The bar: a cited seq must actually exist in the staged trace — pick one
+# number the report cites and verify it:
+S=$(grep -o 'seq[ =:]*[0-9]\+' "$D" | grep -o '[0-9]\+' | head -1)
+grep -q "\"seq\":$S," heartbit-trace-*.jsonl && echo "cited seq $S is real OK"
 ```
 
 The bar (per the MCP lesson): the diagnosis must cite **specific seq numbers /
-tool names that exist in the trace file** — verify one cited seq actually
-appears in the trace. A generic essay is a FAIL.
+tool names that exist in the trace file**. A generic essay is a FAIL.
 
 - [ ] **Step 4: Legacy debug log unaffected**
 
@@ -1989,5 +2019,5 @@ git commit -m "test(tui): live-validate execution trace + /stats + /analyze" # i
 ## Self-review (run after writing, fix inline)
 
 1. **Spec coverage:** envelope v1 ✓ (T1) · writer thread/0600/self-disable ✓ (T2) · core_trace bridge subsumes CP3/CP4 ✓ (T3) · RetryAttempt wiring ✓ (T4+T5) · all UI event types from the spec table ✓ (T1/T5: session_started, user_input, agent_spawned, mode_changed, effect, approval+latency+mode, interrupt_requested, session_resumed, error) · lossless agent tap before `Msg::from_event` ✓ (T5) · no `on_text`/`on_reasoning` tracing ✓ (taps don't touch them) · stats dimensions ✓ (T6) · `/stats` ✓ (T7) · `/analyze` with stats-first + targeted greps + diagnosis.md ✓ (T8) · tolerant readers ✓ (T6) · legacy `HEARTBIT_TUI_DEBUG` untouched-but-additive ✓ (T5 `legacy_debug_file`) · live validation bar ✓ (T10).
-2. **Known divergence (documented):** `agent_spawned` carries `context_recall`/`verify_command` instead of the spec's `multi_agent` (the static flag no longer shapes the engine — unified entry agent).
+2. **Known divergences (documented):** (a) `agent_spawned` carries `context_recall`/`verify_command` instead of the spec's `multi_agent` (the static flag no longer shapes the engine — unified entry agent). (b) The diagnosis is written to **cwd** (`heartbit-diagnosis-<id>.md`, `/export` precedent) over a **staged trace copy** (`heartbit-trace-<id>.jsonl`) — not "next to the trace" in the config dir as the spec first said: the workspace-rooted builtins reject absolute paths (`resolve_path`, verified `builtins/mod.rs:225-238`), and the snapshot also freezes a still-growing current-session trace. Spec updated to match.
 3. **Type consistency check:** `TraceHandle.record_ui(&UiEvent)` / `record_agent(&AgentEvent)` used consistently in T5/T7/T8; `Effect::name()` (T5) gains arms in T7 (`compute_stats`) and T8 (`analyze`); `Msg::StatsReady(Result<String,String>)` matches the edge's `Ok(render())`/`Err(String)`; `resolve_trace_target(&dir, &sid, target.as_deref())` signature consistent between T7 and T8.

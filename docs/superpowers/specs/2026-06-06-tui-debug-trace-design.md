@@ -133,15 +133,22 @@ Default target = current session so far; `last` = most recent previous session.
 Composes a task for the **regular agent** (no new engine):
 
 1. Run the stats pre-pass.
-2. Build a prompt from a **template const** containing: the stats JSON, the trace
-   file path, the trace-format reference, jq/grep recipes, and the diagnosis
-   dimensions (errors & root chains, doom loops, latency outliers, token waste,
-   approval friction, interrupt causes).
-3. Send through the normal `Effect::SendInput` path. The agent investigates
-   *specific* spots with its existing read/grep/bash tools — it never slurps the
-   whole file — then presents findings in the transcript **and** saves
-   `<id>.diagnosis.md` next to the trace via its write tool (one approval prompt
-   in Normal mode; none in YOLO).
+2. **Stage a snapshot copy** of the trace into the workspace
+   (`heartbit-trace-<id>.jsonl` in cwd). Required, not cosmetic: the
+   workspace-rooted builtins **reject absolute paths** (`resolve_path`,
+   `builtins/mod.rs:225-238`), so the agent cannot touch
+   `~/.config/heartbit/sessions/` directly — and the snapshot freezes a
+   still-growing current-session trace so greps don't race the writer.
+3. Build a prompt from a **template const** containing: the stats JSON, the
+   staged trace path, the trace-format reference, grep/jq recipes, and the
+   diagnosis dimensions (errors & root chains, doom loops, latency outliers,
+   token waste, approval friction, interrupt causes).
+4. Send through the normal `Effect::SendInput` path. The agent investigates
+   *specific* spots — `read`/`grep` builtins are allow-listed, so investigation
+   is **silent** — it never slurps the whole file — then presents findings in
+   the transcript **and** saves `heartbit-diagnosis-<id>.md` in cwd (the
+   `/export`-writes-to-cwd precedent; one write-approval prompt in Normal mode,
+   none in YOLO).
 
 **Why a prompt template, not a SKILL.md:** skills are progressive disclosure for
 when the *agent* decides; here the *command* knows the guidance is needed, every
