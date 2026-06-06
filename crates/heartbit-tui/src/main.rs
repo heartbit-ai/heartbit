@@ -27,6 +27,7 @@ mod markdown;
 mod models;
 mod msg;
 mod session;
+mod splash;
 mod trace;
 mod trace_stats;
 mod ui;
