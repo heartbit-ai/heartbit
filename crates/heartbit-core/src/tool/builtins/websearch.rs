@@ -288,8 +288,32 @@ impl WebSearchTool {
             .await
             .map_err(|e| Error::Agent(format!("Failed to read DuckDuckGo response: {e}")))?;
 
-        Ok(parse_duckduckgo_html(&html, num_results))
+        duckduckgo_results_or_block(&html, num_results)
     }
+}
+
+/// Parse a DuckDuckGo HTML page, surfacing the anti-bot wall as an ERROR.
+/// DDG serves a 200 OK challenge page under scraping pressure (live finding:
+/// the first query works, every later one gets the wall); parsing it to an
+/// empty set masked the block as "No search results found." and sent the
+/// model fabricating URLs. Genuine empty pages still return Ok(vec![]).
+fn duckduckgo_results_or_block(html: &str, max_results: u64) -> Result<Vec<SearchResult>, Error> {
+    let results = parse_duckduckgo_html(html, max_results);
+    if results.is_empty() {
+        let lower = html.to_lowercase();
+        let walled = !html.contains("result__a")
+            && (lower.contains("anomaly") || lower.contains("challenge") || lower.contains("bots"));
+        if walled {
+            return Err(Error::Agent(
+                "DuckDuckGo blocked this request (anti-bot challenge page). \
+                 Scraped search is rate-limited; configure EXA_API_KEY, \
+                 TAVILY_API_KEY, or BRAVE_API_KEY for reliable search, or \
+                 wait before retrying."
+                    .into(),
+            ));
+        }
+    }
+    Ok(results)
 }
 
 impl Default for WebSearchTool {
@@ -298,6 +322,7 @@ impl Default for WebSearchTool {
     }
 }
 
+#[derive(Debug)]
 struct SearchResult {
     title: String,
     url: String,
@@ -628,6 +653,43 @@ mod tests {
     fn definition_has_correct_name() {
         let tool = WebSearchTool::new();
         assert_eq!(tool.definition().name, "websearch");
+    }
+
+    // Live finding: DuckDuckGo serves a 200 OK anti-bot page from the second
+    // scrape onwards (markers: "anomaly"/"challenge"/"bots", zero result__a
+    // divs). Parsing it to an EMPTY result set masked the block as a benign
+    // "No search results found." — the model then fabricated URLs (8× 404).
+    // A bot-wall must surface as an ERROR; a genuine empty stays a success.
+    #[test]
+    fn ddg_bot_wall_is_an_error_not_an_empty_success() {
+        let wall = r#"<html><body>
+            <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+            <p>Please complete the following challenge to confirm this search
+            was made by a human.</p></body></html>"#;
+        let err = duckduckgo_results_or_block(wall, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("anti-bot"), "got: {err}");
+        assert!(
+            err.contains("API_KEY"),
+            "error must point at configuring a real provider: {err}"
+        );
+    }
+
+    #[test]
+    fn ddg_genuine_empty_stays_a_success() {
+        let empty = r#"<html><body><div class="no-results">
+            No results found for your search.</div></body></html>"#;
+        let results = duckduckgo_results_or_block(empty, 8).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ddg_results_page_parses_normally() {
+        let page = r#"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=x">Title A</a>"#;
+        let results = duckduckgo_results_or_block(page, 8).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Title A");
     }
 
     #[test]
