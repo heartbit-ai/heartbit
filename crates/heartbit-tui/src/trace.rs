@@ -166,9 +166,11 @@ impl TraceHandle {
 }
 
 /// Spawn the writer thread for `path` (parent dirs created; file 0600,
-/// append-only, flushed per line). `on_error` fires AT MOST ONCE if the file
-/// can't be opened or written — the trace then self-disables for the session;
-/// it must never take down or block a run.
+/// append-only, written straight through per line — `std::fs::File` is
+/// unbuffered, so each `writeln!` reaches the OS; no fsync by design).
+/// `on_error` fires AT MOST ONCE if the file can't be opened or written —
+/// the trace then self-disables for the session; it must never take down or
+/// block a run.
 pub fn spawn_writer(path: PathBuf, on_error: Box<dyn FnOnce(String) + Send>) -> TraceHandle {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let disabled = Arc::new(AtomicBool::new(false));
@@ -536,5 +538,38 @@ mod tests {
         handle.record_ui(&UiEvent::UserInput {
             text: "ignored".into(),
         });
+    }
+
+    #[test]
+    fn concurrent_producers_get_unique_complete_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.trace.jsonl");
+        let handle = spawn_writer(path.clone(), Box::new(|_| {}));
+        let producers: Vec<_> = (0..4)
+            .map(|i| {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    for j in 0..25 {
+                        h.record_ui(&UiEvent::UserInput {
+                            text: format!("t{i}-{j}"),
+                        });
+                    }
+                })
+            })
+            .collect();
+        for p in producers {
+            p.join().unwrap();
+        }
+        let lines = wait_for_lines(&path, 100);
+        assert_eq!(lines.len(), 100);
+        // file order is NOT authoritative under concurrent producers — the seq
+        // field is. We assert the SET of seqs is exactly {0..100} (unique and
+        // complete); readers sort by seq, never by file position.
+        let mut seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<TraceRecord>(l).unwrap().seq)
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (0..100).collect::<Vec<u64>>());
     }
 }
