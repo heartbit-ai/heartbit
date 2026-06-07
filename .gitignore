@@ -51,3 +51,6 @@ heartbit-diagnosis-*.md
 heartbit-lessons.md
 
 research-*.md
+
+# Agent scratch/temporary work (the "temporary directory" the prompt points at)
+scratch/

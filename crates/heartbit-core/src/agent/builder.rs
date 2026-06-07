@@ -788,14 +788,25 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             None => self.system_prompt,
         };
 
-        // Append workspace hint to the system prompt if configured.
+        // Append workspace hint to the system prompt if configured. State the
+        // BOUNDARY explicitly: the file tools jail every path to the workspace,
+        // so the agent must not waste turns probing outside it (live finding —
+        // models repeatedly tried /tmp for "a temporary directory", got
+        // rejected, and thrashed because the prompt never said it was blocked).
         if let Some(ref ws) = self.workspace {
             system_prompt.push_str(&format!(
-                "\n\nYour workspace directory is {}. You can freely create, organize, and manage \
-                 files there. Use it for notes, intermediate results, generated artifacts, and \
-                 anything you want to persist. Paths can be relative (resolved against workspace) \
-                 or absolute.",
-                ws.display()
+                "\n\n## Filesystem boundary (read this before any file work)\n\
+                 Your workspace directory is {ws}. The file tools (read/write/edit/grep/glob) \
+                 can ONLY access paths INSIDE it: a relative path resolves against the \
+                 workspace, and an absolute path is accepted ONLY when it already points \
+                 inside the workspace. Any path OUTSIDE (e.g. /tmp, your home directory, /etc) \
+                 is REJECTED — do NOT attempt it. If a task asks for a 'temporary' or 'scratch' \
+                 area, create a SUBDIRECTORY inside the workspace (e.g. ./scratch) — that IS \
+                 your temporary directory. bash's working directory is also confined here; \
+                 `cd` outside the workspace is silently ignored, so use workspace-relative or \
+                 absolute-inside-workspace paths and treat the workspace as your filesystem \
+                 root. Within it you can freely create, organize, and manage files.",
+                ws = ws.display()
             ));
         }
 

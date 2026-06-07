@@ -5267,6 +5267,16 @@ mod tests {
         assert!(runner.system_prompt.contains("/test/workspace"));
         assert!(runner.system_prompt.contains("base prompt"));
         assert!(runner.system_prompt.contains("workspace directory"));
+        // …and state the BOUNDARY so the agent doesn't probe /tmp and thrash.
+        assert!(
+            runner.system_prompt.contains("REJECTED"),
+            "the prompt must say outside-workspace paths are rejected"
+        );
+        assert!(
+            runner.system_prompt.to_lowercase().contains("temporary")
+                && runner.system_prompt.contains("./scratch"),
+            "the prompt must point 'temporary' work at a workspace subdirectory"
+        );
     }
 
     #[tokio::test]
