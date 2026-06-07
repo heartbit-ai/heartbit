@@ -186,6 +186,62 @@ const PLAN_GATE_BACKSTOP_AT: u32 = 3;
 /// mutation set; design doc §4 resolves the two semantics by intent).
 const MODE_READONLY_DENY: &[&str] = &["edit", "write", "patch", "bash"];
 
+/// Rustc failure classes the repair-hint gate recognizes (live finding
+/// 6a258ab2: the model iterated blind on E0405 sqlx API drift).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RustcHintClass {
+    /// Unresolved name/trait/method in an external crate → the model's API
+    /// knowledge is stale; ground in the CURRENT docs before retrying.
+    StaleApi,
+    /// Type mismatch → read the exact signature, don't iterate on guesses.
+    TypeMismatch,
+    /// Borrow/move errors → restructure ownership, mechanical retries fail.
+    Ownership,
+}
+
+/// Classify a failing tool output (cargo/rustc) into a repair-hint class.
+fn classify_rustc_failure(output: &str) -> Option<RustcHintClass> {
+    if !output.contains("error[") && !output.contains("error:") {
+        return None;
+    }
+    const STALE: &[&str] = &[
+        "error[E0405]",
+        "error[E0412]",
+        "error[E0433]",
+        "error[E0599]",
+        "unresolved import",
+        "cannot find trait",
+        "cannot find type",
+        "cannot find function",
+        "no method named",
+    ];
+    if STALE.iter().any(|p| output.contains(p)) {
+        return Some(RustcHintClass::StaleApi);
+    }
+    if output.contains("error[E0308]") {
+        return Some(RustcHintClass::TypeMismatch);
+    }
+    const OWN: &[&str] = &[
+        "error[E0382]",
+        "error[E0499]",
+        "error[E0502]",
+        "error[E0505]",
+    ];
+    if OWN.iter().any(|p| output.contains(p)) {
+        return Some(RustcHintClass::Ownership);
+    }
+    None
+}
+
+/// True when a failing output looks like a failed BUILD (for the consecutive-
+/// failure escalation counter).
+fn is_build_failure(output: &str) -> bool {
+    output.contains("error[E") || output.contains("could not compile")
+}
+
+/// Consecutive failed-build batches after which the escalation hint fires.
+const ESCALATION_AFTER_FAILURES: u32 = 3;
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -810,6 +866,13 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut scope_declared = false;
             let mut mutating_calls: u32 = 0;
             let mut plan_gate_fired = false;
+            // Repair-hint gates (one per class per request) + the consecutive
+            // failed-build escalation counter.
+            let mut hint_fired: std::collections::HashSet<RustcHintClass> =
+                std::collections::HashSet::new();
+            let mut deps_hint_fired = false;
+            let mut consecutive_build_failures: u32 = 0;
+            let mut escalation_fired = false;
             // Request-intent mode (router): routed per fresh request; the
             // harness enforces the contract. Without a router, everything is
             // EXECUTE (today's semantics).
@@ -1815,6 +1878,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                         scope_declared = carried;
                         mutating_calls = 0;
                         plan_gate_fired = false;
+                        hint_fired.clear();
+                        deps_hint_fired = false;
+                        consecutive_build_failures = 0;
+                        escalation_fired = false;
                         question_called = false;
                         study_contract_nudged = false;
                         continue;
@@ -2140,22 +2207,32 @@ impl<P: LlmProvider> AgentRunner<P> {
                             mutations = would_be,
                             "plan gate: building without a plan artifact"
                         );
+                        let design_check = if self.tools.contains_key("advisor") {
+                            " Finally, get a quick design review: call the `advisor` \
+                             tool with your plan (criteria, scope, dependency choices) — \
+                             one frontier review prevents over-engineering."
+                        } else {
+                            ""
+                        };
                         let results: Vec<ToolResult> = tool_calls
                             .iter()
                             .map(|tc| {
                                 ToolResult::error(
                                     tc.id.clone(),
-                                    "[plan gate] You are building without a plan. This \
-                                     request needs the front half FIRST: if any requirement \
-                                     is unclear (interface, data model, persistence, scope), \
-                                     ask the user with the `question` tool; otherwise write \
-                                     todos with acceptance criteria (todowrite) and install \
-                                     the goal (set_goal) — the `intake` recipe does both for \
-                                     a feature request. ALSO declare your working scope with \
-                                     set_scope (the exact target directory — honor every \
-                                     location constraint in the request, e.g. 'a temporary \
-                                     directory' means OUTSIDE this repository). THEN build."
-                                        .to_string(),
+                                    format!(
+                                        "[plan gate] You are building without a plan. This \
+                                         request needs the front half FIRST: if any \
+                                         requirement is unclear (interface, data model, \
+                                         persistence, scope), ask the user with the \
+                                         `question` tool; otherwise write todos with \
+                                         acceptance criteria (todowrite) and install the \
+                                         goal (set_goal) — the `intake` recipe does both \
+                                         for a feature request. ALSO declare your working \
+                                         scope with set_scope (the exact target directory \
+                                         — honor every location constraint in the request, \
+                                         e.g. 'a temporary directory' means OUTSIDE this \
+                                         repository).{design_check} THEN build."
+                                    ),
                                 )
                             })
                             .collect();
@@ -2398,7 +2475,91 @@ impl<P: LlmProvider> AgentRunner<P> {
                     doom_tracker.note_batch_outcome(results.iter().any(|r| r.is_error));
                 }
 
+                // Repair-hint gates: deterministic scanners over the batch.
+                // (a) rustc failure classes → one targeted hint per class per
+                // request; (b) consecutive failed builds → advisor escalation;
+                // (c) hand-written Cargo.toml deps → cargo-add hint.
+                let mut pending_hints: Vec<String> = Vec::new();
+                {
+                    let mut batch_has_build_failure = false;
+                    for r in results.iter().filter(|r| r.is_error) {
+                        if is_build_failure(&r.content) {
+                            batch_has_build_failure = true;
+                        }
+                        if let Some(class) = classify_rustc_failure(&r.content)
+                            && hint_fired.insert(class)
+                        {
+                            let hint = match class {
+                                RustcHintClass::StaleApi => {
+                                    let fetch = if self.tools.contains_key("webfetch") {
+                                        "fetch the crate's CURRENT docs first \
+                                         (webfetch https://docs.rs/<crate>/latest)"
+                                    } else {
+                                        "consult the crate's CURRENT docs first"
+                                    };
+                                    format!(
+                                        "[repair hint] Unresolved name/method in an external \
+                                         crate: your knowledge of its API is likely STALE — \
+                                         do not guess again. {fetch}, and add dependencies \
+                                         with `cargo add <crate>` (resolves the real current \
+                                         version) instead of hand-writing versions."
+                                    )
+                                }
+                                RustcHintClass::TypeMismatch => "[repair hint] Type \
+                                     mismatch: read the EXACT signature/type definition \
+                                     (read the source or docs) before editing — don't \
+                                     iterate on guessed casts."
+                                    .to_string(),
+                                RustcHintClass::Ownership => "[repair hint] Borrow/move \
+                                     error: re-read the FULL error span and restructure \
+                                     ownership (scope the borrows, clone deliberately) — \
+                                     mechanical retries rarely fix these."
+                                    .to_string(),
+                            };
+                            pending_hints.push(hint);
+                        }
+                    }
+                    if batch_has_build_failure {
+                        consecutive_build_failures += 1;
+                        if !escalation_fired
+                            && consecutive_build_failures >= ESCALATION_AFTER_FAILURES
+                            && self.tools.contains_key("advisor")
+                        {
+                            escalation_fired = true;
+                            pending_hints.push(format!(
+                                "[escalation] {consecutive_build_failures} consecutive \
+                                 failed builds on this request. Stop iterating: consult \
+                                 the `advisor` tool with the FULL error output and your \
+                                 last attempt before trying again."
+                            ));
+                        }
+                    } else if results.iter().any(|r| !r.is_error) {
+                        consecutive_build_failures = 0;
+                    }
+                }
+                if !deps_hint_fired
+                    && allowed_calls.iter().any(|c| {
+                        matches!(c.name.as_str(), "write" | "edit")
+                            && c.input
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|p| p.ends_with("Cargo.toml"))
+                            && c.input.to_string().contains("dependencies")
+                    })
+                {
+                    deps_hint_fired = true;
+                    pending_hints.push(
+                        "[deps hint] You hand-wrote Cargo.toml dependency versions — \
+                         prefer `cargo add <crate>`: it resolves the CURRENT version and \
+                         features, avoiding stale-API guesswork."
+                            .to_string(),
+                    );
+                }
+
                 ctx.add_tool_results(results);
+                if !pending_hints.is_empty() {
+                    ctx.add_user_message(pending_hints.join("\n\n"));
+                }
 
                 // Hard ingestion cap: a single fresh tool result must never be
                 // able to blow the context window (pruning only trims OLD
@@ -5118,6 +5279,159 @@ mod tests {
         assert!(
             names.contains(&"write".to_string()),
             "no router → no masking: {names:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_api_error_triggers_docs_hint() {
+        // Live finding 6a258ab2: E0405 (sqlx API drift) → the model guessed
+        // repeatedly instead of grounding itself in the CURRENT docs.
+        struct FailingBash;
+        impl Tool for FailingBash {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "bash".into(),
+                    description: "bash".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                Box::pin(async {
+                    Ok(ToolOutput::error(
+                        "error[E0405]: cannot find trait `SqliteArgument` in crate `sqlx`",
+                    ))
+                })
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("bash", 10),
+            MockProvider::text_response("hmm", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(FailingBash))
+            .tool(Arc::new(NamedTool { name: "webfetch" }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("compile le projet").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[repair hint]")
+                && t.contains("docs.rs")
+                && t.contains("cargo add")),
+            "stale-API failure must inject the docs-first hint: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handwritten_cargo_toml_triggers_cargo_add_hint() {
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::types::CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    input: serde_json::json!({
+                        "file_path": "/tmp/x/Cargo.toml",
+                        "content": "[package]\nname=\"x\"\n[dependencies]\nsqlx = \"0.6\"\n"
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("crée le projet dans /tmp/x").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let hinted = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::Text { text }
+                if text.contains("[deps hint]") && text.contains("cargo add"))
+            });
+        assert!(
+            hinted,
+            "hand-written dependency versions must get the cargo-add hint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn third_consecutive_build_failure_suggests_advisor() {
+        struct AlwaysFailing;
+        impl Tool for AlwaysFailing {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "bash".into(),
+                    description: "bash".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                Box::pin(async {
+                    Ok(ToolOutput::error(
+                        "error[E0308]: mismatched types — expected `String`, found `i32`",
+                    ))
+                })
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("bash", 10),
+            tool_use_named("bash", 10),
+            tool_use_named("bash", 10),
+            MockProvider::text_response("stuck", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(AlwaysFailing))
+            .tool(Arc::new(NamedTool { name: "advisor" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        runner.execute("fixe le build").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let escalated = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::Text { text }
+                if text.contains("[escalation]") && text.contains("advisor"))
+            });
+        assert!(
+            escalated,
+            "3 consecutive failed builds must suggest the advisor escalation"
         );
     }
 

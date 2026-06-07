@@ -877,6 +877,10 @@ impl App {
                 // continue deliberately (the 402 incident left an amnesiac
                 // respawn with no bridge).
                 self.effects.push(Effect::EmergencyHandoff(error));
+                // Failed sessions are exactly what /learn distills best.
+                self.history.push(Cell::Notice(
+                    "tip: /learn can distill lessons from this failure".into(),
+                ));
             }
             Msg::Approval { tools, reply } => {
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
@@ -1665,6 +1669,26 @@ impl App {
         self.effects.push(Effect::Interrupt);
         self.finalize_active();
         self.history.push(Cell::Notice("interrupted".into()));
+        // An interrupt after a string of tool errors usually means the user
+        // watched the agent struggle — suggest distilling the lesson.
+        let errors = self
+            .history
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Cell::Tool {
+                        status: crate::cells::ToolStatus::Failed,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if errors >= 3 {
+            self.history.push(Cell::Notice(format!(
+                "{errors} tool errors this session — /learn can distill lessons from them"
+            )));
+        }
         self.running = false;
     }
 
@@ -2383,6 +2407,42 @@ mod tests {
         typed(&mut app, "/mode yolo");
         app.update(key(KeyCode::Enter));
         assert_eq!(app.permission_mode, PermissionMode::Yolo);
+    }
+
+    #[test]
+    fn run_failed_suggests_learn() {
+        let mut app = keyed();
+        app.update(Msg::RunFailed("boom".into()));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("/learn"))),
+            "a failed run must point at /learn"
+        );
+    }
+
+    #[test]
+    fn interrupt_after_many_tool_errors_suggests_learn() {
+        let mut app = keyed();
+        for _ in 0..3 {
+            app.history.push(Cell::Tool {
+                name: "bash".into(),
+                input: "{}".into(),
+                status: crate::cells::ToolStatus::Failed,
+                output: Some("error[E0308]".into()),
+                duration_ms: Some(5),
+                agent: None,
+            });
+        }
+        app.running = true;
+        app.update(key(KeyCode::Esc)); // interrupt
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("/learn"))),
+            "an error-heavy interrupted session must point at /learn: {:?}",
+            app.history.len()
+        );
     }
 
     #[test]
@@ -3177,7 +3237,12 @@ mod tests {
         app.running = true;
         app.update(Msg::RunFailed("boom".into()));
         assert!(!app.running);
-        assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("boom")));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("boom"))),
+            "failure notice present (the /learn tip may follow it)"
+        );
     }
 
     #[test]
