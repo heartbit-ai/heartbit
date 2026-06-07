@@ -794,7 +794,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Plan-gate state: wish phrasing of the CURRENT request, whether a
             // plan artifact (question/todos/goal/scope/recipe) was produced,
             // cumulative mutations, and the one-shot flag.
-            let mut request_is_wish = is_wish_request(&task);
+            let mut request_is_wish = is_wish_request(task);
             let mut plan_artifact_seen = false;
             let mut mutating_calls: u32 = 0;
             let mut plan_gate_fired = false;
