@@ -49,7 +49,9 @@ impl Tool for GlobTool {
         ToolDefinition {
             name: "glob".into(),
             description: "Find files matching a glob pattern. Returns file paths sorted by \
-                          path length (shortest first). Skips hidden files."
+                          path length (shortest first). Skips hidden files and build/dependency \
+                          directories (target, node_modules, dist, build, .git, __pycache__) \
+                          unless the pattern itself starts with that directory."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -120,6 +122,22 @@ impl Tool for GlobTool {
                             .components()
                             .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')));
                         if has_hidden {
+                            continue;
+                        }
+
+                        // Skip build/dependency dirs (target, node_modules, ...)
+                        // by component, relative to the search base. Exemption:
+                        // if the user's pattern itself BEGINS with that dir
+                        // (e.g. `target/**/*.rs`), they asked for it explicitly,
+                        // so don't filter. Rule is "starts with"; a mid-pattern
+                        // `**/target/*` is still filtered (acceptable per spec).
+                        let in_skip_dir = relative.components().any(|c| {
+                            c.as_os_str().to_str().is_some_and(|s| {
+                                super::SKIP_DIRS.contains(&s)
+                                    && !(pattern == s || pattern.starts_with(&format!("{s}/")))
+                            })
+                        });
+                        if in_skip_dir {
                             continue;
                         }
 
@@ -288,6 +306,68 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("visible.rs"));
         assert!(!result.content.contains(".hidden.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_skips_build_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("x.rs"), "").unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("y.rs"), "").unwrap();
+
+        let tool = GlobTool::new(None, Arc::new(Vec::new()));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "**/*.rs",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("y.rs"),
+            "should include src match: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("target"),
+            "must not include target/ paths: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_explicit_build_dir_pattern_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target").join("debug");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("x.rs"), "").unwrap();
+
+        // Pattern explicitly starts inside the build dir -> the skip rule must
+        // exempt it (the user deliberately asked for target/).
+        let tool = GlobTool::new(None, Arc::new(Vec::new()));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "pattern": "target/**/*.rs",
+                    "path": dir.path().to_str().unwrap()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("x.rs"),
+            "explicit target/ pattern should still return the file: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -199,6 +199,7 @@ impl CrmMockProvider {
                 ..Default::default()
             },
             model: Some("crm-mock-v1".into()),
+            reasoning: None,
         }
     }
 
@@ -221,6 +222,7 @@ impl CrmMockProvider {
                 ..Default::default()
             },
             model: Some("crm-mock-v1".into()),
+            reasoning: None,
         }
     }
 }

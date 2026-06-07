@@ -96,6 +96,43 @@ fn over_window_fraction(input_tokens: u32, window: u32, fraction: f32) -> bool {
     window > 0 && input_tokens as f32 >= fraction.clamp(0.0, 1.0) * window as f32
 }
 
+/// Default hard cap (bytes) on each FRESH tool result entering the context.
+/// 256KB matches the `read` builtin's own `MAX_FILE_SIZE` — a legitimate
+/// full-file read must never be truncated by this net. A single uncapped
+/// result (e.g. a grep sweeping build artifacts) once reached ~1MB and blew a
+/// 262K-token window in one turn. When the model window is known, the
+/// effective cap is additionally clamped to `window_tokens` bytes (≈ ¼ of the
+/// window in tokens) so small-window models stay protected.
+pub(super) const DEFAULT_TOOL_RESULT_INGEST_CAP: usize = 256 * 1024;
+
+/// Emergency per-result bound applied on a context-overflow error, before
+/// retrying. Deliberately aggressive: the window is already blown, and full
+/// content stays restorable via `fetch_full_output` when a recall store is set.
+const EMERGENCY_TOOL_RESULT_MAX_BYTES: usize = 4_096;
+
+/// Fallback bound (bytes) for the summarization transcript when the model's
+/// context window is unknown. 256KB ≈ 64K tokens.
+const DEFAULT_SUMMARY_INPUT_MAX_BYTES: usize = 262_144;
+
+/// Head+tail slice of an oversized summarization transcript: keeps the task
+/// (head) and the most recent activity (tail), drops the middle.
+fn bound_transcript(text: &str, budget: usize) -> String {
+    const MARKER: &str = "\n[transcript abridged for summary — middle omitted]\n";
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let head_budget = budget / 4;
+    let tail_budget = budget
+        .saturating_sub(head_budget)
+        .saturating_sub(MARKER.len());
+    let head_end = crate::tool::builtins::floor_char_boundary(text, head_budget);
+    let mut tail_start = text.len().saturating_sub(tail_budget);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{}{}", &text[..head_end], MARKER, &text[tail_start..])
+}
+
 /// Output of a completed agent run.
 ///
 /// Returned by [`AgentRunner::execute`] on success. Contains the agent's
@@ -208,6 +245,11 @@ pub struct AgentRunner<P: LlmProvider> {
     /// When set, tool outputs exceeding this byte threshold are compressed
     /// via an LLM call that preserves factual content while removing redundancy.
     pub(super) tool_output_compression_threshold: Option<usize>,
+    /// Hard cap (bytes) applied to each fresh tool result at ingestion into
+    /// the conversation context. Defaults to [`DEFAULT_TOOL_RESULT_INGEST_CAP`]
+    /// (64KB). Full output is preserved in `context_recall_store` (when set)
+    /// and in `AgentOutput::tool_call_records` regardless.
+    pub(super) tool_result_ingest_cap: Option<usize>,
     /// When set, limits the number of tool definitions sent per LLM turn.
     /// Tools are selected based on recent usage and keyword relevance.
     pub(super) max_tools_per_turn: Option<usize>,
@@ -346,6 +388,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             reasoning_effort: None,
             enable_reflection: false,
             tool_output_compression_threshold: None,
+            tool_result_ingest_cap: Some(DEFAULT_TOOL_RESULT_INGEST_CAP),
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
@@ -917,17 +960,51 @@ impl<P: LlmProvider> AgentRunner<P> {
                 let mut response = match llm_result {
                     Ok(r) => r,
                     Err(e) => {
-                        // Auto-compaction: on context overflow, summarize and retry
+                        // Context-overflow recovery. No message-count gate: the
+                        // 2026-06-07 incident overflowed at EXACTLY 5 messages
+                        // (one giant fresh tool result) and a `> 5` gate here
+                        // skipped recovery entirely.
                         if crate::llm::error_class::classify(&e)
                             == crate::llm::error_class::ErrorClass::ContextOverflow
                             && can_compact
-                            && ctx.message_count() > 5
                         {
                             tracing::warn!(
                                 agent = %self.name,
                                 error = %e,
-                                "context overflow detected, attempting auto-compaction"
+                                "context overflow detected, attempting recovery"
                             );
+                            // Deterministic first: hard-truncate oversized tool
+                            // results and retry WITHOUT an LLM call — a
+                            // summarization request would resend the very
+                            // context that just overflowed.
+                            let emergency_cap = self
+                                .session_prune_config
+                                .as_ref()
+                                .map(|c| c.pruned_tool_result_max_bytes)
+                                .unwrap_or(EMERGENCY_TOOL_RESULT_MAX_BYTES);
+                            let saved = ctx.truncate_oversized_tool_results(
+                                emergency_cap,
+                                self.context_recall_store.is_some(),
+                            );
+                            if saved > 0 {
+                                tracing::warn!(
+                                    agent = %self.name,
+                                    bytes_saved = saved,
+                                    emergency_cap,
+                                    "oversized tool results truncated, retrying"
+                                );
+                                self.emit(AgentEvent::AutoCompactionTriggered {
+                                    agent: self.name.clone(),
+                                    turn: ctx.current_turn(),
+                                    success: true,
+                                    usage: TokenUsage::default(),
+                                });
+                                compacted_last_turn = true;
+                                continue;
+                            }
+                            // Nothing oversized (aggregate bloat): fall back to
+                            // LLM summarization — `generate_summary` bounds its
+                            // transcript, so it cannot itself overflow.
                             match self.generate_summary(&ctx).await {
                                 Ok((Some(summary), summary_usage)) => {
                                     total_usage += summary_usage;
@@ -1861,6 +1938,33 @@ impl<P: LlmProvider> AgentRunner<P> {
 
                 ctx.add_tool_results(results);
 
+                // Hard ingestion cap: a single fresh tool result must never be
+                // able to blow the context window (pruning only trims OLD
+                // results; the proactive trigger only sees the PREVIOUS call's
+                // usage). Full content is already in the recall store (when
+                // set) and in `tool_call_records`.
+                if let Some(cap) = self.tool_result_ingest_cap {
+                    // Clamp to the model window when known: bytes ≈ tokens*4,
+                    // so `window_tokens` BYTES bounds one result to ~¼ of the
+                    // window in TOKENS (256KB default vs a 32K-token model
+                    // would otherwise still overflow it).
+                    let cap = match self.context_window_tokens {
+                        Some(window) => cap.min(window as usize),
+                        None => cap,
+                    };
+                    let saved =
+                        ctx.cap_last_tool_results(cap, self.context_recall_store.is_some());
+                    if saved > 0 {
+                        debug!(
+                            agent = %self.name,
+                            turn = ctx.current_turn(),
+                            bytes_saved = saved,
+                            cap,
+                            "fresh tool results capped at ingestion"
+                        );
+                    }
+                }
+
                 // Reflection: inject a user-role prompt that nudges the LLM to assess
                 // tool results before deciding the next action (Reflexion/CRITIC pattern).
                 if !tool_interrupted && self.enable_reflection {
@@ -1878,8 +1982,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // vs summarize_threshold when no window is known. Never compact two
                 // turns running (anti-thrash).
                 let proactive_trigger = match self.context_window_tokens {
+                    // max(real, estimate): the REAL count is from the PREVIOUS
+                    // response and is blind to tool results that landed since;
+                    // the chars/4 estimate of the live ctx catches fresh bloat.
                     Some(window) => over_window_fraction(
-                        last_input_tokens,
+                        last_input_tokens.max(ctx.total_tokens()),
                         window,
                         self.compaction_threshold_fraction,
                     ),
@@ -1955,7 +2062,15 @@ impl<P: LlmProvider> AgentRunner<P> {
         &self,
         ctx: &AgentContext,
     ) -> Result<(Option<String>, TokenUsage), Error> {
-        let text = ctx.conversation_text();
+        // Bound the transcript BEFORE summarizing: the summary call must never
+        // itself overflow the window it is trying to rescue. chars ≈ tokens*4,
+        // so window*2 bytes targets ~half the window; generous fixed fallback
+        // when the window is unknown.
+        let budget = self
+            .context_window_tokens
+            .map(|w| (w as usize).saturating_mul(2).max(2_048))
+            .unwrap_or(DEFAULT_SUMMARY_INPUT_MAX_BYTES);
+        let text = bound_transcript(&ctx.conversation_text(), budget);
         let lines: Vec<&str> = text.lines().collect();
 
         // Use recursive summarization for long conversations (>20 lines)
@@ -3426,6 +3541,345 @@ mod tests {
             reqs.iter()
                 .any(|r| r.system.contains("GOAL") && r.system.contains("DECISIONS")),
             "the summary call must use the structured preservation prompt"
+        );
+    }
+
+    /// A tool that returns `size` bytes of output (for context-size tests).
+    struct BigTool {
+        size: usize,
+    }
+    impl Tool for BigTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "big".into(),
+                description: "Returns a large output.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            let size = self.size;
+            Box::pin(async move { Ok(ToolOutput::success("x".repeat(size))) })
+        }
+    }
+
+    /// Tool-use response for tool `name` reporting `input_tokens`.
+    fn tool_use_named(name: &str, input_tokens: u32) -> crate::llm::types::CompletionResponse {
+        crate::llm::types::CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage {
+                input_tokens,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            model: None,
+        }
+    }
+
+    /// Extract all ToolResult contents from a request's messages.
+    fn tool_result_contents(req: &crate::llm::types::CompletionRequest) -> Vec<String> {
+        req.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn overflow_error() -> Error {
+        Error::Api {
+            status: 400,
+            message: "Prompt contains 325070 tokens and 0 draft tokens, too large for model \
+                      with 262144 maximum context length"
+                .into(),
+        }
+    }
+
+    // --- Layer 2: hard ingestion cap on fresh tool results ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_cap_truncates_giant_fresh_tool_result_by_default() {
+        // A 200KB fresh tool result must be capped at ingestion (default 64KB)
+        // so it can never blow the next request — the 2026-06-07 incident.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 400_000 }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let contents = tool_result_contents(&reqs[1]);
+        assert_eq!(contents.len(), 1);
+        assert!(
+            contents[0].len() <= super::DEFAULT_TOOL_RESULT_INGEST_CAP + 64,
+            "fresh result must be capped: got {} bytes",
+            contents[0].len()
+        );
+        assert!(contents[0].contains("[truncated:"), "non-restorable marker");
+        assert!(
+            !contents[0].contains("fetch_full_output"),
+            "no restore promise without a recall store"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_cap_marker_is_restorable_with_recall_store() {
+        let store = Arc::new(crate::agent::context_recall::ContextRecallStore::new());
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 400_000 }))
+            .context_recall_store(store.clone())
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        {
+            let reqs = provider.captured_requests.lock().unwrap();
+            let contents = tool_result_contents(&reqs[1]);
+            assert!(
+                contents[0].contains("fetch_full_output(\"call-1\")"),
+                "restorable marker must name the ref: {}",
+                &contents[0][contents[0].len().saturating_sub(200)..]
+            );
+        }
+        // Full content must be restorable from the store.
+        let full = store.get("call-1").await.expect("full output indexed");
+        assert_eq!(full.len(), 400_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_cap_clamped_by_model_window() {
+        // The static default (256KB) would blow a small model window on its
+        // own — when the window is known, the per-result cap clamps to
+        // window-tokens bytes (≈ ¼ of the window in tokens).
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 10_000 }))
+            .context_window_tokens(1000)
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let contents = tool_result_contents(&reqs[1]);
+        assert!(
+            contents[0].len() <= 1_000 + 64,
+            "cap must clamp to the window: got {} bytes",
+            contents[0].len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_cap_configurable_via_builder() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 50_000 }))
+            .tool_result_ingest_cap(1_000)
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let contents = tool_result_contents(&reqs[1]);
+        assert!(
+            contents[0].len() <= 1_000 + 64,
+            "custom cap applies: got {} bytes",
+            contents[0].len()
+        );
+    }
+
+    // --- Layer 3: proactive trigger must see a fresh (uncounted) bloated ctx ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proactive_compaction_sees_fresh_context_estimate() {
+        // The provider reports LOW input tokens (100 < 700 budget) but the
+        // accumulated fresh tool results push the chars/4 estimate of the ctx
+        // far over the window fraction — compaction must still fire.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 100),
+            tool_use_named("big", 100),
+            tool_use_named("big", 100), // turn 3: message_count > 5, estimate >> 700
+            MockProvider::text_response("summary text", 1, 1),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 10_000 }))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .on_event(Arc::new(move |ev| {
+                events_clone.lock().expect("lock").push(ev);
+            }))
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let summarized = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::agent::events::AgentEvent::ContextSummarized { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            summarized, 1,
+            "estimate-driven proactive compaction must fire exactly once"
+        );
+    }
+
+    // --- Layer 4: bounded summary transcript ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_transcript_is_bounded() {
+        // The summary request must never resend an unbounded transcript —
+        // otherwise compaction itself overflows the window it's trying to save.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("big", 800),
+            tool_use_named("big", 800),
+            tool_use_named("big", 800), // fires proactive compaction (800 >= 700)
+            MockProvider::text_response("summary text", 1, 1),
+            MockProvider::text_response("done", 800, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 5_000 }))
+            .context_window_tokens(1000)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        let summary_req = reqs
+            .iter()
+            .find(|r| r.system.contains("GOAL"))
+            .expect("summary request captured");
+        let user_text: String = summary_req.messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // window=1000 tokens → budget = 1000*2 bytes (half the window in chars)
+        assert!(
+            user_text.len() <= 2_000 + 128,
+            "summary transcript must be bounded: got {} bytes",
+            user_text.len()
+        );
+        assert!(
+            user_text.contains("[transcript abridged"),
+            "abridge marker present"
+        );
+    }
+
+    // --- Layer 5: reactive overflow recovery ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reactive_overflow_truncates_oversized_results_and_retries_without_summary() {
+        // On a classified context-overflow error, the runner must FIRST
+        // hard-truncate oversized tool results (deterministic, no LLM) and
+        // retry — NOT summarize (the summary call would itself overflow).
+        let provider = Arc::new(MockProvider::new_with_results(vec![
+            Ok(tool_use_named("big", 100)),
+            Err(overflow_error()),
+            Ok(MockProvider::text_response("done", 100, 1)),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(BigTool { size: 60_000 }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        let output = runner.execute("go").await.expect("run must recover");
+        assert_eq!(output.result, "done");
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r.system.contains("GOAL")),
+            "deterministic recovery must not call the summarizer"
+        );
+        // The retried request carries the emergency-truncated result.
+        let contents = tool_result_contents(&reqs[2]);
+        assert!(
+            contents[0].len() <= 4_096 + 64,
+            "retried result emergency-truncated: got {} bytes",
+            contents[0].len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reactive_overflow_recovers_with_few_messages_via_summary() {
+        // Overflow on the FIRST call (message_count == 1): nothing to truncate,
+        // so the runner falls back to summarization and retries. The incident
+        // failed here because of a `message_count > 5` gate — pinned removed.
+        let provider = Arc::new(MockProvider::new_with_results(vec![
+            Err(overflow_error()),
+            Ok(MockProvider::text_response("summary text", 1, 1)),
+            Ok(MockProvider::text_response("done", 100, 1)),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .max_turns(5)
+            .build()
+            .unwrap();
+        let output = runner.execute("go").await.expect("run must recover");
+        assert_eq!(output.result, "done");
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert!(
+            reqs.iter().any(|r| r.system.contains("GOAL")),
+            "summary fallback must have been attempted"
         );
     }
 

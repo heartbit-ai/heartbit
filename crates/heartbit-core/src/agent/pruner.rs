@@ -133,14 +133,33 @@ pub fn prune_old_tool_results(
 ///
 /// If content fits within `max_bytes`, returns it unchanged.
 /// Otherwise, keeps head bytes up to a char boundary and appends marker.
-fn truncate_with_marker(content: &str, max_bytes: usize, tool_use_id: &str) -> String {
+pub(crate) fn truncate_with_marker(content: &str, max_bytes: usize, tool_use_id: &str) -> String {
+    truncate_with_marker_ext(content, max_bytes, tool_use_id, true)
+}
+
+/// Like [`truncate_with_marker`], but `restorable` controls the marker text.
+///
+/// `restorable = true` promises `fetch_full_output(<id>)` restore (the content
+/// is indexed in a `ContextRecallStore`). `restorable = false` emits an honest
+/// `[truncated: …]` marker without a restore hint — used when no recall store
+/// is wired, so the LLM is never trained to make a guaranteed-failing call.
+pub(crate) fn truncate_with_marker_ext(
+    content: &str,
+    max_bytes: usize,
+    tool_use_id: &str,
+    restorable: bool,
+) -> String {
     if content.len() <= max_bytes {
         return content.to_string();
     }
     let omitted = content.len() - max_bytes;
-    let marker = format!(
-        "\n[pruned: {omitted} bytes omitted, id={tool_use_id} — call fetch_full_output(\"{tool_use_id}\") to restore]"
-    );
+    let marker = if restorable {
+        format!(
+            "\n[pruned: {omitted} bytes omitted, id={tool_use_id} — call fetch_full_output(\"{tool_use_id}\") to restore]"
+        )
+    } else {
+        format!("\n[truncated: {omitted} bytes omitted — full content not retained]")
+    };
     let head_budget = max_bytes.saturating_sub(marker.len());
     let boundary = floor_char_boundary(content, head_budget);
     let head = &content[..boundary];
@@ -430,6 +449,44 @@ mod tests {
         assert!(result.contains("[pruned:"));
         assert!(result.contains("bytes omitted"));
         assert!(result.contains("id=tc_x"));
+    }
+
+    #[test]
+    fn truncate_with_marker_ext_restorable_matches_existing_marker() {
+        let content = "a".repeat(1000);
+        let ext = truncate_with_marker_ext(&content, 100, "tc_x", true);
+        let legacy = truncate_with_marker(&content, 100, "tc_x");
+        assert_eq!(ext, legacy, "restorable=true must match the legacy marker");
+        assert!(ext.contains("fetch_full_output"));
+    }
+
+    #[test]
+    fn truncate_with_marker_ext_not_restorable_omits_fetch_hint() {
+        let content = "a".repeat(1000);
+        let result = truncate_with_marker_ext(&content, 100, "tc_x", false);
+        assert!(result.len() <= 200, "head + marker stays bounded");
+        assert!(result.contains("[truncated:"));
+        assert!(result.contains("bytes omitted"));
+        assert!(
+            !result.contains("fetch_full_output"),
+            "must not promise a restore that cannot happen: {result}"
+        );
+    }
+
+    #[test]
+    fn truncate_with_marker_ext_not_restorable_short_content_unchanged() {
+        assert_eq!(
+            truncate_with_marker_ext("hello", 100, "tc_x", false),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn truncate_with_marker_ext_not_restorable_utf8_safe() {
+        let content = "🦀".repeat(100); // 400 bytes
+        let result = truncate_with_marker_ext(&content, 120, "tc_x", false);
+        assert!(result.starts_with('🦀'), "char-boundary head survives");
+        for _ in result.chars() {} // valid UTF-8 throughout
     }
 
     #[test]

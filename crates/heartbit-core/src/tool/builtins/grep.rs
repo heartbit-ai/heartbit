@@ -11,7 +11,15 @@ use crate::llm::types::ToolDefinition;
 use crate::sandbox::CorePathPolicy;
 use crate::tool::{Tool, ToolOutput};
 
+use super::SKIP_DIRS;
+
 const MAX_MATCHES: usize = 100;
+/// Max bytes for a single emitted match line (path + line number + content).
+/// A single `.d` dep file line under `target/` can be ~100KB; without this an
+/// individual line could blow the model context even at MAX_MATCHES = 100.
+const MAX_LINE_BYTES: usize = 2_000;
+/// Max total bytes of all match lines combined.
+const MAX_TOTAL_BYTES: usize = 100_000;
 
 /// Builtin tool that searches file contents for a regex pattern.
 ///
@@ -51,7 +59,10 @@ impl Tool for GrepTool {
             name: "grep".into(),
             description: "Search file contents using regex patterns. Uses ripgrep (rg) when \
                           available, falls back to built-in regex search. Returns matching lines \
-                          with file paths and line numbers."
+                          with file paths and line numbers. Skips build/dependency directories \
+                          (target, node_modules, dist, build, .git, __pycache__) and hidden \
+                          files; long lines and total output are truncated. Pass a direct file \
+                          path to search inside a skipped directory."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -119,8 +130,13 @@ impl Tool for GrepTool {
                 return Ok(ToolOutput::error(format!("Path not found: {path}")));
             }
 
+            // When the path is a single file, the skip-dir filter must NOT
+            // apply (mirrors the fallback's single-file branch) — the user
+            // explicitly targeted that file even if it lives under target/.
+            let is_file = search_path.is_file();
+
             // Try ripgrep first
-            match try_ripgrep(pattern, &path, include, literal).await {
+            match try_ripgrep(pattern, &path, include, literal, is_file).await {
                 Ok(output) => Ok(output),
                 Err(_) => {
                     // Fallback to built-in regex search (sync IO, run on blocking thread)
@@ -142,6 +158,7 @@ async fn try_ripgrep(
     path: &str,
     include: Option<&str>,
     literal: bool,
+    is_file: bool,
 ) -> Result<ToolOutput, Error> {
     let mut cmd = tokio::process::Command::new("rg");
     cmd.arg("-H")
@@ -154,6 +171,18 @@ async fn try_ripgrep(
 
     if literal {
         cmd.arg("-F");
+    }
+
+    // Skip build/dependency dirs for parity with the fallback walker. rg honors
+    // .gitignore inside a git repo, but not in non-git dirs — these globs make
+    // the behavior consistent everywhere. NOT applied to a single explicit file:
+    // rg's `--glob` exclusions outrank the "explicit path overrides ignore" rule,
+    // so excluding `target` here would make `grep <file under target/>` return
+    // nothing — matching the fallback's single-file branch that skips this.
+    if !is_file {
+        for dir in SKIP_DIRS {
+            cmd.arg("--glob").arg(format!("!{dir}"));
+        }
     }
 
     if let Some(glob_pattern) = include {
@@ -173,25 +202,26 @@ async fn try_ripgrep(
     match output.status.code() {
         Some(0) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Single-pass: collect first MAX_MATCHES lines and count total
+            // Apply the same per-line and total-byte caps as the fallback path
+            // so a giant single line (e.g. a minified/dep file) can't blow the
+            // model context even when rg is the one producing output.
             let mut lines = Vec::with_capacity(MAX_MATCHES);
-            let mut total = 0;
+            let mut total_bytes = 0usize;
+            let mut byte_capped = false;
             for line in stdout.lines() {
-                total += 1;
-                if lines.len() < MAX_MATCHES {
-                    lines.push(line);
+                if !push_capped(&mut lines, &mut total_bytes, line) {
+                    byte_capped = true;
+                    break;
+                }
+                if lines.len() >= MAX_MATCHES {
+                    break;
                 }
             }
-            let truncated = if total > MAX_MATCHES {
-                format!("\n\n(showing first {MAX_MATCHES} of {total} matches)")
-            } else {
-                String::new()
-            };
-            Ok(ToolOutput::success(format!(
-                "Found {} matches\n\n{}{}",
-                lines.len(),
-                lines.join("\n"),
-                truncated,
+            let count_capped = !byte_capped && lines.len() >= MAX_MATCHES;
+            Ok(ToolOutput::success(render_matches(
+                &lines,
+                byte_capped,
+                count_capped,
             )))
         }
         Some(1) => Ok(ToolOutput::success("No matches found.")),
@@ -223,24 +253,31 @@ fn fallback_grep(
         .map_err(|e| Error::Agent(format!("Invalid include pattern: {e}")))?;
 
     let mut matches = Vec::new();
+    let mut total = 0usize;
 
     let walker: Box<dyn Iterator<Item = walkdir::DirEntry>> = if path.is_file() {
+        // Single-file branch: grep the file as given, even inside a build dir.
         Box::new(
             walkdir::WalkDir::new(path)
                 .into_iter()
                 .filter_map(|e| e.ok()),
         )
     } else {
+        // Directory branch: PRUNE skipped build dirs and hidden dirs via
+        // filter_entry (stops descent — fixes the multi-second sweep of
+        // target/). The root (depth 0) is always kept so explicitly targeting
+        // a dir named e.g. `target`, or tempfile's dot-prefixed temp roots,
+        // still works.
         Box::new(
             walkdir::WalkDir::new(path)
                 .into_iter()
+                .filter_entry(|e| e.depth() == 0 || (!is_skipped_dir(e) && !is_hidden(e)))
                 .filter_map(|e| e.ok())
-                .filter(|e| !is_hidden(e))
                 .filter(|e| e.file_type().is_file()),
         )
     };
 
-    for entry in walker {
+    'outer: for entry in walker {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -267,40 +304,51 @@ fn fallback_grep(
             Err(_) => continue, // Skip binary/unreadable files
         };
 
+        let mut byte_capped = false;
         for (line_num, line) in content.lines().enumerate() {
             if re.is_match(line) {
-                matches.push(format!(
-                    "{}:{}: {}",
-                    file_path.display(),
-                    line_num + 1,
-                    line
-                ));
+                let entry = format!("{}:{}: {}", file_path.display(), line_num + 1, line);
+                if !push_capped(&mut matches, &mut total, &entry) {
+                    byte_capped = true;
+                    break;
+                }
                 if matches.len() >= MAX_MATCHES {
                     break;
                 }
             }
         }
 
+        if byte_capped {
+            return Ok(ToolOutput::success(render_matches(&matches, true, false)));
+        }
         if matches.len() >= MAX_MATCHES {
-            break;
+            break 'outer;
         }
     }
 
     if matches.is_empty() {
         Ok(ToolOutput::success("No matches found."))
     } else {
-        let count = matches.len();
-        let truncated = if count >= MAX_MATCHES {
-            format!("\n\n(showing first {MAX_MATCHES} matches, there may be more)")
-        } else {
-            String::new()
-        };
-        Ok(ToolOutput::success(format!(
-            "Found {count} matches\n\n{}{}",
-            matches.join("\n"),
-            truncated,
+        Ok(ToolOutput::success(render_matches(
+            &matches,
+            false,
+            matches.len() >= MAX_MATCHES,
         )))
     }
+}
+
+/// Render collected match lines with the appropriate truncation footer.
+/// The byte-cap footer takes precedence over the count-cap footer.
+fn render_matches(matches: &[String], byte_capped: bool, count_capped: bool) -> String {
+    let count = matches.len();
+    let footer = if byte_capped {
+        format!("\n\n(output truncated at {MAX_TOTAL_BYTES} bytes)")
+    } else if count_capped {
+        format!("\n\n(showing first {MAX_MATCHES} matches, there may be more)")
+    } else {
+        String::new()
+    };
+    format!("Found {count} matches\n\n{}{footer}", matches.join("\n"))
 }
 
 fn is_hidden(entry: &walkdir::DirEntry) -> bool {
@@ -308,6 +356,43 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
         .file_name()
         .to_str()
         .is_some_and(|s| s.starts_with('.'))
+}
+
+/// True when `entry` is a directory whose name is in [`SKIP_DIRS`]. Used by
+/// `filter_entry` to PRUNE the subtree (stop descent) rather than just filter
+/// the dir entry itself — this is what keeps grep from sweeping `target/`.
+fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
+}
+
+/// Append one `entry` match line to `matches`, applying the per-line and total
+/// byte caps shared by the ripgrep and fallback paths.
+///
+/// Returns `false` when the total cap is hit (caller should stop). On per-line
+/// overflow the line is truncated at a UTF-8 boundary with an inline marker.
+fn push_capped(matches: &mut Vec<String>, total: &mut usize, entry: &str) -> bool {
+    let line = if entry.len() > MAX_LINE_BYTES {
+        let cut = super::floor_char_boundary(entry, MAX_LINE_BYTES);
+        format!(
+            "{} …[line truncated, {} bytes total]",
+            &entry[..cut],
+            entry.len()
+        )
+    } else {
+        entry.to_string()
+    };
+
+    // +1 for the newline that joins lines in the rendered output.
+    if *total + line.len() + 1 > MAX_TOTAL_BYTES {
+        return false;
+    }
+    *total += line.len() + 1;
+    matches.push(line);
+    true
 }
 
 #[cfg(test)]
@@ -422,6 +507,163 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("match.rs"));
+    }
+
+    #[test]
+    fn fallback_grep_skips_build_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("x.d"), "needle here\n").unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "needle here\n").unwrap();
+
+        let result = super::fallback_grep("needle", dir.path(), None, false).unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("main.rs"),
+            "should find src match: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("target"),
+            "must not descend into target/: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn fallback_grep_caps_giant_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // One matching line of ~200KB on a single line.
+        let mut huge = String::with_capacity(200_000);
+        huge.push_str("needle ");
+        huge.push_str(&"a".repeat(200_000));
+        huge.push('\n');
+        std::fs::write(dir.path().join("big.txt"), &huge).unwrap();
+
+        let result = super::fallback_grep("needle", dir.path(), None, false).unwrap();
+        assert!(!result.is_error);
+        // Each emitted match line must be capped near MAX_LINE_BYTES (+ marker slack).
+        let longest = result.content.lines().map(str::len).max().unwrap_or(0);
+        assert!(
+            longest <= super::MAX_LINE_BYTES + 80,
+            "match line not capped: longest = {longest}"
+        );
+        assert!(
+            result.content.contains("line truncated"),
+            "missing truncation indicator: {}",
+            &result.content[..result.content.len().min(300)]
+        );
+        // Total output far below the raw 200KB.
+        assert!(
+            result.content.len() < 10_000,
+            "total output too large: {}",
+            result.content.len()
+        );
+    }
+
+    #[test]
+    fn fallback_grep_caps_total_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~60 files each with a ~3KB matching line => ~180KB > 100KB cap.
+        for i in 0..60 {
+            let line = format!("needle {}\n", "x".repeat(3_000));
+            std::fs::write(dir.path().join(format!("f{i}.txt")), line).unwrap();
+        }
+
+        let result = super::fallback_grep("needle", dir.path(), None, false).unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.len() <= super::MAX_TOTAL_BYTES + 2_000,
+            "total output not capped: {}",
+            result.content.len()
+        );
+        assert!(
+            result.content.contains("output truncated"),
+            "missing total-truncation note: ...{}",
+            &result.content[result.content.len().saturating_sub(120)..]
+        );
+    }
+
+    #[test]
+    fn fallback_grep_explicit_file_in_build_dir_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let file = deps.join("x.d");
+        std::fs::write(&file, "needle here\n").unwrap();
+
+        // Path points DIRECTLY at the file inside target/ -> single-file branch,
+        // skip-dirs must NOT apply.
+        let result = super::fallback_grep("needle", &file, None, false).unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("needle"),
+            "explicit file in build dir should still grep: {}",
+            result.content
+        );
+    }
+
+    // End-to-end through execute() — exercises the rg path when rg is installed,
+    // the fallback otherwise. Both must skip build dirs on a directory search.
+    #[tokio::test]
+    async fn grep_execute_skips_build_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("x.d"), "needle here\n").unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "needle here\n").unwrap();
+
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("main.rs"),
+            "should find src match: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("target"),
+            "must not include target/ paths: {}",
+            result.content
+        );
+    }
+
+    // The skip-dir exclusion must NOT block an explicitly targeted file inside a
+    // build dir — on the rg path this means NOT passing `--glob '!target'` for a
+    // single file (rg's glob exclusions outrank the explicit-path-overrides rule).
+    #[tokio::test]
+    async fn grep_execute_explicit_file_in_build_dir_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path().join("target").join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let file = deps.join("x.d");
+        std::fs::write(&file, "needle here\n").unwrap();
+
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({ "pattern": "needle", "path": file.to_str().unwrap() }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("needle"),
+            "explicit file in build dir should still grep (rg path): {}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -286,6 +286,21 @@ pub(crate) fn resolve_path(
     }
 }
 
+/// Directories that file-traversal builtins (`grep`, `glob`) skip by default.
+///
+/// These are gitignored build / dependency / VCS directories that can be huge
+/// (a single `.d` dep file under `target/` can be ~100KB on one line) and would
+/// otherwise blow up tool output and walk time. `list.rs` keeps its own richer
+/// `DEFAULT_IGNORES`; this is the shared minimal set for the search builtins.
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".git",
+    "__pycache__",
+];
+
 /// Round `target` down to the nearest UTF-8 character boundary in `text`.
 ///
 /// Returns the largest position `≤ target.min(text.len())` that lies on a char

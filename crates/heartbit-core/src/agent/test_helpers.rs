@@ -16,13 +16,19 @@ use super::AgentRunner;
 /// Mock LLM provider that returns pre-configured responses in order and
 /// captures every request for later inspection.
 pub(crate) struct MockProvider {
-    responses: Mutex<Vec<CompletionResponse>>,
+    responses: Mutex<Vec<Result<CompletionResponse, Error>>>,
     /// Every `CompletionRequest` received, in call order.
     pub captured_requests: Mutex<Vec<CompletionRequest>>,
 }
 
 impl MockProvider {
     pub fn new(responses: Vec<CompletionResponse>) -> Self {
+        Self::new_with_results(responses.into_iter().map(Ok).collect())
+    }
+
+    /// Like [`MockProvider::new`] but each entry may be an `Err` — for tests
+    /// that exercise LLM error recovery paths (e.g. context overflow).
+    pub fn new_with_results(responses: Vec<Result<CompletionResponse, Error>>) -> Self {
         Self {
             responses: Mutex::new(responses),
             captured_requests: Mutex::new(Vec::new()),
@@ -56,7 +62,7 @@ impl LlmProvider for MockProvider {
         if responses.is_empty() {
             return Err(Error::Agent("no more mock responses".into()));
         }
-        Ok(responses.remove(0))
+        responses.remove(0)
     }
 
     fn model_name(&self) -> Option<&str> {

@@ -65,6 +65,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
     pub(super) enable_reflection: bool,
     pub(super) tool_output_compression_threshold: Option<usize>,
+    pub(super) tool_result_ingest_cap: Option<usize>,
     pub(super) max_tools_per_turn: Option<usize>,
     pub(super) tool_profile: Option<tool_filter::ToolProfile>,
     pub(super) max_identical_tool_calls: Option<u32>,
@@ -334,6 +335,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// Byte threshold above which tool output is compressed via an LLM call.
     pub fn tool_output_compression_threshold(mut self, threshold: usize) -> Self {
         self.tool_output_compression_threshold = Some(threshold);
+        self
+    }
+
+    /// Hard cap (bytes) applied to each fresh tool result entering the
+    /// conversation context. Defaults to 64KB; oversized results are truncated
+    /// with a marker (restorable via `fetch_full_output` when a context recall
+    /// store is wired).
+    pub fn tool_result_ingest_cap(mut self, bytes: usize) -> Self {
+        self.tool_result_ingest_cap = Some(bytes);
         self
     }
 
@@ -650,6 +660,11 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 "tool_output_compression_threshold must be at least 1".into(),
             ));
         }
+        if self.tool_result_ingest_cap == Some(0) {
+            return Err(Error::Config(
+                "tool_result_ingest_cap must be at least 1".into(),
+            ));
+        }
         if self.max_identical_tool_calls == Some(0) {
             return Err(Error::Config(
                 "max_identical_tool_calls must be at least 1".into(),
@@ -799,6 +814,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             reasoning_effort: self.reasoning_effort,
             enable_reflection: self.enable_reflection,
             tool_output_compression_threshold: self.tool_output_compression_threshold,
+            tool_result_ingest_cap: self.tool_result_ingest_cap,
             max_tools_per_turn: self.max_tools_per_turn,
             tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,

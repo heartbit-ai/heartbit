@@ -73,12 +73,43 @@ fn is_context_overflow(message: &str) -> bool {
     ];
 
     let lower = message.to_lowercase();
-    PATTERNS.iter().any(|p| lower.contains(p))
+    if PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // Mistral phrasing: "Prompt contains 325070 tokens …, too large for model".
+    // Compound match (both fragments required) so a plain "prompt contains"
+    // in an unrelated validation error can't false-positive.
+    lower.contains("prompt contains") && lower.contains("token")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Context overflow (regression pins) ---
+
+    #[test]
+    fn classify_mistral_openrouter_overflow_as_context_overflow() {
+        // EXACT error body from TUI session 6a24e4bb-4159588 (2026-06-07):
+        // OpenRouter wraps Mistral's raw error; the nested `raw` payload carries
+        // "maximum context length", which the substring patterns must match.
+        let err = Error::Api {
+            status: 400,
+            message: r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"object\":\"error\",\"message\":\"Prompt contains 325070 tokens and 0 draft tokens, too large for model with 262144 maximum context length\",\"type\":\"invalid_request_invalid_args\",\"param\":null,\"code\":\"3051\",\"raw_status_code\":400}","provider_name":"Mistral","is_byok":false}},"user_id":"user_x"}"#.into(),
+        };
+        assert_eq!(classify(&err), ErrorClass::ContextOverflow);
+    }
+
+    #[test]
+    fn classify_bare_prompt_contains_tokens_as_context_overflow() {
+        // Same Mistral message WITHOUT the OpenRouter wrapper (direct API) —
+        // must classify on the "prompt contains … tokens" phrasing alone.
+        let err = Error::Api {
+            status: 400,
+            message: "Prompt contains 325070 tokens and 0 draft tokens, too large for model".into(),
+        };
+        assert_eq!(classify(&err), ErrorClass::ContextOverflow);
+    }
 
     // --- Auth errors ---
 

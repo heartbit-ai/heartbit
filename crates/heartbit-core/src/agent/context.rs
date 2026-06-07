@@ -4,7 +4,32 @@ use crate::llm::types::{
     CompletionRequest, ContentBlock, Message, ReasoningEffort, Role, ToolDefinition, ToolResult,
 };
 
+use super::pruner::truncate_with_marker_ext;
 use super::token_estimator::{estimate_message_tokens, estimate_tokens};
+
+/// Truncate every `ToolResult` block in `msg` exceeding `max_bytes`.
+/// Returns bytes saved. Message role and block count are never changed.
+fn truncate_tool_results_in_message(
+    msg: &mut Message,
+    max_bytes: usize,
+    restorable: bool,
+) -> usize {
+    let mut saved = 0;
+    for block in &mut msg.content {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+            && content.len() > max_bytes
+        {
+            let truncated = truncate_with_marker_ext(content, max_bytes, tool_use_id, restorable);
+            saved += content.len().saturating_sub(truncated.len());
+            *content = truncated;
+        }
+    }
+    saved
+}
 
 /// Strategy for managing the context window.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +175,35 @@ impl AgentContext {
 
     pub(crate) fn add_tool_results(&mut self, results: Vec<ToolResult>) {
         self.messages.push(Message::tool_results(results));
+    }
+
+    /// Cap every `ToolResult` block in the LAST message to `max_bytes`.
+    ///
+    /// Deterministic safety net applied right after tool-result ingestion so a
+    /// single giant fresh result can never blow the model's context window.
+    /// `restorable` selects the marker text (see
+    /// [`pruner::truncate_with_marker_ext`]). Returns total bytes saved.
+    pub(crate) fn cap_last_tool_results(&mut self, max_bytes: usize, restorable: bool) -> usize {
+        match self.messages.last_mut() {
+            Some(msg) if msg.role == Role::User => {
+                truncate_tool_results_in_message(msg, max_bytes, restorable)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Truncate every `ToolResult` block exceeding `max_bytes` across ALL
+    /// messages. Emergency recovery for context overflow — deterministic, no
+    /// LLM call. Returns total bytes saved.
+    pub(crate) fn truncate_oversized_tool_results(
+        &mut self,
+        max_bytes: usize,
+        restorable: bool,
+    ) -> usize {
+        self.messages
+            .iter_mut()
+            .map(|msg| truncate_tool_results_in_message(msg, max_bytes, restorable))
+            .sum()
     }
 
     /// Get the text from the last assistant message (avoids re-cloning the response).
@@ -450,6 +504,103 @@ mod tests {
         let req = ctx.to_request();
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn cap_last_tool_results_truncates_oversized() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![
+            ToolResult::success("c1", "x".repeat(10_000)),
+            ToolResult::success("c2", "small"),
+        ]);
+
+        let saved = ctx.cap_last_tool_results(1_000, false);
+        assert!(saved > 8_000, "bytes saved should be substantial: {saved}");
+
+        let msgs = ctx.messages();
+        assert_eq!(msgs.len(), 2, "message count unchanged");
+        let ContentBlock::ToolResult { content, .. } = &msgs[1].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() <= 1_000, "capped: {} bytes", content.len());
+        assert!(content.contains("[truncated:"), "non-restorable marker");
+        let ContentBlock::ToolResult { content, .. } = &msgs[1].content[1] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(content, "small", "sub-cap result untouched");
+    }
+
+    #[test]
+    fn cap_last_tool_results_restorable_marker_names_ref() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![ToolResult::success("tc_big", "y".repeat(5_000))]);
+
+        ctx.cap_last_tool_results(500, true);
+
+        let ContentBlock::ToolResult { content, .. } = &ctx.messages()[1].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.contains("fetch_full_output(\"tc_big\")"));
+    }
+
+    #[test]
+    fn cap_last_tool_results_noop_when_small_or_not_tool_results() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![ToolResult::success("c1", "tiny")]);
+        assert_eq!(ctx.cap_last_tool_results(1_000, false), 0);
+
+        ctx.add_user_message("plain user text");
+        assert_eq!(
+            ctx.cap_last_tool_results(1, false),
+            0,
+            "non-tool-result tail is a no-op"
+        );
+    }
+
+    #[test]
+    fn cap_last_tool_results_utf8_safe() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![ToolResult::success("c1", "🦀".repeat(1_000))]);
+
+        ctx.cap_last_tool_results(500, false);
+
+        let ContentBlock::ToolResult { content, .. } = &ctx.messages()[1].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.starts_with('🦀'));
+        for _ in content.chars() {}
+    }
+
+    #[test]
+    fn truncate_oversized_tool_results_walks_all_messages() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![ToolResult::success("c1", "a".repeat(8_000))]);
+        ctx.add_assistant_message(Message::assistant("thinking"));
+        ctx.add_tool_results(vec![ToolResult::success("c2", "b".repeat(8_000))]);
+
+        let saved = ctx.truncate_oversized_tool_results(1_000, false);
+        assert!(saved > 12_000, "both oversized results truncated: {saved}");
+
+        let roles: Vec<_> = ctx.messages().iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::User, Role::Assistant, Role::User],
+            "message count and roles unchanged"
+        );
+        for msg in ctx.messages() {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    assert!(content.len() <= 1_000, "all results capped");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_oversized_tool_results_noop_returns_zero() {
+        let mut ctx = AgentContext::new("sys", "task", vec![]);
+        ctx.add_tool_results(vec![ToolResult::success("c1", "small")]);
+        assert_eq!(ctx.truncate_oversized_tool_results(1_000, false), 0);
     }
 
     #[test]
