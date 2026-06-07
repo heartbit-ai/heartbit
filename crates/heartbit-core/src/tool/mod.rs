@@ -8,6 +8,8 @@ pub mod handoff;
 pub mod mcp;
 pub mod mcp_presets;
 pub mod mcp_server;
+pub mod set_goal;
+pub mod set_scope;
 
 use std::future::Future;
 use std::pin::Pin;

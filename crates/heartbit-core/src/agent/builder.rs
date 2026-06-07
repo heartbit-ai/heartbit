@@ -91,6 +91,10 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) max_total_tokens: Option<u64>,
     /// Optional persistent goal gated by an independent judge.
     pub(super) goal: Option<super::goal::GoalCondition>,
+    /// Optional SHARED goal slot (overrides `goal` as the storage): lets a
+    /// `set_goal` tool install/replace the goal at runtime. When unset, a
+    /// fresh private slot is created from `goal`.
+    pub(super) goal_slot: Option<super::goal::GoalSlot>,
     /// Controls whether audit records include full content or metadata only.
     pub(super) audit_mode: audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
@@ -524,6 +528,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         self
     }
 
+    /// Share an externally owned [`GoalSlot`](super::goal::GoalSlot) with this
+    /// runner — the `set_goal` tool holds the same slot and can install or
+    /// replace the goal at runtime. Takes precedence over [`Self::goal`] as
+    /// the storage (a `goal()` value seeds the slot only if the slot is empty).
+    pub fn goal_slot(mut self, slot: super::goal::GoalSlot) -> Self {
+        self.goal_slot = Some(slot);
+        self
+    }
+
     /// Set the audit mode controlling what data is stored in audit records.
     ///
     /// - `Full` (default): all content is recorded.
@@ -844,7 +857,22 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
                 self.observability_mode,
             ),
             max_total_tokens: self.max_total_tokens,
-            goal: self.goal,
+            goal: match self.goal_slot {
+                Some(slot) => {
+                    // Seed the shared slot from `goal()` only when empty — a
+                    // goal already installed in the slot wins.
+                    if let Some(seed) = self.goal {
+                        let mut g = slot
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if g.is_none() {
+                            *g = Some(seed);
+                        }
+                    }
+                    slot
+                }
+                None => std::sync::Arc::new(std::sync::RwLock::new(self.goal)),
+            },
             audit_mode: self.audit_mode,
             audit_trail: self.audit_trail,
             audit_user_id: self.audit_user_id,

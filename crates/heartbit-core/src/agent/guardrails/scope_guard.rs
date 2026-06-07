@@ -88,6 +88,21 @@ impl ScopeGuard {
         }
     }
 
+    /// Replace the whole allowlist (the `set_scope` tool: the agent declares
+    /// its working scope after planning; an empty list un-seeds the guard).
+    pub fn set(&self, paths: Vec<PathBuf>) {
+        let normalized: Vec<PathBuf> = paths.iter().map(|p| normalize_path(p)).collect();
+        *self.allowed.write().unwrap_or_else(PoisonError::into_inner) = normalized;
+    }
+
+    /// The current allowlist (normalized), for display/confirmation.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.allowed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Decide the guard action for a tool call, synchronously.
     ///
     /// Pulled out of `pre_tool` so the `RwLock` is never held across an

@@ -615,6 +615,22 @@ async fn build_engine(
             let _ = ui_tx.send(Msg::Notice(format!("handoff disabled: {e}")));
         }
     }
+    // Judge-gated completion, runtime path: the entry agent installs its own
+    // acceptance criteria via `set_goal` (or the user via /goal); the "fast"
+    // role judges every natural stop until they're met.
+    let entry_goal_judge = match provider_factory("fast") {
+        Ok(judge) => Some(judge),
+        Err(e) => {
+            let _ = ui_tx.send(Msg::Notice(format!("goal judge disabled: {e}")));
+            None
+        }
+    };
+    // Scope guard (anti-drift): the agent declares its blast radius with
+    // `set_scope`; edits outside it are denied. Unseeded = no restriction.
+    let scope_guard = Arc::new(heartbit_core::ScopeGuard::new(vec![]));
+    tools.push(Arc::new(heartbit_core::SetScopeTool::new(
+        scope_guard.clone(),
+    )));
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();
@@ -776,6 +792,7 @@ async fn build_engine(
     )));
     let mut builder = Orchestrator::builder(provider)
         .entry_agent(tools)
+        .guardrail(scope_guard)
         .entry_workflow_recipes(recipe_meta)
         .entry_context(heartbit_core::SubAgentContextConfig {
             todo_store: Some(todo_store),
@@ -798,6 +815,9 @@ async fn build_engine(
         // here). Identical batches abort fast; near-duplicates get more rope.
         .max_identical_tool_calls(3)
         .max_fuzzy_identical_tool_calls(5);
+    if let Some(judge) = entry_goal_judge {
+        builder = builder.entry_goal_judge(judge);
+    }
     // The squad available for delegation: each sub-agent gets its own context
     // stack (recitation / restore-on-demand / compaction / replan).
     for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {

@@ -61,6 +61,13 @@ Respond with EXACTLY one verdict line, then optionally a brief reason:\n\
 or\n\
   GOAL_MET: NO: <one sentence on what concrete evidence is still missing>";
 
+/// Shared, runtime-mutable goal slot: the runner reads it at every natural
+/// stop; the `set_goal` tool (entry agent) installs/replaces the goal
+/// mid-run — e.g. with the acceptance criteria the `intake` recipe produced.
+/// `std::sync::RwLock` per repo convention (never held across an await; the
+/// goal is CLONED out before the async judge call).
+pub type GoalSlot = Arc<std::sync::RwLock<Option<GoalCondition>>>;
+
 /// A persistent objective evaluated by an independent judge after each
 /// natural completion.
 #[derive(Clone)]
@@ -122,6 +129,11 @@ impl GoalCondition {
     /// The objective text (used to recite the goal in continuation guidance).
     pub fn objective(&self) -> &str {
         &self.objective
+    }
+
+    /// Whether per-criterion judging is enabled (see [`Self::with_per_criterion`]).
+    pub fn per_criterion(&self) -> bool {
+        self.per_criterion
     }
 
     /// Build the guidance message injected when the goal is not yet met: the

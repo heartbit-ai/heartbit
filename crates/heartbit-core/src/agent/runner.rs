@@ -329,10 +329,13 @@ pub struct AgentRunner<P: LlmProvider> {
     /// Hard limit on cumulative tokens (input + output) across all turns.
     /// When exceeded, the agent returns `Error::BudgetExceeded`.
     pub(super) max_total_tokens: Option<u64>,
-    /// Optional persistent goal: an independent judge gates the natural-completion
-    /// exit and the agent keeps working (bounded by `max_continuations` and
-    /// `max_turns`) until the objective is met. `None` = no goal gating.
-    pub(super) goal: Option<super::goal::GoalCondition>,
+    /// Optional persistent goal: an independent judge gates EVERY natural stop
+    /// and the agent keeps working (bounded by `max_continuations` and
+    /// `max_turns`) until the objective is met. A shared slot so the
+    /// `set_goal` tool can install/replace the goal at runtime (e.g. from
+    /// `intake` acceptance criteria); a met or budget-exhausted goal
+    /// auto-clears (per-request semantics). `None` inside = no goal gating.
+    pub(super) goal: super::goal::GoalSlot,
     /// Controls whether audit records include full content or metadata only.
     pub(super) audit_mode: super::audit::AuditMode,
     /// Optional audit trail for recording untruncated agent decisions.
@@ -425,6 +428,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             workspace: None,
             max_total_tokens: None,
             goal: None,
+            goal_slot: None,
             audit_mode: super::audit::AuditMode::Full,
             audit_trail: None,
             audit_user_id: None,
@@ -684,6 +688,9 @@ impl<P: LlmProvider> AgentRunner<P> {
             // turn counter on `ctx` is the other bound — a goal continuation goes
             // through the loop top, so it consumes a turn and respects max_turns.
             let mut goal_continuations_used: u32 = 0;
+            // Last settled goal verdict (the gate clears the slot when a goal
+            // settles, so the verdict must outlive it for the final output).
+            let mut last_goal_met: Option<bool> = None;
             // Long-horizon "replan on out-of-plan": bounded count of verify-fail
             // continuations so a permanently-red verify can't loop forever.
             let mut verify_replans_used: u32 = 0;
@@ -1455,19 +1462,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                         ));
                     }
 
-                    // Interactive mode: if on_input is set, ask for more input
-                    // instead of returning. This enables multi-turn conversations.
-                    if let Some(ref on_input) = self.on_input
-                        && let Some(next_message) = on_input().await
-                        && !next_message.trim().is_empty()
-                    {
-                        ctx.add_user_message(next_message);
-                        // New user request: the delegation-nudge window restarts.
-                        nudge_tool_calls = 0;
-                        nudge_delegated = false;
-                        nudge_sent = false;
-                        continue;
-                    }
+                    // STOP GATES come BEFORE awaiting the next user message —
+                    // in chat mode `on_input().await` blocks until the user
+                    // types again, so gates placed after it would only ever
+                    // fire at session end (found inert on the TUI path).
 
                     // Long-horizon "replan on out-of-plan": a RED verification is
                     // the canonical out-of-plan signal. Before allowing natural
@@ -1499,13 +1497,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
 
                     // Goal gating: an INDEPENDENT judge decides whether the
-                    // objective is met before this natural completion is allowed
-                    // to return (anti over-report). Not-met re-injects the judge's
-                    // reason and continues (bounded by max_continuations AND the
-                    // loop's max_turns guard); met or cap-exhausted falls through
-                    // with `goal_met` recorded. Other exits (MaxTurns/Truncated)
-                    // are NOT looped — an unmet goal there is reported, not retried.
-                    let goal_met: Option<bool> = if let Some(goal) = self.goal.clone() {
+                    // objective is met before this natural stop is allowed (anti
+                    // over-report). Not-met re-injects the judge's reason and
+                    // continues (bounded by max_continuations AND the loop's
+                    // max_turns guard). Met OR cap-exhausted records the verdict
+                    // and CLEARS the slot (per-request semantics: a settled goal
+                    // must not bill a judge call on every later chat turn).
+                    let goal_now = self
+                        .goal
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(goal) = goal_now {
                         // The judge sees the whole conversation rendered to text —
                         // including tool results (the EVIDENCE) — not just the
                         // agent's final claim, so it grades what actually happened.
@@ -1514,7 +1517,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // Account the judge's tokens against the run's usage.
                         total_usage += judge_usage;
                         if verdict.satisfied {
-                            Some(true)
+                            last_goal_met = Some(true);
+                            *self
+                                .goal
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                         } else if goal_continuations_used < goal.max_continuations() {
                             goal_continuations_used += 1;
                             debug!(
@@ -1526,12 +1533,35 @@ impl<P: LlmProvider> AgentRunner<P> {
                             ctx.add_user_message(goal.continuation_message(&verdict.reason));
                             continue;
                         } else {
-                            // Continuation budget exhausted without meeting the goal.
-                            Some(false)
+                            // Continuation budget exhausted without meeting the
+                            // goal: report not-met, stop gating.
+                            debug!(
+                                agent = %self.name,
+                                "goal continuation budget exhausted; goal cleared (not met)"
+                            );
+                            last_goal_met = Some(false);
+                            *self
+                                .goal
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                         }
-                    } else {
-                        None
-                    };
+                    }
+
+                    // Interactive mode: if on_input is set, ask for more input
+                    // instead of returning. This enables multi-turn conversations.
+                    if let Some(ref on_input) = self.on_input
+                        && let Some(next_message) = on_input().await
+                        && !next_message.trim().is_empty()
+                    {
+                        ctx.add_user_message(next_message);
+                        // New user request: the delegation-nudge window restarts.
+                        nudge_tool_calls = 0;
+                        nudge_delegated = false;
+                        nudge_sent = false;
+                        continue;
+                    }
+
+                    let goal_met: Option<bool> = last_goal_met;
 
                     self.emit(AgentEvent::RunCompleted {
                         agent: self.name.clone(),
@@ -3943,6 +3973,72 @@ mod tests {
         assert!(
             reqs.iter().any(|r| r.system.contains("GOAL")),
             "summary fallback must have been attempted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn goal_gates_before_next_input_in_chat_mode() {
+        // Chat mode (on_input set): the goal judge must gate EACH natural stop
+        // BEFORE the runner awaits the next user message — otherwise the gate
+        // only fires at session end (inert mid-session). Once met, the goal
+        // auto-clears (per-request semantics): later stops pay no judge call.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let main = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("attempt 1", 10, 1),
+            MockProvider::text_response("attempt 2", 10, 1),
+            MockProvider::text_response("final", 10, 1),
+        ]));
+        let judge = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("GOAL_MET: NO: no evidence yet", 1, 1),
+            MockProvider::text_response("GOAL_MET: YES", 1, 1),
+        ]));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let inputs_c = inputs.clone();
+        let on_input: Arc<crate::agent::runner::OnInput> = Arc::new(move || {
+            let n = inputs_c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Some("another request".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let runner = AgentRunner::builder(main.clone())
+            .name("test")
+            .system_prompt("sys")
+            .goal(crate::agent::goal::GoalCondition::new(
+                "demonstrate the result",
+                Arc::new(crate::llm::BoxedProvider::from_arc(judge.clone())),
+            ))
+            .on_input(on_input)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner.execute("do the thing").await.unwrap();
+
+        assert_eq!(out.result, "final");
+        assert_eq!(out.goal_met, Some(true));
+        let judge_calls = judge.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            judge_calls, 2,
+            "judge gates each stop until met, then auto-clears (no 3rd call)"
+        );
+        let main_reqs = main.captured_requests.lock().unwrap();
+        assert_eq!(main_reqs.len(), 3, "continuation + chat turn both happened");
+        let texts: Vec<String> = main_reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("not yet complete")),
+            "the judge's continuation reached the agent BEFORE any input wait: {texts:?}"
         );
     }
 

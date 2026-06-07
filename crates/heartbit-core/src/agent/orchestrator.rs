@@ -273,6 +273,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             entry_workflow_recipes: Vec::new(),
             entry_context: SubAgentContextConfig::default(),
             entry_goal: None,
+            entry_goal_judge: None,
         }
     }
 
@@ -1640,19 +1641,31 @@ pub fn build_entry_agent_prompt(
         squads_enabled,
         dispatch_mode,
         workflow_recipes,
-        false,
+        EntryCaps::default(),
     )
 }
 
-/// Like [`build_entry_agent_prompt`], with `can_ask_user` adding the intake
-/// clarify rule (only when the `question` tool is actually registered — never
-/// instruct the model to call a tool it doesn't have).
+/// Capability flags tailoring the entry prompt to the tools ACTUALLY
+/// registered — the prompt must never instruct calling a tool the agent
+/// doesn't have.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EntryCaps {
+    /// `question` tool registered → include the intake clarify rule.
+    pub ask_user: bool,
+    /// `set_goal` tool registered → include the goal-installation rule.
+    pub set_goal: bool,
+    /// `set_scope` tool registered → include the scope-declaration rule.
+    pub set_scope: bool,
+}
+
+/// Like [`build_entry_agent_prompt`], with [`EntryCaps`] gating the
+/// clarify/completion-discipline rules on tool availability.
 pub fn build_entry_agent_prompt_ext(
     agents: &[(&str, &str, &[String])],
     squads_enabled: bool,
     dispatch_mode: DispatchMode,
     workflow_recipes: &[(&str, &str)],
-    can_ask_user: bool,
+    caps: EntryCaps,
 ) -> String {
     let agent_list: String = if agents.is_empty() {
         "(none configured — handle everything yourself with your own tools)".to_string()
@@ -1703,7 +1716,25 @@ pub fn build_entry_agent_prompt_ext(
         )
     };
 
-    let clarify_block = if can_ask_user {
+    let mut discipline = String::new();
+    if caps.set_goal {
+        discipline.push_str(
+            "\n- **Substantive work gets a judged goal.** Right after planning, install the \
+             acceptance criteria as your completion goal with `set_goal` (one observable \
+             criterion per line — e.g. straight from the `intake` recipe's output). An \
+             independent judge then gates your completion until the criteria are demonstrably \
+             met — finish by SHOWING the evidence, not claiming it.\n",
+        );
+    }
+    if caps.set_scope {
+        discipline.push_str(
+            "\n- **Declare your blast radius.** Before substantive edits, declare the \
+             files/directories you intend to modify with `set_scope`; edits outside it are \
+             denied. Widen the scope EXPLICITLY (set_scope again) when genuinely needed — \
+             never drift into unrelated files.\n",
+        );
+    }
+    let clarify_block = if caps.ask_user {
         "\n- **Underspecified request?** Before substantive work, if the next step depends on \
          user INTENT and guessing would cause rework (scope / risk / intent — e.g. which \
          behavior, destructive vs additive, which of two designs), ask the user with the \
@@ -1727,7 +1758,7 @@ pub fn build_entry_agent_prompt_ext(
            broad request (implement a feature, add+wire+test something, review/audit/refactor \
            across the codebase, investigate-then-change). Break it into self-contained tasks and \
            {delegation_line} Independent parts run in parallel, each agent stays \
-           focused.{workflow_decision_line}\n{clarify_block}\n\
+           focused.{workflow_decision_line}\n{clarify_block}{discipline}\n\
          ## Principles\n\
          - Trivial → answer. Small & focused → do it yourself. Substantive or multi-part → \
            DELEGATE. Do NOT grind through a large multi-part task entirely yourself when \
@@ -2076,6 +2107,11 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     /// agent's own runner: an independent judge gates natural completion
     /// (completion-loop harness). Only used when `entry_mode`.
     entry_goal: Option<super::goal::GoalCondition>,
+    /// Optional judge provider enabling the RUNTIME goal path: registers a
+    /// `set_goal` tool on the entry agent sharing the runner's goal slot, so
+    /// the agent installs its own acceptance criteria (e.g. from the `intake`
+    /// recipe) and the judge gates every later stop. Only used when `entry_mode`.
+    entry_goal_judge: Option<Arc<BoxedProvider>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -2108,6 +2144,15 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// (bounded by the goal's `max_continuations`).
     pub fn entry_goal(mut self, goal: super::goal::GoalCondition) -> Self {
         self.entry_goal = Some(goal);
+        self
+    }
+
+    /// Enable the RUNTIME goal path: give the entry agent a `set_goal` tool
+    /// (judged by `judge` — use a separate/cheaper model) sharing the runner's
+    /// goal slot. The agent installs its own acceptance criteria mid-run and
+    /// the independent judge gates every natural stop until they're met.
+    pub fn entry_goal_judge(mut self, judge: Arc<BoxedProvider>) -> Self {
+        self.entry_goal_judge = Some(judge);
         self
     }
 
@@ -2578,18 +2623,27 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 .iter()
                 .map(|(n, d)| (n.as_str(), d.as_str()))
                 .collect();
-            // Intake clarify rule only when the `question` tool is actually
-            // among the entry agent's direct tools (P6, completion-loop).
-            let can_ask_user = self
-                .entry_direct_tools
-                .iter()
-                .any(|t| t.definition().name == "question");
+            // Gate each rule on the tool ACTUALLY being available (P6,
+            // completion-loop): question from the direct tools; set_goal from
+            // the judge config (the tool is registered below); set_scope from
+            // the direct tools.
+            let caps = EntryCaps {
+                ask_user: self
+                    .entry_direct_tools
+                    .iter()
+                    .any(|t| t.definition().name == "question"),
+                set_goal: self.entry_goal_judge.is_some(),
+                set_scope: self
+                    .entry_direct_tools
+                    .iter()
+                    .any(|t| t.definition().name == "set_scope"),
+            };
             build_entry_agent_prompt_ext(
                 &triples,
                 squads_enabled,
                 self.dispatch_mode,
                 &recipes,
-                can_ask_user,
+                caps,
             )
         } else {
             build_system_prompt(&triples, squads_enabled, self.dispatch_mode)
@@ -2725,12 +2779,18 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                         ..Default::default()
                     });
             }
-            // Judge-gated completion (completion-loop harness P2): forward the
-            // entry goal to the entry runner so an independent judge gates
-            // natural completion.
-            if let Some(goal) = self.entry_goal.take() {
-                runner_builder = runner_builder.goal(goal);
+            // Judge-gated completion: a SHARED goal slot seeds from the
+            // build-time entry_goal AND (when a judge is configured) backs the
+            // runtime `set_goal` tool — the agent installs its own acceptance
+            // criteria mid-run and the judge gates every later natural stop.
+            let goal_slot: super::goal::GoalSlot =
+                Arc::new(std::sync::RwLock::new(self.entry_goal.take()));
+            if let Some(judge) = self.entry_goal_judge.take() {
+                runner_builder = runner_builder.tool(Arc::new(
+                    crate::tool::set_goal::SetGoalTool::new(goal_slot.clone(), judge),
+                ));
             }
+            runner_builder = runner_builder.goal_slot(goal_slot);
             // Deterministic delegation nudge: prompt-only routing has twice
             // failed to make mid-tier models delegate organically (live trace
             // evidence 2026-06-07 — zero organic delegations across ~30
@@ -4493,7 +4553,16 @@ mod tests {
         // the entry prompt carries the when-to-ask policy; without the tool the
         // rule is absent (never instruct calling an unregistered tool).
         let agents: Vec<(&str, &str, &[String])> = vec![];
-        let with = build_entry_agent_prompt_ext(&agents, false, DispatchMode::Parallel, &[], true);
+        let with = build_entry_agent_prompt_ext(
+            &agents,
+            false,
+            DispatchMode::Parallel,
+            &[],
+            EntryCaps {
+                ask_user: true,
+                ..Default::default()
+            },
+        );
         let low = with.to_lowercase();
         assert!(
             low.contains("guessing would cause rework"),
@@ -4507,8 +4576,13 @@ mod tests {
             low.contains("state") && low.contains("assumption"),
             "rule must give the proceed-with-assumptions alternative: {with}"
         );
-        let without =
-            build_entry_agent_prompt_ext(&agents, false, DispatchMode::Parallel, &[], false);
+        let without = build_entry_agent_prompt_ext(
+            &agents,
+            false,
+            DispatchMode::Parallel,
+            &[],
+            EntryCaps::default(),
+        );
         assert!(
             !without
                 .to_lowercase()
@@ -4707,6 +4781,84 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("objective is not yet complete")),
             "judge continuation must be injected into the entry agent: {tails:?}"
+        );
+    }
+
+    #[test]
+    fn entry_prompt_discipline_rules_gated_on_caps() {
+        let agents: Vec<(&str, &str, &[String])> = vec![];
+        let full = build_entry_agent_prompt_ext(
+            &agents,
+            false,
+            DispatchMode::Parallel,
+            &[],
+            EntryCaps {
+                ask_user: false,
+                set_goal: true,
+                set_scope: true,
+            },
+        );
+        assert!(full.contains("set_goal"), "goal rule present: {full}");
+        assert!(full.contains("set_scope"), "scope rule present: {full}");
+        let none = build_entry_agent_prompt_ext(
+            &agents,
+            false,
+            DispatchMode::Parallel,
+            &[],
+            EntryCaps::default(),
+        );
+        assert!(!none.contains("set_goal") && !none.contains("set_scope"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entry_agent_set_goal_tool_installs_runtime_goal() {
+        // The runtime half of judge-gated completion: with entry_goal_judge
+        // set, the entry agent gets a `set_goal` tool sharing the runner's
+        // goal slot — installing a goal mid-run makes the judge gate the very
+        // next natural stop.
+        let main = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "g1".into(),
+                        name: "set_goal".into(),
+                        input: json!({"objective": "demonstrate the endpoint works"}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                text_end("first stop"),  // judge says NO → continuation
+                text_end("real result"), // judge says YES
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let judge = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(vec![
+                text_end("GOAL_MET: NO: nothing demonstrated"),
+                text_end("GOAL_MET: YES"),
+            ]),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(main.clone())
+            .entry_agent(vec![])
+            .entry_goal_judge(Arc::new(crate::llm::BoxedProvider::from_arc(judge.clone())))
+            .sub_agent("worker", "does work", "you work")
+            .max_turns(20)
+            .build()
+            .unwrap();
+        let out = orch.run("ship the endpoint").await.unwrap();
+        assert_eq!(out.result, "real result");
+        assert_eq!(
+            judge.tails.lock().unwrap().len(),
+            2,
+            "judge consulted at both stops"
+        );
+        let tails = main.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("not yet complete")),
+            "the runtime-installed goal gated the stop: {tails:?}"
         );
     }
 

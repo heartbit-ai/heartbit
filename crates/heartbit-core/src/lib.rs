@@ -45,7 +45,7 @@ pub use agent::dag::{DagAgent, DagAgentBuilder};
 pub use agent::debate::{DebateAgent, DebateAgentBuilder};
 pub use agent::evaluator::{EvaluatorOptimizerAgent, EvaluatorOptimizerAgentBuilder};
 pub use agent::events::{AgentEvent, OnEvent};
-pub use agent::goal::{GoalCondition, GoalVerdict};
+pub use agent::goal::{GoalCondition, GoalSlot, GoalVerdict};
 pub use agent::guardrail::{GuardAction, Guardrail};
 #[allow(deprecated)]
 pub use agent::guardrails::ContentFenceGuardrail;
@@ -205,6 +205,8 @@ pub use tool::mcp_presets::{
     resolve_preset,
 };
 pub use tool::mcp_server::{McpServer, McpServerConfig, ServerResource};
+pub use tool::set_goal::SetGoalTool;
+pub use tool::set_scope::SetScopeTool;
 pub use tool::{Tool, ToolOutput, validate_tool_input};
 
 // --- Workspace re-exports ---

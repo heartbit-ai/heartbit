@@ -184,6 +184,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/handoff",
         "brief for another session (`/handoff <purpose>`)",
     ),
+    (
+        "/goal",
+        "judge-gated objective (`/goal <objective>` | clear)",
+    ),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
     ("/context-recall", "toggle context restore-on-demand"),
@@ -1142,6 +1146,25 @@ impl App {
             }
             "export" => self.effects.push(Effect::ExportSession),
             "resume" => self.effects.push(Effect::ListSessions),
+            "goal" => {
+                if arg.is_empty() {
+                    self.history.push(Cell::Notice(
+                        "usage: /goal <objective> (the judge gates completion until met) \
+                         · /goal clear"
+                            .into(),
+                    ));
+                } else if arg.eq_ignore_ascii_case("clear") {
+                    self.effects.push(Effect::SendInput(
+                        "Call the `set_goal` tool with clear=true (remove the completion goal)."
+                            .to_string(),
+                    ));
+                } else {
+                    self.effects.push(Effect::SendInput(format!(
+                        "Call the `set_goal` tool now with this objective, then keep working \
+                         toward it: \"{arg}\""
+                    )));
+                }
+            }
             "handoff" => {
                 if arg.is_empty() {
                     // Bare: browse saved briefs (a purposeless handoff is
@@ -2279,6 +2302,49 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    #[test]
+    fn slash_goal_with_objective_sends_set_goal_instruction() {
+        let mut app = keyed();
+        typed(&mut app, "/goal tous les tests passent");
+        app.update(key(KeyCode::Enter));
+        let sent = app.effects.iter().find_map(|e| match e {
+            Effect::SendInput(s) => Some(s.clone()),
+            _ => None,
+        });
+        let sent = sent.expect("must submit a set_goal instruction");
+        assert!(sent.contains("set_goal"), "names the tool: {sent}");
+        assert!(
+            sent.contains("tous les tests passent"),
+            "carries the objective verbatim: {sent}"
+        );
+    }
+
+    #[test]
+    fn slash_goal_clear_sends_clear_instruction() {
+        let mut app = keyed();
+        typed(&mut app, "/goal clear");
+        app.update(key(KeyCode::Enter));
+        let sent = app.effects.iter().find_map(|e| match e {
+            Effect::SendInput(s) => Some(s.clone()),
+            _ => None,
+        });
+        let sent = sent.expect("must submit");
+        assert!(sent.contains("set_goal") && sent.contains("clear"));
+    }
+
+    #[test]
+    fn slash_goal_bare_notices_usage() {
+        let mut app = keyed();
+        typed(&mut app, "/goal");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("/goal <"))),
+            "bare /goal explains usage"
+        );
     }
 
     #[test]
