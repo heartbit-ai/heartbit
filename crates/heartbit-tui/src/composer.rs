@@ -126,6 +126,12 @@ impl Composer {
     }
 
     /// The submit-history entries (oldest→newest) — for Ctrl+R reverse search.
+    /// Seed the recall history with persisted entries (older first) —
+    /// called once at startup so ↑ scrolls into PREVIOUS sessions' prompts.
+    pub fn seed_history(&mut self, entries: Vec<String>) {
+        self.history = entries;
+    }
+
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -434,6 +440,20 @@ mod tests {
         c.insert_str("line1\nline2");
         assert_eq!(c.text(), "line1\nline2");
         assert_eq!(c.render_lines().len(), 2);
+    }
+
+    #[test]
+    fn seeded_history_is_recalled_with_up() {
+        let mut c = Composer::default();
+        c.seed_history(vec!["ancien prompt".into(), "dernier prompt".into()]);
+        c.history_prev();
+        assert_eq!(
+            c.text(),
+            "dernier prompt",
+            "↑ recalls the persisted history"
+        );
+        c.history_prev();
+        assert_eq!(c.text(), "ancien prompt");
     }
 
     #[test]

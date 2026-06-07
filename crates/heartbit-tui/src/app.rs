@@ -247,6 +247,8 @@ pub enum Effect {
     ResumeSession(String),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
+    /// Append a submitted prompt to the per-directory persistent history.
+    PersistPrompt(String),
     /// List handoff briefs (for the `/handoff` picker).
     ListHandoffs,
     /// Seed the session from a chosen handoff brief (path of the .md file).
@@ -284,6 +286,7 @@ impl Effect {
             Effect::ListSessions => "list_sessions",
             Effect::ResumeSession(_) => "resume_session",
             Effect::Interrupt => "interrupt",
+            Effect::PersistPrompt(_) => "persist_prompt",
             Effect::ListHandoffs => "list_handoffs",
             Effect::SeedFromHandoff(_) => "seed_from_handoff",
             Effect::EmergencyHandoff(_) => "emergency_handoff",
@@ -494,7 +497,10 @@ impl App {
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),
-            permission_mode: PermissionMode::Normal,
+            // YOLO by default (user decision 2026-06-07): approvals
+            // auto-allow; Shift+Tab / /mode switch live when more caution
+            // is wanted. The status line always shows non-Normal modes.
+            permission_mode: PermissionMode::Yolo,
             file_index: Vec::new(),
             files_requested: false,
             context_tokens: 0,
@@ -1080,6 +1086,9 @@ impl App {
             return;
         }
         let text = self.composer.take();
+        // Persist the raw prompt to the per-directory history (slash commands
+        // never reach here — they returned above, so secrets stay unrecallable).
+        self.effects.push(Effect::PersistPrompt(text.clone()));
         self.history.push(Cell::User(text.clone())); // display the user's text verbatim
         self.running = true;
         self.follow = true; // jump back to the newest when the user sends
@@ -2020,7 +2029,13 @@ mod tests {
         app.has_fallback_provider = true; // e.g. ANTHROPIC_API_KEY present
         typed(&mut app, "hi");
         app.update(key(KeyCode::Enter));
-        assert_eq!(app.effects, vec![Effect::SendInput("hi".into())]);
+        assert_eq!(
+            app.effects,
+            vec![
+                Effect::PersistPrompt("hi".into()),
+                Effect::SendInput("hi".into())
+            ]
+        );
         assert!(app.modal.is_none());
     }
 
@@ -2302,6 +2317,31 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    #[test]
+    fn submit_persists_the_raw_prompt() {
+        let mut app = keyed();
+        typed(&mut app, "corrige le bug du parseur");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.effects
+                .contains(&Effect::PersistPrompt("corrige le bug du parseur".into())),
+            "user prompts must reach the per-directory history"
+        );
+    }
+
+    #[test]
+    fn slash_commands_are_never_persisted() {
+        let mut app = keyed();
+        typed(&mut app, "/key sk-secret-123");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistPrompt(_))),
+            "slash commands (possibly secrets) must never be persisted"
+        );
     }
 
     #[test]
@@ -2852,7 +2892,13 @@ mod tests {
         typed(&mut app, "hello");
         app.update(key(KeyCode::Enter));
         assert!(matches!(app.history.last(), Some(Cell::User(t)) if t == "hello"));
-        assert_eq!(app.effects, vec![Effect::SendInput("hello".into())]);
+        assert_eq!(
+            app.effects,
+            vec![
+                Effect::PersistPrompt("hello".into()),
+                Effect::SendInput("hello".into())
+            ]
+        );
         assert!(app.running);
         assert!(app.composer.is_empty());
     }
@@ -3319,16 +3365,20 @@ mod tests {
     #[test]
     fn shift_tab_cycles_permission_mode_and_emits_effect() {
         let mut app = keyed();
+        assert_eq!(
+            app.permission_mode,
+            PermissionMode::Yolo,
+            "YOLO is the default"
+        );
+        app.update(key(KeyCode::BackTab)); // wraps to Normal
         assert_eq!(app.permission_mode, PermissionMode::Normal);
+        assert!(app.effects.contains(&Effect::SetPermissionMode(0)));
         app.update(key(KeyCode::BackTab)); // → Plan
         assert_eq!(app.permission_mode, PermissionMode::Plan);
         assert!(app.effects.contains(&Effect::SetPermissionMode(1)));
         app.update(key(KeyCode::BackTab)); // → YOLO
         assert_eq!(app.permission_mode, PermissionMode::Yolo);
         assert!(app.effects.contains(&Effect::SetPermissionMode(2)));
-        app.update(key(KeyCode::BackTab)); // wraps to Normal
-        assert_eq!(app.permission_mode, PermissionMode::Normal);
-        assert!(app.effects.contains(&Effect::SetPermissionMode(0)));
         // a notice records the change
         assert!(
             app.history
@@ -3621,7 +3671,7 @@ mod tests {
         app.modal = Some(Modal::ModePicker { sel: 2 });
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
-        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        assert_eq!(app.permission_mode, PermissionMode::Yolo); // untouched default
         assert!(
             !app.effects
                 .iter()

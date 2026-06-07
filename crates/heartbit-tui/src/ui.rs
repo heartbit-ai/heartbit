@@ -1535,7 +1535,8 @@ mod tests {
         let backend = TestBackend::new(100, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("m");
-        // Normal → not shown
+        // Normal → not shown (the app now DEFAULTS to YOLO; set Normal explicitly)
+        app.permission_mode = PermissionMode::Normal;
         terminal.draw(|f| view(f, &app)).unwrap();
         assert!(!buffer_text(terminal.backend().buffer()).contains("YOLO"));
         // YOLO → shown

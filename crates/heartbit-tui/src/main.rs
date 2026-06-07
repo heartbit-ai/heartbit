@@ -187,6 +187,12 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.splash = cfg.splash.then_some(0);
     // Same deterministic registry the engine builds — /workflows lists it.
     app.workflow_recipes = heartbit_core::default_registry().meta();
+    // Per-directory persistent prompt history: ↑ recalls prompts from
+    // previous sessions in THIS directory.
+    app.composer
+        .seed_history(session::load_prompt_history(&session::prompt_history_file(
+            &cwd,
+        )));
     app.fast_model = cfg.fast_model.clone();
     app.frontier_model = cfg.frontier_model.clone();
     app.workflow_journal_dir = session::sessions_dir().join("journals").join(&session_id);
@@ -206,7 +212,9 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let interrupt = InterruptHandle::new();
     // Shared permission posture (0=normal, 1=plan, 2=yolo), cycled by the UI
     // (Shift+Tab) and read live by the agent thread's `on_approval`.
-    let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+        app::PermissionMode::Yolo.as_u8(),
+    ));
 
     // Config snapshot at launch — the trace's first record (init_tracing runs
     // after this so its captured banner can't claim seq 0).
@@ -1195,6 +1203,13 @@ async fn run_ui(
                 Effect::ListSessions => {
                     let metas = session::list(&session::sessions_dir());
                     let _ = ui_tx.send(Msg::SessionsListed(metas));
+                }
+                Effect::PersistPrompt(prompt) => {
+                    if let Err(e) =
+                        session::append_prompt_history(&session::prompt_history_file(&cwd), &prompt)
+                    {
+                        tracing::warn!(error = %e, "could not persist prompt history");
+                    }
                 }
                 Effect::ListHandoffs => {
                     let briefs = session::list_handoffs(&session::handoffs_dir());

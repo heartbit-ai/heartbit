@@ -190,6 +190,65 @@ pub fn write_emergency_brief(
     Ok(path)
 }
 
+/// Cap on persisted prompt-history entries per directory (last N kept).
+const PROMPT_HISTORY_MAX: usize = 500;
+
+/// Stable FNV-1a 64 hash — keys the per-directory prompt-history file by the
+/// working directory path (stable across runs and toolchains, unlike
+/// `DefaultHasher`).
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The persistent prompt-history file for `cwd`
+/// (`<config-dir>/prompt_history/<fnv-of-path>.jsonl`, one JSON string per line
+/// — robust to multi-line prompts). Per-directory by design: ↑ in a project
+/// recalls THAT project's prompts.
+pub fn prompt_history_file(cwd: &Path) -> PathBuf {
+    let key = format!("{:016x}", fnv1a64(&cwd.to_string_lossy()));
+    crate::config::config_path()
+        .parent()
+        .map(|p| p.join("prompt_history").join(format!("{key}.jsonl")))
+        .unwrap_or_else(|| PathBuf::from(format!("prompt_history-{key}.jsonl")))
+}
+
+/// Load the persisted prompts (older first, last [`PROMPT_HISTORY_MAX`] kept).
+pub fn load_prompt_history(file: &Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<String> = body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<String>(l).ok())
+        .collect();
+    if entries.len() > PROMPT_HISTORY_MAX {
+        entries.drain(..entries.len() - PROMPT_HISTORY_MAX);
+    }
+    entries
+}
+
+/// Append one prompt (best-effort; creates the directory on first use).
+pub fn append_prompt_history(file: &Path, prompt: &str) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
+    writeln!(
+        f,
+        "{}",
+        serde_json::to_string(prompt).map_err(std::io::Error::other)?
+    )
+}
+
 /// Render a transcript as Markdown (pure) for `/export`.
 pub fn to_markdown(history: &[Cell]) -> String {
     let mut out = String::from("# Heartbit session\n\n");
@@ -258,6 +317,54 @@ mod tests {
                 stats: Box::new(crate::trace_stats::TraceStats::default()),
             },
         ]
+    }
+
+    #[test]
+    fn prompt_history_roundtrips_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("h.jsonl");
+        append_prompt_history(&f, "ligne un\nligne deux").unwrap();
+        append_prompt_history(&f, "second prompt").unwrap();
+        let loaded = load_prompt_history(&f);
+        assert_eq!(
+            loaded,
+            vec![
+                "ligne un\nligne deux".to_string(),
+                "second prompt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_history_caps_at_last_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("h.jsonl");
+        for i in 0..(PROMPT_HISTORY_MAX + 10) {
+            append_prompt_history(&f, &format!("p{i}")).unwrap();
+        }
+        let loaded = load_prompt_history(&f);
+        assert_eq!(loaded.len(), PROMPT_HISTORY_MAX);
+        assert_eq!(
+            loaded.last().unwrap(),
+            &format!("p{}", PROMPT_HISTORY_MAX + 9)
+        );
+        assert_eq!(
+            loaded.first().unwrap(),
+            "p10",
+            "oldest beyond the cap dropped"
+        );
+    }
+
+    #[test]
+    fn prompt_history_missing_file_is_empty() {
+        assert!(load_prompt_history(Path::new("/nonexistent/h.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn prompt_history_is_per_directory() {
+        let a = prompt_history_file(Path::new("/tmp/project-a"));
+        let b = prompt_history_file(Path::new("/tmp/project-b"));
+        assert_ne!(a, b, "each directory gets its own history file");
     }
 
     #[test]
