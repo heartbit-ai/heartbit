@@ -144,6 +144,43 @@ fn announces_intent(text: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// True when the request is WISH-PHRASED — an intent expression ("je
+/// souhaite créer…", "I'd like to build…") rather than a direct imperative.
+/// Live finding (session 6a25578a): a wish-phrased, underspecified feature
+/// request was answered by a unilateral design decision + immediate build.
+/// Wish phrasing lowers the plan-gate to the FIRST mutation.
+fn is_wish_request(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "je souhaite",
+        "j'aimerais",
+        "je voudrais",
+        "i'd like",
+        "i would like",
+        "it would be nice",
+        "j'aurais besoin",
+    ];
+    let lower = text.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Tools whose call constitutes a PLAN ARTIFACT — evidence the front half
+/// engaged (clarified, planned, or scoped) before building.
+const PLAN_ARTIFACT_TOOLS: &[&str] = &[
+    "question",
+    "todowrite",
+    "set_goal",
+    "set_scope",
+    "run_workflow",
+];
+
+/// Mutating tools the plan-gate counts (file mutations; bash is excluded —
+/// it is mostly used for exploration and a `mkdir` writes no content).
+const PLAN_GATE_MUTATING: &[&str] = &["edit", "write", "patch"];
+
+/// Cumulative mutations (without any plan artifact) at which the tier-2
+/// backstop fires regardless of request phrasing.
+const PLAN_GATE_BACKSTOP_AT: u32 = 3;
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -754,6 +791,13 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Act-gate: tools executed this request + one-shot redirect flag.
             let mut request_tool_calls: u32 = 0;
             let mut intent_nudged = false;
+            // Plan-gate state: wish phrasing of the CURRENT request, whether a
+            // plan artifact (question/todos/goal/scope/recipe) was produced,
+            // cumulative mutations, and the one-shot flag.
+            let mut request_is_wish = is_wish_request(&task);
+            let mut plan_artifact_seen = false;
+            let mut mutating_calls: u32 = 0;
+            let mut plan_gate_fired = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -1551,9 +1595,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                         debug!(agent = %self.name, "announced intent with zero work; act gate");
                         ctx.add_user_message(
                             "[act gate] You announced what you are about to do, then \
-                             stopped without doing it. EXECUTE it now with your tools in \
-                             this same turn. If you are actually waiting on a user \
-                             decision, ask it via the `question` tool instead of stopping."
+                             stopped without doing it. If any requirement is unclear, ask \
+                             the user NOW with the `question` tool; if it is a feature \
+                             request, plan first (todos with acceptance criteria, \
+                             set_goal). Otherwise EXECUTE it now with your tools in this \
+                             same turn — never stop on an announcement."
                                 .to_string(),
                         );
                         continue;
@@ -1645,14 +1691,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                         && let Some(next_message) = on_input().await
                         && !next_message.trim().is_empty()
                     {
+                        // New user request: all per-request gates re-arm.
+                        request_is_wish = is_wish_request(&next_message);
                         ctx.add_user_message(next_message);
-                        // New user request: the delegation-nudge window restarts.
                         nudge_tool_calls = 0;
                         nudge_delegated = false;
                         nudge_sent = false;
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         intent_nudged = false;
+                        plan_artifact_seen = false;
+                        mutating_calls = 0;
+                        plan_gate_fired = false;
                         continue;
                     }
 
@@ -1894,6 +1944,60 @@ impl<P: LlmProvider> AgentRunner<P> {
                         continue;
                     }
                 }
+
+                // Plan-gate (live finding 6a25578a: wish-phrased "je souhaite
+                // créer un petit crm" → unilateral design + immediate build,
+                // zero plan artifacts). Building without ANY plan artifact is
+                // blocked BEFORE execution, doom-loop style (the batch gets
+                // error results): tier 1 — a wish-phrased request gates the
+                // FIRST mutation; tier 2 — any request gates the
+                // PLAN_GATE_BACKSTOP_AT-th cumulative mutation. A plan
+                // artifact (question/todowrite/set_goal/set_scope/
+                // run_workflow) disarms it; one-shot per request.
+                if tool_calls
+                    .iter()
+                    .any(|c| PLAN_ARTIFACT_TOOLS.contains(&c.name.as_str()))
+                {
+                    plan_artifact_seen = true;
+                }
+                let batch_mutations = tool_calls
+                    .iter()
+                    .filter(|c| PLAN_GATE_MUTATING.contains(&c.name.as_str()))
+                    .count() as u32;
+                if batch_mutations > 0 && !plan_artifact_seen && !plan_gate_fired {
+                    let would_be = mutating_calls + batch_mutations;
+                    let tier1 = request_is_wish;
+                    let tier2 = would_be >= PLAN_GATE_BACKSTOP_AT;
+                    if tier1 || tier2 {
+                        plan_gate_fired = true;
+                        debug!(
+                            agent = %self.name,
+                            wish = tier1,
+                            mutations = would_be,
+                            "plan gate: building without a plan artifact"
+                        );
+                        let results: Vec<ToolResult> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                ToolResult::error(
+                                    tc.id.clone(),
+                                    "[plan gate] You are building without a plan. This \
+                                     request needs the front half FIRST: if any requirement \
+                                     is unclear (interface, data model, persistence, scope), \
+                                     ask the user with the `question` tool; otherwise write \
+                                     todos with acceptance criteria (todowrite) and install \
+                                     the goal (set_goal) — the `intake` recipe does both for \
+                                     a feature request. THEN build."
+                                        .to_string(),
+                                )
+                            })
+                            .collect();
+                        total_tool_calls += tool_calls.len();
+                        ctx.add_tool_results(results);
+                        continue;
+                    }
+                }
+                mutating_calls += batch_mutations;
 
                 // Harness-barrier tools (set_scope / set_goal) mutate the very
                 // state their sibling calls are checked against. Executing them
@@ -4429,6 +4533,160 @@ mod tests {
             "second announce passes through"
         );
         assert_eq!(provider.captured_requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wish_request_first_mutation_is_plan_gated() {
+        // Live finding (session 6a25578a): "je souhaite créer un petit crm…"
+        // → the model unilaterally picked a web app and started writing files
+        // with ZERO plan artifacts (no question/todos/goal). A wish-phrased
+        // request gates the FIRST mutation: nothing is written before the
+        // front half engages.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10),    // charge! → must be blocked
+            tool_use_named("question", 10), // reacts to the gate: asks
+            tool_use_named("write", 10),    // now allowed
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        let out = runner
+            .execute("je souhaite créer un petit crm dans un répertoire temporaire")
+            .await
+            .unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let req2: Vec<(String, bool)> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            req2.iter().any(|(c, e)| *e && c.contains("[plan gate]")),
+            "the first mutation must be blocked with plan guidance: {req2:?}"
+        );
+        // After the question (plan artifact), the write executes for real.
+        let last_results: Vec<String> = reqs
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            last_results.iter().any(|c| c == "ok"),
+            "post-artifact write must execute: {last_results:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn imperative_small_task_is_not_plan_gated() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        let out = runner
+            .execute("corrige la typo dans src/a.rs")
+            .await
+            .unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("[plan gate]")))),
+            "an imperative small task must pass untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn third_mutation_without_plan_hits_the_backstop() {
+        // Imperative phrasing escapes tier 1, but sustained building with no
+        // plan artifact hits the tier-2 backstop at the 3rd mutation.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10),
+            tool_use_named("write", 10),
+            tool_use_named("write", 10), // ← blocked (cumulative 3rd)
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        runner
+            .execute("crée un site vitrine complet")
+            .await
+            .unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let gated = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("[plan gate]")),
+            )
+            .count();
+        assert_eq!(gated, 1, "backstop fires exactly once at the 3rd mutation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn todowrite_disarms_the_plan_gate() {
+        // A wish request that PLANS first (todowrite) builds unimpeded.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("todowrite", 10),
+            tool_use_named("write", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "todowrite" }))
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner
+            .execute("j'aimerais créer un petit outil de notes")
+            .await
+            .unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("[plan gate]")))),
+            "planning first must disarm the gate"
+        );
     }
 
     // --- Deterministic delegation nudge ---
