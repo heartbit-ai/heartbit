@@ -420,6 +420,11 @@ pub struct App {
     pub models_loading: bool,
     /// Multi-agent orchestrator mode (applies on next agent start).
     pub multi_agent: bool,
+    /// Set once a delegation happens this session (the option-C entry agent
+    /// delegates dynamically without the manual `/agents` toggle). Activates the
+    /// roster + per-agent tool-cell badges so parallel sub-agents are attributed
+    /// — live finding 6a25eb4d: 4 parallel workers ran with zero attribution.
+    pub saw_delegation: bool,
     /// Context restore-on-demand (single-agent path): index tool outputs + gentle
     /// session pruner so old tool results truncate to a restorable marker. ON by
     /// default; toggled via `/context-recall`, applies on next start.
@@ -502,6 +507,7 @@ impl App {
             models: Vec::new(),
             models_loading: false,
             multi_agent: false,
+            saw_delegation: false,
             context_recall: true,
             verify_command: None,
             prompt_caching: true,
@@ -604,10 +610,18 @@ impl App {
         }
     }
 
+    /// Whether the multi-agent roster + tool-cell badges are live: the user
+    /// opted in via `/agents`, OR a delegation happened this session (the
+    /// option-C entry agent delegates dynamically). Single-agent chat that never
+    /// delegates stays clean (no roster, no badges).
+    fn roster_active(&self) -> bool {
+        self.multi_agent || self.saw_delegation
+    }
+
     /// Find or create an agent row (first-seen order), and set it Working with
-    /// the given activity. Only tracked in multi-agent mode.
+    /// the given activity. Only tracked once the roster is active.
     fn agent_set_working(&mut self, name: &str, activity: impl Into<String>) {
-        if !self.multi_agent {
+        if !self.roster_active() {
             return;
         }
         let activity = activity.into();
@@ -631,7 +645,7 @@ impl App {
 
     /// Mark an agent finished (Done/Failed) with its token cost.
     fn agent_finish(&mut self, name: &str, success: bool, tokens: u32) {
-        if !self.multi_agent {
+        if !self.roster_active() {
             return;
         }
         if let Some(row) = self.agents.iter_mut().find(|r| r.name == name) {
@@ -645,10 +659,11 @@ impl App {
         }
     }
 
-    /// The agent badge to stamp on a tool cell: the agent name in multi-agent
-    /// mode (so the transcript shows who ran each tool), `None` in single mode.
+    /// The agent badge to stamp on a tool cell: the agent name once the roster is
+    /// active (so the transcript shows who ran each tool), `None` for clean
+    /// single-agent chat that hasn't delegated.
     fn agent_badge(&self, agent: &str) -> Option<String> {
-        if self.multi_agent {
+        if self.roster_active() {
             Some(agent.to_string())
         } else {
             None
@@ -808,13 +823,18 @@ impl App {
                 });
             }
             Msg::AgentsDispatched(names) => {
+                // A delegation activates the roster + badges for the rest of the
+                // session, even without the manual /agents toggle.
+                if !names.is_empty() {
+                    self.saw_delegation = true;
+                }
                 for n in &names {
                     self.agent_set_working(n, "dispatched");
                 }
                 if !names.is_empty() {
                     self.history.push(Cell::Notice(format!(
                         "→ delegating to {}",
-                        names.join(", ")
+                        format_dispatch_names(&names)
                     )));
                 }
             }
@@ -2021,6 +2041,33 @@ fn first_words(s: &str, max: usize) -> String {
     }
 }
 
+/// Format a dispatch roster for the "→ delegating to …" notice, collapsing
+/// duplicate agent names with a count (first-seen order). A `delegate_task` with
+/// 4 tasks all named "worker" reads "worker ×4", not "worker, worker, worker,
+/// worker" (which looks like a bug) — live finding 6a25eb4d.
+fn format_dispatch_names(names: &[String]) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for n in names {
+        if !counts.contains_key(n.as_str()) {
+            order.push(n.as_str());
+        }
+        *counts.entry(n.as_str()).or_insert(0) += 1;
+    }
+    order
+        .iter()
+        .map(|name| {
+            let c = counts[name];
+            if c > 1 {
+                format!("{name} ×{c}")
+            } else {
+                (*name).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse a `/mcp add` argument: a lone known-preset name becomes a preset
 /// server, otherwise the first token is the command and the rest are its args.
 fn parse_mcp_add(rest: &str) -> McpServerSpec {
@@ -2954,11 +3001,63 @@ mod tests {
     }
 
     #[test]
-    fn roster_is_inert_in_single_agent_mode() {
+    fn solo_tool_call_inert_but_delegation_activates_roster() {
+        // Live finding 6a25eb4d: the option-C entry agent delegates dynamically,
+        // but the roster was gated behind the manual /agents flag — so 4 parallel
+        // workers ran with ZERO attribution. New contract: a solo tool call stays
+        // inert (no roster noise for pure chat), but a delegation activates the
+        // roster even without the manual toggle.
         let mut app = keyed(); // multi_agent = false
         app.update(tool_started("heartbit", "bash"));
+        assert!(
+            app.agents.is_empty(),
+            "a solo tool call before any delegation must not open the roster"
+        );
         app.update(Msg::AgentsDispatched(vec!["x".into()]));
-        assert!(app.agents.is_empty(), "no roster tracking in single mode");
+        assert_eq!(app.agents.len(), 1, "delegation opens the roster");
+        assert_eq!(app.agents[0].name, "x");
+    }
+
+    #[test]
+    fn delegation_enables_sub_agent_badges_without_manual_toggle() {
+        let mut app = keyed(); // multi_agent = false
+        // Before delegation: a solo cell is unbadged (clean for pure chat).
+        app.update(tool_started("orchestrator", "bash"));
+        assert!(matches!(
+            app.history.last(),
+            Some(Cell::Tool { agent: None, .. })
+        ));
+        // After delegation: sub-agent tool cells carry their agent badge so the
+        // transcript shows who ran each tool.
+        app.update(Msg::AgentsDispatched(vec!["worker".into()]));
+        app.update(tool_started("worker", "write"));
+        assert!(matches!(
+            app.history.last(),
+            Some(Cell::Tool { agent: Some(a), .. }) if a == "worker"
+        ));
+    }
+
+    #[test]
+    fn dispatch_notice_counts_duplicate_agents() {
+        // "→ delegating to worker, worker, worker, worker" reads like a bug;
+        // count-format it so 4 parallel workers are legible.
+        assert_eq!(
+            format_dispatch_names(&[
+                "worker".into(),
+                "worker".into(),
+                "worker".into(),
+                "worker".into()
+            ]),
+            "worker ×4"
+        );
+        assert_eq!(
+            format_dispatch_names(&["worker".into(), "researcher".into()]),
+            "worker, researcher"
+        );
+        assert_eq!(
+            format_dispatch_names(&["a".into(), "a".into(), "b".into()]),
+            "a ×2, b"
+        );
     }
 
     #[test]

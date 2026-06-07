@@ -343,8 +343,6 @@ struct DelegateTaskTool {
     cached_definition: ToolDefinition,
     /// Optional event callback for sub-agent dispatch/completion events.
     on_event: Option<Arc<OnEvent>>,
-    /// Optional streaming text callback, forwarded to sub-agents.
-    on_text: Option<Arc<crate::llm::OnText>>,
     /// Optional LSP manager, forwarded to sub-agents.
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
     /// Observability mode inherited from the orchestrator, forwarded to sub-agents.
@@ -416,7 +414,6 @@ impl DelegateTaskTool {
             let blackboard = self.blackboard.clone();
             let knowledge_base = self.knowledge_base.clone();
             let on_event = self.on_event.clone();
-            let on_text = self.on_text.clone();
             let lsp_manager = self.lsp_manager.clone();
             let permission_rules = self.permission_rules.clone();
             let observability_mode = self.observability_mode;
@@ -543,10 +540,11 @@ impl DelegateTaskTool {
                 if let Some(ref on_event) = on_event {
                     builder = builder.on_event(on_event.clone());
                 }
-                // Forward on_text so sub-agent streaming text is visible
-                if let Some(ref on_text) = on_text {
-                    builder = builder.on_text(on_text.clone());
-                }
+                // Sub-agents do NOT stream text (contract: see OrchestratorBuilder
+                // ::on_text). Live finding 6a25eb4d: forwarding on_text to N
+                // parallel sub-agents crisscrossed their tokens into one
+                // un-namespaced buffer. Their work stays visible via attributed
+                // tool-call events; only the orchestrator's synthesis streams.
 
                 // Multi-agent context enablement: forward this sub-agent's
                 // context wiring (recitation, restore-on-demand, proactive
@@ -768,8 +766,6 @@ struct FormSquadTool {
     blackboard: Option<Arc<dyn Blackboard>>,
     knowledge_base: Option<Arc<dyn KnowledgeBase>>,
     on_event: Option<Arc<OnEvent>>,
-    /// Optional streaming text callback, forwarded to squad members.
-    on_text: Option<Arc<crate::llm::OnText>>,
     /// Optional LSP manager, forwarded to squad members.
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
     cached_definition: ToolDefinition,
@@ -892,7 +888,6 @@ impl Tool for FormSquadTool {
                 let bb = private_bb.clone();
                 let knowledge_base = self.knowledge_base.clone();
                 let on_event = self.on_event.clone();
-                let on_text = self.on_text.clone();
                 let lsp_manager = self.lsp_manager.clone();
                 let permission_rules = self.permission_rules.clone();
                 let observability_mode = self.observability_mode;
@@ -1014,10 +1009,7 @@ impl Tool for FormSquadTool {
                     if let Some(ref on_event) = on_event {
                         builder = builder.on_event(on_event.clone());
                     }
-                    // Forward on_text so sub-agent streaming text is visible
-                    if let Some(ref on_text) = on_text {
-                        builder = builder.on_text(on_text.clone());
-                    }
+                    // Squad members do NOT stream text — see DelegateTaskTool.
 
                     // Multi-agent context enablement (form_squad path): forward
                     // this squad member's context wiring, mirroring the delegate
@@ -1235,7 +1227,6 @@ struct SpawnAgentTool {
     shared_memory: Option<Arc<dyn Memory>>,
     memory_namespace_prefix: Option<String>,
     on_event: Option<Arc<OnEvent>>,
-    on_text: Option<Arc<crate::llm::OnText>>,
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
     observability_mode: super::observability::ObservabilityMode,
     workspace: Option<std::path::PathBuf>,
@@ -1411,9 +1402,7 @@ impl SpawnAgentTool {
         if let Some(ref cb) = self.on_event {
             builder = builder.on_event(cb.clone());
         }
-        if let Some(ref cb) = self.on_text {
-            builder = builder.on_text(cb.clone());
-        }
+        // Spawned agents do NOT stream text — see DelegateTaskTool.
         if let Some(ref trail) = self.audit_trail {
             builder = builder.audit_trail(trail.clone());
         }
@@ -2755,7 +2744,6 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             knowledge_base: self.knowledge_base.clone(),
             cached_definition,
             on_event: self.on_event.clone(),
-            on_text: self.on_text.clone(),
             lsp_manager: self.lsp_manager.clone(),
             observability_mode: resolved_mode,
             allow_shared_write: self.allow_shared_write,
@@ -2849,7 +2837,6 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 blackboard: self.blackboard.clone(),
                 knowledge_base: self.knowledge_base.clone(),
                 on_event: self.on_event.clone(),
-                on_text: self.on_text.clone(),
                 lsp_manager: self.lsp_manager.clone(),
                 cached_definition: squad_def,
                 observability_mode: resolved_mode,
@@ -2873,7 +2860,6 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 shared_memory: self.shared_memory.clone(),
                 memory_namespace_prefix: self.memory_namespace_prefix.clone(),
                 on_event: self.on_event.clone(),
-                on_text: self.on_text.clone(),
                 lsp_manager: self.lsp_manager.clone(),
                 observability_mode: resolved_mode,
                 workspace: self.workspace.clone(),
@@ -3406,7 +3392,6 @@ mod tests {
             accumulated_tokens: Arc::new(Mutex::new(TokenUsage::default())),
             cached_definition,
             on_event: None,
-            on_text: None,
             lsp_manager: None,
             observability_mode: crate::ObservabilityMode::Production,
             allow_shared_write: true,
@@ -4241,6 +4226,115 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Contract (orchestrator.rs `on_text` doc): "Sub-agents do not stream — only
+    /// the orchestrator's own reasoning and final synthesis are emitted
+    /// incrementally." Live finding 6a25eb4d: one `delegate_task` with 4 tasks
+    /// spawned 4 parallel `worker` agents, each handed a clone of the SAME
+    /// `on_text`; their tokens crisscrossed character-by-character into one
+    /// un-namespaced buffer ("les messages s'entrecroisent"). The fix restores
+    /// the contract: a delegated sub-agent's streamed text must NOT reach the
+    /// orchestrator's `on_text`; the orchestrator's synthesis still does.
+    #[tokio::test]
+    async fn sub_agent_text_does_not_reach_on_text() {
+        // A provider whose stream_complete actually invokes on_text per text
+        // block (the default trait impl ignores it, so MockProvider can't
+        // exercise this contract).
+        struct StreamingMock {
+            responses: Mutex<Vec<CompletionResponse>>,
+        }
+        impl LlmProvider for StreamingMock {
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, Error> {
+                let mut r = self.responses.lock().expect("mock lock");
+                if r.is_empty() {
+                    return Err(Error::Agent("no more mock responses".into()));
+                }
+                Ok(r.remove(0))
+            }
+            async fn stream_complete(
+                &self,
+                request: CompletionRequest,
+                on_text: &crate::llm::OnText,
+            ) -> Result<CompletionResponse, Error> {
+                let resp = self.complete(request).await?;
+                for block in &resp.content {
+                    if let ContentBlock::Text { text } = block {
+                        on_text(text);
+                    }
+                }
+                Ok(resp)
+            }
+            fn model_name(&self) -> Option<&str> {
+                Some("stream-mock")
+            }
+        }
+
+        let texts: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let texts_clone = texts.clone();
+
+        let provider = Arc::new(StreamingMock {
+            responses: Mutex::new(vec![
+                // 1: orchestrator delegates (tool call, no streamed text)
+                CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-1".into(),
+                        name: "delegate_task".into(),
+                        input: json!({
+                            "tasks": [{"agent": "researcher", "task": "Research"}]
+                        }),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 2: SUB-AGENT streams text — must NOT reach on_text
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "SUBAGENT_SECRET".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+                // 3: ORCHESTRATOR synthesis — MUST reach on_text
+                CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "ORCH_SYNTHESIS".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    reasoning: None,
+                    usage: TokenUsage::default(),
+                    model: None,
+                },
+            ]),
+        });
+
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("researcher", "Research", "prompt")
+            .on_text(Arc::new(move |s: &str| {
+                texts_clone.lock().unwrap().push(s.to_string());
+            }))
+            .build()
+            .unwrap();
+
+        orch.run("task").await.unwrap();
+
+        let got = texts.lock().unwrap().join("");
+        assert!(
+            got.contains("ORCH_SYNTHESIS"),
+            "the orchestrator's own synthesis must still stream (got: {got:?})"
+        );
+        assert!(
+            !got.contains("SUBAGENT_SECRET"),
+            "a delegated sub-agent's text must NOT reach on_text — it crisscrosses \
+             with other parallel sub-agents (got: {got:?})"
+        );
     }
 
     #[tokio::test]
@@ -8240,7 +8334,6 @@ mod tests {
             shared_memory: None,
             memory_namespace_prefix: None,
             on_event: None,
-            on_text: None,
             lsp_manager: None,
             observability_mode: crate::agent::observability::ObservabilityMode::Production,
             workspace: None,
