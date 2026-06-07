@@ -169,7 +169,9 @@ impl PermissionMode {
         match s.trim().to_lowercase().as_str() {
             "normal" | "default" => Some(PermissionMode::Normal),
             "plan" => Some(PermissionMode::Plan),
-            "yolo" | "auto" => Some(PermissionMode::Yolo),
+            // "auto" now belongs to the request-mode pin release (/mode auto);
+            // yolo keeps its own name.
+            "yolo" => Some(PermissionMode::Yolo),
             _ => None,
         }
     }
@@ -239,6 +241,8 @@ pub enum Effect {
     SaveVerifyCommand(Option<String>),
     /// Apply the permission mode to the shared (cross-thread) approval gate.
     SetPermissionMode(u8),
+    /// Pin the request-intent mode (0 = auto; RequestMode::as_pin_u8 codes).
+    SetRequestModePin(u8),
     /// Export the current transcript (read from `App.history`) to a Markdown file.
     ExportSession,
     /// List saved sessions (for the `/resume` picker).
@@ -282,6 +286,7 @@ impl Effect {
             Effect::SaveContextRecall(_) => "save_context_recall",
             Effect::SaveVerifyCommand(_) => "save_verify_command",
             Effect::SetPermissionMode(_) => "set_permission_mode",
+            Effect::SetRequestModePin(_) => "set_request_mode_pin",
             Effect::ExportSession => "export_session",
             Effect::ListSessions => "list_sessions",
             Effect::ResumeSession(_) => "resume_session",
@@ -1409,10 +1414,31 @@ impl App {
                 )));
             }
             None => {
-                self.history.push(Cell::Notice(format!(
-                    "usage: /mode [normal|plan|yolo] (currently {})",
-                    self.permission_mode.label()
-                )));
+                // Request-intent pins: `/mode study|clarify|execute|answer`
+                // forces the response mode for every following request;
+                // `/mode auto` resumes routing. Orthogonal to the approval
+                // modes above (live effect, no respawn).
+                let trimmed = arg.trim().to_lowercase();
+                if trimmed == "auto" {
+                    self.effects.push(Effect::SetRequestModePin(0));
+                    self.history
+                        .push(Cell::Notice("request mode: auto (router decides)".into()));
+                } else if let Some(mode) =
+                    heartbit_core::agent::router::RequestMode::parse(&trimmed)
+                {
+                    self.effects
+                        .push(Effect::SetRequestModePin(mode.as_pin_u8()));
+                    self.history.push(Cell::Notice(format!(
+                        "request mode PINNED to {} — /mode auto to release",
+                        mode.label()
+                    )));
+                } else {
+                    self.history.push(Cell::Notice(format!(
+                        "usage: /mode [normal|plan|yolo] · request mode: /mode \
+                         [answer|study|clarify|execute|auto] (currently {})",
+                        self.permission_mode.label()
+                    )));
+                }
             }
         }
     }
@@ -2342,6 +2368,21 @@ mod tests {
                 .any(|e| matches!(e, Effect::PersistPrompt(_))),
             "slash commands (possibly secrets) must never be persisted"
         );
+    }
+
+    #[test]
+    fn slash_mode_pins_request_mode_and_releases() {
+        let mut app = keyed();
+        typed(&mut app, "/mode study");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::SetRequestModePin(3)));
+        typed(&mut app, "/mode auto");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::SetRequestModePin(0)));
+        // permission modes still work
+        typed(&mut app, "/mode yolo");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.permission_mode, PermissionMode::Yolo);
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod orchestrator;
 pub mod permission;
 pub mod prompts;
 pub mod pruner;
+pub mod router;
 pub mod routing;
 mod runner;
 pub mod tenant_tracker;

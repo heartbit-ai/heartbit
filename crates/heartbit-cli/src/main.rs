@@ -2522,6 +2522,19 @@ async fn run_chat_from_config(
         None
     };
 
+    // Request-intent router (mode contracts): chat inherits the core-side
+    // request fidelity (answer/execute/study/clarify). Classifier reuses the
+    // session provider. Opt out with HEARTBIT_REQUEST_ROUTER=0.
+    let request_router = if std::env::var("HEARTBIT_REQUEST_ROUTER").as_deref() != Ok("0") {
+        Some(std::sync::Arc::new(
+            heartbit_core::agent::router::RequestRouter::new(Some(std::sync::Arc::new(
+                heartbit_core::BoxedProvider::from_arc(provider.clone()),
+            ))),
+        ))
+    } else {
+        None
+    };
+
     let mut builder = AgentRunner::builder(provider)
         .name("heartbit")
         .system_prompt(
@@ -2536,6 +2549,9 @@ async fn run_chat_from_config(
         .on_text(on_text)
         .on_input(input_callback())
         .observability_mode(mode);
+    if let Some(router) = request_router {
+        builder = builder.request_router(router);
+    }
 
     if let Some(ref ws) = workspace_dir {
         builder = builder.workspace(ws.clone());

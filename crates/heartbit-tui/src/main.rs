@@ -215,6 +215,9 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(
         app::PermissionMode::Yolo.as_u8(),
     ));
+    // Request-intent pin (0 = auto): shared with the core router so
+    // `/mode study|clarify|execute|answer` takes effect live.
+    let request_mode_pin = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     // Config snapshot at launch — the trace's first record (init_tracing runs
     // after this so its captured banner can't claim seq 0).
@@ -248,6 +251,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         cwd,
         interrupt,
         perm_mode,
+        request_mode_pin,
         session_id,
         trace_handle,
     )
@@ -441,6 +445,7 @@ async fn build_engine(
     prompt_caching: bool,
     fast_model: Option<String>,
     frontier_model: Option<String>,
+    request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     workflow_journal_dir: PathBuf,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
@@ -826,6 +831,13 @@ async fn build_engine(
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
+    // Request-intent router: marker layer + "fast" classifier + safe default,
+    // with the /mode pin shared from the UI thread.
+    let router_fast = provider_factory("fast").ok();
+    builder = builder.entry_request_router(Arc::new(
+        heartbit_core::agent::router::RequestRouter::new(router_fast)
+            .with_pin(request_mode_pin.clone()),
+    ));
     // The squad available for delegation: each sub-agent gets its own context
     // stack (recitation / restore-on-demand / compaction / replan).
     for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
@@ -947,6 +959,7 @@ fn spawn_agent(
     interrupt: &InterruptHandle,
     epoch: u64,
     perm_mode: &Arc<std::sync::atomic::AtomicU8>,
+    request_mode_pin: &Arc<std::sync::atomic::AtomicU8>,
     trace: &trace::TraceHandle,
     reason: &'static str,
 ) -> bool {
@@ -971,6 +984,7 @@ fn spawn_agent(
     let prompt_caching = app.prompt_caching;
     let fast_model = app.fast_model.clone();
     let frontier_model = app.frontier_model.clone();
+    let request_mode_pin = request_mode_pin.clone();
     let workflow_journal_dir = app.workflow_journal_dir.clone();
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
@@ -1002,6 +1016,7 @@ fn spawn_agent(
                 prompt_caching,
                 fast_model,
                 frontier_model,
+                request_mode_pin,
                 workflow_journal_dir,
             )
             .await
@@ -1037,6 +1052,7 @@ async fn run_ui(
     cwd: PathBuf,
     interrupt: InterruptHandle,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
+    request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     session_id: String,
     trace: trace::TraceHandle,
 ) -> anyhow::Result<()> {
@@ -1058,6 +1074,7 @@ async fn run_ui(
         &interrupt,
         agent_epoch,
         &perm_mode,
+        &request_mode_pin,
         &trace,
         "startup",
     );
@@ -1125,6 +1142,7 @@ async fn run_ui(
                             &interrupt,
                             agent_epoch,
                             &perm_mode,
+                            &request_mode_pin,
                             &trace,
                             "respawn",
                         );
@@ -1149,6 +1167,7 @@ async fn run_ui(
                             &interrupt,
                             agent_epoch,
                             &perm_mode,
+                            &request_mode_pin,
                             &trace,
                             "key_set",
                         );
@@ -1177,6 +1196,9 @@ async fn run_ui(
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
                     }
+                }
+                Effect::SetRequestModePin(v) => {
+                    request_mode_pin.store(v, std::sync::atomic::Ordering::Relaxed);
                 }
                 Effect::SetPermissionMode(m) => {
                     // Apply live to the shared gate the agent's on_approval reads.
@@ -1245,6 +1267,7 @@ async fn run_ui(
                                 &interrupt,
                                 agent_epoch,
                                 &perm_mode,
+                                &request_mode_pin,
                                 &trace,
                                 "handoff_seed",
                             );

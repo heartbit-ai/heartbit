@@ -20,6 +20,10 @@ pub enum ToolProfile {
     /// Full: all tools including MCP (~29 tools, ~4500 tokens).
     /// For tasks requiring external service integration.
     Full,
+    /// Read-only: investigation tools only — no edit/write/patch, no bash
+    /// (side effects). The STUDY/ANSWER mode contract (request-intent
+    /// router): the model cannot call what it never received.
+    ReadOnly,
 }
 
 /// Tool names that are always included regardless of profile.
@@ -33,6 +37,34 @@ const CONVERSATIONAL_TOOLS: &[&str] = &[
     "memory_forget",
     "memory_consolidate",
     "todoread",
+];
+
+/// Tool names available in the ReadOnly profile (STUDY/ANSWER contracts):
+/// reading, searching, planning artifacts and the user-dialogue channel —
+/// nothing that mutates the workspace or runs commands.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "list",
+    "todoread",
+    "todowrite",
+    "webfetch",
+    "websearch",
+    "fetch_full_output",
+    "recall_context",
+    "advisor",
+    "set_goal",
+    "set_scope",
+    "run_workflow",
+    "handoff",
+    "memory_recall",
+    "memory_store",
+    "memory_update",
+    "memory_forget",
+    "memory_consolidate",
+    "question",
+    "__respond__",
 ];
 
 /// Built-in tool names that indicate the Standard profile.
@@ -71,6 +103,11 @@ const BUILTIN_TOOLS: &[&str] = &[
 pub fn filter_tools(tools: &[ToolDefinition], profile: ToolProfile) -> Vec<ToolDefinition> {
     match profile {
         ToolProfile::Full => tools.to_vec(),
+        ToolProfile::ReadOnly => tools
+            .iter()
+            .filter(|t| READ_ONLY_TOOLS.contains(&t.name.as_str()))
+            .cloned()
+            .collect(),
         ToolProfile::Standard => tools
             .iter()
             .filter(|t| BUILTIN_TOOLS.contains(&t.name.as_str()))

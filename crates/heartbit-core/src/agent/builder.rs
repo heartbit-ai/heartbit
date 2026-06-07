@@ -67,6 +67,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) tool_output_compression_threshold: Option<usize>,
     pub(super) tool_result_ingest_cap: Option<usize>,
     pub(super) delegation_nudge: Option<super::runner::DelegationNudge>,
+    pub(super) request_router: Option<std::sync::Arc<super::router::RequestRouter>>,
     pub(super) max_tools_per_turn: Option<usize>,
     pub(super) tool_profile: Option<tool_filter::ToolProfile>,
     pub(super) max_identical_tool_calls: Option<u32>,
@@ -358,6 +359,15 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// [`super::runner::DelegationNudge`].
     pub fn delegation_nudge(mut self, nudge: super::runner::DelegationNudge) -> Self {
         self.delegation_nudge = Some(nudge);
+        self
+    }
+
+    /// Enable the request-intent router: each fresh request is routed to a
+    /// response mode (answer/execute/study/clarify) and the harness enforces
+    /// the mode contract (tool masking + execution deny). See
+    /// [`super::router::RequestRouter`].
+    pub fn request_router(mut self, router: std::sync::Arc<super::router::RequestRouter>) -> Self {
+        self.request_router = Some(router);
         self
     }
 
@@ -839,6 +849,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             tool_output_compression_threshold: self.tool_output_compression_threshold,
             tool_result_ingest_cap: self.tool_result_ingest_cap,
             delegation_nudge: self.delegation_nudge,
+            request_router: self.request_router,
             max_tools_per_turn: self.max_tools_per_turn,
             tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,

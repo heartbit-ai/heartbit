@@ -274,6 +274,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             entry_context: SubAgentContextConfig::default(),
             entry_goal: None,
             entry_goal_judge: None,
+            entry_request_router: None,
         }
     }
 
@@ -2114,6 +2115,9 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     /// the agent installs its own acceptance criteria (e.g. from the `intake`
     /// recipe) and the judge gates every later stop. Only used when `entry_mode`.
     entry_goal_judge: Option<Arc<BoxedProvider>>,
+    /// Optional request-intent router for the entry agent's own runner
+    /// (answer/execute/study/clarify mode contracts). Only used when `entry_mode`.
+    entry_request_router: Option<Arc<super::router::RequestRouter>>,
 }
 
 impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
@@ -2155,6 +2159,14 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// the independent judge gates every natural stop until they're met.
     pub fn entry_goal_judge(mut self, judge: Arc<BoxedProvider>) -> Self {
         self.entry_goal_judge = Some(judge);
+        self
+    }
+
+    /// Enable the request-intent router on the entry agent's own runner: each
+    /// fresh user request is routed to a response mode and the harness
+    /// enforces its contract (see [`super::router::RequestRouter`]).
+    pub fn entry_request_router(mut self, router: Arc<super::router::RequestRouter>) -> Self {
+        self.entry_request_router = Some(router);
         self
     }
 
@@ -2793,6 +2805,10 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 ));
             }
             runner_builder = runner_builder.goal_slot(goal_slot);
+            // Request-intent routing (answer/execute/study/clarify contracts).
+            if let Some(router) = self.entry_request_router.take() {
+                runner_builder = runner_builder.request_router(router);
+            }
             // Deterministic delegation nudge: prompt-only routing has twice
             // failed to make mid-tier models delegate organically (live trace
             // evidence 2026-06-07 — zero organic delegations across ~30
@@ -6726,6 +6742,7 @@ mod tests {
                 | AgentEvent::ContextSummarized { agent, .. }
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
+                | AgentEvent::RequestRouted { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
@@ -7420,6 +7437,7 @@ mod tests {
                 | AgentEvent::ContextSummarized { agent, .. }
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
+                | AgentEvent::RequestRouted { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
@@ -7456,6 +7474,7 @@ mod tests {
                 AgentEvent::ContextSummarized { .. } => "ContextSummarized",
                 AgentEvent::GuardrailDenied { .. } => "GuardrailDenied",
                 AgentEvent::GuardrailWarned { .. } => "GuardrailWarned",
+                AgentEvent::RequestRouted { .. } => "RequestRouted",
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",
                 AgentEvent::FuzzyDoomLoopDetected { .. } => "FuzzyDoomLoopDetected",

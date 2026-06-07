@@ -181,6 +181,11 @@ const PLAN_GATE_MUTATING: &[&str] = &["edit", "write", "patch"];
 /// backstop fires regardless of request phrasing.
 const PLAN_GATE_BACKSTOP_AT: u32 = 3;
 
+/// Tools denied at execution in STUDY/ANSWER (read-only) mode — the
+/// side-effect set (bash INCLUDED here, unlike the plan-gate's content-
+/// mutation set; design doc §4 resolves the two semantics by intent).
+const MODE_READONLY_DENY: &[&str] = &["edit", "write", "patch", "bash"];
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -343,6 +348,11 @@ pub struct AgentRunner<P: LlmProvider> {
     /// (64KB). Full output is preserved in `context_recall_store` (when set)
     /// and in `AgentOutput::tool_call_records` regardless.
     pub(super) tool_result_ingest_cap: Option<usize>,
+    /// Optional request-intent router: picks the response mode (answer/
+    /// execute/study/clarify) per fresh request, BEFORE the first LLM turn;
+    /// the harness then enforces the mode contract (tool masking + execution
+    /// deny). `None` = today's semantics (everything is EXECUTE).
+    pub(super) request_router: Option<Arc<super::router::RequestRouter>>,
     /// Optional deterministic delegation nudge (see [`DelegationNudge`]).
     pub(super) delegation_nudge: Option<DelegationNudge>,
     /// When set, limits the number of tool definitions sent per LLM turn.
@@ -488,6 +498,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             tool_output_compression_threshold: None,
             tool_result_ingest_cap: Some(DEFAULT_TOOL_RESULT_INGEST_CAP),
             delegation_nudge: None,
+            request_router: None,
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
@@ -798,6 +809,33 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut plan_artifact_seen = false;
             let mut mutating_calls: u32 = 0;
             let mut plan_gate_fired = false;
+            // Request-intent mode (router): routed per fresh request; the
+            // harness enforces the contract. Without a router, everything is
+            // EXECUTE (today's semantics).
+            let mut request_mode = match &self.request_router {
+                Some(router) => {
+                    let routed = router.route(task).await;
+                    debug!(
+                        agent = %self.name,
+                        mode = routed.mode.label(),
+                        source = ?routed.source,
+                        confidence = routed.confidence,
+                        "request routed"
+                    );
+                    self.emit(AgentEvent::RequestRouted {
+                        agent: self.name.clone(),
+                        mode: routed.mode.label().to_string(),
+                        source: format!("{:?}", routed.source).to_lowercase(),
+                        confidence: routed.confidence,
+                    });
+                    routed.mode
+                }
+                None => super::router::RequestMode::Execute,
+            };
+            // STUDY contract: the go/no-go question must happen before the
+            // study can settle (one corrective per request).
+            let mut question_called = false;
+            let mut study_contract_nudged = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -867,6 +905,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                     && let Some(last) = request.messages.last_mut()
                 {
                     last.content.push(ContentBlock::Text { text: block });
+                }
+
+                // Mode contract, PRIMARY enforcement (tool masking): in
+                // STUDY/ANSWER the model never RECEIVES mutating tools — it
+                // cannot call what it never received (prompt directives don't
+                // hold against non-compliant models; IFEval <50% mid-tier).
+                if matches!(
+                    request_mode,
+                    super::router::RequestMode::Study | super::router::RequestMode::Answer
+                ) {
+                    request.tools =
+                        tool_filter::filter_tools(&request.tools, tool_filter::ToolProfile::ReadOnly);
                 }
 
                 // Tool profile pre-filter: narrow tool set based on query classification
@@ -1605,7 +1655,28 @@ impl<P: LlmProvider> AgentRunner<P> {
                         continue;
                     }
 
-                    // Long-horizon "replan on out-of-plan": a RED verification is
+                    // STUDY contract: a study must END in a proposal + an
+                    // explicit go/no-go via the question tool — a bare "j'ai
+                    // fini d'étudier" stop is a contract violation (once per
+                    // request).
+                    if request_mode == super::router::RequestMode::Study
+                        && !study_contract_nudged
+                        && !question_called
+                        && self.tools.contains_key("question")
+                    {
+                        study_contract_nudged = true;
+                        debug!(agent = %self.name, "study contract: no go/no-go question; corrective injected");
+                        ctx.add_user_message(
+                            "[study contract] End your study properly: give a NUMBERED \
+                             proposal (options + your recommendation), then ask the user \
+                             go/no-go with the `question` tool. Do not build anything in \
+                             this mode."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+
+                    // Long-horizon \"replan on out-of-plan\": a RED verification is
                     // the canonical out-of-plan signal. Before allowing natural
                     // completion, if opted in and the latest canonical
                     // VERIFY_RESULT is FAIL, re-inject a corrective nudge and
@@ -1693,6 +1764,43 @@ impl<P: LlmProvider> AgentRunner<P> {
                     {
                         // New user request: all per-request gates re-arm.
                         request_is_wish = is_wish_request(&next_message);
+                        // Follow-up policy: a bare affirmation after a STUDY/
+                        // CLARIFY proposal PROMOTES to EXECUTE carrying the
+                        // prior plan (no re-routing, no re-clarifying — the
+                        // front half already happened).
+                        let carried = self.request_router.is_some()
+                            && matches!(
+                                request_mode,
+                                super::router::RequestMode::Study
+                                    | super::router::RequestMode::Clarify
+                            )
+                            && super::router::is_bare_affirmation(&next_message);
+                        if carried {
+                            request_mode = super::router::RequestMode::Execute;
+                            debug!(agent = %self.name, "bare affirmation: promoted to execute under the prior plan");
+                            self.emit(AgentEvent::RequestRouted {
+                                agent: self.name.clone(),
+                                mode: "execute".to_string(),
+                                source: "affirmation".to_string(),
+                                confidence: 1.0,
+                            });
+                        } else if let Some(router) = &self.request_router {
+                            let routed = router.route(&next_message).await;
+                            debug!(
+                                agent = %self.name,
+                                mode = routed.mode.label(),
+                                source = ?routed.source,
+                                confidence = routed.confidence,
+                                "request routed"
+                            );
+                            self.emit(AgentEvent::RequestRouted {
+                                agent: self.name.clone(),
+                                mode: routed.mode.label().to_string(),
+                                source: format!("{:?}", routed.source).to_lowercase(),
+                                confidence: routed.confidence,
+                            });
+                            request_mode = routed.mode;
+                        }
                         ctx.add_user_message(next_message);
                         nudge_tool_calls = 0;
                         nudge_delegated = false;
@@ -1700,9 +1808,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         intent_nudged = false;
-                        plan_artifact_seen = false;
+                        // The carried plan from the prior request counts as
+                        // the plan artifact (don't re-gate an approved plan).
+                        plan_artifact_seen = carried;
                         mutating_calls = 0;
                         plan_gate_fired = false;
+                        question_called = false;
+                        study_contract_nudged = false;
                         continue;
                     }
 
@@ -1960,13 +2072,49 @@ impl<P: LlmProvider> AgentRunner<P> {
                 {
                     plan_artifact_seen = true;
                 }
+                if tool_calls.iter().any(|c| c.name == "question") {
+                    question_called = true;
+                }
+
+                // Mode contract, BACKSTOP enforcement (execution deny): a
+                // mutating call that slips past the masking (hallucinated
+                // name, repaired name) is refused before side effects.
+                if matches!(
+                    request_mode,
+                    super::router::RequestMode::Study | super::router::RequestMode::Answer
+                ) && tool_calls
+                    .iter()
+                    .any(|c| MODE_READONLY_DENY.contains(&c.name.as_str()))
+                {
+                    debug!(agent = %self.name, mode = request_mode.label(), "mode contract: mutating batch denied");
+                    let results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            ToolResult::error(
+                                tc.id.clone(),
+                                format!(
+                                    "[mode contract] This request is in {} mode (read-only): \
+                                     investigate and PROPOSE — do not modify anything. End \
+                                     with a numbered proposal and ask go/no-go via the \
+                                     `question` tool; the user's approval switches to \
+                                     execute mode.",
+                                    request_mode.label()
+                                ),
+                            )
+                        })
+                        .collect();
+                    total_tool_calls += tool_calls.len();
+                    ctx.add_tool_results(results);
+                    continue;
+                }
                 let batch_mutations = tool_calls
                     .iter()
                     .filter(|c| PLAN_GATE_MUTATING.contains(&c.name.as_str()))
                     .count() as u32;
                 if batch_mutations > 0 && !plan_artifact_seen && !plan_gate_fired {
                     let would_be = mutating_calls + batch_mutations;
-                    let tier1 = request_is_wish;
+                    let tier1 = request_is_wish
+                        || request_mode == super::router::RequestMode::Clarify;
                     let tier2 = would_be >= PLAN_GATE_BACKSTOP_AT;
                     if tier1 || tier2 {
                         plan_gate_fired = true;
@@ -4686,6 +4834,231 @@ mod tests {
                 .flat_map(|m| m.content.iter())
                 .any(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("[plan gate]")))),
             "planning first must disarm the gate"
+        );
+    }
+
+    fn study_router() -> Arc<crate::agent::router::RequestRouter> {
+        Arc::new(crate::agent::router::RequestRouter::new(None))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn study_mode_masks_mutating_tools_from_the_request() {
+        // STUDY contract, primary enforcement: the model never RECEIVES
+        // edit/write/patch/bash. "étudie…" routes STUDY at L0.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("question", 10), // satisfies the go/no-go contract
+            MockProvider::text_response("proposition: 1) sqlite 2) postgres", 10, 5),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "read" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(study_router())
+            .max_turns(6)
+            .build()
+            .unwrap();
+        runner
+            .execute("étudie les options de persistance pour le module")
+            .await
+            .unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let names: Vec<String> = reqs[0].tools.iter().map(|t| t.name.clone()).collect();
+        assert!(
+            !names.contains(&"write".to_string()),
+            "write masked: {names:?}"
+        );
+        assert!(
+            names.contains(&"read".to_string()),
+            "read available: {names:?}"
+        );
+        assert!(names.contains(&"question".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn study_mode_denies_hallucinated_mutations() {
+        // Backstop: even a hallucinated mutating call is refused pre-execution.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10), // model tries anyway
+            tool_use_named("question", 10),
+            MockProvider::text_response("proposition: 1) a 2) b", 10, 5),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(study_router())
+            .max_turns(8)
+            .build()
+            .unwrap();
+        runner.execute("étudie le cache du build").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let denied = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::ToolResult { content, is_error, .. }
+                if *is_error && content.contains("[mode contract]"))
+            });
+        assert!(
+            denied,
+            "the hallucinated write must be denied with the contract message"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn study_stop_without_question_gets_contract_corrective() {
+        // STUDY must end in a proposal + go/no-go via the question tool; a
+        // stop without any question call gets ONE corrective.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("j'ai fini d'étudier.", 10, 5), // no question!
+            tool_use_named("question", 10),
+            MockProvider::text_response("proposition: 1) a 2) b — go?", 10, 5),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(study_router())
+            .max_turns(8)
+            .build()
+            .unwrap();
+        runner
+            .execute("étudie les options de logging")
+            .await
+            .unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[study contract]")),
+            "missing corrective: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clarify_mode_arms_plan_gate_without_wish_marker() {
+        // "construis-moi un crm" — imperative, NO wish marker → L0 CLARIFY →
+        // the first mutation is gated even though is_wish_request is false.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10), // blocked by the plan gate
+            tool_use_named("question", 10),
+            tool_use_named("write", 10), // artifact exists → allowed
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(study_router())
+            .max_turns(8)
+            .build()
+            .unwrap();
+        let out = runner.execute("construis-moi un crm").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let gated = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::ToolResult { content, .. }
+                if content.contains("[plan gate]"))
+            });
+        assert!(gated, "CLARIFY mode must gate the first mutation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bare_affirmation_promotes_study_to_execute() {
+        // After a STUDY proposal, "vas-y" promotes to EXECUTE carrying the
+        // plan: the write runs, no re-clarification, no plan-gate.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("question", 10), // study: go/no-go asked
+            MockProvider::text_response("proposition: 1) sqlite. go?", 10, 5),
+            tool_use_named("write", 10), // after "vas-y": EXECUTE
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let inputs = Arc::new(AtomicUsize::new(0));
+        let inputs_c = inputs.clone();
+        let on_input: Arc<crate::agent::runner::OnInput> = Arc::new(move || {
+            let n = inputs_c.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Some("vas-y".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(study_router())
+            .on_input(on_input)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner
+            .execute("étudie le meilleur stockage pour le module")
+            .await
+            .unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        // After the affirmation, write must be available again (unmasked)…
+        let last_tools: Vec<String> = reqs
+            .last()
+            .unwrap()
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert!(last_tools.contains(&"write".to_string()), "{last_tools:?}");
+        // …and execute without any gate.
+        let blocked = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::ToolResult { content, .. }
+                if content.contains("[plan gate]") || content.contains("[mode contract]"))
+            });
+        assert!(!blocked, "the approved plan must execute unimpeded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn router_absent_keeps_today_semantics() {
+        // No router configured → no masking, no mode contracts (library
+        // users see zero behavior change).
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "ok", 10, 1,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .max_turns(3)
+            .build()
+            .unwrap();
+        runner.execute("étudie les options de cache").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let names: Vec<String> = reqs[0].tools.iter().map(|t| t.name.clone()).collect();
+        assert!(
+            names.contains(&"write".to_string()),
+            "no router → no masking: {names:?}"
         );
     }
 

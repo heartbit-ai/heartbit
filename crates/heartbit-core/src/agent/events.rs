@@ -162,6 +162,17 @@ pub enum AgentEvent {
     },
 
     /// An LLM retry attempt is about to happen (before the sleep).
+    /// A fresh request was routed to a response mode (request-intent router).
+    RequestRouted {
+        /// Agent name.
+        agent: String,
+        /// The chosen mode label ("answer"/"execute"/"study"/"clarify").
+        mode: String,
+        /// Which layer decided ("markers"/"classifier"/"safe_default"/"pinned"/"affirmation").
+        source: String,
+        /// Classifier confidence (1.0 for deterministic sources).
+        confidence: f32,
+    },
     RetryAttempt {
         agent: String,
         /// Current attempt number (1-indexed).
@@ -331,6 +342,7 @@ impl AgentEvent {
             Self::GuardrailDenied { .. } => "guardrail_denied",
             Self::GuardrailWarned { .. } => "guardrail_warned",
             Self::RunFailed { .. } => "run_failed",
+            Self::RequestRouted { .. } => "request_routed",
             Self::RetryAttempt { .. } => "retry_attempt",
             Self::DoomLoopDetected { .. } => "doom_loop_detected",
             Self::FuzzyDoomLoopDetected { .. } => "fuzzy_doom_loop_detected",

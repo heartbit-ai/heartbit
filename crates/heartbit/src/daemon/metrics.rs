@@ -584,6 +584,9 @@ impl DaemonMetrics {
             AgentEvent::RunFailed { .. } => {
                 self.errors_total.with_label_values(&["run_failed"]).inc();
             }
+            // Request-intent routing decisions: no dedicated metric yet
+            // (visible in traces/audit); ignored here.
+            AgentEvent::RequestRouted { .. } => {}
             AgentEvent::RetryAttempt { .. } => {
                 self.retry_attempts_total.inc();
             }
