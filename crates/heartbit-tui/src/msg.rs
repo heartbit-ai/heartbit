@@ -111,6 +111,13 @@ pub enum Msg {
         tools: Vec<PendingTool>,
         reply: SyncSender<ApprovalDecision>,
     },
+    /// Agent-to-user structured question (the `question` builtin): render the
+    /// options modal and send the selections back through the oneshot channel.
+    /// Dropping the sender (Esc) makes the tool report a dismissal.
+    Question {
+        request: heartbit_core::tool::builtins::QuestionRequest,
+        reply: tokio::sync::oneshot::Sender<heartbit_core::tool::builtins::QuestionResponse>,
+    },
 }
 
 impl Msg {

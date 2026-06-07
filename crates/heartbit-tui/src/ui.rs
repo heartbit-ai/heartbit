@@ -351,6 +351,81 @@ pub fn view(frame: &mut Frame, app: &App) {
 
     // --- modal overlays ---
     match &app.modal {
+        Some(Modal::Question(m)) => {
+            let w = area.width.min(84);
+            let total = m.request.questions.len();
+            let mut mlines: Vec<Line> = Vec::new();
+            if let Some(q) = m.request.questions.get(m.current) {
+                mlines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", q.header),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  question {}/{total}", m.current + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                mlines.push(Line::raw(""));
+                mlines.push(Line::from(Span::styled(
+                    q.question.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                mlines.push(Line::raw(""));
+                for (i, opt) in q.options.iter().enumerate() {
+                    let mark = if q.multiple {
+                        if m.picked.get(i).copied().unwrap_or(false) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        }
+                    } else if i == m.selected {
+                        " ▸ "
+                    } else {
+                        "   "
+                    };
+                    let style = if i == m.selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    mlines.push(Line::from(Span::styled(
+                        format!("{mark} {}", opt.label),
+                        style,
+                    )));
+                    mlines.push(Line::from(Span::styled(
+                        format!("      {}", opt.description),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                mlines.push(Line::raw(""));
+                let hint = if q.multiple {
+                    "↑↓ · Space toggle · Enter confirm · Esc dismiss"
+                } else {
+                    "↑↓ · Enter choose · Esc dismiss"
+                };
+                mlines.push(Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            let h = (mlines.len() as u16 + 2).min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let modal_widget = Paragraph::new(mlines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" the agent asks "),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(modal_widget, rect);
+        }
         Some(Modal::Approval(modal)) => {
             let w = area.width.min(84);
             let mut mlines = vec![Line::from(Span::styled(
@@ -1227,6 +1302,52 @@ mod tests {
         assert!(
             text2.contains("anthropic/claude-x") && text2.contains("openai/gpt-y"),
             "model list missing:\n{text2}"
+        );
+    }
+
+    #[test]
+    fn question_modal_renders_header_options_descriptions() {
+        use crate::app::{Modal, QuestionModal};
+        use heartbit_core::tool::builtins::{Question, QuestionOption, QuestionRequest};
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.modal = Some(Modal::Question(QuestionModal {
+            request: QuestionRequest {
+                questions: vec![Question {
+                    question: "Which storage backend?".into(),
+                    header: "Storage".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "sqlite".into(),
+                            description: "single file, zero ops".into(),
+                        },
+                        QuestionOption {
+                            label: "postgres".into(),
+                            description: "full server".into(),
+                        },
+                    ],
+                    multiple: false,
+                }],
+            },
+            reply: None,
+            current: 0,
+            selected: 0,
+            picked: vec![false; 2],
+            answers: Vec::new(),
+        }));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("the agent asks"), "title:\n{text}");
+        assert!(text.contains("Storage"), "header chip:\n{text}");
+        assert!(text.contains("Which storage backend?"), "question:\n{text}");
+        assert!(
+            text.contains("sqlite") && text.contains("postgres"),
+            "options:\n{text}"
+        );
+        assert!(
+            text.contains("single file, zero ops"),
+            "descriptions:\n{text}"
         );
     }
 

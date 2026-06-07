@@ -312,6 +312,7 @@ fn fresh_builtins(
     cwd: &std::path::Path,
     context_recall_store: Option<&Arc<heartbit_core::ContextRecallStore>>,
     todo_store: Option<&Arc<heartbit_core::tool::builtins::TodoStore>>,
+    on_question: Option<Arc<heartbit_core::tool::builtins::OnQuestion>>,
 ) -> Vec<Arc<dyn heartbit_core::tool::Tool>> {
     let mut tool_cfg = BuiltinToolsConfig::default();
     tool_cfg.workspace = Some(cwd.to_path_buf());
@@ -324,6 +325,10 @@ fn fresh_builtins(
     if let Some(store) = todo_store {
         tool_cfg.todo_store = store.clone();
     }
+    // When present, registers the `question` tool (agent-to-user structured
+    // questions). Entry agent ONLY — clarification owns the user channel and
+    // does not propagate to sub-agents.
+    tool_cfg.on_question = on_question;
     builtin_tools(tool_cfg)
 }
 
@@ -375,7 +380,7 @@ fn default_sub_agents(
         // nothing until the agent writes todos).
         let recall = context_recall.then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
         let todo = Arc::new(heartbit_core::tool::builtins::TodoStore::new());
-        let mut tools = fresh_builtins(cwd, recall.as_ref(), Some(&todo));
+        let mut tools = fresh_builtins(cwd, recall.as_ref(), Some(&todo), None);
         tools.extend(mcp_tools.iter().cloned());
         SubAgentConfig {
             name: name.into(),
@@ -496,8 +501,37 @@ async fn build_engine(
     // run_workflow tool; the squad stays available for delegation.
     let recall_store = context_recall.then(|| Arc::new(heartbit_core::ContextRecallStore::new()));
     let todo_store = Arc::new(heartbit_core::tool::builtins::TodoStore::new());
+    // Agent-to-user structured questions (completion-loop harness P5): the
+    // `question` tool sends the request to the UI thread (options modal) and
+    // awaits the user's selections through a oneshot channel. Entry agent only.
+    let on_question: Arc<heartbit_core::tool::builtins::OnQuestion> = {
+        let tx = ui_tx.clone();
+        Arc::new(move |req: heartbit_core::tool::builtins::QuestionRequest| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send(Msg::Question {
+                    request: req,
+                    reply: reply_tx,
+                })
+                .map_err(|_| heartbit_core::Error::Agent("UI channel closed".into()))?;
+                reply_rx.await.map_err(|_| {
+                    heartbit_core::Error::Agent(
+                        "the user dismissed the question — proceed with your best \
+                         judgment and state the assumption"
+                            .into(),
+                    )
+                })
+            })
+        })
+    };
     // The entry agent's direct tools: builtins FIRST so MCP can't shadow a trusted one.
-    let mut tools = fresh_builtins(&cwd, recall_store.as_ref(), Some(&todo_store));
+    let mut tools = fresh_builtins(
+        &cwd,
+        recall_store.as_ref(),
+        Some(&todo_store),
+        Some(on_question),
+    );
     tools.extend(mcp_tools.iter().cloned());
     // Self-verification (opt-in via /verify): a deterministic `verify` tool that
     // runs the project's build/test command (VERIFY_RESULT: PASS/FAIL).

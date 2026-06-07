@@ -187,6 +187,7 @@ pub use tool::a2a::A2aClient;
 pub use tool::advisor::AdvisorTool;
 #[cfg(feature = "ghost-domain-config")]
 pub use tool::builtins::TwitterCredentials;
+pub use tool::builtins::handoff::SessionHandoffTool;
 pub use tool::builtins::{
     BuiltinToolsConfig, FileTracker, OnQuestion, Question, QuestionOption, QuestionRequest,
     QuestionResponse, TodoPriority, TodoStatus, TodoStore, ToolRisk, builtin_tools,

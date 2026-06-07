@@ -20,6 +20,11 @@ pub struct TodoItem {
     pub status: TodoStatus,
     /// Priority level of the task.
     pub priority: TodoPriority,
+    /// Observable done-condition for this item ("done when: …"). The
+    /// completion-loop harness uses it as the per-loop acceptance criterion;
+    /// recited alongside the content so it stays in recent attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
 }
 
 /// Status of a to-do item.
@@ -160,6 +165,10 @@ pub(crate) fn recite_open_todos(items: &[TodoItem]) -> Option<String> {
         s.push_str(mark);
         s.push(' ');
         s.push_str(&item.content);
+        if let Some(acceptance) = &item.acceptance {
+            s.push_str(" — done when: ");
+            s.push_str(acceptance);
+        }
         s.push('\n');
     }
     Some(s)
@@ -205,6 +214,10 @@ impl Tool for TodoWriteTool {
                                 "priority": {
                                     "type": "string",
                                     "enum": ["critical", "high", "medium", "low"]
+                                },
+                                "acceptance": {
+                                    "type": "string",
+                                    "description": "Observable done-condition for this item (e.g. 'cargo test green', 'GET /health returns 200'). Recommended for feature work."
                                 }
                             },
                             "required": ["content", "status", "priority"]
@@ -306,6 +319,7 @@ mod tests {
             content: content.into(),
             status,
             priority: TodoPriority::Medium,
+            acceptance: None,
         }
     }
 
@@ -348,6 +362,39 @@ mod tests {
         assert!(block.contains("[ ] ship it"), "pending marker: {block}");
         // in_progress comes before pending in the input order
         assert!(block.find("write tests").unwrap() < block.find("ship it").unwrap());
+    }
+
+    #[test]
+    fn todo_item_carries_acceptance_condition() {
+        // Per-loop done-condition (completion-loop harness P1): a todowrite
+        // payload may attach an observable acceptance criterion to each item.
+        let item: TodoItem = serde_json::from_value(json!({
+            "content": "add /health endpoint",
+            "status": "in_progress",
+            "priority": "high",
+            "acceptance": "GET /health returns 200 and cargo test is green"
+        }))
+        .expect("acceptance field deserializes");
+        assert_eq!(
+            item.acceptance.as_deref(),
+            Some("GET /health returns 200 and cargo test is green")
+        );
+        // Round-trips through serialization.
+        let back: TodoItem =
+            serde_json::from_value(serde_json::to_value(&item).expect("ser")).expect("de");
+        assert_eq!(back.acceptance, item.acceptance);
+        // Back-compat: payloads WITHOUT the field still deserialize.
+        let legacy: TodoItem = serde_json::from_value(json!({
+            "content": "x", "status": "pending", "priority": "low"
+        }))
+        .expect("legacy payload still valid");
+        assert!(legacy.acceptance.is_none());
+        // Recitation surfaces the done-condition for open items.
+        let block = recite_open_todos(&[item]).expect("non-empty");
+        assert!(
+            block.contains("done when: GET /health returns 200"),
+            "acceptance line missing from recitation: {block}"
+        );
     }
 
     #[test]

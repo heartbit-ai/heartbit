@@ -6,6 +6,7 @@ mod fetch_full_output;
 mod file_tracker;
 mod glob;
 mod grep;
+pub mod handoff;
 mod image_generate;
 mod list;
 mod patch;

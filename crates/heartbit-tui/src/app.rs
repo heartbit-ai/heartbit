@@ -325,11 +325,30 @@ pub struct SessionPicker {
     pub sel: usize,
 }
 
+/// Agent-to-user structured question modal (the `question` builtin): one or
+/// more questions answered in sequence; selections are sent back through the
+/// oneshot channel when the last question is confirmed.
+pub struct QuestionModal {
+    pub request: heartbit_core::tool::builtins::QuestionRequest,
+    /// Consumed when the final answer is sent. Dropped on Esc (dismissal).
+    pub reply:
+        Option<tokio::sync::oneshot::Sender<heartbit_core::tool::builtins::QuestionResponse>>,
+    /// Index of the question currently displayed.
+    pub current: usize,
+    /// Highlighted option for the current question.
+    pub selected: usize,
+    /// Multi-select toggles for the CURRENT question (reset on advance).
+    pub picked: Vec<bool>,
+    /// Confirmed answers (labels) for already-answered questions.
+    pub answers: Vec<Vec<String>>,
+}
+
 /// A modal overlay.
 pub enum Modal {
     Approval(ApprovalModal),
     KeyEntry(KeyEntryModal),
     ModelPicker(ModelPicker),
+    Question(QuestionModal),
     /// `/mode` picker: choose the execution mode (`sel` indexes [`MODES`]).
     ModePicker {
         sel: usize,
@@ -650,6 +669,7 @@ impl App {
                     h.sel = 0;
                 }
                 Some(Modal::Approval(_))
+                | Some(Modal::Question(_))
                 | Some(Modal::SessionPicker(_))
                 | Some(Modal::ModePicker { .. }) => {}
                 None => self.composer.insert_str(&s),
@@ -820,6 +840,21 @@ impl App {
             }
             Msg::Approval { tools, reply } => {
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
+            }
+            Msg::Question { request, reply } => {
+                let n_opts = request
+                    .questions
+                    .first()
+                    .map(|q| q.options.len())
+                    .unwrap_or(0);
+                self.modal = Some(Modal::Question(QuestionModal {
+                    request,
+                    reply: Some(reply),
+                    current: 0,
+                    selected: 0,
+                    picked: vec![false; n_opts],
+                    answers: Vec::new(),
+                }));
             }
             Msg::ModelsLoaded(models) => {
                 self.models = models;
@@ -1532,12 +1567,95 @@ impl App {
     fn handle_modal_key(&mut self, key: KeyEvent) {
         match self.modal {
             Some(Modal::Approval(_)) => self.handle_approval_key(key),
+            Some(Modal::Question(_)) => self.handle_question_key(key),
             Some(Modal::KeyEntry(_)) => self.handle_key_entry(key),
             Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
             Some(Modal::HistorySearch(_)) => self.handle_history_search_key(key),
             Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
             Some(Modal::ModePicker { .. }) => self.handle_mode_picker_key(key),
             None => {}
+        }
+    }
+
+    /// Question-modal keys: ↑/↓ highlight, Space toggles (multi-select),
+    /// Enter confirms the current question (advances or sends the answers),
+    /// Esc dismisses (drops the sender → the tool reports the dismissal).
+    fn handle_question_key(&mut self, key: KeyEvent) {
+        let Some(Modal::Question(m)) = &mut self.modal else {
+            return;
+        };
+        let Some(q) = m.request.questions.get(m.current) else {
+            self.modal = None;
+            return;
+        };
+        let n = q.options.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = None; // sender dropped → dismissal
+                self.history
+                    .push(Cell::Notice("question dismissed".to_string()));
+            }
+            KeyCode::Up if n > 0 => m.selected = (m.selected + n - 1) % n,
+            KeyCode::Down if n > 0 => m.selected = (m.selected + 1) % n,
+            KeyCode::Char(' ') if q.multiple => {
+                if let Some(p) = m.picked.get_mut(m.selected) {
+                    *p = !*p;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                // Confirm the current question: multi-select takes the toggled
+                // set (falling back to the highlighted option when none was
+                // toggled); single-select takes the highlighted option.
+                let labels: Vec<String> = if q.multiple {
+                    let toggled: Vec<String> = q
+                        .options
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| m.picked.get(*i).copied().unwrap_or(false))
+                        .map(|(_, o)| o.label.clone())
+                        .collect();
+                    if toggled.is_empty() {
+                        q.options
+                            .get(m.selected)
+                            .map(|o| vec![o.label.clone()])
+                            .unwrap_or_default()
+                    } else {
+                        toggled
+                    }
+                } else {
+                    q.options
+                        .get(m.selected)
+                        .map(|o| vec![o.label.clone()])
+                        .unwrap_or_default()
+                };
+                m.answers.push(labels);
+                m.current += 1;
+                m.selected = 0;
+                let next_opts = m
+                    .request
+                    .questions
+                    .get(m.current)
+                    .map(|q| q.options.len())
+                    .unwrap_or(0);
+                m.picked = vec![false; next_opts];
+                if m.current >= m.request.questions.len() {
+                    // All answered: deliver and close.
+                    let answers = std::mem::take(&mut m.answers);
+                    let summary = answers
+                        .iter()
+                        .map(|a| a.join(", "))
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    if let Some(reply) = m.reply.take() {
+                        let _ =
+                            reply.send(heartbit_core::tool::builtins::QuestionResponse { answers });
+                    }
+                    self.modal = None;
+                    self.history
+                        .push(Cell::Notice(format!("answered: {summary}")));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2080,6 +2198,102 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    fn question_msg(
+        multiple: bool,
+        n_questions: usize,
+    ) -> (
+        Msg,
+        tokio::sync::oneshot::Receiver<heartbit_core::tool::builtins::QuestionResponse>,
+    ) {
+        use heartbit_core::tool::builtins::{Question, QuestionOption, QuestionRequest};
+        let q = |i: usize| Question {
+            question: format!("Which approach for part {i}?"),
+            header: format!("Q{i}"),
+            options: vec![
+                QuestionOption {
+                    label: "option-a".into(),
+                    description: "the first way".into(),
+                },
+                QuestionOption {
+                    label: "option-b".into(),
+                    description: "the second way".into(),
+                },
+            ],
+            multiple,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Msg::Question {
+                request: QuestionRequest {
+                    questions: (0..n_questions).map(q).collect(),
+                },
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn question_msg_opens_modal_and_enter_returns_single_label() {
+        let mut app = keyed();
+        let (msg, mut rx) = question_msg(false, 1);
+        app.update(msg);
+        assert!(matches!(app.modal, Some(Modal::Question(_))));
+        app.update(key(KeyCode::Down)); // highlight option-b
+        app.update(key(KeyCode::Enter));
+        assert!(app.modal.is_none(), "answering closes the modal");
+        let resp = rx.try_recv().expect("answer delivered");
+        assert_eq!(resp.answers, vec![vec!["option-b".to_string()]]);
+    }
+
+    #[test]
+    fn question_modal_multi_select_space_toggles_and_enter_returns_all() {
+        let mut app = keyed();
+        let (msg, mut rx) = question_msg(true, 1);
+        app.update(msg);
+        app.update(key(KeyCode::Char(' '))); // toggle option-a
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char(' '))); // toggle option-b
+        app.update(key(KeyCode::Enter));
+        let resp = rx.try_recv().expect("answer delivered");
+        assert_eq!(
+            resp.answers,
+            vec![vec!["option-a".to_string(), "option-b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn question_modal_advances_through_questions() {
+        let mut app = keyed();
+        let (msg, mut rx) = question_msg(false, 2);
+        app.update(msg);
+        app.update(key(KeyCode::Enter)); // Q0 → option-a (default highlight)
+        assert!(
+            matches!(app.modal, Some(Modal::Question(_))),
+            "modal stays open for the next question"
+        );
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter)); // Q1 → option-b
+        let resp = rx.try_recv().expect("answer delivered");
+        assert_eq!(
+            resp.answers,
+            vec![vec!["option-a".to_string()], vec!["option-b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn question_modal_esc_drops_reply_channel() {
+        let mut app = keyed();
+        let (msg, mut rx) = question_msg(false, 1);
+        app.update(msg);
+        app.update(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "dismissing must drop the sender so the tool reports failure"
+        );
     }
 
     #[test]
