@@ -172,6 +172,14 @@ pub fn view(frame: &mut Frame, app: &App) {
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
     )];
+    // Advisor pairing: keep the judge model permanently visible next to the
+    // main model (`/model advisor` to change it; hidden when unset).
+    if let Some(advisor) = &app.frontier_model {
+        status.push(Span::styled(
+            format!("· advised by {advisor} "),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     // Context-window fill: a small gauge when we know the model's limit, else a
     // raw token count. Color thresholds: green <70%, yellow <90%, red beyond.
     status.extend(context_spans(app));
@@ -1292,6 +1300,33 @@ mod tests {
         assert!(
             !text.contains("agents ·"),
             "roster panel must hide when no agent is running:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_advised_by_when_advisor_set() {
+        let backend = TestBackend::new(110, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("mistralai/mistral-medium");
+        app.frontier_model = Some("anthropic/claude-opus-4".into());
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("advised by anthropic/claude-opus-4"),
+            "advisor model missing from status line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_line_omits_advised_by_when_advisor_unset() {
+        let backend = TestBackend::new(110, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new("mistralai/mistral-medium");
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("advised by"),
+            "no advisor → no 'advised by' segment:\n{text}"
         );
     }
 
