@@ -641,9 +641,14 @@ async fn build_engine(
     // Scope guard (anti-drift): the agent declares its blast radius with
     // `set_scope`; edits outside it are denied. Unseeded = no restriction.
     let scope_guard = Arc::new(heartbit_core::ScopeGuard::new(vec![]));
-    tools.push(Arc::new(heartbit_core::SetScopeTool::new(
-        scope_guard.clone(),
-    )));
+    tools.push(Arc::new(
+        heartbit_core::SetScopeTool::new(scope_guard.clone())
+            // Outside→inside protection: a task scoped outside this repo
+            // (e.g. "un répertoire temporaire") can't silently relocate into
+            // it (live finding 6a25947c: it re-scoped into the repo twice and
+            // even added itself to the workspace Cargo.toml).
+            .with_workspace(cwd.clone()),
+    ));
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();

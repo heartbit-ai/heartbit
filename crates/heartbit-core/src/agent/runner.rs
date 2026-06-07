@@ -2191,8 +2191,14 @@ impl<P: LlmProvider> AgentRunner<P> {
                 let needs_scope = request_mode == super::router::RequestMode::Clarify
                     && !scope_declared
                     && self.tools.contains_key("set_scope");
+                // CLARIFY means ASK-FIRST (live finding 6a25947c: the model
+                // wrote todos+scope and built a WEB app without ever asking —
+                // a todo is a plan artifact, not the user's answer).
+                let needs_ask = request_mode == super::router::RequestMode::Clarify
+                    && !question_called
+                    && self.tools.contains_key("question");
                 if batch_mutations > 0
-                    && (!plan_artifact_seen || needs_scope)
+                    && (!plan_artifact_seen || needs_scope || needs_ask)
                     && !plan_gate_fired
                 {
                     let would_be = mutating_calls + batch_mutations;
