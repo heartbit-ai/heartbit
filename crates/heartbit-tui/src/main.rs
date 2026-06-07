@@ -54,6 +54,36 @@ use crate::msg::{Msg, PendingTool};
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
 
+/// Warning notice when `HEARTBIT_MODEL` is set: the env var has higher
+/// precedence than the config, so `/model` changes are silently ignored until
+/// it is unset (live-finding footgun). Pure for testing; the caller passes the
+/// env value. `None` when the env is unset/empty.
+fn heartbit_model_override_notice(env_model: Option<&str>) -> Option<String> {
+    let m = env_model.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "\u{26a0} HEARTBIT_MODEL={m} overrides the model — /model changes won't apply until you unset it"
+    ))
+}
+
+#[cfg(test)]
+mod model_override_tests {
+    use super::heartbit_model_override_notice as f;
+
+    #[test]
+    fn env_set_warns() {
+        let n = f(Some("mistralai/mistral-medium-3-5")).expect("warns");
+        assert!(n.contains("HEARTBIT_MODEL=mistralai/mistral-medium-3-5"));
+        assert!(n.contains("/model"));
+    }
+
+    #[test]
+    fn env_unset_or_empty_is_silent() {
+        assert!(f(None).is_none());
+        assert!(f(Some("")).is_none());
+        assert!(f(Some("   ")).is_none());
+    }
+}
+
 /// Initialize tracing: the always-on trace bridge (`heartbit::interrupt` →
 /// `core_trace` records in the session trace) plus the legacy opt-in debug
 /// file (`HEARTBIT_TUI_DEBUG=1` → `/tmp/heartbit-tui-debug.log` — unchanged,
@@ -204,6 +234,13 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     // context bar knows the model's window and the /model picker is pre-warmed.
     app.models_loading = true;
     app.effects.push(Effect::FetchModels);
+    // Surface the HEARTBIT_MODEL override footgun: if it's set, /model is a
+    // no-op and the user would otherwise be baffled.
+    if let Some(notice) =
+        heartbit_model_override_notice(std::env::var("HEARTBIT_MODEL").ok().as_deref())
+    {
+        app.history.push(Cell::Notice(notice));
+    }
     // No provider configured at all → open the key prompt immediately.
     if app.api_key.is_none() && !has_anthropic {
         app.modal = Some(app::Modal::KeyEntry(app::KeyEntryModal::default()));
@@ -1051,9 +1088,9 @@ async fn run_ui(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     mut ui_rx: UnboundedReceiver<Msg>,
-    input_tx: UnboundedSender<String>,
+    mut input_tx: UnboundedSender<String>,
     ui_tx: UnboundedSender<Msg>,
-    input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
+    mut input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -1153,6 +1190,20 @@ async fn run_ui(
                         );
                     }
                     let _ = input_tx.send(text);
+                }
+                Effect::RespawnAgent => {
+                    // A model/advisor change: the live agent captured the old
+                    // model at spawn. Recreate the input channel — dropping the
+                    // old sender closes it, so the current agent (idle, blocked
+                    // on `on_input`, or finishing its turn) reaches end-of-input
+                    // and exits — then mark not-started so the NEXT message
+                    // spawns a fresh agent that reads the new `app.model`.
+                    // `on_input` holds a clone of `input_rx`; nothing else
+                    // clones `input_tx`, so the close is clean.
+                    let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    input_tx = ntx;
+                    input_rx = Arc::new(Mutex::new(nrx));
+                    agent_started = false;
                 }
                 Effect::SaveKey(key) => {
                     let mut cfg = config::TuiConfig::load();

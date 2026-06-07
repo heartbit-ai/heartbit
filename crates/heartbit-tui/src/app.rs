@@ -243,6 +243,11 @@ pub enum Effect {
     SetPermissionMode(u8),
     /// Pin the request-intent mode (0 = auto; RequestMode::as_pin_u8 codes).
     SetRequestModePin(u8),
+    /// Rebuild the agent thread so a model/advisor change takes effect — the
+    /// running agent captured the OLD model at spawn (live finding: /model
+    /// persisted but the long-lived agent kept the old model). Applied on the
+    /// user's next message.
+    RespawnAgent,
     /// Export the current transcript (read from `App.history`) to a Markdown file.
     ExportSession,
     /// List saved sessions (for the `/resume` picker).
@@ -287,6 +292,7 @@ impl Effect {
             Effect::SaveVerifyCommand(_) => "save_verify_command",
             Effect::SetPermissionMode(_) => "set_permission_mode",
             Effect::SetRequestModePin(_) => "set_request_mode_pin",
+            Effect::RespawnAgent => "respawn_agent",
             Effect::ExportSession => "export_session",
             Effect::ListSessions => "list_sessions",
             Effect::ResumeSession(_) => "resume_session",
@@ -1368,8 +1374,12 @@ impl App {
     fn set_model(&mut self, model: String) {
         self.model = model.clone();
         self.effects.push(Effect::SaveModel(model.clone()));
+        // Rebuild the agent so the new model is actually used (the live agent
+        // captured the old model at spawn — a persisted change alone never
+        // reached it).
+        self.effects.push(Effect::RespawnAgent);
         self.history.push(Cell::Notice(format!(
-            "model set to {model} — active on next start"
+            "model set to {model} — active on your next message"
         )));
     }
 
@@ -1380,8 +1390,9 @@ impl App {
         self.frontier_model = Some(model.clone());
         self.effects
             .push(Effect::SaveFrontierModel(Some(model.clone())));
+        self.effects.push(Effect::RespawnAgent);
         self.history.push(Cell::Notice(format!(
-            "advisor model set to {model} — active on next start"
+            "advisor model set to {model} — active on your next message"
         )));
     }
 
@@ -1390,8 +1401,9 @@ impl App {
     fn clear_frontier_model(&mut self) {
         self.frontier_model = None;
         self.effects.push(Effect::SaveFrontierModel(None));
+        self.effects.push(Effect::RespawnAgent);
         self.history.push(Cell::Notice(
-            "advisor model cleared — falls back to the main model on next start".to_string(),
+            "advisor model cleared — falls back to the main model on your next message".to_string(),
         ));
     }
 
@@ -2443,6 +2455,43 @@ mod tests {
             "an error-heavy interrupted session must point at /learn: {:?}",
             app.history.len()
         );
+    }
+
+    #[test]
+    fn slash_model_requests_respawn_so_the_change_takes_effect() {
+        // Live finding (session 6a25ca5e): /model persisted but the long-lived
+        // agent kept the old model. Changing the model must request a respawn.
+        let mut app = keyed();
+        typed(&mut app, "/model qwen/qwen3-vl-235b");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.model, "qwen/qwen3-vl-235b");
+        assert!(
+            app.effects
+                .contains(&Effect::SaveModel("qwen/qwen3-vl-235b".into()))
+        );
+        assert!(
+            app.effects.contains(&Effect::RespawnAgent),
+            "a model change must request an agent respawn"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("next message"))),
+            "the notice must say the change applies on the next message"
+        );
+    }
+
+    #[test]
+    fn slash_model_advisor_requests_respawn() {
+        let mut app = keyed();
+        typed(&mut app, "/model advisor anthropic/claude-opus-4");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::RespawnAgent));
+        // and clearing too
+        let mut app2 = keyed();
+        typed(&mut app2, "/model advisor clear");
+        app2.update(key(KeyCode::Enter));
+        assert!(app2.effects.contains(&Effect::RespawnAgent));
     }
 
     #[test]
