@@ -1738,9 +1738,11 @@ pub fn build_entry_agent_prompt_ext(
         "\n- **Underspecified request?** Before substantive work, if the next step depends on \
          user INTENT and guessing would cause rework (scope / risk / intent — e.g. which \
          behavior, destructive vs additive, which of two designs), ask the user with the \
-         `question` tool: 1–4 batched questions, 2–4 concrete options each. Otherwise PROCEED \
-         and state your assumptions explicitly (as todos when planning). Never ask about what \
-         you can discover yourself from the code.\n"
+         `question` tool: 1–4 batched questions, 2–4 concrete options each. Use the `question` \
+         TOOL — not a free-text question in your reply — whenever the choices are enumerable \
+         (the user answers with one keypress). Otherwise PROCEED and state your assumptions \
+         explicitly (as todos when planning). Never ask about what you can discover yourself \
+         from the code.\n"
     } else {
         ""
     };
