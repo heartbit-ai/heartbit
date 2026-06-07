@@ -52,3 +52,40 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: heartbit-${{ matrix.target }}.tar.gz
+
+  publish-crate:
+    name: Publish heartbit-core to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev libcurl4-openssl-dev pkg-config
+
+      # Publishes only heartbit-core (the umbrella `heartbit` + CLI/TUI are
+      # intentionally not on crates.io). No-op until the CARGO_REGISTRY_TOKEN
+      # repo secret is set; idempotent (skips a version already on crates.io)
+      # so re-running a tag never fails.
+      - name: Publish heartbit-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN secret not set — skipping crates.io publish."
+            echo "Add it under Settings → Secrets and variables → Actions to enable auto-publish."
+            exit 0
+          fi
+          VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "heartbit-core version: $VER"
+          if curl -s "https://index.crates.io/he/ar/heartbit-core" \
+              | grep -q "\"vers\":\"$VER\""; then
+            echo "::notice::heartbit-core $VER is already on crates.io — skipping (idempotent)."
+            exit 0
+          fi
+          cargo publish -p heartbit-core
