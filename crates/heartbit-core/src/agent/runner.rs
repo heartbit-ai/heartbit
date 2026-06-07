@@ -110,6 +110,12 @@ pub(super) const DEFAULT_TOOL_RESULT_INGEST_CAP: usize = 256 * 1024;
 /// content stays restorable via `fetch_full_output` when a recall store is set.
 const EMERGENCY_TOOL_RESULT_MAX_BYTES: usize = 4_096;
 
+/// Harness-barrier tools: they mutate the guard/goal state sibling calls are
+/// checked against, so a batch containing one is split — barriers execute
+/// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
+/// fix, live finding 2026-06-07).
+const BARRIER_TOOLS: &[&str] = &["set_scope", "set_goal"];
+
 /// Fallback bound (bytes) for the summarization transcript when the model's
 /// context window is unknown. 256KB ≈ 64K tokens.
 const DEFAULT_SUMMARY_INPUT_MAX_BYTES: usize = 262_144;
@@ -1800,6 +1806,42 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 }
 
+                // Harness-barrier tools (set_scope / set_goal) mutate the very
+                // state their sibling calls are checked against. Executing them
+                // inside the parallel batch is a TOCTOU: live session 6a251f55
+                // emitted set_scope + an out-of-scope write in ONE batch, and
+                // the write's pre_tool ran on the still-empty allowlist. Hoist
+                // barriers out and execute them FIRST (serially, in emission
+                // order) so siblings are checked against the updated state.
+                // Approval/permissions already ran for the whole batch above;
+                // barrier tools mutate in-process harness state only, so the
+                // pre_tool guardrail pass on them is deliberately skipped.
+                let mut barrier_results: Vec<ToolResult> = Vec::new();
+                let mut barrier_records: Vec<ToolCallRecord> = Vec::new();
+                let tool_calls: Vec<crate::llm::types::ToolCall> = if tool_calls.len() > 1
+                    && tool_calls
+                        .iter()
+                        .any(|c| BARRIER_TOOLS.contains(&c.name.as_str()))
+                {
+                    let (barriers, rest): (Vec<_>, Vec<_>) = tool_calls
+                        .into_iter()
+                        .partition(|c| BARRIER_TOOLS.contains(&c.name.as_str()));
+                    for call in barriers {
+                        let (mut r, mut rec) = self
+                            .execute_tools_parallel(
+                                std::slice::from_ref(&call),
+                                ctx.current_turn(),
+                                None,
+                            )
+                            .await;
+                        barrier_results.append(&mut r);
+                        barrier_records.append(&mut rec);
+                    }
+                    rest
+                } else {
+                    tool_calls
+                };
+
                 // pre_tool guardrail: per-call fine-grained filter
                 let (allowed_calls, denied_results) = if self.guardrails.is_empty() {
                     (tool_calls, Vec::new())
@@ -1960,6 +2002,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 };
                 tool_call_records.extend(batch_records);
+                tool_call_records.extend(barrier_records);
+                results.extend(barrier_results);
                 results.extend(denied_results);
                 results.extend(permission_denied_results);
 
@@ -4039,6 +4083,86 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("not yet complete")),
             "the judge's continuation reached the agent BEFORE any input wait: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn barrier_tool_seeds_guard_before_sibling_mutations() {
+        // LIVE FINDING (session 6a251f55, 2026-06-07): the model emitted
+        // set_scope + an out-of-scope write in ONE parallel batch — the
+        // write's pre_tool ran on the still-empty allowlist (TOCTOU) and the
+        // mutation went through. Harness-barrier tools must execute FIRST,
+        // before sibling calls are guard-checked or dispatched.
+        let guard = Arc::new(crate::agent::guardrails::ScopeGuard::new(vec![]));
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::types::CompletionResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "c-scope".into(),
+                        name: "set_scope".into(),
+                        input: serde_json::json!({"paths": ["/tmp/x/utils.py"]}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c-ok".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"file_path": "/tmp/x/utils.py", "content": "a"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c-deny".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"file_path": "/tmp/x/notes.txt", "content": "b"}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(crate::tool::set_scope::SetScopeTool::new(
+                guard.clone(),
+            )))
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .guardrail(guard)
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        // The 2nd request carries the batch's tool results — find them by id.
+        let results: Vec<(String, String, bool)> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.clone(), content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        let by_id = |id: &str| {
+            results
+                .iter()
+                .find(|(i, _, _)| i == id)
+                .unwrap_or_else(|| panic!("missing result {id}: {results:?}"))
+        };
+        let (_, scope_out, scope_err) = by_id("c-scope");
+        assert!(!scope_err, "set_scope itself succeeds: {scope_out}");
+        let (_, ok_out, ok_err) = by_id("c-ok");
+        assert!(!ok_err, "in-scope sibling write allowed: {ok_out}");
+        let (_, deny_out, deny_err) = by_id("c-deny");
+        assert!(
+            *deny_err && deny_out.contains("scope guard"),
+            "out-of-scope sibling write must be DENIED by the freshly-seeded \
+             guard (TOCTOU fix): err={deny_err} out={deny_out}"
         );
     }
 
