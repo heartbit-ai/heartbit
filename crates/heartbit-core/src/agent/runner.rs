@@ -110,6 +110,18 @@ pub(super) const DEFAULT_TOOL_RESULT_INGEST_CAP: usize = 256 * 1024;
 /// content stays restorable via `fetch_full_output` when a recall store is set.
 const EMERGENCY_TOOL_RESULT_MAX_BYTES: usize = 4_096;
 
+/// True when `text` is a multi-question prose battery aimed at the user —
+/// at least two non-empty lines ending with `?`. The threshold deliberately
+/// ignores single trailing questions ("Anything else?") and rhetorical asides;
+/// code blocks rarely produce two `?`-terminated lines.
+fn is_prose_question_battery(text: &str) -> bool {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && l.ends_with('?'))
+        .count()
+        >= 2
+}
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -715,6 +727,8 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut nudge_tool_calls: u32 = 0;
             let mut nudge_delegated = false;
             let mut nudge_sent = false;
+            // Ask-gate: one prose-battery→question-tool redirect per request.
+            let mut prose_question_nudged = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -1473,6 +1487,32 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // types again, so gates placed after it would only ever
                     // fire at session end (found inert on the TUI path).
 
+                    // Ask-gate: a stop that is a multi-question prose battery
+                    // is a CLARIFICATION, not a completion — and the user
+                    // can't answer options efficiently in free text. When the
+                    // structured `question` tool is registered, redirect ONCE
+                    // per request (live finding 6a254624: the model reliably
+                    // asks, but in prose; prompt rules alone don't move it).
+                    if !prose_question_nudged
+                        && self.tools.contains_key("question")
+                        && ctx
+                            .last_assistant_text()
+                            .is_some_and(|t| is_prose_question_battery(&t))
+                    {
+                        prose_question_nudged = true;
+                        debug!(agent = %self.name, "prose question battery; redirecting to the question tool");
+                        ctx.add_user_message(
+                            "[ask gate] You just asked the user several questions in free \
+                             text — they cannot answer options efficiently that way. Re-ask \
+                             NOW with the `question` tool: 1-4 batched questions, 2-4 \
+                             concrete options each (multiple=false unless choices combine). \
+                             For open questions, offer your best concrete proposals as the \
+                             options."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+
                     // Long-horizon "replan on out-of-plan": a RED verification is
                     // the canonical out-of-plan signal. Before allowing natural
                     // completion, if opted in and the latest canonical
@@ -1564,6 +1604,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         nudge_tool_calls = 0;
                         nudge_delegated = false;
                         nudge_sent = false;
+                        prose_question_nudged = false;
                         continue;
                     }
 
@@ -4163,6 +4204,91 @@ mod tests {
             *deny_err && deny_out.contains("scope guard"),
             "out-of-scope sibling write must be DENIED by the freshly-seeded \
              guard (TOCTOU fix): err={deny_err} out={deny_out}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prose_question_battery_triggers_ask_gate() {
+        // Live finding (session 6a254624): the model asks its clarification
+        // battery in PROSE — the user can't answer options efficiently and
+        // the structured channel sits unused. When the stop is a multi-
+        // question prose battery AND the question tool is registered, the
+        // runner deterministically redirects to the tool (once per request).
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response(
+                "Avant de commencer :\n1. Quel langage ?\n2. Interface web ou CLI ?\n3. Quelle persistance ?",
+                10,
+                5,
+            ),
+            tool_use_named("question", 10), // the redirect worked
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("crée un CRM").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[ask gate]")),
+            "the prose battery must be redirected to the question tool: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_trailing_question_does_not_trigger_ask_gate() {
+        // "Anything else?" endings are not clarification batteries.
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "Voilà, c'est fait. Autre chose ?",
+            10,
+            5,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .max_turns(4)
+            .build()
+            .unwrap();
+        runner.execute("petite tâche").await.unwrap();
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            1,
+            "no redirect turn for a single trailing question"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ask_gate_inactive_without_question_tool() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "1. Quel langage ?\n2. Quelle interface ?",
+            10,
+            5,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .max_turns(4)
+            .build()
+            .unwrap();
+        runner.execute("crée un CRM").await.unwrap();
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            1,
+            "no question tool registered → prose questions pass through"
         );
     }
 
