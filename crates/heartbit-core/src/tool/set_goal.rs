@@ -43,8 +43,11 @@ impl Tool for SetGoalTool {
             description: "Install (or replace) your completion goal: an independent judge \
                           will gate your completion until the objective's criteria are \
                           verifiably met. Use it right after planning substantive work — \
-                          pass the acceptance criteria (one per line). Pass clear=true to \
-                          remove the goal."
+                          pass the acceptance criteria (one per line). CARRY OVER every \
+                          explicit constraint from the user's request (target directory or \
+                          location, language, environment, naming) — a constraint dropped \
+                          from the criteria can never be judged. Pass clear=true to remove \
+                          the goal."
                 .into(),
             input_schema: json!({
                 "type": "object",

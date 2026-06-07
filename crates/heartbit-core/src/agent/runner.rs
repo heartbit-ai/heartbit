@@ -807,6 +807,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             // cumulative mutations, and the one-shot flag.
             let mut request_is_wish = is_wish_request(task);
             let mut plan_artifact_seen = false;
+            let mut scope_declared = false;
             let mut mutating_calls: u32 = 0;
             let mut plan_gate_fired = false;
             // Request-intent mode (router): routed per fresh request; the
@@ -1811,6 +1812,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // The carried plan from the prior request counts as
                         // the plan artifact (don't re-gate an approved plan).
                         plan_artifact_seen = carried;
+                        scope_declared = carried;
                         mutating_calls = 0;
                         plan_gate_fired = false;
                         question_called = false;
@@ -2075,6 +2077,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                 if tool_calls.iter().any(|c| c.name == "question") {
                     question_called = true;
                 }
+                if tool_calls.iter().any(|c| c.name == "set_scope") {
+                    scope_declared = true;
+                }
 
                 // Mode contract, BACKSTOP enforcement (execution deny): a
                 // mutating call that slips past the masking (hallucinated
@@ -2111,7 +2116,18 @@ impl<P: LlmProvider> AgentRunner<P> {
                     .iter()
                     .filter(|c| PLAN_GATE_MUTATING.contains(&c.name.as_str()))
                     .count() as u32;
-                if batch_mutations > 0 && !plan_artifact_seen && !plan_gate_fired {
+                // CLARIFY discipline: an under-specified request must ALSO
+                // declare its blast radius before mutating — live finding
+                // 6a258ab2: the model honored "répertoire temporaire" for one
+                // mkdir, then silently rebuilt INSIDE the host repo; a
+                // declared scope would have denied every misplaced write.
+                let needs_scope = request_mode == super::router::RequestMode::Clarify
+                    && !scope_declared
+                    && self.tools.contains_key("set_scope");
+                if batch_mutations > 0
+                    && (!plan_artifact_seen || needs_scope)
+                    && !plan_gate_fired
+                {
                     let would_be = mutating_calls + batch_mutations;
                     let tier1 = request_is_wish
                         || request_mode == super::router::RequestMode::Clarify;
@@ -2135,7 +2151,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                                      ask the user with the `question` tool; otherwise write \
                                      todos with acceptance criteria (todowrite) and install \
                                      the goal (set_goal) — the `intake` recipe does both for \
-                                     a feature request. THEN build."
+                                     a feature request. ALSO declare your working scope with \
+                                     set_scope (the exact target directory — honor every \
+                                     location constraint in the request, e.g. 'a temporary \
+                                     directory' means OUTSIDE this repository). THEN build."
                                         .to_string(),
                                 )
                             })
@@ -4977,6 +4996,46 @@ mod tests {
                 if content.contains("[plan gate]"))
             });
         assert!(gated, "CLARIFY mode must gate the first mutation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clarify_first_mutation_requires_declared_scope_too() {
+        // Live finding 6a258ab2: plan artifacts existed (todos+goal) but no
+        // scope was declared — the model rebuilt INSIDE the host repo. In
+        // CLARIFY mode the first mutation requires set_scope as well.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("todowrite", 10), // plan artifact, but NO scope
+            tool_use_named("write", 10),     // → must still be plan-gated
+            tool_use_named("set_scope", 10), // declares the blast radius
+            tool_use_named("write", 10),     // → now allowed
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "todowrite" }))
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "set_scope" }))
+            .request_router(study_router())
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner.execute("construis-moi un crm").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let gated = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolResult { content, .. }
+                if content.contains("[plan gate]"))
+            })
+            .count();
+        assert!(
+            gated >= 1,
+            "the unscoped mutation must be plan-gated despite the todo artifact"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

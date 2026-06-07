@@ -1731,8 +1731,10 @@ pub fn build_entry_agent_prompt_ext(
         discipline.push_str(
             "\n- **Declare your blast radius.** Before substantive edits, declare the \
              files/directories you intend to modify with `set_scope`; edits outside it are \
-             denied. Widen the scope EXPLICITLY (set_scope again) when genuinely needed — \
-             never drift into unrelated files.\n",
+             denied. The scope must HONOR every location constraint in the request (e.g. \
+             'a temporary directory' means a fresh dir under /tmp, never inside the current \
+             repository). Widen the scope EXPLICITLY (set_scope again) when genuinely \
+             needed — never drift into unrelated files.\n",
         );
     }
     let clarify_block = if caps.ask_user {

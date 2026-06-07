@@ -101,9 +101,23 @@ pub fn view(frame: &mut Frame, app: &App) {
     let comp_inner_w = area.width.saturating_sub(2).max(1) as usize;
     let comp_rows = app.composer.wrap_lines(comp_inner_w).len().max(1) as u16;
     let comp_h = (comp_rows + 2).clamp(3, 8);
+    // Status spans are built up-front: their measured width decides whether
+    // the status bar needs ONE line or TWO (identity row + metrics row) —
+    // a long model+advisor pair must not push the state off-screen.
+    let (status_identity, status_metrics) = status_spans(app);
+    let status_w: usize = status_identity
+        .iter()
+        .chain(status_metrics.iter())
+        .map(|sp: &Span| sp.width())
+        .sum();
+    let status_h: u16 = if status_w <= area.width as usize {
+        1
+    } else {
+        2
+    };
     let chunks = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(status_h),
         Constraint::Length(comp_h),
     ])
     .split(area);
@@ -160,81 +174,20 @@ pub fn view(frame: &mut Frame, app: &App) {
         }
     }
 
-    // --- status line: model · context bar · cumulative tokens · TTFT · state ---
-    let state = if app.running {
-        format!("{} working", SPINNER[app.spinner % SPINNER.len()])
+    // --- status bar: identity row (+ metrics row when it would overflow) ---
+    if status_h == 1 {
+        let mut line = status_identity;
+        line.extend(status_metrics);
+        frame.render_widget(Paragraph::new(Line::from(line)), chunks[1]);
     } else {
-        "ready".to_string()
-    };
-    let mut status = vec![Span::styled(
-        format!(" {} ", app.model),
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    )];
-    // Advisor pairing: keep the judge model permanently visible next to the
-    // main model (`/model advisor` to change it; hidden when unset).
-    if let Some(advisor) = &app.frontier_model {
-        status.push(Span::styled(
-            format!("· advised by {advisor} "),
-            Style::default().fg(Color::Magenta),
-        ));
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(status_identity),
+                Line::from(status_metrics),
+            ]),
+            chunks[1],
+        );
     }
-    // Context-window fill: a small gauge when we know the model's limit, else a
-    // raw token count. Color thresholds: green <70%, yellow <90%, red beyond.
-    status.extend(context_spans(app));
-    status.push(Span::styled(
-        format!(
-            "· {} tok ",
-            human_tokens(app.tokens.input_tokens + app.tokens.output_tokens)
-        ),
-        Style::default().fg(Color::DarkGray),
-    ));
-    // Cache-hit metric: surface cumulative prompt-cache reads (green = savings).
-    if app.tokens.cache_read_input_tokens > 0 {
-        status.push(Span::styled(
-            format!(
-                "· {} cached ",
-                human_tokens(app.tokens.cache_read_input_tokens)
-            ),
-            Style::default().fg(Color::Green),
-        ));
-    }
-    if app.last_ttft_ms > 0 {
-        status.push(Span::styled(
-            format!("· {} ttft ", human_ms(app.last_ttft_ms)),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    // Un-pinned transcript: say so, and how to get back (streaming keeps
-    // appending out of sight — silent drift reads as a hang).
-    if !app.follow {
-        status.push(Span::styled(
-            "· ↑ scrolled — wheel down to follow ",
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    // Execution mode — only when not Normal (keeps the line clean).
-    if app.permission_mode != crate::app::PermissionMode::Normal {
-        let c = match app.permission_mode {
-            crate::app::PermissionMode::Yolo => Color::Red,
-            crate::app::PermissionMode::Plan => Color::Blue,
-            _ => Color::Yellow,
-        };
-        status.push(Span::styled(
-            format!("· {} ", app.permission_mode.label()),
-            Style::default().fg(c).add_modifier(Modifier::BOLD),
-        ));
-    }
-    status.push(Span::styled(
-        format!("· {state} "),
-        Style::default().fg(if app.running {
-            Color::Yellow
-        } else {
-            Color::Green
-        }),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(status)), chunks[1]);
 
     // --- composer ---
     // Pre-wrapped rows + a vertical scroll that keeps the cursor's row inside
@@ -740,6 +693,86 @@ pub fn view(frame: &mut Frame, app: &App) {
             ));
         }
     }
+}
+
+/// Build the status-bar spans as two groups: IDENTITY (model · advised by)
+/// and METRICS (context · tokens · cache · ttft · scroll · mode · state).
+/// The caller renders them on one line when they fit, two otherwise.
+fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let state = if app.running {
+        format!("{} working", SPINNER[app.spinner % SPINNER.len()])
+    } else {
+        "ready".to_string()
+    };
+    let mut identity = vec![Span::styled(
+        format!(" {} ", app.model),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )];
+    // Advisor pairing: keep the judge model permanently visible next to the
+    // main model (`/model advisor` to change it; hidden when unset).
+    if let Some(advisor) = &app.frontier_model {
+        identity.push(Span::styled(
+            format!("· advised by {advisor} "),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    // Context-window fill: a small gauge when we know the model's limit, else a
+    // raw token count. Color thresholds: green <70%, yellow <90%, red beyond.
+    let mut metrics = context_spans(app);
+    metrics.push(Span::styled(
+        format!(
+            "· {} tok ",
+            human_tokens(app.tokens.input_tokens + app.tokens.output_tokens)
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
+    // Cache-hit metric: surface cumulative prompt-cache reads (green = savings).
+    if app.tokens.cache_read_input_tokens > 0 {
+        metrics.push(Span::styled(
+            format!(
+                "· {} cached ",
+                human_tokens(app.tokens.cache_read_input_tokens)
+            ),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if app.last_ttft_ms > 0 {
+        metrics.push(Span::styled(
+            format!("· {} ttft ", human_ms(app.last_ttft_ms)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Un-pinned transcript: say so, and how to get back (streaming keeps
+    // appending out of sight — silent drift reads as a hang).
+    if !app.follow {
+        metrics.push(Span::styled(
+            "· ↑ scrolled — wheel down to follow ",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    // Execution mode — only when not Normal (keeps the line clean).
+    if app.permission_mode != crate::app::PermissionMode::Normal {
+        let c = match app.permission_mode {
+            crate::app::PermissionMode::Yolo => Color::Red,
+            crate::app::PermissionMode::Plan => Color::Blue,
+            _ => Color::Yellow,
+        };
+        metrics.push(Span::styled(
+            format!("· {} ", app.permission_mode.label()),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
+        ));
+    }
+    metrics.push(Span::styled(
+        format!("· {state} "),
+        Style::default().fg(if app.running {
+            Color::Yellow
+        } else {
+            Color::Green
+        }),
+    ));
+    (identity, metrics)
 }
 
 /// `1234 → "1.2k"`, `999 → "999"` — compact token/number formatting.
@@ -1461,6 +1494,46 @@ mod tests {
         assert!(
             !text.contains("agents ·"),
             "roster panel must hide when no agent is running:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_wraps_to_two_lines_when_overflowing() {
+        // Narrow terminal + long model/advisor pair: the metrics (incl. the
+        // run state) must wrap to a second row instead of falling off-screen.
+        let backend = TestBackend::new(58, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("mistralai/mistral-medium-3-5");
+        app.frontier_model = Some("anthropic/claude-opus-4.6".into());
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("advised by"), "identity row:\n{text}");
+        assert!(text.contains("ready"), "state must stay visible:\n{text}");
+        let model_row = text
+            .lines()
+            .find(|l| l.contains("mistral-medium"))
+            .expect("model row");
+        assert!(
+            !model_row.contains("ready"),
+            "metrics must be on their own row when narrow:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_stays_single_line_when_it_fits() {
+        let backend = TestBackend::new(140, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.frontier_model = Some("a/opus".into());
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let status_row = text
+            .lines()
+            .find(|l| l.contains("advised by"))
+            .expect("status row");
+        assert!(
+            status_row.contains("ready"),
+            "wide terminal keeps one status row:\n{text}"
         );
     }
 
