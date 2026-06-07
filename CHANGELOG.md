@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2026.607.1] - 2026-06-07 — request-intent harness, completion-loop gates, deep research + advisor, TUI streaming
+
+Covers the 60 commits on `feat/tui-streaming-markdown` since `v2026.507.4`. The
+headline is a **deterministic request-fidelity harness**: the framework now infers
+the response mode a request calls for and enforces it, compensating for mid-tier
+models' tendency to charge ahead on hedged/underspecified requests. All changes are
+additive; the enforced quality gate (fmt + clippy `-D warnings` + tests) is green at
+5206 tests / 0 failures. heartbit-core has no intra-workspace path dependencies and
+is independently publishable.
+
+### Added — request-intent router & mode contracts (`agent/router.rs`)
+
+- `RequestRouter` with a 3-layer design: Layer 0 deterministic markers
+  (force × completeness, FR conditional morphology), Layer 1 `fast`-role LLM
+  classifier for the ambiguous residue, Layer 2 safe-default on low confidence.
+- `RequestMode` (`Answer` / `Execute` / `Study` / `Clarify`), `RoutedMode`,
+  `RouteSource`; `AgentEvent::RequestRouted { mode, source, confidence }`.
+- Mode contracts enforced by tool masking (`ToolProfile::ReadOnly`) + an
+  execution-deny backstop: STUDY/ANSWER are read-only and must end in a proposal;
+  CLARIFY asks before mutating. User overrides: go-tokens force EXECUTE,
+  `/mode answer|study|clarify|execute|auto` pins live; the model can never
+  self-promote.
+- Builder wiring: `AgentRunnerBuilder::request_router`,
+  `OrchestratorBuilder::entry_request_router`. CLI `chat` inherits it
+  (`HEARTBIT_REQUEST_ROUTER=0` to opt out).
+
+### Added — completion-loop harness (judge-gated work to a finish)
+
+- Runtime goal: `GoalSlot` + the `set_goal` tool install/replace acceptance
+  criteria mid-run; an independent judge (`GoalCondition::with_per_criterion`)
+  gates every natural stop; `OrchestratorBuilder::entry_goal_judge`, `/goal`.
+- Scope guard: `ScopeGuard` + the `set_scope` tool bound the blast radius
+  (`SetScopeTool::with_workspace` refuses an outside→inside workspace relocation).
+- `TodoItem.acceptance` per-loop done-conditions, recited at the context tail.
+- Front-half `intake` recipe (acceptance-criteria extraction + gap elicitation).
+- The structured `question` tool/`OnQuestion` channel is now reachable from the
+  TUI (options modal, single/multi-select).
+
+### Added — deterministic stop/dispatch gates (`agent/runner.rs`)
+
+- Ask-gate (prose question battery → the structured `question` tool), act-gate
+  (announced-then-stalled → execute or ask), plan-gate (building without a plan
+  artifact → blocked pre-execution), repair hints (stale-API / type-mismatch /
+  ownership classes + `cargo add` nudge), advisor escalation after consecutive
+  failed builds, and the `DelegationNudge` (entry agent reminded to use the squad).
+- Context-overflow defense in depth: grep/glob skip build dirs + byte caps, a
+  default-on per-result ingestion cap (window-clamped), estimate-aware proactive
+  compaction, bounded summarization, and deterministic reactive recovery.
+
+### Added — workflows, deep research & advisor
+
+- `deep_research` workflow recipe (plan → tooled angles → verify → cited synthesis)
+  with a tolerant angle parser; `run_workflow` gains resume from a content-addressed
+  journal and a `budget` arg; worktree isolation for flow leaves.
+- Advisor mode — a frontier-model reviewer over the full transcript
+  (`SessionHandoffTool` for purpose-tailored session bridges).
+- Model roles wired end-to-end (per-call model via host `ProviderFactory`;
+  `deep_research` plans on `fast`).
+- MCP request timeout via `HEARTBIT_MCP_TIMEOUT_SECS`; absolute paths inside the
+  workspace accepted; more actionable `form_squad` errors.
+
+### Added — TUI (`heartbit-tui`)
+
+- Live streaming Markdown; a splash screen; `/research`, `/workflows`, `/stats`
+  (styled card), `/model advisor`, the bare `/mode` picker; "advised by <model>" in
+  the status line; YOLO default mode; persistent per-directory prompt history.
+
+### Notes
+
+- The `[Unreleased]` section below is the detail of the heartbit-ghost P1.1 X-tool
+  family that shipped as part of `2026.507.4`; retained for history.
+
 ## [2026.507.4] - 2026-05-26 — heartbit-ghost P1.x integration + heartbit-core boundary cleanup
 
 Covers everything since `v2026.507.3` (commit `ca994e6`, published 2026-05-07
@@ -117,7 +189,7 @@ to crates.io.
 - The `v2026.507.3` git tag was created retroactively on commit `ca994e6`
   (matches the crates.io publish on 2026-05-07).
 
-## [Unreleased]
+### heartbit-ghost P1.1 — X (Twitter) tool family (shipped within 2026.507.4)
 
 
 The P1.1 increment ships the X (Twitter) tool family on top of the Phase 0
