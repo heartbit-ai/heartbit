@@ -860,6 +860,15 @@ fn default_permissions() -> PermissionRuleset {
         allow("list"),
         allow("todoread"),
         allow("todowrite"),
+        // Harness-dialogue tools: no workspace effect — asking the user to
+        // APPROVE the agent's request to ask them a question is a double
+        // modal (live finding, session 6a254624). set_goal/set_scope mutate
+        // in-process harness state only; handoff writes its brief OUTSIDE the
+        // workspace (<config>/handoffs).
+        allow("question"),
+        allow("set_goal"),
+        allow("set_scope"),
+        allow("handoff"),
         PermissionRule {
             tool: "*".into(),
             pattern: "*".into(),
@@ -1513,4 +1522,34 @@ fn save_session(id: &str, history: &[crate::cells::Cell]) -> std::io::Result<()>
         history: history.to_vec(),
     };
     session::save(&session::sessions_dir(), &s)
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn harness_dialogue_tools_are_auto_allowed() {
+        // Live finding (session 6a254624): in normal mode the `question` tool
+        // hit the wildcard Ask rule — the user had to APPROVE the agent's
+        // request to ask them a question (double modal). Harness-dialogue
+        // tools (question, set_goal, set_scope, handoff) touch no workspace
+        // file and must never sit behind an approval prompt.
+        let rules = default_permissions();
+        for tool in ["question", "set_goal", "set_scope", "handoff"] {
+            assert_eq!(
+                rules.evaluate(tool, &serde_json::json!({})),
+                Some(PermissionAction::Allow),
+                "{tool} must be auto-allowed"
+            );
+        }
+        // Mutating tools still go through approval.
+        for tool in ["write", "edit", "bash", "patch"] {
+            assert_eq!(
+                rules.evaluate(tool, &serde_json::json!({})),
+                Some(PermissionAction::Ask),
+                "{tool} must still ask"
+            );
+        }
+    }
 }
