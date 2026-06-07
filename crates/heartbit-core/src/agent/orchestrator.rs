@@ -1616,6 +1616,11 @@ pub fn build_system_prompt(
     )
 }
 
+/// Direct tool calls on one user request before the entry agent's runner
+/// injects the deterministic delegation nudge. The entry prompt defines a
+/// "small focused change" as ~1–3 calls; by 8, the work is substantive.
+const ENTRY_DELEGATION_NUDGE_AFTER: u32 = 8;
+
 /// System prompt for the UNIFIED entry agent (option C).
 ///
 /// Unlike [`build_system_prompt`] — a pure router that MUST always delegate and
@@ -2665,6 +2670,22 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                         ..Default::default()
                     });
             }
+            // Deterministic delegation nudge: prompt-only routing has twice
+            // failed to make mid-tier models delegate organically (live trace
+            // evidence 2026-06-07 — zero organic delegations across ~30
+            // sessions, three models). After N direct calls on one request
+            // without delegating, the runner injects a one-shot reminder.
+            let mut nudge_tools = vec!["delegate_task".to_string()];
+            if squads_enabled {
+                nudge_tools.push("form_squad".into());
+            }
+            if !self.entry_workflow_recipes.is_empty() {
+                nudge_tools.push("run_workflow".into());
+            }
+            runner_builder = runner_builder.delegation_nudge(super::runner::DelegationNudge {
+                after_tool_calls: ENTRY_DELEGATION_NUDGE_AFTER,
+                tool_names: nudge_tools,
+            });
         }
 
         // Register form_squad tool when enabled
@@ -4559,6 +4580,65 @@ mod tests {
 
     /// Captures the tail (last-message text) of every LLM request, for the
     /// multi-agent context-enablement tests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entry_agent_auto_wires_delegation_nudge() {
+        // The entry agent grinds through ENTRY_DELEGATION_NUDGE_AFTER direct
+        // tool calls without delegating → the runner must inject the one-shot
+        // "[delegation check]" reminder (live trace evidence 2026-06-07: zero
+        // organic delegations across ~30 sessions; prompt-only routing failed).
+        struct NoopTool;
+        impl Tool for NoopTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "noop".into(),
+                    description: "no-op".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(ToolOutput::success("ok")) })
+            }
+        }
+
+        let mut responses: Vec<CompletionResponse> = (0..ENTRY_DELEGATION_NUDGE_AFTER)
+            .map(|i| CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("t{i}"),
+                    name: "noop".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            })
+            .collect();
+        responses.push(text_end("done"));
+        let provider = Arc::new(TailCapturingProvider {
+            responses: Mutex::new(responses),
+            tails: Mutex::new(vec![]),
+        });
+        let mut orch = Orchestrator::builder(provider.clone())
+            .entry_agent(vec![Arc::new(NoopTool)])
+            .sub_agent("worker", "does work", "you work")
+            .max_turns(30)
+            .build()
+            .unwrap();
+        let out = orch.run("a substantive task").await.unwrap();
+        assert_eq!(out.result, "done");
+        let tails = provider.tails.lock().unwrap();
+        assert!(
+            tails.iter().any(|t| t.contains("[delegation check]")),
+            "the nudge must reach the model after {ENTRY_DELEGATION_NUDGE_AFTER} solo calls: {tails:?}"
+        );
+    }
+
     struct TailCapturingProvider {
         responses: Mutex<Vec<CompletionResponse>>,
         tails: Mutex<Vec<String>>,

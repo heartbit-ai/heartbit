@@ -46,7 +46,7 @@ pub(crate) mod test_helpers;
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
 pub use interrupt::InterruptHandle;
-pub use runner::{AgentOutput, AgentRunner, OnInput};
+pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
 use crate::error::Error;

@@ -114,6 +114,22 @@ const EMERGENCY_TOOL_RESULT_MAX_BYTES: usize = 4_096;
 /// context window is unknown. 256KB ≈ 64K tokens.
 const DEFAULT_SUMMARY_INPUT_MAX_BYTES: usize = 262_144;
 
+/// Deterministic delegation nudge. Prompt-only routing has repeatedly failed
+/// to make mid-tier models delegate organically — they grind through
+/// substantive work solo (live trace evidence, 2026-06-07: ~30 sessions, zero
+/// organic delegations across three models). After `after_tool_calls` direct
+/// tool calls on ONE user request with none of `tool_names` used, the runner
+/// injects a one-shot reminder that the squad exists. Deterministic and
+/// model-agnostic, like the doom-loop and replan gates.
+#[derive(Debug, Clone)]
+pub struct DelegationNudge {
+    /// Direct-tool-call count (per user request) at which the nudge fires.
+    pub after_tool_calls: u32,
+    /// Tool names that count as delegation — using any of them suppresses
+    /// the nudge for the rest of the request.
+    pub tool_names: Vec<String>,
+}
+
 /// Head+tail slice of an oversized summarization transcript: keeps the task
 /// (head) and the most recent activity (tail), drops the middle.
 fn bound_transcript(text: &str, budget: usize) -> String {
@@ -250,6 +266,8 @@ pub struct AgentRunner<P: LlmProvider> {
     /// (64KB). Full output is preserved in `context_recall_store` (when set)
     /// and in `AgentOutput::tool_call_records` regardless.
     pub(super) tool_result_ingest_cap: Option<usize>,
+    /// Optional deterministic delegation nudge (see [`DelegationNudge`]).
+    pub(super) delegation_nudge: Option<DelegationNudge>,
     /// When set, limits the number of tool definitions sent per LLM turn.
     /// Tools are selected based on recent usage and keyword relevance.
     pub(super) max_tools_per_turn: Option<usize>,
@@ -389,6 +407,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             enable_reflection: false,
             tool_output_compression_threshold: None,
             tool_result_ingest_cap: Some(DEFAULT_TOOL_RESULT_INGEST_CAP),
+            delegation_nudge: None,
             max_tools_per_turn: None,
             tool_profile: None,
             max_identical_tool_calls: None,
@@ -678,6 +697,11 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut compacted_last_turn = false;
             // Anti-thrash guard for proactive compaction: never fire two turns running.
             let mut proactive_compacted_last_turn = false;
+            // Delegation-nudge state, scoped to ONE user request (reset when
+            // `on_input` delivers the next message in chat mode).
+            let mut nudge_tool_calls: u32 = 0;
+            let mut nudge_delegated = false;
+            let mut nudge_sent = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -1438,6 +1462,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                         && !next_message.trim().is_empty()
                     {
                         ctx.add_user_message(next_message);
+                        // New user request: the delegation-nudge window restarts.
+                        nudge_tool_calls = 0;
+                        nudge_delegated = false;
+                        nudge_sent = false;
                         continue;
                     }
 
@@ -1975,6 +2003,41 @@ impl<P: LlmProvider> AgentRunner<P> {
                      3. What is the best next step?"
                             .to_string(),
                     );
+                }
+
+                // Deterministic delegation nudge: after N direct tool calls on
+                // one user request with no delegation tool used, remind ONCE
+                // that the squad exists (prompt guidance alone has proven
+                // insufficient on mid-tier models — same rationale as the
+                // doom-loop and replan gates).
+                if let Some(ref nudge) = self.delegation_nudge {
+                    nudge_tool_calls += allowed_calls.len() as u32;
+                    if allowed_calls
+                        .iter()
+                        .any(|c| nudge.tool_names.contains(&c.name))
+                    {
+                        nudge_delegated = true;
+                    }
+                    if !tool_interrupted
+                        && !nudge_sent
+                        && !nudge_delegated
+                        && nudge_tool_calls >= nudge.after_tool_calls
+                    {
+                        nudge_sent = true;
+                        debug!(
+                            agent = %self.name,
+                            tool_calls = nudge_tool_calls,
+                            "delegation nudge injected"
+                        );
+                        ctx.add_user_message(format!(
+                            "[delegation check] You have made {nudge_tool_calls} direct tool \
+                             calls on this request without delegating. If meaningful work \
+                             remains — especially independent parts — delegate it now ({}) \
+                             instead of continuing alone. If the task is nearly finished, \
+                             ignore this and complete it.",
+                            nudge.tool_names.join(" / ")
+                        ));
+                    }
                 }
 
                 // Proactive compaction backstop. Prefer the REAL post-prune token
@@ -2787,7 +2850,7 @@ mod tests {
     use crate::tool::{Tool, ToolOutput};
 
     use super::super::test_helpers::MockProvider;
-    use super::AgentRunner;
+    use super::{AgentRunner, DelegationNudge};
 
     // Long-horizon planning (recitation): when a todo_store has open items,
     // the runner appends a plan block to the tail of the last message.
@@ -3880,6 +3943,135 @@ mod tests {
         assert!(
             reqs.iter().any(|r| r.system.contains("GOAL")),
             "summary fallback must have been attempted"
+        );
+    }
+
+    // --- Deterministic delegation nudge ---
+
+    /// A no-op tool with a configurable name (stands in for delegate_task).
+    struct NamedTool {
+        name: &'static str,
+    }
+    impl Tool for NamedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.into(),
+                description: format!("Mock {}", self.name),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            Box::pin(async { Ok(ToolOutput::success("ok")) })
+        }
+    }
+
+    fn nudge_text_in(req: &crate::llm::types::CompletionRequest) -> usize {
+        req.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[delegation check]")),
+            )
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_nudge_fires_once_after_threshold() {
+        // 3 direct tool calls with after_tool_calls=2 → the nudge is injected
+        // exactly ONCE (after the 2nd call), visible in later requests.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .delegation_nudge(DelegationNudge {
+                after_tool_calls: 2,
+                tool_names: vec!["delegate_task".into()],
+            })
+            .max_turns(10)
+            .build()
+            .unwrap();
+        runner.execute("substantive task").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert_eq!(
+            nudge_text_in(&reqs[2]),
+            1,
+            "nudge present after the threshold"
+        );
+        assert_eq!(
+            nudge_text_in(reqs.last().unwrap()),
+            1,
+            "nudge injected exactly once, not repeated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_nudge_suppressed_when_delegation_used() {
+        // The first call IS a delegation tool → no nudge ever fires.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("delegate_task", 100),
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .tool(Arc::new(NamedTool {
+                name: "delegate_task",
+            }))
+            .delegation_nudge(DelegationNudge {
+                after_tool_calls: 2,
+                tool_names: vec!["delegate_task".into()],
+            })
+            .max_turns(10)
+            .build()
+            .unwrap();
+        runner.execute("substantive task").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert_eq!(
+            nudge_text_in(reqs.last().unwrap()),
+            0,
+            "delegating suppresses the nudge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_nudge_absent_by_default() {
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            tool_use_named("work", 100),
+            MockProvider::text_response("done", 100, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(10)
+            .build()
+            .unwrap();
+        runner.execute("task").await.unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert_eq!(
+            nudge_text_in(reqs.last().unwrap()),
+            0,
+            "no nudge when not configured"
         );
     }
 

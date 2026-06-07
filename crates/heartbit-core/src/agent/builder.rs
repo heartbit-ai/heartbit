@@ -66,6 +66,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) enable_reflection: bool,
     pub(super) tool_output_compression_threshold: Option<usize>,
     pub(super) tool_result_ingest_cap: Option<usize>,
+    pub(super) delegation_nudge: Option<super::runner::DelegationNudge>,
     pub(super) max_tools_per_turn: Option<usize>,
     pub(super) tool_profile: Option<tool_filter::ToolProfile>,
     pub(super) max_identical_tool_calls: Option<u32>,
@@ -339,11 +340,20 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     }
 
     /// Hard cap (bytes) applied to each fresh tool result entering the
-    /// conversation context. Defaults to 64KB; oversized results are truncated
+    /// conversation context. Defaults to 256KB; oversized results are truncated
     /// with a marker (restorable via `fetch_full_output` when a context recall
     /// store is wired).
     pub fn tool_result_ingest_cap(mut self, bytes: usize) -> Self {
         self.tool_result_ingest_cap = Some(bytes);
+        self
+    }
+
+    /// Deterministic delegation nudge: after `nudge.after_tool_calls` direct
+    /// tool calls on one user request with none of `nudge.tool_names` used,
+    /// inject a one-shot reminder to delegate. See
+    /// [`super::runner::DelegationNudge`].
+    pub fn delegation_nudge(mut self, nudge: super::runner::DelegationNudge) -> Self {
+        self.delegation_nudge = Some(nudge);
         self
     }
 
@@ -815,6 +825,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             enable_reflection: self.enable_reflection,
             tool_output_compression_threshold: self.tool_output_compression_threshold,
             tool_result_ingest_cap: self.tool_result_ingest_cap,
+            delegation_nudge: self.delegation_nudge,
             max_tools_per_turn: self.max_tools_per_turn,
             tool_profile: self.tool_profile,
             max_identical_tool_calls: self.max_identical_tool_calls,
