@@ -122,6 +122,28 @@ fn is_prose_question_battery(text: &str) -> bool {
         >= 2
 }
 
+/// True when `text` announces imminent first-person action — the
+/// narrate-then-stop failure mode ("Je vais créer… Laisse-moi d'abord
+/// vérifier…" then end_turn with zero tool calls; live session 6a2552a9).
+/// Deliberately small fr/en marker list; combined with the zero-work
+/// condition by the caller, so a closing "let me know" after real work
+/// never triggers.
+fn announces_intent(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "je vais ",
+        "laisse-moi ",
+        "laissez-moi ",
+        "je commence par ",
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i'm going to ",
+        "i am going to ",
+    ];
+    let lower = text.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -729,6 +751,9 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut nudge_sent = false;
             // Ask-gate: one prose-battery→question-tool redirect per request.
             let mut prose_question_nudged = false;
+            // Act-gate: tools executed this request + one-shot redirect flag.
+            let mut request_tool_calls: u32 = 0;
+            let mut intent_nudged = false;
 
             loop {
                 if ctx.current_turn() >= ctx.max_turns() {
@@ -1513,6 +1538,27 @@ impl<P: LlmProvider> AgentRunner<P> {
                         continue;
                     }
 
+                    // Act-gate: a stop that ANNOUNCES action with ZERO tools
+                    // executed this request is narrate-then-stall, not an
+                    // answer (live finding 6a2552a9: "Je vais créer… Laisse-
+                    // moi d'abord vérifier…" then silence). One-shot redirect:
+                    // do the work now, or ask properly.
+                    if !intent_nudged
+                        && request_tool_calls == 0
+                        && ctx.last_assistant_text().is_some_and(|t| announces_intent(&t))
+                    {
+                        intent_nudged = true;
+                        debug!(agent = %self.name, "announced intent with zero work; act gate");
+                        ctx.add_user_message(
+                            "[act gate] You announced what you are about to do, then \
+                             stopped without doing it. EXECUTE it now with your tools in \
+                             this same turn. If you are actually waiting on a user \
+                             decision, ask it via the `question` tool instead of stopping."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+
                     // Long-horizon "replan on out-of-plan": a RED verification is
                     // the canonical out-of-plan signal. Before allowing natural
                     // completion, if opted in and the latest canonical
@@ -1605,6 +1651,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                         nudge_delegated = false;
                         nudge_sent = false;
                         prose_question_nudged = false;
+                        request_tool_calls = 0;
+                        intent_nudged = false;
                         continue;
                     }
 
@@ -2125,6 +2173,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // that the squad exists (prompt guidance alone has proven
                 // insufficient on mid-tier models — same rationale as the
                 // doom-loop and replan gates).
+                request_tool_calls += allowed_calls.len() as u32;
                 if let Some(ref nudge) = self.delegation_nudge {
                     nudge_tool_calls += allowed_calls.len() as u32;
                     if allowed_calls
@@ -4290,6 +4339,96 @@ mod tests {
             1,
             "no question tool registered → prose questions pass through"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn announced_intent_without_work_triggers_act_gate() {
+        // Live finding (session 6a2552a9): "Je vais créer un petit CRM…
+        // Laisse-moi d'abord vérifier…" then end_turn with ZERO tool calls —
+        // the model narrates intent and stops. Deterministic one-shot redirect:
+        // execute now or ask via the question tool.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response(
+                "Je vais créer un petit CRM simple. Laisse-moi d'abord vérifier la structure.",
+                10,
+                5,
+            ),
+            tool_use_named("work", 10), // the redirect worked: it acts
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("crée un CRM").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[act gate]")),
+            "announced intent with zero work must be redirected: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_gate_silent_after_real_work() {
+        // Once tools ran this request, a closing "let me know…" or summary
+        // mentioning future steps must NOT loop the agent.
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("work", 10),
+            MockProvider::text_response(
+                "C'est fait. Je vais te laisser tester — dis-moi si tu veux des ajustements.",
+                10,
+                5,
+            ),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        runner.execute("petite tâche").await.unwrap();
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            2,
+            "no redirect once real work happened"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_gate_is_one_shot() {
+        // If the model announces again right after the redirect, let it
+        // through — bounded, no loop.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("Je vais créer le fichier maintenant.", 10, 5),
+            MockProvider::text_response("Je vais vraiment le faire bientôt.", 10, 5),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("crée un fichier").await.unwrap();
+        assert!(
+            out.result.contains("bientôt"),
+            "second announce passes through"
+        );
+        assert_eq!(provider.captured_requests.lock().unwrap().len(), 2);
     }
 
     // --- Deterministic delegation nudge ---
