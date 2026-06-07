@@ -1077,6 +1077,14 @@ async fn run_ui(
                             .push(Cell::Notice(format!("could not save config: {e}")));
                     }
                 }
+                Effect::SaveFrontierModel(model) => {
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.frontier_model = model;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
                 Effect::SaveMcp(servers) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.mcp_servers = servers;

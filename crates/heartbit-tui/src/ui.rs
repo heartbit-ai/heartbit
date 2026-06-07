@@ -476,11 +476,12 @@ pub fn view(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            let widget = Paragraph::new(mlines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" select model "),
-            );
+            let title = match picker.target {
+                crate::app::ModelTarget::Main => " select model ",
+                crate::app::ModelTarget::Advisor => " select advisor model ",
+            };
+            let widget =
+                Paragraph::new(mlines).block(Block::default().borders(Borders::ALL).title(title));
             frame.render_widget(widget, rect);
         }
         Some(Modal::ModePicker { sel }) => {
@@ -1218,6 +1219,24 @@ mod tests {
         assert!(
             text2.contains("anthropic/claude-x") && text2.contains("openai/gpt-y"),
             "model list missing:\n{text2}"
+        );
+    }
+
+    #[test]
+    fn model_picker_advisor_target_renders_advisor_title() {
+        use crate::app::{Modal, ModelPicker, ModelTarget};
+        let backend = TestBackend::new(72, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.modal = Some(Modal::ModelPicker(ModelPicker {
+            target: ModelTarget::Advisor,
+            ..ModelPicker::default()
+        }));
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("select advisor model"),
+            "advisor title missing:\n{text}"
         );
     }
 

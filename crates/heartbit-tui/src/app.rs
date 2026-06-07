@@ -179,7 +179,7 @@ impl PermissionMode {
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/mode", "set execution mode: normal | plan | yolo"),
-    ("/model", "show or set the model"),
+    ("/model", "set the model (`/model advisor` for the advisor)"),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
     ("/context-recall", "toggle context restore-on-demand"),
@@ -217,6 +217,9 @@ pub enum Effect {
     SaveKey(String),
     /// Persist a new model id to the config file.
     SaveModel(String),
+    /// Persist the advisor's frontier model to the config file (None = clear,
+    /// falling back to the main model).
+    SaveFrontierModel(Option<String>),
     /// Persist the MCP server list to the config file.
     SaveMcp(Vec<McpServerSpec>),
     /// Fetch the OpenRouter model catalog (async, for the model picker).
@@ -255,6 +258,7 @@ impl Effect {
             Effect::SendInput(_) => "send_input",
             Effect::SaveKey(_) => "save_key",
             Effect::SaveModel(_) => "save_model",
+            Effect::SaveFrontierModel(_) => "save_frontier_model",
             Effect::SaveMcp(_) => "save_mcp",
             Effect::FetchModels => "fetch_models",
             Effect::WalkFiles => "walk_files",
@@ -292,6 +296,19 @@ pub struct KeyEntryModal {
 pub struct ModelPicker {
     pub query: String,
     pub selected: usize,
+    /// Which model the selection applies to: the main agent model or the
+    /// advisor's frontier model (`/model advisor`).
+    pub target: ModelTarget,
+}
+
+/// What a model-picker selection sets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelTarget {
+    /// The main agent model (`/model`).
+    #[default]
+    Main,
+    /// The advisor's frontier model (`/model advisor`).
+    Advisor,
 }
 
 /// Reverse history search (Ctrl+R): a query + the highlighted match index.
@@ -1027,7 +1044,16 @@ impl App {
             }
             "model" | "models" => {
                 if arg.is_empty() {
-                    self.open_model_picker();
+                    self.open_model_picker(ModelTarget::Main);
+                } else if arg == "advisor" {
+                    self.open_model_picker(ModelTarget::Advisor);
+                } else if let Some(rest) = arg.strip_prefix("advisor ") {
+                    let rest = rest.trim();
+                    if rest.eq_ignore_ascii_case("clear") || rest.eq_ignore_ascii_case("off") {
+                        self.clear_frontier_model();
+                    } else {
+                        self.set_frontier_model(rest.to_string());
+                    }
                 } else {
                     self.set_model(arg);
                 }
@@ -1225,6 +1251,28 @@ impl App {
         )));
     }
 
+    /// Set the advisor's frontier model (`/model advisor <name>`): persist,
+    /// notice. Takes effect on the next agent start (the advisor provider is
+    /// built once at engine spawn).
+    fn set_frontier_model(&mut self, model: String) {
+        self.frontier_model = Some(model.clone());
+        self.effects
+            .push(Effect::SaveFrontierModel(Some(model.clone())));
+        self.history.push(Cell::Notice(format!(
+            "advisor model set to {model} — active on next start"
+        )));
+    }
+
+    /// Clear the advisor's frontier model (`/model advisor clear`): the
+    /// advisor falls back to the main model on the next start.
+    fn clear_frontier_model(&mut self) {
+        self.frontier_model = None;
+        self.effects.push(Effect::SaveFrontierModel(None));
+        self.history.push(Cell::Notice(
+            "advisor model cleared — falls back to the main model on next start".to_string(),
+        ));
+    }
+
     /// `/mode [normal|plan|yolo]` — set the execution mode (same as Shift+Tab).
     /// Bare `/mode` reports the current one. Applied live to the approval gate.
     fn set_mode(&mut self, arg: String) {
@@ -1323,9 +1371,13 @@ impl App {
         }));
     }
 
-    /// Open the OpenRouter model picker, fetching the catalog on first use.
-    fn open_model_picker(&mut self) {
-        self.modal = Some(Modal::ModelPicker(ModelPicker::default()));
+    /// Open the OpenRouter model picker for `target` (main model or advisor),
+    /// fetching the catalog on first use.
+    fn open_model_picker(&mut self, target: ModelTarget) {
+        self.modal = Some(Modal::ModelPicker(ModelPicker {
+            target,
+            ..ModelPicker::default()
+        }));
         if self.models.is_empty() && !self.models_loading {
             self.models_loading = true;
             self.effects.push(Effect::FetchModels);
@@ -1354,14 +1406,17 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
-                let sel = match &self.modal {
-                    Some(Modal::ModelPicker(p)) => p.selected,
-                    _ => 0,
+                let (sel, target) = match &self.modal {
+                    Some(Modal::ModelPicker(p)) => (p.selected, p.target),
+                    _ => (0, ModelTarget::Main),
                 };
                 if let Some(&idx) = filtered.get(sel.min(n.saturating_sub(1))) {
                     let id = self.models[idx].id.clone();
                     self.modal = None;
-                    self.set_model(id);
+                    match target {
+                        ModelTarget::Main => self.set_model(id),
+                        ModelTarget::Advisor => self.set_frontier_model(id),
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -2025,6 +2080,99 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    #[test]
+    fn slash_model_advisor_no_arg_opens_picker_for_advisor() {
+        let mut app = keyed();
+        typed(&mut app, "/model advisor");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            matches!(
+                app.modal,
+                Some(Modal::ModelPicker(ModelPicker {
+                    target: ModelTarget::Advisor,
+                    ..
+                }))
+            ),
+            "bare `/model advisor` opens the picker targeting the advisor"
+        );
+        assert!(app.models_loading);
+        assert!(app.effects.contains(&Effect::FetchModels));
+    }
+
+    #[test]
+    fn slash_model_advisor_with_arg_sets_frontier_and_saves() {
+        let mut app = keyed();
+        typed(&mut app, "/model advisor anthropic/claude-opus-4");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.model, "m", "the MAIN model must not change");
+        assert!(app.modal.is_none(), "a direct set must not open the picker");
+        assert!(app.effects.contains(&Effect::SaveFrontierModel(Some(
+            "anthropic/claude-opus-4".into()
+        ))));
+        assert_eq!(
+            app.frontier_model.as_deref(),
+            Some("anthropic/claude-opus-4"),
+            "the in-memory advisor model drives the next respawn"
+        );
+        assert!(
+            app.history.iter().any(
+                |c| matches!(c, Cell::Notice(n) if n.contains("advisor model set to anthropic/claude-opus-4"))
+            ),
+            "must notice the advisor model change"
+        );
+    }
+
+    #[test]
+    fn slash_model_advisor_clear_unsets_frontier() {
+        let mut app = keyed();
+        app.frontier_model = Some("a/opus".into());
+        typed(&mut app, "/model advisor clear");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::SaveFrontierModel(None)));
+        assert!(app.frontier_model.is_none(), "in-memory value cleared too");
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("advisor model cleared"))),
+            "must notice the fallback to the main model"
+        );
+    }
+
+    #[test]
+    fn model_picker_advisor_enter_sets_frontier_not_main() {
+        let mut app = keyed();
+        typed(&mut app, "/model advisor");
+        app.update(key(KeyCode::Enter)); // open advisor picker + FetchModels
+        app.update(Msg::ModelsLoaded(vec![
+            ModelEntry {
+                id: "qwen/q".into(),
+                name: "Qwen".into(),
+                context: None,
+            },
+            ModelEntry {
+                id: "anthropic/claude".into(),
+                name: "Claude".into(),
+                context: None,
+            },
+        ]));
+        for c in "claude".chars() {
+            app.update(key(KeyCode::Char(c)));
+        }
+        app.update(key(KeyCode::Enter)); // select the only match
+        assert_eq!(app.model, "m", "the MAIN model must not change");
+        assert!(app.modal.is_none(), "selecting closes the picker");
+        assert!(
+            app.effects
+                .contains(&Effect::SaveFrontierModel(Some("anthropic/claude".into())))
+        );
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveModel(_))),
+            "advisor selection must not save the main model"
+        );
     }
 
     #[test]
