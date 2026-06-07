@@ -126,12 +126,20 @@ impl Tool for WriteTool {
                     return Ok(ToolOutput::error(msg));
                 }
 
-                // Skip write if content identical
+                // Skip write if content identical. The message is deliberately
+                // emphatic: a model that keeps re-writing the same content
+                // usually believes the write FAILED — when it actually
+                // succeeded and the file is fine, just not where the model is
+                // looking (live finding 6a25d21b: bash cwd drift made the file
+                // invisible, so the model rewrote it in a doom loop).
                 if let Ok(existing) = tokio::fs::read_to_string(&target).await
                     && existing == content
                 {
                     return Ok(ToolOutput::success(format!(
-                        "File unchanged: {file_path} (content identical)"
+                        "File already has EXACTLY this content — the write SUCCEEDED, \
+                         nothing to do: {file_path}. Do NOT write it again. If you can't \
+                         find or run it, the problem is your working directory or path, not \
+                         the write — check `pwd` and use an absolute path."
                     )));
                 }
             }
@@ -298,7 +306,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("unchanged"));
+        // Emphatic "already succeeded" message (anti doom-loop, finding 6a25d21b).
+        assert!(result.content.contains("write SUCCEEDED"));
+        assert!(result.content.contains("Do NOT write it again"));
     }
 
     #[tokio::test]

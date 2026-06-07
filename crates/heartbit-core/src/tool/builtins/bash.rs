@@ -345,6 +345,33 @@ impl Tool for BashTool {
                 }
             }
 
+            // Surface the persistent cwd when it has drifted from the
+            // workspace root. The cwd survives `cd` ACROSS calls, but the model
+            // assumes each call starts fresh — and the `write` tool resolves
+            // paths against the workspace, not this cwd. Hiding the cwd made a
+            // `cd ./x` loop nest `x/x/x` and the model's files "vanish" (live
+            // finding 6a25d21b). Showing it lets the model self-correct.
+            let cwd_hint = match &self.workspace {
+                Some(ws) => {
+                    let here = self.cwd.lock().expect("bash cwd lock poisoned").clone();
+                    if here != *ws {
+                        let rel = here
+                            .strip_prefix(ws)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| here.display().to_string());
+                        Some(format!(
+                            "\n[cwd: {rel} (relative to the workspace root) — bash KEEPS this \
+                             directory between calls; `write` paths are relative to the \
+                             workspace, NOT here. Use absolute paths or `cd` back if this is \
+                             not where you meant to be.]"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
             // Combine output
             let mut combined = String::new();
             if !user_stdout.is_empty() {
@@ -361,7 +388,8 @@ impl Tool for BashTool {
             let combined = truncate_middle(&combined, MAX_OUTPUT_CHARS);
 
             let exit_info = format!("\n\n(exit code: {exit_code})");
-            let output_text = format!("{combined}{exit_info}");
+            let cwd_suffix = cwd_hint.unwrap_or_default();
+            let output_text = format!("{combined}{exit_info}{cwd_suffix}");
 
             if exit_code == 0 {
                 Ok(ToolOutput::success(output_text))
@@ -573,6 +601,52 @@ mod tests {
             "expected cwd to be {}, got: {}",
             dir.path().display(),
             result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_surfaces_drifted_cwd_in_workspace() {
+        // Live finding 6a25d21b: bash's cwd persists across calls but was
+        // hidden, so a `cd ./x` drift was invisible and the model nested
+        // x/x/x. The result must now show the cwd when it leaves the root.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("scratch")).unwrap();
+        let tool = BashTool::with_sandbox(
+            ws.path().to_path_buf(),
+            crate::workspace::EnvPolicy::Inherit,
+        );
+        // At root → no cwd hint.
+        let at_root = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "echo hi"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !at_root.content.contains("[cwd:"),
+            "root needs no hint: {}",
+            at_root.content
+        );
+        // After cd into a subdir → the hint appears with the relative path.
+        let drifted = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"command": "cd scratch && echo hi"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            drifted.content.contains("[cwd: scratch"),
+            "drifted cwd must be surfaced: {}",
+            drifted.content
+        );
+        assert!(
+            drifted
+                .content
+                .contains("KEEPS this directory between calls"),
+            "the hint must explain persistence: {}",
+            drifted.content
         );
     }
 

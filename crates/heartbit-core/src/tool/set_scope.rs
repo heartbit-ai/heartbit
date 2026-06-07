@@ -87,7 +87,18 @@ impl Tool for SetScopeTool {
                 .iter()
                 .filter_map(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from)
+                .map(|s| {
+                    // Resolve RELATIVE roots against the workspace so the scope
+                    // is ONE canonical absolute location. A relative `./scratch`
+                    // is ambiguous (the write tool reads it workspace-relative,
+                    // bash relative to its drifting cwd) — live finding
+                    // 6a25d21b. Absolute paths are kept as-is.
+                    let p = PathBuf::from(s);
+                    match (&self.workspace, p.is_relative()) {
+                        (Some(ws), true) => ws.join(p),
+                        _ => p,
+                    }
+                })
                 .collect();
             let n = roots.len();
             // Outside→inside transition check: a task deliberately scoped
@@ -224,6 +235,34 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn relative_scope_is_resolved_against_the_workspace() {
+        // Live finding 6a25d21b: a relative scope "./scratch-crm" was ambiguous
+        // — write resolved it workspace-relative, bash via its drifting cwd.
+        // set_scope now anchors a relative root to the workspace (one canonical
+        // absolute location).
+        let guard = Arc::new(ScopeGuard::new(vec![]));
+        let tool = SetScopeTool::new(guard.clone()).with_workspace("/repo");
+        let out = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"paths": ["./scratch-crm"]}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let roots = guard.roots();
+        assert_eq!(roots, vec![PathBuf::from("/repo/scratch-crm")]);
+        // An absolute root is kept verbatim.
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"paths": ["/tmp/elsewhere"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(guard.roots(), vec![PathBuf::from("/tmp/elsewhere")]);
     }
 
     #[test]

@@ -4572,6 +4572,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doom_loop_hard_aborts_when_soft_warning_ignored() {
+        // Live finding 6a25d21b: doom detected at 3/4/5 but the model ignored
+        // the soft warning and spun forever (user had to interrupt). With
+        // threshold 3 + margin 2, the 5th identical call HARD-ABORTS the run.
+        let tool_response = |id: &str| CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "my_tool".into(),
+                input: json!({"key": "same_value"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        // The model keeps repeating, ignoring every soft warning.
+        let provider = Arc::new(MockProvider::new(
+            (0..8).map(|i| tool_response(&format!("c{i}"))).collect(),
+        ));
+        let runner = AgentRunner::builder(provider)
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(MockTool::new("my_tool", "tool result")))
+            .max_turns(30)
+            .max_identical_tool_calls(3)
+            .build()
+            .unwrap();
+        let err = runner.execute("do something").await.unwrap_err();
+        // execute() wraps the terminal error in WithPartialUsage.
+        let inner = match &err {
+            crate::Error::WithPartialUsage { source, .. } => source.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(inner, crate::Error::DoomLoopAborted(n) if *n >= 5),
+            "an ignored doom loop must hard-abort, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn doom_loop_resets_on_different_call() {
         // 2 identical calls, then a different call, then 2 more of the different.
         // With threshold 3, no doom loop should be detected.

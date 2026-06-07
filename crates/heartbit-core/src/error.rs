@@ -71,6 +71,13 @@ pub enum Error {
     #[error("Max turns ({0}) exceeded")]
     MaxTurnsExceeded(usize),
 
+    /// The agent repeated the same tool call past the doom-loop hard limit and
+    /// ignored the soft warnings — the run is aborted rather than spin forever.
+    /// Not retryable; the approach is stuck and needs a human or a different
+    /// strategy.
+    #[error("Doom loop: identical tool calls repeated {0} times — aborting the run")]
+    DoomLoopAborted(u32),
+
     /// The LLM response was cut off because `max_tokens` was reached.
     ///
     /// The agent loop surfaces this as an error when truncation is fatal. Callers

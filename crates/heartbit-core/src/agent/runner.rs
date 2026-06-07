@@ -197,10 +197,18 @@ enum RustcHintClass {
     TypeMismatch,
     /// Borrow/move errors → restructure ownership, mechanical retries fail.
     Ownership,
+    /// A shell command was not found (exit 127) → wrong binary name
+    /// (python vs python3), missing tool, or not on PATH. Live finding
+    /// 6a25d21b: the model ran `python` (only `python3` exists) and thrashed.
+    CommandNotFound,
 }
 
-/// Classify a failing tool output (cargo/rustc) into a repair-hint class.
+/// Classify a failing tool output (cargo/rustc/shell) into a repair-hint class.
 fn classify_rustc_failure(output: &str) -> Option<RustcHintClass> {
+    // Shell command-not-found (exit 127) — not a rustc error, check first.
+    if output.contains("command not found") || output.contains("(exit code: 127)") {
+        return Some(RustcHintClass::CommandNotFound);
+    }
     if !output.contains("error[") && !output.contains("error:") {
         return None;
     }
@@ -241,6 +249,12 @@ fn is_build_failure(output: &str) -> bool {
 
 /// Consecutive failed-build batches after which the escalation hint fires.
 const ESCALATION_AFTER_FAILURES: u32 = 3;
+
+/// Extra identical-tool-call repeats allowed AFTER the soft doom-loop warning
+/// before the run is hard-aborted. The soft warning fires at the configured
+/// threshold; this many further repeats (the model ignoring it) trips the
+/// hard stop (live finding 6a25d21b: the soft warning was ignored 3→4→5).
+const DOOM_HARD_STOP_MARGIN: u32 = 2;
 
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
@@ -2084,6 +2098,30 @@ impl<P: LlmProvider> AgentRunner<P> {
                         self.max_fuzzy_identical_tool_calls,
                     );
                     if exact {
+                        // HARD stop: the soft warning (error results below) gives
+                        // the model `DOOM_HARD_STOP_MARGIN` turns to change course;
+                        // past that it has demonstrably ignored the warnings, so
+                        // abort instead of spinning forever (live finding
+                        // 6a25d21b: doom detected at 3/4/5, never stopped, user
+                        // had to interrupt by hand).
+                        if doom_tracker.count() >= threshold + DOOM_HARD_STOP_MARGIN {
+                            self.emit(AgentEvent::DoomLoopDetected {
+                                agent: self.name.clone(),
+                                turn: ctx.current_turn(),
+                                consecutive_count: doom_tracker.count(),
+                                tool_names: tool_calls
+                                    .iter()
+                                    .map(|tc| tc.name.clone())
+                                    .collect(),
+                            });
+                            let n = doom_tracker.count();
+                            self.emit(AgentEvent::RunFailed {
+                                agent: self.name.clone(),
+                                error: format!("doom loop aborted after {n} repeats"),
+                                partial_usage: total_usage,
+                            });
+                            return Err((Error::DoomLoopAborted(n), total_usage));
+                        }
                         debug!(
                             agent = %self.name,
                             count = doom_tracker.count(),
@@ -2115,6 +2153,30 @@ impl<P: LlmProvider> AgentRunner<P> {
                         ctx.add_tool_results(results);
                         continue;
                     } else if fuzzy {
+                        // Hard stop mirrors the exact path: a fuzzy loop that
+                        // survives the soft warning by DOOM_HARD_STOP_MARGIN
+                        // turns is aborted (the fuzzy threshold is already more
+                        // lenient than exact).
+                        if let Some(fthresh) = self.max_fuzzy_identical_tool_calls
+                            && doom_tracker.fuzzy_count() >= fthresh + DOOM_HARD_STOP_MARGIN
+                        {
+                            self.emit(AgentEvent::FuzzyDoomLoopDetected {
+                                agent: self.name.clone(),
+                                turn: ctx.current_turn(),
+                                consecutive_count: doom_tracker.fuzzy_count(),
+                                tool_names: tool_calls
+                                    .iter()
+                                    .map(|tc| tc.name.clone())
+                                    .collect(),
+                            });
+                            let n = doom_tracker.fuzzy_count();
+                            self.emit(AgentEvent::RunFailed {
+                                agent: self.name.clone(),
+                                error: format!("fuzzy doom loop aborted after {n} repeats"),
+                                partial_usage: total_usage,
+                            });
+                            return Err((Error::DoomLoopAborted(n), total_usage));
+                        }
                         debug!(
                             agent = %self.name,
                             count = doom_tracker.fuzzy_count(),
@@ -2584,6 +2646,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                                      error: re-read the FULL error span and restructure \
                                      ownership (scope the borrows, clone deliberately) — \
                                      mechanical retries rarely fix these."
+                                    .to_string(),
+                                RustcHintClass::CommandNotFound => "[repair hint] Command \
+                                     not found: check the exact binary name (e.g. `python` \
+                                     → `python3`, `pip` → `pip3`), verify it is installed \
+                                     (`which <cmd>`), or use an alternative — do not retry \
+                                     the same command."
                                     .to_string(),
                             };
                             self.emit(AgentEvent::GateFired {
@@ -5371,6 +5439,54 @@ mod tests {
             names.contains(&"write".to_string()),
             "no router → no masking: {names:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_not_found_triggers_repair_hint() {
+        struct CmdNotFound;
+        impl Tool for CmdNotFound {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "bash".into(),
+                    description: "bash".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                Box::pin(async {
+                    Ok(ToolOutput::error(
+                        "bash: line 1: python: command not found\n(exit code: 127)",
+                    ))
+                })
+            }
+        }
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("bash", 10),
+            MockProvider::text_response("ok", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(CmdNotFound))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("run it").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let hinted = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::Text { text }
+                if text.contains("[repair hint]") && text.contains("python3"))
+            });
+        assert!(hinted, "command-not-found must hint python→python3");
     }
 
     #[tokio::test(flavor = "multi_thread")]
