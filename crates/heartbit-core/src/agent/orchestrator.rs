@@ -1745,7 +1745,11 @@ pub fn build_entry_agent_prompt_ext(
          TOOL — not a free-text question in your reply — whenever the choices are enumerable \
          (the user answers with one keypress). Otherwise PROCEED and state your assumptions \
          explicitly (as todos when planning). Never ask about what you can discover yourself \
-         from the code.\n"
+         from the code. NEVER re-ask anything the user ALREADY specified in the request (a \
+         location like 'temporary directory', a language, a scope) — honor it, don't \
+         re-litigate it. Every option you offer MUST respect every stated constraint: never \
+         present a choice that contradicts the request (e.g. don't offer 'in the repository' \
+         when a temporary directory was asked for).\n"
     } else {
         ""
     };
@@ -4805,6 +4809,31 @@ mod tests {
     }
 
     #[test]
+    fn clarify_rule_forbids_re_asking_specified_facts() {
+        let agents: Vec<(&str, &str, &[String])> = vec![];
+        let p = build_entry_agent_prompt_ext(
+            &agents,
+            false,
+            DispatchMode::Parallel,
+            &[],
+            EntryCaps {
+                ask_user: true,
+                ..Default::default()
+            },
+        );
+        let low = p.to_lowercase();
+        assert!(
+            low.contains("never re-ask anything the user already specified"),
+            "must forbid re-asking specified facts: {p}"
+        );
+        assert!(
+            low.contains("respect every stated constraint")
+                && low.contains("contradicts the request"),
+            "options must honor constraints: {p}"
+        );
+    }
+
+    #[test]
     fn entry_prompt_discipline_rules_gated_on_caps() {
         let agents: Vec<(&str, &str, &[String])> = vec![];
         let full = build_entry_agent_prompt_ext(
@@ -6745,6 +6774,7 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RequestRouted { agent, .. }
+                | AgentEvent::GateFired { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
@@ -7440,6 +7470,7 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RequestRouted { agent, .. }
+                | AgentEvent::GateFired { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
                 | AgentEvent::FuzzyDoomLoopDetected { agent, .. }
@@ -7477,6 +7508,7 @@ mod tests {
                 AgentEvent::GuardrailDenied { .. } => "GuardrailDenied",
                 AgentEvent::GuardrailWarned { .. } => "GuardrailWarned",
                 AgentEvent::RequestRouted { .. } => "RequestRouted",
+                AgentEvent::GateFired { .. } => "GateFired",
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",
                 AgentEvent::FuzzyDoomLoopDetected { .. } => "FuzzyDoomLoopDetected",

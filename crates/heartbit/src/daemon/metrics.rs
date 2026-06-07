@@ -587,6 +587,7 @@ impl DaemonMetrics {
             // Request-intent routing decisions: no dedicated metric yet
             // (visible in traces/audit); ignored here.
             AgentEvent::RequestRouted { .. } => {}
+            AgentEvent::GateFired { .. } => {}
             AgentEvent::RetryAttempt { .. } => {
                 self.retry_attempts_total.inc();
             }

@@ -873,6 +873,10 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut deps_hint_fired = false;
             let mut consecutive_build_failures: u32 = 0;
             let mut escalation_fired = false;
+            // Hard escalation (C): once raised, edit/write/patch are BLOCKED
+            // until the advisor is consulted (live finding 6a25ca5e: 24 build
+            // failures, advisor never called — the soft suggestion was ignored).
+            let mut advisor_required = false;
             // Request-intent mode (router): routed per fresh request; the
             // harness enforces the contract. Without a router, everything is
             // EXECUTE (today's semantics).
@@ -1684,6 +1688,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                     {
                         prose_question_nudged = true;
                         debug!(agent = %self.name, "prose question battery; redirecting to the question tool");
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "ask_gate".into(),
+                            reason: "prose question battery".into(),
+                        });
+
                         ctx.add_user_message(
                             "[ask gate] You just asked the user several questions in free \
                              text — they cannot answer options efficiently that way. Re-ask \
@@ -1707,6 +1717,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                     {
                         intent_nudged = true;
                         debug!(agent = %self.name, "announced intent with zero work; act gate");
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "act_gate".into(),
+                            reason: "announced intent, zero tools".into(),
+                        });
+
                         ctx.add_user_message(
                             "[act gate] You announced what you are about to do, then \
                              stopped without doing it. If any requirement is unclear, ask \
@@ -1730,6 +1746,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                     {
                         study_contract_nudged = true;
                         debug!(agent = %self.name, "study contract: no go/no-go question; corrective injected");
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "study_contract".into(),
+                            reason: "study ended without a go/no-go question".into(),
+                        });
+
                         ctx.add_user_message(
                             "[study contract] End your study properly: give a NUMBERED \
                              proposal (options + your recommendation), then ask the user \
@@ -1882,6 +1904,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         deps_hint_fired = false;
                         consecutive_build_failures = 0;
                         escalation_fired = false;
+                        advisor_required = false;
                         question_called = false;
                         study_contract_nudged = false;
                         continue;
@@ -2147,6 +2170,37 @@ impl<P: LlmProvider> AgentRunner<P> {
                 if tool_calls.iter().any(|c| c.name == "set_scope") {
                     scope_declared = true;
                 }
+                if tool_calls.iter().any(|c| c.name == "advisor") {
+                    advisor_required = false;
+                    consecutive_build_failures = 0;
+                }
+                if advisor_required
+                    && tool_calls
+                        .iter()
+                        .any(|c| matches!(c.name.as_str(), "edit" | "write" | "patch"))
+                {
+                    debug!(agent = %self.name, "hard escalation: mutations blocked until advisor consulted");
+                    self.emit(AgentEvent::GateFired {
+                        agent: self.name.clone(),
+                        gate: "escalation_block".into(),
+                        reason: format!("{consecutive_build_failures} failed builds; advisor required"),
+                    });
+                    let results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            ToolResult::error(
+                                tc.id.clone(),
+                                "[escalation] Too many failed builds — STOP editing. Call \
+                                 the `advisor` tool with the full error output and your last \
+                                 attempt FIRST; edits are blocked until you do."
+                                    .to_string(),
+                            )
+                        })
+                        .collect();
+                    total_tool_calls += tool_calls.len();
+                    ctx.add_tool_results(results);
+                    continue;
+                }
 
                 // Mode contract, BACKSTOP enforcement (execution deny): a
                 // mutating call that slips past the masking (hallucinated
@@ -2159,6 +2213,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     .any(|c| MODE_READONLY_DENY.contains(&c.name.as_str()))
                 {
                     debug!(agent = %self.name, mode = request_mode.label(), "mode contract: mutating batch denied");
+                    self.emit(AgentEvent::GateFired {
+                        agent: self.name.clone(),
+                        gate: "mode_contract".into(),
+                        reason: format!("{} mode: mutation denied", request_mode.label()),
+                    });
                     let results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|tc| {
@@ -2213,6 +2272,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                             mutations = would_be,
                             "plan gate: building without a plan artifact"
                         );
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "plan_gate".into(),
+                            reason: format!("mutation #{would_be} without a plan artifact"),
+                        });
                         let design_check = if self.tools.contains_key("advisor") {
                             " Finally, get a quick design review: call the `advisor` \
                              tool with your plan (criteria, scope, dependency choices) — \
@@ -2522,6 +2586,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                                      mechanical retries rarely fix these."
                                     .to_string(),
                             };
+                            self.emit(AgentEvent::GateFired {
+                                agent: self.name.clone(),
+                                gate: "repair_hint".into(),
+                                reason: format!("{class:?}"),
+                            });
                             pending_hints.push(hint);
                         }
                     }
@@ -2532,11 +2601,17 @@ impl<P: LlmProvider> AgentRunner<P> {
                             && self.tools.contains_key("advisor")
                         {
                             escalation_fired = true;
+                            advisor_required = true;
+                            self.emit(AgentEvent::GateFired {
+                                agent: self.name.clone(),
+                                gate: "escalation".into(),
+                                reason: format!("{consecutive_build_failures} consecutive failed builds"),
+                            });
                             pending_hints.push(format!(
                                 "[escalation] {consecutive_build_failures} consecutive \
-                                 failed builds on this request. Stop iterating: consult \
+                                 failed builds on this request. STOP iterating: consult \
                                  the `advisor` tool with the FULL error output and your \
-                                 last attempt before trying again."
+                                 last attempt — edits are now blocked until you do."
                             ));
                         }
                     } else if results.iter().any(|r| !r.is_error) {
@@ -2554,6 +2629,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     })
                 {
                     deps_hint_fired = true;
+                    self.emit(AgentEvent::GateFired {
+                        agent: self.name.clone(),
+                        gate: "deps_hint".into(),
+                        reason: "hand-written Cargo.toml deps".into(),
+                    });
                     pending_hints.push(
                         "[deps hint] You hand-wrote Cargo.toml dependency versions — \
                          prefer `cargo add <crate>`: it resolves the CURRENT version and \
@@ -2631,6 +2711,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                             tool_calls = nudge_tool_calls,
                             "delegation nudge injected"
                         );
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "delegation_nudge".into(),
+                            reason: format!("{nudge_tool_calls} direct calls, no delegation"),
+                        });
                         ctx.add_user_message(format!(
                             "[delegation check] You have made {nudge_tool_calls} direct tool \
                              calls on this request without delegating. If meaningful work \
@@ -5438,6 +5523,111 @@ mod tests {
         assert!(
             escalated,
             "3 consecutive failed builds must suggest the advisor escalation"
+        );
+    }
+
+    /// A bash tool that always reports a build failure (for escalation tests).
+    struct FailingBuild;
+    impl Tool for FailingBuild {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "bash".into(),
+                description: "bash".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            Box::pin(async { Ok(ToolOutput::error("error[E0308]: mismatched types")) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hard_escalation_blocks_edits_until_advisor_is_consulted() {
+        // C: after the escalation, edit/write/patch are DENIED until the
+        // advisor is called (live finding 6a25ca5e: the soft suggestion was
+        // ignored through 24 failed builds).
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("bash", 10),    // fail 1
+            tool_use_named("bash", 10),    // fail 2
+            tool_use_named("bash", 10),    // fail 3 → escalation + advisor_required
+            tool_use_named("edit", 10),    // BLOCKED (advisor required)
+            tool_use_named("advisor", 10), // consult → clears the block
+            tool_use_named("edit", 10),    // now allowed
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(FailingBuild))
+            .tool(Arc::new(NamedTool { name: "edit" }))
+            .tool(Arc::new(NamedTool { name: "advisor" }))
+            .max_turns(12)
+            .build()
+            .unwrap();
+        let out = runner.execute("fixe le build").await.unwrap();
+        // Reaching the terminal "done" proves the block was CLEARED by the
+        // advisor — otherwise the edit stays denied and the run never settles.
+        assert_eq!(out.result, "done");
+        // The final transcript (last request) carries the escalation deny that
+        // blocked the pre-advisor edit (an error ToolResult, not a suggestion).
+        let reqs = provider.captured_requests.lock().unwrap();
+        let blocked = reqs
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|b| matches!(b, ContentBlock::ToolResult { content, is_error, .. }
+                if *is_error && content.contains("[escalation]") && content.contains("edits are blocked")));
+        assert!(blocked, "the pre-advisor edit must be hard-denied");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gates_emit_gate_fired_events_for_the_trace() {
+        // B: gates were invisible (user-message injections). Now each fires a
+        // GateFired event so a session can be audited.
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("write", 10), // wish request → plan gate blocks
+            tool_use_named("question", 10),
+            tool_use_named("write", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "write" }))
+            .tool(Arc::new(NamedTool { name: "question" }))
+            .request_router(std::sync::Arc::new(
+                crate::agent::router::RequestRouter::new(None),
+            ))
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        runner
+            .execute("je souhaite créer un petit crm")
+            .await
+            .unwrap();
+        let gates: Vec<String> = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|e| match e {
+                crate::agent::events::AgentEvent::GateFired { gate, .. } => Some(gate.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gates.iter().any(|g| g == "plan_gate"),
+            "the plan gate must emit a GateFired event: {gates:?}"
         );
     }
 

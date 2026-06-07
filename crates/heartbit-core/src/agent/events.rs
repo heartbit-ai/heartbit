@@ -173,6 +173,20 @@ pub enum AgentEvent {
         /// Classifier confidence (1.0 for deterministic sources).
         confidence: f32,
     },
+    /// A deterministic harness gate fired (ask/act/plan/mode-contract/study/
+    /// repair-hint/escalation/delegation-nudge). These inject guidance into
+    /// the agent's context; this event makes them visible in the trace so a
+    /// session can be audited (previously invisible — they were user messages).
+    GateFired {
+        /// Agent name.
+        agent: String,
+        /// Gate identifier ("plan_gate", "ask_gate", "act_gate",
+        /// "mode_contract", "study_contract", "repair_hint", "deps_hint",
+        /// "escalation", "delegation_nudge").
+        gate: String,
+        /// Short reason / context (e.g. the failure class, the routed mode).
+        reason: String,
+    },
     RetryAttempt {
         agent: String,
         /// Current attempt number (1-indexed).
@@ -343,6 +357,7 @@ impl AgentEvent {
             Self::GuardrailWarned { .. } => "guardrail_warned",
             Self::RunFailed { .. } => "run_failed",
             Self::RequestRouted { .. } => "request_routed",
+            Self::GateFired { .. } => "gate_fired",
             Self::RetryAttempt { .. } => "retry_attempt",
             Self::DoomLoopDetected { .. } => "doom_loop_detected",
             Self::FuzzyDoomLoopDetected { .. } => "fuzzy_doom_loop_detected",
