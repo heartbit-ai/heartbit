@@ -180,6 +180,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/mode", "set execution mode: normal | plan | yolo"),
     ("/model", "set the model (`/model advisor` for the advisor)"),
+    (
+        "/handoff",
+        "brief for another session (`/handoff <purpose>`)",
+    ),
     ("/mcp", "list / add / clear MCP servers"),
     ("/agents", "toggle multi-agent workflow mode"),
     ("/context-recall", "toggle context restore-on-demand"),
@@ -239,6 +243,13 @@ pub enum Effect {
     ResumeSession(String),
     /// Abandon the in-flight turn (abort generation), keeping the session.
     Interrupt,
+    /// List handoff briefs (for the `/handoff` picker).
+    ListHandoffs,
+    /// Seed the session from a chosen handoff brief (path of the .md file).
+    SeedFromHandoff(std::path::PathBuf),
+    /// Write a deterministic emergency handoff brief after a terminal run
+    /// failure (no LLM — the provider may be the thing that failed).
+    EmergencyHandoff(String),
     /// Compute trace stats (None = current session; "last" | <id> otherwise).
     ComputeStats(Option<String>),
     /// Prepare an `/analyze` run (resolve trace, compute stats, build prompt).
@@ -269,6 +280,9 @@ impl Effect {
             Effect::ListSessions => "list_sessions",
             Effect::ResumeSession(_) => "resume_session",
             Effect::Interrupt => "interrupt",
+            Effect::ListHandoffs => "list_handoffs",
+            Effect::SeedFromHandoff(_) => "seed_from_handoff",
+            Effect::EmergencyHandoff(_) => "emergency_handoff",
             Effect::ComputeStats(_) => "compute_stats",
             Effect::Analyze(_) => "analyze",
             Effect::Learn => "learn",
@@ -349,6 +363,11 @@ pub enum Modal {
     KeyEntry(KeyEntryModal),
     ModelPicker(ModelPicker),
     Question(QuestionModal),
+    /// `/handoff` brief picker: saved briefs, newest first.
+    HandoffPicker {
+        briefs: Vec<crate::session::HandoffMeta>,
+        sel: usize,
+    },
     /// `/mode` picker: choose the execution mode (`sel` indexes [`MODES`]).
     ModePicker {
         sel: usize,
@@ -671,6 +690,7 @@ impl App {
                 Some(Modal::Approval(_))
                 | Some(Modal::Question(_))
                 | Some(Modal::SessionPicker(_))
+                | Some(Modal::HandoffPicker { .. })
                 | Some(Modal::ModePicker { .. }) => {}
                 None => self.composer.insert_str(&s),
             },
@@ -837,6 +857,11 @@ impl App {
                 self.learning = None;
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
+                // P12: a run failure is terminal for this engine — leave a
+                // deterministic emergency brief so the next session can
+                // continue deliberately (the 402 incident left an amnesiac
+                // respawn with no bridge).
+                self.effects.push(Effect::EmergencyHandoff(error));
             }
             Msg::Approval { tools, reply } => {
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
@@ -861,6 +886,15 @@ impl App {
                 self.models_loading = false;
             }
             Msg::FilesLoaded(files) => self.file_index = files,
+            Msg::HandoffsListed(briefs) => {
+                if briefs.is_empty() {
+                    self.history.push(Cell::Notice(
+                        "no handoff briefs yet — `/handoff <purpose>` creates one".into(),
+                    ));
+                } else {
+                    self.modal = Some(Modal::HandoffPicker { briefs, sel: 0 });
+                }
+            }
             Msg::SessionsListed(sessions) => {
                 if sessions.is_empty() {
                     self.history
@@ -1108,6 +1142,18 @@ impl App {
             }
             "export" => self.effects.push(Effect::ExportSession),
             "resume" => self.effects.push(Effect::ListSessions),
+            "handoff" => {
+                if arg.is_empty() {
+                    // Bare: browse saved briefs (a purposeless handoff is
+                    // invalid by design — the purpose tailors the brief).
+                    self.effects.push(Effect::ListHandoffs);
+                } else {
+                    self.effects.push(Effect::SendInput(format!(
+                        "Call the `handoff` tool now with purpose: \"{arg}\". Then tell me \
+                         the brief's path in one line."
+                    )));
+                }
+            }
             "stats" => {
                 let target = if arg.is_empty() { None } else { Some(arg) };
                 self.effects.push(Effect::ComputeStats(target));
@@ -1572,6 +1618,7 @@ impl App {
             Some(Modal::ModelPicker(_)) => self.handle_model_picker_key(key),
             Some(Modal::HistorySearch(_)) => self.handle_history_search_key(key),
             Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
+            Some(Modal::HandoffPicker { .. }) => self.handle_handoff_picker_key(key),
             Some(Modal::ModePicker { .. }) => self.handle_mode_picker_key(key),
             None => {}
         }
@@ -1724,6 +1771,40 @@ impl App {
                 self.modal = None;
                 if let Some(id) = id {
                     self.effects.push(Effect::ResumeSession(id));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handoff-brief picker keys: ↑/↓ select (wrap), Enter seed, Esc cancel.
+    fn handle_handoff_picker_key(&mut self, key: KeyEvent) {
+        let n = match &self.modal {
+            Some(Modal::HandoffPicker { briefs, .. }) => briefs.len(),
+            _ => return,
+        };
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up if n > 0 => {
+                if let Some(Modal::HandoffPicker { sel, .. }) = &mut self.modal {
+                    *sel = ((*sel).min(n - 1) + n - 1) % n;
+                }
+            }
+            KeyCode::Down if n > 0 => {
+                if let Some(Modal::HandoffPicker { sel, .. }) = &mut self.modal {
+                    *sel = ((*sel).min(n - 1) + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let path = match &self.modal {
+                    Some(Modal::HandoffPicker { briefs, sel }) => briefs
+                        .get((*sel).min(n.saturating_sub(1)))
+                        .map(|b| b.path.clone()),
+                    _ => None,
+                };
+                self.modal = None;
+                if let Some(path) = path {
+                    self.effects.push(Effect::SeedFromHandoff(path));
                 }
             }
             _ => {}
@@ -2198,6 +2279,85 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert_eq!(app.model, "m", "Esc must not change the model");
+    }
+
+    #[test]
+    fn slash_handoff_with_purpose_sends_tool_instruction() {
+        let mut app = keyed();
+        typed(&mut app, "/handoff prototype the picker UI");
+        app.update(key(KeyCode::Enter));
+        let sent = app.effects.iter().find_map(|e| match e {
+            Effect::SendInput(s) => Some(s.clone()),
+            _ => None,
+        });
+        let sent = sent.expect("must submit an instruction to the agent");
+        assert!(sent.contains("handoff"), "names the tool: {sent}");
+        assert!(
+            sent.contains("prototype the picker UI"),
+            "carries the purpose verbatim: {sent}"
+        );
+    }
+
+    #[test]
+    fn slash_handoff_bare_lists_briefs() {
+        let mut app = keyed();
+        typed(&mut app, "/handoff");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::ListHandoffs));
+    }
+
+    #[test]
+    fn handoff_picker_enter_seeds_selected_brief() {
+        let mut app = keyed();
+        app.update(Msg::HandoffsListed(vec![
+            crate::session::HandoffMeta {
+                file_name: "2026-06-07-prototype.md".into(),
+                path: std::path::PathBuf::from("/tmp/h/2026-06-07-prototype.md"),
+                preview: "Purpose: prototype the picker".into(),
+            },
+            crate::session::HandoffMeta {
+                file_name: "2026-06-06-refactor.md".into(),
+                path: std::path::PathBuf::from("/tmp/h/2026-06-06-refactor.md"),
+                preview: "Purpose: refactor".into(),
+            },
+        ]));
+        assert!(matches!(app.modal, Some(Modal::HandoffPicker { .. })));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert!(
+            app.effects
+                .contains(&Effect::SeedFromHandoff(std::path::PathBuf::from(
+                    "/tmp/h/2026-06-06-refactor.md"
+                )))
+        );
+    }
+
+    #[test]
+    fn handoffs_listed_empty_notices_instead_of_modal() {
+        let mut app = keyed();
+        app.update(Msg::HandoffsListed(vec![]));
+        assert!(app.modal.is_none());
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("no handoff"))),
+        );
+    }
+
+    #[test]
+    fn run_failed_pushes_emergency_handoff_effect() {
+        let mut app = keyed();
+        typed(&mut app, "do something big");
+        app.update(key(KeyCode::Enter));
+        app.update(Msg::RunFailed("API error (402): out of credits".into()));
+        assert!(
+            app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::EmergencyHandoff(err) if err.contains("402"))),
+            "a terminal failure must leave a brief behind: {:?}",
+            app.effects
+        );
     }
 
     fn question_msg(

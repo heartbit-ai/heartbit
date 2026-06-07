@@ -68,6 +68,10 @@ pub struct GoalCondition {
     objective: String,
     judge: Arc<BoxedProvider>,
     max_continuations: u32,
+    /// When true, the judge grades EACH criterion line of the objective
+    /// independently (checklist verdict). Off by default — it lengthens the
+    /// judge reply and is only worth the cost for multi-criterion objectives.
+    per_criterion: bool,
 }
 
 /// The judge's decision plus its reason (the reason becomes the agent's
@@ -89,7 +93,17 @@ impl GoalCondition {
             objective: objective.into(),
             judge,
             max_continuations: DEFAULT_MAX_CONTINUATIONS,
+            per_criterion: false,
         }
+    }
+
+    /// Opt into per-criterion judging: the judge grades each criterion line of
+    /// the objective separately and names the specific unmet ones — sharper
+    /// continuation guidance for multi-criterion objectives, at the cost of a
+    /// longer judge reply.
+    pub fn with_per_criterion(mut self, on: bool) -> Self {
+        self.per_criterion = on;
+        self
     }
 
     /// Override how many extra continuations are granted to reach the goal after
@@ -138,11 +152,28 @@ impl GoalCondition {
              Is the objective satisfied by the evidence above? Reply with the verdict line.",
             self.objective, evidence
         );
+        let system = if self.per_criterion {
+            format!(
+                "{JUDGE_SYSTEM_PROMPT}\n\nThe OBJECTIVE is a list of acceptance criteria. \
+                 Evaluate EACH criterion independently against the evidence: output one line \
+                 per criterion, `- [met] <criterion>` or `- [NOT MET] <criterion>: <missing \
+                 evidence>`, BEFORE the verdict line. GOAL_MET: YES only when EVERY criterion \
+                 is met; otherwise GOAL_MET: NO: name the specific unmet criteria."
+            )
+        } else {
+            JUDGE_SYSTEM_PROMPT.to_string()
+        };
+        let max_tokens = if self.per_criterion {
+            // One checklist line per criterion needs more room than a bare verdict.
+            JUDGE_MAX_TOKENS * 4
+        } else {
+            JUDGE_MAX_TOKENS
+        };
         let request = CompletionRequest {
-            system: JUDGE_SYSTEM_PROMPT.to_string(),
+            system,
             messages: vec![Message::user(user)],
             tools: Vec::new(),
-            max_tokens: JUDGE_MAX_TOKENS,
+            max_tokens,
             tool_choice: None,
             reasoning_effort: None,
         };
@@ -246,6 +277,82 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Captures the judge request and returns a canned reply.
+    struct StubJudge {
+        reply: String,
+        captured: Mutex<Vec<CompletionRequest>>,
+    }
+    impl LlmProvider for StubJudge {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<crate::llm::types::CompletionResponse, crate::error::Error> {
+            self.captured.lock().expect("lock").push(request);
+            Ok(crate::llm::types::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.reply.clone(),
+                }],
+                stop_reason: crate::llm::types::StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_reports_per_criterion_status() {
+        // P8 (opt-in): the judge evaluates EACH criterion separately and the
+        // continuation guidance names the SPECIFIC unmet criterion.
+        let judge = Arc::new(StubJudge {
+            reply: "- [met] A: endpoint returns 200\n- [NOT MET] B: no test evidence\n\
+                    GOAL_MET: NO: criterion B unmet — tests were never run"
+                .into(),
+            captured: Mutex::new(Vec::new()),
+        });
+        let goal = GoalCondition::new(
+            "- A: GET /health returns 200\n- B: cargo test green",
+            Arc::new(BoxedProvider::from_arc(judge.clone())),
+        )
+        .with_per_criterion(true);
+        let (verdict, _usage) = goal.evaluate("transcript evidence here").await;
+        assert!(!verdict.satisfied);
+        assert!(
+            verdict.reason.contains("criterion B"),
+            "reason names the unmet criterion: {}",
+            verdict.reason
+        );
+        let cont = goal.continuation_message(&verdict.reason);
+        assert!(
+            cont.contains("criterion B"),
+            "continuation carries the specific gap: {cont}"
+        );
+        // The judge prompt carries the per-criterion instruction…
+        let reqs = judge.captured.lock().expect("lock");
+        assert!(
+            reqs[0].system.contains("EACH criterion"),
+            "per-criterion instruction missing: {}",
+            reqs[0].system
+        );
+    }
+
+    #[tokio::test]
+    async fn default_judge_prompt_has_no_per_criterion_instruction() {
+        let judge = Arc::new(StubJudge {
+            reply: "GOAL_MET: YES".into(),
+            captured: Mutex::new(Vec::new()),
+        });
+        let goal = GoalCondition::new("ship it", Arc::new(BoxedProvider::from_arc(judge.clone())));
+        let _ = goal.evaluate("evidence").await;
+        let reqs = judge.captured.lock().expect("lock");
+        assert!(
+            !reqs[0].system.contains("EACH criterion"),
+            "off by default (cost): {}",
+            reqs[0].system
+        );
+    }
 
     #[test]
     fn parses_yes() {

@@ -22,6 +22,7 @@ pub mod guardrail;
 pub mod guardrails;
 pub mod handoff;
 pub mod instructions;
+mod intake;
 pub mod interrupt;
 pub mod mixture;
 pub mod observability;

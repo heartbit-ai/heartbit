@@ -360,6 +360,7 @@ pub fn default_registry() -> WorkflowRegistry {
     WorkflowRegistry::new()
         .register(recipes::parallel_review())
         .register(crate::agent::deep_research::recipe())
+        .register(crate::agent::intake::recipe())
 }
 
 #[cfg(test)]

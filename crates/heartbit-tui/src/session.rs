@@ -93,6 +93,103 @@ pub fn list(dir: &Path) -> Vec<SessionMeta> {
     metas.into_iter().map(|(_, m)| m).collect()
 }
 
+/// One saved handoff brief (purpose-tailored session bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffMeta {
+    /// File name (carries the date + purpose slug).
+    pub file_name: String,
+    /// Absolute path of the brief.
+    pub path: PathBuf,
+    /// First non-empty line — shown in the picker.
+    pub preview: String,
+}
+
+/// The handoff-briefs directory (`<config-dir>/handoffs`) — disposable briefs,
+/// deliberately OUTSIDE any workspace (no doc rot in repos).
+pub fn handoffs_dir() -> PathBuf {
+    crate::config::config_path()
+        .parent()
+        .map(|p| p.join("handoffs"))
+        .unwrap_or_else(|| PathBuf::from("handoffs"))
+}
+
+/// List handoff briefs, most recent first, with a one-line preview.
+pub fn list_handoffs(dir: &Path) -> Vec<HandoffMeta> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut metas: Vec<(std::time::SystemTime, HandoffMeta)> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let preview = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim_start_matches('#').trim().to_string())
+            })
+            .unwrap_or_else(|| "(empty)".into());
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        metas.push((
+            mtime,
+            HandoffMeta {
+                file_name,
+                path,
+                preview,
+            },
+        ));
+    }
+    metas.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    metas.into_iter().map(|(_, m)| m).collect()
+}
+
+/// Write a DETERMINISTIC emergency handoff brief on a terminal run failure —
+/// no LLM call (the provider may be the very thing that failed, e.g. credits
+/// exhausted). Captures the error, the user's requests, and a pointer to the
+/// saved session so a fresh session can continue deliberately.
+pub fn write_emergency_brief(
+    dir: &Path,
+    session_id: &str,
+    error: &str,
+    history: &[Cell],
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let mut body = String::from("# Emergency handoff (run failed)\n\n");
+    body.push_str(&format!("## Why\nThe run died mid-work: {error}\n\n"));
+    body.push_str("## User requests this session\n");
+    let mut any = false;
+    for c in history {
+        if let Cell::User(t) = c {
+            any = true;
+            body.push_str(&format!("- {}\n", t.lines().next().unwrap_or("")));
+        }
+    }
+    if !any {
+        body.push_str("- (none recorded)\n");
+    }
+    body.push_str(&format!(
+        "\n## Pointers\n- Full session transcript: `{}/{session_id}.json` (use /resume)\n- \
+         Trace: `{}/{session_id}.trace.jsonl`\n\n## Next steps\nResume in a fresh session: \
+         review the last assistant/tool activity in the transcript, verify the working tree \
+         state (`git status`), and continue the most recent user request.\n",
+        sessions_dir().display(),
+        sessions_dir().display(),
+    ));
+    let path = dir.join(format!("emergency-{session_id}.md"));
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
 /// Render a transcript as Markdown (pure) for `/export`.
 pub fn to_markdown(history: &[Cell]) -> String {
     let mut out = String::from("# Heartbit session\n\n");
@@ -161,6 +258,54 @@ mod tests {
                 stats: Box::new(crate::trace_stats::TraceStats::default()),
             },
         ]
+    }
+
+    #[test]
+    fn list_handoffs_newest_first_with_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.md"), "# Purpose: refactor\nbody").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("new.md"), "\n# Purpose: prototype\nbody").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "not a brief").unwrap();
+        let briefs = list_handoffs(dir.path());
+        assert_eq!(briefs.len(), 2, "only .md files list");
+        assert_eq!(briefs[0].file_name, "new.md", "newest first");
+        assert_eq!(briefs[0].preview, "Purpose: prototype");
+    }
+
+    #[test]
+    fn list_handoffs_missing_dir_is_empty() {
+        assert!(list_handoffs(std::path::Path::new("/nonexistent/x")).is_empty());
+    }
+
+    #[test]
+    fn emergency_brief_is_deterministic_and_pointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = vec![
+            Cell::User("add the /health endpoint".into()),
+            Cell::Agent("working on it".into()),
+        ];
+        let path = write_emergency_brief(
+            dir.path(),
+            "sess-42",
+            "API error (402): out of credits",
+            &history,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("402"), "carries the error");
+        assert!(
+            body.contains("add the /health endpoint"),
+            "carries the user requests"
+        );
+        assert!(body.contains("sess-42"), "points at the session artifacts");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("sess-42"),
+            "file named by session"
+        );
     }
 
     #[test]

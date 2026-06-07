@@ -601,6 +601,20 @@ async fn build_engine(
             let _ = ui_tx.send(Msg::Notice(format!("advisor disabled: {e}")));
         }
     }
+    // Session handoff (completion-loop harness P10/P11): purpose-tailored
+    // brief over the same transcript seam — distilled by the "fast" role
+    // (falls back to the main model), written under <config>/handoffs/.
+    match provider_factory("fast") {
+        Ok(fast) => {
+            tools.push(Arc::new(heartbit_core::SessionHandoffTool::new(
+                fast,
+                session::handoffs_dir(),
+            )));
+        }
+        Err(e) => {
+            let _ = ui_tx.send(Msg::Notice(format!("handoff disabled: {e}")));
+        }
+    }
 
     let on_text: Arc<OnText> = {
         let tx = ui_tx.clone();
@@ -1152,6 +1166,66 @@ async fn run_ui(
                 Effect::ListSessions => {
                     let metas = session::list(&session::sessions_dir());
                     let _ = ui_tx.send(Msg::SessionsListed(metas));
+                }
+                Effect::ListHandoffs => {
+                    let briefs = session::list_handoffs(&session::handoffs_dir());
+                    let _ = ui_tx.send(Msg::HandoffsListed(briefs));
+                }
+                Effect::SeedFromHandoff(path) => match std::fs::read_to_string(&path) {
+                    Ok(brief) => {
+                        if agent_started {
+                            // Honest note: an already-running engine keeps its
+                            // context — for a PURE fresh session, pick the brief
+                            // right after starting the TUI.
+                            app.history.push(Cell::Notice(
+                                "seeding into the CURRENT session (restart the TUI and pick \
+                                 the brief at startup for a pure session)"
+                                    .into(),
+                            ));
+                        }
+                        // Inline (NOT a queued Effect::SendInput): an effect
+                        // pushed mid-drain waits for the next key/tick — at
+                        // idle that strands the seed indefinitely.
+                        let text = format!(
+                            "Continue from this handoff brief. Follow its Next steps; use its \
+                             pointers instead of re-deriving context.\n\n{brief}"
+                        );
+                        trace.record_ui(&trace::UiEvent::UserInput { text: text.clone() });
+                        if !agent_started {
+                            agent_epoch += 1;
+                            agent_started = spawn_agent(
+                                app,
+                                &ui_tx,
+                                &input_rx,
+                                &cwd,
+                                &interrupt,
+                                agent_epoch,
+                                &perm_mode,
+                                &trace,
+                                "handoff_seed",
+                            );
+                        }
+                        let _ = input_tx.send(text);
+                    }
+                    Err(e) => app
+                        .history
+                        .push(Cell::Notice(format!("could not read brief: {e}"))),
+                },
+                Effect::EmergencyHandoff(error) => {
+                    match session::write_emergency_brief(
+                        &session::handoffs_dir(),
+                        &session_id,
+                        &error,
+                        &app.history,
+                    ) {
+                        Ok(path) => app.history.push(Cell::Notice(format!(
+                            "emergency handoff brief written: {} (pick it up with /handoff)",
+                            path.display()
+                        ))),
+                        Err(e) => app
+                            .history
+                            .push(Cell::Notice(format!("could not write brief: {e}"))),
+                    }
                 }
                 Effect::ResumeSession(id) => match session::load(&session::sessions_dir(), &id) {
                     Ok(s) => {

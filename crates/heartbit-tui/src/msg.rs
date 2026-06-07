@@ -105,6 +105,8 @@ pub enum Msg {
     LearnFailed(String),
     /// A resumed session's transcript (replaces the current history).
     SessionLoaded(Vec<crate::cells::Cell>),
+    /// Saved handoff briefs (for the `/handoff` picker).
+    HandoffsListed(Vec<crate::session::HandoffMeta>),
 
     // ---- the synchronous approval round-trip ----
     Approval {
