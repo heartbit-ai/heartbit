@@ -356,6 +356,70 @@ struct DelegateTaskTool {
     /// défenses (PII, secret scanner, LLM judge) que l'opérateur avait
     /// configurées au niveau orchestrator.
     guardrails: Vec<Arc<dyn Guardrail>>,
+    /// Orchestration nudge state: the fingerprint of the last same-agent fan-out
+    /// batch refused (refuse-once). An explicit identical retry (same fingerprint)
+    /// is allowed through; a different bad batch re-nudges. Never held across
+    /// `.await` — read+cleared synchronously before dispatch.
+    fanout_refused: std::sync::Mutex<Option<u64>>,
+}
+
+/// Threshold for the same-agent fan-out nudge: delegating this many (or more)
+/// parallel tasks to ONE agent name in a single `delegate_task` call is the
+/// anti-pattern from live finding 6a25eb4d (4× "worker" building one
+/// interdependent artifact). Catches the live 4-pile-up; spares the 2–3-part
+/// parallel work the prompt explicitly encourages. Tunable from GateFired
+/// telemetry (bump to 4 if the trace shows happy-path friction dominating).
+const SAME_AGENT_FANOUT_NUDGE_AT: usize = 3;
+
+/// If any single agent name is the target of `>= threshold` tasks in one batch,
+/// return `(name, count)` — the orchestration nudge's only robust, language- and
+/// format-agnostic signal (it reads the typed `agent` field, not the free-text
+/// `task`, which mid-tier models write in any language with no path syntax).
+/// First-seen order so the reported name is deterministic.
+fn same_agent_fanout(tasks: &[DelegatedTask], threshold: usize) -> Option<(String, usize)> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for t in tasks {
+        *counts.entry(t.agent.as_str()).or_insert(0) += 1;
+    }
+    tasks
+        .iter()
+        .map(|t| t.agent.as_str())
+        .find(|name| counts[name] >= threshold)
+        .map(|name| (name.to_string(), counts[name]))
+}
+
+/// Order-sensitive fingerprint of a delegate batch, so the refuse-once gate can
+/// recognise an EXPLICIT identical retry (the user/agent re-asserting the same
+/// call) and let it through, while a DIFFERENT bad batch re-nudges (not a global
+/// latch — live finding: a session-wide AtomicBool would fire only once ever).
+fn batch_fingerprint(tasks: &[DelegatedTask]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in tasks {
+        t.agent.hash(&mut h);
+        t.task.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Actionable guidance for a refused same-agent fan-out. Names the TWO correct
+/// fixes (do it yourself / one sequential task) and the explicit independent
+/// escape. Deliberately does NOT suggest form_squad or distinct agents — the
+/// design panel proved both reproduce the failure (isolated agents still race;
+/// the squad blackboard shares text, not the filesystem).
+fn fanout_guidance(agent: &str, count: usize) -> String {
+    format!(
+        "You delegated {count} parallel tasks to the SAME agent '{agent}'. delegate_task \
+         runs them as ISOLATED parallel agents — none can see another's files or output. \
+         If these tasks are INTERDEPENDENT (they build one artifact, or one needs another's \
+         result — e.g. a manifest needs the directory to exist, modules need the crate), \
+         isolated parallel agents will race and thrash. Do ONE of these instead: (1) build \
+         this set YOURSELF, in order, with your own write/edit/bash tools; or (2) send it as \
+         a SINGLE delegate_task to ONE agent, describing every step in order, so one agent \
+         does them sequentially in one workspace. If these {count} tasks are genuinely \
+         INDEPENDENT (e.g. each reads a different file), re-issue the SAME call unchanged and \
+         it will run."
+    )
 }
 
 impl DelegateTaskTool {
@@ -731,6 +795,55 @@ impl Tool for DelegateTaskTool {
         Box::pin(async move {
             let delegate_input: DelegateInput = serde_json::from_value(input)
                 .map_err(|e| Error::Agent(format!("Invalid delegate_task input: {e}")))?;
+
+            // Orchestration nudge (live finding 6a25eb4d): a same-agent parallel
+            // fan-out (N tasks to ONE isolated agent) is the interdependent-work
+            // anti-pattern. Refuse it ONCE with actionable guidance; an explicit
+            // identical retry dispatches. This is a NUDGE, not a guaranteed
+            // prevention — we can't tell interdependent from independent on this
+            // topology — so both the refusal AND the retry-through are traced
+            // (GateFired) to make prevent-vs-nudge empirical.
+            if let Some((agent, count)) =
+                same_agent_fanout(&delegate_input.tasks, SAME_AGENT_FANOUT_NUDGE_AT)
+            {
+                let fp = batch_fingerprint(&delegate_input.tasks);
+                let is_retry = {
+                    let mut last = self
+                        .fanout_refused
+                        .lock()
+                        .expect("fanout_refused lock poisoned");
+                    if *last == Some(fp) {
+                        *last = None; // explicit retry consumes the one-shot
+                        true
+                    } else {
+                        *last = Some(fp);
+                        false
+                    }
+                };
+                if is_retry {
+                    if let Some(cb) = &self.on_event {
+                        cb(AgentEvent::GateFired {
+                            agent: "orchestrator".into(),
+                            gate: "same_agent_fanout_dispatched".into(),
+                            reason: format!(
+                                "{count} parallel tasks to '{agent}' dispatched after nudge \
+                                 (retry-through)"
+                            ),
+                        });
+                    }
+                } else {
+                    if let Some(cb) = &self.on_event {
+                        cb(AgentEvent::GateFired {
+                            agent: "orchestrator".into(),
+                            gate: "same_agent_fanout".into(),
+                            reason: format!(
+                                "{count} parallel tasks delegated to the same agent '{agent}'"
+                            ),
+                        });
+                    }
+                    return Ok(ToolOutput::error(fanout_guidance(&agent, count)));
+                }
+            }
 
             let result = self.delegate(delegate_input.tasks).await?;
             Ok(ToolOutput::success(result))
@@ -1755,8 +1868,12 @@ pub fn build_entry_agent_prompt_ext(
            spans MULTIPLE files/areas/components; it has several independent parts; or it is a \
            broad request (implement a feature, add+wire+test something, review/audit/refactor \
            across the codebase, investigate-then-change). Break it into self-contained tasks and \
-           {delegation_line} Independent parts run in parallel, each agent stays \
-           focused.{workflow_decision_line}\n{clarify_block}{discipline}\n\
+           {delegation_line} Parallel delegation is ONLY for tasks with NO shared write target AND \
+           where no task needs another's output — delegated agents run ISOLATED and cannot see \
+           each other's files. INTERDEPENDENT or shared-output work (e.g. building one project: \
+           the manifest needs the directory, modules need the crate) must be done by YOU directly \
+           or as ONE sequential task — never fanned out to N parallel same-agent tasks (they race \
+           and thrash).{workflow_decision_line}\n{clarify_block}{discipline}\n\
          ## Principles\n\
          - Trivial → answer. Small & focused → do it yourself. Substantive or multi-part → \
            DELEGATE. Do NOT grind through a large multi-part task entirely yourself when \
@@ -1818,6 +1935,10 @@ pub fn build_delegate_tool_schema(
             format!(
                 "Delegate independent tasks to sub-agents for parallel execution. \
                  Each task runs in isolation — agents cannot see each other's work. \
+                 ONLY for tasks with NO shared write target and NO cross-task dependency: \
+                 do NOT split ONE artifact (e.g. files under a shared directory, or steps where \
+                 one needs another's output) across parallel tasks — build interdependent work \
+                 as a SINGLE task or do it yourself. \
                  Write clear, self-contained task descriptions with all necessary context. \
                  Available agents: {}",
                 serde_json::to_string(&agent_descriptions)
@@ -2749,6 +2870,7 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             allow_shared_write: self.allow_shared_write,
             tenant_tracker: self.tenant_tracker.clone(),
             guardrails: self.guardrails.clone(),
+            fanout_refused: std::sync::Mutex::new(None),
         });
 
         let mut runner_builder = AgentRunner::builder(self.provider)
@@ -3397,6 +3519,7 @@ mod tests {
             allow_shared_write: true,
             tenant_tracker: None,
             guardrails: vec![],
+            fanout_refused: std::sync::Mutex::new(None),
         };
 
         let def = tool.definition();
@@ -4334,6 +4457,171 @@ mod tests {
             !got.contains("SUBAGENT_SECRET"),
             "a delegated sub-agent's text must NOT reach on_text — it crisscrosses \
              with other parallel sub-agents (got: {got:?})"
+        );
+    }
+
+    fn dtask(agent: &str, task: &str) -> DelegatedTask {
+        DelegatedTask {
+            agent: agent.into(),
+            task: task.into(),
+        }
+    }
+
+    #[test]
+    fn same_agent_fanout_fires_on_pile_up_only() {
+        // The live failure (6a25eb4d): 4 parallel tasks ALL to "worker" building one
+        // interdependent artifact. The ONLY robust, language-agnostic signal on this
+        // topology (sub-agents share identical tools; mid-tier task text is French /
+        // slash-free) is the structural same-agent count off the typed `agent` field.
+        let four_workers = vec![
+            dtask("worker", "create the dir structure in /tmp/crm_project"),
+            dtask("worker", "create Cargo.toml"),
+            dtask("worker", "create src/models.rs"),
+            dtask("worker", "create src/config.rs"),
+        ];
+        assert_eq!(
+            same_agent_fanout(&four_workers, SAME_AGENT_FANOUT_NUDGE_AT),
+            Some(("worker".to_string(), 4))
+        );
+        // Exactly at threshold (3) fires.
+        assert_eq!(
+            same_agent_fanout(&four_workers[..3], SAME_AGENT_FANOUT_NUDGE_AT),
+            Some(("worker".to_string(), 3))
+        );
+        // Below threshold (2 same-agent) does NOT fire — small parallel splits are fine.
+        assert_eq!(
+            same_agent_fanout(&four_workers[..2], SAME_AGENT_FANOUT_NUDGE_AT),
+            None
+        );
+        // A normal multi-distinct-agent squad shape does NOT fire.
+        assert_eq!(
+            same_agent_fanout(
+                &[
+                    dtask("worker", "build X"),
+                    dtask("researcher", "investigate Y")
+                ],
+                SAME_AGENT_FANOUT_NUDGE_AT
+            ),
+            None
+        );
+        // Mixed batch where ONE name still piles up fires on that name.
+        assert_eq!(
+            same_agent_fanout(
+                &[
+                    dtask("worker", "a"),
+                    dtask("worker", "b"),
+                    dtask("worker", "c"),
+                    dtask("researcher", "d"),
+                ],
+                SAME_AGENT_FANOUT_NUDGE_AT
+            ),
+            Some(("worker".to_string(), 3))
+        );
+        // 2+2 split across two agents: no single name reaches the threshold → no fire
+        // (a known gap, accepted — the live anti-pattern is same-agent pile-up).
+        assert_eq!(
+            same_agent_fanout(
+                &[
+                    dtask("worker", "a"),
+                    dtask("worker", "b"),
+                    dtask("researcher", "c"),
+                    dtask("researcher", "d"),
+                ],
+                SAME_AGENT_FANOUT_NUDGE_AT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_fingerprint_is_stable_and_discriminating() {
+        let a = vec![dtask("worker", "alpha"), dtask("worker", "beta")];
+        let a2 = vec![dtask("worker", "alpha"), dtask("worker", "beta")];
+        let b = vec![dtask("worker", "alpha"), dtask("worker", "GAMMA")];
+        // Identical batch → identical fingerprint (so an explicit retry is recognized).
+        assert_eq!(batch_fingerprint(&a), batch_fingerprint(&a2));
+        // Any change in agent/task → different fingerprint (a different bad batch
+        // re-nudges, it is not silently latched through).
+        assert_ne!(batch_fingerprint(&a), batch_fingerprint(&b));
+    }
+
+    /// The orchestration nudge end-to-end: a same-agent pile-up is REFUSED ONCE
+    /// (not dispatched, GateFired emitted), and the EXPLICIT identical retry
+    /// dispatches — with a distinct `_dispatched` event so retry-through is
+    /// measurable (advisor: prevent-vs-nudge must be empirical, not assumed).
+    #[tokio::test]
+    async fn same_agent_fanout_refused_once_then_dispatches_on_retry() {
+        use crate::agent::events::AgentEvent;
+
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let ev = events.clone();
+
+        let fanout = json!({"tasks": [
+            {"agent": "worker", "task": "create /tmp/p/a.rs"},
+            {"agent": "worker", "task": "create /tmp/p/b.rs"},
+            {"agent": "worker", "task": "create /tmp/p/c.rs"}
+        ]});
+        let delegate = |input: serde_json::Value| CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "delegate_task".into(),
+                input,
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        let text = |t: &str| CompletionResponse {
+            content: vec![ContentBlock::Text { text: t.into() }],
+            stop_reason: StopReason::EndTurn,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+
+        let provider = Arc::new(MockProvider::new(vec![
+            delegate(fanout.clone()), // turn 1: pile-up → REFUSED (no dispatch)
+            delegate(fanout.clone()), // turn 2: identical retry → DISPATCHES
+            text("done a"),           // 3 workers on the retry…
+            text("done b"),
+            text("done c"),
+            text("synthesis"), // orchestrator final
+        ]));
+
+        let mut orch = Orchestrator::builder(provider)
+            .sub_agent("worker", "General implementation agent", "prompt")
+            .on_event(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .build()
+            .unwrap();
+
+        orch.run("build a small project").await.unwrap();
+
+        let events = events.lock().unwrap();
+        let gate_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::GateFired { gate, .. } => Some(gate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gate_ids.contains(&"same_agent_fanout"),
+            "the pile-up must be refused once with a GateFired nudge: {gate_ids:?}"
+        );
+        assert!(
+            gate_ids.contains(&"same_agent_fanout_dispatched"),
+            "the explicit retry must dispatch AND record retry-through: {gate_ids:?}"
+        );
+        // The sub-agents ran exactly once — on the retry, not the refused attempt.
+        let dispatched = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::SubAgentsDispatched { .. }))
+            .count();
+        assert_eq!(
+            dispatched, 1,
+            "first attempt refused (0 dispatch), retry dispatched (1) → exactly 1"
         );
     }
 

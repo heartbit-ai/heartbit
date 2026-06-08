@@ -182,7 +182,8 @@ pub enum AgentEvent {
         agent: String,
         /// Gate identifier ("plan_gate", "ask_gate", "act_gate",
         /// "mode_contract", "study_contract", "repair_hint", "deps_hint",
-        /// "escalation", "delegation_nudge").
+        /// "escalation", "delegation_nudge", "same_agent_fanout",
+        /// "same_agent_fanout_dispatched").
         gate: String,
         /// Short reason / context (e.g. the failure class, the routed mode).
         reason: String,
