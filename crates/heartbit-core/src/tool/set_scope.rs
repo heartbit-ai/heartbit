@@ -19,13 +19,17 @@ use crate::tool::{Tool, ToolOutput};
 /// Declare/replace the working scope enforced by the shared [`ScopeGuard`].
 pub struct SetScopeTool {
     guard: Arc<ScopeGuard>,
-    /// The host workspace root: a scope that was entirely OUTSIDE it must not
-    /// silently move back INSIDE (live finding 6a25947c: scoped /tmp as
-    /// requested, then re-scoped into the host repo twice, leaving junk).
+    /// The host workspace root. A scope root OUTSIDE it is futile: the file
+    /// tools reject any write outside the workspace regardless of scope (live
+    /// finding 6a265efd — models scoped /tmp for "a temporary directory", every
+    /// write was rejected, then they thrashed into the repo via a symlink and
+    /// stray dirs). The first outside scope is refused with a redirect to an
+    /// in-workspace scratch subdir; relocating INTO the workspace is the correct
+    /// course-correction, never refused.
     workspace: Option<std::path::PathBuf>,
-    /// One-shot: the first outside→inside transition is refused with
-    /// guidance; an explicit retry passes (bounded friction).
-    inside_warned: std::sync::atomic::AtomicBool,
+    /// One-shot: the first scope declaring an OUTSIDE root is refused with the
+    /// scratch redirect; an explicit retry passes (e.g. read-only / bash use).
+    outside_warned: std::sync::atomic::AtomicBool,
 }
 
 impl SetScopeTool {
@@ -34,12 +38,11 @@ impl SetScopeTool {
         Self {
             guard,
             workspace: None,
-            inside_warned: std::sync::atomic::AtomicBool::new(false),
+            outside_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Set the host workspace root enabling the outside→inside transition
-    /// check.
+    /// Set the host workspace root enabling the outside-scope redirect.
     pub fn with_workspace(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.workspace = Some(root.into());
         self
@@ -101,28 +104,30 @@ impl Tool for SetScopeTool {
                 })
                 .collect();
             let n = roots.len();
-            // Outside→inside transition check: a task deliberately scoped
-            // OUTSIDE the host workspace (e.g. "a temporary directory") must
-            // not silently relocate INTO it. First attempt is refused with
-            // guidance; an explicit retry passes (deliberate, visible).
+            // Outside-scope redirect: declaring a scope root OUTSIDE the host
+            // workspace is futile — the file tools reject any write outside the
+            // workspace regardless of scope. The first such scope is refused with
+            // a redirect to an in-workspace scratch subdir; an explicit retry
+            // passes (e.g. read-only or bash-only use). Relocating INTO the
+            // workspace is the correct course-correction and is never refused
+            // (live finding 6a265efd: the old outside→inside refusal told the
+            // agent to "keep building in /tmp" — impossible — so it symlinked and
+            // littered the repo).
             if let Some(ws) = &self.workspace {
-                let current = self.guard.roots();
-                let current_all_outside =
-                    !current.is_empty() && current.iter().all(|r| !r.starts_with(ws));
-                let new_some_inside = roots.iter().any(|r| r.starts_with(ws));
-                if current_all_outside
-                    && new_some_inside
+                let outside: Vec<&PathBuf> = roots.iter().filter(|r| !r.starts_with(ws)).collect();
+                if !outside.is_empty()
                     && !self
-                        .inside_warned
+                        .outside_warned
                         .swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
                     return Ok(ToolOutput::error(format!(
-                        "scope was deliberately OUTSIDE this workspace ({}) — moving it \
-                         INSIDE ({}) contradicts that (a 'temporary directory' stays \
-                         outside the repository). Keep building in the current scope, or \
-                         if relocating is genuinely needed, ask the user with the \
-                         `question` tool first, then call set_scope again.",
-                        current
+                        "scope root(s) {} are OUTSIDE this workspace ({}) — the file tools can \
+                         only write INSIDE it, so an outside scope cannot be acted on. For \
+                         temporary or scratch work, scope a SUBDIRECTORY inside the workspace \
+                         instead (e.g. ./scratch-<name>), kept gitignored so it stays \
+                         disposable. Re-issue unchanged to override (e.g. read-only or \
+                         bash-only use).",
+                        outside
                             .iter()
                             .map(|p| p.display().to_string())
                             .collect::<Vec<_>>()
@@ -255,14 +260,14 @@ mod tests {
         assert!(!out.is_error);
         let roots = guard.roots();
         assert_eq!(roots, vec![PathBuf::from("/repo/scratch-crm")]);
-        // An absolute root is kept verbatim.
+        // An absolute root INSIDE the workspace is kept verbatim.
         tool.execute(
             &crate::ExecutionContext::default(),
-            json!({"paths": ["/tmp/elsewhere"]}),
+            json!({"paths": ["/repo/elsewhere"]}),
         )
         .await
         .unwrap();
-        assert_eq!(guard.roots(), vec![PathBuf::from("/tmp/elsewhere")]);
+        assert_eq!(guard.roots(), vec![PathBuf::from("/repo/elsewhere")]);
     }
 
     #[test]
@@ -272,47 +277,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outside_to_inside_workspace_rescope_is_refused_once() {
-        // Live finding 6a25947c: scoped /tmp (as requested), then re-scoped
-        // INTO the host repo ("temporaire à l'intérieur du workspace") and
-        // littered it. The first such transition is refused with guidance;
-        // an explicit retry passes (deliberate).
+    async fn outside_scope_is_refused_once_with_scratch_redirect() {
+        // Live finding 6a265efd: models scoped /tmp for "a temporary directory",
+        // but the file tools reject every write outside the workspace, so the
+        // outside scope is futile. It is refused with a redirect to an
+        // in-workspace scratch subdir; relocating INTO the workspace is the
+        // correct course-correction and is NEVER refused (the old guard refused
+        // it, telling the agent to "keep building in /tmp" — impossible — so it
+        // symlinked and littered the repo).
         let guard = Arc::new(ScopeGuard::new(vec![]));
         let tool = SetScopeTool::new(guard.clone()).with_workspace("/repo");
-        tool.execute(
-            &crate::ExecutionContext::default(),
-            json!({"paths": ["/tmp/proj"]}),
-        )
-        .await
-        .unwrap();
+        // An OUTSIDE scope is refused with the scratch redirect, and NOT applied.
         let out = tool
             .execute(
                 &crate::ExecutionContext::default(),
-                json!({"paths": ["/repo/crm_temp"]}),
+                json!({"paths": ["/tmp/proj"]}),
             )
             .await
             .unwrap();
-        assert!(out.is_error, "first outside→inside move must be refused");
+        assert!(out.is_error, "an outside scope must be refused");
         assert!(out.content.contains("OUTSIDE this workspace"));
-        // The guard still holds the OUTSIDE scope.
-        let roots = guard.roots();
-        assert_eq!(roots.len(), 1);
-        assert!(roots[0].to_string_lossy().contains("/tmp/proj"));
-        // A deliberate retry passes (one-shot friction).
-        let out2 = tool
+        assert!(
+            out.content.contains("scratch"),
+            "must redirect to an in-workspace scratch subdir: {}",
+            out.content
+        );
+        assert!(
+            guard.roots().is_empty(),
+            "the futile outside scope must NOT be applied"
+        );
+        // Relocating INTO the workspace is the correct move — never refused.
+        let inside = tool
             .execute(
                 &crate::ExecutionContext::default(),
-                json!({"paths": ["/repo/crm_temp"]}),
+                json!({"paths": ["/repo/scratch-crm"]}),
             )
             .await
             .unwrap();
-        assert!(!out2.is_error, "the explicit retry is allowed");
+        assert!(!inside.is_error, "an in-workspace scope is always allowed");
+        assert_eq!(guard.roots(), vec![PathBuf::from("/repo/scratch-crm")]);
+        // The one-shot is consumed: an explicit retry of an outside scope passes
+        // (e.g. read-only / bash-only use).
+        let retry = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"paths": ["/tmp/proj"]}),
+            )
+            .await
+            .unwrap();
+        assert!(!retry.is_error, "the explicit retry overrides the redirect");
     }
 
     #[tokio::test]
     async fn inside_workspace_rescope_is_normal() {
         // Normal repo work (scope inside the workspace from the start) is
-        // never bothered by the transition check.
+        // never bothered by the outside-scope redirect.
         let guard = Arc::new(ScopeGuard::new(vec![]));
         let tool = SetScopeTool::new(guard).with_workspace("/repo");
         tool.execute(

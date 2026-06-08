@@ -1833,10 +1833,12 @@ pub fn build_entry_agent_prompt_ext(
         discipline.push_str(
             "\n- **Declare your blast radius.** Before substantive edits, declare the \
              files/directories you intend to modify with `set_scope`; edits outside it are \
-             denied. The scope must HONOR every location constraint in the request (e.g. \
-             'a temporary directory' means a fresh dir under /tmp, never inside the current \
-             repository). Widen the scope EXPLICITLY (set_scope again) when genuinely \
-             needed — never drift into unrelated files.\n",
+             denied. The file tools can ONLY write INSIDE the workspace, so 'a temporary \
+             directory' means a fresh scratch SUBDIRECTORY inside the workspace (e.g. \
+             ./scratch-<name>) — NOT /tmp or your home directory (those are rejected), and \
+             NOT scattered among tracked files. Keep it gitignored so it stays disposable. \
+             Widen the scope EXPLICITLY (set_scope again) when genuinely needed — never \
+             drift into unrelated files.\n",
         );
     }
     let clarify_block = if caps.ask_user {
@@ -1849,9 +1851,10 @@ pub fn build_entry_agent_prompt_ext(
          explicitly (as todos when planning). Never ask about what you can discover yourself \
          from the code. NEVER re-ask anything the user ALREADY specified in the request (a \
          location like 'temporary directory', a language, a scope) — honor it, don't \
-         re-litigate it. Every option you offer MUST respect every stated constraint: never \
-         present a choice that contradicts the request (e.g. don't offer 'in the repository' \
-         when a temporary directory was asked for).\n"
+         re-litigate it. Resolve a constraint to where the file tools can actually act: 'a \
+         temporary directory' is honored by a fresh gitignored scratch subdirectory INSIDE \
+         the workspace (e.g. ./scratch-<name>), since paths outside the workspace are \
+         rejected — state that assumption and proceed, don't ask.\n"
     } else {
         ""
     };
@@ -5208,10 +5211,13 @@ mod tests {
             low.contains("never re-ask anything the user already specified"),
             "must forbid re-asking specified facts: {p}"
         );
+        // A constraint is honored by RESOLVING it to where the file tools can
+        // act — e.g. 'a temporary directory' → an in-workspace scratch subdir —
+        // not re-litigated and not taken to an unwritable location (/tmp).
         assert!(
-            low.contains("respect every stated constraint")
-                && low.contains("contradicts the request"),
-            "options must honor constraints: {p}"
+            low.contains("resolve a constraint")
+                && low.contains("scratch subdirectory inside the workspace"),
+            "constraints must be resolved to where the file tools can act: {p}"
         );
     }
 

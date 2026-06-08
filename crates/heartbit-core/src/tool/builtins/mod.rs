@@ -259,8 +259,10 @@ pub(crate) fn resolve_path(
             let normalized = crate::workspace::normalize_path(&candidate);
             if !normalized.starts_with(ws) {
                 return Err(format!(
-                    "Path '{path}' escapes the workspace root ({}). \
-                     Use a path inside the workspace.",
+                    "Path '{path}' escapes the workspace root ({}). The file tools can only \
+                     access paths INSIDE the workspace. Use a path inside it; for temporary \
+                     or scratch work, create a subdirectory like ./scratch — that is your \
+                     temporary directory (keep it out of tracked files).",
                     ws.display()
                 ));
             }
@@ -268,7 +270,9 @@ pub(crate) fn resolve_path(
                 && !canonical.starts_with(ws)
             {
                 return Err(format!(
-                    "Path '{path}' resolves to {} which is outside the workspace.",
+                    "Path '{path}' resolves to {} which is outside the workspace. Use a path \
+                     inside the workspace; for temporary/scratch work, a subdirectory like \
+                     ./scratch is your temporary directory.",
                     canonical.display()
                 ));
             }
@@ -650,6 +654,23 @@ mod tests {
         let result = resolve_path("/etc/passwd", Some(&ws), &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("escapes the workspace"));
+    }
+
+    #[test]
+    fn resolve_path_rejection_redirects_to_in_workspace_scratch() {
+        // Live finding 6a265efd: models follow "a temporary directory" → /tmp,
+        // the jail rejects it, and (trace seq 38→43) they REACT to the rejection
+        // by relocating — but with no destination they pick wrong (repo root,
+        // a symlink, tmp_crm_project…). The rejection must carry the destination:
+        // a scratch subdirectory INSIDE the workspace.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let err = resolve_path("/tmp/crm-project/main.rs", Some(&ws), &[]).unwrap_err();
+        assert!(
+            err.contains("scratch"),
+            "the outside-workspace rejection must name an in-workspace scratch \
+             destination, not just refuse: {err}"
+        );
     }
 
     #[test]
