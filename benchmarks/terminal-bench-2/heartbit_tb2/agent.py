@@ -33,6 +33,7 @@ from harbor.models.agent.context import AgentContext
 
 from .heartbit_io import (
     build_heartbit_env,
+    is_static_musl,
     parse_stderr_tokens,
     parse_trace_tokens,
 )
@@ -53,8 +54,15 @@ RUNTIME_APT = "ca-certificates libssl3 libcurl4 zlib1g"
 
 # Host-side artefacts, resolved relative to the repo root (…/benchmarks/terminal-bench-2/heartbit_tb2/agent.py).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_PREBUILT_BIN = _REPO_ROOT / "target" / "release" / "heartbit"
+_MUSL_BIN = _REPO_ROOT / "target" / "x86_64-unknown-linux-musl" / "release" / "heartbit"
+_GLIBC_BIN = _REPO_ROOT / "target" / "release" / "heartbit"
 _DEFAULT_SRC_BUNDLE = _REPO_ROOT / "benchmarks" / "terminal-bench-2" / "dist" / "heartbit-src.tar.gz"
+
+
+def _default_prebuilt_bin() -> Path:
+    """Prefer the slim static musl binary (portable to any container) over the
+    glibc one, so `prebuilt` mode is portable by default once build_musl.sh ran."""
+    return _MUSL_BIN if _MUSL_BIN.is_file() else _GLIBC_BIN
 
 
 class HeartbitAgent(BaseInstalledAgent):
@@ -77,18 +85,23 @@ class HeartbitAgent(BaseInstalledAgent):
             await self._install_build(environment)
 
     async def _install_prebuilt(self, environment: BaseEnvironment) -> None:
-        bin_path = Path(os.environ.get("HEARTBIT_BIN", str(_DEFAULT_PREBUILT_BIN)))
+        bin_path = Path(os.environ.get("HEARTBIT_BIN", str(_default_prebuilt_bin())))
         if not bin_path.is_file():
             raise FileNotFoundError(
                 f"prebuilt heartbit binary not found at {bin_path}. Build it first "
-                f"(benchmarks/terminal-bench-2/scripts/build_prebuilt.sh) or set HEARTBIT_BIN."
+                f"(scripts/build_musl.sh for a portable static binary, or "
+                f"scripts/build_prebuilt.sh for a glibc one) or set HEARTBIT_BIN."
             )
-        # Runtime libs first (best-effort: a non-apt base must ship them already).
-        await self.exec_as_root(
-            environment,
-            command=f"apt-get update && apt-get install -y {RUNTIME_APT} || true",
-            timeout_sec=600,
-        )
+        # A static musl binary (build_musl.sh) needs NO runtime libs and no CA
+        # store (rustls + webpki-roots). A glibc binary needs libssl/libcurl/zlib
+        # + ca-certificates — installed best-effort (a non-apt base must already
+        # ship them). Detect the static case to skip the pointless apt step.
+        if not is_static_musl(str(bin_path), os.environ.get("HEARTBIT_BIN_STATIC")):
+            await self.exec_as_root(
+                environment,
+                command=f"apt-get update && apt-get install -y {RUNTIME_APT} || true",
+                timeout_sec=600,
+            )
         await environment.upload_file(source_path=bin_path, target_path=CONTAINER_BIN)
         await self.exec_as_root(environment, command=f"chmod +x {CONTAINER_BIN}")
 

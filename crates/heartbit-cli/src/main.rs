@@ -1,8 +1,15 @@
+#[cfg(feature = "daemon")]
 mod daemon;
+#[cfg(feature = "persona")]
 mod persona;
+#[cfg(feature = "persona")]
 mod persona_review;
+#[cfg(feature = "restate")]
 mod serve;
+#[cfg(feature = "restate")]
 mod submit;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +19,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "postgres")]
+use heartbit::PostgresMemoryStore;
 use heartbit::tool::Tool;
 use heartbit::{
     A2aClient, AgentEvent, AgentOutput, AgentRunner, AnthropicProvider, Blackboard, BoxedProvider,
@@ -19,9 +28,9 @@ use heartbit::{
     ContextStrategyConfig, HeartbitConfig, HeuristicGate, InMemoryBlackboard,
     InMemoryKnowledgeBase, InMemoryStore, KnowledgeBase, KnowledgeSourceConfig, McpClient,
     McpServerEntry, Memory, MemoryConfig, MemoryQuery, NamespacedMemory, ObservabilityMode,
-    OnApproval, OnEvent, OnQuestion, OnRetry, OnText, Orchestrator, PostgresMemoryStore,
-    QuestionRequest, QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, TenantScope,
-    ToolCall, Workspace, builtin_tools,
+    OnApproval, OnEvent, OnQuestion, OnRetry, OnText, Orchestrator, QuestionRequest,
+    QuestionResponse, RetryConfig, RetryingProvider, SubAgentConfig, TenantScope, ToolCall,
+    Workspace, builtin_tools,
 };
 
 #[derive(Parser)]
@@ -63,12 +72,14 @@ enum Commands {
         trace_file: Option<PathBuf>,
     },
     /// Start the Restate-compatible HTTP worker
+    #[cfg(feature = "restate")]
     Serve {
         /// Address to bind the worker
         #[arg(long, default_value = "0.0.0.0:9080")]
         bind: String,
     },
     /// Submit a task to Restate for durable execution
+    #[cfg(feature = "restate")]
     Submit {
         /// The task to execute
         #[arg(trailing_var_arg = true)]
@@ -83,6 +94,7 @@ enum Commands {
         restate_url: Option<String>,
     },
     /// Query workflow status
+    #[cfg(feature = "restate")]
     Status {
         /// Workflow ID to check
         workflow_id: String,
@@ -93,6 +105,7 @@ enum Commands {
     },
     /// Send human approval signal to a child agent workflow.
     /// Use 'heartbit status <orchestrator-id>' to find child workflow IDs.
+    #[cfg(feature = "restate")]
     Approve {
         /// Child agent workflow ID to approve (from 'status' output)
         workflow_id: String,
@@ -102,6 +115,7 @@ enum Commands {
         restate_url: Option<String>,
     },
     /// Get the result of a completed workflow
+    #[cfg(feature = "restate")]
     Result {
         /// Workflow ID to get results from
         workflow_id: String,
@@ -120,6 +134,7 @@ enum Commands {
         verbose: bool,
     },
     /// Run the daemon: long-running Kafka-backed task execution with HTTP API
+    #[cfg(feature = "daemon")]
     Daemon {
         /// Address to bind the HTTP API (overrides config)
         #[arg(long)]
@@ -132,6 +147,7 @@ enum Commands {
         validate_config: bool,
     },
     /// Manage personas (list, run, configure, audit).
+    #[cfg(feature = "persona")]
     Persona {
         #[command(subcommand)]
         sub: persona::PersonaCommand,
@@ -178,9 +194,11 @@ enum SkillAction {
     },
 }
 
+#[cfg(feature = "restate")]
 const DEFAULT_RESTATE_URL: &str = "http://localhost:8080";
 
 /// Resolve restate URL: CLI flag → config file → default.
+#[cfg(feature = "restate")]
 fn resolve_restate_url(cli_url: Option<String>, config_path: Option<&std::path::Path>) -> String {
     if let Some(url) = cli_url {
         return url;
@@ -238,11 +256,23 @@ fn init_tracing() {
 /// Initialize tracing from config: OTel-aware if `[telemetry]` is set, simple fmt otherwise.
 pub(crate) fn init_tracing_from_config(config: &HeartbitConfig) -> Result<()> {
     if let Some(telemetry) = &config.telemetry {
-        serve::setup_telemetry(&telemetry.otlp_endpoint, &telemetry.service_name)?;
-        tracing::info!(
-            "OpenTelemetry configured, exporting to {}",
-            telemetry.otlp_endpoint
-        );
+        #[cfg(feature = "telemetry")]
+        {
+            telemetry::setup_telemetry(&telemetry.otlp_endpoint, &telemetry.service_name)?;
+            tracing::info!(
+                "OpenTelemetry configured, exporting to {}",
+                telemetry.otlp_endpoint
+            );
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = &telemetry.otlp_endpoint;
+            init_tracing();
+            tracing::warn!(
+                "[telemetry] configured but this binary was built without the \
+                 'telemetry' feature; falling back to plain tracing"
+            );
+        }
     } else {
         init_tracing();
     }
@@ -367,6 +397,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        #[cfg(feature = "restate")]
         Some(Commands::Serve { bind }) => {
             // serve::run_worker handles its own tracing init (with optional OTel)
             let config_path = cli
@@ -375,6 +406,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| std::path::Path::new("heartbit.toml"));
             serve::run_worker(config_path, &bind).await
         }
+        #[cfg(feature = "restate")]
         Some(Commands::Submit {
             task,
             approve,
@@ -392,6 +424,7 @@ async fn main() -> Result<()> {
             let url = resolve_restate_url(restate_url, Some(config_path));
             submit::submit_task(config_path, &task_str, &url, approve).await
         }
+        #[cfg(feature = "restate")]
         Some(Commands::Status {
             workflow_id,
             restate_url,
@@ -400,6 +433,7 @@ async fn main() -> Result<()> {
             let url = resolve_restate_url(restate_url, cli.config.as_deref());
             submit::query_status(&workflow_id, &url).await
         }
+        #[cfg(feature = "restate")]
         Some(Commands::Approve {
             workflow_id,
             restate_url,
@@ -408,6 +442,7 @@ async fn main() -> Result<()> {
             let url = resolve_restate_url(restate_url, cli.config.as_deref());
             submit::send_approval(&workflow_id, &url).await
         }
+        #[cfg(feature = "restate")]
         Some(Commands::Result {
             workflow_id,
             restate_url,
@@ -425,6 +460,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        #[cfg(feature = "daemon")]
         Some(Commands::Daemon {
             bind,
             verbose,
@@ -446,6 +482,7 @@ async fn main() -> Result<()> {
                 .await
             }
         }
+        #[cfg(feature = "persona")]
         Some(Commands::Persona { sub }) => persona::run(sub).await,
         Some(Commands::Templates { action }) => run_template_command(action),
         Some(Commands::Skills { action }) => run_skill_command(action),
@@ -1038,6 +1075,8 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn story_id(mut self, v: Option<&'a str>) -> Self {
         self.story_id = v;
         self
@@ -1049,6 +1088,8 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn external_memory(mut self, v: Option<Arc<dyn Memory>>) -> Self {
         self.external_memory = v;
         self
@@ -1059,6 +1100,8 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn pre_loaded_tools(
         mut self,
         v: Option<&'a HashMap<String, Vec<Arc<dyn Tool>>>>,
@@ -1073,11 +1116,15 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn guardrails(mut self, v: Vec<Arc<dyn heartbit::Guardrail>>) -> Self {
         self.guardrails = v;
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn memory_confidentiality_cap(
         mut self,
         v: Option<heartbit::Confidentiality>,
@@ -1095,16 +1142,22 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn audit_user_id(mut self, v: Option<&'a str>) -> Self {
         self.audit_user_id = v;
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn audit_tenant_id(mut self, v: Option<&'a str>) -> Self {
         self.audit_tenant_id = v;
         self
     }
 
+    // Daemon-only: callers live behind the `daemon` feature.
+    #[allow(dead_code)]
     pub(crate) fn allow_shared_write(mut self, v: bool) -> Self {
         self.allow_shared_write = v;
         self
@@ -2108,57 +2161,70 @@ pub(crate) async fn create_memory_store(config: &MemoryConfig) -> Result<Arc<dyn
             database_url,
             embedding,
         } => {
-            let mut store = PostgresMemoryStore::connect(database_url)
-                .await
-                .context("failed to connect to PostgreSQL for memory store")?;
-            store
-                .run_migration()
-                .await
-                .context("failed to run memory store migration")?;
-            let memory: Arc<dyn Memory> = Arc::new(store);
-
-            // Wrap with EmbeddingMemory if embedding provider is configured
-            if let Some(emb_config) = embedding
-                && emb_config.provider != "none"
+            #[cfg(not(feature = "postgres"))]
             {
-                if emb_config.provider == "local" {
-                    #[cfg(feature = "local-embedding")]
-                    {
-                        // Treat the OpenAI default model as "unset" for local provider
-                        let model_name = if emb_config.model == "text-embedding-3-small" {
-                            None
-                        } else {
-                            Some(emb_config.model.as_str())
-                        };
-                        let provider = heartbit::LocalEmbeddingProvider::new(
-                            model_name,
-                            emb_config.cache_dir.as_deref().map(std::path::Path::new),
-                        )?;
+                let _ = (database_url, embedding);
+                bail!(
+                    "PostgreSQL memory store requires the 'postgres' feature; \
+                     this binary was built without it (slim build). Rebuild with \
+                     --features postgres (or full) to use a postgres:// memory URL."
+                );
+            }
+            #[cfg(feature = "postgres")]
+            {
+                let mut store = PostgresMemoryStore::connect(database_url)
+                    .await
+                    .context("failed to connect to PostgreSQL for memory store")?;
+                store
+                    .run_migration()
+                    .await
+                    .context("failed to run memory store migration")?;
+                let memory: Arc<dyn Memory> = Arc::new(store);
+
+                // Wrap with EmbeddingMemory if embedding provider is configured
+                if let Some(emb_config) = embedding
+                    && emb_config.provider != "none"
+                {
+                    if emb_config.provider == "local" {
+                        #[cfg(feature = "local-embedding")]
+                        {
+                            // Treat the OpenAI default model as "unset" for local provider
+                            let model_name = if emb_config.model == "text-embedding-3-small" {
+                                None
+                            } else {
+                                Some(emb_config.model.as_str())
+                            };
+                            let provider = heartbit::LocalEmbeddingProvider::new(
+                                model_name,
+                                emb_config.cache_dir.as_deref().map(std::path::Path::new),
+                            )?;
+                            return Ok(Arc::new(heartbit::EmbeddingMemory::new(
+                                memory,
+                                Arc::new(provider),
+                            )));
+                        }
+                        #[cfg(not(feature = "local-embedding"))]
+                        bail!("local embedding provider requires the 'local-embedding' feature");
+                    }
+
+                    let api_key = std::env::var(&emb_config.api_key_env).unwrap_or_default();
+                    if !api_key.is_empty() {
+                        let mut provider =
+                            heartbit::OpenAiEmbedding::new(&api_key, &emb_config.model);
+                        if let Some(ref base_url) = emb_config.base_url {
+                            provider = provider.with_base_url(base_url);
+                        }
+                        if let Some(dim) = emb_config.dimension {
+                            provider = provider.with_dimension(dim);
+                        }
                         return Ok(Arc::new(heartbit::EmbeddingMemory::new(
                             memory,
                             Arc::new(provider),
                         )));
                     }
-                    #[cfg(not(feature = "local-embedding"))]
-                    bail!("local embedding provider requires the 'local-embedding' feature");
                 }
-
-                let api_key = std::env::var(&emb_config.api_key_env).unwrap_or_default();
-                if !api_key.is_empty() {
-                    let mut provider = heartbit::OpenAiEmbedding::new(&api_key, &emb_config.model);
-                    if let Some(ref base_url) = emb_config.base_url {
-                        provider = provider.with_base_url(base_url);
-                    }
-                    if let Some(dim) = emb_config.dimension {
-                        provider = provider.with_dimension(dim);
-                    }
-                    return Ok(Arc::new(heartbit::EmbeddingMemory::new(
-                        memory,
-                        Arc::new(provider),
-                    )));
-                }
+                Ok(memory)
             }
-            Ok(memory)
         }
     }
 }

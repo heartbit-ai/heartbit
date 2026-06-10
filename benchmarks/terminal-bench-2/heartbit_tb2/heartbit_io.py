@@ -93,6 +93,18 @@ def build_heartbit_env(
     return env
 
 
+def is_static_musl(bin_path: str, static_env: str | None = None) -> bool:
+    """Whether a prebuilt binary is the slim static musl build (no runtime libs).
+
+    Conservative: True only when explicitly flagged (``HEARTBIT_BIN_STATIC``) or
+    the path lives under the musl target dir. A glibc binary is treated as
+    dynamic so the adapter still best-effort installs its runtime libs.
+    """
+    if static_env and static_env.strip().lower() in ("1", "true", "yes"):
+        return True
+    return "x86_64-unknown-linux-musl" in bin_path
+
+
 def parse_trace_tokens(trace_text: str) -> dict[str, Any] | None:
     """Parse the ``--trace-file`` AgentOutput JSON into AgentContext fields."""
     try:
