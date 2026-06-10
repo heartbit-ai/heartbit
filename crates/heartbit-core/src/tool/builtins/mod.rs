@@ -266,15 +266,55 @@ pub(crate) fn resolve_path(
                     ws.display()
                 ));
             }
-            if let Ok(canonical) = normalized.canonicalize()
-                && !canonical.starts_with(ws)
-            {
-                return Err(format!(
-                    "Path '{path}' resolves to {} which is outside the workspace. Use a path \
-                     inside the workspace; for temporary/scratch work, a subdirectory like \
-                     ./scratch is your temporary directory.",
-                    canonical.display()
-                ));
+            match normalized.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.starts_with(ws) {
+                        return Err(format!(
+                            "Path '{path}' resolves to {} which is outside the workspace. Use a \
+                             path inside the workspace; for temporary/scratch work, a \
+                             subdirectory like ./scratch is your temporary directory.",
+                            canonical.display()
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // The target does not exist yet (a new-file create), so the
+                    // whole-path canonicalize above has nothing to resolve. The
+                    // lexical `starts_with` check does NOT resolve symlinks, so a
+                    // symlinked INTERMEDIATE directory inside the workspace (e.g.
+                    // `data -> ~/.ssh`, which a cloned repo can ship) would let
+                    // the create escape the jail. Canonicalize the DEEPEST
+                    // EXISTING ancestor and require it inside the workspace
+                    // before allowing creation.
+                    for ancestor in normalized.ancestors() {
+                        if ancestor.symlink_metadata().is_err() {
+                            continue; // not created yet — keep walking up
+                        }
+                        match ancestor.canonicalize() {
+                            Ok(canonical) if canonical.starts_with(ws) => break,
+                            Ok(canonical) => {
+                                return Err(format!(
+                                    "Path '{path}' resolves to {} which is outside the \
+                                     workspace. Use a path inside the workspace; for \
+                                     temporary/scratch work, a subdirectory like ./scratch is \
+                                     your temporary directory.",
+                                    canonical.display()
+                                ));
+                            }
+                            Err(_) => {
+                                // Exists (e.g. a dangling symlink) but cannot be
+                                // resolved: containment is unprovable — fail closed.
+                                return Err(format!(
+                                    "Path '{path}' resolves through '{}' which cannot be \
+                                     verified inside the workspace. Use a path inside the \
+                                     workspace; for temporary/scratch work, a subdirectory \
+                                     like ./scratch is your temporary directory.",
+                                    ancestor.display()
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             if is_protected(&normalized, protected_paths) {
                 return Err(format!("Access to '{path}' is denied (protected path)."));
@@ -727,6 +767,77 @@ mod tests {
         let ws = dir.path().canonicalize().unwrap();
         let result = resolve_path("../escape", Some(&ws), &[]);
         assert!(result.is_err());
+    }
+
+    // Jail escape (audit 2026-06-09): a NEW-file write through a symlinked
+    // INTERMEDIATE directory must be rejected. The whole-path canonicalize
+    // check is skipped when the final component does not exist, and the
+    // lexical normalize does not resolve symlinks — so `data -> /outside`
+    // plus a write to `data/evil.txt` used to pass the jail.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_new_file_through_symlinked_intermediate_dir_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside_c, ws.join("data")).unwrap();
+
+        let result = resolve_path("data/evil.txt", Some(&ws), &[]);
+        assert!(
+            result.is_err(),
+            "new-file create through a symlinked intermediate dir must be rejected: {result:?}"
+        );
+        assert!(
+            result.unwrap_err().contains("outside the workspace"),
+            "rejection should use the jail wording"
+        );
+    }
+
+    // Same escape, one level deeper: only an ANCESTOR of the parent exists.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_new_file_deep_under_symlinked_dir_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_c = outside.path().canonicalize().unwrap();
+        std::fs::create_dir(outside_c.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside_c, ws.join("data")).unwrap();
+
+        let result = resolve_path("data/sub/evil.txt", Some(&ws), &[]);
+        assert!(
+            result.is_err(),
+            "deep new-file create through a symlinked dir must be rejected: {result:?}"
+        );
+    }
+
+    // A DANGLING symlink ancestor cannot be canonicalized; containment cannot
+    // be proven, so creation must fail closed (create_dir_all would otherwise
+    // materialize the link target outside the jail).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_new_file_through_dangling_symlink_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("/nonexistent_heartbit_jail_test", ws.join("data")).unwrap();
+
+        let result = resolve_path("data/evil.txt", Some(&ws), &[]);
+        assert!(
+            result.is_err(),
+            "new-file create through a dangling symlink must fail closed: {result:?}"
+        );
+    }
+
+    // Regression guard: creating a new file under a NOT-YET-EXISTING real
+    // subdirectory stays allowed (the deepest existing ancestor is the
+    // workspace root itself).
+    #[test]
+    fn resolve_path_new_file_in_nonexistent_real_subdir_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let result = resolve_path("newdir/sub/file.txt", Some(&ws), &[]);
+        assert_eq!(result.unwrap(), ws.join("newdir/sub/file.txt"));
     }
 
     #[test]

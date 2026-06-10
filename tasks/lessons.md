@@ -180,3 +180,50 @@ Accept `KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')`. More genera
 when a real-terminal key "does nothing" but the logic + pty repro pass, suspect the
 key ENCODING differs from your harness — log the raw event to a FILE
 (`HEARTBIT_TUI_DEBUG`, since the TUI owns the terminal) rather than re-deriving.
+
+## 2026-06-09 — Absolute message indices are invalidated by compaction (runner)
+
+**What happened:** fixing the verify-replan gate to scan only the CURRENT
+request's messages, I captured `request_start_msg = ctx.message_count()` at
+`on_input` and sliced `messages[request_start_msg..]`. Compaction
+(`inject_summary`) clears and rebuilds the message list down to `[summary] +
+last_4_verbatim`, so the absolute index then pointed PAST the end → empty slice
+→ the gate silently missed a RED verify still kept in the tail. The unit tests
+for the request-scoping passed (no compaction in them); an adversarial review of
+the fix caught it.
+
+**Rule:** any per-request/long-lived ABSOLUTE index into `ctx.messages()` must be
+re-anchored at every `inject_summary` site (compaction is a clear+rebuild, not an
+append). Re-anchor to `min(1)` (just past the index-0 summary) so the scan still
+covers the recent kept tail. When a fix introduces an index/offset into a list
+that another subsystem mutates, write a test that triggers that mutation.
+
+## 2026-06-09 — Word-boundary matching drops inflected verb forms (router)
+
+**What happened:** replacing substring matching with word-boundary matching to
+stop "analyse" firing inside the noun "analyseur" also dropped the French
+infinitive/imperative study verbs ("analyser", "étudier", "évaluer", "analysez")
+— their stem+suffix is alphanumeric-flanked, so the boundary check rejects them.
+An investigation request with a code anchor then fell through to EXECUTE — the
+safety-protected STUDY→EXECUTE flip. Fixtures used only bare-stem+space, so they
+passed.
+
+**Rule:** when tightening a matcher from substring → word-boundary, enumerate the
+INFLECTED forms you still need to match (verbs conjugate; nouns don't), and verify
+each added form is NOT a substring of the look-alike you're excluding
+(analyser ⊄ analyseur). Add a fixture for the inflected form WITH the anchor that
+makes the misroute dangerous.
+
+## 2026-06-09 — Review the FIXES, not just the findings (audit workflow)
+
+**What happened:** a multi-aspect audit found 45 real bugs; 6 parallel agents +
+the main loop fixed them all and the full gate went green (5292 tests). A second
+adversarial review pass — over the FIX DIFF, not the original code — found 5 real
+defects introduced or left by the fixes (1 high, 3 medium, 1 low), including a
+regression I introduced. A green gate proves the OBVIOUS cases work; it does not
+prove the fix is correct on the cases the tests don't cover.
+
+**Rule:** after a large fix batch, run an adversarial correctness review over the
+DIFF (per-chunk reviewers + per-finding verification) before declaring done. Treat
+"all tests pass" as necessary, not sufficient. The cheap win: each reviewer reads
+the diff fragment, then the surrounding real code, and hunts the uncovered case.

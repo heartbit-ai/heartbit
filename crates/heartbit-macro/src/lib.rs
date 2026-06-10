@@ -336,7 +336,11 @@ fn build_schema_tokens(params: &[ParamInfo]) -> syn::Result<TokenStream2> {
 
         property_entries.push(prop);
 
-        if !param.is_option {
+        // A param is required only when it is neither Option nor carries a
+        // `#[tool(default = ...)]`: a declared default is applied at runtime
+        // when the argument is absent, so advertising it as required would
+        // contradict the schema's `default`.
+        if !param.is_option && param.default_value.is_none() {
             required_names.push(name_str);
         }
     }
@@ -397,6 +401,24 @@ fn build_deserialize_tokens(params: &[ParamInfo]) -> TokenStream2 {
                             _ => None,
                         };
                     }
+                }
+            } else if let Some(default_val) = &p.default_value {
+                // Non-Option param with #[tool(default = ...)]: the schema
+                // advertises the default, so the runtime must APPLY it when
+                // the argument is absent (or explicitly null) instead of
+                // erroring with "missing required field".
+                let default_json = lit_to_json_token(default_val);
+                quote! {
+                    let #name: #ty = match input.get(#name_str) {
+                        Some(v) if !v.is_null() => ::serde_json::from_value(v.clone())
+                            .map_err(|e| ::heartbit::Error::Agent(
+                                format!("invalid value for `{}`: {}", #name_str, e)
+                            ))?,
+                        _ => ::serde_json::from_value(::serde_json::json!(#default_json))
+                            .map_err(|e| ::heartbit::Error::Agent(
+                                format!("invalid default for `{}`: {}", #name_str, e)
+                            ))?,
+                    };
                 }
             } else {
                 quote! {

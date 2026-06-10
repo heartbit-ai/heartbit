@@ -270,6 +270,10 @@ impl QuoteSeenStore for JsonlQuoteSeenStore {
                 .open(&self.path)
                 .await?;
             file.write_all(line.as_bytes()).await?;
+            // tokio::fs::File buffers internally: without an explicit flush the
+            // write may still be in-flight on the blocking pool when the file
+            // is dropped — readers (and a fast process exit) can miss the line.
+            file.flush().await?;
             cache.insert(key);
             Ok(())
         })

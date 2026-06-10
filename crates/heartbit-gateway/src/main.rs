@@ -108,9 +108,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build a lightweight LLM provider for sensor triage from environment variables.
+/// Build the LLM provider for sensor triage from environment variables.
 ///
-/// Tries `ANTHROPIC_API_KEY` first (using haiku), then `OPENROUTER_API_KEY`.
+/// Tries `ANTHROPIC_API_KEY` first, then `OPENROUTER_API_KEY`. Both paths
+/// currently wire `claude-sonnet-4` — NOT a haiku-class SLM. Triage runs per
+/// ingested event, so model cost multiplies; switching to a cheaper
+/// haiku-class model (or making this configurable) is a deliberate follow-up,
+/// not something this function does today.
 fn build_slm_provider() -> Result<Arc<dyn heartbit::llm::DynLlmProvider>> {
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         let provider = heartbit::AnthropicProvider::new(&api_key, "claude-sonnet-4-20250514");

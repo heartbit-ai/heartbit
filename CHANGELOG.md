@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+Eight commits since `v2026.607.1`, five of which change heartbit-core runtime
+behavior (orchestrator, runner, set_scope, bash, builder prompts). Most are
+hardening driven by live CRM-session traces (6a25ca5e, 6a25d21b, 6a25eb4d,
+6a265efd).
+
+### Added
+
+- **Gate observability + hard advisor escalation + clarify question-quality**
+  (`a2ff809`) — the 9 deterministic gates now emit
+  `AgentEvent::GateFired { gate, reason }` so fired gates are auditable in the
+  trace; after repeated consecutive failed builds, edit/write/patch are denied
+  until the advisor is consulted (advisor-gated, resets per request); the
+  clarify rule and intake gap prompt forbid re-asking facts the user already
+  specified and require offered options to honor every stated constraint.
+- **Orchestration nudge — refuse-once same-agent parallel fan-out** (`05ea2f6`)
+  — `delegate_task` batches that pile 3+ tasks onto the SAME agent are refused
+  once with actionable guidance (do it yourself / one sequential task); an
+  identical retry dispatches, and both paths emit `GateFired` so retry-through
+  is measurable. Entry prompt + parallel schema now state the real predicate:
+  parallel only when there is no shared write target and no cross-task
+  dependency.
+- **CI: auto-publish heartbit-core to crates.io on tag** (`f3734f8`) — release
+  workflow gains a `publish-crate` job: no-op until `CARGO_REGISTRY_TOKEN` is
+  set, idempotent on already-published versions, scoped to heartbit-core only.
+
+### Fixed
+
+- **Sub-agents no longer stream through the parent `on_text`** (`fa20786`,
+  core + TUI) — N parallel sub-agents sharing one un-attributed `on_text`
+  merged token streams character-by-character. Restores the documented
+  contract: sub-agents use `complete()`, only the orchestrator's own synthesis
+  streams; sub-agent work stays visible via attributed tool-call events. TUI:
+  a delegation auto-activates the roster and per-agent badges
+  (`saw_delegation`), and dispatch notices count duplicates ("worker ×4").
+- **Filesystem boundary stated in the workspace prompt** (`699d01b`) — the
+  workspace hint now says file tools can ONLY access paths inside the
+  workspace, outside paths (/tmp, home, /etc) are rejected, and
+  temporary/scratch work belongs in an in-workspace `./scratch` subdirectory;
+  stops the /tmp probe-and-thrash loop.
+- **Bash cwd visibility, doom-loop hard-stop, write/scope clarity**
+  (`9ecd8d6`) — bash surfaces its persistent cwd when it drifts from the
+  workspace root; the doom-loop soft warning is now backed by a hard abort
+  (`Error::DoomLoopAborted`) after 2 more ignored turns; `set_scope` resolves
+  relative roots against the workspace; "File unchanged" results state
+  emphatically that the write SUCCEEDED; new exit-127 (command-not-found)
+  repair-hint class.
+- **"Temporary directory" guidance reconciled with the workspace jail**
+  (`5c7f319`) — three places told three different stories (one of them
+  unsatisfiable: "/tmp, never inside the repo" while the file tools reject
+  /tmp). All guidance now points at one destination: a gitignored `./scratch`
+  subdirectory inside the workspace. The `set_scope` guard was inverted:
+  outside scopes are refused once with the scratch redirect; relocating INTO
+  the workspace is never refused. `resolve_path` rejections now carry the
+  destination.
+- **TUI: `/model` takes effect on the next message** (`bfe4782`) — the
+  long-lived agent thread captured the model at spawn, so `/model` persisted
+  but never applied until process restart. Model changes now respawn the agent
+  (input-channel recreation, lazy respawn on the next message). Bonus: startup
+  notice when `HEARTBIT_MODEL` env overrides the configured model.
+
+### Notes
+
+- The workspace version is still `2026.607.1` (already tagged and published —
+  immutable); it must be bumped before the next tag so the release workflow's
+  idempotency guard cannot silently no-op.
+
 ## [2026.607.1] - 2026-06-07 — request-intent harness, completion-loop gates, deep research + advisor, TUI streaming
 
 Covers the 60 commits on `feat/tui-streaming-markdown` since `v2026.507.4`. The
@@ -73,8 +141,9 @@ is independently publishable.
 
 ### Notes
 
-- The `[Unreleased]` section below is the detail of the heartbit-ghost P1.1 X-tool
-  family that shipped as part of `2026.507.4`; retained for history.
+- The "heartbit-ghost P1.1 — X (Twitter) tool family" section under `2026.507.4`
+  below is the detail of the X-tool family that shipped as part of that release;
+  retained for history.
 
 ## [2026.507.4] - 2026-05-26 — heartbit-ghost P1.x integration + heartbit-core boundary cleanup
 

@@ -29,14 +29,52 @@ use crate::{build_on_retry, build_provider_from_config, init_tracing_from_config
 
 use self::auth::{JwtMiddlewareState, auth_middleware, jwt_auth_middleware, resolve_auth_tokens};
 use self::handlers::{
-    HttpMetrics, cors_middleware, handle_approval, handle_cancel, handle_get, handle_healthz,
-    handle_list, handle_metrics, handle_readyz, handle_stats, handle_stream, handle_submit,
-    handle_usage, http_metrics_middleware, mcp_tools_for_user, validate_path_component,
+    CorsState, HttpMetrics, cors_middleware, handle_approval, handle_cancel, handle_get,
+    handle_healthz, handle_list, handle_metrics, handle_readyz, handle_stats, handle_stream,
+    handle_submit, handle_usage, http_metrics_middleware, mcp_tools_for_user,
+    validate_path_component,
 };
 use self::memory::build_institutional_entry;
 use self::types::{AppState, PendingApprovals};
 
 // --- Daemon startup ---
+
+/// CLI-side `[daemon]` extension keys.
+///
+/// heartbit-core's `DaemonConfig` tolerates unknown keys, so CLI-only HTTP
+/// settings live here and are parsed from the same config file. All fields
+/// carry serde defaults — configs that omit them keep the prior behavior.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct DaemonCliExt {
+    /// `Access-Control-Allow-Origin` value for the HTTP API (e.g.
+    /// `"http://localhost:5173"`, or `"*"` to restore the legacy permissive
+    /// dashboard behavior). SECURITY default: unset — no CORS headers are
+    /// emitted, so foreign-origin browser JavaScript cannot read responses.
+    #[serde(default)]
+    pub(crate) cors_allow_origin: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CliExtConfig {
+    #[serde(default)]
+    daemon: DaemonCliExt,
+}
+
+/// Parse the CLI-side `[daemon]` extension keys from the raw config file.
+/// Any read or parse failure falls back to defaults (the typed
+/// `HeartbitConfig` load has already surfaced real config errors).
+fn load_daemon_cli_ext(config_path: &std::path::Path) -> DaemonCliExt {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return DaemonCliExt::default();
+    };
+    match toml::from_str::<CliExtConfig>(&raw) {
+        Ok(ext) => ext.daemon,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse CLI daemon extension keys, using defaults");
+            DaemonCliExt::default()
+        }
+    }
+}
 
 pub async fn run_daemon(
     config_path: &std::path::Path,
@@ -1254,8 +1292,15 @@ pub async fn run_daemon(
 
     let mut app = routes.with_state(app_state);
 
-    // Permissive CORS for local dashboard access (file:// or localhost origins).
-    app = app.layer(middleware::from_fn(cors_middleware));
+    // CORS: headers are emitted only when `[daemon] cors_allow_origin` is
+    // configured. SECURITY default: off — the previous unconditional wildcard
+    // let any web page the operator visits read API responses (and reach task
+    // execution when no auth was configured).
+    let cors_state = CorsState::new(load_daemon_cli_ext(config_path).cors_allow_origin);
+    if let Some(origin) = cors_state.allow_origin.as_deref() {
+        tracing::info!(origin = %origin, "CORS enabled for configured origin");
+    }
+    app = app.layer(middleware::from_fn_with_state(cors_state, cors_middleware));
 
     // Add HTTP metrics middleware when metrics are enabled
     if let Some(ref m) = metrics {
@@ -1630,5 +1675,33 @@ impl heartbit_ghost::reply::ReplyReviewDelivery for LogOnlyReplyDelivery {
         >,
     > {
         Box::pin(async move { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+mod cli_ext_tests {
+    use super::*;
+
+    #[test]
+    fn cors_allow_origin_defaults_to_none_for_existing_configs() {
+        // Backward compat: a config without the key parses with the default.
+        let ext: CliExtConfig =
+            toml::from_str("[daemon]\nbind = \"127.0.0.1:8080\"\n").expect("parses");
+        assert!(ext.daemon.cors_allow_origin.is_none());
+
+        // A config with no [daemon] section at all also defaults cleanly.
+        let ext: CliExtConfig = toml::from_str("").expect("parses");
+        assert!(ext.daemon.cors_allow_origin.is_none());
+    }
+
+    #[test]
+    fn cors_allow_origin_parses_when_configured() {
+        let ext: CliExtConfig =
+            toml::from_str("[daemon]\ncors_allow_origin = \"http://localhost:5173\"\n")
+                .expect("parses");
+        assert_eq!(
+            ext.daemon.cors_allow_origin.as_deref(),
+            Some("http://localhost:5173")
+        );
     }
 }

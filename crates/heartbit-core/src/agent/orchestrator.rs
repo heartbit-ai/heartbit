@@ -356,6 +356,15 @@ struct DelegateTaskTool {
     /// défenses (PII, secret scanner, LLM judge) que l'opérateur avait
     /// configurées au niveau orchestrator.
     guardrails: Vec<Arc<dyn Guardrail>>,
+    /// Human-approval callback propagated to delegated sub-agents.
+    /// SECURITY (audit 2026-06-09): without this, a sub-agent's tool calls hit
+    /// the runner's "Ask with no callback → allow" fallback, so one approved
+    /// `delegate_task` call silently dropped the whole human gate.
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
+    /// Shared AlwaysAllow/AlwaysDeny store propagated to sub-agents so
+    /// persistent approval decisions land in ONE ruleset for the whole run
+    /// (shared semantics — the `Arc<Mutex<…>>` makes that natural).
+    learned_permissions: Option<Arc<std::sync::Mutex<super::permission::LearnedPermissions>>>,
     /// Orchestration nudge state: the fingerprint of the last same-agent fan-out
     /// batch refused (refuse-once). An explicit identical retry (same fingerprint)
     /// is allowed through; a different bad batch re-nudges. Never held across
@@ -489,6 +498,10 @@ impl DelegateTaskTool {
             // the moment work is delegated. SpawnAgentTool already does this; the
             // delegate path used to skip it.
             let orchestrator_guardrails = self.guardrails.clone();
+            // SECURITY (audit 2026-06-09): propagate the human-approval gate and
+            // the shared AlwaysAllow/AlwaysDeny store (same shape as F-AGENT-2).
+            let on_approval = self.on_approval.clone();
+            let learned_permissions = self.learned_permissions.clone();
 
             info!(agent = %agent_def.name, task = %task.task, "spawning sub-agent");
 
@@ -584,6 +597,18 @@ impl DelegateTaskTool {
                 // Forward permission rules from orchestrator to sub-agents
                 if !permission_rules.is_empty() {
                     builder = builder.permission_rules(permission_rules);
+                }
+
+                // SECURITY (audit 2026-06-09): forward the orchestrator's
+                // human-approval callback so the sub-agent's tool calls are
+                // gated by the same reviewer. Without it, `Ask` rules (and the
+                // legacy batch gate) silently auto-allow in sub-agents.
+                if let Some(ref cb) = on_approval {
+                    builder = builder.on_approval(cb.clone());
+                }
+                // Shared AlwaysAllow/AlwaysDeny memory: one store for the run.
+                if let Some(ref learned) = learned_permissions {
+                    builder = builder.learned_permissions(learned.clone());
                 }
 
                 // Forward observability mode from orchestrator to sub-agents
@@ -892,6 +917,13 @@ struct FormSquadTool {
     /// squad member's own so squad work can't bypass the orchestrator's defenses
     /// (the `delegate_task` path already does this; `form_squad` used to skip it).
     guardrails: Vec<Arc<dyn Guardrail>>,
+    /// Human-approval callback propagated to squad members.
+    /// SECURITY (audit 2026-06-09): same gate as `delegate_task` — see
+    /// `DelegateTaskTool::on_approval`.
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
+    /// Shared AlwaysAllow/AlwaysDeny store propagated to squad members
+    /// (one ruleset for the whole run).
+    learned_permissions: Option<Arc<std::sync::Mutex<super::permission::LearnedPermissions>>>,
 }
 
 impl Tool for FormSquadTool {
@@ -1008,6 +1040,10 @@ impl Tool for FormSquadTool {
                 let tenant_tracker = self.tenant_tracker.clone();
                 // SECURITY (F-AGENT-2): propagate orchestrator guardrails to squad members.
                 let squad_guardrails = self.guardrails.clone();
+                // SECURITY (audit 2026-06-09): propagate the human-approval gate and
+                // the shared AlwaysAllow/AlwaysDeny store to squad members too.
+                let on_approval = self.on_approval.clone();
+                let learned_permissions = self.learned_permissions.clone();
 
                 info!(agent = %agent_def.name, task = %task.task, "spawning squad member");
 
@@ -1102,6 +1138,17 @@ impl Tool for FormSquadTool {
                     // Forward permission rules from orchestrator to squad members
                     if !permission_rules.is_empty() {
                         builder = builder.permission_rules(permission_rules);
+                    }
+
+                    // SECURITY (audit 2026-06-09): forward the human-approval
+                    // gate so squad members' tool calls are gated by the same
+                    // reviewer as the orchestrator's own.
+                    if let Some(ref cb) = on_approval {
+                        builder = builder.on_approval(cb.clone());
+                    }
+                    // Shared AlwaysAllow/AlwaysDeny memory: one store for the run.
+                    if let Some(ref learned) = learned_permissions {
+                        builder = builder.learned_permissions(learned.clone());
                     }
 
                     // Forward observability mode from orchestrator to squad members
@@ -1351,6 +1398,13 @@ struct SpawnAgentTool {
     cached_definition: ToolDefinition,
     /// Optional per-tenant token tracker propagated to each spawned agent runner.
     tenant_tracker: Option<Arc<crate::agent::tenant_tracker::TenantTokenTracker>>,
+    /// Human-approval callback propagated to spawned agents.
+    /// SECURITY (audit 2026-06-09): same gate as `delegate_task` — see
+    /// `DelegateTaskTool::on_approval`.
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
+    /// Shared AlwaysAllow/AlwaysDeny store propagated to spawned agents
+    /// (one ruleset for the whole run).
+    learned_permissions: Option<Arc<std::sync::Mutex<super::permission::LearnedPermissions>>>,
 }
 
 #[derive(Deserialize)]
@@ -1505,6 +1559,15 @@ impl SpawnAgentTool {
         }
         if !self.guardrails.is_empty() {
             builder = builder.guardrails(self.guardrails.clone());
+        }
+        // SECURITY (audit 2026-06-09): forward the human-approval gate so the
+        // spawned agent's tool calls are gated by the same reviewer.
+        if let Some(ref cb) = self.on_approval {
+            builder = builder.on_approval(cb.clone());
+        }
+        // Shared AlwaysAllow/AlwaysDeny memory: one store for the run.
+        if let Some(ref learned) = self.learned_permissions {
+            builder = builder.learned_permissions(learned.clone());
         }
         if let Some(ref ws) = self.workspace {
             builder = builder.workspace(ws.clone());
@@ -2481,9 +2544,17 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         self
     }
 
-    /// Set a callback for human-in-the-loop approval on the orchestrator's
-    /// tool calls (i.e., delegate_task calls). Sub-agents do not use this
-    /// callback — only the orchestrator's decisions are gated.
+    /// Set a callback for human-in-the-loop approval on tool calls.
+    ///
+    /// The callback gates the orchestrator's own tool calls (delegate_task,
+    /// form_squad, spawn_agent, direct tools) AND is propagated to every
+    /// sub-agent runner those tools spawn, so delegated work runs under the
+    /// same human gate (audit 2026-06-09 — without propagation, one approved
+    /// `delegate_task` call silently dropped the gate for all sub-agent work).
+    /// `AlwaysAllow`/`AlwaysDeny` decisions share one learned-permission store
+    /// across the whole run when [`learned_permissions`] is set.
+    ///
+    /// [`learned_permissions`]: OrchestratorBuilder::learned_permissions
     pub fn on_approval(mut self, callback: Arc<crate::llm::OnApproval>) -> Self {
         self.on_approval = Some(callback);
         self
@@ -2873,6 +2944,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
             allow_shared_write: self.allow_shared_write,
             tenant_tracker: self.tenant_tracker.clone(),
             guardrails: self.guardrails.clone(),
+            on_approval: self.on_approval.clone(),
+            learned_permissions: self.learned_permissions.clone(),
             fanout_refused: std::sync::Mutex::new(None),
         });
 
@@ -2968,6 +3041,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 allow_shared_write: self.allow_shared_write,
                 tenant_tracker: self.tenant_tracker.clone(),
                 guardrails: self.guardrails.clone(),
+                on_approval: self.on_approval.clone(),
+                learned_permissions: self.learned_permissions.clone(),
             });
             runner_builder = runner_builder.tool(form_squad_tool);
         }
@@ -2995,6 +3070,8 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
                 audit_delegation_chain: self.audit_delegation_chain.clone(),
                 cached_definition: spawn_def,
                 tenant_tracker: self.tenant_tracker.clone(),
+                on_approval: self.on_approval.clone(),
+                learned_permissions: self.learned_permissions.clone(),
             });
             runner_builder = runner_builder.tool(spawn_tool);
         }
@@ -3199,6 +3276,72 @@ mod tests {
             let response = self.response.clone();
             Box::pin(async move { Ok(ToolOutput::success(response)) })
         }
+    }
+
+    /// A tool that records whether it was ever executed — used to prove the
+    /// human-approval gate (deny) actually prevented execution in sub-agents.
+    struct TrackedTool {
+        def: crate::llm::types::ToolDefinition,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TrackedTool {
+        #[allow(clippy::type_complexity)]
+        fn make(
+            name: &str,
+        ) -> (
+            Arc<dyn crate::tool::Tool>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tool = Arc::new(Self {
+                def: crate::llm::types::ToolDefinition {
+                    name: name.into(),
+                    description: format!("Tracked {name}"),
+                    input_schema: json!({"type": "object"}),
+                },
+                executed: executed.clone(),
+            });
+            (tool, executed)
+        }
+    }
+
+    impl crate::tool::Tool for TrackedTool {
+        fn definition(&self) -> crate::llm::types::ToolDefinition {
+            self.def.clone()
+        }
+
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>,
+        > {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(ToolOutput::success("mutated")) })
+        }
+    }
+
+    /// Approval callback that records every tool name it is asked about,
+    /// denies `danger_tool`, and allows everything else.
+    #[allow(clippy::type_complexity)]
+    fn deny_danger_approval() -> (Arc<crate::llm::OnApproval>, Arc<Mutex<Vec<String>>>) {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let cb: Arc<crate::llm::OnApproval> = Arc::new(move |calls| {
+            let mut guard = seen_cb.lock().expect("seen lock");
+            for call in calls {
+                guard.push(call.name.clone());
+            }
+            if calls.iter().any(|c| c.name == "danger_tool") {
+                crate::llm::ApprovalDecision::Deny
+            } else {
+                crate::llm::ApprovalDecision::Allow
+            }
+        });
+        (cb, seen)
     }
 
     #[test]
@@ -3522,6 +3665,8 @@ mod tests {
             allow_shared_write: true,
             tenant_tracker: None,
             guardrails: vec![],
+            on_approval: None,
+            learned_permissions: None,
             fanout_refused: std::sync::Mutex::new(None),
         };
 
@@ -5798,6 +5943,257 @@ mod tests {
                 .skip(1)
                 .any(|s| s.contains("[ORCH_GUARD_ACTIVE]")),
             "a form_squad member's system prompt must contain the orchestrator guardrail marker; got: {systems:?}"
+        );
+    }
+
+    /// SECURITY (audit 2026-06-09, HIGH): the human-approval gate must follow
+    /// delegated work. Before the fix, sub-agent runners were built without
+    /// the orchestrator's `on_approval` callback, so every sub-agent tool call
+    /// was silently auto-allowed (an `Ask` permission rule with no callback
+    /// falls into the runner's "no callback → allow" branch) — one approved
+    /// `delegate_task` call bypassed the whole human gate, including Plan
+    /// mode's read-only promise.
+    #[tokio::test]
+    async fn on_approval_propagates_to_delegated_sub_agents() {
+        let (danger_tool, executed) = TrackedTool::make("danger_tool");
+        let (approval, seen) = deny_danger_approval();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // 1: orchestrator delegates (gate fires for delegate_task → Allow)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "delegate_task".into(),
+                    input: json!({"tasks": [{"agent": "worker", "task": "mutate"}]}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 2: sub-agent calls the dangerous tool (gate must fire → Deny)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-2".into(),
+                    name: "danger_tool".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 3: sub-agent gives up after the deny
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "stopped".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 4: orchestrator synthesis
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        let mut orch = Orchestrator::builder(provider.clone())
+            .on_approval(approval)
+            .sub_agent_full(SubAgentConfig {
+                name: "worker".into(),
+                description: "Worker agent".into(),
+                system_prompt: "You work.".into(),
+                tools: vec![danger_tool],
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let output = orch.run("do work").await.unwrap();
+        assert_eq!(output.result, "done");
+
+        let names = seen.lock().expect("seen lock").clone();
+        assert!(
+            names.iter().any(|n| n == "danger_tool"),
+            "approval callback must fire for the SUB-AGENT's tool calls; saw: {names:?}"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "human-denied tool must NOT execute in the sub-agent"
+        );
+        // The deny must be visible to the sub-agent as a tool error.
+        let requests = provider.captured_requests.lock().expect("capture lock");
+        let denied_seen = requests.iter().any(|r| {
+            r.messages.iter().any(|m| {
+                m.content.iter().any(|b| match b {
+                    ContentBlock::ToolResult { content, .. } => {
+                        content.contains("denied by human reviewer")
+                    }
+                    _ => false,
+                })
+            })
+        });
+        assert!(
+            denied_seen,
+            "sub-agent must see the human-reviewer denial as a tool result"
+        );
+    }
+
+    /// SECURITY (audit 2026-06-09): same human-approval propagation for the
+    /// `form_squad` path — squad members' tool calls must be gated by the
+    /// orchestrator's `on_approval` callback too.
+    #[tokio::test]
+    async fn on_approval_propagates_to_form_squad_members() {
+        let (danger_tool, executed) = TrackedTool::make("danger_tool");
+        let (approval, seen) = deny_danger_approval();
+
+        fn text(t: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::Text { text: t.into() }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+        fn danger_call(id: &str) -> CompletionResponse {
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: id.into(),
+                    name: "danger_tool".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            }
+        }
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // 1: orchestrator forms a 2-member squad (gate fires → Allow)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "form_squad".into(),
+                    input: json!({"tasks": [
+                        {"agent": "worker", "task": "do A"},
+                        {"agent": "helper", "task": "do B"}
+                    ]}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 2-3: both members try the dangerous tool (gate must fire → Deny)
+            danger_call("call-a"),
+            danger_call("call-b"),
+            // 4-5: both members give up after the deny
+            text("stopped"),
+            text("stopped"),
+            // 6: orchestrator synthesis
+            text("done"),
+        ]));
+
+        let mut orch = Orchestrator::builder(provider.clone())
+            .on_approval(approval)
+            .enable_squads(true)
+            .sub_agent_full(SubAgentConfig {
+                name: "worker".into(),
+                description: "Worker agent".into(),
+                system_prompt: "You work.".into(),
+                tools: vec![danger_tool.clone()],
+                ..Default::default()
+            })
+            .sub_agent_full(SubAgentConfig {
+                name: "helper".into(),
+                description: "Helper agent".into(),
+                system_prompt: "You help.".into(),
+                tools: vec![danger_tool],
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let output = orch.run("do work").await.unwrap();
+        assert_eq!(output.result, "done");
+
+        let names = seen.lock().expect("seen lock").clone();
+        assert!(
+            names.iter().any(|n| n == "danger_tool"),
+            "approval callback must fire for squad members' tool calls; saw: {names:?}"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "human-denied tool must NOT execute in any squad member"
+        );
+    }
+
+    /// SECURITY (audit 2026-06-09): same human-approval propagation for the
+    /// `spawn_agent` path — dynamically spawned agents inherit the gate.
+    #[tokio::test]
+    async fn spawn_agent_forwards_on_approval() {
+        let (danger_tool, executed) = TrackedTool::make("danger_tool");
+        let (approval, seen) = deny_danger_approval();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // 1: spawned agent tries the dangerous tool (gate must fire → Deny)
+            CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "danger_tool".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            // 2: spawned agent gives up after the deny
+            CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "stopped".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+        ]));
+
+        let mut config = make_spawn_config();
+        config.tool_allowlist = vec!["danger_tool".into()];
+        let mut tool = build_spawn_tool(provider, config, vec![danger_tool]);
+        tool.on_approval = Some(approval);
+
+        let result = tool
+            .spawn(SpawnAgentInput {
+                name: "mutator".into(),
+                system_prompt: "You mutate.".into(),
+                tools: vec!["danger_tool".into()],
+                task: "mutate".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let names = seen.lock().expect("seen lock").clone();
+        assert!(
+            names.iter().any(|n| n == "danger_tool"),
+            "approval callback must fire for the spawned agent's tool calls; saw: {names:?}"
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "human-denied tool must NOT execute in the spawned agent"
         );
     }
 
@@ -8638,6 +9034,8 @@ mod tests {
             audit_delegation_chain: vec![],
             cached_definition,
             tenant_tracker: None,
+            on_approval: None,
+            learned_permissions: None,
         }
     }
 

@@ -426,8 +426,11 @@ fn parse_duckduckgo_html(html: &str, max_results: u64) -> Vec<SearchResult> {
         };
         let abs_marker = search_start + marker_pos;
 
-        // Find the href attribute (look backwards for <a, then find href)
-        let tag_start_region = abs_marker.saturating_sub(200);
+        // Find the href attribute (look backwards for <a, then find href).
+        // Floor to a char boundary: `abs_marker - 200` is an arbitrary byte
+        // offset into third-party HTML and can land mid-codepoint when the
+        // preceding result's title/snippet is multibyte (panic otherwise).
+        let tag_start_region = super::floor_char_boundary(html, abs_marker.saturating_sub(200));
         let tag_region = &html[tag_start_region..abs_marker];
         let href = tag_region
             .rfind("href=\"")
@@ -941,6 +944,27 @@ mod tests {
     fn parse_duckduckgo_html_empty() {
         let results = parse_duckduckgo_html("<html><body>No results</body></html>", 10);
         assert!(results.is_empty());
+    }
+
+    // Panic-safety (audit 2026-06-09): the backwards href window used to slice
+    // at `abs_marker - 200`, an arbitrary byte offset into third-party HTML.
+    // When the preceding result's snippet is multibyte-dense (French/Japanese/
+    // emoji titles), that offset lands mid-codepoint and the slice panics. The
+    // pad loop shifts the offset byte-by-byte so at least one iteration is
+    // guaranteed to land inside a 2-byte char with the old code.
+    #[test]
+    fn parse_duckduckgo_html_multibyte_before_marker_does_not_panic() {
+        for pad in 0..4 {
+            let mut html = String::new();
+            html.push_str("<a href=\"https://a.example\" class=\"result__a\">First</a>");
+            html.push_str(&"x".repeat(pad));
+            html.push_str(&"é".repeat(150)); // 300 bytes of 2-byte chars
+            html.push_str("<a class=\"result__a\" href=\"https://b.example\">Second</a>");
+
+            let results = parse_duckduckgo_html(&html, 10);
+            assert_eq!(results.len(), 2, "pad={pad}: both results expected");
+            assert_eq!(results[1].title, "Second", "pad={pad}");
+        }
     }
 
     #[test]

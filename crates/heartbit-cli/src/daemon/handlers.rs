@@ -804,31 +804,104 @@ pub(crate) async fn http_metrics_middleware(
     response
 }
 
-/// Permissive CORS middleware for local dashboard access.
+/// CORS policy for the daemon HTTP API.
+///
+/// SECURITY: the default is OFF — no CORS headers are emitted, so browser
+/// JavaScript on foreign origins cannot read API responses. The previous
+/// unconditional `Access-Control-Allow-Origin: *` let any web page the
+/// operator visits read task results (and reach `/v1/tasks/execute` when no
+/// auth was configured). Operators opt in via `[daemon] cors_allow_origin`
+/// in the config file; the explicit value `"*"` restores the old permissive
+/// behavior for local dashboards.
+#[derive(Clone, Default)]
+pub(crate) struct CorsState {
+    /// Validated `Access-Control-Allow-Origin` value, `None` = CORS off.
+    pub(crate) allow_origin: Option<Arc<str>>,
+}
+
+impl CorsState {
+    /// Build from the configured origin. Empty or header-invalid values are
+    /// ignored (CORS stays off) with a warning.
+    pub(crate) fn new(allow_origin: Option<String>) -> Self {
+        let allow_origin = allow_origin.filter(|s| !s.is_empty()).and_then(|s| {
+            if axum::http::HeaderValue::from_str(&s).is_ok() {
+                Some(Arc::from(s.as_str()))
+            } else {
+                tracing::warn!(
+                    origin = %s,
+                    "invalid cors_allow_origin value ignored — CORS headers stay disabled"
+                );
+                None
+            }
+        });
+        Self { allow_origin }
+    }
+
+    /// The `Access-Control-Allow-Origin` value to emit for a request carrying
+    /// `request_origin`, or `None` when no CORS headers should be emitted.
+    fn allow_origin_for(&self, request_origin: Option<&str>) -> Option<&str> {
+        let allowed = self.allow_origin.as_deref()?;
+        if allowed == "*" {
+            return Some("*");
+        }
+        (request_origin == Some(allowed)).then_some(allowed)
+    }
+}
+
+/// CORS middleware: emits headers only for the configured origin (see
+/// [`CorsState`]). When CORS is off or the origin is not allowed, requests
+/// (including OPTIONS preflights) pass through to the router untouched.
 pub(crate) async fn cors_middleware(
+    State(cors): State<CorsState>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
-    // Handle preflight OPTIONS requests.
-    if request.method() == axum::http::Method::OPTIONS {
-        return axum::http::Response::builder()
+    let request_origin = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let allow = cors
+        .allow_origin_for(request_origin.as_deref())
+        .map(String::from);
+
+    // Answer preflight only when the origin is allowed; otherwise fall
+    // through (the router's 405 carries no CORS headers, so the browser
+    // blocks the cross-origin call).
+    if request.method() == axum::http::Method::OPTIONS
+        && let Some(ref origin) = allow
+    {
+        let mut builder = axum::http::Response::builder()
             .status(204)
-            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Origin", origin.as_str())
             .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
             .header(
                 "Access-Control-Allow-Headers",
                 "Content-Type, Authorization",
             )
-            .header("Access-Control-Max-Age", "3600")
+            .header("Access-Control-Max-Age", "3600");
+        if origin != "*" {
+            builder = builder.header("Vary", "Origin");
+        }
+        return builder
             .body(axum::body::Body::empty())
-            .unwrap()
+            .expect("static headers are valid")
             .into_response();
     }
 
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+    if let Some(origin) = allow {
+        response.headers_mut().insert(
+            "Access-Control-Allow-Origin",
+            axum::http::HeaderValue::from_str(&origin)
+                .expect("origin validated at CorsState construction"),
+        );
+        if origin != "*" {
+            response
+                .headers_mut()
+                .insert("Vary", axum::http::HeaderValue::from_static("Origin"));
+        }
+    }
     response
 }
 
@@ -849,4 +922,170 @@ pub(crate) fn validate_path_component(s: &str) -> Result<(), String> {
         return Err(format!("absolute path in component: {s:?}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::{Router, routing::get};
+
+    /// Spin up a real server with the CORS middleware so the tests exercise
+    /// the exact layer the daemon mounts (no tower test deps needed).
+    async fn serve(cors: CorsState) -> String {
+        let app = Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .layer(axum::middleware::from_fn_with_state(cors, cors_middleware));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}")
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("reqwest client")
+    }
+
+    #[tokio::test]
+    async fn cors_disabled_by_default_emits_no_headers() {
+        let base = serve(CorsState::new(None)).await;
+        let resp = client()
+            .get(format!("{base}/ping"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "no CORS header must be emitted when cors_allow_origin is unset"
+        );
+
+        // Preflight is not answered either: OPTIONS falls through to the
+        // router (405 on a GET-only route) without CORS headers.
+        let resp = client()
+            .request(reqwest::Method::OPTIONS, format!("{base}/ping"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .expect("OPTIONS");
+        assert_ne!(resp.status(), 204, "preflight must not be short-circuited");
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_configured_origin_match_emits_headers() {
+        let base = serve(CorsState::new(Some("http://localhost:5173".into()))).await;
+        let resp = client()
+            .get(format!("{base}/ping"))
+            .header("Origin", "http://localhost:5173")
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+        assert_eq!(
+            resp.headers().get("vary").and_then(|v| v.to_str().ok()),
+            Some("Origin"),
+            "specific-origin CORS must set Vary: Origin"
+        );
+
+        // Preflight for the allowed origin is answered with 204 + headers.
+        let resp = client()
+            .request(reqwest::Method::OPTIONS, format!("{base}/ping"))
+            .header("Origin", "http://localhost:5173")
+            .send()
+            .await
+            .expect("OPTIONS");
+        assert_eq!(resp.status(), 204);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+        assert!(resp.headers().get("access-control-allow-methods").is_some());
+    }
+
+    #[tokio::test]
+    async fn cors_configured_origin_mismatch_emits_no_headers() {
+        let base = serve(CorsState::new(Some("http://localhost:5173".into()))).await;
+        let resp = client()
+            .get(format!("{base}/ping"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "a non-allowed origin must not receive CORS headers"
+        );
+
+        let resp = client()
+            .request(reqwest::Method::OPTIONS, format!("{base}/ping"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .expect("OPTIONS");
+        assert_ne!(resp.status(), 204);
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_explicit_wildcard_restores_permissive_behavior() {
+        let base = serve(CorsState::new(Some("*".into()))).await;
+        let resp = client()
+            .get(format!("{base}/ping"))
+            .header("Origin", "https://anywhere.example")
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+
+        let resp = client()
+            .request(reqwest::Method::OPTIONS, format!("{base}/ping"))
+            .header("Origin", "https://anywhere.example")
+            .send()
+            .await
+            .expect("OPTIONS");
+        assert_eq!(resp.status(), 204);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn cors_state_filters_empty_and_invalid_values() {
+        assert!(CorsState::new(Some(String::new())).allow_origin.is_none());
+        // Header-invalid value (embedded newline) is ignored → CORS stays off.
+        assert!(
+            CorsState::new(Some("http://a\nb".into()))
+                .allow_origin
+                .is_none()
+        );
+        assert!(
+            CorsState::new(Some("http://localhost:5173".into()))
+                .allow_origin
+                .is_some()
+        );
+    }
 }
