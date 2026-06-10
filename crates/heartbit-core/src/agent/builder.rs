@@ -909,3 +909,67 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::AgentRunner;
+    use crate::agent::goal::{GoalCondition, GoalSlot};
+    use crate::agent::test_helpers::MockProvider;
+
+    fn goal(objective: &str) -> GoalCondition {
+        // The judge provider is never called at build time — a stub is fine.
+        let judge = Arc::new(MockProvider::new(vec![]));
+        GoalCondition::new(
+            objective,
+            Arc::new(crate::llm::BoxedProvider::from_arc(judge)),
+        )
+    }
+
+    // Documented contract: a goal already installed in a shared slot WINS over
+    // a `goal()`-seeded one — `goal()` only seeds an EMPTY slot.
+    #[test]
+    fn goal_slot_preloaded_wins_over_builder_goal() {
+        let slot: GoalSlot = Arc::new(std::sync::RwLock::new(Some(goal("slot goal A"))));
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .goal(goal("builder goal B"))
+            .goal_slot(slot)
+            .build()
+            .unwrap();
+        let installed = runner.goal.read().unwrap();
+        assert_eq!(
+            installed.as_ref().map(|g| g.objective()),
+            Some("slot goal A"),
+            "a preloaded slot goal must win over the builder goal()"
+        );
+    }
+
+    // The other half of the contract: an EMPTY shared slot is seeded by
+    // `goal()` so the builder goal is not silently dropped.
+    #[test]
+    fn empty_goal_slot_is_seeded_by_builder_goal() {
+        let slot: GoalSlot = Arc::new(std::sync::RwLock::new(None));
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .goal(goal("builder goal B"))
+            .goal_slot(slot.clone())
+            .build()
+            .unwrap();
+        // Visible both through the runner and the externally-held slot handle.
+        assert_eq!(
+            runner.goal.read().unwrap().as_ref().map(|g| g.objective()),
+            Some("builder goal B"),
+        );
+        assert_eq!(
+            slot.read().unwrap().as_ref().map(|g| g.objective()),
+            Some("builder goal B"),
+            "the external slot handle observes the seeded goal"
+        );
+    }
+}

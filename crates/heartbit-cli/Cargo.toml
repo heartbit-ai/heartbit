@@ -49,6 +49,10 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 sqlx = { workspace = true }
 regex = { workspace = true }
+# Runtime use: CLI-side `[daemon]` extension keys (e.g. cors_allow_origin) are
+# parsed from the raw config file because heartbit-core's DaemonConfig cannot
+# carry CLI-only fields.
+toml = { workspace = true }
 
 [features]
 # SECURITY (F-FS-5): the `sandbox` feature is enabled by default on Linux
@@ -62,6 +66,3 @@ default = ["sandbox"]
 local-embedding = ["heartbit/local-embedding"]
 daemon = ["heartbit/daemon"]
 sandbox = ["heartbit/sandbox"]
-
-[dev-dependencies]
-toml = { workspace = true }

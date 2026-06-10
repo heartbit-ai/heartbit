@@ -152,7 +152,12 @@ pub fn view(frame: &mut Frame, app: &App) {
     let view_h = transcript_area.height;
     let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Count VISUAL rows (post-wrap) at the TRANSCRIPT width, not logical lines.
-    let total = transcript.line_count(transcript_area.width) as u16;
+    // The usize → u16 narrowing must SATURATE at ratatui's scroll boundary: a
+    // wrapping cast past 65,535 rows collapses `max_off` and pins follow mode
+    // near the TOP of the transcript (the newest output becomes unreachable).
+    let total = transcript
+        .line_count(transcript_area.width)
+        .min(u16::MAX as usize) as u16;
     let max_off = total.saturating_sub(view_h);
     // Follow-the-bottom by default; top-anchored once the user scrolls up (so
     // streaming output never yanks or drifts the view). `view()` feeds `max_off`
@@ -979,6 +984,33 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    #[test]
+    fn transcript_past_u16_rows_saturates_instead_of_wrapping_to_top() {
+        // Audit 2026-06-09: `line_count as u16` WRAPS modulo 65,536 — past
+        // 65,535 visual rows, `total` collapsed and follow mode pinned the view
+        // near the TOP of the transcript. Saturating keeps the newest
+        // u16-reachable window visible instead.
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        // 35,000 one-line notices + their separators = 70,000 visual rows.
+        for i in 0..35_000 {
+            app.history.push(Cell::Notice(format!("line {i}")));
+        }
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        // Wrapping cast: 70,000 % 65,536 = 4,464 → the view showed cells near
+        // index ~2,230. Saturated: offset 65,527 → cells near index ~32,765.
+        assert!(
+            !text.contains("line 22"),
+            "view must not wrap back to the top of the transcript:\n{text}"
+        );
+        assert!(
+            text.contains("line 3276"),
+            "view must pin to the newest reachable window:\n{text}"
+        );
     }
 
     #[test]

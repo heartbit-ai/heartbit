@@ -1,7 +1,22 @@
 # Twitter/X AI Content Generator Pipeline
 #
 # Multi-agent pipeline: research -> debate (3 writers) -> judge -> image -> publish
-# Run: cargo run -- run -c configs/twitter-content-gen.toml "Post about today's AI news"
+#
+# There is no `[orchestrator].system_prompt` config key — the orchestrator
+# builds its own system prompt from the agent names/descriptions below, so the
+# pipeline ORDER lives in the agent descriptions and the task you pass on the
+# command line. Run with a task that spells out the pipeline:
+#
+# Run: cargo run -- run -c configs/twitter-content-gen.toml "Run the X/Twitter \
+#   content pipeline about today's AI news, in this EXACT order: \
+#   1) researcher finds today's top AI/tech stories; \
+#   2) ALL THREE writers (writer_informative, writer_provocative, writer_witty) \
+#      each get the FULL research and draft one tweet; \
+#   3) judge scores ALL THREE proposals and picks the winner; \
+#   4) image_generator creates an image for the winning tweet; \
+#   5) publisher posts the winning tweet text together with the image data. \
+#   Pass FULL context between stages (don't summarize away details) and stop \
+#   immediately on any failure, reporting what went wrong."
 
 [provider]
 name = "openrouter"
@@ -14,42 +29,12 @@ max_retries = 3
 max_turns = 15
 dispatch_mode = "sequential"
 routing = "always_orchestrate"
-system_prompt = """You are a social media content pipeline orchestrator for X/Twitter, focused on AI/tech news.
-
-## Pipeline (execute in this EXACT order):
-
-### Step 1: Research
-Delegate to "researcher" with: "Find the most interesting and trending AI/tech news from today. \
-Focus on breakthroughs, product launches, open-source releases, or industry shifts. \
-Return 3-5 top stories with key facts and why they matter."
-
-### Step 2: Writing Competition (delegate to ALL THREE writers)
-Take the research results and delegate to each writer with the FULL research context:
-- Delegate to "writer_informative" with: "Based on this research, write a tweet: [research]. Pick the single best story."
-- Delegate to "writer_provocative" with: "Based on this research, write a tweet: [research]. Pick the single best story."
-- Delegate to "writer_witty" with: "Based on this research, write a tweet: [research]. Pick the single best story."
-
-### Step 3: Judge
-Delegate to "judge" with ALL THREE tweet proposals: \
-"Here are 3 tweet proposals. Score each 1-10 on engagement, accuracy, and clarity. Pick the winner.\n\n\
-Informative: [tweet1]\nProvocative: [tweet2]\nWitty: [tweet3]"
-
-### Step 4: Image Generation
-Delegate to "image_generator" with: "Generate a visually striking image for this tweet: [winning tweet text]"
-
-### Step 5: Publish
-Delegate to "publisher" with the winning tweet text AND the image data from image_generator.
-
-## Rules
-- Pass FULL context between stages (don't summarize away details)
-- Stop immediately on any failure and report what went wrong
-- The publisher must receive both the tweet text AND the image data"""
 
 # --- Agent Definitions ---
 
 [[agents]]
 name = "researcher"
-description = "Finds trending AI/tech news stories using web search"
+description = "PIPELINE STEP 1: finds trending AI/tech news stories using web search. Always runs first; its full report feeds all three writers."
 system_prompt = """You are an AI/tech news researcher. Your job is to find the most compelling, \
 trending stories in AI and technology from the last 24 hours.
 
@@ -70,7 +55,7 @@ max_tokens = 4096
 
 [[agents]]
 name = "writer_informative"
-description = "Writes factual, informative tweet angles"
+description = "PIPELINE STEP 2 (one of THREE writers — all three must run, each with the FULL research report): writes factual, informative tweet angles"
 system_prompt = """You are a tech journalist writing for X/Twitter. Your style is INFORMATIVE:
 - Lead with the most important fact
 - Include specific numbers or names
@@ -89,7 +74,7 @@ max_tokens = 1024
 
 [[agents]]
 name = "writer_provocative"
-description = "Writes bold, opinion-driven tweet angles"
+description = "PIPELINE STEP 2 (one of THREE writers — all three must run, each with the FULL research report): writes bold, opinion-driven tweet angles"
 system_prompt = """You are a tech thought leader writing for X/Twitter. Your style is PROVOCATIVE:
 - Start with a bold claim or hot take
 - Challenge conventional wisdom
@@ -108,7 +93,7 @@ max_tokens = 1024
 
 [[agents]]
 name = "writer_witty"
-description = "Writes clever, humor-driven tweet angles"
+description = "PIPELINE STEP 2 (one of THREE writers — all three must run, each with the FULL research report): writes clever, humor-driven tweet angles"
 system_prompt = """You are a tech comedian writing for X/Twitter. Your style is WITTY:
 - Find the absurd or ironic angle in the news
 - Use wordplay, analogies, or unexpected comparisons
@@ -127,7 +112,7 @@ max_tokens = 1024
 
 [[agents]]
 name = "judge"
-description = "Scores tweet proposals and picks the best one"
+description = "PIPELINE STEP 3: receives ALL THREE tweet proposals verbatim, scores them, and picks the single winner"
 system_prompt = """You are a social media strategist judging tweet proposals for X/Twitter.
 
 For each tweet, score 1-10 on:
@@ -154,7 +139,7 @@ max_tokens = 1024
 
 [[agents]]
 name = "image_generator"
-description = "Generates a visual image to accompany the winning tweet"
+description = "PIPELINE STEP 4: generates a visual image for the winning tweet text chosen by the judge"
 system_prompt = """You are a visual designer creating images for X/Twitter posts about AI/tech news.
 
 Given a tweet, generate a compelling image using the image_generate tool.
@@ -173,7 +158,7 @@ max_tokens = 2048
 
 [[agents]]
 name = "publisher"
-description = "Posts the winning tweet with image to X/Twitter via MCP"
+description = "PIPELINE STEP 5 (final): posts to X/Twitter via MCP — must receive BOTH the winning tweet text AND the image data from image_generator"
 system_prompt = """You are a social media publisher. Your ONLY job is to post the tweet to X/Twitter.
 
 You will receive:

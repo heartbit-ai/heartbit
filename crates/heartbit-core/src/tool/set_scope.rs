@@ -43,8 +43,14 @@ impl SetScopeTool {
     }
 
     /// Set the host workspace root enabling the outside-scope redirect.
+    /// Also shared with the guard so it anchors relative file paths against
+    /// the same root (set_scope declares ABSOLUTE roots; the file tools pass
+    /// workspace-RELATIVE paths — without a common anchor the guard falsely
+    /// denied in-scope writes).
     pub fn with_workspace(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.workspace = Some(root.into());
+        let root = root.into();
+        self.guard.set_workspace(&root);
+        self.workspace = Some(root);
         self
     }
 }
@@ -195,6 +201,39 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(allowed, GuardAction::Allow));
+    }
+
+    // End-to-end (audit 2026-06-09): with_workspace shares the anchor with
+    // the guard, so an absolute scope declared via set_scope and a
+    // workspace-RELATIVE write target resolve identically — the in-scope
+    // write is allowed, the out-of-scope one denied.
+    #[tokio::test]
+    async fn with_workspace_anchors_relative_writes_against_absolute_scope() {
+        let guard = Arc::new(ScopeGuard::new(vec![]));
+        let tool = SetScopeTool::new(guard.clone()).with_workspace("/repo");
+        // The agent declares a relative scope; set_scope resolves it to
+        // /repo/scratch-x (absolute).
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            json!({"paths": ["scratch-x"], "reason": "scratch work"}),
+        )
+        .await
+        .unwrap();
+        // A workspace-relative write inside the scope is allowed…
+        let allowed = guard
+            .pre_tool(&call("write", "scratch-x/new.rs"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(allowed, GuardAction::Allow),
+            "in-scope relative write must be allowed: {allowed:?}"
+        );
+        // …one outside it is denied.
+        let denied = guard.pre_tool(&call("edit", "src/main.rs")).await.unwrap();
+        assert!(
+            matches!(denied, GuardAction::Deny { .. }),
+            "out-of-scope relative write must be denied: {denied:?}"
+        );
     }
 
     #[tokio::test]

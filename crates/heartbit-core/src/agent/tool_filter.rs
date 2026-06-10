@@ -67,6 +67,15 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "__respond__",
 ];
 
+/// Whether `name` is permitted under the ReadOnly profile. The runner's
+/// STUDY/ANSWER execution-deny backstop uses this so the deny set always
+/// mirrors the mask exactly (a call that slips past masking — hallucinated,
+/// repaired, MCP, delegation — is refused unless the mask would have
+/// offered it).
+pub(crate) fn is_read_only_tool(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name) || ESSENTIAL_TOOLS.contains(&name)
+}
+
 /// Built-in tool names that indicate the Standard profile.
 const BUILTIN_TOOLS: &[&str] = &[
     "bash",

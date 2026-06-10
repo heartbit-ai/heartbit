@@ -54,8 +54,10 @@ impl RequestMode {
     }
 }
 
-/// Explicit go-tokens: the user's keypress always wins — EXECUTE regardless
-/// of phrasing. Checked first.
+/// Explicit go-tokens: the user's keypress always wins — EXECUTE when the
+/// go IS the message (see `is_explicit_go`). An occurrence embedded in a
+/// longer sentence is content, not a keypress ("don't do it yet" must not
+/// promote). Checked first.
 const GO_TOKENS: &[&str] = &[
     "vas-y",
     "vas y",
@@ -112,6 +114,26 @@ const STUDY_MARKERS: &[&str] = &[
     "what do you think",
     "évalue",
     "evalue",
+    // Inflected forms of the study VERBS: word-boundary matching (which
+    // replaced the old substring scan to stop "analyse" firing inside the
+    // noun "analyseur") would otherwise drop the infinitive/imperative
+    // conjugations and let an investigation request fall through to EXECUTE
+    // — the dangerous direction. These forms are NOT substrings of their
+    // noun counterparts (analyseur / évaluateur), so the noun stays out.
+    // `explorer` is deliberately omitted: it is also the English noun.
+    "étudier",
+    "etudier",
+    "étudiez",
+    "etudiez",
+    "analyser",
+    "analysez",
+    "analyze",
+    "évaluer",
+    "evaluer",
+    "évaluez",
+    "evaluez",
+    "réfléchir",
+    "reflechir",
 ];
 
 /// Design-heavy nouns that, WITHOUT a concrete spec, signal an
@@ -210,19 +232,103 @@ fn contains_any(lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| lower.contains(m))
 }
 
+/// True when any marker occurs as a whole word/phrase: an occurrence flanked
+/// by an alphanumeric char does not count ("analyse" must not fire inside
+/// "analyseur", "explore" not inside "explorer"). Boundaries are char-class
+/// based (`char::is_alphanumeric`), not ASCII `\b`, so accented French words
+/// bound correctly.
+fn contains_any_word(lower: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| contains_word(lower, m))
+}
+
+fn contains_word(lower: &str, marker: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(marker) {
+        let start = from + pos;
+        let end = start + marker.len();
+        let left_ok = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let right_ok = lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if left_ok && right_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Affirmation filler tolerated around an explicit go ("ok vas-y",
+/// "oui, fais-le alors").
+const GO_FILLER: &[&str] = &[
+    "ok", "oui", "yes", "yeah", "yep", "bon", "alors", "then", "et", "and", "please", "stp", "svp",
+    "d'accord", "parfait",
+];
+
+/// True when the trimmed lowercase message IS an explicit go: every word is
+/// part of a GO_TOKEN phrase or affirmation filler (punctuation-tolerant),
+/// with at least one go-token present. A go-token embedded in a longer
+/// sentence ("don't do it yet", "before you go ahead…", "tu vas y arriver")
+/// must NOT force EXECUTE — the mode with no safety nets.
+fn is_explicit_go(trimmed: &str) -> bool {
+    // Normalize: keep word chars (incl. accents), hyphens and apostrophes;
+    // everything else (punctuation, dashes, nbsp…) becomes a separator.
+    let normalized: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '\'' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.is_empty() {
+        return false;
+    }
+    let go_phrases: Vec<Vec<&str>> = GO_TOKENS
+        .iter()
+        .map(|t| t.split_whitespace().collect())
+        .collect();
+    let mut i = 0;
+    let mut saw_go = false;
+    'words: while i < words.len() {
+        for phrase in &go_phrases {
+            if words[i..].starts_with(phrase) {
+                i += phrase.len();
+                saw_go = true;
+                continue 'words;
+            }
+        }
+        if GO_FILLER.contains(&words[i]) {
+            i += 1;
+            continue;
+        }
+        return false;
+    }
+    saw_go
+}
+
 /// Layer 0: deterministic classification. Returns `Some(mode)` only when
 /// CONFIDENT; `None` = ambiguous residue (Layer 1 / safe default).
 pub fn classify_l0(text: &str) -> Option<RequestMode> {
     let lower = text.to_lowercase();
     let trimmed = lower.trim();
 
-    // The user's explicit go always wins.
-    if contains_any(trimmed, GO_TOKENS) {
+    // The user's explicit go always wins — but only when the go IS the
+    // message (whole-text token equality, punctuation/filler tolerated),
+    // never as a substring of a longer request ("don't do it yet…").
+    if is_explicit_go(trimmed) {
         return Some(RequestMode::Execute);
     }
 
     let wish = contains_any(trimmed, WISH_MARKERS) || has_fr_conditional_volition(trimmed);
-    let study = contains_any(trimmed, STUDY_MARKERS);
+    let study = contains_any_word(trimmed, STUDY_MARKERS);
     let design = contains_any(trimmed, DESIGN_NOUNS);
     let anchored = has_concrete_anchor(trimmed);
     let interrogative = QUESTION_OPENERS.iter().any(|q| trimmed.starts_with(q))
@@ -374,6 +480,15 @@ impl RequestRouter {
         self
     }
 
+    /// The currently pinned mode, if the user pinned one (`None` = auto).
+    /// The runner consults this before the bare-affirmation promotion: a
+    /// PINNED Study/Clarify mode must never be silently promoted to Execute.
+    pub fn pinned_mode(&self) -> Option<RequestMode> {
+        self.pin
+            .as_ref()
+            .and_then(|p| RequestMode::from_pin_u8(p.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
     /// Route a fresh request. Always returns a mode (never blocks the run):
     /// L0 when confident, else L1 when available and confident, else the
     /// SAFER default (CLARIFY for design-ish texts, STUDY otherwise).
@@ -442,9 +557,13 @@ impl RequestRouter {
                 _ => None,
             })
             .collect();
-        // Tolerant parse: find the outermost JSON object.
+        // Tolerant parse: find the outermost JSON object. A '}' preceding
+        // the first '{' (stray-brace reply) must bail, not panic the slice.
         let start = body.find('{')?;
         let end = body.rfind('}')?;
+        if end <= start {
+            return None;
+        }
         let v: serde_json::Value = serde_json::from_str(&body[start..=end]).ok()?;
         let mode = RequestMode::parse(v.get("mode")?.as_str()?)?;
         let confidence = v.get("confidence")?.as_f64().unwrap_or(0.0) as f32;
@@ -519,9 +638,27 @@ mod tests {
             "ajoute un test dans crates/core/tests.rs",
             RequestMode::Execute,
         ),
-        // --- go-tokens force EXECUTE regardless of phrasing
-        ("vas-y code directement le crm", RequestMode::Execute),
-        ("je souhaite un crm — just build it", RequestMode::Execute),
+        // --- go-tokens promote ONLY when the go IS the whole message
+        // (token equality modulo punctuation/filler — audit 2026-06-09)
+        ("vas-y", RequestMode::Execute),
+        ("ok vas-y !", RequestMode::Execute),
+        ("just do it", RequestMode::Execute),
+        ("go ahead", RequestMode::Execute),
+        // --- an EMBEDDED go-token is content, not a keypress: route on the
+        // rest of the text. These two previously expected EXECUTE via the
+        // whole-text substring bug; design-noun-without-spec is CLARIFY.
+        ("vas-y code directement le crm", RequestMode::Clarify),
+        ("je souhaite un crm — just build it", RequestMode::Clarify),
+        // --- STUDY stems must not fire inside larger words (audit 2026-06-09)
+        (
+            "corrige l'analyseur dans src/parse.rs",
+            RequestMode::Execute,
+        ),
+        (
+            "add tests for the explorer view in src/ui.rs",
+            RequestMode::Execute,
+        ),
+        ("analyse les options de cache", RequestMode::Study),
         // --- investigation → STUDY
         ("regarde si on peut accélérer le build", RequestMode::Study),
         (
@@ -578,6 +715,107 @@ mod tests {
                 classify_l0(text),
                 None,
                 "{text:?} must fall through to L1/L2"
+            );
+        }
+    }
+
+    /// Finding 2 (audit 2026-06-09): a go-token promotes only when the go
+    /// IS the entire trimmed message (punctuation + affirmation filler
+    /// tolerated), never as a substring of a longer request.
+    #[test]
+    fn explicit_go_requires_the_whole_message() {
+        for s in [
+            "vas-y",
+            "Vas-y !",
+            "ok vas-y",
+            "fais-le.",
+            "do it",
+            "go ahead",
+            "oui, fais-le alors",
+            "vas y",
+        ] {
+            assert_eq!(
+                classify_l0(s),
+                Some(RequestMode::Execute),
+                "{s:?} is an explicit go"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_or_negated_go_does_not_promote() {
+        for s in [
+            "don't do it yet, first show me the plan",
+            "before you go ahead, explain the tradeoffs",
+            "tu vas y arriver",
+            "ne le fais pas tout de suite, vas-y étape par étape",
+        ] {
+            assert_ne!(
+                classify_l0(s),
+                Some(RequestMode::Execute),
+                "{s:?} must NOT promote to EXECUTE"
+            );
+        }
+    }
+
+    /// Finding 3 (audit 2026-06-09): STUDY stems must match on
+    /// char-class word boundaries — "analyse" must not fire inside
+    /// "analyseur", "explore" not inside "explorer".
+    #[test]
+    fn study_stems_do_not_match_inside_words() {
+        for s in [
+            "corrige l'analyseur dans src/parse.rs",
+            "add tests for the explorer view in src/ui.rs",
+            "améliore l'exploitation des logs dans src/log.rs",
+        ] {
+            assert_eq!(
+                classify_l0(s),
+                Some(RequestMode::Execute),
+                "{s:?} is an anchored directive, not a study"
+            );
+        }
+        // …while genuine study verbs at word boundaries still route STUDY.
+        for s in [
+            "analyse les options de cache",
+            "explore les alternatives à kafka",
+        ] {
+            assert_eq!(
+                classify_l0(s),
+                Some(RequestMode::Study),
+                "{s:?} is a study request"
+            );
+        }
+    }
+
+    /// Regression (audit 2026-06-09): word-boundary matching must still catch
+    /// INFLECTED study verbs (infinitive/imperative). With only bare stems an
+    /// "analyser …/etudier …/évaluer …" request carrying a concrete code
+    /// anchor (a path/extension) silently fell through to EXECUTE — the
+    /// safety-protected STUDY→EXECUTE flip. The noun forms must stay EXECUTE.
+    #[test]
+    fn inflected_study_verbs_with_anchor_route_study_not_execute() {
+        for s in [
+            "analyser le module dans src/cache.rs",
+            "étudier l'option de persistance dans src/db.rs",
+            "évaluer les alternatives à kafka dans src/bus.rs",
+            "analysez le coût du parsing dans src/parse.rs",
+        ] {
+            assert_eq!(
+                classify_l0(s),
+                Some(RequestMode::Study),
+                "{s:?} is an inflected study verb — must route STUDY, never EXECUTE"
+            );
+        }
+        // The noun counterparts remain anchored directives (EXECUTE): the
+        // inflected verbs are not substrings of these.
+        for s in [
+            "corrige l'analyseur dans src/parse.rs",
+            "répare l'évaluateur d'expressions dans src/eval.rs",
+        ] {
+            assert_eq!(
+                classify_l0(s),
+                Some(RequestMode::Execute),
+                "{s:?} names a noun, not a study verb"
             );
         }
     }
@@ -686,6 +924,16 @@ mod tests {
             RequestMode::Clarify,
             "design-ish ambiguous text → CLARIFY"
         );
+    }
+
+    /// Finding 1 (audit 2026-06-09): '}' preceding the only '{' in the
+    /// classifier reply (end < start) must bail to the safe default, not
+    /// panic the routing thread on a reversed slice.
+    #[tokio::test]
+    async fn classifier_reply_with_brace_before_open_does_not_panic() {
+        let r = router_with("nope} I cannot classify this {");
+        let routed = r.route("fais quelque chose de bien").await;
+        assert_eq!(routed.source, RouteSource::SafeDefault);
     }
 
     #[tokio::test]

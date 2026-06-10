@@ -455,6 +455,10 @@ pub struct App {
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
     pub last_ttft_ms: u64,
     pub running: bool,
+    /// A model/advisor change landed MID-RUN: the engine rebuild is deferred
+    /// to turn-idle (an immediate channel swap would let the next message
+    /// spawn a second engine while the old one still runs — audit 2026-06-09).
+    pub pending_respawn: bool,
     /// In-flight /learn: staged-lessons digest at stage time (commit guard).
     pub learning: Option<u64>,
     /// When `true`, the transcript stays pinned to the newest content (the
@@ -523,6 +527,7 @@ impl App {
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
+            pending_respawn: false,
             learning: None,
             follow: true,
             scroll_top: 0,
@@ -797,7 +802,24 @@ impl App {
                     if let Some(digest) = self.learning.take() {
                         self.effects.push(Effect::CommitLessons(digest));
                     }
+                    self.flush_pending_respawn();
                 }
+            }
+            // A sub-agent's LLM call: its cost is real (session totals) but its
+            // lifecycle is NOT the run's — running/roster/learning/context bar
+            // stay untouched (the unattributed leak flipped running=false
+            // mid-run and settled still-working siblings — audit 2026-06-09).
+            Msg::SubAgentLlmDone { usage } => {
+                self.tokens.input_tokens =
+                    self.tokens.input_tokens.saturating_add(usage.input_tokens);
+                self.tokens.output_tokens = self
+                    .tokens
+                    .output_tokens
+                    .saturating_add(usage.output_tokens);
+                self.tokens.cache_read_input_tokens = self
+                    .tokens
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_read_input_tokens);
             }
             Msg::ToolStarted {
                 id,
@@ -883,6 +905,7 @@ impl App {
                 if let Some(digest) = self.learning.take() {
                     self.effects.push(Effect::CommitLessons(digest));
                 }
+                self.flush_pending_respawn();
             }
             Msg::AgentExited(_) => {
                 self.finalize_active();
@@ -891,11 +914,13 @@ impl App {
                 // file — and clearing here prevents a stale flag leaking into the
                 // next run's first text-only LlmDone.
                 self.learning = None;
+                self.flush_pending_respawn();
             }
             Msg::RunFailed(error) => {
                 self.finalize_active();
                 self.running = false;
                 self.learning = None;
+                self.flush_pending_respawn();
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
                 // P12: a run failure is terminal for this engine — leave a
@@ -950,6 +975,12 @@ impl App {
             }
             Msg::SessionLoaded(history) => {
                 self.history = history;
+                // The transcript was replaced wholesale: drop stale in-flight
+                // tool ids (a late completion would overwrite a resumed cell)
+                // and any half-streamed buffers from the previous transcript.
+                self.tool_index.clear();
+                self.active = None;
+                self.active_reasoning = None;
                 self.follow = true;
                 self.history
                     .push(Cell::Notice("— session resumed —".into()));
@@ -1182,6 +1213,16 @@ impl App {
             "verify" => self.set_verify_command(arg),
             "clear" | "new" => {
                 self.history.clear();
+                // Stale in-flight ids would point into the REPLACED transcript —
+                // a late ToolCompleted must not overwrite a regrown cell.
+                self.tool_index.clear();
+                // `/clear` is reachable mid-stream (submit() dispatches slashes
+                // unconditionally, the engine keeps running). A surviving
+                // half-streamed buffer would keep growing via StreamDelta and
+                // get flushed as a ghost Cell into the just-cleared transcript —
+                // drop it, exactly as the SessionLoaded path does.
+                self.active = None;
+                self.active_reasoning = None;
                 self.todos.clear();
                 self.agents.clear();
                 self.follow = true;
@@ -1389,6 +1430,28 @@ impl App {
             .push(Cell::Notice("OpenRouter API key saved.".into()));
     }
 
+    /// Request the engine rebuild a model/advisor change needs: immediate when
+    /// idle; DEFERRED to turn-idle when a turn is in flight (swapping the input
+    /// channel under a live engine lets the next message spawn a second engine
+    /// alongside it — audit 2026-06-09). Returns the notice suffix.
+    fn queue_respawn(&mut self) -> &'static str {
+        if self.running {
+            self.pending_respawn = true;
+            "applies when the current turn ends"
+        } else {
+            self.effects.push(Effect::RespawnAgent);
+            "active on your next message"
+        }
+    }
+
+    /// The turn just went idle: flush a deferred model/advisor respawn.
+    fn flush_pending_respawn(&mut self) {
+        if self.pending_respawn {
+            self.pending_respawn = false;
+            self.effects.push(Effect::RespawnAgent);
+        }
+    }
+
     /// Set the model (same semantics as `/model <name>`): update, persist, notice.
     /// Takes effect on the next agent start.
     fn set_model(&mut self, model: String) {
@@ -1397,10 +1460,9 @@ impl App {
         // Rebuild the agent so the new model is actually used (the live agent
         // captured the old model at spawn — a persisted change alone never
         // reached it).
-        self.effects.push(Effect::RespawnAgent);
-        self.history.push(Cell::Notice(format!(
-            "model set to {model} — active on your next message"
-        )));
+        let when = self.queue_respawn();
+        self.history
+            .push(Cell::Notice(format!("model set to {model} — {when}")));
     }
 
     /// Set the advisor's frontier model (`/model advisor <name>`): persist,
@@ -1410,9 +1472,9 @@ impl App {
         self.frontier_model = Some(model.clone());
         self.effects
             .push(Effect::SaveFrontierModel(Some(model.clone())));
-        self.effects.push(Effect::RespawnAgent);
+        let when = self.queue_respawn();
         self.history.push(Cell::Notice(format!(
-            "advisor model set to {model} — active on your next message"
+            "advisor model set to {model} — {when}"
         )));
     }
 
@@ -1421,10 +1483,10 @@ impl App {
     fn clear_frontier_model(&mut self) {
         self.frontier_model = None;
         self.effects.push(Effect::SaveFrontierModel(None));
-        self.effects.push(Effect::RespawnAgent);
-        self.history.push(Cell::Notice(
-            "advisor model cleared — falls back to the main model on your next message".to_string(),
-        ));
+        let when = self.queue_respawn();
+        self.history.push(Cell::Notice(format!(
+            "advisor model cleared — falls back to the main model ({when})"
+        )));
     }
 
     /// `/mode [normal|plan|yolo]` — set the execution mode (same as Shift+Tab).
@@ -1722,6 +1784,8 @@ impl App {
             )));
         }
         self.running = false;
+        // The interrupt ends the turn — a deferred model change applies now.
+        self.flush_pending_respawn();
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -2539,6 +2603,209 @@ mod tests {
         typed(&mut app2, "/model advisor clear");
         app2.update(key(KeyCode::Enter));
         assert!(app2.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn slash_model_mid_run_defers_respawn_to_turn_idle() {
+        // Audit 2026-06-09: an immediate RespawnAgent mid-run swaps the input
+        // channel out from under the live engine — the next message then spawns
+        // a SECOND engine while the old one still runs (shared workspace/UI).
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "/model openai/gpt-x");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.model, "openai/gpt-x", "the choice is not dropped");
+        assert!(
+            app.effects
+                .contains(&Effect::SaveModel("openai/gpt-x".into())),
+            "persistence still happens immediately"
+        );
+        assert!(
+            !app.effects.contains(&Effect::RespawnAgent),
+            "no respawn while a turn is in flight"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("turn ends"))),
+            "the notice must say the change applies when the turn ends"
+        );
+        // Turn-idle (final text-only LlmDone) flushes the deferred respawn.
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(app.effects.contains(&Effect::RespawnAgent));
+        // Once flushed, it must not fire again on the next idle turn.
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!app.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn deferred_respawn_flushes_on_interrupt_too() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "/model advisor anthropic/claude-opus-4");
+        app.update(key(KeyCode::Enter));
+        assert!(!app.effects.contains(&Effect::RespawnAgent));
+        app.update(key(KeyCode::Esc)); // interrupt ends the turn
+        assert!(
+            app.effects.contains(&Effect::RespawnAgent),
+            "Esc ends the turn — the deferred respawn must flush"
+        );
+    }
+
+    #[test]
+    fn sub_agent_llm_done_accumulates_cost_without_lifecycle() {
+        // Audit 2026-06-09: sub-agent LlmResponse leaked into Msg::LlmDone —
+        // flipping running=false mid-run, settling the roster after the FIRST
+        // sibling finished, committing /learn early, and overwriting the
+        // context-fill bar with the sub-agent's window.
+        let mut app = multi();
+        app.running = true;
+        app.learning = Some(42);
+        app.context_tokens = 123;
+        app.update(Msg::AgentsDispatched(vec![
+            "worker".into(),
+            "researcher".into(),
+        ]));
+        app.update(Msg::SubAgentLlmDone {
+            usage: TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        });
+        assert_eq!(app.tokens.input_tokens, 1000, "cost still counts");
+        assert_eq!(app.tokens.output_tokens, 50);
+        assert!(app.running, "a sub-agent turn must not idle the run");
+        assert_eq!(app.learning, Some(42), "no early /learn commit");
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitLessons(_)))
+        );
+        assert_eq!(
+            app.context_tokens, 123,
+            "the context bar shows the ENTRY agent's fill, not the sub-agent's"
+        );
+        assert!(
+            app.agents.iter().all(|r| r.state == AgentState::Working),
+            "still-working siblings must not be settled Done"
+        );
+    }
+
+    #[test]
+    fn clear_drops_stale_tool_index() {
+        // Audit 2026-06-09: /clear left tool_index pointing into the OLD
+        // transcript — an in-flight ToolCompleted then overwrote whatever Tool
+        // cell occupied that index in the regrown history.
+        let mut app = keyed();
+        app.history.push(Cell::User("hi".into()));
+        app.update(tool_started("heartbit", "bash")); // id "heartbit-bash" at idx 1
+        typed(&mut app, "/clear");
+        app.update(key(KeyCode::Enter));
+        // Regrow: a NEW tool lands at the same index the old id pointed to.
+        app.update(Msg::ToolStarted {
+            id: "t2".into(),
+            name: "read".into(),
+            input: "{}".into(),
+            agent: "heartbit".into(),
+        });
+        app.update(Msg::ToolCompleted {
+            id: "heartbit-bash".into(),
+            is_error: true,
+            output: "BOOM".into(),
+            duration_ms: 9,
+        });
+        let t2 = app
+            .history
+            .iter()
+            .find(|c| matches!(c, Cell::Tool { name, .. } if name == "read"))
+            .expect("the new tool cell exists");
+        assert!(
+            matches!(
+                t2,
+                Cell::Tool {
+                    status: ToolStatus::Running,
+                    output: None,
+                    ..
+                }
+            ),
+            "a stale completion must not corrupt the regrown transcript"
+        );
+    }
+
+    #[test]
+    fn clear_mid_stream_drops_the_half_streamed_buffer() {
+        // Audit-review 2026-06-09: /clear is reachable while the agent streams
+        // (the engine keeps running). A surviving `active`/`active_reasoning`
+        // buffer would keep growing and be flushed as a ghost Cell into the
+        // just-cleared transcript. It must be dropped, like SessionLoaded does.
+        let mut app = keyed();
+        app.history.push(Cell::User("hi".into()));
+        app.update(Msg::ReasoningDelta("thinking…".into()));
+        app.update(Msg::StreamDelta("half an answer".into()));
+        assert!(app.active.is_some(), "precondition: a live buffer exists");
+        typed(&mut app, "/clear");
+        app.update(key(KeyCode::Enter));
+        assert!(app.active.is_none(), "/clear must drop the streamed buffer");
+        assert!(
+            app.active_reasoning.is_none(),
+            "/clear must drop the streamed reasoning buffer"
+        );
+        // The in-flight turn continues; the next finalize must not resurrect
+        // pre-clear content into the cleared transcript.
+        app.update(Msg::StreamDelta("post-clear text".into()));
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        let ghost = app.history.iter().any(|c| {
+            matches!(c, Cell::Agent(t) if t.contains("half an answer"))
+                || matches!(c, Cell::Reasoning(t) if t.contains("thinking"))
+        });
+        assert!(!ghost, "no pre-clear content may reappear after /clear");
+    }
+
+    #[test]
+    fn session_loaded_drops_stale_tool_index_and_stream() {
+        let mut app = keyed();
+        app.update(tool_started("heartbit", "bash")); // id "heartbit-bash" at idx 0
+        app.update(Msg::StreamDelta("half-streamed".into()));
+        app.update(Msg::SessionLoaded(vec![Cell::Tool {
+            name: "write".into(),
+            input: "{}".into(),
+            status: ToolStatus::Ok,
+            output: Some("done".into()),
+            duration_ms: Some(1),
+            agent: None,
+        }]));
+        assert!(
+            app.active.is_none(),
+            "no stale stream over a resumed session"
+        );
+        app.update(Msg::ToolCompleted {
+            id: "heartbit-bash".into(),
+            is_error: true,
+            output: "BOOM".into(),
+            duration_ms: 9,
+        });
+        assert!(
+            matches!(
+                &app.history[0],
+                Cell::Tool { name, output: Some(o), .. } if name == "write" && o == "done"
+            ),
+            "a stale completion must not overwrite the resumed transcript"
+        );
     }
 
     #[test]

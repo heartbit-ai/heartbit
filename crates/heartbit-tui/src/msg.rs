@@ -15,6 +15,13 @@ pub struct PendingTool {
     pub input: String,
 }
 
+/// The entry agent's event name: core's `Orchestrator` names its entry runner
+/// `"orchestrator"`. Run lifecycle (the `running` flag, roster settle, /learn
+/// commit, terminal failure) must key off THIS agent only — the delegation
+/// plane forwards `on_event` to every sub-agent, so their lifecycle events
+/// arrive on the same channel under their own names (audit 2026-06-09).
+pub const ENTRY_AGENT: &str = "orchestrator";
+
 /// Everything that can drive an [`crate::app::App`] state transition.
 pub enum Msg {
     // ---- from the terminal ----
@@ -63,6 +70,12 @@ pub enum Msg {
         agent: String,
         success: bool,
         tokens: u32,
+    },
+    /// A sub-agent's LLM call finished: accumulate its cost into the session
+    /// totals WITHOUT touching the run lifecycle (`running`, roster settle,
+    /// /learn commit, context-fill bar) — those belong to the entry agent.
+    SubAgentLlmDone {
+        usage: TokenUsage,
     },
     /// The orchestrator dynamically spawned a sub-agent with a scoped task.
     AgentSpawned {
@@ -125,19 +138,28 @@ pub enum Msg {
 impl Msg {
     /// Translate a framework [`AgentEvent`] into a UI [`Msg`], or `None` if it has
     /// no visible effect. Streaming text arrives separately via the `on_text`
-    /// callback (as [`Msg::StreamDelta`]), not from events.
+    /// callback (as [`Msg::StreamDelta`]), not from events. Lifecycle events
+    /// (turn/LLM/run) are gated on [`ENTRY_AGENT`]: forwarded sub-agent copies
+    /// map to roster/cost messages instead, never to run-state transitions.
     pub fn from_event(event: AgentEvent) -> Option<Msg> {
         match event {
-            AgentEvent::TurnStarted { .. } => Some(Msg::TurnStarted),
+            AgentEvent::TurnStarted { agent, .. } => {
+                (agent == ENTRY_AGENT).then_some(Msg::TurnStarted)
+            }
             AgentEvent::LlmResponse {
+                agent,
                 usage,
                 tool_call_count,
                 time_to_first_token_ms,
                 ..
-            } => Some(Msg::LlmDone {
-                usage,
-                had_tool_calls: tool_call_count > 0,
-                ttft_ms: time_to_first_token_ms,
+            } => Some(if agent == ENTRY_AGENT {
+                Msg::LlmDone {
+                    usage,
+                    had_tool_calls: tool_call_count > 0,
+                    ttft_ms: time_to_first_token_ms,
+                }
+            } else {
+                Msg::SubAgentLlmDone { usage }
             }),
             AgentEvent::ToolCallStarted {
                 tool_name,
@@ -182,8 +204,28 @@ impl Msg {
                 output,
                 duration_ms,
             }),
-            AgentEvent::RunCompleted { .. } => Some(Msg::RunCompleted),
-            AgentEvent::RunFailed { error, .. } => Some(Msg::RunFailed(error)),
+            AgentEvent::RunCompleted { agent, .. } => {
+                // A sub-agent's completion is already a roster row finish (the
+                // SubAgentCompleted event above) — only the ENTRY agent's
+                // completion ends the run.
+                (agent == ENTRY_AGENT).then_some(Msg::RunCompleted)
+            }
+            AgentEvent::RunFailed {
+                agent,
+                error,
+                partial_usage,
+            } => Some(if agent == ENTRY_AGENT {
+                Msg::RunFailed(error)
+            } else {
+                // A sub-agent failure is routine (delegate_task returns the
+                // error as a tool result; the orchestrator continues) — mark
+                // the roster row failed, never the whole run.
+                Msg::SubAgentDone {
+                    agent,
+                    success: false,
+                    tokens: partial_usage.input_tokens + partial_usage.output_tokens,
+                }
+            }),
             AgentEvent::GuardrailDenied {
                 reason, tool_name, ..
             } => Some(Msg::Notice(format!(
@@ -279,11 +321,126 @@ mod tests {
     #[test]
     fn run_failed_carries_error() {
         let ev = AgentEvent::RunFailed {
-            agent: "a".into(),
+            agent: ENTRY_AGENT.into(),
             error: "kaboom".into(),
             partial_usage: TokenUsage::default(),
         };
         assert!(matches!(Msg::from_event(ev), Some(Msg::RunFailed(e)) if e == "kaboom"));
+    }
+
+    // ---- delegation-plane attribution (audit 2026-06-09): sub-agent lifecycle
+    // events must NOT masquerade as the entry agent's — they flipped `running`
+    // mid-run, settled the roster early, committed /learn lessons before the
+    // rewrite, and declared the whole run failed on a sub-agent failure.
+
+    fn llm_response(agent: &str, tool_call_count: usize) -> AgentEvent {
+        AgentEvent::LlmResponse {
+            agent: agent.into(),
+            turn: 1,
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            },
+            stop_reason: heartbit_core::StopReason::EndTurn,
+            tool_call_count,
+            text: String::new(),
+            latency_ms: 5,
+            model: None,
+            time_to_first_token_ms: 2,
+        }
+    }
+
+    #[test]
+    fn entry_llm_response_maps_to_llm_done() {
+        match Msg::from_event(llm_response(ENTRY_AGENT, 0)) {
+            Some(Msg::LlmDone {
+                usage,
+                had_tool_calls,
+                ttft_ms,
+            }) => {
+                assert_eq!(usage.input_tokens, 100);
+                assert!(!had_tool_calls);
+                assert_eq!(ttft_ms, 2);
+            }
+            _ => panic!("entry-agent LlmResponse must map to LlmDone"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_llm_response_maps_to_usage_only_not_llm_done() {
+        match Msg::from_event(llm_response("worker", 0)) {
+            Some(Msg::SubAgentLlmDone { usage }) => {
+                assert_eq!(usage.input_tokens, 100, "the cost is still accumulated");
+            }
+            Some(Msg::LlmDone { .. }) => {
+                panic!("a sub-agent LlmResponse must not flip the run lifecycle")
+            }
+            _ => panic!("expected SubAgentLlmDone"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_run_completed_is_dropped_entry_maps() {
+        let sub = AgentEvent::RunCompleted {
+            agent: "researcher".into(),
+            total_usage: TokenUsage::default(),
+            tool_calls_made: 3,
+        };
+        assert!(
+            Msg::from_event(sub).is_none(),
+            "SubAgentCompleted already finishes the roster row"
+        );
+        let entry = AgentEvent::RunCompleted {
+            agent: ENTRY_AGENT.into(),
+            total_usage: TokenUsage::default(),
+            tool_calls_made: 3,
+        };
+        assert!(matches!(Msg::from_event(entry), Some(Msg::RunCompleted)));
+    }
+
+    #[test]
+    fn sub_agent_run_failed_maps_to_roster_failure_not_run_failed() {
+        let ev = AgentEvent::RunFailed {
+            agent: "worker".into(),
+            error: "Max turns (60) exceeded".into(),
+            partial_usage: TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            },
+        };
+        match Msg::from_event(ev) {
+            Some(Msg::SubAgentDone {
+                agent,
+                success,
+                tokens,
+            }) => {
+                assert_eq!(agent, "worker");
+                assert!(!success);
+                assert_eq!(tokens, 10);
+            }
+            Some(Msg::RunFailed(_)) => {
+                panic!("a sub-agent failure must not declare the whole run failed")
+            }
+            _ => panic!("expected SubAgentDone"),
+        }
+    }
+
+    #[test]
+    fn sub_agent_turn_started_is_dropped_entry_maps() {
+        let sub = AgentEvent::TurnStarted {
+            agent: "worker".into(),
+            turn: 1,
+            max_turns: 60,
+        };
+        assert!(Msg::from_event(sub).is_none());
+        let entry = AgentEvent::TurnStarted {
+            agent: ENTRY_AGENT.into(),
+            turn: 1,
+            max_turns: 300,
+        };
+        assert!(matches!(Msg::from_event(entry), Some(Msg::TurnStarted)));
     }
 
     #[test]

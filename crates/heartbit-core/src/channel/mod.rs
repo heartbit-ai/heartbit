@@ -72,7 +72,9 @@ pub type ConsolidateSession =
 
 /// Split a message into chunks that fit a platform's message-length limit.
 ///
-/// Tries to split at newlines for readability; falls back to char boundaries.
+/// Tries to split at newlines for readability; falls back to the largest
+/// UTF-8 char boundary that fits. When `max_len` is smaller than a single
+/// character, that character is emitted whole (a codepoint cannot be split).
 /// Shared by Discord, Slack, and other channel adapters.
 pub fn chunk_message(text: &str, max_len: usize) -> Vec<&str> {
     if text.len() <= max_len {
@@ -85,19 +87,21 @@ pub fn chunk_message(text: &str, max_len: usize) -> Vec<&str> {
             chunks.push(remaining);
             break;
         }
-        // Try to split at a newline
-        let split_at = remaining[..max_len].rfind('\n').unwrap_or_else(|| {
-            // Fall back to char boundary
-            let mut pos = max_len;
-            while pos > 0 && !remaining.is_char_boundary(pos) {
-                pos -= 1;
-            }
-            pos
-        });
-        let split_at = if split_at == 0 {
-            max_len.min(remaining.len())
-        } else {
-            split_at
+        // Largest char-boundary window that fits the limit — computed BEFORE
+        // any slicing, so a multibyte character at `max_len` cannot panic.
+        let window_end = crate::tool::builtins::floor_char_boundary(remaining, max_len);
+        // Prefer splitting at the last newline inside the window.
+        let split_at = match remaining[..window_end].rfind('\n') {
+            Some(nl) if nl > 0 => nl,
+            // No usable newline: take the whole window.
+            _ if window_end > 0 => window_end,
+            // Degenerate: max_len is smaller than the first character. Emit
+            // it whole so the loop always advances.
+            _ => remaining
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(remaining.len()),
         };
         chunks.push(&remaining[..split_at]);
         remaining = &remaining[split_at..];
@@ -131,5 +135,66 @@ mod tests {
                 attachments: Vec::new(),
             };
         }
+    }
+
+    #[test]
+    fn chunk_message_short_text_passthrough() {
+        assert_eq!(chunk_message("hello", 10), vec!["hello"]);
+    }
+
+    #[test]
+    fn chunk_message_prefers_newline_split() {
+        let chunks = chunk_message("aaa\nbbb", 5);
+        assert_eq!(chunks, vec!["aaa", "bbb"]);
+    }
+
+    // Panic-safety: byte index max_len falling INSIDE a multibyte character
+    // must not panic — the old code sliced `remaining[..max_len]` before the
+    // char-boundary fallback ever ran. An LLM reply in French/emoji over the
+    // platform limit is the live trigger (Discord/Slack bridges).
+    #[test]
+    fn chunk_message_multibyte_at_boundary_does_not_panic() {
+        // "é" is 2 bytes; an odd max_len lands mid-codepoint.
+        let text = "é".repeat(60); // 120 bytes
+        let chunks = chunk_message(&text, 5);
+        // No newlines in the input, so the chunks must reassemble losslessly.
+        assert_eq!(chunks.concat(), text);
+        for c in &chunks {
+            assert!(c.len() <= 5, "chunk over limit: {} bytes", c.len());
+        }
+    }
+
+    #[test]
+    fn chunk_message_emoji_at_boundary_does_not_panic() {
+        // 4-byte emoji; max_len = 10 lands mid-codepoint (10 % 4 != 0).
+        let text = "🦀".repeat(30); // 120 bytes
+        let chunks = chunk_message(&text, 10);
+        assert_eq!(chunks.concat(), text);
+        for c in &chunks {
+            assert!(c.len() <= 10, "chunk over limit: {} bytes", c.len());
+        }
+    }
+
+    // The `split_at == 0` fallback used to re-assign a raw `max_len` index,
+    // reintroducing the non-boundary slice even after a safe one was computed:
+    // a window whose ONLY newline is at position 0 takes that path.
+    #[test]
+    fn chunk_message_leading_newline_window_does_not_panic() {
+        let mut text = String::from("\n");
+        text.push_str(&"é".repeat(30)); // newline + 60 bytes of 2-byte chars
+        let chunks = chunk_message(&text, 5);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(c.len() <= 5, "chunk over limit: {} bytes", c.len());
+        }
+    }
+
+    // Degenerate limit: max_len smaller than the first character's width. A
+    // codepoint cannot be split, so the chunk carries the whole char (the only
+    // non-panicking option) and the loop must still terminate.
+    #[test]
+    fn chunk_message_max_len_smaller_than_char_still_terminates() {
+        let chunks = chunk_message("日本語", 1);
+        assert_eq!(chunks, vec!["日", "本", "語"]);
     }
 }

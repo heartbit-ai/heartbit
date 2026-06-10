@@ -20,6 +20,15 @@ const MAX_MATCHES: usize = 100;
 const MAX_LINE_BYTES: usize = 2_000;
 /// Max total bytes of all match lines combined.
 const MAX_TOTAL_BYTES: usize = 100_000;
+/// Hard cap on raw bytes ingested from rg's stdout. `--max-count` limits
+/// matches PER FILE, not globally, so a permissive pattern over a large tree
+/// can emit far more than the rendered caps — the reader stops (and rg is
+/// killed) once this many bytes are collected, bounding process memory at the
+/// source. 10x `MAX_TOTAL_BYTES` leaves room for per-line truncation to still
+/// fill the rendered output.
+const MAX_RG_STDOUT_BYTES: usize = MAX_TOTAL_BYTES * 10;
+/// Cap on rg's stderr (only ever a short error message on exit code 2).
+const MAX_RG_STDERR_BYTES: usize = 8_192;
 
 /// Builtin tool that searches file contents for a regex pattern.
 ///
@@ -165,7 +174,8 @@ async fn try_ripgrep(
         .arg("-n")
         .arg("--color")
         .arg("never")
-        // Cap output at source to avoid buffering unbounded results
+        // Per-FILE match cap (rg has no global one) — the global byte cap is
+        // enforced by the capped stdout reader below (MAX_RG_STDOUT_BYTES).
         .arg("--max-count")
         .arg((MAX_MATCHES + 1).to_string());
 
@@ -192,16 +202,59 @@ async fn try_ripgrep(
     cmd.arg(pattern).arg(path);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // If this future is dropped mid-flight (interrupt), don't leave rg running.
+    cmd.kill_on_drop(true);
 
-    let output = cmd
-        .output()
-        .await
+    let mut child = cmd
+        .spawn()
         .map_err(|e| Error::Agent(format!("rg not available: {e}")))?;
 
-    // rg exit code 0 = matches found, 1 = no matches, 2 = error
-    match output.status.code() {
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Agent("rg stdout unavailable".into()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| Error::Agent("rg stderr unavailable".into()))?;
+    // Drain stderr concurrently (retaining only a short head) so rg can never
+    // block on a full stderr pipe while we read stdout.
+    let stderr_task = tokio::spawn(async move {
+        let mut pipe = stderr_pipe;
+        read_capped(&mut pipe, MAX_RG_STDERR_BYTES, true).await
+    });
+
+    // Global source-side cap: stop ingesting once MAX_RG_STDOUT_BYTES are
+    // collected — `--max-count` is only per-file, so a permissive pattern over
+    // a large tree could otherwise buffer hundreds of MB before the rendered
+    // caps apply.
+    let (raw, source_capped) = read_capped(&mut stdout_pipe, MAX_RG_STDOUT_BYTES, false)
+        .await
+        .map_err(|e| Error::Agent(format!("rg read failed: {e}")))?;
+    if source_capped {
+        // We already hold more than the rendered caps can use; stop rg instead
+        // of letting it stream the rest of the tree.
+        let _ = child.start_kill();
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| Error::Agent(format!("rg failed: {e}")))?;
+    let stderr_raw = match stderr_task.await {
+        Ok(Ok((bytes, _))) => bytes,
+        _ => Vec::new(),
+    };
+
+    // rg exit code 0 = matches found, 1 = no matches, 2 = error. A kill after
+    // the source cap means matches were found: treat it as success.
+    let code = if source_capped {
+        Some(0)
+    } else {
+        status.code()
+    };
+    match code {
         Some(0) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&raw);
             // Apply the same per-line and total-byte caps as the fallback path
             // so a giant single line (e.g. a minified/dep file) can't blow the
             // model context even when rg is the one producing output.
@@ -226,10 +279,41 @@ async fn try_ripgrep(
         }
         Some(1) => Ok(ToolOutput::success("No matches found.")),
         _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&stderr_raw);
             Err(Error::Agent(format!("rg error: {stderr}")))
         }
     }
+}
+
+/// Read from `reader`, retaining at most `cap` bytes. With `drain` set, keeps
+/// reading (and discarding) to EOF after the cap so the writer never blocks on
+/// a full pipe; otherwise returns as soon as the cap is reached. Returns the
+/// collected bytes and whether the cap was hit.
+async fn read_capped<R>(reader: &mut R, cap: usize, drain: bool) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8_192];
+    let mut capped = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if out.len() < cap {
+            let take = n.min(cap - out.len());
+            out.extend_from_slice(&buf[..take]);
+        }
+        if out.len() >= cap {
+            capped = true;
+            if !drain {
+                break;
+            }
+        }
+    }
+    Ok((out, capped))
 }
 
 fn fallback_grep(
@@ -663,6 +747,80 @@ mod tests {
             result.content.contains("needle"),
             "explicit file in build dir should still grep (rg path): {}",
             result.content
+        );
+    }
+
+    // ---- source-side rg stdout cap (audit 2026-06-09) ----
+
+    #[tokio::test]
+    async fn read_capped_stops_at_cap() {
+        let data = vec![b'a'; 3 * MAX_RG_STDOUT_BYTES];
+        let mut reader = &data[..];
+        let (out, capped) = super::read_capped(&mut reader, MAX_RG_STDOUT_BYTES, false)
+            .await
+            .unwrap();
+        assert!(capped, "3x the cap must report capped");
+        assert_eq!(
+            out.len(),
+            MAX_RG_STDOUT_BYTES,
+            "must retain exactly the cap"
+        );
+        assert!(
+            !reader.is_empty(),
+            "without drain, reading must stop at the cap (memory/latency bound)"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_small_input_uncapped() {
+        let data = b"hello".to_vec();
+        let mut reader = &data[..];
+        let (out, capped) = super::read_capped(&mut reader, 100, false).await.unwrap();
+        assert!(!capped);
+        assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_capped_drain_consumes_to_eof_but_retains_cap() {
+        let data = vec![b'x'; 100_000];
+        let mut reader = &data[..];
+        let (out, capped) = super::read_capped(&mut reader, 1_000, true).await.unwrap();
+        assert!(capped);
+        assert_eq!(out.len(), 1_000);
+        assert!(reader.is_empty(), "drain mode must consume to EOF");
+    }
+
+    // End-to-end: a search whose raw match volume exceeds MAX_RG_STDOUT_BYTES
+    // must still return a correctly capped result (rg path: source-capped read
+    // + kill; fallback path: walker caps). Exercises whichever path is live.
+    #[tokio::test]
+    async fn grep_execute_source_volume_beyond_rg_cap_still_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        // 15 files x 101 matching lines x ~800 bytes ≈ 1.2MB of raw matches,
+        // beyond MAX_RG_STDOUT_BYTES (1MB) even with --max-count 101 per file.
+        let line = format!("needle {}\n", "y".repeat(800));
+        for i in 0..15 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), line.repeat(101)).unwrap();
+        }
+
+        let tool = GrepTool::new(None, Arc::new(Vec::new()));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.len() <= MAX_TOTAL_BYTES + 2_000,
+            "rendered output not capped: {}",
+            result.content.len()
+        );
+        assert!(
+            result.content.contains("truncated") || result.content.contains("showing first"),
+            "missing truncation footer: ...{}",
+            &result.content[result.content.len().saturating_sub(150)..]
         );
     }
 

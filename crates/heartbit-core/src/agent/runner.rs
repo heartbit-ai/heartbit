@@ -181,10 +181,11 @@ const PLAN_GATE_MUTATING: &[&str] = &["edit", "write", "patch"];
 /// backstop fires regardless of request phrasing.
 const PLAN_GATE_BACKSTOP_AT: u32 = 3;
 
-/// Tools denied at execution in STUDY/ANSWER (read-only) mode — the
-/// side-effect set (bash INCLUDED here, unlike the plan-gate's content-
-/// mutation set; design doc §4 resolves the two semantics by intent).
-const MODE_READONLY_DENY: &[&str] = &["edit", "write", "patch", "bash"];
+// STUDY/ANSWER execution-deny backstop: mirrors the ReadOnly tool mask
+// (`tool_filter::is_read_only_tool`) as a WHITELIST — any call not in the
+// read-only set (edit/write/patch/bash, but also delegation, MCP, A2A…)
+// is refused before side effects. A blacklist here proved too narrow: it
+// covered 4 names while delegate_task/form_squad/MCP calls slipped through.
 
 /// Rustc failure classes the repair-hint gate recognizes (live finding
 /// 6a258ab2: the model iterated blind on E0405 sqlx API drift).
@@ -851,15 +852,24 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut last_goal_met: Option<bool> = None;
             // Long-horizon "replan on out-of-plan": bounded count of verify-fail
             // continuations so a permanently-red verify can't loop forever.
+            // Per-REQUEST (reset at on_input) like the other gates.
             let mut verify_replans_used: u32 = 0;
             const MAX_VERIFY_REPLANS: u32 = 8;
+            // Index of the first message of the CURRENT request — the
+            // verify-replan gate scans only this suffix so stale verify
+            // results from earlier requests can't re-trigger it.
+            let mut request_start_msg: usize = 0;
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
             let mut last_model_name: Option<String> = None;
-            // Prevents infinite compaction loops: set true after compaction,
-            // cleared at the start of each normal iteration.
-            let mut compacted_last_turn = false;
+            // Reactive overflow-recovery ladder (prevents both infinite
+            // compaction loops AND the single-shot dead-end): 0 = untried,
+            // 1 = deterministic truncation ran last turn, 2 = summarization
+            // ran last turn. A second consecutive overflow escalates to the
+            // next rung instead of failing; past rung 2 it is unrecoverable.
+            // Cleared at the start of each normal (non-recovering) iteration.
+            let mut overflow_recovery_stage: u8 = 0;
             // Anti-thrash guard for proactive compaction: never fire two turns running.
             let mut proactive_compacted_last_turn = false;
             // Delegation-nudge state, scoped to ONE user request (reset when
@@ -930,8 +940,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 ctx.increment_turn();
-                let can_compact = !compacted_last_turn;
-                compacted_last_turn = false;
+                let entry_recovery_stage = overflow_recovery_stage;
+                overflow_recovery_stage = 0;
                 debug!(agent = %self.name, turn = ctx.current_turn(), "executing turn");
                 self.emit(AgentEvent::TurnStarted {
                     agent: self.name.clone(),
@@ -1072,7 +1082,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // event is what the TUI trace and /stats consume. Stays 0 for
                 // cache hits and non-streaming calls.
                 let ttft_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let llm_result = if let Some(cached) = cache_hit {
+                // Whether THIS turn's response was synthesized because the user
+                // interrupted. Read by the stop-gates below: an interrupted turn
+                // must fall straight through to `on_input` — running the
+                // corrective gates (goal judge, verify-replan, ask/act/study)
+                // would override the interrupt and keep the run going.
+                let mut llm_interrupted = false;
+                let llm_result = if let Some(mut cached) = cache_hit {
                     tracing::debug!(
                         agent = %self.name,
                         turn = ctx.current_turn(),
@@ -1081,6 +1097,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     if mode.includes_metrics() {
                         llm_span.record("cache_hit", true);
                     }
+                    // A cache hit consumes zero provider tokens — zero the
+                    // stored usage so totals, cost, the max_total_tokens budget,
+                    // and per-tenant accounting aren't billed a second time
+                    // (the original call already accounted them).
+                    cached.usage = TokenUsage::default();
                     Ok(cached)
                 } else {
                     // TTFT: wrap on_text to capture time-to-first-token
@@ -1131,7 +1152,6 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // clean end-of-turn (non-empty text — providers reject empty
                     // assistant content), rearm for the next turn, and let the
                     // existing no-tool-calls path await the next `on_input` message.
-                    let mut interrupted = false;
                     let result = match self.interrupt.as_ref() {
                         Some(handle) => {
                             let token = handle.token();
@@ -1139,7 +1159,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 biased;
                                 _ = token.cancelled() => {
                                     handle.rearm();
-                                    interrupted = true;
+                                    llm_interrupted = true;
                                     Ok(crate::llm::types::CompletionResponse {
                                         content: vec![crate::llm::types::ContentBlock::Text {
                                             text: "[interrupted by user]".into(),
@@ -1158,7 +1178,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // Store successful non-streaming responses in cache (never the
                     // synthetic interrupt response). Only EndTurn responses are
                     // cached — ToolUse responses trigger side-effecting execution.
-                    if !interrupted
+                    if !llm_interrupted
                         && let (Ok(resp), Some(key)) = (&result, cache_key)
                         && resp.stop_reason == crate::llm::types::StopReason::EndTurn
                         && let Some(ref c) = self.response_cache
@@ -1218,44 +1238,51 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // skipped recovery entirely.
                         if crate::llm::error_class::classify(&e)
                             == crate::llm::error_class::ErrorClass::ContextOverflow
-                            && can_compact
+                            && entry_recovery_stage < 2
                         {
                             tracing::warn!(
                                 agent = %self.name,
                                 error = %e,
+                                recovery_stage = entry_recovery_stage,
                                 "context overflow detected, attempting recovery"
                             );
-                            // Deterministic first: hard-truncate oversized tool
-                            // results and retry WITHOUT an LLM call — a
-                            // summarization request would resend the very
-                            // context that just overflowed.
-                            let emergency_cap = self
-                                .session_prune_config
-                                .as_ref()
-                                .map(|c| c.pruned_tool_result_max_bytes)
-                                .unwrap_or(EMERGENCY_TOOL_RESULT_MAX_BYTES);
-                            let saved = ctx.truncate_oversized_tool_results(
-                                emergency_cap,
-                                self.context_recall_store.is_some(),
-                            );
-                            if saved > 0 {
-                                tracing::warn!(
-                                    agent = %self.name,
-                                    bytes_saved = saved,
+                            // Rung 1, deterministic first: hard-truncate
+                            // oversized tool results and retry WITHOUT an LLM
+                            // call — a summarization request would resend the
+                            // very context that just overflowed. Skipped when
+                            // truncation already ran last turn (it saved bytes
+                            // but the retry still overflowed): escalate to
+                            // summarization instead of dead-ending.
+                            if entry_recovery_stage == 0 {
+                                let emergency_cap = self
+                                    .session_prune_config
+                                    .as_ref()
+                                    .map(|c| c.pruned_tool_result_max_bytes)
+                                    .unwrap_or(EMERGENCY_TOOL_RESULT_MAX_BYTES);
+                                let saved = ctx.truncate_oversized_tool_results(
                                     emergency_cap,
-                                    "oversized tool results truncated, retrying"
+                                    self.context_recall_store.is_some(),
                                 );
-                                self.emit(AgentEvent::AutoCompactionTriggered {
-                                    agent: self.name.clone(),
-                                    turn: ctx.current_turn(),
-                                    success: true,
-                                    usage: TokenUsage::default(),
-                                });
-                                compacted_last_turn = true;
-                                continue;
+                                if saved > 0 {
+                                    tracing::warn!(
+                                        agent = %self.name,
+                                        bytes_saved = saved,
+                                        emergency_cap,
+                                        "oversized tool results truncated, retrying"
+                                    );
+                                    self.emit(AgentEvent::AutoCompactionTriggered {
+                                        agent: self.name.clone(),
+                                        turn: ctx.current_turn(),
+                                        success: true,
+                                        usage: TokenUsage::default(),
+                                    });
+                                    overflow_recovery_stage = 1;
+                                    continue;
+                                }
                             }
-                            // Nothing oversized (aggregate bloat): fall back to
-                            // LLM summarization — `generate_summary` bounds its
+                            // Rung 2 — nothing oversized (aggregate bloat) or
+                            // truncation already tried: fall back to LLM
+                            // summarization — `generate_summary` bounds its
                             // transcript, so it cannot itself overflow.
                             match self.generate_summary(&ctx).await {
                                 Ok((Some(summary), summary_usage)) => {
@@ -1266,6 +1293,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                                     *usage_acc.lock().expect("usage lock poisoned") = total_usage;
                                     self.flush_to_memory_before_compaction(&ctx, 4).await;
                                     ctx.inject_summary(summary, 4);
+                                    // Re-anchor the request boundary past the
+                                    // index-0 summary (see the proactive site).
+                                    request_start_msg = request_start_msg.min(1);
                                     self.emit(AgentEvent::AutoCompactionTriggered {
                                         agent: self.name.clone(),
                                         turn: ctx.current_turn(),
@@ -1277,7 +1307,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                                         turn: ctx.current_turn(),
                                         usage: summary_usage,
                                     });
-                                    compacted_last_turn = true;
+                                    overflow_recovery_stage = 2;
                                     continue;
                                 }
                                 Ok((None, summary_usage)) => {
@@ -1694,7 +1724,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // structured `question` tool is registered, redirect ONCE
                     // per request (live finding 6a254624: the model reliably
                     // asks, but in prose; prompt rules alone don't move it).
-                    if !prose_question_nudged
+                    if !llm_interrupted
+                        && !prose_question_nudged
                         && self.tools.contains_key("question")
                         && ctx
                             .last_assistant_text()
@@ -1725,7 +1756,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // answer (live finding 6a2552a9: "Je vais créer… Laisse-
                     // moi d'abord vérifier…" then silence). One-shot redirect:
                     // do the work now, or ask properly.
-                    if !intent_nudged
+                    if !llm_interrupted
+                        && !intent_nudged
                         && request_tool_calls == 0
                         && ctx.last_assistant_text().is_some_and(|t| announces_intent(&t))
                     {
@@ -1753,7 +1785,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // explicit go/no-go via the question tool — a bare "j'ai
                     // fini d'étudier" stop is a contract violation (once per
                     // request).
-                    if request_mode == super::router::RequestMode::Study
+                    if !llm_interrupted
+                        && request_mode == super::router::RequestMode::Study
                         && !study_contract_nudged
                         && !question_called
                         && self.tools.contains_key("question")
@@ -1784,10 +1817,22 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // — no judge call; a green/absent verify falls through. A
                     // GoalCondition, if present, gates on the same evidence via its
                     // judge, so this is the cheap pre-gate for the no-goal path.
-                    if self.replan_on_verify_fail
+                    // Scan only the CURRENT request's messages: a stale
+                    // VERIFY_RESULT: FAIL from an earlier chat request must not
+                    // re-trigger the gate on unrelated requests. `request_start_msg`
+                    // is re-anchored at every compaction (see `reanchor` at the
+                    // inject_summary sites) so it stays a valid index; the
+                    // `.min(message_count())` is a defensive clamp.
+                    let request_messages = ctx
+                        .messages()
+                        .get(request_start_msg.min(ctx.message_count())..)
+                        .unwrap_or(&[]);
+                    if !llm_interrupted
+                        && self.replan_on_verify_fail
                         && verify_replans_used < MAX_VERIFY_REPLANS
-                        && let Some(outcome) =
-                            crate::codegen::parse_latest_verify(&ctx.conversation_text())
+                        && let Some(outcome) = crate::codegen::parse_latest_verify(
+                            &super::context::messages_to_text(request_messages),
+                        )
                         && !outcome.passed
                     {
                         verify_replans_used += 1;
@@ -1812,11 +1857,17 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // max_turns guard). Met OR cap-exhausted records the verdict
                     // and CLEARS the slot (per-request semantics: a settled goal
                     // must not bill a judge call on every later chat turn).
-                    let goal_now = self
-                        .goal
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
+                    // An interrupted turn skips goal gating entirely: the user
+                    // asked the run to STOP — judging and auto-continuing here
+                    // would force them to interrupt once per continuation.
+                    let goal_now = if llm_interrupted {
+                        None
+                    } else {
+                        self.goal
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                    };
                     if let Some(goal) = goal_now {
                         // The judge sees the whole conversation rendered to text —
                         // including tool results (the EVIDENCE) — not just the
@@ -1867,8 +1918,14 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // Follow-up policy: a bare affirmation after a STUDY/
                         // CLARIFY proposal PROMOTES to EXECUTE carrying the
                         // prior plan (no re-routing, no re-clarifying — the
-                        // front half already happened).
-                        let carried = self.request_router.is_some()
+                        // front half already happened). A user-PINNED mode is
+                        // exempt: the pin is an explicit instruction that
+                        // outranks the promotion heuristic — "oui" in pinned
+                        // STUDY answers the proposal, it doesn't lift the pin.
+                        let carried = self
+                            .request_router
+                            .as_ref()
+                            .is_some_and(|r| r.pinned_mode().is_none())
                             && matches!(
                                 request_mode,
                                 super::router::RequestMode::Study
@@ -1901,6 +1958,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                             });
                             request_mode = routed.mode;
                         }
+                        request_start_msg = ctx.message_count();
                         ctx.add_user_message(next_message);
                         nudge_tool_calls = 0;
                         nudge_delegated = false;
@@ -1908,6 +1966,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         intent_nudged = false;
+                        // Per-request continuation budgets re-arm with the
+                        // other gates: a second set_goal (or a new red-verify
+                        // cycle) on a later request gets its full budget.
+                        goal_continuations_used = 0;
+                        verify_replans_used = 0;
                         // The carried plan from the prior request counts as
                         // the plan artifact (don't re-gate an approved plan).
                         plan_artifact_seen = carried;
@@ -1977,6 +2040,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                 //
                 // When no rules are set, the legacy behavior applies: if `on_approval`
                 // is set, the entire batch is sent for approval.
+                // Doom-loop tracking must see fully-DENIED batches too: a model
+                // hammering a denied tool would otherwise spin to max_turns
+                // with the tracker never recording a turn (the all-denied
+                // paths `continue` before the main doom check below).
+                let doom_snapshot: Option<Vec<ToolCall>> = self
+                    .max_identical_tool_calls
+                    .map(|_| tool_calls.clone());
                 let (tool_calls, permission_denied_results) = if self.has_permission_rules() {
                     let mut allowed = Vec::new();
                     let mut denied = Vec::new();
@@ -2043,6 +2113,16 @@ impl<P: LlmProvider> AgentRunner<P> {
 
                     // If ALL calls were denied, add results and continue
                     if allowed.is_empty() && !denied.is_empty() {
+                        if let Some(batch) = doom_snapshot.as_ref()
+                            && let Some(n) = self.denied_batch_doom_abort(
+                                &mut doom_tracker,
+                                batch,
+                                ctx.current_turn(),
+                                total_usage,
+                            )
+                        {
+                            return Err((Error::DoomLoopAborted(n), total_usage));
+                        }
                         total_tool_calls += denied.len();
                         ctx.add_tool_results(denied);
                         continue;
@@ -2071,6 +2151,16 @@ impl<P: LlmProvider> AgentRunner<P> {
                             agent = %self.name,
                             "tool execution denied by approval callback"
                         );
+                        if let Some(batch) = doom_snapshot.as_ref()
+                            && let Some(n) = self.denied_batch_doom_abort(
+                                &mut doom_tracker,
+                                batch,
+                                ctx.current_turn(),
+                                total_usage,
+                            )
+                        {
+                            return Err((Error::DoomLoopAborted(n), total_usage));
+                        }
                         let results: Vec<ToolResult> = tool_calls
                             .iter()
                             .map(|tc| {
@@ -2220,21 +2310,32 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // PLAN_GATE_BACKSTOP_AT-th cumulative mutation. A plan
                 // artifact (question/todowrite/set_goal/set_scope/
                 // run_workflow) disarms it; one-shot per request.
-                if tool_calls
+                // Batch contributions to the plan/ask/scope flags. COMMITTED
+                // only after the refusal gates below pass: a refused batch
+                // executed nothing, so arming from its CALLS would let the
+                // model evade a gate by tripping another. Two same-batch
+                // nuances: set_scope/set_goal are barrier tools (hoisted and
+                // executed BEFORE their siblings), so their same-batch
+                // presence legitimately satisfies the contracts — but a
+                // `question` batched WITH mutations has NOT been answered when
+                // the mutations run, so it satisfies neither ask-first nor the
+                // plan-artifact requirement for this batch.
+                let batch_artifact = tool_calls
                     .iter()
-                    .any(|c| PLAN_ARTIFACT_TOOLS.contains(&c.name.as_str()))
-                {
-                    plan_artifact_seen = true;
-                }
-                if tool_calls.iter().any(|c| c.name == "question") {
-                    question_called = true;
-                }
-                if tool_calls.iter().any(|c| c.name == "set_scope") {
-                    scope_declared = true;
-                }
+                    .any(|c| PLAN_ARTIFACT_TOOLS.contains(&c.name.as_str()));
+                let batch_artifact_nonquestion = tool_calls.iter().any(|c| {
+                    c.name != "question" && PLAN_ARTIFACT_TOOLS.contains(&c.name.as_str())
+                });
+                let batch_question = tool_calls.iter().any(|c| c.name == "question");
+                let batch_scope = tool_calls.iter().any(|c| c.name == "set_scope");
                 if tool_calls.iter().any(|c| c.name == "advisor") {
                     advisor_required = false;
                     consecutive_build_failures = 0;
+                    // Re-arm the escalation one-shot: a FRESH failure streak
+                    // after this consult must be able to raise the block again
+                    // (otherwise one consult unlocks unlimited failed builds
+                    // for the rest of the request).
+                    escalation_fired = false;
                 }
                 if advisor_required
                     && tool_calls
@@ -2272,7 +2373,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     super::router::RequestMode::Study | super::router::RequestMode::Answer
                 ) && tool_calls
                     .iter()
-                    .any(|c| MODE_READONLY_DENY.contains(&c.name.as_str()))
+                    .any(|c| !tool_filter::is_read_only_tool(&c.name))
                 {
                     debug!(agent = %self.name, mode = request_mode.label(), "mode contract: mutating batch denied");
                     self.emit(AgentEvent::GateFired {
@@ -2304,25 +2405,41 @@ impl<P: LlmProvider> AgentRunner<P> {
                     .iter()
                     .filter(|c| PLAN_GATE_MUTATING.contains(&c.name.as_str()))
                     .count() as u32;
+                // Under CLARIFY the gate ALSO counts bash as a mutation: a
+                // bash-driven build (`cargo new`, mkdir, heredoc writes) would
+                // otherwise satisfy the whole request without ask-first/scope
+                // ever engaging. Outside CLARIFY bash stays exempt (mostly
+                // exploration; the tier-2 cumulative backstop is unchanged).
+                let gate_mutations = if request_mode == super::router::RequestMode::Clarify {
+                    batch_mutations
+                        + tool_calls.iter().filter(|c| c.name == "bash").count() as u32
+                } else {
+                    batch_mutations
+                };
                 // CLARIFY discipline: an under-specified request must ALSO
                 // declare its blast radius before mutating — live finding
                 // 6a258ab2: the model honored "répertoire temporaire" for one
                 // mkdir, then silently rebuilt INSIDE the host repo; a
                 // declared scope would have denied every misplaced write.
                 let needs_scope = request_mode == super::router::RequestMode::Clarify
-                    && !scope_declared
+                    && !(scope_declared || batch_scope)
                     && self.tools.contains_key("set_scope");
                 // CLARIFY means ASK-FIRST (live finding 6a25947c: the model
                 // wrote todos+scope and built a WEB app without ever asking —
                 // a todo is a plan artifact, not the user's answer).
+                // Pre-batch `question_called` ONLY: a question batched with
+                // the mutations has not been ANSWERED when they run — the
+                // ask-first contract requires the answer, not the call.
                 let needs_ask = request_mode == super::router::RequestMode::Clarify
                     && !question_called
                     && self.tools.contains_key("question");
-                if batch_mutations > 0
-                    && (!plan_artifact_seen || needs_scope || needs_ask)
+                if gate_mutations > 0
+                    && (!(plan_artifact_seen || batch_artifact_nonquestion)
+                        || needs_scope
+                        || needs_ask)
                     && !plan_gate_fired
                 {
-                    let would_be = mutating_calls + batch_mutations;
+                    let would_be = mutating_calls + gate_mutations;
                     let tier1 = request_is_wish
                         || request_mode == super::router::RequestMode::Clarify;
                     let tier2 = would_be >= PLAN_GATE_BACKSTOP_AT;
@@ -2361,9 +2478,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                                          goal (set_goal) — the `intake` recipe does both \
                                          for a feature request. ALSO declare your working \
                                          scope with set_scope (the exact target directory \
-                                         — honor every location constraint in the request, \
-                                         e.g. 'a temporary directory' means OUTSIDE this \
-                                         repository).{design_check} THEN build."
+                                         — honor every location constraint in the request; \
+                                         'a temporary directory' means a fresh gitignored \
+                                         scratch SUBDIRECTORY inside this workspace, e.g. \
+                                         ./scratch-<name> — paths outside the workspace are \
+                                         rejected by the file tools).{design_check} THEN \
+                                         build."
                                     ),
                                 )
                             })
@@ -2374,6 +2494,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                     }
                 }
                 mutating_calls += batch_mutations;
+                // The batch passed every refusal gate (escalation, mode
+                // contract, plan gate) and WILL execute — commit its flag
+                // contributions now. (`question` arms here too: a passing
+                // question executes and blocks for the user's answer.)
+                plan_artifact_seen = plan_artifact_seen || batch_artifact;
+                question_called = question_called || batch_question;
+                scope_declared = scope_declared || batch_scope;
 
                 // Harness-barrier tools (set_scope / set_goal) mutate the very
                 // state their sibling calls are checked against. Executing them
@@ -2711,15 +2838,15 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 ctx.add_tool_results(results);
-                if !pending_hints.is_empty() {
-                    ctx.add_user_message(pending_hints.join("\n\n"));
-                }
 
                 // Hard ingestion cap: a single fresh tool result must never be
                 // able to blow the context window (pruning only trims OLD
                 // results; the proactive trigger only sees the PREVIOUS call's
                 // usage). Full content is already in the recall store (when
-                // set) and in `tool_call_records`.
+                // set) and in `tool_call_records`. MUST run while the tool
+                // results are still the LAST message — injecting hints first
+                // made `cap_last_tool_results` miss them entirely (regression
+                // of the 7de5df6 layer-2 ordering).
                 if let Some(cap) = self.tool_result_ingest_cap {
                     // Clamp to the model window when known: bytes ≈ tokens*4,
                     // so `window_tokens` BYTES bounds one result to ~¼ of the
@@ -2740,6 +2867,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                             "fresh tool results capped at ingestion"
                         );
                     }
+                }
+
+                if !pending_hints.is_empty() {
+                    ctx.add_user_message(pending_hints.join("\n\n"));
                 }
 
                 // Reflection: inject a user-role prompt that nudges the LLM to assess
@@ -2768,7 +2899,16 @@ impl<P: LlmProvider> AgentRunner<P> {
                     {
                         nudge_delegated = true;
                     }
+                    // Never nudge toward delegation in a read-only mode:
+                    // delegated sub-agents run with side effects the
+                    // STUDY/ANSWER contract forbids (the backstop would deny
+                    // the delegate call anyway).
+                    let read_only_mode = matches!(
+                        request_mode,
+                        super::router::RequestMode::Study | super::router::RequestMode::Answer
+                    );
                     if !tool_interrupted
+                        && !read_only_mode
                         && !nudge_sent
                         && !nudge_delegated
                         && nudge_tool_calls >= nudge.after_tool_calls
@@ -2840,6 +2980,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                     if let Some(summary) = summary {
                         self.flush_to_memory_before_compaction(&ctx, 4).await;
                         ctx.inject_summary(summary, 4);
+                        // Compaction collapses the message list into an index-0
+                        // summary + verbatim tail, invalidating the absolute
+                        // request boundary. Re-anchor it just after the summary
+                        // so the verify-replan scan still covers the (current,
+                        // recent) kept tail and excludes the older summary.
+                        request_start_msg = request_start_msg.min(1);
                         self.emit(AgentEvent::ContextSummarized {
                             agent: self.name.clone(),
                             turn: ctx.current_turn(),
@@ -3197,12 +3343,20 @@ impl<P: LlmProvider> AgentRunner<P> {
             return content.to_string();
         }
         let original_len = content.len();
+        // Bound the input BEFORE sending: the compression call must never
+        // itself overflow the window it is protecting (same head+tail bound
+        // as `generate_summary`).
+        let budget = self
+            .context_window_tokens
+            .map(|w| (w as usize).saturating_mul(2).max(2_048))
+            .unwrap_or(DEFAULT_SUMMARY_INPUT_MAX_BYTES);
+        let bounded = bound_transcript(content, budget);
         let request = CompletionRequest {
             system: "Compress the following tool output, preserving all factual content, \
                      key values, and actionable information. Remove redundancy and formatting \
                      noise. Return ONLY the compressed content."
                 .into(),
-            messages: vec![Message::user(content.to_string())],
+            messages: vec![Message::user(bounded)],
             tools: vec![],
             max_tokens: (self.max_tokens / 3).max(256),
             tool_choice: None,
@@ -3223,6 +3377,48 @@ impl<P: LlmProvider> AgentRunner<P> {
                 content.to_string()
             }
         }
+    }
+
+    /// Record a fully-DENIED batch against the doom tracker and, if it has
+    /// repeated past the hard-stop margin (EXACT *or* FUZZY), emit the abort
+    /// events and return the repeat count for the caller to fail on. Without
+    /// this, the all-denied paths `continue` before the main doom check and a
+    /// model hammering a denied tool — byte-identical OR same-name/varying-
+    /// input — spins to max_turns. Returns `None` when doom tracking is off
+    /// or the batch has not yet crossed the hard-stop margin.
+    fn denied_batch_doom_abort(
+        &self,
+        doom_tracker: &mut DoomLoopTracker,
+        batch: &[ToolCall],
+        turn: usize,
+        total_usage: TokenUsage,
+    ) -> Option<u32> {
+        let threshold = self.max_identical_tool_calls?;
+        let (exact, fuzzy) =
+            doom_tracker.record(batch, threshold, self.max_fuzzy_identical_tool_calls);
+        let n = if exact && doom_tracker.count() >= threshold + DOOM_HARD_STOP_MARGIN {
+            doom_tracker.count()
+        } else if fuzzy
+            && self
+                .max_fuzzy_identical_tool_calls
+                .is_some_and(|ft| doom_tracker.fuzzy_count() >= ft + DOOM_HARD_STOP_MARGIN)
+        {
+            doom_tracker.fuzzy_count()
+        } else {
+            return None;
+        };
+        self.emit(AgentEvent::DoomLoopDetected {
+            agent: self.name.clone(),
+            turn,
+            consecutive_count: n,
+            tool_names: batch.iter().map(|tc| tc.name.clone()).collect(),
+        });
+        self.emit(AgentEvent::RunFailed {
+            agent: self.name.clone(),
+            error: format!("doom loop aborted after {n} denied repeats"),
+            partial_usage: total_usage,
+        });
+        Some(n)
     }
 
     /// Find the closest tool name match within a maximum edit distance.
@@ -6096,6 +6292,746 @@ mod tests {
         assert!(
             ttft >= 10,
             "streaming TTFT must reach the LlmResponse event, got {ttft}ms"
+        );
+    }
+
+    // ===== Multi-aspect audit (2026-06-09) regression tests =====
+
+    /// on_input helper: yields the given messages in order, then `None`.
+    fn scripted_inputs(msgs: &[&str]) -> Arc<crate::agent::runner::OnInput> {
+        let queue = Arc::new(std::sync::Mutex::new(
+            msgs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        ));
+        Arc::new(move || {
+            let queue = queue.clone();
+            Box::pin(async move {
+                let mut q = queue.lock().expect("inputs lock");
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            })
+        })
+    }
+
+    /// Stub tool that records whether it executed.
+    struct FlagTool {
+        name: String,
+        output: ToolOutput,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FlagTool {
+        fn new(name: &str, output: ToolOutput) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
+            let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    output,
+                    executed: executed.clone(),
+                }),
+                executed,
+            )
+        }
+    }
+    impl Tool for FlagTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "stub".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: &crate::ExecutionContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+        {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let out = ToolOutput {
+                content: self.output.content.clone(),
+                is_error: self.output.is_error,
+            };
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    fn pinned_router(
+        mode: super::super::router::RequestMode,
+    ) -> Arc<super::super::router::RequestRouter> {
+        let pin = Arc::new(std::sync::atomic::AtomicU8::new(mode.as_pin_u8()));
+        Arc::new(super::super::router::RequestRouter::new(None).with_pin(pin))
+    }
+
+    // The verify-replan budget is PER-REQUEST: it re-arms at on_input, and the
+    // gate scans only the current request's messages (a stale FAIL from an
+    // earlier request must not re-trigger it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_replan_budget_rearms_and_is_request_scoped() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..9 {
+            responses.push(MockProvider::text_response("done1", 1, 1));
+        }
+        responses.push(verify_tool_call());
+        for _ in 0..9 {
+            responses.push(MockProvider::text_response("done2", 1, 1));
+        }
+        responses.push(MockProvider::text_response("done3", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .replan_on_verify_fail(true)
+            .on_input(scripted_inputs(&["re-verify it", "now just answer"]))
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "done3");
+        let n = provider.captured_requests.lock().unwrap().len();
+        assert_eq!(
+            n, 21,
+            "10 (request 1) + 10 (request 2: budget re-armed) + 1 (request 3: \
+             stale FAILs out of scope) provider calls; got {n}"
+        );
+    }
+
+    // Stop-gate ORDER pin: the verify-replan corrective must reach the agent
+    // BEFORE the runner awaits the next user message (gates after on_input
+    // were found inert on the TUI path — they only ever fired at session end).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replan_gates_before_next_input_in_chat_mode() {
+        let mut responses = vec![verify_tool_call()];
+        for _ in 0..9 {
+            responses.push(MockProvider::text_response("done", 1, 1));
+        }
+        responses.push(MockProvider::text_response("after-input", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![Arc::new(FailingVerifyTool)])
+            .replan_on_verify_fail(true)
+            .on_input(scripted_inputs(&["follow-up"]))
+            .max_turns(50)
+            .build()
+            .unwrap();
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.result, "after-input");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let has_text = |r: &crate::llm::types::CompletionRequest, needle: &str| {
+            r.messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+        };
+        let red_idx = reqs
+            .iter()
+            .position(|r| has_text(r, "Verification is RED"))
+            .expect("replan corrective injected");
+        let input_idx = reqs
+            .iter()
+            .position(|r| has_text(r, "follow-up"))
+            .expect("follow-up reached the agent");
+        assert!(
+            red_idx < input_idx,
+            "replan gate must fire BEFORE awaiting input (red at {red_idx}, input at {input_idx})"
+        );
+    }
+
+    // The goal continuation budget is PER-REQUEST: a second goal installed in
+    // the slot on a later chat request gets its full budget (it used to
+    // inherit the exhausted counter and settle not-met with ZERO continuations).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn goal_continuation_budget_rearms_on_new_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let main = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("a1", 1, 1),
+            MockProvider::text_response("a2", 1, 1),
+            MockProvider::text_response("b1", 1, 1),
+            MockProvider::text_response("b2", 1, 1),
+        ]));
+        let judge = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("GOAL_MET: NO: not yet", 1, 1),
+            MockProvider::text_response("GOAL_MET: YES", 1, 1),
+            MockProvider::text_response("GOAL_MET: NO: goal B not yet", 1, 1),
+            MockProvider::text_response("GOAL_MET: YES", 1, 1),
+        ]));
+        let slot: crate::agent::goal::GoalSlot = Arc::new(std::sync::RwLock::new(None));
+        *slot.write().unwrap() = Some(
+            crate::agent::goal::GoalCondition::new(
+                "goal A",
+                Arc::new(crate::llm::BoxedProvider::from_arc(judge.clone())),
+            )
+            .with_max_continuations(1),
+        );
+        let slot_for_input = slot.clone();
+        let judge_for_input = judge.clone();
+        let n_inputs = Arc::new(AtomicUsize::new(0));
+        let on_input: Arc<crate::agent::runner::OnInput> = Arc::new(move || {
+            let slot = slot_for_input.clone();
+            let judge = judge_for_input.clone();
+            let n = n_inputs.clone();
+            Box::pin(async move {
+                if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The next request installs goal B (set_goal / /goal).
+                    *slot.write().unwrap() = Some(
+                        crate::agent::goal::GoalCondition::new(
+                            "goal B",
+                            Arc::new(crate::llm::BoxedProvider::from_arc(judge)),
+                        )
+                        .with_max_continuations(1),
+                    );
+                    Some("second task".to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        let runner = AgentRunner::builder(main.clone())
+            .name("t")
+            .system_prompt("s")
+            .goal_slot(slot)
+            .on_input(on_input)
+            .max_turns(20)
+            .build()
+            .unwrap();
+        let out = runner.execute("first task").await.unwrap();
+        assert_eq!(
+            out.result, "b2",
+            "goal B earned its continuation — the budget re-armed on the new request"
+        );
+        assert_eq!(out.goal_met, Some(true));
+        assert_eq!(judge.captured_requests.lock().unwrap().len(), 4);
+    }
+
+    // A user interrupt must short-circuit the stop-gates: the goal judge runs
+    // only on the REAL stop after the follow-up, never on the synthesized
+    // "[interrupted by user]" turn (which would auto-continue the run the
+    // user just asked to stop).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupted_turn_skips_goal_gate_and_awaits_input() {
+        use crate::agent::interrupt::InterruptHandle;
+        let main = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "real", 1, 1,
+        )]));
+        let judge = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "GOAL_MET: YES",
+            1,
+            1,
+        )]));
+        let interrupt = InterruptHandle::new();
+        interrupt.interrupt();
+        let runner = AgentRunner::builder(main.clone())
+            .name("t")
+            .system_prompt("s")
+            .goal(crate::agent::goal::GoalCondition::new(
+                "finish",
+                Arc::new(crate::llm::BoxedProvider::from_arc(judge.clone())),
+            ))
+            .on_input(scripted_inputs(&["continue"]))
+            .interrupt(interrupt)
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner.execute("task").await.unwrap();
+        assert_eq!(out.result, "real");
+        let judge_reqs = judge.captured_requests.lock().unwrap();
+        assert_eq!(judge_reqs.len(), 1, "judge gated only the real stop");
+        let transcript: String = judge_reqs[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            transcript.contains("real"),
+            "judge ran AFTER the real answer, not on the interrupted turn: {transcript:?}"
+        );
+        assert_eq!(out.goal_met, Some(true));
+    }
+
+    // A response served from the cache consumed zero provider tokens — it
+    // must not re-bill the original call's usage (totals, cost, budget).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_hit_does_not_rebill_usage() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "answer", 7, 5,
+        )]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .response_cache_size(4)
+            .max_turns(3)
+            .build()
+            .unwrap();
+        let first = runner.execute("hi").await.unwrap();
+        assert_eq!(first.tokens_used.input_tokens, 7);
+        let second = runner.execute("hi").await.unwrap();
+        assert_eq!(second.result, "answer", "served from cache");
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            1,
+            "no second LLM call"
+        );
+        assert_eq!(
+            second.tokens_used.total(),
+            0,
+            "a cache hit must not re-bill the original call's tokens"
+        );
+    }
+
+    // A model hammering a permission-DENIED tool used to bypass doom-loop
+    // tracking entirely (the all-denied path continued before the tracker
+    // recorded the batch) and spun to max_turns. It must hard-stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denied_tool_hammering_hits_doom_hard_stop() {
+        use crate::agent::permission::{PermissionAction, PermissionRule, PermissionRuleset};
+        let responses = (0..8)
+            .map(|_| tool_use_named("bash", 1))
+            .collect::<Vec<_>>();
+        let provider = Arc::new(MockProvider::new(responses));
+        let rules = PermissionRuleset::new(vec![PermissionRule {
+            tool: "bash".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Deny,
+        }]);
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .permission_rules(rules)
+            .max_identical_tool_calls(2)
+            .max_turns(20)
+            .build()
+            .unwrap();
+        let err = runner.execute("go").await.unwrap_err();
+        let err = match err {
+            Error::WithPartialUsage { source, .. } => *source,
+            e => e,
+        };
+        assert!(
+            matches!(err, Error::DoomLoopAborted(_)),
+            "denied hammering must hard-stop, got: {err:?}"
+        );
+    }
+
+    // Audit-review regression: a model hammering a permission-DENIED tool with
+    // the SAME name but VARYING inputs must ALSO hard-stop (fuzzy doom), not
+    // just byte-identical repeats. The all-denied paths previously discarded
+    // the fuzzy signal and spun to max_turns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuzzy_denied_tool_hammering_hits_doom_hard_stop() {
+        use crate::agent::permission::{PermissionAction, PermissionRule, PermissionRuleset};
+        // Same tool name, DIFFERENT input each turn → fuzzy (not exact) loop.
+        let responses: Vec<_> = (0..10)
+            .map(|i| crate::llm::types::CompletionResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("c{i}"),
+                    name: "bash".into(),
+                    input: serde_json::json!({ "command": format!("echo {i}") }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            })
+            .collect();
+        let provider = Arc::new(MockProvider::new(responses));
+        let rules = PermissionRuleset::new(vec![PermissionRule {
+            tool: "bash".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Deny,
+        }]);
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .permission_rules(rules)
+            .max_identical_tool_calls(2)
+            .max_fuzzy_identical_tool_calls(2)
+            .max_turns(30)
+            .build()
+            .unwrap();
+        let err = runner.execute("go").await.unwrap_err();
+        let err = match err {
+            Error::WithPartialUsage { source, .. } => *source,
+            e => e,
+        };
+        assert!(
+            matches!(err, Error::DoomLoopAborted(_)),
+            "varying-input denied hammering must hard-stop via fuzzy doom, got: {err:?}"
+        );
+        // It must NOT have run to max_turns (the bug would spin to 30).
+        assert!(
+            provider.captured_requests.lock().unwrap().len() < 30,
+            "fuzzy doom must hard-stop well before max_turns"
+        );
+    }
+
+    // CLARIFY ask-first: a `question` batched WITH mutations has not been
+    // answered when the writes run — the plan gate must refuse the batch
+    // (and a refused batch must not arm the contract flags).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clarify_batched_question_with_write_is_plan_gated() {
+        let (question_tool, _) = FlagTool::new("question", ToolOutput::success("answer: A"));
+        let (write_tool, write_executed) = FlagTool::new("write", ToolOutput::success("ok"));
+        let batch = crate::llm::types::CompletionResponse {
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "q1".into(),
+                    name: "question".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    input: serde_json::json!({"file_path": "x.rs", "content": "y"}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            batch,
+            MockProvider::text_response("stopped", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![question_tool, write_tool])
+            .request_router(pinned_router(super::super::router::RequestMode::Clarify))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("je veux un crm").await.unwrap();
+        assert!(
+            !write_executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the write must NOT execute before the question is answered"
+        );
+        let reqs = provider.captured_requests.lock().unwrap();
+        let results = tool_result_contents(&reqs[1]);
+        assert!(
+            results.iter().all(|r| r.contains("[plan gate]")),
+            "the whole batch gets plan-gate error results: {results:?}"
+        );
+        // The reconciled scratch guidance (5c7f319) — never "OUTSIDE this repository".
+        assert!(
+            results[0].contains("scratch SUBDIRECTORY"),
+            "plan-gate text must carry the in-workspace scratch guidance: {}",
+            results[0]
+        );
+        assert!(
+            !results[0].contains("OUTSIDE this repository"),
+            "the unsatisfiable outside-the-repo guidance must stay dead: {}",
+            results[0]
+        );
+    }
+
+    // STUDY/ANSWER deny backstop is a WHITELIST mirror of the mask: any
+    // side-effecting call that slips past masking (delegation, MCP, repaired
+    // names) is refused — not just edit/write/patch/bash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn study_mode_denies_non_readonly_tools_at_execution() {
+        let (delegate, delegate_executed) =
+            FlagTool::new("delegate_task", ToolOutput::success("delegated"));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("delegate_task", 1),
+            MockProvider::text_response("proposal", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![delegate])
+            .request_router(pinned_router(super::super::router::RequestMode::Study))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        let out = runner.execute("étudie le module").await.unwrap();
+        assert_eq!(out.result, "proposal");
+        assert!(
+            !delegate_executed.load(std::sync::atomic::Ordering::SeqCst),
+            "delegate_task must be refused in STUDY mode (side effects)"
+        );
+        let reqs = provider.captured_requests.lock().unwrap();
+        let results = tool_result_contents(&reqs[1]);
+        assert!(
+            results.iter().any(|r| r.contains("[mode contract]")),
+            "{results:?}"
+        );
+    }
+
+    // The delegation nudge must stay silent in read-only modes — it would
+    // push the model toward a delegate call the backstop then denies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_nudge_suppressed_in_readonly_mode() {
+        let (read_tool, _) = FlagTool::new("read", ToolOutput::success("contents"));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("read", 1),
+            tool_use_named("read", 1),
+            MockProvider::text_response("proposal", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![read_tool])
+            .request_router(pinned_router(super::super::router::RequestMode::Study))
+            .delegation_nudge(DelegationNudge {
+                after_tool_calls: 1,
+                tool_names: vec!["delegate_task".into()],
+            })
+            .max_turns(6)
+            .build()
+            .unwrap();
+        runner.execute("étudie le module").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let nudged = reqs.iter().any(|r| {
+            r.messages.iter().flat_map(|m| m.content.iter()).any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[delegation check]")),
+            )
+        });
+        assert!(!nudged, "no delegation nudge in read-only STUDY mode");
+    }
+
+    // The delegation nudge re-arms per request (shipped behavior, was unpinned).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_nudge_rearms_on_new_request() {
+        let (read_tool, _) = FlagTool::new("read", ToolOutput::success("contents"));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("read", 1),
+            tool_use_named("read", 1),
+            MockProvider::text_response("done1", 1, 1),
+            tool_use_named("read", 1),
+            tool_use_named("read", 1),
+            MockProvider::text_response("done2", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![read_tool])
+            .delegation_nudge(DelegationNudge {
+                after_tool_calls: 2,
+                tool_names: vec!["delegate_task".into()],
+            })
+            .on_input(scripted_inputs(&["next request"]))
+            .max_turns(20)
+            .build()
+            .unwrap();
+        runner.execute("first request").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let last = reqs.last().expect("requests captured");
+        let nudges = last
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[delegation check]")),
+            )
+            .count();
+        assert_eq!(
+            nudges, 2,
+            "one nudge per request — the counter re-arms at on_input"
+        );
+    }
+
+    // Regression of the 7de5df6 layer-2 ordering: the ingest cap must apply
+    // even when a repair hint fires in the same turn (the hint message used
+    // to displace the tool results as the "last message" and the cap missed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_cap_applies_when_hints_fire_same_turn() {
+        let big_failing = format!("bash: foo: command not found\n{}", "x".repeat(200_000));
+        let original_len = big_failing.len();
+        let (bash_tool, _) = FlagTool::new("bash", ToolOutput::error(big_failing));
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("bash", 1),
+            MockProvider::text_response("done", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![bash_tool])
+            .tool_result_ingest_cap(1024)
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("run it").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let hint_present =
+            reqs[1].messages.iter().flat_map(|m| m.content.iter()).any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[repair hint]")),
+            );
+        assert!(hint_present, "the repair hint fired this turn");
+        let contents = tool_result_contents(&reqs[1]);
+        assert!(
+            contents[0].len() < original_len / 2,
+            "the fresh tool result must be capped even with a same-turn hint: {} bytes",
+            contents[0].len()
+        );
+    }
+
+    // Reactive overflow recovery escalates: truncation rung first; when the
+    // retry STILL overflows, the summarization rung runs instead of failing
+    // (the old boolean guard dead-ended after one recovery).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overflow_recovery_escalates_truncation_then_summary() {
+        let provider = Arc::new(MockProvider::new_with_results(vec![
+            Ok(tool_use_named("big", 1)),
+            Err(overflow_error()),
+            Err(overflow_error()),
+            Ok(MockProvider::text_response("summary of it all", 1, 1)),
+            Ok(MockProvider::text_response("done", 1, 1)),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(BigTool { size: 400_000 }))
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner.execute("go").await.unwrap();
+        assert_eq!(
+            out.result, "done",
+            "second consecutive overflow escalates to summarization instead of failing"
+        );
+    }
+
+    // A user-PINNED Study mode must survive a bare affirmation: "vas-y"
+    // answers the proposal, it does not lift the pin into EXECUTE.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_mode_survives_bare_affirmation() {
+        let (write_tool, write_executed) = FlagTool::new("write", ToolOutput::success("ok"));
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("proposal: A or B", 1, 1),
+            tool_use_named("write", 1),
+            MockProvider::text_response("end", 1, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![write_tool])
+            .request_router(pinned_router(super::super::router::RequestMode::Study))
+            .on_input(scripted_inputs(&["vas-y"]))
+            .max_turns(10)
+            .build()
+            .unwrap();
+        let out = runner.execute("étudie le module").await.unwrap();
+        assert_eq!(out.result, "end");
+        assert!(
+            !write_executed.load(std::sync::atomic::Ordering::SeqCst),
+            "pinned STUDY: the write after 'vas-y' must still be denied"
+        );
+        let reqs = provider.captured_requests.lock().unwrap();
+        let denied = reqs.iter().any(|r| {
+            tool_result_contents(r)
+                .iter()
+                .any(|c| c.contains("[mode contract]"))
+        });
+        assert!(denied, "the mode-contract backstop denied the write");
+    }
+
+    // Audit-review regression: the verify-replan gate's request-scoped scan
+    // uses an ABSOLUTE message index (request_start_msg) that compaction
+    // invalidates. After a mid-request summary collapses the message list,
+    // the index used to point past the end → empty slice → the gate MISSED a
+    // RED verify still present in the kept tail and the agent finished on red.
+    // The fix re-anchors the index at every inject_summary; this drives the
+    // reactive-overflow→summary path and asserts the gate still fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_replan_survives_midrequest_compaction() {
+        // Request 1 grows the message list well past the post-compaction size
+        // (summary + last 4) so request_start_msg for request 2 exceeds it.
+        let (noop, _) = FlagTool::new("noop", ToolOutput::success("ok"));
+        let mut responses = vec![
+            tool_use_named("noop", 1),
+            tool_use_named("noop", 1),
+            tool_use_named("noop", 1),
+            tool_use_named("noop", 1),
+            MockProvider::text_response("done1", 1, 1), // completes request 1
+        ];
+        // Request 2: verify (RED), then an overflow that forces summarization,
+        // then completion attempts that must be caught by the replan gate.
+        responses.push(verify_tool_call());
+        // generate_summary's provider.complete response (the summary text):
+        responses.push(MockProvider::text_response(
+            "[summary of the session]",
+            1,
+            1,
+        ));
+        // After re-anchored compaction the model tries to finish repeatedly;
+        // the gate re-injects until the bound, then it settles.
+        for _ in 0..12 {
+            responses.push(MockProvider::text_response("done2", 1, 1));
+        }
+        let mut results: Vec<Result<crate::llm::types::CompletionResponse, Error>> =
+            responses.into_iter().map(Ok).collect();
+        // Insert the overflow error right after the verify tool call (index 6:
+        // 5 request-1 responses + 1 verify).
+        results.insert(6, Err(overflow_error()));
+        let provider = Arc::new(MockProvider::new_with_results(results));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tools(vec![noop, Arc::new(FailingVerifyTool)])
+            .replan_on_verify_fail(true)
+            .on_input(scripted_inputs(&["second request"]))
+            .max_turns(60)
+            .build()
+            .unwrap();
+        runner.execute("first request").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let fired = reqs.iter().any(|r| {
+            r.messages.iter().flat_map(|m| m.content.iter()).any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("Verification is RED")),
+            )
+        });
+        assert!(
+            fired,
+            "the verify-replan gate must still fire on the RED verify kept in \
+             the tail after a mid-request compaction (re-anchored boundary)"
+        );
+    }
+
+    // The hard-escalation one-shot re-arms after an advisor consult: a FRESH
+    // 3-failure streak must raise the block again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escalation_rearms_after_advisor_consult() {
+        let (advisor, _) = FlagTool::new("advisor", ToolOutput::success("advice: simplify"));
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            responses.push(tool_use_named("bash", 1));
+        }
+        responses.push(tool_use_named("advisor", 1));
+        for _ in 0..3 {
+            responses.push(tool_use_named("bash", 1));
+        }
+        responses.push(MockProvider::text_response("stopping", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(FailingBuild))
+            .tool(advisor)
+            .max_turns(20)
+            .build()
+            .unwrap();
+        runner.execute("build it").await.unwrap();
+        let reqs = provider.captured_requests.lock().unwrap();
+        let last = reqs.last().expect("requests captured");
+        let escalations = last
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::Text { text } if text.contains("[escalation]")))
+            .count();
+        assert_eq!(
+            escalations, 2,
+            "a fresh failure streak after the consult re-raises the escalation"
         );
     }
 }

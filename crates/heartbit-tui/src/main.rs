@@ -247,6 +247,11 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     }
 
     let interrupt = InterruptHandle::new();
+    // True while the engine idles at the on_input boundary (set by the agent
+    // thread, cleared by the UI before each send): an Esc that lands in that
+    // window must NOT latch the interrupt token — the runner only rearms it
+    // inside a turn, so the next message would instantly self-interrupt.
+    let agent_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Shared permission posture (0=normal, 1=plan, 2=yolo), cycled by the UI
     // (Shift+Tab) and read live by the agent thread's `on_approval`.
     let perm_mode = Arc::new(std::sync::atomic::AtomicU8::new(
@@ -287,6 +292,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         input_rx,
         cwd,
         interrupt,
+        agent_parked,
         perm_mode,
         request_mode_pin,
         session_id,
@@ -473,6 +479,7 @@ async fn build_engine(
     input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
+    agent_parked: Arc<std::sync::atomic::AtomicBool>,
     mcp_servers: Vec<config::McpServerSpec>,
     context_recall: bool,
     context_window: Option<u32>,
@@ -769,10 +776,23 @@ async fn build_engine(
     };
     let on_input: Arc<OnInput> = {
         let rx = input_rx;
+        let parked = agent_parked;
         Arc::new(move || {
             let rx = rx.clone();
-            Box::pin(async move { rx.lock().await.recv().await })
-                as Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+            let parked = parked.clone();
+            Box::pin(async move {
+                // The engine idles here between turns. While parked, an Esc has
+                // nothing to interrupt — the UI skips the cancel, because the
+                // runner only rearms the token INSIDE a turn, so a cancel that
+                // lands now would poison the NEXT turn (instant self-interrupt
+                // of the user's next message). The UI clears the flag BEFORE
+                // sending, so a message queued right at the boundary stays
+                // interruptible.
+                parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                let msg = rx.lock().await.recv().await;
+                parked.store(false, std::sync::atomic::Ordering::SeqCst);
+                msg
+            }) as Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
         })
     };
 
@@ -985,6 +1005,44 @@ fn translate(event: Event) -> Option<Msg> {
     }
 }
 
+/// Gate an agent-thread message before it reaches the reducer: a stale
+/// [`Msg::AgentExited`] (an epoch we already replaced) must be DROPPED — the
+/// reducer can't see epochs and would flip `running=false` / clear `learning`
+/// in the middle of the NEW engine's run. The current epoch's exit clears
+/// `agent_started` so the next message respawns.
+fn admit_agent_msg(msg: &Msg, agent_epoch: u64, agent_started: &mut bool) -> bool {
+    match msg {
+        Msg::AgentExited(e) if *e == agent_epoch => {
+            *agent_started = false;
+            true
+        }
+        Msg::AgentExited(_) => false,
+        _ => true,
+    }
+}
+
+/// Sends [`Msg::AgentExited`] when dropped — including on a PANIC anywhere in
+/// the agent thread (runtime build, engine build, the runner). Without it the
+/// exit signal lived at the end of the happy path only: a panic left
+/// `agent_started` stuck true, so every subsequent message was silently sent
+/// into a dead channel (spinner forever, no diagnosis — stderr is the
+/// alt-screen).
+struct AgentExitGuard {
+    tx: UnboundedSender<Msg>,
+    epoch: u64,
+}
+
+impl Drop for AgentExitGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.tx.send(Msg::Notice(
+                "agent thread panicked — the engine will restart on your next message".into(),
+            ));
+        }
+        let _ = self.tx.send(Msg::AgentExited(self.epoch));
+    }
+}
+
 /// Spawn the agent thread if a provider is configured; returns whether it was
 /// spawned. Building the runner here (on the agent thread) connects MCP servers
 /// **eagerly** — at startup, or the moment a key is set — so they're ready
@@ -999,6 +1057,7 @@ fn spawn_agent(
     input_rx: &Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: &std::path::Path,
     interrupt: &InterruptHandle,
+    agent_parked: &Arc<std::sync::atomic::AtomicBool>,
     epoch: u64,
     perm_mode: &Arc<std::sync::atomic::AtomicU8>,
     request_mode_pin: &Arc<std::sync::atomic::AtomicU8>,
@@ -1033,9 +1092,18 @@ fn spawn_agent(
     let input_rx = input_rx.clone();
     let cwd = cwd.to_path_buf();
     let interrupt = interrupt.clone();
+    let agent_parked = agent_parked.clone();
     let perm_mode = perm_mode.clone();
     let trace = trace.clone();
     std::thread::spawn(move || {
+        // Declared BEFORE anything that can panic: its Drop signals this
+        // thread's exit (with its epoch) so the UI can respawn — even when the
+        // runtime build, the engine build, or the runner panics. The UI
+        // ignores a stale exit if the engine was already replaced.
+        let _exit_guard = AgentExitGuard {
+            tx: done_tx.clone(),
+            epoch,
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1049,6 +1117,7 @@ fn spawn_agent(
                 input_rx.clone(),
                 cwd,
                 interrupt,
+                agent_parked.clone(),
                 mcp_servers,
                 context_recall,
                 context_window,
@@ -1065,8 +1134,12 @@ fn spawn_agent(
             {
                 Ok(mut engine) => {
                     // MCP is now connected (eagerly). Wait for the first user message,
-                    // then run; `on_input` feeds the rest from the same channel.
+                    // then run; `on_input` feeds the rest from the same channel. The
+                    // parked flag mirrors the on_input contract: while waiting, an Esc
+                    // has nothing to interrupt (see Effect::Interrupt).
+                    agent_parked.store(true, std::sync::atomic::Ordering::SeqCst);
                     let first = input_rx.lock().await.recv().await;
+                    agent_parked.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(first) = first {
                         let _ = engine.run(&first).await;
                     }
@@ -1075,9 +1148,6 @@ fn spawn_agent(
                     let _ = done_tx.send(Msg::Notice(format!("cannot start agent: {e}")));
                 }
             }
-            // Signal this thread's exit (with its epoch) so the UI can respawn —
-            // ignoring a stale exit if the engine was already replaced.
-            let _ = done_tx.send(Msg::AgentExited(epoch));
         });
     });
     true
@@ -1093,6 +1163,7 @@ async fn run_ui(
     mut input_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     cwd: PathBuf,
     interrupt: InterruptHandle,
+    agent_parked: Arc<std::sync::atomic::AtomicBool>,
     perm_mode: Arc<std::sync::atomic::AtomicU8>,
     request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     session_id: String,
@@ -1114,6 +1185,7 @@ async fn run_ui(
         &input_rx,
         &cwd,
         &interrupt,
+        &agent_parked,
         agent_epoch,
         &perm_mode,
         &request_mode_pin,
@@ -1135,21 +1207,16 @@ async fn run_ui(
             maybe_msg = ui_rx.recv() => {
                 if let Some(m) = maybe_msg {
                     // The agent thread exited (build failure or session end) → allow
-                    // the next message to rebuild the runner. Ignore a stale exit
-                    // whose epoch we already superseded (an `/agents` restart).
-                    if let Msg::AgentExited(e) = m
-                        && e == agent_epoch
-                    {
-                        agent_started = false;
+                    // the next message to rebuild the runner. A stale exit whose
+                    // epoch we already superseded is dropped BEFORE the reducer
+                    // (it would flip running=false mid-new-run).
+                    if admit_agent_msg(&m, agent_epoch, &mut agent_started) {
+                        app.update(m);
                     }
-                    app.update(m);
                     while let Ok(m2) = ui_rx.try_recv() {
-                        if let Msg::AgentExited(e) = m2
-                            && e == agent_epoch
-                        {
-                            agent_started = false;
+                        if admit_agent_msg(&m2, agent_epoch, &mut agent_started) {
+                            app.update(m2);
                         }
-                        app.update(m2);
                     }
                 }
             }
@@ -1182,6 +1249,7 @@ async fn run_ui(
                             &input_rx,
                             &cwd,
                             &interrupt,
+                            &agent_parked,
                             agent_epoch,
                             &perm_mode,
                             &request_mode_pin,
@@ -1189,21 +1257,32 @@ async fn run_ui(
                             "respawn",
                         );
                     }
+                    // Cleared BEFORE the send: the engine is about to (or already
+                    // does) work on this message — an Esc from here on must reach
+                    // the interrupt token, even if the engine hasn't woken yet.
+                    agent_parked.store(false, std::sync::atomic::Ordering::SeqCst);
                     let _ = input_tx.send(text);
                 }
                 Effect::RespawnAgent => {
                     // A model/advisor change: the live agent captured the old
                     // model at spawn. Recreate the input channel — dropping the
                     // old sender closes it, so the current agent (idle, blocked
-                    // on `on_input`, or finishing its turn) reaches end-of-input
-                    // and exits — then mark not-started so the NEXT message
-                    // spawns a fresh agent that reads the new `app.model`.
-                    // `on_input` holds a clone of `input_rx`; nothing else
-                    // clones `input_tx`, so the close is clean.
-                    let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                    input_tx = ntx;
-                    input_rx = Arc::new(Mutex::new(nrx));
-                    agent_started = false;
+                    // on `on_input`) reaches end-of-input and exits — then mark
+                    // not-started so the NEXT message spawns a fresh agent that
+                    // reads the new `app.model`. `on_input` holds a clone of
+                    // `input_rx`; nothing else clones `input_tx`, so the close
+                    // is clean. The reducer defers this effect to turn-idle;
+                    // this guard is the backstop — swapping mid-turn would let
+                    // the next message spawn a SECOND engine while the old one
+                    // still runs (audit 2026-06-09).
+                    if app.running {
+                        app.pending_respawn = true;
+                    } else {
+                        let (ntx, nrx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                        input_tx = ntx;
+                        input_rx = Arc::new(Mutex::new(nrx));
+                        agent_started = false;
+                    }
                 }
                 Effect::SaveKey(key) => {
                     let mut cfg = config::TuiConfig::load();
@@ -1221,6 +1300,7 @@ async fn run_ui(
                             &input_rx,
                             &cwd,
                             &interrupt,
+                            &agent_parked,
                             agent_epoch,
                             &perm_mode,
                             &request_mode_pin,
@@ -1321,6 +1401,7 @@ async fn run_ui(
                                 &input_rx,
                                 &cwd,
                                 &interrupt,
+                                &agent_parked,
                                 agent_epoch,
                                 &perm_mode,
                                 &request_mode_pin,
@@ -1328,6 +1409,7 @@ async fn run_ui(
                                 "handoff_seed",
                             );
                         }
+                        agent_parked.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = input_tx.send(text);
                     }
                     Err(e) => app
@@ -1415,17 +1497,28 @@ async fn run_ui(
                         running = app.running,
                         "Effect::Interrupt dequeued in UI loop"
                     );
-                    interrupt.interrupt();
-                    tracing::info!(
-                        target: "heartbit::interrupt",
-                        checkpoint = "CP2_handle_interrupt_called",
-                        is_cancelled = interrupt.is_interrupted(),
-                        "interrupt.interrupt() returned"
-                    );
-                    trace.record_ui(&trace::UiEvent::InterruptRequested {
-                        checkpoint: "cp2_handle_interrupted".into(),
-                        running: app.running,
-                    });
+                    // Turn-boundary race: when the engine is already parked at
+                    // on_input there is nothing to interrupt — and the runner
+                    // only rearms the token INSIDE a turn, so a cancel latched
+                    // now would instantly self-interrupt the NEXT message.
+                    if agent_parked.load(std::sync::atomic::Ordering::SeqCst) {
+                        trace.record_ui(&trace::UiEvent::InterruptRequested {
+                            checkpoint: "cp2_skipped_engine_idle".into(),
+                            running: app.running,
+                        });
+                    } else {
+                        interrupt.interrupt();
+                        tracing::info!(
+                            target: "heartbit::interrupt",
+                            checkpoint = "CP2_handle_interrupt_called",
+                            is_cancelled = interrupt.is_interrupted(),
+                            "interrupt.interrupt() returned"
+                        );
+                        trace.record_ui(&trace::UiEvent::InterruptRequested {
+                            checkpoint: "cp2_handle_interrupted".into(),
+                            running: app.running,
+                        });
+                    }
                 }
                 Effect::ComputeStats(target) => {
                     let tx = ui_tx.clone();
@@ -1645,5 +1738,58 @@ mod permission_tests {
                 "{tool} must still ask"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn stale_agent_exit_is_not_admitted_to_the_reducer() {
+        // Audit 2026-06-09: the epoch guard only protected `agent_started`;
+        // the reducer still saw the stale exit and flipped running=false /
+        // cleared `learning` in the middle of the NEW engine's run.
+        let mut started = true;
+        assert!(
+            !admit_agent_msg(&Msg::AgentExited(1), 2, &mut started),
+            "a stale exit (epoch 1 vs current 2) must be dropped"
+        );
+        assert!(started, "a stale exit must not reset agent_started");
+        assert!(
+            admit_agent_msg(&Msg::AgentExited(2), 2, &mut started),
+            "the current epoch's exit reaches the reducer"
+        );
+        assert!(!started, "the current epoch's exit resets agent_started");
+        let mut started = true;
+        assert!(
+            admit_agent_msg(&Msg::Notice("x".into()), 2, &mut started),
+            "non-exit messages always pass"
+        );
+        assert!(started);
+    }
+
+    #[test]
+    fn agent_exit_guard_sends_exited_even_on_panic() {
+        // Audit 2026-06-09: the exit signal lived at the end of the happy path
+        // only — a panic anywhere in the agent thread left `agent_started`
+        // stuck true and every subsequent message was silently dropped.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let handle = std::thread::spawn(move || {
+            let _guard = AgentExitGuard { tx, epoch: 7 };
+            panic!("boom");
+        });
+        assert!(handle.join().is_err(), "the thread did panic");
+        let mut saw_exit = false;
+        let mut saw_notice = false;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                Msg::AgentExited(7) => saw_exit = true,
+                Msg::Notice(n) if n.contains("panicked") => saw_notice = true,
+                _ => {}
+            }
+        }
+        assert!(saw_exit, "AgentExited(epoch) must be sent on panic");
+        assert!(saw_notice, "the panic must surface as a visible notice");
     }
 }

@@ -12,8 +12,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Quality gate: a tag push must never publish untested code to crates.io
+  # (ci.yml only runs on branch pushes / PRs, not on tags). Mirrors the
+  # documented gate: fmt + clippy -D warnings + tests, excluding the WIP
+  # mini-crm app.
+  test:
+    name: Quality gate (fmt + clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev libcurl4-openssl-dev pkg-config
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings
+
+      - name: tests
+        run: cargo test --workspace --exclude mini-crm
+
   build:
     name: Build ${{ matrix.target }}
+    # Gate the binary upload on the quality gate too: the "Upload to GitHub
+    # Release" step below ships user-downloadable binaries, so a tag with
+    # failing tests must not publish them (publish-crate already needs `test`,
+    # but the GitHub Release is a second user-facing channel).
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -55,7 +88,7 @@ jobs:
 
   publish-crate:
     name: Publish heartbit-core to crates.io
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

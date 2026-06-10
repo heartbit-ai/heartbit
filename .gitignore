@@ -54,3 +54,11 @@ research-*.md
 
 # Agent scratch/temporary work (the "temporary directory" the prompt points at)
 scratch/
+
+# Agent-session scratch projects at the repo root (pre-scratch/-convention debris)
+crm-project/
+plate_solving_research/
+plate_solving_rust/
+scratch-rpg-game/
+# wget's default log file has no .log suffix, so `*.log` above doesn't catch it
+wget-log

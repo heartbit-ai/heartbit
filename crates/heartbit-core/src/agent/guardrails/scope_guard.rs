@@ -62,6 +62,13 @@ fn extract_path(input: &serde_json::Value) -> Option<PathBuf> {
 pub struct ScopeGuard {
     /// Normalized in-scope roots. An empty Vec means "unseeded → allow all".
     allowed: RwLock<Vec<PathBuf>>,
+    /// Workspace root used to anchor RELATIVE paths before comparison. The
+    /// live combination is absolute roots (set_scope resolves against the
+    /// workspace) + workspace-relative `file_path` from the file tools —
+    /// without the anchor that pair always compared unequal and in-scope
+    /// writes were falsely denied. `None` keeps the legacy lexical behavior
+    /// (relative only matches relative).
+    workspace: RwLock<Option<PathBuf>>,
 }
 
 impl ScopeGuard {
@@ -73,7 +80,20 @@ impl ScopeGuard {
         let normalized = allowed.iter().map(|p| normalize_path(p)).collect();
         Self {
             allowed: RwLock::new(normalized),
+            workspace: RwLock::new(None),
         }
+    }
+
+    /// Set the workspace root that anchors relative paths (both targets and
+    /// roots) before the containment check. Wired automatically by
+    /// `SetScopeTool::with_workspace` so the guard and the tool resolve
+    /// paths identically.
+    pub fn set_workspace(&self, root: impl AsRef<Path>) {
+        let normalized = normalize_path(root.as_ref());
+        *self
+            .workspace
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(normalized);
     }
 
     /// Extend the allowlist at runtime with an additional in-scope root.
@@ -117,7 +137,21 @@ impl ScopeGuard {
             // Mutating call without a parseable path (e.g. `patch`) → allow.
             return GuardAction::Allow;
         };
-        let target = normalize_path(&path);
+        let workspace = self
+            .workspace
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // Anchor relative paths to the workspace so a relative `file_path`
+        // (how the file tools receive paths) compares against the absolute
+        // roots set_scope declares.
+        let anchor = |p: &Path| -> PathBuf {
+            match (&workspace, p.is_relative()) {
+                (Some(ws), true) => normalize_path(&ws.join(p)),
+                _ => normalize_path(p),
+            }
+        };
+        let target = anchor(&path);
 
         let roots = self.allowed.read().unwrap_or_else(PoisonError::into_inner);
         // Unseeded guard → allow everything.
@@ -125,7 +159,7 @@ impl ScopeGuard {
             return GuardAction::Allow;
         }
         // Component-wise containment: equals-root OR descendant-of-root.
-        let in_scope = roots.iter().any(|root| target.starts_with(root));
+        let in_scope = roots.iter().any(|root| target.starts_with(anchor(root)));
         if in_scope {
             return GuardAction::Allow;
         }
@@ -293,5 +327,46 @@ mod tests {
     fn guard_name() {
         let guard = ScopeGuard::new(vec![]);
         assert_eq!(guard.name(), "scope_guard");
+    }
+
+    // The LIVE combination (audit 2026-06-09): set_scope resolves roots to
+    // ABSOLUTE paths against the workspace, but the file tools pass
+    // workspace-RELATIVE `file_path`s. Without a shared anchor the two always
+    // compared unequal and in-scope writes were FALSELY denied.
+    #[tokio::test]
+    async fn relative_target_anchored_to_workspace_is_in_scope() {
+        let guard = ScopeGuard::new(vec![PathBuf::from("/repo/scratch-x")]);
+        guard.set_workspace("/repo");
+        // The file tool emits a workspace-relative path.
+        let call = mutating_call("write", "scratch-x/new.rs");
+        let action = guard.pre_tool(&call).await.unwrap();
+        assert!(
+            matches!(action, GuardAction::Allow),
+            "a relative in-scope write must be allowed once anchored: {action:?}"
+        );
+    }
+
+    // Anchoring must not WIDEN scope: a relative path resolving outside the
+    // declared root is still denied.
+    #[tokio::test]
+    async fn relative_target_outside_root_still_denied_when_anchored() {
+        let guard = ScopeGuard::new(vec![PathBuf::from("/repo/scratch-x")]);
+        guard.set_workspace("/repo");
+        let call = mutating_call("write", "src/main.rs");
+        let action = guard.pre_tool(&call).await.unwrap();
+        assert!(
+            action.is_denied(),
+            "an out-of-scope relative write must stay denied: {action:?}"
+        );
+    }
+
+    // Without a workspace anchor the legacy lexical behavior holds (relative
+    // only matches relative) — no silent change for callers that never set one.
+    #[tokio::test]
+    async fn no_workspace_keeps_lexical_relative_matching() {
+        let guard = ScopeGuard::new(vec![PathBuf::from("scratch-x")]);
+        let call = mutating_call("write", "scratch-x/new.rs");
+        let action = guard.pre_tool(&call).await.unwrap();
+        assert!(matches!(action, GuardAction::Allow), "{action:?}");
     }
 }
