@@ -60,11 +60,10 @@ def build_heartbit_env(
     provider, model = parse_model_id(model_name)
     env: dict[str, str] = {}
 
-    # Preserve PATH/HOME so the binary and its TLS roots resolve.
-    for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM"):
-        if k in base_env:
-            env[k] = base_env[k]
-    env.setdefault("HOME", "/root")
+    # Deliberately do NOT forward the host's PATH/HOME — they are host paths that
+    # don't exist in the container and would override its own (Harbor merges this
+    # dict over the container env). heartbit resolves its workspace from
+    # HEARTBIT_WORKSPACE and runs bash with its own PATH allowlist.
 
     if provider:
         env["HEARTBIT_PROVIDER"] = provider
