@@ -8,11 +8,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from heartbit_tb2.heartbit_io import (  # noqa: E402
     build_heartbit_env,
+    is_static_musl,
     parse_model_id,
     parse_stderr_tokens,
     parse_trace_tokens,
     provider_api_key_env,
 )
+
+
+def test_is_static_musl_detects_musl_path_and_flag():
+    assert is_static_musl("/repo/target/x86_64-unknown-linux-musl/release/heartbit")
+    assert not is_static_musl("/repo/target/release/heartbit")
+    assert is_static_musl("/custom/heartbit", static_env="1")
+    assert not is_static_musl("/custom/heartbit", static_env="0")
 
 
 def test_parse_model_id_splits_provider_prefix():

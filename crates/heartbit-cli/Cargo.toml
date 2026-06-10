@@ -16,13 +16,14 @@ path = "src/main.rs"
 [[bin]]
 name = "heartbit_blog_render"
 path = "src/bin/heartbit_blog_render.rs"
+required-features = ["persona"]
 
 [dependencies]
-heartbit = { path = "../heartbit", features = ["full"] }
+heartbit = { path = "../heartbit", default-features = false }
 heartbit-core = { path = "../heartbit-core" }
-heartbit-ghost = { path = "../heartbit-ghost" }
-heartbit-telegram = { path = "../heartbit-telegram" }
-teloxide = { workspace = true }
+heartbit-ghost = { path = "../heartbit-ghost", optional = true }
+heartbit-telegram = { path = "../heartbit-telegram", optional = true }
+teloxide = { workspace = true, optional = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -31,28 +32,28 @@ clap = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-restate-sdk = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-axum = { workspace = true }
+restate-sdk = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
-prometheus = { workspace = true }
-rdkafka = { workspace = true }
+prometheus = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
 dotenvy = { workspace = true }
 thiserror = { workspace = true }
-base64 = { workspace = true }
-sqlx = { workspace = true }
+base64 = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 regex = { workspace = true }
 # Runtime use: CLI-side `[daemon]` extension keys (e.g. cors_allow_origin) are
 # parsed from the raw config file because heartbit-core's DaemonConfig cannot
 # carry CLI-only fields.
-toml = { workspace = true }
+toml = { workspace = true, optional = true }
 
 [features]
 # SECURITY (F-FS-5): the `sandbox` feature is enabled by default on Linux
@@ -62,7 +63,40 @@ toml = { workspace = true }
 # users who explicitly accept that risk. macOS and Windows have no Landlock
 # equivalent; on those platforms, BashTool emits a `tracing::warn!` at build
 # time so the user knows kernel sandboxing is unavailable.
-default = ["sandbox"]
-local-embedding = ["heartbit/local-embedding"]
-daemon = ["heartbit/daemon"]
+default = ["full"]
 sandbox = ["heartbit/sandbox"]
+telemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+postgres = ["dep:sqlx", "heartbit/postgres"]
+# submit.rs uses PostgresStore + restate; serve.rs uses telemetry
+restate = ["dep:restate-sdk", "heartbit/restate", "postgres", "telemetry"]
+# daemon/mod.rs unconditionally wires the persona/ghost stack (heartbit_ghost
+# register + persona_review telegram delivery), so daemon ⊇ persona.
+daemon = [
+    "dep:rdkafka",
+    "dep:axum",
+    "dep:prometheus",
+    "dep:toml",
+    "postgres",
+    "heartbit/daemon",
+    "telemetry",
+    "persona",
+]
+persona = [
+    "dep:teloxide",
+    "dep:heartbit-telegram",
+    "dep:heartbit-ghost",
+    "dep:base64",
+]
+# `heartbit/core` reproduces heartbit's own `default = ["core"]`, which the
+# previous `default-features`-on dependency pulled in. It is an inert marker
+# feature today (gates no code), but carrying it keeps the full build feature-
+# identical to the pre-refactor baseline and future-proofs against `core`
+# gaining content.
+slim = ["sandbox", "heartbit/core", "heartbit/a2a"]
+full = ["sandbox", "heartbit/core", "restate", "daemon", "persona", "heartbit/full"]
+local-embedding = ["heartbit/local-embedding"]

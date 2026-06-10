@@ -81,22 +81,37 @@ mismatch; **but** it needs apt + network (for rustup) in each task container and
 adds many minutes per container. Fine for the local smoke; see *Scaling* for the
 caveat.
 
-### `prebuilt` (fast) — upload a host-built binary
+### `prebuilt` (fast, recommended for scale) — upload a host-built binary
 
-Build once on a glibc base matching the TB2 images, then upload + apt-install the
-runtime libs only:
+`prebuilt` mode auto-detects the binary: it prefers the **slim static musl**
+build (portable to *any* container) and falls back to the glibc one.
+
+**Portable static binary (recommended) — `build_musl.sh`:**
 
 ```bash
-benchmarks/terminal-bench-2/scripts/build_prebuilt.sh rust:1-bookworm
-# -> target/release/heartbit   (the adapter's default HEARTBIT_BIN)
+benchmarks/terminal-bench-2/scripts/build_musl.sh
+# -> target/x86_64-unknown-linux-musl/release/heartbit   (fully static)
 export HEARTBIT_INSTALL_MODE=prebuilt
 ```
 
-The binary is **glibc-dynamic** (links OpenSSL 3 / libcurl / zlib via teloxide +
-librdkafka; a static musl build is blocked without slimming the crate). The
-adapter apt-installs `ca-certificates libssl3 libcurl4 zlib1g` (`ca-certificates`
-is mandatory — without it every HTTPS call to the model API fails TLS). Use this
-on Debian/Ubuntu-derived task images whose glibc/OpenSSL major matches your build.
+This builds the **slim** feature set (run/chat env-path only — no
+teloxide/kafka/restate/postgres/openssl, pure rustls+ring) for
+`x86_64-unknown-linux-musl` inside `rust:alpine`. The result is **statically
+linked** with **compiled-in CA roots (webpki-roots)**, so it runs in
+scratch/distroless/alpine/glibc containers alike — the adapter installs **no**
+runtime libs and needs **no** `ca-certificates`. This is the path for Daytona
+`-n 32`.
+
+**Glibc fallback — `build_prebuilt.sh`** (only if you can't run the musl build):
+
+```bash
+benchmarks/terminal-bench-2/scripts/build_prebuilt.sh rust:1-bookworm
+# -> target/release/heartbit   (glibc-dynamic)
+```
+
+The glibc binary links OpenSSL 3 / libcurl / zlib; the adapter apt-installs
+`ca-certificates libssl3 libcurl4 zlib1g` (best-effort). Only fits
+Debian/Ubuntu-derived task images whose glibc/OpenSSL major matches your build.
 
 ## 4. Run heartbit on the benchmark
 
@@ -180,9 +195,20 @@ best-effort reporting.
 `build` mode compiles heartbit (full features incl. the librdkafka C build) in
 **every** task container — minutes per container × n trials × 89 tasks, and it
 needs network for rustup. That's fine for the local smoke but untenable for
-Daytona `-n 32`. For scale, either switch to `prebuilt` (if the bases are glibc),
-or invest in a slim/musl build (make `teloxide` optional + a `core` feature set)
-for a portable binary. Pick the path deliberately and report it with your numbers.
+Daytona `-n 32`. **For scale, use the slim static musl binary** (`build_musl.sh`
+→ `HEARTBIT_INSTALL_MODE=prebuilt`): built once, uploaded as a single static
+file into each container, portable to any base, no per-task compile, no runtime
+libs. Report which mode you used with your numbers.
+
+### How the slim binary is built (`--features slim`)
+
+heartbit-cli is feature-gated: `default = ["full"]` (the normal binary, with
+serve/daemon/persona/restate), and `slim = ["sandbox", "heartbit/a2a"]` keeps
+only the `run`/`chat` env-path (AgentRunner + builtins + Anthropic/MCP/A2A over
+rustls). The heavy deps (teloxide/rdkafka/restate-sdk/sqlx/axum/prometheus/
+opentelemetry) are optional and their subcommands `#[cfg]`-gated, so the slim
+graph drops openssl-sys/native-tls/librdkafka entirely — which is what makes the
+static musl link possible. The full build is unchanged.
 
 ## Methodology
 
