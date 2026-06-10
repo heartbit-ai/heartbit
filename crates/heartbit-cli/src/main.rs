@@ -56,6 +56,11 @@ enum Commands {
         /// Print structured agent events to stderr as one-line JSON
         #[arg(long, short)]
         verbose: bool,
+        /// Write the final AgentOutput as pretty JSON to this path (headless
+        /// benchmark trace; env path only). Failure to write logs a warning
+        /// and does not fail the run.
+        #[arg(long)]
+        trace_file: Option<PathBuf>,
     },
     /// Start the Restate-compatible HTTP worker
     Serve {
@@ -314,10 +319,24 @@ pub(crate) fn workspace_root_from_config(config: &HeartbitConfig) -> PathBuf {
         .unwrap_or_else(default_workspace_root_path)
 }
 
-/// Default workspace root when no config is available (`~/.heartbit/workspaces`).
+/// Resolve the workspace root from an optional `HEARTBIT_WORKSPACE` override and
+/// the `HOME` directory. When `workspace_env` is set and non-empty, it is used
+/// verbatim; otherwise falls back to `{home}/.heartbit/workspaces`.
+///
+/// Pure helper so it can be unit-tested without env mutation.
+fn resolve_workspace_root(workspace_env: Option<&str>, home: &str) -> PathBuf {
+    match workspace_env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(ws) => PathBuf::from(ws),
+        None => PathBuf::from(format!("{home}/.heartbit/workspaces")),
+    }
+}
+
+/// Default workspace root when no config is available. Honors the
+/// `HEARTBIT_WORKSPACE` env override first, else `~/.heartbit/workspaces`.
 fn default_workspace_root_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(format!("{home}/.heartbit/workspaces"))
+    let workspace_env = std::env::var("HEARTBIT_WORKSPACE").ok();
+    resolve_workspace_root(workspace_env.as_deref(), &home)
 }
 
 #[tokio::main]
@@ -332,6 +351,7 @@ async fn main() -> Result<()> {
             task,
             approve,
             verbose,
+            trace_file,
         }) => {
             let task_str = task.join(" ");
             if task_str.is_empty() {
@@ -343,6 +363,7 @@ async fn main() -> Result<()> {
                 approve,
                 verbose,
                 cli.observability.as_deref(),
+                trace_file,
             )
             .await
         }
@@ -443,6 +464,7 @@ async fn main() -> Result<()> {
                 false,
                 false,
                 cli.observability.as_deref(),
+                None,
             )
             .await
         }
@@ -455,10 +477,11 @@ async fn run_standalone(
     approve: bool,
     verbose: bool,
     observability_flag: Option<&str>,
+    trace_file: Option<PathBuf>,
 ) -> Result<()> {
     match config_path {
         Some(path) => run_from_config(path, task, approve, verbose, observability_flag).await,
-        None => run_from_env(task, approve, verbose, observability_flag).await,
+        None => run_from_env(task, approve, verbose, observability_flag, trace_file).await,
     }
 }
 
@@ -2145,6 +2168,7 @@ async fn run_from_env(
     approve: bool,
     verbose: bool,
     observability_flag: Option<&str>,
+    trace_file: Option<PathBuf>,
 ) -> Result<()> {
     init_tracing();
     let mode = resolve_observability(observability_flag, None, verbose);
@@ -2178,8 +2202,37 @@ async fn run_from_env(
     )
     .await?;
     output.estimated_cost_usd = heartbit::estimate_cost(&model, &output.tokens_used);
+    // Headless-benchmark trace: serialize the final AgentOutput for the Harbor
+    // adapter. The agent already did its work in the container, so a write
+    // failure must NOT fail the run — log a warning and continue.
+    if let Some(ref path) = trace_file
+        && let Err(e) = write_trace(&output, path)
+    {
+        tracing::warn!(path = %path.display(), error = %e, "failed to write trace file");
+    }
     print_streaming_stats(&output);
     Ok(())
+}
+
+/// Serialize an [`AgentOutput`] as pretty JSON to `path` (create/truncate).
+///
+/// Used by the headless-benchmark trace-file affordance. Pure helper so it can
+/// be unit-tested without touching the env or the agent loop.
+fn write_trace(output: &AgentOutput, path: &std::path::Path) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(output).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+/// Whether non-interactive mode is enabled, given the raw `HEARTBIT_NONINTERACTIVE`
+/// value. `"1"` or `"true"` (case-insensitive) => true; unset/anything else => false.
+///
+/// When enabled, the blocking `question` tool is dropped so a headless benchmark
+/// never stalls on stdin. Pure helper for unit testing without env mutation.
+fn noninteractive_enabled(val: Option<&str>) -> bool {
+    matches!(
+        val.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 /// Resolve the model name from environment variables (mirrors build_provider_from_env logic).
@@ -2224,7 +2277,12 @@ async fn run_default_agent(
 
     let mut tools = {
         let mut btc = BuiltinToolsConfig::default();
-        btc.on_question = Some(question_callback());
+        // Drop the blocking `question` tool in non-interactive mode so a headless
+        // benchmark never stalls on stdin (builtins only add it when on_question
+        // is Some). Default (unset) is unchanged.
+        if !noninteractive_enabled(std::env::var("HEARTBIT_NONINTERACTIVE").ok().as_deref()) {
+            btc.on_question = Some(question_callback());
+        }
         btc.workspace = workspace_dir.clone();
         btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
         btc.skill_dirs = skill_dirs.clone();
@@ -2719,7 +2777,11 @@ async fn run_chat_from_env(
 
     let mut tools = {
         let mut btc = BuiltinToolsConfig::default();
-        btc.on_question = Some(question_callback());
+        // Same non-interactive guard as the run env path: skip the blocking
+        // `question` tool when HEARTBIT_NONINTERACTIVE is set. Default unchanged.
+        if !noninteractive_enabled(std::env::var("HEARTBIT_NONINTERACTIVE").ok().as_deref()) {
+            btc.on_question = Some(question_callback());
+        }
         btc.workspace = workspace_dir.clone();
         btc.dangerous_tools = true; // CLI mode: enable bash for backward compat
         builtin_tools(btc)
@@ -3275,6 +3337,102 @@ skills = []
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Change 1: --trace-file write helper ---
+
+    #[test]
+    fn write_trace_emits_result_and_token_fields() {
+        // Build an AgentOutput with the fields the Python adapter parses.
+        // AgentOutput is #[non_exhaustive], so construct via Default + assign.
+        let mut output = AgentOutput::default();
+        output.result = "all done".to_string();
+        output.tokens_used.input_tokens = 1234;
+        output.tokens_used.output_tokens = 56;
+        output.estimated_cost_usd = Some(0.0042);
+
+        // Unique path in the temp dir (reading temp_dir is not env mutation).
+        let path = std::env::temp_dir().join(format!(
+            "heartbit-trace-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        write_trace(&output, &path).expect("write_trace should succeed");
+
+        let bytes = std::fs::read_to_string(&path).expect("trace file should exist");
+        let _ = std::fs::remove_file(&path);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&bytes).expect("trace file should be valid JSON");
+        assert_eq!(parsed["result"], "all done");
+        assert_eq!(parsed["tokens_used"]["input_tokens"], 1234);
+        assert_eq!(parsed["tokens_used"]["output_tokens"], 56);
+        // estimated_cost_usd is skip_serializing_if Option::is_none — must be
+        // present here since we set it (the adapter relies on this).
+        assert_eq!(parsed["estimated_cost_usd"], 0.0042);
+    }
+
+    #[test]
+    fn run_subcommand_parses_trace_file_flag_before_task() {
+        // Locks the clap wiring: --trace-file (flags-first) is captured into the
+        // Run arm and the trailing task is collected separately.
+        let cli = Cli::try_parse_from(["heartbit", "run", "--trace-file", "/x.json", "do", "it"])
+            .expect("should parse");
+        match cli.command {
+            Some(Commands::Run {
+                task, trace_file, ..
+            }) => {
+                assert_eq!(trace_file, Some(PathBuf::from("/x.json")));
+                assert_eq!(task, vec!["do".to_string(), "it".to_string()]);
+            }
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    // --- Change 2: HEARTBIT_NONINTERACTIVE guard ---
+
+    #[test]
+    fn noninteractive_enabled_recognizes_truthy_values() {
+        assert!(noninteractive_enabled(Some("1")));
+        assert!(noninteractive_enabled(Some("true")));
+        assert!(noninteractive_enabled(Some("TRUE")));
+        assert!(noninteractive_enabled(Some(" true ")));
+    }
+
+    #[test]
+    fn noninteractive_disabled_by_default_and_falsey() {
+        assert!(!noninteractive_enabled(None));
+        assert!(!noninteractive_enabled(Some("0")));
+        assert!(!noninteractive_enabled(Some("false")));
+        assert!(!noninteractive_enabled(Some("")));
+        assert!(!noninteractive_enabled(Some("yes")));
+    }
+
+    // --- Change 3: HEARTBIT_WORKSPACE override ---
+
+    #[test]
+    fn resolve_workspace_root_honors_override() {
+        assert_eq!(
+            resolve_workspace_root(Some("/task/dir"), "/home/u"),
+            PathBuf::from("/task/dir")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_falls_back_when_unset_or_empty() {
+        assert_eq!(
+            resolve_workspace_root(None, "/home/u"),
+            PathBuf::from("/home/u/.heartbit/workspaces")
+        );
+        // Empty / whitespace-only override is treated as unset.
+        assert_eq!(
+            resolve_workspace_root(Some("   "), "/home/u"),
+            PathBuf::from("/home/u/.heartbit/workspaces")
+        );
+    }
 
     #[test]
     fn verbose_implies_analysis_mode() {
