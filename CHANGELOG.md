@@ -6,10 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Eight commits since `v2026.607.1`, five of which change heartbit-core runtime
-behavior (orchestrator, runner, set_scope, bash, builder prompts). Most are
-hardening driven by live CRM-session traces (6a25ca5e, 6a25d21b, 6a25eb4d,
-6a265efd).
+## [2026.611.1] - 2026-06-11
+
+Changes since `v2026.607.1`. The headline is a multi-aspect audit of
+heartbit-core (45 confirmed findings fixed, including a HIGH human-in-the-loop
+bypass) and a rustls-only dependency switch that makes the crate
+static-musl-buildable; plus the per-request gate hardening already noted below.
+
+### Added (this release)
+
+- **Multi-aspect audit — 45 findings fixed + 5 fix-defects** (`e7bb045`) — a
+  10-aspect audit with adversarial verification; 71 new regression tests. Most
+  load-bearing: orchestrator now propagates `on_approval` + learned permissions
+  to sub-agents (closes a HIGH HITL-bypass where a delegated tool call escaped
+  the human-approval gate); user interrupt short-circuits the stop-gates;
+  cache hits no longer re-bill token usage; denied-tool-batch doom detection
+  (exact + fuzzy); ReadOnly mode deny is a whitelist mirror of the tool mask;
+  overflow recovery escalates truncate→summary; verify-replan is per-request
+  and re-anchored across compaction; router no longer misroutes inflected
+  French study verbs into EXECUTE. Tool/codegen hardening: symlinked-dir jail
+  escape closed, UTF-8-safe chunking/slicing, VerifyCommandTool process-group
+  teardown, ripgrep stdout cap.
+- **Portable static (musl) build path** (`b2f445c`) — heartbit-cli is
+  feature-gated (`default = ["full"]`, `slim = ["sandbox", "heartbit/core",
+  "heartbit/a2a"]`) so a slim, fully static `x86_64-unknown-linux-musl` binary
+  can be built (run/chat env-path only). Enables the Terminal-Bench 2.0
+  benchmark harness under `benchmarks/terminal-bench-2/` (Harbor adapter +
+  headless CLI hooks `--trace-file` / `HEARTBIT_WORKSPACE` /
+  `HEARTBIT_NONINTERACTIVE`).
+
+### Changed (this release)
+
+- **reqwest is now rustls-only by default** — the workspace `reqwest` gains
+  `default-features = false` (re-adding `http2` + `charset`), so the always-on
+  crates (incl. heartbit-core) no longer pull `default-tls` → native-tls →
+  openssl-sys. heartbit-core's HTTP stack (Anthropic/OpenAI-compat/Gemini/
+  OpenRouter providers, MCP, A2A) resolves to rustls + ring with compiled-in
+  webpki-roots. No behavioural change for the HTTPS endpoints.
 
 ### Added
 

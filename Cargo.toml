@@ -8,7 +8,7 @@ members = ["crates/heartbit", "crates/heartbit-cli", "crates/heartbit-macro", "c
 #   cargo test   --workspace --exclude mini-crm
 
 [workspace.package]
-version = "2026.607.1"
+version = "2026.611.1"
 authors = ["Pascal Le Clech <pascal@heartbit.ai>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/heartbit-ai/heartbit"
