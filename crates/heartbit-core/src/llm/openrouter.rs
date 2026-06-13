@@ -461,6 +461,11 @@ struct OpenAiUsage {
     /// OpenAI-format cache reporting (what OpenRouter actually returns).
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// AP4: OpenAI nests reasoning under `completion_tokens_details`. The flat
+    /// `reasoning_tokens` above is OpenRouter's older form; the OpenAI-normalized
+    /// path puts the value here (mirroring `prompt_tokens_details` for cache).
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Deserialize, Default)]
@@ -469,6 +474,12 @@ struct PromptTokensDetails {
     cached_tokens: u32,
     #[serde(default)]
     cache_write_tokens: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 /// Map an OpenAI-format usage object to [`TokenUsage`], preferring the
@@ -481,12 +492,18 @@ fn usage_to_tokens(u: &OpenAiUsage) -> TokenUsage {
         }
         _ => (u.cache_read_input_tokens, u.cache_creation_input_tokens),
     };
+    // AP4: prefer the nested OpenAI-format reasoning count; fall back to the flat
+    // field for OpenRouter's older shape.
+    let reasoning = match &u.completion_tokens_details {
+        Some(d) if d.reasoning_tokens > 0 => d.reasoning_tokens,
+        _ => u.reasoning_tokens,
+    };
     TokenUsage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
         cache_creation_input_tokens: cache_write,
         cache_read_input_tokens: cache_read,
-        reasoning_tokens: u.reasoning_tokens,
+        reasoning_tokens: reasoning,
     }
 }
 
@@ -606,8 +623,12 @@ struct StreamingDelta {
 
 #[derive(Deserialize)]
 struct StreamingToolCallDelta {
+    // L4: `Option`, not a `#[serde(default)]=0` `usize`. OpenAI-native streaming
+    // always sends `index`; some backends omit it, and a default of 0 would
+    // merge every parallel tool call into slot 0 (corrupting ids/args). With no
+    // index we fall back to id-based slot allocation below.
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -850,19 +871,33 @@ fn process_openai_event(
 
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc_delta in tcs {
+                // L4: resolve the target slot. With an explicit `index`, use it
+                // (OpenAI-native behaviour, unchanged). With no index, a delta
+                // carrying a FRESH `id` starts a new call; otherwise it continues
+                // the most recent slot — so parallel calls from index-omitting
+                // backends no longer all collapse into slot 0.
+                let slot = match tc_delta.index {
+                    Some(i) => i,
+                    None => match (&tc_delta.id, tool_calls.last()) {
+                        (Some(id), last) if last.map(|t| t.id.as_str()) != Some(id.as_str()) => {
+                            tool_calls.len()
+                        }
+                        _ => tool_calls.len().saturating_sub(1),
+                    },
+                };
                 // SECURITY (F-LLM-4): refuse outsized tool_call indices.
-                if tc_delta.index >= super::STREAM_MAX_TOOL_CALLS {
+                if slot >= super::STREAM_MAX_TOOL_CALLS {
                     tracing::warn!(
-                        index = tc_delta.index,
+                        index = slot,
                         limit = super::STREAM_MAX_TOOL_CALLS,
                         "OpenAI-format tool_call index exceeds cap; dropping delta"
                     );
                     continue;
                 }
-                while tool_calls.len() <= tc_delta.index {
+                while tool_calls.len() <= slot {
                     tool_calls.push(AccumulatedToolCall::default());
                 }
-                let tc = &mut tool_calls[tc_delta.index];
+                let tc = &mut tool_calls[slot];
                 if let Some(ref id) = tc_delta.id {
                     tc.id.clone_from(id);
                 }
@@ -967,6 +1002,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(usage_to_tokens(&u).cache_read_input_tokens, 4);
+    }
+
+    #[test]
+    fn usage_prefers_nested_completion_tokens_details_for_reasoning() {
+        // AP4: OpenAI nests reasoning under `completion_tokens_details`.
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+            "completion_tokens_details": { "reasoning_tokens": 33 }
+        }))
+        .unwrap();
+        assert_eq!(usage_to_tokens(&u).reasoning_tokens, 33);
+
+        // Falls back to the flat field (OpenRouter's older shape) when the
+        // nested object is absent.
+        let u: OpenAiUsage = serde_json::from_value(json!({
+            "prompt_tokens": 10, "completion_tokens": 50, "reasoning_tokens": 12
+        }))
+        .unwrap();
+        assert_eq!(usage_to_tokens(&u).reasoning_tokens, 12);
     }
 
     // --- Request building tests ---
@@ -1601,6 +1656,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 25,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
         let response = into_completion_response(api).unwrap();
@@ -1803,6 +1859,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_parallel_tool_calls_without_index() {
+        // L4: a backend that OMITS `index` on streaming tool-call deltas must
+        // still yield two distinct calls (keyed by fresh `id`), not one merged
+        // call in slot 0. Each call's args arrive in a later index-less,
+        // id-less continuation delta.
+        let sse = make_sse_data(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"q\":1}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"c2","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"p\":2}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+        let on_text: &crate::llm::OnText = &|_| {};
+
+        let response = parse_openai_stream(stream, on_text).await.unwrap();
+        let calls = response.tool_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "index-less parallel calls collapsed into one"
+        );
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].id, "c2");
+    }
+
+    #[tokio::test]
     async fn stream_text_with_tool_calls() {
         let sse = make_sse_data(&[
             r#"{"choices":[{"delta":{"content":"Let me search."},"finish_reason":null}]}"#,
@@ -1866,6 +1952,7 @@ mod tests {
                 cache_read_input_tokens: 60,
                 reasoning_tokens: 0,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
 
@@ -1894,6 +1981,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 0,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
 

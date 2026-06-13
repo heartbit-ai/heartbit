@@ -227,6 +227,11 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default)]
     cached_content_token_count: u32,
+    // AP3: gemini-2.5 thinking models report reasoning tokens ONLY here, not
+    // folded into `candidatesTokenCount`. Without this field they were silently
+    // discarded and `reasoning_tokens` stayed 0 → reasoning cost invisible.
+    #[serde(default)]
+    thoughts_token_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +522,7 @@ fn parse_gemini_response(resp: GeminiResponse) -> Result<CompletionResponse, Err
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
             cache_read_input_tokens: u.cached_content_token_count,
+            reasoning_tokens: u.thoughts_token_count,
             ..Default::default()
         });
 
@@ -669,11 +675,30 @@ where
     let has_tool_calls = content
         .iter()
         .any(|c| matches!(c, ContentBlock::ToolUse { .. }));
+    // AP5: mirror the non-streaming `finish_reason` mapping. The previous silent
+    // `_ => EndTurn` catch-all folded SAFETY/RECITATION (and any future reason)
+    // into a clean completion, so a safety/recitation-blocked partial stream
+    // looked like a finished answer to the agent loop. Handle the blocked
+    // reasons explicitly and `warn!` on unknown ones for observability.
     let stop_reason = match finish_reason.as_deref() {
-        Some("STOP") if has_tool_calls => StopReason::ToolUse,
-        Some("STOP") => StopReason::EndTurn,
+        Some("STOP") => {
+            if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }
         Some("MAX_TOKENS") => StopReason::MaxTokens,
-        _ => {
+        Some("SAFETY") => StopReason::EndTurn,
+        Some("RECITATION") => StopReason::EndTurn,
+        Some(other) => {
+            warn!(
+                finish_reason = other,
+                "unknown Gemini finish_reason (stream), treating as EndTurn"
+            );
+            StopReason::EndTurn
+        }
+        None => {
             if has_tool_calls {
                 StopReason::ToolUse
             } else {
@@ -756,6 +781,7 @@ fn process_gemini_event(
             input_tokens: u.prompt_token_count,
             output_tokens: u.candidates_token_count,
             cache_read_input_tokens: u.cached_content_token_count,
+            reasoning_tokens: u.thoughts_token_count,
             ..Default::default()
         };
     }
@@ -941,10 +967,13 @@ mod tests {
                 prompt_token_count: 10,
                 candidates_token_count: 5,
                 cached_content_token_count: 0,
+                thoughts_token_count: 7,
             }),
         };
         let result = parse_gemini_response(resp).unwrap();
         assert_eq!(result.text(), "Hello!");
+        // AP3: thinking tokens are surfaced as reasoning_tokens.
+        assert_eq!(result.usage.reasoning_tokens, 7);
         assert_eq!(result.stop_reason, StopReason::EndTurn);
         assert_eq!(result.usage.input_tokens, 10);
         assert_eq!(result.usage.output_tokens, 5);
@@ -1236,6 +1265,7 @@ mod tests {
                 prompt_token_count: 50,
                 candidates_token_count: 10,
                 cached_content_token_count: 30,
+                thoughts_token_count: 0,
             }),
         };
         let result = parse_gemini_response(resp).unwrap();

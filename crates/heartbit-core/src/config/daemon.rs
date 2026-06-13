@@ -404,7 +404,8 @@ pub struct PersonaPostsConfig {
     #[serde(default = "super::default_true")]
     pub enabled: bool,
     /// Posting interval, in seconds. Default 14400 (4 hours).
-    /// Validation: must be ≥60 (rejected at config load otherwise).
+    /// Recommended ≥60. NOTE: this is NOT enforced at config load — the value
+    /// is consumed as-is by the (cross-crate) scheduler loop.
     #[serde(default = "default_post_interval_seconds")]
     pub post_interval_seconds: u64,
     /// Randomness applied to each `post_interval_seconds` tick, as a
@@ -544,7 +545,8 @@ pub struct PersonaQuotesConfig {
     pub enabled: bool,
     /// Polling interval, in seconds. Default 5400 (90 min — medium per
     /// brainstorm).
-    /// Validation: must be ≥60 (rejected at config load otherwise).
+    /// Recommended ≥60. NOTE: this is NOT enforced at config load — the value
+    /// is consumed as-is by the (cross-crate) scheduler loop.
     #[serde(default = "default_quote_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
     /// Randomness applied to each `poll_interval_seconds` tick, as a

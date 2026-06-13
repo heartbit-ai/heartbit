@@ -111,11 +111,26 @@ impl Tool for EditTool {
                 return Ok(ToolOutput::error(format!("File not found: {file_path}")));
             }
 
-            if let Some(policy) = &self.path_policy
-                && let Err(e) = policy.check_path(&path)
-            {
-                return Ok(ToolOutput::error(format!("path policy: {e}")));
-            }
+            // SECURITY (F-FS-1): mirror write.rs/patch.rs. With a policy active,
+            // recompose the canonical target and write it via the symlink-safe
+            // component walk (`write_beneath_root`) so an intermediate- or
+            // final-component symlink swap (parallel tool-call race) cannot
+            // redirect the write outside the policy root. EditTool was previously
+            // left out of this hardening and wrote via plain `tokio::fs::write`,
+            // which follows symlinks. Without a policy, fall back to the
+            // O_NOFOLLOW writer like the sibling tools.
+            let (target, write_root) = match &self.path_policy {
+                Some(policy) => match policy.check_path_for_create(&path) {
+                    Ok(canonical) => {
+                        let root = policy
+                            .allowed_root_for(&canonical)
+                            .map(std::path::Path::to_path_buf);
+                        (canonical, root)
+                    }
+                    Err(e) => return Ok(ToolOutput::error(format!("path policy: {e}"))),
+                },
+                None => (path.clone(), None),
+            };
 
             // No-op guard
             if old_string == new_string {
@@ -125,12 +140,12 @@ impl Tool for EditTool {
             }
 
             // Read-before-write guard
-            if let Err(msg) = self.file_tracker.check_unmodified(&path) {
+            if let Err(msg) = self.file_tracker.check_unmodified(&target) {
                 return Ok(ToolOutput::error(msg));
             }
 
             // Read current content
-            let content = tokio::fs::read_to_string(&path)
+            let content = tokio::fs::read_to_string(&target)
                 .await
                 .map_err(|e| Error::Agent(format!("Cannot read file: {e}")))?;
 
@@ -158,13 +173,22 @@ impl Tool for EditTool {
             let new_content =
                 String::from(&content[..idx]) + new_string + &content[idx + old_string.len()..];
 
-            // Write
-            tokio::fs::write(&path, &new_content)
-                .await
-                .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
+            // Write (symlink-safe; see F-FS-1 note above)
+            match write_root {
+                Some(root) => {
+                    super::write_beneath_root(&root, &target, new_content.as_bytes())
+                        .await
+                        .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
+                }
+                None => {
+                    super::write_no_follow(&target, new_content.as_bytes())
+                        .await
+                        .map_err(|e| Error::Agent(format!("Cannot write file: {e}")))?;
+                }
+            }
 
             // Update tracker
-            let _ = self.file_tracker.record_read(&path);
+            let _ = self.file_tracker.record_read(&target);
 
             // Build output: show changed lines with context
             let output = format_edit_snippet(&new_content, idx, new_string.len());

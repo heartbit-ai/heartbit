@@ -213,13 +213,30 @@ impl<P: LlmProvider> ConsolidationPipeline<P> {
 
             self.memory.store(scope, consolidated).await?;
 
-            // Delete originals
+            // Delete originals. AP10: surface deletion failures and count only
+            // the sources actually removed. `let _ = forget()` previously
+            // swallowed errors while still counting every cluster member, so a
+            // failed delete left stale episodic entries beside the new summary
+            // (silent duplication) and over-reported `entries_consolidated`.
+            let mut deleted = 0usize;
             for id in &source_ids {
-                let _ = self.memory.forget(scope, id).await;
+                match self.memory.forget(scope, id).await {
+                    // `forget` returns `Ok(true)` only when an entry was actually
+                    // removed. `Ok(false)` (id absent — e.g. a duplicate in
+                    // `source_ids` or a concurrent delete) must NOT be counted, or
+                    // `entries_consolidated` over-reports.
+                    Ok(true) => deleted += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        id = %id,
+                        error = %e,
+                        "consolidation: failed to delete source entry; leaving it in place"
+                    ),
+                }
             }
 
             clusters_merged += 1;
-            entries_consolidated += cluster.len();
+            entries_consolidated += deleted;
         }
 
         Ok(ConsolidationResult {

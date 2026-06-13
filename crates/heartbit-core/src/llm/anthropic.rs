@@ -141,20 +141,12 @@ impl LlmProvider for AnthropicProvider {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let message = if status.as_u16() == 401 || status.as_u16() == 403 {
-                format!("authentication failed (HTTP {})", status.as_u16())
-            } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<body read error: {e}>"))
-            };
-            return Err(Error::Api {
-                status: status.as_u16(),
-                message,
-            });
+        if !response.status().is_success() {
+            // Mirror `complete()` (and the gemini/openrouter providers): route the
+            // error body through `api_error_from_response`, which caps it at
+            // `ERROR_BODY_MAX_BYTES` and strips control/ANSI chars. The previous
+            // raw `response.text()` here was an unbounded, unsanitized read.
+            return Err(super::api_error_from_response(response).await);
         }
 
         parse_sse_stream_with_callback(response.bytes_stream(), on_text).await

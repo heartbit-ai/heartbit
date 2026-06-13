@@ -41,6 +41,7 @@ impl JsonRpcClient {
 
         // Spawn reader task
         let pending_clone = Arc::clone(&pending);
+        let pending_drain = Arc::clone(&pending);
         let diag_clone = Arc::clone(&published_diagnostics);
         let version_clone = Arc::clone(&diagnostics_version);
         let notify_clone = Arc::clone(&diagnostics_notify);
@@ -56,6 +57,11 @@ impl JsonRpcClient {
             {
                 tracing::debug!(error = %e, "LSP JSON-RPC reader exited");
             }
+            // R4/A3: on reader exit (EOF, fatal framing error, server crash),
+            // drop every pending response sender so in-flight `request()` callers
+            // fail fast with "response channel closed" instead of hanging until
+            // their own timeout, and the map retains no stale senders.
+            pending_drain.lock().await.clear();
         });
 
         Self {
@@ -122,6 +128,16 @@ impl JsonRpcClient {
     ) -> Option<serde_json::Value> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            // B6: register the notification waiter BEFORE reading the cache.
+            // `Notify::notify_waiters()` stores no permit, so a notification
+            // firing in the gap between the cache check and the await would be
+            // lost — stalling diagnostics that already arrived until the full
+            // remaining timeout elapses. `Notified::enable()` registers the
+            // waiter eagerly (a bare `notified()` only registers on first poll).
+            let notified = self.diagnostics_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             {
                 let cache = self.published_diagnostics.lock().await;
                 if let Some(entry) = cache.get(uri)
@@ -134,7 +150,7 @@ impl JsonRpcClient {
             if remaining.is_zero() {
                 return None;
             }
-            let _ = tokio::time::timeout(remaining, self.diagnostics_notify.notified()).await;
+            let _ = tokio::time::timeout(remaining, notified.as_mut()).await;
         }
     }
 
@@ -159,8 +175,11 @@ impl JsonRpcClient {
     }
 
     /// Background reader loop: parse Content-Length framed messages and dispatch.
-    async fn read_loop(
-        stdout: ChildStdout,
+    ///
+    /// Generic over the byte source (`ChildStdout` in production) so the framing
+    /// and resync behaviour can be unit-tested against in-memory inputs.
+    async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
+        stdout: R,
         pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
         published_diagnostics: Arc<Mutex<HashMap<String, DiagnosticsEntry>>>,
         diagnostics_version: Arc<AtomicU64>,
@@ -170,47 +189,52 @@ impl JsonRpcClient {
         let mut header_buf = String::new();
 
         loop {
-            // Parse headers
-            let content_length = loop {
-                header_buf.clear();
-                let n = reader
-                    .read_line(&mut header_buf)
-                    .await
-                    .map_err(|e| format!("read header: {e}"))?;
-                if n == 0 {
-                    return Err("EOF reading headers".into());
-                }
-                let trimmed = header_buf.trim();
-                if trimmed.is_empty() {
-                    // Empty line = end of headers, but we need content-length
-                    // This shouldn't happen before we've seen Content-Length
-                    continue;
-                }
-                if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-                    let len: usize = len_str
-                        .trim()
-                        .parse()
-                        .map_err(|e| format!("invalid Content-Length: {e}"))?;
-                    // SECURITY (F-LSP-1): cap Content-Length at 64 MiB. A
-                    // hostile or compromised LSP server could send
-                    // `Content-Length: 99999999999999`; without this cap, the
-                    // `vec![0u8; len]` below would attempt a multi-TB
-                    // allocation and OOM the agent.
-                    const LSP_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-                    if len > LSP_MAX_BODY_BYTES {
-                        return Err(format!(
-                            "LSP Content-Length {len} exceeds cap of {LSP_MAX_BODY_BYTES} bytes (F-LSP-1)"
-                        ));
-                    }
-                    // Read the blank line after headers
+            // Parse the header block. B5: the LSP base protocol does NOT
+            // guarantee `Content-Length` is the last header (a `Content-Type`
+            // may follow it). Read header lines until the blank terminator,
+            // capturing Content-Length wherever it appears, instead of assuming
+            // exactly one more line follows it.
+            let content_length = {
+                let mut len: Option<usize> = None;
+                loop {
                     header_buf.clear();
-                    reader
+                    let n = reader
                         .read_line(&mut header_buf)
                         .await
-                        .map_err(|e| format!("read blank line: {e}"))?;
-                    break len;
+                        .map_err(|e| format!("read header: {e}"))?;
+                    if n == 0 {
+                        return Err("EOF reading headers".into());
+                    }
+                    let trimmed = header_buf.trim();
+                    if trimmed.is_empty() {
+                        // Blank line terminates the header block.
+                        break;
+                    }
+                    if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
+                        let parsed: usize = len_str
+                            .trim()
+                            .parse()
+                            .map_err(|e| format!("invalid Content-Length: {e}"))?;
+                        // SECURITY (F-LSP-1): cap Content-Length at 64 MiB. A
+                        // hostile or compromised LSP server could send
+                        // `Content-Length: 99999999999999`; without this cap, the
+                        // `vec![0u8; len]` below would attempt a multi-TB
+                        // allocation and OOM the agent.
+                        const LSP_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+                        if parsed > LSP_MAX_BODY_BYTES {
+                            return Err(format!(
+                                "LSP Content-Length {parsed} exceeds cap of {LSP_MAX_BODY_BYTES} bytes (F-LSP-1)"
+                            ));
+                        }
+                        len = Some(parsed);
+                    }
+                    // Any other header (e.g. Content-Type) is ignored; keep
+                    // reading until the blank line.
                 }
-                // Skip other headers (e.g., Content-Type)
+                match len {
+                    Some(l) => l,
+                    None => return Err("header block ended without Content-Length".into()),
+                }
             };
 
             // Read body
@@ -220,8 +244,18 @@ impl JsonRpcClient {
                 .await
                 .map_err(|e| format!("read body: {e}"))?;
 
-            let msg: serde_json::Value =
-                serde_json::from_slice(&body).map_err(|e| format!("parse JSON: {e}"))?;
+            // B4: a single malformed body must NOT kill the reader task —
+            // doing so silently disables ALL diagnostics for the rest of the
+            // session (every later request resolves only via its own timeout).
+            // The framing was valid (we read exactly `content_length` bytes), so
+            // the stream is still aligned: skip this frame and resync on the next.
+            let msg: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(error = %e, "LSP: skipping malformed JSON-RPC frame");
+                    continue;
+                }
+            };
 
             // Dispatch response (has "id") vs notification (no "id")
             if let Some(id) = msg.get("id").and_then(|v| v.as_i64()) {
@@ -329,6 +363,63 @@ mod tests {
         // Content-Length is in bytes
         let expected_len = body.len();
         assert!(s.starts_with(&format!("Content-Length: {expected_len}\r\n\r\n")));
+    }
+
+    /// Drive `read_loop` over a finite in-memory byte source (returns `Err` on
+    /// EOF after consuming all frames — expected) and return the resulting
+    /// diagnostics cache.
+    async fn run_read_loop_to_eof(input: Vec<u8>) -> HashMap<String, DiagnosticsEntry> {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let diag = Arc::new(Mutex::new(HashMap::new()));
+        let version = Arc::new(AtomicU64::new(0));
+        let notify = Arc::new(Notify::new());
+        let _ = JsonRpcClient::read_loop(
+            &input[..],
+            Arc::clone(&pending),
+            Arc::clone(&diag),
+            Arc::clone(&version),
+            Arc::clone(&notify),
+        )
+        .await;
+        let guard = diag.lock().await;
+        guard.clone()
+    }
+
+    fn publish_diagnostics_frame(uri: &str) -> Vec<u8> {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{uri}","diagnostics":[]}}}}"#
+        );
+        encode_message(&body)
+    }
+
+    #[tokio::test]
+    async fn read_loop_handles_content_type_header_after_content_length() {
+        // B5: Content-Length is not guaranteed to be the last header. A
+        // Content-Type following it must not desync the body offset.
+        let body = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///x.rs","diagnostics":[]}}"#;
+        let framed = format!(
+            "Content-Length: {}\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let cache = run_read_loop_to_eof(framed.into_bytes()).await;
+        assert!(
+            cache.contains_key("file:///x.rs"),
+            "a Content-Type header after Content-Length desynced the reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_loop_skips_malformed_frame_and_continues() {
+        // B4: one malformed body must not kill the reader for the whole session.
+        let bad = "not valid json";
+        let mut framed = encode_message(bad);
+        framed.extend_from_slice(&publish_diagnostics_frame("file:///y.rs"));
+        let cache = run_read_loop_to_eof(framed).await;
+        assert!(
+            cache.contains_key("file:///y.rs"),
+            "a malformed frame killed the reader and dropped the next valid frame"
+        );
     }
 
     #[tokio::test]

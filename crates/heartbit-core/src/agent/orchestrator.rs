@@ -1462,11 +1462,35 @@ impl SpawnAgentTool {
     }
 
     async fn spawn(&self, input: SpawnAgentInput) -> Result<ToolOutput, Error> {
-        // 1. Spawn count cap
-        let current = self.spawn_count.load(std::sync::atomic::Ordering::Relaxed);
-        if current >= self.spawn_config.max_spawned_agents {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // 1. Spawn count cap — reserve a slot ATOMICALLY. A1: the previous
+        // load-then-check let N concurrent `spawn_agent` tool calls in one turn
+        // all observe `count < max` and overshoot the cap, because the count was
+        // only incremented AFTER each child finished. `fetch_add` reserves the
+        // slot up front; the RAII guard rolls the reservation back on any early
+        // return (validation failure, build error) and is committed once the
+        // agent actually executes (a real execution legitimately consumes a slot).
+        struct SlotGuard<'a> {
+            counter: &'a AtomicU32,
+            committed: bool,
+        }
+        impl Drop for SlotGuard<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.counter.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        let reserved = self.spawn_count.fetch_add(1, Ordering::AcqRel);
+        let mut slot = SlotGuard {
+            counter: &self.spawn_count,
+            committed: false,
+        };
+        if reserved >= self.spawn_config.max_spawned_agents {
             return Ok(ToolOutput::error(format!(
-                "Spawn limit reached: {current}/{} agents already spawned this run.",
+                "Spawn limit reached: {reserved}/{} agents already spawned this run.",
                 self.spawn_config.max_spawned_agents
             )));
         }
@@ -1622,6 +1646,10 @@ impl SpawnAgentTool {
 
         let runner = builder.build()?;
 
+        // The slot is now consumed by a real execution: commit the reservation
+        // so it is NOT rolled back when `slot` drops at the end of the function.
+        slot.committed = true;
+
         info!(
             agent = %spawned_name,
             tools = ?input.tools,
@@ -1631,9 +1659,7 @@ impl SpawnAgentTool {
         // Execute
         match runner.execute(&input.task).await {
             Ok(output) => {
-                // Post-execution bookkeeping
-                self.spawn_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Post-execution bookkeeping (the count slot was reserved up front).
                 {
                     let mut acc = self.accumulated_tokens.lock().expect("token lock");
                     *acc += output.tokens_used;
@@ -1651,8 +1677,6 @@ impl SpawnAgentTool {
                 )))
             }
             Err(e) => {
-                self.spawn_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let partial = e.partial_usage();
                 {
                     let mut acc = self.accumulated_tokens.lock().expect("token lock");
@@ -9218,6 +9242,53 @@ mod tests {
             .unwrap();
         assert!(r2.is_error);
         assert!(r2.content.contains("Spawn limit reached"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_count_cap_holds_under_concurrent_calls() {
+        // A1: two concurrent spawn calls with max_spawned_agents=1 must not both
+        // pass the cap. The previous load-then-check (count incremented only
+        // after each child finished) let both observe count=0 and overshoot.
+        let mk = || CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            usage: TokenUsage::default(),
+            stop_reason: StopReason::EndTurn,
+            reasoning: None,
+            model: None,
+        };
+        // Two responses so that, under the buggy code, BOTH spawns could execute.
+        let provider = Arc::new(MockProvider::new(vec![mk(), mk()]));
+        let mut config = make_spawn_config();
+        config.max_spawned_agents = 1;
+        let tool = build_spawn_tool(provider, config, vec![]);
+
+        let (r1, r2) = tokio::join!(
+            tool.spawn(SpawnAgentInput {
+                name: "first".into(),
+                system_prompt: "t".into(),
+                tools: vec![],
+                task: "t".into(),
+            }),
+            tool.spawn(SpawnAgentInput {
+                name: "second".into(),
+                system_prompt: "t".into(),
+                tools: vec![],
+                task: "t".into(),
+            }),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        let errors = [&r1, &r2].iter().filter(|r| r.is_error).count();
+        assert_eq!(
+            errors, 1,
+            "exactly one of two concurrent spawns must be rejected by the cap"
+        );
+        assert!(
+            r1.content.contains("Spawn limit reached")
+                || r2.content.contains("Spawn limit reached")
+        );
     }
 
     #[tokio::test]

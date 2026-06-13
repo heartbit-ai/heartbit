@@ -177,6 +177,11 @@ pub struct BrowserAgentBuilder<P: LlmProvider> {
     /// agent INCLUDES the page snapshots returned by the tools — so it grades the
     /// real page state, not the agent's claim. Set via [`Self::goal`].
     goal: Option<crate::agent::goal::GoalCondition>,
+    /// Optional human-confirmation callback for destructive actions (spec 21).
+    /// When set, mutating clicks on confidently-destructive labels (per
+    /// [`confirm`]) are routed through it before executing. Set via
+    /// [`Self::on_approval`]; `None` = no confirmation step (zero overhead).
+    on_approval: Option<Arc<crate::llm::OnApproval>>,
 }
 
 impl<P: LlmProvider> BrowserAgentBuilder<P> {
@@ -200,7 +205,18 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
             settle: SettleConfig::default(),
             confirm: ConfirmPolicy::default(),
             goal: None,
+            on_approval: None,
         }
+    }
+
+    /// Set the human-confirmation callback for destructive actions. When set, a
+    /// mutating click whose target label is confidently classified as
+    /// consequential/irreversible (per [`Self::confirm`]) is routed through
+    /// `on_approval` before executing; a denial aborts the action. Off by
+    /// default. See [`ConfirmActionTool`](super::confirm::ConfirmActionTool).
+    pub fn on_approval(mut self, on_approval: Arc<crate::llm::OnApproval>) -> Self {
+        self.on_approval = Some(on_approval);
+        self
     }
 
     /// Set a persistent [`GoalCondition`](crate::agent::goal::GoalCondition): an
@@ -340,11 +356,19 @@ impl<P: LlmProvider> BrowserAgentBuilder<P> {
         // 3. distill snapshot output (smaller observations re-entering context).
         let subset = filter_tools(raw_tools, &self.tool_allow);
         let reliable = wrap_browser_tools(subset);
-        let tools = if self.distill_enabled {
+        let distilled = if self.distill_enabled {
             DistillingTool::wrap_all(reliable, self.distill.clone())
         } else {
             reliable
         };
+        // B1: outermost layer — track the snapshot the agent actually grounds on
+        // (post-distill) and gate confidently-destructive mutating actions
+        // through `on_approval`. No-op when `on_approval` is unset.
+        let tools = super::confirm::ConfirmActionTool::wrap_all(
+            distilled,
+            self.confirm.clone(),
+            self.on_approval.clone(),
+        );
         let guards = browser_guardrails(self.allow_hosts, self.extra_guardrails);
         let prompt = self
             .system_prompt

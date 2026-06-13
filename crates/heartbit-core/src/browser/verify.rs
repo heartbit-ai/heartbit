@@ -146,6 +146,24 @@ pub fn diff(before: &SnapshotSignature, after: &SnapshotSignature) -> ActionEffe
     if changed > 0 {
         reasons.push(format!("content changed on {changed} element(s)"));
     }
+    // B2: added/removed content nodes — including non-interactive ones
+    // (StaticText, alert) that `interactable_uids` does not track. A failed
+    // login adding `StaticText "Invalid password"`, or a successful submit
+    // adding a non-interactive success banner, is a real change that URL,
+    // title, and the interactable-uid set all miss → false `NoOp` otherwise.
+    let content_added = after
+        .content_digest
+        .keys()
+        .filter(|uid| !before.content_digest.contains_key(uid.as_str()))
+        .count();
+    let content_removed = before
+        .content_digest
+        .keys()
+        .filter(|uid| !after.content_digest.contains_key(uid.as_str()))
+        .count();
+    if content_added > 0 || content_removed > 0 {
+        reasons.push(format!("content nodes +{content_added}/-{content_removed}"));
+    }
     if after.console_errors > before.console_errors {
         reasons.push(format!(
             "console errors +{}",
@@ -239,6 +257,29 @@ mod tests {
         assert!(effect.is_progress());
         if let ActionEffect::Changed(s) = effect {
             assert!(s.contains("elements +1"), "summary: {s}");
+        }
+    }
+
+    #[test]
+    fn diff_added_noninteractive_text_is_change() {
+        // B2: a failed login adds a non-interactive StaticText error banner with
+        // no URL/title/interactive-element change. URL, title, and the
+        // interactable-uid set all miss it; it must still register as a change,
+        // not a false NoOp ("Illusion of Progress" inverse).
+        let before = signature(SNAP_A, "https://app.test/login", &[]);
+        let with_banner = r#"uid=1_0 RootWebArea "Login" url="https://app.test/login"
+  uid=1_1 textbox "Email"
+  uid=1_2 textbox "Password"
+  uid=1_3 button "Sign in"
+  uid=1_9 StaticText "Invalid password""#;
+        let after = signature(with_banner, "https://app.test/login", &[]);
+        let effect = diff(&before, &after);
+        assert!(
+            effect.is_progress(),
+            "an added non-interactive error banner must register as a change, got {effect:?}"
+        );
+        if let ActionEffect::Changed(s) = effect {
+            assert!(s.contains("content nodes +1"), "summary: {s}");
         }
     }
 

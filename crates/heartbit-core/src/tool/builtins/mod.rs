@@ -52,6 +52,28 @@ fn is_protected(path: &std::path::Path, protected: &[PathBuf]) -> bool {
     false
 }
 
+/// Like [`is_protected`], but also screens the symlink-resolved target.
+///
+/// SECURITY (F-FS-12): `is_protected` matches the *lexical* path only, so a
+/// symlink with an innocuous name (`config.txt -> .env`, or
+/// `notes.txt -> ~/.aws/credentials`) evades the denylist while still reading
+/// the real secret. Canonicalizing the path resolves the symlink so the actual
+/// target is screened too. Non-existent paths (new-file creates) don't
+/// canonicalize — they fall back to the lexical check, which is sufficient
+/// since there is no existing target to alias.
+fn is_protected_resolved(path: &std::path::Path, protected: &[PathBuf]) -> bool {
+    if is_protected(path, protected) {
+        return true;
+    }
+    if let Ok(canonical) = path.canonicalize()
+        && canonical != path
+        && is_protected(&canonical, protected)
+    {
+        return true;
+    }
+    false
+}
+
 /// Write `bytes` to `path`, refusing to follow symlinks at the final
 /// component (Unix). On non-Unix platforms, falls back to plain `tokio::fs::write`.
 ///
@@ -316,14 +338,14 @@ pub(crate) fn resolve_path(
                     }
                 }
             }
-            if is_protected(&normalized, protected_paths) {
+            if is_protected_resolved(&normalized, protected_paths) {
                 return Err(format!("Access to '{path}' is denied (protected path)."));
             }
             Ok(normalized)
         }
         None => {
             let result = p.to_path_buf();
-            if is_protected(&result, protected_paths) {
+            if is_protected_resolved(&result, protected_paths) {
                 return Err(format!("Access to '{path}' is denied (protected path)."));
             }
             Ok(result)
@@ -728,6 +750,45 @@ mod tests {
     fn resolve_path_absolute_passthrough_without_workspace() {
         let result = resolve_path("/absolute/path", None, &[]);
         assert_eq!(result.unwrap(), PathBuf::from("/absolute/path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_symlink_to_protected_target_denied_in_workspace() {
+        // S1: a workspace-internal symlink with an innocuous name (`config.txt`)
+        // pointing at a protected file (`secret.env`) must be denied. The lexical
+        // denylist (`*.env`) only sees `config.txt`; the fix resolves the symlink
+        // target before screening.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("secret.env"), "API_KEY=xxx").unwrap();
+        std::os::unix::fs::symlink(ws.join("secret.env"), ws.join("config.txt")).unwrap();
+        let protected = vec![PathBuf::from("*.env")];
+        let result = resolve_path("config.txt", Some(&ws), &protected);
+        assert!(
+            result.is_err(),
+            "symlink to a protected target must be denied, got {result:?}"
+        );
+        assert!(result.unwrap_err().contains("protected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_symlink_to_protected_target_denied_no_workspace() {
+        // S1 (no-workspace path): an innocuously-named symlink pointing at a
+        // protected target must be denied even when no workspace jail is set.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::write(base.join("creds.pem"), "-----BEGIN KEY-----").unwrap();
+        let link = base.join("notes.txt");
+        std::os::unix::fs::symlink(base.join("creds.pem"), &link).unwrap();
+        let protected = vec![PathBuf::from("*.pem")];
+        let result = resolve_path(link.to_str().unwrap(), None, &protected);
+        assert!(
+            result.is_err(),
+            "symlink to a protected target must be denied without a workspace, got {result:?}"
+        );
+        assert!(result.unwrap_err().contains("protected"));
     }
 
     #[test]

@@ -86,8 +86,11 @@ impl<P: LlmProvider + 'static> VotingAgent<P> {
         let mut total_usage = TokenUsage::default();
 
         while let Some(join_result) = set.join_next().await {
-            let (idx, agent_result) = join_result
-                .map_err(|e| Error::Agent(format!("voting agent task panicked: {e}")))?;
+            let (idx, agent_result) = join_result.map_err(|e| {
+                // AP6: preserve completed siblings' usage on a panic.
+                Error::Agent(format!("voting agent task panicked: {e}"))
+                    .accumulate_usage(total_usage)
+            })?;
             let output = agent_result.map_err(|e| e.accumulate_usage(total_usage))?;
             total_usage += output.tokens_used;
             outputs.push((idx, output));

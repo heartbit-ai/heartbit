@@ -14,8 +14,7 @@ env:
 jobs:
   # Quality gate: a tag push must never publish untested code to crates.io
   # (ci.yml only runs on branch pushes / PRs, not on tags). Mirrors the
-  # documented gate: fmt + clippy -D warnings + tests, excluding the WIP
-  # mini-crm app.
+  # documented gate: fmt + clippy -D warnings + tests.
   test:
     name: Quality gate (fmt + clippy + tests)
     runs-on: ubuntu-latest
@@ -35,10 +34,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: tests
-        run: cargo test --workspace --exclude mini-crm
+        run: cargo test --workspace
 
   build:
     name: Build ${{ matrix.target }}

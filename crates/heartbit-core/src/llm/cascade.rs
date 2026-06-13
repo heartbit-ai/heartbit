@@ -1,7 +1,9 @@
 //! Cascading provider — tries cheaper models first and escalates on rejection or error.
 
 use crate::error::Error;
-use crate::llm::types::{CompletionRequest, CompletionResponse, ContentBlock, StopReason};
+use crate::llm::types::{
+    CompletionRequest, CompletionResponse, ContentBlock, StopReason, TokenUsage,
+};
 use crate::llm::{DynLlmProvider, LlmProvider, OnText};
 
 /// Evaluates whether a cheaper model's response is "good enough"
@@ -139,12 +141,19 @@ impl LlmProvider for CascadingProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
+        // L2: a tier whose response the gate rejects (or which errors carrying
+        // partial usage) was still billed by the upstream provider. Accumulate
+        // that usage and fold it into whatever tier is ultimately accepted (or
+        // into the terminal error) so cascade cost accounting reflects every
+        // call actually made, not just the accepting tier.
+        let mut rejected_usage = TokenUsage::default();
         for (i, tier) in self.tiers.iter().enumerate() {
             let is_last = i == self.tiers.len() - 1;
             match tier.provider.complete(request.clone()).await {
                 Ok(mut response) => {
                     if is_last || self.gate.accept(&request, &response) {
                         response.model = Some(tier.label.clone());
+                        response.usage += rejected_usage;
                         tracing::info!(
                             tier = %tier.label,
                             is_last,
@@ -153,19 +162,21 @@ impl LlmProvider for CascadingProvider {
                         );
                         return Ok(response);
                     }
+                    rejected_usage += response.usage;
                     tracing::info!(
                         from = %tier.label,
                         to = %self.tiers[i + 1].label,
                         "cascade: gate rejected, escalating"
                     );
                 }
-                Err(e) if is_last => return Err(e),
+                Err(e) if is_last => return Err(e.accumulate_usage(rejected_usage)),
                 Err(e) => {
                     tracing::warn!(
                         tier = %tier.label,
                         error = %e,
                         "cascade: tier failed, escalating"
                     );
+                    rejected_usage += e.partial_usage();
                 }
             }
         }
@@ -188,16 +199,23 @@ impl LlmProvider for CascadingProvider {
         }
 
         // Non-final tiers: use complete() to avoid streaming tokens we might discard
+        let mut rejected_usage = TokenUsage::default(); // L2: see complete()
         for (i, tier) in self.tiers.iter().enumerate() {
             let is_last = i == self.tiers.len() - 1;
             if is_last {
-                let mut resp = tier.provider.stream_complete(request, on_text).await?;
+                let mut resp = tier
+                    .provider
+                    .stream_complete(request, on_text)
+                    .await
+                    .map_err(|e| e.accumulate_usage(rejected_usage))?;
                 resp.model = Some(tier.label.clone());
+                resp.usage += rejected_usage;
                 return Ok(resp);
             }
             match tier.provider.complete(request.clone()).await {
                 Ok(mut response) if self.gate.accept(&request, &response) => {
                     response.model = Some(tier.label.clone());
+                    response.usage += rejected_usage;
                     tracing::info!(
                         tier = %tier.label,
                         output_tokens = response.usage.output_tokens,
@@ -210,7 +228,8 @@ impl LlmProvider for CascadingProvider {
                     }
                     return Ok(response);
                 }
-                Ok(_) => {
+                Ok(response) => {
+                    rejected_usage += response.usage;
                     tracing::info!(
                         from = %tier.label,
                         to = %self.tiers[i + 1].label,
@@ -223,6 +242,7 @@ impl LlmProvider for CascadingProvider {
                         error = %e,
                         "cascade: tier failed, escalating"
                     );
+                    rejected_usage += e.partial_usage();
                 }
             }
         }
@@ -245,19 +265,23 @@ impl LlmProvider for CascadingProvider {
             return Ok(resp);
         }
 
+        let mut rejected_usage = TokenUsage::default(); // L2: see complete()
         for (i, tier) in self.tiers.iter().enumerate() {
             let is_last = i == self.tiers.len() - 1;
             if is_last {
                 let mut resp = tier
                     .provider
                     .stream_complete_with_reasoning(request, on_text, on_reasoning)
-                    .await?;
+                    .await
+                    .map_err(|e| e.accumulate_usage(rejected_usage))?;
                 resp.model = Some(tier.label.clone());
+                resp.usage += rejected_usage;
                 return Ok(resp);
             }
             match tier.provider.complete(request.clone()).await {
                 Ok(mut response) if self.gate.accept(&request, &response) => {
                     response.model = Some(tier.label.clone());
+                    response.usage += rejected_usage;
                     // Non-streaming tier: emit reasoning then text as single chunks.
                     if let Some(r) = response.reasoning.as_deref()
                         && !r.is_empty()
@@ -270,9 +294,12 @@ impl LlmProvider for CascadingProvider {
                     }
                     return Ok(response);
                 }
-                Ok(_) => {}
+                Ok(response) => {
+                    rejected_usage += response.usage;
+                }
                 Err(e) => {
                     tracing::warn!(tier = %tier.label, error = %e, "cascade: tier failed, escalating");
+                    rejected_usage += e.partial_usage();
                 }
             }
         }
@@ -697,6 +724,34 @@ mod tests {
         // Final tier always accepts regardless of gate.
         assert_eq!(resp.text(), "great answer");
         assert_eq!(resp.model.as_deref(), Some("sonnet"));
+    }
+
+    #[tokio::test]
+    async fn cascade_folds_rejected_tier_usage_into_accepted_response() {
+        // L2: a gate-rejected cheap tier was still billed by the upstream
+        // provider; its usage must be folded into the accepted tier's usage so
+        // cascade cost accounting reflects every call actually made.
+        let provider = CascadingProvider::builder()
+            .add_tier(
+                "haiku",
+                FixedProvider::ok("haiku", text_response("dunno", 10)),
+            )
+            .add_tier(
+                "sonnet",
+                FixedProvider::ok("sonnet", text_response("great answer", 50)),
+            )
+            .gate(AlwaysReject)
+            .build()
+            .unwrap();
+
+        let resp = LlmProvider::complete(&provider, test_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            resp.usage.output_tokens, 60,
+            "rejected haiku (10) + accepted sonnet (50) must both be counted"
+        );
     }
 
     #[tokio::test]

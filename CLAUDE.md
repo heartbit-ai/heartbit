@@ -22,10 +22,9 @@ Multi-agent enterprise runtime in Rust.
 
 ### Rust Quality Gates
 ```bash
-cargo fmt --all -- --check && cargo clippy --workspace --exclude mini-crm --all-targets -- -D warnings && cargo test --workspace --exclude mini-crm
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
-All three must pass. No warnings allowed. (`mini-crm` is a WIP app excluded from the
-gate — build it directly with `cargo build -p mini-crm`.)
+All three must pass. No warnings allowed.
 
 ### Code Style (from rust-best-practices)
 - `thiserror` for library errors (heartbit crate), `anyhow` for application code (CLI).

@@ -67,6 +67,11 @@ impl<P: LlmProvider> HandoffRunner<P> {
         let mut total_cost: Option<f64> = None;
         let mut effective_task = task.to_string();
         let mut handoff_count = 0;
+        // AC3: accumulate every hop's output so a later agent in a multi-hop
+        // chain (A→B→C) sees ALL prior agents' contributions in `Full` mode, not
+        // just the immediately-preceding one. Previously `Full` mode embedded
+        // only the current agent's output, dropping intermediate context.
+        let mut transcript = String::new();
 
         loop {
             let agent = self.agents.get(&current_agent).ok_or_else(|| {
@@ -103,15 +108,19 @@ impl<P: LlmProvider> HandoffRunner<P> {
                     )));
                 }
 
+                // Append this hop to the running transcript before building the
+                // next task, so `Full` mode reflects the whole chain.
+                transcript.push_str(&format!(
+                    "## Handoff from {current_agent}\nReason: {reason}\n\n{result}\n\n",
+                    result = output.result,
+                ));
+
                 // Build context for the target agent
                 effective_task = match context_mode {
                     HandoffContextMode::Full => {
                         format!(
-                            "## Handoff from {current_agent}\n\
-                             Reason: {reason}\n\n\
-                             ## Original task\n{task}\n\n\
-                             ## Conversation so far\n{result}",
-                            result = output.result,
+                            "## Original task\n{task}\n\n\
+                             ## Conversation so far\n{transcript}"
                         )
                     }
                     HandoffContextMode::Summary => {
@@ -346,6 +355,57 @@ mod tests {
         assert_eq!(output.result, "Your bill is $42.");
         assert_eq!(output.tokens_used.input_tokens, 130);
         assert_eq!(output.tokens_used.output_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn full_mode_accumulates_context_across_multi_hop_chain() {
+        // AC3: A→B→C in Full mode. When B hands to C, C must see A's
+        // contribution too, not just B's. We plant a distinctive marker in A's
+        // handoff reason and assert it reaches C's task.
+        let a = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            &format!("{HANDOFF_SENTINEL}b:full:ALICE_SECRET_FINDING"),
+            10,
+            5,
+        )]));
+        let b = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            &format!("{HANDOFF_SENTINEL}c:full:bob passes to c"),
+            10,
+            5,
+        )]));
+        let c = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "final answer from c",
+            10,
+            5,
+        )]));
+
+        let runner = HandoffRunner::builder()
+            .agent("a", make_agent(a, "a"))
+            .agent("b", make_agent(b, "b"))
+            .agent("c", make_agent(c.clone(), "c"))
+            .initial_agent("a")
+            .max_handoffs(5)
+            .build()
+            .unwrap();
+
+        let output = runner.execute("do the chain").await.unwrap();
+        assert_eq!(output.result, "final answer from c");
+
+        // C's request must carry A's marker (the whole chain), not just B's hop.
+        let reqs = c.captured_requests.lock().unwrap();
+        let c_sees: String = reqs[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                crate::llm::types::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            c_sees.contains("ALICE_SECRET_FINDING"),
+            "agent C did not receive agent A's intermediate context: {c_sees}"
+        );
     }
 
     #[tokio::test]
