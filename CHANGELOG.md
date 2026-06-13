@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2026.613.1] - 2026-06-13
+
+Changes since `v2026.611.1`. A second deep multi-aspect audit of heartbit-core
+(10 parallel aspect reviewers + 3 adversarial fix-diff reviewers), plus removal
+of the throwaway `mini-crm` WIP app from the workspace.
+
+### Fixed (this release)
+
+- **Deep multi-aspect audit — 35 defects fixed** (`#14`) — each verified
+  against the code and covered by a test; workspace gate green. Highlights:
+  - **Panics:** behavioral guardrail `Instant - window_ttl` underflow on a
+    fresh-boot host (default 1800s); `read` tool `start + limit` overflow on an
+    LLM-supplied `limit` — both missed by the dedicated panics reviewer.
+  - **Security/data:** unbounded+unsanitised Anthropic streaming error body
+    (OOM/log-poisoning); knowledge-chunk map keyed on `(tenant, id)` (closes a
+    cross-tenant clobber); `edit` tool routed through the symlink-safe writer
+    (F-FS-1 parity with write/patch); browser `evaluate_script` denied by
+    default; LSP `<lsp-diagnostics>` output XML-escaped.
+  - **Correctness:** structured-output validation-fail now answers every
+    co-submitted `tool_use` id (orphaned id was an Anthropic 400 run-breaker);
+    atomic `spawn_agent` cap reservation closes a concurrent-overshoot race;
+    memory graph-expansion enforces the tenant boundary; LSP reader survives a
+    malformed frame / `Content-Type` header / lost-wakeup / pending-map leak;
+    cascade accounts gate-rejected tier token usage; gemini/openrouter read
+    reasoning tokens from the correct path; multi-hop handoff accumulates the
+    full transcript; gemini streaming `finish_reason` mirrors non-streaming.
+  - **Browser confirm flow (was inert) + injection scanner wired** —
+    `ConfirmActionTool` gates confidently-destructive mutating clicks through an
+    opt-in `OnApproval` (fail-open on an unresolvable uid).
+  - The fix-diff review caught and corrected 3 defects introduced by the fixes
+    themselves. Full per-finding disposition (incl. deferred non-defects) in
+    `tasks/heartbit-core-deep-review-2026-06-13.md`.
+
+### Removed
+
+- **`mini-crm` WIP app** — a throwaway scaffolding crate kept out of the gate
+  via `--exclude mini-crm`. Removed entirely; the quality gate (and CI) is now a
+  plain `cargo clippy/test --workspace`.
+
 ## [2026.611.1] - 2026-06-11
 
 Changes since `v2026.607.1`. The headline is a multi-aspect audit of
