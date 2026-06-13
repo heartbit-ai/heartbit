@@ -180,8 +180,11 @@ impl<P: LlmProvider + 'static> DagAgent<P> {
             }
 
             while let Some(join_result) = set.join_next().await {
-                let (idx, agent_result) = join_result
-                    .map_err(|e| Error::Agent(format!("DAG agent task panicked: {e}")))?;
+                let (idx, agent_result) = join_result.map_err(|e| {
+                    // AP6: preserve completed siblings' usage on a panic.
+                    Error::Agent(format!("DAG agent task panicked: {e}"))
+                        .accumulate_usage(total_usage)
+                })?;
                 let output = agent_result.map_err(|e| e.accumulate_usage(total_usage))?;
                 output.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
                 completed.insert(idx, output.result);
@@ -271,8 +274,11 @@ impl<P: LlmProvider + 'static> DagAgent<P> {
         let mut results = Vec::with_capacity(nodes.len());
         let mut partial_usage = TokenUsage::default();
         while let Some(join_result) = set.join_next().await {
-            let (idx, agent_result) =
-                join_result.map_err(|e| Error::Agent(format!("DAG agent task panicked: {e}")))?;
+            let (idx, agent_result) = join_result.map_err(|e| {
+                // AP6: preserve completed siblings' usage on a panic.
+                Error::Agent(format!("DAG agent task panicked: {e}"))
+                    .accumulate_usage(partial_usage)
+            })?;
             let output = agent_result.map_err(|e| e.accumulate_usage(partial_usage))?;
             partial_usage += output.tokens_used;
             results.push((idx, output));

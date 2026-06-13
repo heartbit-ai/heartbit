@@ -530,6 +530,11 @@ impl Tool for MemoryConsolidateTool {
 
             // Fetch source memories to merge their keywords and tags.
             // Use a generous limit — consolidation is not a hot path.
+            // AP9: propagate a recall failure instead of `unwrap_or_default()`.
+            // An empty source list would leave `max_confidentiality` at the
+            // default (Public) while `forget` still deletes the sources below —
+            // silently DOWNGRADING the consolidated entry's access controls,
+            // exactly what the "never downgrades" invariant (below) forbids.
             let sources = self
                 .memory
                 .recall(
@@ -539,8 +544,7 @@ impl Tool for MemoryConsolidateTool {
                         ..Default::default()
                     },
                 )
-                .await
-                .unwrap_or_default();
+                .await?;
 
             let source_set: std::collections::HashSet<&str> =
                 input.source_ids.iter().map(|s| s.as_str()).collect();

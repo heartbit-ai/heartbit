@@ -535,16 +535,28 @@ impl Memory for InMemoryStore {
             // the same immutable borrow on `entries`) and append to the
             // scored Vec. Reuses the cached tokens for related entries
             // too — graph-expansion never tokenises on the recall path.
-            let min_s = query.min_strength.unwrap_or(0.0);
             // Hoist the normalisation scalar out of the loop.
             let max_bm25 = bm25_map
                 .values()
                 .copied()
                 .fold(f64::NEG_INFINITY, f64::max)
                 .max(1.0);
+            let min_s = query.min_strength.unwrap_or(0.0);
             let mut expanded_added = 0usize;
             for related_id in &to_expand {
                 if let Some(related) = entries.get(related_id) {
+                    // SECURITY (M1): enforce the TENANT boundary on graph-expanded
+                    // entries — the first pass rejects cross-tenant entries, but
+                    // this loop previously checked only confidentiality + strength,
+                    // so a cross-tenant `related_ids` ref could leak an entry the
+                    // caller may not see. We re-check tenant ONLY here, NOT
+                    // agent/category/tags/memory_type: graph expansion
+                    // intentionally pulls related context ACROSS those dimensions
+                    // within the same tenant (just as it pulls across lexical
+                    // overlap). Confidentiality + strength stay, as before.
+                    if related.author_tenant_id.as_deref() != Some(tenant_id.as_str()) {
+                        continue;
+                    }
                     if let Some(max_conf) = query.max_confidentiality
                         && related.confidentiality > max_conf
                     {
@@ -871,6 +883,98 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Rust is fast");
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_does_not_leak_cross_tenant_related_entries() {
+        // M1: a recall scoped to tenant-1 must not surface a related entry owned
+        // by tenant-2 via graph expansion, even when a tenant-1 entry carries a
+        // hand-crafted cross-tenant `related_ids` ref. The first-pass filter
+        // rejects cross-tenant entries; the expansion path must apply the same
+        // filter (it previously re-checked only confidentiality + strength).
+        let store = InMemoryStore::new();
+        let t1 = TenantScope::new("tenant-1");
+        let t2 = TenantScope::new("tenant-2");
+
+        store
+            .store(
+                &t2,
+                make_entry("secret", "a", "tenant two private data", "fact"),
+            )
+            .await
+            .unwrap();
+
+        let mut bait = make_entry("bait", "a", "rust is fast", "fact");
+        bait.related_ids = vec!["secret".to_string()];
+        store.store(&t1, bait).await.unwrap();
+
+        let results = store
+            .recall(
+                &t1,
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().any(|e| e.id == "bait"),
+            "own entry should be recalled"
+        );
+        assert!(
+            !results.iter().any(|e| e.id == "secret"),
+            "cross-tenant related entry leaked via graph expansion: {:?}",
+            results.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_preserves_cross_category_within_tenant() {
+        // M1 must close the TENANT leak WITHOUT also dropping same-tenant related
+        // entries that differ in category/agent — graph expansion intentionally
+        // pulls related context across those dimensions. A category-filtered
+        // query whose bait matches must still surface its related entry even
+        // though that related entry is in a different category.
+        let store = InMemoryStore::new();
+        let scope = test_scope();
+
+        store
+            .store(
+                &scope,
+                make_entry("related", "a", "rust ownership notes", "design"),
+            )
+            .await
+            .unwrap();
+        let mut bait = make_entry("bait", "a", "rust borrow checker", "fact");
+        bait.related_ids = vec!["related".to_string()];
+        store.store(&scope, bait).await.unwrap();
+
+        let results = store
+            .recall(
+                &scope,
+                MemoryQuery {
+                    text: Some("rust".into()),
+                    category: Some("fact".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(results.iter().any(|e| e.id == "bait"));
+        assert!(
+            results.iter().any(|e| e.id == "related"),
+            "same-tenant related entry in a different category must still be \
+             surfaced via graph expansion: {:?}",
+            results
+                .iter()
+                .map(|e| (&e.id, &e.category))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

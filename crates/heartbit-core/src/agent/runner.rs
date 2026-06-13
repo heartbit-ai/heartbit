@@ -1630,14 +1630,40 @@ impl<P: LlmProvider> AgentRunner<P> {
                             error = %validation_error,
                             "structured output failed schema validation, retrying"
                         );
-                        ctx.add_tool_results(vec![ToolResult {
-                            tool_use_id: respond_call.id.clone(),
-                            content: format!(
-                                "Structured output validation failed: {validation_error}. \
-                                 Please fix the output to match the schema and call __respond__ again."
-                            ),
-                            is_error: true,
-                        }]);
+                        // AC1: every tool_use block in the assistant turn MUST
+                        // get a matching tool_result, or the NEXT request carries
+                        // an orphaned tool_use and the provider rejects it with a
+                        // hard 400 (run-breaker). `tool_choice` is not forced to
+                        // `__respond__`, so the model can co-submit real tools
+                        // alongside it. Answer `__respond__` with the validation
+                        // error and any co-submitted tools with an "ignored"
+                        // result so none are left unanswered.
+                        let validation_results = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                if tc.id == respond_call.id {
+                                    ToolResult {
+                                        tool_use_id: tc.id.clone(),
+                                        content: format!(
+                                            "Structured output validation failed: \
+                                             {validation_error}. Please fix the output to \
+                                             match the schema and call __respond__ again."
+                                        ),
+                                        is_error: true,
+                                    }
+                                } else {
+                                    ToolResult {
+                                        tool_use_id: tc.id.clone(),
+                                        content: "Ignored: `__respond__` was co-submitted \
+                                                  but failed schema validation. Call \
+                                                  `__respond__` alone with a corrected output."
+                                            .to_string(),
+                                        is_error: true,
+                                    }
+                                }
+                            })
+                            .collect();
+                        ctx.add_tool_results(validation_results);
                         continue;
                     }
 
@@ -3972,6 +3998,84 @@ mod tests {
         assert_eq!(
             n, 2,
             "without the gate, completes on the first EndTurn (got {n})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn structured_validation_failure_answers_all_co_submitted_tool_calls() {
+        // AC1: when the model co-submits a real tool alongside `__respond__` and
+        // `__respond__` fails schema validation, EVERY tool_use block must get a
+        // matching tool_result — otherwise the next request has an orphaned
+        // tool_use and a real provider rejects it with a 400, killing the run.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "integer" } },
+            "required": ["answer"]
+        });
+
+        // Turn 1: `__respond__` with the WRONG type + a co-submitted real tool.
+        let turn1 = CompletionResponse {
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "resp1".into(),
+                    name: crate::llm::types::RESPOND_TOOL_NAME.into(),
+                    input: serde_json::json!({ "answer": "not-an-integer" }),
+                },
+                ContentBlock::ToolUse {
+                    id: "other1".into(),
+                    name: "some_tool".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+        // Turn 2: a valid `__respond__` → the run completes.
+        let turn2 = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "resp2".into(),
+                name: crate::llm::types::RESPOND_TOOL_NAME.into(),
+                input: serde_json::json!({ "answer": 42 }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            reasoning: None,
+            usage: TokenUsage::default(),
+            model: None,
+        };
+
+        let provider = Arc::new(MockProvider::new(vec![turn1, turn2]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("t")
+            .system_prompt("s")
+            .structured_schema(schema)
+            .max_turns(5)
+            .build()
+            .unwrap();
+
+        let out = runner.execute("do it").await.unwrap();
+        assert_eq!(out.structured, Some(serde_json::json!({ "answer": 42 })));
+
+        // The SECOND request must carry a tool_result for BOTH turn-1 tool_use ids.
+        let requests = provider.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected a second request after retry");
+        let result_ids: std::collections::HashSet<&str> = requests[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            result_ids.contains("resp1"),
+            "missing tool_result for __respond__ id"
+        );
+        assert!(
+            result_ids.contains("other1"),
+            "co-submitted tool_use was orphaned — next request would 400"
         );
     }
 

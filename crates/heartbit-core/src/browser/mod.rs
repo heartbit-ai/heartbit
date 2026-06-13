@@ -33,7 +33,7 @@ pub use builder::{
     BROWSER_SYSTEM_PROMPT, BrowserAgentBuilder, browser_guardrails, filter_tools,
     wrap_browser_tools,
 };
-pub use confirm::{ActionRisk, ConfirmPolicy, classify_label, label_for_uid};
+pub use confirm::{ActionRisk, ConfirmActionTool, ConfirmPolicy, classify_label, label_for_uid};
 pub use distill::{DistillConfig, distill_snapshot, interactive_uids};
 pub use distill_tool::DistillingTool;
 pub use guard::DomainAllowlistGuard;

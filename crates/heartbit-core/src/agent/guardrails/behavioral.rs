@@ -88,9 +88,14 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
 impl BehavioralMonitorGuardrail {
     /// Evict entries older than `window_ttl` and trim to `window_size`.
     fn evict(&self, window: &mut VecDeque<ToolCallRecord>) {
-        let cutoff = Instant::now() - self.window_ttl;
-        while window.front().is_some_and(|r| r.timestamp < cutoff) {
-            window.pop_front();
+        // `checked_sub` guards the case where `window_ttl` exceeds the host's
+        // monotonic uptime (fresh boot): `Instant - Duration` would otherwise
+        // panic on underflow. When it underflows, no entry can be older than the
+        // window, so skip TTL eviction (the size trim below still runs).
+        if let Some(cutoff) = Instant::now().checked_sub(self.window_ttl) {
+            while window.front().is_some_and(|r| r.timestamp < cutoff) {
+                window.pop_front();
+            }
         }
         while window.len() > self.window_size {
             window.pop_front();
@@ -110,11 +115,15 @@ impl BehavioralMonitorGuardrail {
                     max_count,
                     window: rule_window,
                 } => {
-                    let cutoff = now - *rule_window;
+                    // `checked_sub` guards underflow when `rule_window` exceeds
+                    // host uptime; `None` means every record falls within the
+                    // window (cutoff predates all of monotonic time so far).
+                    let cutoff = now.checked_sub(*rule_window);
                     let count = window
                         .iter()
                         .filter(|r| {
-                            r.timestamp >= cutoff && pattern_matches(tool_pattern, &r.tool_name)
+                            cutoff.is_none_or(|c| r.timestamp >= c)
+                                && pattern_matches(tool_pattern, &r.tool_name)
                         })
                         .count();
                     // Also count the current call if it matches
@@ -150,10 +159,10 @@ impl BehavioralMonitorGuardrail {
                     max_denied,
                     window: rule_window,
                 } => {
-                    let cutoff = now - *rule_window;
+                    let cutoff = now.checked_sub(*rule_window);
                     let denied_count = window
                         .iter()
-                        .filter(|r| r.was_denied && r.timestamp >= cutoff)
+                        .filter(|r| r.was_denied && cutoff.is_none_or(|c| r.timestamp >= c))
                         .count();
                     if denied_count > *max_denied {
                         return GuardAction::kill(format!(
@@ -441,6 +450,37 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         // Should allow because old entries are evicted
+        let action = g.pre_tool(&test_call("bash")).await.unwrap();
+        assert_eq!(action, GuardAction::Allow);
+    }
+
+    #[tokio::test]
+    async fn huge_window_does_not_panic_on_low_uptime() {
+        // Regression: `Instant::now() - window` underflows and panics when the
+        // configured window exceeds the host's monotonic uptime (fresh microVM /
+        // Firecracker / just-booted CI runner / freshly-rebooted container).
+        // An astronomically large window forces the underflow path deterministically
+        // regardless of actual uptime.
+        let huge = Duration::from_secs(u64::MAX);
+        let g = BehavioralMonitorGuardrail::builder()
+            .rule(BehaviorRule::FrequencyLimit {
+                tool_pattern: "bash".into(),
+                max_count: 2,
+                window: huge,
+            })
+            .rule(BehaviorRule::DenialSpike {
+                max_denied: 2,
+                window: huge,
+            })
+            .window_ttl(huge)
+            .build();
+
+        // post_tool triggers evict() (window_ttl underflow);
+        // pre_tool triggers evaluate() FrequencyLimit + DenialSpike (per-rule
+        // window underflow). Neither must panic.
+        let call = test_call("bash");
+        let mut output = ToolOutput::success("ok".to_string());
+        g.post_tool(&call, &mut output).await.unwrap();
         let action = g.pre_tool(&test_call("bash")).await.unwrap();
         assert_eq!(action, GuardAction::Allow);
     }

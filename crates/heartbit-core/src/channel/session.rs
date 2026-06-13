@@ -49,18 +49,29 @@ pub enum SessionRole {
     Assistant,
 }
 
+/// Cap on how many prior messages are replayed into the prompt. R5: a long-lived
+/// daemon session would otherwise concatenate its ENTIRE history into every
+/// request, inflating context size/cost without bound and eventually risking
+/// context overflow. Only the most recent messages are included.
+const MAX_HISTORY_MESSAGES: usize = 100;
+
 /// Format session history as context to prepend to a new message.
 ///
 /// When there is prior conversation history, returns the new message prefixed
-/// with a formatted history section. When history is empty, returns the message
+/// with a formatted history section (windowed to the last
+/// [`MAX_HISTORY_MESSAGES`]). When history is empty, returns the message
 /// unchanged.
 pub fn format_session_context(history: &[SessionMessage], message: &str) -> String {
     if history.is_empty() {
         return message.to_string();
     }
 
+    let start = history.len().saturating_sub(MAX_HISTORY_MESSAGES);
     let mut ctx = String::from("## Conversation history\n");
-    for msg in history {
+    if start > 0 {
+        ctx.push_str(&format!("[... {start} earlier message(s) omitted ...]\n"));
+    }
+    for msg in &history[start..] {
         let role = match msg.role {
             SessionRole::User => "User",
             SessionRole::Assistant => "Assistant",
@@ -471,6 +482,26 @@ mod tests {
         assert!(second_pos < third_pos);
         assert!(third_pos < fourth_pos);
         assert!(fourth_pos < fifth_pos);
+    }
+
+    #[test]
+    fn format_context_windows_long_history() {
+        // R5: a very long history must not be replayed in full.
+        let history: Vec<SessionMessage> = (0..MAX_HISTORY_MESSAGES + 20)
+            .map(|i| make_message(SessionRole::User, &format!("msg-{i}")))
+            .collect();
+        let result = format_session_context(&history, "now");
+        // Oldest messages are omitted; the most recent are kept.
+        assert!(result.contains("earlier message(s) omitted"));
+        assert!(
+            !result.contains("msg-0:"),
+            "oldest message should be windowed out"
+        );
+        assert!(!result.contains("User: msg-0\n"));
+        assert!(result.contains(&format!("msg-{}", MAX_HISTORY_MESSAGES + 19)));
+        // Exactly MAX_HISTORY_MESSAGES history lines are emitted.
+        let history_lines = result.matches("User: msg-").count();
+        assert_eq!(history_lines, MAX_HISTORY_MESSAGES);
     }
 
     #[test]

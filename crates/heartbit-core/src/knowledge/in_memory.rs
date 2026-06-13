@@ -18,7 +18,12 @@ use super::{Chunk, KnowledgeBase, KnowledgeQuery, SearchResult};
 ///
 /// Always used behind `Arc<dyn KnowledgeBase>`, so no inner `Arc` needed.
 pub struct InMemoryKnowledgeBase {
-    chunks: RwLock<HashMap<String, Chunk>>,
+    // AP1: keyed on `(tenant_id, chunk_id)` — NOT `chunk_id` alone. `chunk_id`
+    // derives from the source URI *string* with no tenant component, so two
+    // tenants indexing the same URI string (e.g. both ingest `"README.md"`)
+    // produce identical ids; a bare-id key would let the second insert clobber
+    // the first, silently dropping a tenant's document.
+    chunks: RwLock<HashMap<(String, String), Chunk>>,
 }
 
 impl InMemoryKnowledgeBase {
@@ -68,9 +73,14 @@ impl KnowledgeBase for InMemoryKnowledgeBase {
         // index time. The argument is &str → owned String for the async block.
         let tid = scope.tenant_id.clone();
         Box::pin(async move {
-            chunk.tenant_id = if tid.is_empty() { None } else { Some(tid) };
+            chunk.tenant_id = if tid.is_empty() {
+                None
+            } else {
+                Some(tid.clone())
+            };
+            let key = (tid, chunk.id.clone());
             let mut data = self.chunks.write().await;
-            data.insert(chunk.id.clone(), chunk);
+            data.insert(key, chunk);
             Ok(())
         })
     }
@@ -483,6 +493,48 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].match_count, 1); // deduplicated, not 3
+    }
+
+    /// AP1: two tenants indexing chunks that share the SAME id (because
+    /// `chunk_id` derives from the URI string alone, with no tenant component)
+    /// must NOT clobber each other — the store keys on `(tenant_id, chunk_id)`.
+    #[tokio::test]
+    async fn same_chunk_id_across_tenants_does_not_clobber() {
+        let kb = InMemoryKnowledgeBase::new();
+        let scope_a = TenantScope::new("tenant-a");
+        let scope_b = TenantScope::new("tenant-b");
+
+        // Identical chunk id "readme-0" for both tenants, distinct content.
+        kb.index(
+            &scope_a,
+            make_chunk("readme-0", "alice rust document", "README.md", 0),
+        )
+        .await
+        .unwrap();
+        kb.index(
+            &scope_b,
+            make_chunk("readme-0", "bob rust document", "README.md", 0),
+        )
+        .await
+        .unwrap();
+
+        // Both tenants retain their own document (no overwrite).
+        assert_eq!(kb.chunk_count(&scope_a).await.unwrap(), 1);
+        assert_eq!(kb.chunk_count(&scope_b).await.unwrap(), 1);
+
+        let results_a = kb
+            .search(
+                &scope_a,
+                KnowledgeQuery {
+                    text: "alice".into(),
+                    source_filter: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results_a.len(), 1, "tenant A's chunk was clobbered");
+        assert!(results_a[0].chunk.content.contains("alice"));
     }
 
     /// SECURITY (F-KB-1): tenant A's chunks must not be visible to tenant B

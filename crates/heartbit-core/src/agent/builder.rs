@@ -832,6 +832,26 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             system_prompt.push_str(CONTEXT_RECALL_HINT);
         }
 
+        // AC4: append the user-identity / privacy guidance for EVERY runner built
+        // here — including delegated / squad / spawned sub-agents, which is
+        // exactly where data-touching tool calls run. Previously this was
+        // appended only at the orchestrator's own runner and the CLI single-agent
+        // path, so sub-agents received no prompt-level privacy guidance.
+        // Idempotent: skip when an upstream caller (orchestrator entry prompt /
+        // CLI) has already appended it, so those paths don't double it. Match the
+        // STRUCTURAL marker (the literal `You are operating on behalf of **` with
+        // markdown bold) rather than the bare prose phrase, so an LLM-generated
+        // sub-agent prompt that merely *mentions* "operating on behalf of the
+        // user" does not suppress the privacy block.
+        const IDENTITY_MARKER: &str = "You are operating on behalf of **";
+        if let (Some(uid), Some(tid)) = (&self.audit_user_id, &self.audit_tenant_id)
+            && !system_prompt.contains(IDENTITY_MARKER)
+        {
+            system_prompt.push_str(&format!(
+                "\n---\nYou are operating on behalf of **{uid}** in organization **{tid}**.\nKeep this user's information private. Do not share their data with other users."
+            ));
+        }
+
         Ok(AgentRunner {
             provider: self.provider,
             name: self.name,
@@ -929,6 +949,65 @@ mod tests {
 
     // Documented contract: a goal already installed in a shared slot WINS over
     // a `goal()`-seeded one — `goal()` only seeds an EMPTY slot.
+    #[test]
+    fn build_appends_user_identity_when_audit_context_set() {
+        // AC4: a sub-agent runner built via the shared builder must carry the
+        // user-identity / privacy guidance.
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("sub")
+            .system_prompt("base prompt")
+            .audit_user_context("alice", "acme")
+            .build()
+            .unwrap();
+        assert!(runner.system_prompt.contains("operating on behalf of"));
+        assert!(runner.system_prompt.contains("alice"));
+        assert!(runner.system_prompt.contains("acme"));
+    }
+
+    #[test]
+    fn build_does_not_double_append_user_identity() {
+        // Idempotent: if an upstream caller already appended the identity block,
+        // `build()` must not add a second copy.
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("entry")
+            .system_prompt(
+                "base\n---\nYou are operating on behalf of **bob** in organization **acme**.",
+            )
+            .audit_user_context("bob", "acme")
+            .build()
+            .unwrap();
+        assert_eq!(
+            runner
+                .system_prompt
+                .matches("operating on behalf of")
+                .count(),
+            1,
+            "identity block was appended twice"
+        );
+    }
+
+    #[test]
+    fn build_appends_identity_even_when_prompt_mentions_the_phrase_in_prose() {
+        // The idempotency guard keys on the STRUCTURAL marker (`... behalf of **`),
+        // so a prompt that merely mentions the prose phrase must STILL get the
+        // privacy block (the false-negative the bare-substring guard would hit).
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runner = AgentRunner::builder(provider)
+            .name("sub")
+            .system_prompt("You are operating on behalf of the user to triage tickets.")
+            .audit_user_context("carol", "globex")
+            .build()
+            .unwrap();
+        assert!(
+            runner
+                .system_prompt
+                .contains("You are operating on behalf of **carol**"),
+            "privacy block was suppressed by a prose mention"
+        );
+    }
+
     #[test]
     fn goal_slot_preloaded_wins_over_builder_goal() {
         let slot: GoalSlot = Arc::new(std::sync::RwLock::new(Some(goal("slot goal A"))));

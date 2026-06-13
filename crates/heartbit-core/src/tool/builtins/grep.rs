@@ -224,22 +224,51 @@ async fn try_ripgrep(
         read_capped(&mut pipe, MAX_RG_STDERR_BYTES, true).await
     });
 
+    // R2: bound the read + wait with a timeout. Without it, `rg` reading a
+    // blocking special file (FIFO/named pipe) or sitting on a hung mount
+    // (hard NFS / stalled FUSE) never returns, so this `.await` never completes
+    // and the grep tool call hangs the agent forever with no error surfaced.
+    // `BashTool` and `codegen/verify.rs` wrap their waits the same way.
+    const RG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     // Global source-side cap: stop ingesting once MAX_RG_STDOUT_BYTES are
     // collected — `--max-count` is only per-file, so a permissive pattern over
     // a large tree could otherwise buffer hundreds of MB before the rendered
     // caps apply.
-    let (raw, source_capped) = read_capped(&mut stdout_pipe, MAX_RG_STDOUT_BYTES, false)
-        .await
-        .map_err(|e| Error::Agent(format!("rg read failed: {e}")))?;
+    let (raw, source_capped) = match tokio::time::timeout(
+        RG_TIMEOUT,
+        read_capped(&mut stdout_pipe, MAX_RG_STDOUT_BYTES, false),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(Error::Agent(format!("rg read failed: {e}"))),
+        Err(_elapsed) => {
+            let _ = child.start_kill();
+            stderr_task.abort();
+            return Ok(ToolOutput::error(format!(
+                "grep timed out after {}s (a blocking special file or stalled filesystem?)",
+                RG_TIMEOUT.as_secs()
+            )));
+        }
+    };
     if source_capped {
         // We already hold more than the rendered caps can use; stop rg instead
         // of letting it stream the rest of the tree.
         let _ = child.start_kill();
     }
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| Error::Agent(format!("rg failed: {e}")))?;
+    let status = match tokio::time::timeout(RG_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(Error::Agent(format!("rg failed: {e}"))),
+        Err(_elapsed) => {
+            let _ = child.start_kill();
+            stderr_task.abort();
+            return Ok(ToolOutput::error(format!(
+                "grep timed out after {}s waiting for rg to exit",
+                RG_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let stderr_raw = match stderr_task.await {
         Ok(Ok((bytes, _))) => bytes,
         _ => Vec::new(),

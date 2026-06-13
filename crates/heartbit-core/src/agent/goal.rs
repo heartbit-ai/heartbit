@@ -250,7 +250,17 @@ pub(crate) fn parse_goal_verdict(text: &str) -> GoalVerdict {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("GOAL_MET:") {
             let rest = rest.trim();
-            if rest.eq_ignore_ascii_case("yes") || rest.eq_ignore_ascii_case("yes.") {
+            // AC2: accept any reply whose verdict token is `yes`, with optional
+            // trailing punctuation/justification (`YES — all criteria met`,
+            // `YES (verified)`, `YES, done`). Models routinely append a clause
+            // despite the one-line instruction; the NO branch already tolerates
+            // trailing prose, so YES must too — the previous exact-match check
+            // rejected genuine successes and burned the continuation budget.
+            let verdict_token: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            if verdict_token.eq_ignore_ascii_case("yes") {
                 return GoalVerdict {
                     satisfied: true,
                     reason: String::new(),
@@ -395,6 +405,17 @@ mod tests {
         assert!(parse_goal_verdict("GOAL_MET: YES").satisfied);
         assert!(!parse_goal_verdict("GOAL_MET: no: x").satisfied);
         assert!(!parse_goal_verdict("GOAL_MET: NO: x").satisfied);
+    }
+
+    #[test]
+    fn verdict_yes_with_trailing_justification_is_satisfied() {
+        // AC2: a YES verdict with an appended clause must still count as met
+        // (matches the NO branch's tolerance of trailing prose).
+        assert!(parse_goal_verdict("GOAL_MET: YES — all criteria met").satisfied);
+        assert!(parse_goal_verdict("GOAL_MET: YES (verified against tests)").satisfied);
+        assert!(parse_goal_verdict("GOAL_MET: yes, the objective is demonstrated").satisfied);
+        // But a non-yes leading word must NOT be mistaken for yes.
+        assert!(!parse_goal_verdict("GOAL_MET: yesterday it was incomplete").satisfied);
     }
 
     #[test]

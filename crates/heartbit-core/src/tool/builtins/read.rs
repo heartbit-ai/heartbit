@@ -169,9 +169,13 @@ impl Tool for ReadTool {
             let lines: Vec<&str> = text.lines().collect();
             let total_lines = lines.len();
 
-            // Apply offset (1-based) and limit
+            // Apply offset (1-based) and limit. AP2: `limit` comes straight from
+            // LLM tool input (`v as usize`, unclamped), so `start + limit` can
+            // overflow — a debug-build panic on the add, or a release-build wrap
+            // that makes `end < start` and panics the `lines[start..end]` slice.
+            // `saturating_add` clamps to `total_lines` either way.
             let start = if offset > 0 { offset - 1 } else { 0 };
-            let end = (start + limit).min(total_lines);
+            let end = start.saturating_add(limit).min(total_lines);
 
             if start >= total_lines {
                 return Ok(ToolOutput::error(format!(
@@ -300,6 +304,33 @@ mod tests {
 
         // File should be tracked
         assert!(tracker.was_read(&path));
+    }
+
+    #[tokio::test]
+    async fn read_with_huge_limit_does_not_panic() {
+        // AP2: an LLM-supplied `limit` near usize::MAX must not overflow
+        // `start + limit` nor invert the slice range.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        let tool = ReadTool::new(tracker, None, Arc::new(Vec::new()));
+
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "offset": 1,
+                    "limit": u64::MAX
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {:?}", result.content);
+        assert!(result.content.contains("alpha"));
+        assert!(result.content.contains("gamma"));
     }
 
     #[tokio::test]

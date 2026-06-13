@@ -99,8 +99,11 @@ impl<P: LlmProvider + 'static> DebateAgent<P> {
                 Vec::with_capacity(self.debaters.len());
 
             while let Some(join_result) = set.join_next().await {
-                let (name, agent_result) = join_result
-                    .map_err(|e| Error::Agent(format!("debate agent task panicked: {e}")))?;
+                let (name, agent_result) = join_result.map_err(|e| {
+                    // AP6: preserve completed siblings' usage on a panic.
+                    Error::Agent(format!("debate agent task panicked: {e}"))
+                        .accumulate_usage(total_usage)
+                })?;
                 let output = agent_result.map_err(|e| e.accumulate_usage(total_usage))?;
                 output.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
                 round_results.push((name, output));

@@ -2118,7 +2118,13 @@ impl McpClient {
             )
             .await?;
 
-        let init: InitializeResult = serde_json::from_value(init_result).unwrap_or_default();
+        // AP7: propagate a malformed `initialize` result instead of falling back
+        // to `Default` (all capabilities `None`), which silently skips resource
+        // and prompt discovery with no error surfaced. Transport/JSON-RPC errors
+        // were already caught by `?` above; this only fires on a valid-JSON but
+        // structurally-incompatible handshake body.
+        let init: InitializeResult = serde_json::from_value(init_result)
+            .map_err(|e| Error::Mcp(format!("malformed initialize result: {e}")))?;
 
         transport.notify("notifications/initialized", None).await?;
 

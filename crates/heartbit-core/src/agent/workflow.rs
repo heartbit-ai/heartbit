@@ -190,8 +190,13 @@ impl<P: LlmProvider + 'static> ParallelAgent<P> {
         let mut total_cost: Option<f64> = None;
 
         while let Some(join_result) = set.join_next().await {
-            let (name, agent_result) = join_result
-                .map_err(|e| Error::Agent(format!("parallel agent task panicked: {e}")))?;
+            let (name, agent_result) = join_result.map_err(|e| {
+                // AP6: a panicked sibling must not discard the tokens already
+                // burned by completed siblings (the domain-error arm below
+                // accumulates; the panic arm previously did not).
+                Error::Agent(format!("parallel agent task panicked: {e}"))
+                    .accumulate_usage(total_usage)
+            })?;
             let output = agent_result.map_err(|e| e.accumulate_usage(total_usage))?;
             output.accumulate_into(&mut total_usage, &mut total_tool_calls, &mut total_cost);
             results.push((name, output));
