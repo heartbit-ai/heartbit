@@ -3023,18 +3023,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mini-crm"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "heartbit-core",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "minijinja"
 version = "2.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
