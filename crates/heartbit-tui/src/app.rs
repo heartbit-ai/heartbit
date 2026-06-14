@@ -883,7 +883,21 @@ impl App {
                 agent,
                 success,
                 tokens,
-            } => self.agent_finish(&agent, success, tokens),
+                error,
+            } => {
+                self.agent_finish(&agent, success, tokens);
+                // A sub-agent failure stays non-fatal (the orchestrator gets the
+                // error as a tool result and continues), but it must be VISIBLE —
+                // a silent "Max turns exceeded" let a half-done audit pass for a
+                // finished one (live trace 6a2e92e3).
+                if !success {
+                    let reason = error.unwrap_or_else(|| "failed".into());
+                    self.history.push(Cell::Notice(format!(
+                        "⚠ sub-agent {agent} failed: {reason} — its result is partial; \
+                         the orchestrator continues with what it returned."
+                    )));
+                }
+            }
             Msg::AgentSpawned { name, task } => {
                 self.agent_set_working(&name, "spawned");
                 self.history.push(Cell::Notice(format!(
@@ -3419,10 +3433,38 @@ mod tests {
             agent: "worker".into(),
             success: true,
             tokens: 1234,
+            error: None,
         });
         let w = app.agents.iter().find(|r| r.name == "worker").unwrap();
         assert_eq!(w.state, AgentState::Done);
         assert_eq!(w.tokens, 1234);
+    }
+
+    #[test]
+    fn failed_sub_agent_pushes_a_visible_notice() {
+        // Live trace 6a2e92e3: the researcher hit "Max turns (60) exceeded" and
+        // the failure was swallowed (roster row only). It must be surfaced.
+        let mut app = multi();
+        app.update(Msg::AgentsDispatched(vec!["researcher".into()]));
+        app.update(Msg::SubAgentDone {
+            agent: "researcher".into(),
+            success: false,
+            tokens: 10,
+            error: Some("Max turns (60) exceeded".into()),
+        });
+        assert!(
+            app.history.iter().any(|c| matches!(
+                c,
+                Cell::Notice(n) if n.contains("researcher failed") && n.contains("Max turns")
+            )),
+            "a sub-agent failure must surface a visible notice naming the reason"
+        );
+        // …and stay non-fatal (the run is not marked failed).
+        assert!(
+            !app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("run failed")))
+        );
     }
 
     #[test]

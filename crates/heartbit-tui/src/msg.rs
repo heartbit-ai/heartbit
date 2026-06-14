@@ -70,6 +70,9 @@ pub enum Msg {
         agent: String,
         success: bool,
         tokens: u32,
+        /// The failure reason when `!success` (e.g. "Max turns (60) exceeded"),
+        /// so the UI can surface it instead of swallowing it. `None` on success.
+        error: Option<String>,
     },
     /// A sub-agent's LLM call finished: accumulate its cost into the session
     /// totals WITHOUT touching the run lifecycle (`running`, roster settle,
@@ -185,6 +188,7 @@ impl Msg {
                 agent,
                 success,
                 tokens: usage.input_tokens + usage.output_tokens,
+                error: None,
             }),
             AgentEvent::AgentSpawned {
                 spawned_name, task, ..
@@ -219,11 +223,14 @@ impl Msg {
             } else {
                 // A sub-agent failure is routine (delegate_task returns the
                 // error as a tool result; the orchestrator continues) — mark
-                // the roster row failed, never the whole run.
+                // the roster row failed, never the whole run — but surface the
+                // reason (handler pushes a Notice) so a silent 60-turn death
+                // doesn't pass for a finished audit.
                 Msg::SubAgentDone {
                     agent,
                     success: false,
                     tokens: partial_usage.input_tokens + partial_usage.output_tokens,
+                    error: Some(error),
                 }
             }),
             AgentEvent::GuardrailDenied {
@@ -415,10 +422,16 @@ mod tests {
                 agent,
                 success,
                 tokens,
+                error,
             }) => {
                 assert_eq!(agent, "worker");
                 assert!(!success);
                 assert_eq!(tokens, 10);
+                assert_eq!(
+                    error.as_deref(),
+                    Some("Max turns (60) exceeded"),
+                    "the failure reason must be carried through for the UI to show"
+                );
             }
             Some(Msg::RunFailed(_)) => {
                 panic!("a sub-agent failure must not declare the whole run failed")
