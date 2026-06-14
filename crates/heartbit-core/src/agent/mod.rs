@@ -15,6 +15,7 @@ mod doom_loop;
 pub mod dual_llm;
 pub mod evaluator;
 pub mod events;
+pub mod experience;
 pub mod flow;
 pub mod goal;
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub(crate) mod test_helpers;
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
 pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader};
+pub use experience::{Trajectory, TrajectoryStore, distill_procedure};
 pub use interrupt::InterruptHandle;
 pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
 pub use verifier::{LlmVerifier, Selected, Verifier, select_best};

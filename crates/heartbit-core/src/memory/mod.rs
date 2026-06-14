@@ -8,6 +8,7 @@ pub mod in_memory;
 pub mod namespaced;
 pub mod pruning;
 pub mod reflection;
+pub mod rerank;
 pub mod scoring;
 pub mod shared_tools;
 pub mod tools;
