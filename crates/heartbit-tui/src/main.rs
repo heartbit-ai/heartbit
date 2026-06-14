@@ -1574,11 +1574,19 @@ async fn run_ui(
                     }
                 }
                 Effect::FetchModels => {
-                    // Fetch the OpenRouter catalog off the UI thread; the result
-                    // comes back as Msg::ModelsLoaded / ModelsFailed.
+                    // Fetch the model catalog off the UI thread; the result comes
+                    // back as Msg::ModelsLoaded / ModelsFailed. When a custom
+                    // endpoint is active (e.g. the Codex proxy via /codex), list
+                    // ITS models (`/v1/models`) so the picker offers the
+                    // subscription's models, not the OpenRouter catalogue.
                     let tx = ui_tx.clone();
+                    let endpoint = app.custom_endpoint.clone();
                     tokio::spawn(async move {
-                        let msg = match models::fetch_openrouter_models().await {
+                        let result = match &endpoint {
+                            Some(base) => models::fetch_openai_models(base).await,
+                            None => models::fetch_openrouter_models().await,
+                        };
+                        let msg = match result {
                             Ok(m) => Msg::ModelsLoaded(m),
                             Err(e) => Msg::ModelsFailed(e.to_string()),
                         };

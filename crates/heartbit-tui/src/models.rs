@@ -65,6 +65,27 @@ pub async fn fetch_openrouter_models() -> anyhow::Result<Vec<ModelEntry>> {
     parse_models(&body)
 }
 
+/// Fetch the model list from an OpenAI-compatible endpoint's `/models` (e.g. the
+/// ChatGPT-subscription Codex proxy, a local model server, or the real OpenAI
+/// API). `base_url` is the `/v1` base (e.g. `http://127.0.0.1:10531/v1`); the
+/// response is the same `{ "data": [ { "id" }, … ] }` shape `parse_models`
+/// already handles (Codex models carry no name/context → name defaults to id).
+/// Sends `HEARTBIT_OPENAI_API_KEY` as a bearer token when set (real HTTPS APIs);
+/// a localhost proxy needs none.
+pub async fn fetch_openai_models(base_url: &str) -> anyhow::Result<Vec<ModelEntry>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = reqwest::Client::new()
+        .get(&url)
+        .header("User-Agent", "heartbit-tui");
+    if let Ok(key) = std::env::var("HEARTBIT_OPENAI_API_KEY")
+        && !key.trim().is_empty()
+    {
+        req = req.bearer_auth(key.trim());
+    }
+    let body = req.send().await?.error_for_status()?.text().await?;
+    parse_models(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +119,20 @@ mod tests {
     #[test]
     fn parse_models_errors_on_garbage() {
         assert!(parse_models("not json").is_err());
+    }
+
+    #[test]
+    fn parse_models_handles_openai_compat_codex_proxy_shape() {
+        // The Codex proxy's /v1/models payload: id-only entries, no name/context.
+        let proxy = r#"{"object":"list","data":[
+            {"id":"gpt-5.5","object":"model","created":0,"owned_by":"codex-oauth"},
+            {"id":"gpt-5.4-mini","object":"model","created":0,"owned_by":"codex-oauth"}
+        ]}"#;
+        let m = parse_models(proxy).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].id, "gpt-5.5");
+        assert_eq!(m[0].name, "gpt-5.5", "no name field → name defaults to id");
+        assert_eq!(m[0].context, None);
     }
 
     #[test]

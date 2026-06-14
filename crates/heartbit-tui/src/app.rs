@@ -1502,6 +1502,8 @@ impl App {
                 self.model = model;
                 self.has_fallback_provider = fallback;
             }
+            // The model source changed back to OpenRouter — reload that catalog.
+            self.refresh_model_catalog();
             let when = self.queue_respawn();
             self.history.push(Cell::Notice(format!(
                 "codex endpoint cleared — reverting to your normal provider ({}), {when}",
@@ -1523,6 +1525,10 @@ impl App {
         self.custom_endpoint = Some(url.clone());
         // A custom endpoint IS a provider — let a no-OpenRouter-key session start.
         self.has_fallback_provider = true;
+        // Load the proxy's model list into the /model picker (replaces the stale
+        // OpenRouter catalogue) so the user can pick any model the subscription
+        // exposes through Codex.
+        self.refresh_model_catalog();
         // The Codex backend exposes its own model set (discovered live, account/
         // version-dependent — e.g. gpt-5.5, gpt-5.4, gpt-5.4-mini). `gpt-5.5` is the
         // current flagship default; switch with `/model <id>` (check the proxy's
@@ -1695,6 +1701,16 @@ impl App {
 
     /// Open the OpenRouter model picker for `target` (main model or advisor),
     /// fetching the catalog on first use.
+    /// Force a reload of the `/model` picker catalogue from the CURRENT source —
+    /// the custom endpoint's `/v1/models` when one is set (e.g. the Codex proxy),
+    /// else the OpenRouter catalogue. Called when the source changes (`/codex`
+    /// on/off) so the picker never shows the wrong provider's models.
+    fn refresh_model_catalog(&mut self) {
+        self.models.clear();
+        self.models_loading = true;
+        self.effects.push(Effect::FetchModels);
+    }
+
     fn open_model_picker(&mut self, target: ModelTarget) {
         self.modal = Some(Modal::ModelPicker(ModelPicker {
             target,
@@ -2372,6 +2388,28 @@ mod tests {
         assert!(
             app.effects.contains(&Effect::RespawnAgent),
             "the model/endpoint switch must rebuild the idle agent"
+        );
+    }
+
+    #[test]
+    fn slash_codex_refreshes_the_model_catalog_from_the_proxy() {
+        let mut app = keyed();
+        // Seed a stale OpenRouter catalogue so we can prove it gets cleared.
+        app.models = vec![crate::models::ModelEntry {
+            id: "openrouter/old".into(),
+            name: "old".into(),
+            context: None,
+        }];
+        typed(&mut app, "/codex");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.models.is_empty(),
+            "the stale OpenRouter catalogue must be cleared so the proxy's loads"
+        );
+        assert!(app.models_loading, "a refetch is in flight");
+        assert!(
+            app.effects.contains(&Effect::FetchModels),
+            "/codex must refetch the catalogue (now from the proxy's /v1/models)"
         );
     }
 
