@@ -22,6 +22,13 @@ pub fn truncate_for_event(text: &str, max_bytes: usize) -> String {
     format!("{}[truncated: {omitted} bytes omitted]", &text[..cut])
 }
 
+/// Serde default for [`AgentEvent::TaskRouted::agent`]: the routing decision is
+/// always the orchestrator's, so older payloads without the field deserialize to
+/// `"orchestrator"`.
+fn default_orchestrator_agent() -> String {
+    "orchestrator".to_string()
+}
+
 /// Structured events emitted during agent and orchestrator execution.
 ///
 /// All events carry the agent name for identification in multi-agent runs.
@@ -305,6 +312,11 @@ pub enum AgentEvent {
 
     /// Task was routed to single-agent or orchestrator by the complexity analyzer.
     TaskRouted {
+        /// The agent that made the routing decision — always the orchestrator
+        /// (the routing layer). Carried so observers can attribute the decision
+        /// to the orchestrator's lifecycle rather than to an unnamed actor.
+        #[serde(default = "default_orchestrator_agent")]
+        agent: String,
         /// "single_agent" or "orchestrate"
         decision: String,
         reason: String,
@@ -654,6 +666,7 @@ mod tests {
                 task: "analyze tax implications".into(),
             },
             AgentEvent::TaskRouted {
+                agent: "orchestrator".into(),
                 decision: "single_agent".into(),
                 reason: "heuristic score below threshold".into(),
                 selected_agent: Some("coder".into()),

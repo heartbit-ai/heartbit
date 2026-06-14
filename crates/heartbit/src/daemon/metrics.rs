@@ -1288,6 +1288,7 @@ mod tests {
     fn record_task_routed_single_agent() {
         let m = DaemonMetrics::new().unwrap();
         let event = AgentEvent::TaskRouted {
+            agent: "orchestrator".into(),
             decision: "single_agent".into(),
             reason: "low complexity".into(),
             selected_agent: Some("coder".into()),
@@ -1311,6 +1312,7 @@ mod tests {
     fn record_task_routed_orchestrate_with_escalation() {
         let m = DaemonMetrics::new().unwrap();
         let event = AgentEvent::TaskRouted {
+            agent: "orchestrator".into(),
             decision: "orchestrate".into(),
             reason: "high complexity".into(),
             selected_agent: None,
@@ -1581,6 +1583,7 @@ mod tests {
                 priority: None,
             },
             AgentEvent::TaskRouted {
+                agent: "orchestrator".into(),
                 decision: "single_agent".into(),
                 reason: "test".into(),
                 selected_agent: Some("a".into()),

@@ -1314,6 +1314,14 @@ impl<'a> RuntimeBuilder<'a> {
         let event_collector: Arc<std::sync::Mutex<Vec<heartbit::AgentEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
+        // When the router routes a task to a SINGLE agent (bypassing the
+        // orchestrator loop), the orchestration layer still made a decision — it
+        // started, routed, and finished. Emit its own RunStarted/RunCompleted
+        // (agent="orchestrator") around the single run so observers see a
+        // complete, attributed orchestrator lifecycle (the routing decision is
+        // the orchestrator's, not an unnamed actor). Set when we emit RunStarted.
+        let mut emit_orchestrator_lifecycle = false;
+
         let (route_to_single, selected_agent_index) = match routing_mode {
             heartbit::RoutingMode::AlwaysOrchestrate => (false, None),
             heartbit::RoutingMode::SingleAgent => (true, Some(0)),
@@ -1346,8 +1354,19 @@ impl<'a> RuntimeBuilder<'a> {
                         heartbit::RoutingDecision::Orchestrate { .. } => (false, None),
                     };
                     if let Some(ref on_ev) = self.on_event {
+                        // Open the orchestrator's lifecycle BEFORE the routing
+                        // event so its event group is [run_started, task_routed,
+                        // run_completed] — well-formed and attributed.
+                        if is_single {
+                            on_ev(heartbit::AgentEvent::RunStarted {
+                                agent: "orchestrator".into(),
+                                task: task_text.clone(),
+                            });
+                            emit_orchestrator_lifecycle = true;
+                        }
                         let selected_name = idx.map(|i| self.config.agents[i].name.clone());
                         on_ev(heartbit::AgentEvent::TaskRouted {
+                            agent: "orchestrator".into(),
                             decision: if is_single {
                                 "single_agent".into()
                             } else {
@@ -1713,7 +1732,18 @@ impl<'a> RuntimeBuilder<'a> {
                 runner.execute(&task_text).await
             };
             match run_result {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    // Close the orchestrator lifecycle opened at routing time, so
+                    // its event group ends with run_completed (agent=orchestrator).
+                    if emit_orchestrator_lifecycle && let Some(ref on_ev) = self.on_event {
+                        on_ev(heartbit::AgentEvent::RunCompleted {
+                            agent: "orchestrator".into(),
+                            total_usage: output.tokens_used,
+                            tool_calls_made: output.tool_call_results.len(),
+                        });
+                    }
+                    return Ok(output);
+                }
                 Err(err) => {
                     // Tier 3: escalation — if enabled and the failure warrants it,
                     // fall through to orchestrator with partial context.
@@ -1727,6 +1757,7 @@ impl<'a> RuntimeBuilder<'a> {
                     if should_esc {
                         if let Some(ref on_ev) = self.on_event {
                             on_ev(heartbit::AgentEvent::TaskRouted {
+                                agent: "orchestrator".into(),
                                 decision: "orchestrate".into(),
                                 reason: format!("escalated after single-agent failure: {err}"),
                                 selected_agent: None,
