@@ -215,6 +215,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "list the registered workflow recipes (run_workflow)",
     ),
     ("/key", "set the OpenRouter API key"),
+    (
+        "/codex",
+        "run on a ChatGPT-subscription Codex proxy (`/codex [url|off]`)",
+    ),
     ("/quit", "exit the TUI"),
 ];
 
@@ -409,8 +413,21 @@ pub struct App {
     /// The OpenRouter API key in effect (from env, config, or set in-TUI).
     pub api_key: Option<String>,
     /// True when a provider can start without an OpenRouter key (e.g. an
-    /// `ANTHROPIC_API_KEY` env fallback) — so a no-key submit need not prompt.
+    /// `ANTHROPIC_API_KEY` env fallback, or a custom endpoint via `/codex`) — so a
+    /// no-key submit need not prompt.
     pub has_fallback_provider: bool,
+    /// A custom OpenAI-compatible base URL (`http://127.0.0.1:.../v1`), set by
+    /// `/codex` or the `HEARTBIT_OPENAI_BASE_URL` env var at startup. When `Some`,
+    /// the engine builds an `OpenAiCompatProvider` against it (priority over
+    /// OpenRouter), so the TUI can run on a ChatGPT-subscription Codex proxy or any
+    /// OpenAI-compatible endpoint. Applies on the next agent start.
+    pub custom_endpoint: Option<String>,
+    /// While `/codex` is active, the `(model, has_fallback_provider)` that were in
+    /// effect BEFORE activation — restored by `/codex off`. `/codex` is a SESSION
+    /// override (never persisted): the model swap must not leak a Codex model id
+    /// into the saved config, which would brick the next cold start when the proxy
+    /// is gone. `None` ⇒ Codex not active.
+    pub codex_saved: Option<(String, bool)>,
     pub tokens: TokenUsage,
     /// MCP servers to connect when the agent starts (mirrors the config file).
     pub mcp_servers: Vec<McpServerSpec>,
@@ -506,6 +523,8 @@ impl App {
             model: model.into(),
             api_key: None,
             has_fallback_provider: false,
+            custom_endpoint: None,
+            codex_saved: None,
             tokens: TokenUsage::default(),
             mcp_servers: Vec::new(),
             models: Vec::new(),
@@ -1206,6 +1225,7 @@ impl App {
                     self.set_model(arg);
                 }
             }
+            "codex" => self.activate_codex(arg),
             "mcp" => self.handle_mcp(arg),
             "mode" => self.set_mode(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
@@ -1463,6 +1483,67 @@ impl App {
         let when = self.queue_respawn();
         self.history
             .push(Cell::Notice(format!("model set to {model} — {when}")));
+    }
+
+    /// `/codex [url|off]` — one command to run the TUI on a ChatGPT-subscription
+    /// Codex quota. It points the engine at a local Codex→OpenAI-compatible proxy
+    /// (default `http://127.0.0.1:10531/v1`), switches the model to a Codex id, and
+    /// respawns the agent. `off` reverts to the normal provider on the next start.
+    ///
+    /// ⚠ Using a ChatGPT-subscription token outside Codex is a likely Terms-of-
+    /// Service violation (ban risk) and is fragile — see docs/chatgpt-subscription.md.
+    /// The TUI only points at the proxy; it never touches the Codex token itself.
+    fn activate_codex(&mut self, arg: String) {
+        let arg = arg.trim();
+        if matches!(arg, "off" | "clear" | "stop") {
+            self.custom_endpoint = None;
+            // Restore the pre-codex model + fallback (the override is session-only).
+            if let Some((model, fallback)) = self.codex_saved.take() {
+                self.model = model;
+                self.has_fallback_provider = fallback;
+            }
+            let when = self.queue_respawn();
+            self.history.push(Cell::Notice(format!(
+                "codex endpoint cleared — reverting to your normal provider ({}), {when}",
+                self.model
+            )));
+            return;
+        }
+        // The proxy's OpenAI-compatible base URL (arg overrides the default port).
+        let url = if arg.is_empty() {
+            "http://127.0.0.1:10531/v1".to_string()
+        } else {
+            arg.to_string()
+        };
+        // Stash the model + fallback to restore on `/codex off` — but only on the
+        // FIRST activation, so re-running `/codex <url>` keeps the original values.
+        if self.codex_saved.is_none() {
+            self.codex_saved = Some((self.model.clone(), self.has_fallback_provider));
+        }
+        self.custom_endpoint = Some(url.clone());
+        // A custom endpoint IS a provider — let a no-OpenRouter-key session start.
+        self.has_fallback_provider = true;
+        // The Codex backend exposes its own (coding-tuned) model set. SESSION-ONLY:
+        // deliberately NOT persisted (no `SaveModel`) — a Codex model id written to
+        // the config would brick the next launch when the proxy is gone.
+        self.model = "gpt-5-codex".to_string();
+        // Best-effort: warn (don't block) if the Codex login token is absent — the
+        // proxy needs `~/.codex/auth.json` (run `codex login`). Advisory only, so
+        // the reducer stays testable (it never depends on this file existing).
+        let auth_missing = std::env::var("HOME")
+            .ok()
+            .map(|h| !std::path::Path::new(&h).join(".codex/auth.json").exists())
+            .unwrap_or(false);
+        let when = self.queue_respawn();
+        let mut notice = format!(
+            "codex endpoint → {url} · model gpt-5-codex — {when}. \
+             ⚠ subscription-token use outside Codex risks a ToS ban (see \
+             docs/chatgpt-subscription.md); start the local proxy first."
+        );
+        if auth_missing {
+            notice.push_str(" Note: ~/.codex/auth.json not found — run `codex login`.");
+        }
+        self.history.push(Cell::Notice(notice));
     }
 
     /// Set the advisor's frontier model (`/model advisor <name>`): persist,
@@ -2262,6 +2343,56 @@ mod tests {
             app.effects
                 .contains(&Effect::SaveModel("openai/gpt-x".into()))
         );
+    }
+
+    #[test]
+    fn slash_codex_sets_endpoint_model_and_respawns() {
+        let mut app = keyed(); // idle → respawn is immediate
+        typed(&mut app, "/codex");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.custom_endpoint.as_deref(),
+            Some("http://127.0.0.1:10531/v1"),
+            "bare /codex uses the default proxy URL"
+        );
+        assert_eq!(app.model, "gpt-5-codex");
+        assert!(app.has_fallback_provider, "a custom endpoint IS a provider");
+        // SESSION-ONLY: the Codex model id must NOT be persisted (it would brick
+        // the next cold start once the proxy is gone).
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveModel(_))),
+            "/codex must not persist the model to config"
+        );
+        assert!(
+            app.effects.contains(&Effect::RespawnAgent),
+            "the model/endpoint switch must rebuild the idle agent"
+        );
+    }
+
+    #[test]
+    fn slash_codex_off_restores_the_prior_model_and_fallback() {
+        let mut app = keyed(); // keyed() ⇒ model "m", no fallback
+        let prior_model = app.model.clone();
+        let prior_fallback = app.has_fallback_provider;
+        typed(&mut app, "/codex http://127.0.0.1:8080/v1");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.custom_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(app.model, "gpt-5-codex");
+
+        typed(&mut app, "/codex off");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.custom_endpoint, None, "/codex off clears the endpoint");
+        assert_eq!(app.model, prior_model, "the pre-codex model is restored");
+        assert_eq!(
+            app.has_fallback_provider, prior_fallback,
+            "the pre-codex fallback flag is restored"
+        );
+        assert!(app.codex_saved.is_none(), "the stash is consumed");
     }
 
     #[test]

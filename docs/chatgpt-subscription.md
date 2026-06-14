@@ -67,7 +67,27 @@ get an endpoint like `http://127.0.0.1:10531/v1`.
 
 ### 3. Point the heartbit TUI at the proxy
 
-The TUI honours a **custom OpenAI-compatible endpoint** via two env vars
+#### Option A — one command, inside the TUI (recommended)
+
+Start the TUI, then run:
+
+```
+/codex
+```
+
+That single command points the engine at the default proxy URL
+(`http://127.0.0.1:10531/v1`), switches the model to `gpt-5-codex`, and respawns
+the agent — all at once. Pass a URL to override the port
+(`/codex http://127.0.0.1:8080/v1`), and `/codex off` reverts to your normal
+provider. It prints the ToS caveat and warns if `~/.codex/auth.json` is missing.
+
+`/codex` is a **session override** — it does not write anything to your config, so
+the Codex model id can't leak into the next launch and break it once the proxy is
+gone. `/codex off` restores the model and provider you had before.
+
+#### Option B — env vars (set before launch)
+
+The TUI also honours a **custom OpenAI-compatible endpoint** via two env vars
 (see `build_provider` in `crates/heartbit-tui/src/main.rs`):
 
 | Var | Meaning |

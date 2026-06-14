@@ -216,9 +216,11 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     // A custom OpenAI-compatible endpoint (e.g. a ChatGPT-subscription Codex
     // proxy, a local model, or the real OpenAI API) is a complete provider on its
     // own — no OpenRouter key needed, so the agent may spawn.
-    let has_custom_endpoint = std::env::var("HEARTBIT_OPENAI_BASE_URL")
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    let custom_endpoint = std::env::var("HEARTBIT_OPENAI_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_custom_endpoint = custom_endpoint.is_some();
     let has_fallback = has_anthropic || has_custom_endpoint;
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -228,6 +230,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let mut app = App::new(model);
     app.api_key = api_key;
     app.has_fallback_provider = has_fallback;
+    app.custom_endpoint = custom_endpoint;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
@@ -262,8 +265,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     }
     // Custom OpenAI-compatible endpoint in use: tell the user (and remind them to
     // set the matching model with /model — the default is an OpenRouter id).
-    if has_custom_endpoint {
-        let url = std::env::var("HEARTBIT_OPENAI_BASE_URL").unwrap_or_default();
+    if let Some(url) = app.custom_endpoint.clone() {
         app.history.push(Cell::Notice(format!(
             "custom OpenAI-compatible endpoint: {url} — set the model with /model \
              (e.g. gpt-5-codex for a ChatGPT-subscription Codex proxy). This takes \
@@ -339,26 +341,33 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
 /// heartbit-cli's `build_on_retry`) — retries are diagnostic gold and were
 /// previously invisible in the TUI.
 fn build_provider(
+    custom_endpoint: Option<&str>,
     openrouter_key: Option<String>,
     model: &str,
     on_retry: Arc<heartbit_core::OnRetry>,
     prompt_caching: bool,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
-    // Custom OpenAI-compatible endpoint (`HEARTBIT_OPENAI_BASE_URL`). Takes
-    // PRIORITY over OpenRouter so the same config can target: a local model
-    // (Ollama / vLLM / LM Studio), the real OpenAI API, OR a localhost proxy that
-    // bridges a ChatGPT-subscription Codex token to OpenAI-compatible requests
-    // (so the agent runs on the subscription's quota — see docs/chatgpt-subscription.md).
-    // A key present ⇒ Bearer over HTTPS (real API); no key ⇒ AuthStyle::None,
-    // which is what permits a non-HTTPS localhost base_url (the Codex proxy).
-    if let Ok(base_url) = std::env::var("HEARTBIT_OPENAI_BASE_URL")
-        && !base_url.trim().is_empty()
-    {
+    // Custom OpenAI-compatible endpoint (`/codex`, or `HEARTBIT_OPENAI_BASE_URL` at
+    // startup). Takes PRIORITY over OpenRouter so the same config can target: a
+    // local model (Ollama / vLLM / LM Studio), the real OpenAI API, OR a localhost
+    // proxy that bridges a ChatGPT-subscription Codex token to OpenAI-compatible
+    // requests (so the agent runs on the subscription's quota — see
+    // docs/chatgpt-subscription.md). A key present ⇒ Bearer over HTTPS (real API);
+    // no key ⇒ AuthStyle::None, which is what permits a non-HTTPS localhost
+    // base_url (the Codex proxy).
+    if let Some(base_url) = custom_endpoint.filter(|u| !u.trim().is_empty()) {
+        let base_url = base_url.to_string();
+        let is_tls = base_url.trim_start().starts_with("https://");
         let key = std::env::var("HEARTBIT_OPENAI_API_KEY").unwrap_or_default();
-        let auth = if key.trim().is_empty() {
-            AuthStyle::None
-        } else {
+        // Bearer requires HTTPS (the provider rejects a key over plain http). A
+        // localhost proxy is `http://`, so a stray `HEARTBIT_OPENAI_API_KEY` in the
+        // environment must NOT force Bearer there — fall back to `AuthStyle::None`,
+        // which is what permits the non-TLS URL. Bearer only when both a key is
+        // present AND the endpoint is TLS (a real HTTPS API).
+        let auth = if !key.trim().is_empty() && is_tls {
             AuthStyle::Bearer
+        } else {
+            AuthStyle::None
         };
         let base = OpenAiCompatProvider::new(key, model, base_url, auth);
         return Ok(Arc::new(BoxedProvider::new(
@@ -524,6 +533,7 @@ fn default_sub_agents(
 /// provider, never into the tool environment (bash gets a no-secrets allowlist).
 #[allow(clippy::too_many_arguments)]
 async fn build_engine(
+    custom_endpoint: Option<String>,
     api_key: Option<String>,
     model: &str,
     ui_tx: UnboundedSender<Msg>,
@@ -583,7 +593,13 @@ async fn build_engine(
             },
         )
     };
-    let provider = build_provider(api_key.clone(), model, on_retry.clone(), prompt_caching)?;
+    let provider = build_provider(
+        custom_endpoint.as_deref(),
+        api_key.clone(),
+        model,
+        on_retry.clone(),
+        prompt_caching,
+    )?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -662,6 +678,9 @@ async fn build_engine(
         let main_model = model.to_string();
         let fast = fast_model.clone();
         let frontier = frontier_model.clone();
+        // A custom endpoint (e.g. the Codex proxy) is the ONLY provider this
+        // session has — sub-role models must target it too, not OpenRouter.
+        let custom_endpoint = custom_endpoint.clone();
         Arc::new(move |role: &str| {
             let resolved = match role {
                 "main" | "" => return Ok(main_provider.clone()),
@@ -672,8 +691,14 @@ async fn build_engine(
             if resolved == main_model {
                 return Ok(main_provider.clone());
             }
-            build_provider(api_key.clone(), &resolved, on_retry.clone(), true)
-                .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
+            build_provider(
+                custom_endpoint.as_deref(),
+                api_key.clone(),
+                &resolved,
+                on_retry.clone(),
+                true,
+            )
+            .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
         })
     };
     // Recipe-internal agents stream their events to the TRACE ONLY — not to
@@ -1135,6 +1160,7 @@ fn spawn_agent(
         context_recall: app.context_recall,
         verify_command: app.verify_command.clone(),
     });
+    let custom_endpoint = app.custom_endpoint.clone();
     let api_key = app.api_key.clone();
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
@@ -1170,6 +1196,7 @@ fn spawn_agent(
             .expect("agent runtime");
         rt.block_on(async move {
             match build_engine(
+                custom_endpoint,
                 api_key,
                 &model,
                 runner_tx,
