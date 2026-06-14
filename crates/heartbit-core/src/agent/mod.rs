@@ -12,6 +12,7 @@ pub mod dag;
 pub mod debate;
 mod deep_research;
 mod doom_loop;
+pub mod dual_llm;
 pub mod evaluator;
 pub mod events;
 pub mod flow;
@@ -38,6 +39,7 @@ pub mod tenant_tracker;
 mod tetris_live;
 pub mod token_estimator;
 pub mod tool_filter;
+pub mod verifier;
 pub mod voting;
 pub mod workflow;
 pub mod workflow_tool;
@@ -47,8 +49,10 @@ pub(crate) mod test_helpers;
 
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
+pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader};
 pub use interrupt::InterruptHandle;
 pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
+pub use verifier::{LlmVerifier, Selected, Verifier, select_best};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
 use crate::error::Error;
