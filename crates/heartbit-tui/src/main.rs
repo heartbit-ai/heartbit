@@ -865,6 +865,14 @@ async fn build_engine(
             summary_parts.join(" · ")
         }
     )));
+    // SECURITY: surface heartbit-core's lethal-trifecta check (Willison, Jun
+    // 2025) as a startup notice. When the agent's tools can simultaneously read
+    // private data, ingest untrusted content, AND communicate externally, an
+    // indirect prompt injection can exfiltrate the private data. (New capability
+    // from the 2026-frontier core.) Analyse BEFORE `tools` is moved below.
+    if let Some(warning) = heartbit_core::tool::analyze_tools(&tools).warning() {
+        let _ = ui_tx.send(Msg::Notice(format!("⚠ security — {warning}")));
+    }
     let mut builder = Orchestrator::builder(provider)
         .entry_agent(tools)
         .guardrail(scope_guard)
