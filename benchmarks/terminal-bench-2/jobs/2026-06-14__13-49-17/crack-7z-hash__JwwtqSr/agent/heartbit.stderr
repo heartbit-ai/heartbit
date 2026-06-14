@@ -1,0 +1,12 @@
+[2m2026-06-14T13:58:42.186872Z[0m [33m WARN[0m [2mheartbit_core::agent::builder[0m[2m:[0m LETHAL TRIFECTA: this agent can read private data ([bash, read, grep, glob, todoread]), ingest untrusted content ([bash, webfetch, websearch]), AND communicate externally ([bash, webfetch]) — an indirect prompt injection in the untrusted content can exfiltrate the private data. Break the trifecta (remove one leg), gate the exfiltration tools behind human approval, or run the untrusted-content path in a quarantined (no-tool) context. [3magent[0m[2m=[0morchestrator
+[2m2026-06-14T13:59:47.848064Z[0m [33m WARN[0m [1mheartbit.agent.run[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mmax_turns[0m[2m=[0m60[1m}[0m[2m:[0m[1mheartbit.agent.llm_call[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mturn[0m[2m=[0m14[1m}[0m[2m:[0m [2mheartbit_core::llm::retry[0m[2m:[0m retrying streaming LLM call after transient failure (streaming suppressed) [3mattempt[0m[2m=[0m1 [3mmax_retries[0m[2m=[0m3 [3mdelay_ms[0m[2m=[0m616 [3merror[0m[2m=[0mHTTP request failed: error decoding response body
+[2m2026-06-14T13:59:57.170047Z[0m [33m WARN[0m [1mheartbit.agent.run[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mmax_turns[0m[2m=[0m60[1m}[0m[2m:[0m[1mheartbit.agent.llm_call[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mturn[0m[2m=[0m14[1m}[0m[2m:[0m [2mheartbit_core::llm::retry[0m[2m:[0m retrying streaming LLM call after transient failure (streaming suppressed) [3mattempt[0m[2m=[0m2 [3mmax_retries[0m[2m=[0m3 [3mdelay_ms[0m[2m=[0m1235 [3merror[0m[2m=[0mHTTP request failed: error decoding response body
+[2m2026-06-14T14:00:01.333742Z[0m [33m WARN[0m [1mheartbit.agent.run[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mmax_turns[0m[2m=[0m60[1m}[0m[2m:[0m[1mheartbit.agent.llm_call[0m[1m{[0m[3magent[0m[2m=[0morchestrator [3mturn[0m[2m=[0m14[1m}[0m[2m:[0m [2mheartbit_core::llm::retry[0m[2m:[0m retrying streaming LLM call after transient failure (streaming suppressed) [3mattempt[0m[2m=[0m3 [3mmax_retries[0m[2m=[0m3 [3mdelay_ms[0m[2m=[0m4467 [3merror[0m[2m=[0mHTTP request failed: error decoding response body
+Error: HTTP request failed: error decoding response body
+
+Caused by:
+    0: HTTP request failed: error decoding response body
+    1: error decoding response body
+    2: request or response body error
+    3: error reading a body from connection
+    4: unexpected EOF during chunk size line

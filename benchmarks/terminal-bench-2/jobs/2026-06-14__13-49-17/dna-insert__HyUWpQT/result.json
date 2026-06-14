@@ -1,0 +1,120 @@
+{
+    "id": "d327c9fa-acd0-4213-850d-fc53dd694ed2",
+    "task_name": "terminal-bench/dna-insert",
+    "trial_name": "dna-insert__HyUWpQT",
+    "trial_uri": "file:///home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/jobs/2026-06-14__13-49-17/dna-insert__HyUWpQT",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "dna-insert",
+        "ref": "sha256:6e134a226ff852d8bf20f15480c7c1d74e3911d5b458f5cca07aabd23e380f0d"
+    },
+    "source": "terminal-bench/terminal-bench-2",
+    "task_checksum": "bb56a25f994ff659c356ba706a978e7367990b77de204be2b2113b6e86d6d04f",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/dna-insert",
+            "ref": "sha256:6e134a226ff852d8bf20f15480c7c1d74e3911d5b458f5cca07aabd23e380f0d",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2"
+        },
+        "trial_name": "dna-insert__HyUWpQT",
+        "trials_dir": "jobs/2026-06-14__13-49-17",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "heartbit_tb2.agent:HeartbitAgent",
+            "model_name": "codex/gpt-5.5",
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "env": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "env": {},
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "env": {},
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "f1cadb19-5807-4af5-ad9f-2c9ba28cd81c"
+    },
+    "agent_info": {
+        "name": "heartbit",
+        "version": "unknown",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": "codex"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 0,
+        "n_cache_tokens": 0,
+        "n_output_tokens": 0,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "model_name": "gpt-5.5",
+            "tool_calls_made": 13,
+            "goal_met": true,
+            "reasoning_tokens": 0,
+            "result_preview": "Done. Created `primers.fasta` with one primer pair.\n\nVerification:\n- Forward annealing segment Tm: `61.236660 °C`\n- Reverse annealing segment Tm: `61.310775 °C`\n- Tm difference: `< 5 °C`\n- Constructed plasmid matches desired output: `yes`\n- Minimum primer pairs used: `1`",
+            "source": "trace-file"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-06-14T14:00:43.991604Z",
+    "finished_at": "2026-06-14T14:03:18.419794Z",
+    "environment_setup": {
+        "started_at": "2026-06-14T14:00:43.995623Z",
+        "finished_at": "2026-06-14T14:00:48.395185Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-06-14T14:00:48.395226Z",
+        "finished_at": "2026-06-14T14:00:48.911981Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-06-14T14:00:48.912101Z",
+        "finished_at": "2026-06-14T14:02:51.979471Z"
+    },
+    "verifier": {
+        "started_at": "2026-06-14T14:02:52.512666Z",
+        "finished_at": "2026-06-14T14:03:06.778496Z"
+    },
+    "step_results": null
+}

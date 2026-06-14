@@ -1,0 +1,76 @@
+{
+    "schema_version": 1,
+    "created_at": "2026-06-14T13:25:01.156813Z",
+    "harbor": {
+        "version": "0.13.1",
+        "is_editable": false
+    },
+    "invocation": [
+        "/home/pleclech/.local/bin/harbor",
+        "run",
+        "-d",
+        "terminal-bench/terminal-bench-2",
+        "--agent-import-path",
+        "heartbit_tb2.agent:HeartbitAgent",
+        "-m",
+        "codex/gpt-5.5",
+        "-l",
+        "1",
+        "-n",
+        "1",
+        "--allow-agent-host",
+        "172.17.0.1"
+    ],
+    "n_concurrent_trials": 1,
+    "retry": {
+        "max_retries": 0,
+        "exclude_exceptions": [
+            "VerifierTimeoutError",
+            "RewardFileNotFoundError",
+            "RewardFileEmptyError",
+            "VerifierOutputParseError",
+            "AgentTimeoutError"
+        ],
+        "wait_multiplier": 1.0,
+        "min_wait_sec": 1.0,
+        "max_wait_sec": 60.0
+    },
+    "trials": [
+        {
+            "task": {
+                "name": "terminal-bench/make-mips-interpreter",
+                "type": "package",
+                "digest": "sha256:608e82ecd67ce469824a34181b580cbd0e1096cdfc05fe40edda3e6bfada9773",
+                "source": "terminal-bench/terminal-bench-2"
+            },
+            "timeout_multiplier": 1.0,
+            "agent": {
+                "import_path": "heartbit_tb2.agent:HeartbitAgent",
+                "model_name": "codex/gpt-5.5",
+                "skills": [],
+                "extra_allowed_hosts": [
+                    "172.17.0.1"
+                ],
+                "kwargs": {},
+                "env": {},
+                "mcp_servers": []
+            },
+            "skills": [],
+            "environment": {
+                "type": "docker",
+                "force_build": false,
+                "delete": true,
+                "cpu_enforcement_policy": "auto",
+                "memory_enforcement_policy": "auto",
+                "extra_docker_compose": [],
+                "env": {},
+                "kwargs": {},
+                "extra_allowed_hosts": []
+            },
+            "verifier": {
+                "env": {},
+                "disable": false
+            }
+        }
+    ]
+}

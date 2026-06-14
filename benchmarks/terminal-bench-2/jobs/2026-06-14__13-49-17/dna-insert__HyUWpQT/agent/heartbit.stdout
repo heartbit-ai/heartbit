@@ -1,0 +1,8 @@
+Done. Created `primers.fasta` with one primer pair.
+
+Verification:
+- Forward annealing segment Tm: `61.236660 °C`
+- Reverse annealing segment Tm: `61.310775 °C`
+- Tm difference: `< 5 °C`
+- Constructed plasmid matches desired output: `yes`
+- Minimum primer pairs used: `1`

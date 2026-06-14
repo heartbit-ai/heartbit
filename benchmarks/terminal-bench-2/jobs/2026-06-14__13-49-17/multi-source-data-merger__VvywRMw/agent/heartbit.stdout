@@ -1,0 +1,13 @@
+Done.
+
+Generated:
+- `/app/merged_users.parquet`
+- `/app/conflicts.json`
+
+Verified:
+- 4 unique users included: 101, 102, 103, 104
+- `user_id` is integer
+- dates are `YYYY-MM-DD`
+- source priority applied: `source_a > source_b > source_c`
+- conflict report has `total_conflicts: 3`, matching the conflict list length
+- output Parquet schema/contents were read back successfully.

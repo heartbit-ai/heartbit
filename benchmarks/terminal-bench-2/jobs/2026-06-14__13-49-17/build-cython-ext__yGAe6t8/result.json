@@ -1,0 +1,120 @@
+{
+    "id": "33eb85c3-ee93-4295-83d6-519db637baa7",
+    "task_name": "terminal-bench/build-cython-ext",
+    "trial_name": "build-cython-ext__yGAe6t8",
+    "trial_uri": "file:///home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/jobs/2026-06-14__13-49-17/build-cython-ext__yGAe6t8",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "build-cython-ext",
+        "ref": "sha256:38e42b5662bb3c6b8610d193d5ef1b47ee3a8f4bd07eb860ceaab17e9406a368"
+    },
+    "source": "terminal-bench/terminal-bench-2",
+    "task_checksum": "e81ab63bd394abcdaa5eeb6cfa8d2fb0ee9f15230a775898bcf17f19265d729a",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/build-cython-ext",
+            "ref": "sha256:38e42b5662bb3c6b8610d193d5ef1b47ee3a8f4bd07eb860ceaab17e9406a368",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2"
+        },
+        "trial_name": "build-cython-ext__yGAe6t8",
+        "trials_dir": "jobs/2026-06-14__13-49-17",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "heartbit_tb2.agent:HeartbitAgent",
+            "model_name": "codex/gpt-5.5",
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "env": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "env": {},
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "env": {},
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "f1cadb19-5807-4af5-ad9f-2c9ba28cd81c"
+    },
+    "agent_info": {
+        "name": "heartbit",
+        "version": "unknown",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": "codex"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 0,
+        "n_cache_tokens": 0,
+        "n_output_tokens": 0,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "model_name": "gpt-5.5",
+            "tool_calls_made": 23,
+            "goal_met": true,
+            "reasoning_tokens": 0,
+            "result_preview": "Completed with concrete metadata and structure-preservation evidence.\n\nKey outputs:\n\n```text\n### GIT_METADATA_START\npwd=/app/pyknotid\norigin=https://github.com/SPOCKnots/pyknotid.git\nhead=441c807dbec2ee32e1da572e24e58d52a4eb7afa\nhead_tags=0.5.3 \nis_shallow=true\nshallow_file_line_count=1\nshallow_file_contents=441c807dbec2ee32e1da572e24e58d52a4eb7afa\ncommit_count=1\n### GIT_METADATA_END\n```\n\nStructure preservation:\n\n```text\n### STRUCTURE_PRESERVATION_START\ngit_status_porcelain:\n M pyknotid/invarian",
+            "source": "trace-file"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-06-14T14:05:00.679988Z",
+    "finished_at": "2026-06-14T14:13:35.892054Z",
+    "environment_setup": {
+        "started_at": "2026-06-14T14:05:00.683675Z",
+        "finished_at": "2026-06-14T14:05:10.909573Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-06-14T14:05:10.909601Z",
+        "finished_at": "2026-06-14T14:05:11.280239Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-06-14T14:05:11.280302Z",
+        "finished_at": "2026-06-14T14:13:18.783726Z"
+    },
+    "verifier": {
+        "started_at": "2026-06-14T14:13:19.296364Z",
+        "finished_at": "2026-06-14T14:13:24.147569Z"
+    },
+    "step_results": null
+}

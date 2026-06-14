@@ -1,0 +1,118 @@
+{
+    "id": "24ee1a40-c93f-448e-84d0-411baa848020",
+    "task_name": "terminal-bench/extract-moves-from-video",
+    "trial_name": "extract-moves-from-video__MP423Y2",
+    "trial_uri": "file:///home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/jobs/2026-06-14__13-49-17/extract-moves-from-video__MP423Y2",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "extract-moves-from-video",
+        "ref": "sha256:e15a249c82f4068634a136c0641a09feed2c12947e051e6b3c48f21699ed27c5"
+    },
+    "source": "terminal-bench/terminal-bench-2",
+    "task_checksum": "4ce580cd8bb8c7d62760e5980d0b0c2c0e8125e55aecb86169ac23dffd0cc1f8",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/extract-moves-from-video",
+            "ref": "sha256:e15a249c82f4068634a136c0641a09feed2c12947e051e6b3c48f21699ed27c5",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2"
+        },
+        "trial_name": "extract-moves-from-video__MP423Y2",
+        "trials_dir": "jobs/2026-06-14__13-49-17",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "heartbit_tb2.agent:HeartbitAgent",
+            "model_name": "codex/gpt-5.5",
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "env": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "env": {},
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "env": {},
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "f1cadb19-5807-4af5-ad9f-2c9ba28cd81c"
+    },
+    "agent_info": {
+        "name": "heartbit",
+        "version": "unknown",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": "codex"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": null
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": {
+        "exception_type": "NonZeroAgentExitCodeError",
+        "exception_message": "Command failed (exit 1): /usr/local/bin/heartbit run --trace-file /logs/agent/heartbit-trace.json 'Download this video of someone playing zork. https://www.youtube.com/watch?v=ZCbvyPbhRfA. Then transcribe the entire contents of the text, and create a file /app/solution.txt that has all the moves they input, one per line, in the format '\"'\"'n'\"'\"' or '\"'\"'get bag'\"'\"' etc.\n' </dev/null >/logs/agent/heartbit.stdout 2>/logs/agent/heartbit.stderr\nstdout: None\nstderr: None",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/single_step.py\", line 63, in _run_agent\n    await self._run_agent_phase(\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 376, in _run_agent_phase\n    await asyncio.wait_for(\n  File \"/usr/lib/python3.12/asyncio/tasks.py\", line 520, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 39, in wrapper\n    return await fn(self, instruction, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/heartbit_tb2/agent.py\", line 193, in run\n    await self.exec_as_agent(\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 354, in exec_as_agent\n    return await self._exec(\n           ^^^^^^^^^^^^^^^^^\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 317, in _exec\n    raise NonZeroAgentExitCodeError(\nharbor.agents.installed.base.NonZeroAgentExitCodeError: Command failed (exit 1): /usr/local/bin/heartbit run --trace-file /logs/agent/heartbit-trace.json 'Download this video of someone playing zork. https://www.youtube.com/watch?v=ZCbvyPbhRfA. Then transcribe the entire contents of the text, and create a file /app/solution.txt that has all the moves they input, one per line, in the format '\"'\"'n'\"'\"' or '\"'\"'get bag'\"'\"' etc.\n' </dev/null >/logs/agent/heartbit.stdout 2>/logs/agent/heartbit.stderr\nstdout: None\nstderr: None\n",
+        "occurred_at": "2026-06-14T14:13:37.838023"
+    },
+    "started_at": "2026-06-14T14:12:47.923732Z",
+    "finished_at": "2026-06-14T14:14:05.106808Z",
+    "environment_setup": {
+        "started_at": "2026-06-14T14:12:47.927345Z",
+        "finished_at": "2026-06-14T14:12:50.635742Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-06-14T14:12:50.635777Z",
+        "finished_at": "2026-06-14T14:12:51.156469Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-06-14T14:12:51.156557Z",
+        "finished_at": "2026-06-14T14:13:37.837138Z"
+    },
+    "verifier": {
+        "started_at": "2026-06-14T14:13:38.408257Z",
+        "finished_at": "2026-06-14T14:13:53.531801Z"
+    },
+    "step_results": null
+}

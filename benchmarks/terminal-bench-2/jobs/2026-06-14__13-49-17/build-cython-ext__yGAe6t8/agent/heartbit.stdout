@@ -1,0 +1,280 @@
+Done.
+
+- Cloned `pyknotid` 0.5.3 to `/app/pyknotid`.
+- Fixed NumPy 2.x incompatibilities:
+  - Replaced removed `np.int`, `np.float`, `np.complex`, `np.bool` aliases.
+  - Fixed `fractions.gcd` removal by using `math.gcd`.
+  - Updated `setup.py` to import `Extension` from `setuptools`.
+  - Fixed Cython `ccomplexity.pyx` integer dtype for NumPy 2.3.0.
+- Installed build/runtime dependencies into the global Python environment.
+- Built and installed `pyknotid` globally with compiled Cython extensions.
+
+Verification completed:
+
+```text
+numpy 2.3.0
+pyknotid 0.5.3 /usr/local/lib/python3.13/site-packages/pyknotid/__init__.py
+chelpers /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/chelpers.cpython-313-x86_64-linux-gnu.so
+ccomplexity /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/ccomplexity.cpython-313-x86_64-linux-gnu.so
+cinvariants /usr/local/lib/python3.13/site-packages/pyknotid/cinvariants.cpython-313-x86_64-linux-gnu.so
+```
+
+The requested README snippet runs successfully with NumPy `2.3.0` and returns:
+
+```text
+alexander 6.999999999999998
+```
+
+Tests passed, excluding the requested files:
+
+```text
+python -m pytest tests --ignore=tests/test_random_curves.py --ignore=tests/test_catalogue.py -q
+18 passed in 1.30s
+```Completed and verified.
+
+Concrete evidence:
+
+- `/app/pyknotid` is from the requested remote:
+
+```text
+origin https://github.com/SPOCKnots/pyknotid.git
+```
+
+- It is at tag `0.5.3`:
+
+```text
+HEAD 441c807dbec2ee32e1da572e24e58d52a4eb7afa
+git tag --points-at HEAD
+0.5.3
+```
+
+- It is a shallow clone with depth 1:
+
+```text
+git rev-parse --is-shallow-repository
+true
+
+wc -l .git/shallow
+1 .git/shallow
+```
+
+- Global Python installation is active and imports compiled extensions from `site-packages`:
+
+```text
+python_executable /usr/local/bin/python
+numpy 2.3.0
+pyknotid 0.5.3 /usr/local/lib/python3.13/site-packages/pyknotid/__init__.py
+chelpers /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/chelpers.cpython-313-x86_64-linux-gnu.so
+ccomplexity /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/ccomplexity.cpython-313-x86_64-linux-gnu.so
+cinvariants /usr/local/lib/python3.13/site-packages/pyknotid/cinvariants.cpython-313-x86_64-linux-gnu.so
+```
+
+- README snippet runs successfully with NumPy `2.3.0`:
+
+```text
+alexander 6.999999999999998
+```
+
+- Tests pass excluding the two requested files:
+
+```text
+18 passed in 1.40s
+```
+
+- Original structure preserved:
+  - `git diff --summary` produced no moves, renames, deletes, or added files.
+  - `git diff --name-status` shows only modified tracked files (`M`).
+  - `git ls-files --others --exclude-standard` is empty, so no untracked build artifacts remain.
+  - The diff consists of compatibility/build fixes only: removed NumPy aliases, replaced `fractions.gcd`, and changed `setup.py`’s `Extension` import to `setuptools`.Completed the missing verification.
+
+Evidence now demonstrated:
+
+1. **Clone/ref/depth**
+   - Remote:
+
+   ```text
+   https://github.com/SPOCKnots/pyknotid.git
+   ```
+
+   - HEAD:
+
+   ```text
+   441c807dbec2ee32e1da572e24e58d52a4eb7afa
+   ```
+
+   - Tag at HEAD:
+
+   ```text
+   0.5.3
+   ```
+
+   - Shallow clone:
+
+   ```text
+   git rev-parse --is-shallow-repository
+   true
+
+   .git/shallow line count: 1
+   441c807dbec2ee32e1da572e24e58d52a4eb7afa
+   ```
+
+2. **Original structure preserved**
+   - `git diff --name-status` shows only `M` entries.
+   - `git diff --summary` is empty, meaning no creates/deletes/renames/mode changes.
+   - `git ls-files --others --exclude-standard` is empty, meaning no untracked build artifacts remain.
+
+3. **Complete git diff evidence**
+   - I printed the full `git diff` for every modified file.
+   - The only changes are compatibility/build edits:
+     - `np.int` / `n.int` → `int` or `np.int_`
+     - `np.float` / `n.float` → `float`
+     - `np.complex` / `n.complex` → `complex`
+     - `np.bool` / `n.bool` → `bool`
+     - `fractions.gcd` → `math.gcd`
+     - top-level `setup.py`: `distutils.extension.Extension` → `setuptools.Extension`
+
+   No package files were moved, deleted, renamed, or structurally reorganized.
+
+4. **Global install with compiled extensions**
+   Verified from outside `/app/pyknotid`:
+
+   ```text
+   python_executable /usr/local/bin/python
+   numpy 2.3.0
+   pyknotid 0.5.3 /usr/local/lib/python3.13/site-packages/pyknotid/__init__.py
+   chelpers /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/chelpers.cpython-313-x86_64-linux-gnu.so
+   ccomplexity /usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/ccomplexity.cpython-313-x86_64-linux-gnu.so
+   cinvariants /usr/local/lib/python3.13/site-packages/pyknotid/cinvariants.cpython-313-x86_64-linux-gnu.so
+   ```
+
+5. **README snippet**
+   Ran successfully with NumPy `2.3.0`:
+
+   ```text
+   alexander 6.999999999999998
+   ```
+
+6. **Tests**
+   Passed with the requested exclusions:
+
+   ```text
+   18 passed in 1.32s
+   ```Completed with concrete metadata and structure-preservation evidence.
+
+Key outputs:
+
+```text
+### GIT_METADATA_START
+pwd=/app/pyknotid
+origin=https://github.com/SPOCKnots/pyknotid.git
+head=441c807dbec2ee32e1da572e24e58d52a4eb7afa
+head_tags=0.5.3 
+is_shallow=true
+shallow_file_line_count=1
+shallow_file_contents=441c807dbec2ee32e1da572e24e58d52a4eb7afa
+commit_count=1
+### GIT_METADATA_END
+```
+
+Structure preservation:
+
+```text
+### STRUCTURE_PRESERVATION_START
+git_status_porcelain:
+ M pyknotid/invariants.py
+ M pyknotid/make/periodic_knot.py
+ M pyknotid/make/torus.py
+ M pyknotid/representations/dtnotation.py
+ M pyknotid/representations/gausscode.py
+ M pyknotid/representations/representation.py
+ M pyknotid/simplify/octree.py
+ M pyknotid/spacecurves/ccomplexity.pyx
+ M pyknotid/spacecurves/knot.py
+ M pyknotid/spacecurves/openknot.py
+ M pyknotid/spacecurves/periodiccell.py
+ M pyknotid/spacecurves/spacecurve.py
+ M setup.py
+
+git_diff_filter_added_copied_deleted_renamed_typechange_unmerged_unknown_broken:
+
+git_diff_summary:
+
+deleted_tracked_files:
+
+untracked_not_ignored_files:
+
+tracked_so_files_in_source_tree:
+
+untracked_so_files_in_source_tree:
+### STRUCTURE_PRESERVATION_END
+```
+
+This demonstrates:
+- only modified tracked files;
+- no added/copied/deleted/renamed/type-changed files;
+- no diff summary structural changes;
+- no deleted tracked files;
+- no untracked artifacts;
+- no `.so` artifacts left in the source tree.
+
+Compatibility/build diff evidence:
+
+```text
+changed_files_count_and_names:
+13
+...
+diff_numstat:
+2 2 pyknotid/invariants.py
+2 2 pyknotid/make/periodic_knot.py
+1 1 pyknotid/make/torus.py
+...
+1 1 setup.py
+
+git diff --check: OK
+```
+
+The removed lines are only legacy compatibility/build patterns:
+
+```text
+n.complex / n.float
+n.float
+from fractions import gcd
+n.int
+n.bool
+np.int
+np.float
+np.bool
+from distutils.extension import Extension
+```
+
+The added lines are only modern compatibility/build replacements:
+
+```text
+complex / float
+from math import gcd
+dtype=int
+dtype=float
+dtype=bool
+.astype(int)
+.astype(bool)
+np.int_
+from setuptools import Extension
+```
+
+Global install and compiled extension verification:
+
+```text
+python_executable=/usr/local/bin/python
+numpy_version=2.3.0
+pyknotid=0.5.3 file=/usr/local/lib/python3.13/site-packages/pyknotid/__init__.py
+chelpers_file=/usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/chelpers.cpython-313-x86_64-linux-gnu.so
+ccomplexity_file=/usr/local/lib/python3.13/site-packages/pyknotid/spacecurves/ccomplexity.cpython-313-x86_64-linux-gnu.so
+cinvariants_file=/usr/local/lib/python3.13/site-packages/pyknotid/cinvariants.cpython-313-x86_64-linux-gnu.so
+alexander=6.999999999999998
+```
+
+Tests:
+
+```text
+18 passed in 1.30s
+```

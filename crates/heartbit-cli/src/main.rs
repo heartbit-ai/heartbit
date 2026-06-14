@@ -48,7 +48,11 @@ struct Cli {
     command: Option<Commands>,
 
     /// Task to execute (when no subcommand is given)
-    #[arg(trailing_var_arg = true)]
+    // allow_hyphen_values: a task instruction may legitimately start with `-`
+    // (e.g. a bulleted "- You are given…" prompt). Without it clap parses the
+    // leading dash as an unknown flag and aborts with a usage error before the
+    // agent runs (live TB2 finding: pytorch-model-recovery crashed with exit 2).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     task: Vec<String>,
 }
 
@@ -57,7 +61,8 @@ enum Commands {
     /// Execute a task directly (standalone mode, no Restate)
     Run {
         /// The task to execute
-        #[arg(trailing_var_arg = true)]
+        // allow_hyphen_values so a `-`-prefixed instruction isn't parsed as a flag.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         task: Vec<String>,
         /// Require human approval before each tool execution round
         #[arg(long)]
