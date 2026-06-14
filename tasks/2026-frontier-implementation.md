@@ -31,5 +31,14 @@ Honest framing: this is ~8 substantial features (a multi-item roadmap). Deliveri
 
 37 new tests across the 9 code additions. The full CaMeL *capabilities interpreter* (provable IFC) is the research-grade extension beyond #10's Plan-Then-Execute skeleton — noted as future work.
 
+## WIRING HONESTY (critical — same "DEFINED-but-UNWIRED" class the 2026-06-13 audit flagged)
+Unit-green proves each module works in isolation; it does NOT prove the framework gained the live capability. Status of each:
+- **LIVE in runtime:** #1 trifecta — `analyze_tools` warns in `AgentRunnerBuilder::build()`.
+- **Opt-in library guards** (correct to ship un-installed — matches every existing guardrail; the caller adds them via `.guardrails(...)`): #3 `FunctionCallGuard`, #4 `CascadingGuardrail`, #6 `InjectionTool`/`InjectionRobustnessScorer` (eval helpers).
+- **Primitives / seams NOT yet wired into any runtime path (shelfware until integrated):** #2 `QuarantinedReader` (no untrusted-content path routes through it — webfetch/browser still feed the privileged loop), #10 `SecurePlanExecutor`/`PrivilegedPlanner` (no runtime uses it), #5 `Verifier`/`select_best` (no agent uses it), #7 `TrajectoryStore` (nothing records runs or injects `skill_hint` → the flywheel doesn't turn), #8 `LlmReranker` (recall never calls it).
+- No integration test and no live (non-mock) validation exists; "deep test" is satisfied at the UNIT level only.
+
+**Remaining phase (a fresh, focused session — do NOT ram into an exhausted context):** wire `Reranker` into knowledge/memory recall; route webfetch/browser untrusted content through `QuarantinedReader` (or a `flow` Plan-Then-Execute); record trajectories in the runner + inject `skill_hint`; expose a verified-best-of-N runner; then live-validate against AgentDojo/InjecAgent.
+
 ## Gate
 Full workspace: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -D warnings && cargo test --workspace`.
