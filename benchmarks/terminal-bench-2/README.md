@@ -150,6 +150,49 @@ The model id maps automatically: `anthropic/claude-haiku-4-5` →
 `HEARTBIT_PROVIDER=anthropic` + `HEARTBIT_MODEL=claude-haiku-4-5`, and the
 matching API key is forwarded from your shell env into the container.
 
+### Benchmarking the TUI "brain" (entry-agent orchestrator)
+
+By default the adapter runs the **bare single AgentRunner** (`heartbit run`). To
+benchmark the **unified entry-agent orchestrator** — the same "brain" the
+heartbit-tui drives (one capable agent that gathers, then delegates to a
+worker/researcher squad or runs a `parallel_review`/`deep_research` workflow,
+with the Cemri fan-out guidance and the high sub-agent turn budget) — set:
+
+```bash
+export HEARTBIT_ORCHESTRATOR=1            # -> heartbit run --orchestrator
+export HEARTBIT_SUB_AGENT_MAX_TURNS=200   # delegated-sub-agent budget (optional)
+```
+
+The adapter forwards both into the container. The intent router and lessons are
+intentionally NOT in this headless path (the router's CLARIFY/STUDY modes would
+make a no-user agent stall on a question it can't ask).
+
+### Running on a ChatGPT-subscription Codex proxy (gpt-5.5)
+
+Point heartbit at a local Codex→OpenAI-compatible proxy instead of an API key
+(see `docs/chatgpt-subscription.md`). The proxy must bind an interface the task
+containers can reach — bind the docker bridge (or `0.0.0.0`), not `127.0.0.1`:
+
+```bash
+npx openai-oauth --host 0.0.0.0 --port 10531      # reachable from containers
+export HEARTBIT_BASE_URL="http://172.17.0.1:10531/v1"   # docker0 gateway IP
+export HEARTBIT_ORCHESTRATOR=1
+harbor run -d terminal-bench/terminal-bench-2 \
+  --agent-import-path heartbit_tb2.agent:HeartbitAgent \
+  -m codex/gpt-5.5 -n 1
+```
+
+`-m codex/gpt-5.5` → provider `codex` (unknown to heartbit) + a base_url + NO
+key ⇒ `AuthStyle::None`, which is what permits the non-HTTPS gateway URL.
+
+> ⚠️ **Scale + ToS.** Driving a ChatGPT-subscription token outside Codex is a
+> likely ToS violation (ban risk). At 89 tasks × many turns the subscription
+> quota throttles and the token can expire mid-run — those become task failures
+> counted as *capability* failures. So a full-run number partly measures **proxy
+> reliability, not the agent**, and is non-reproducible by others. Use it for a
+> smoke / small subset; for a citable number use a real API key and report
+> "TUI-brain, model, N tasks, proxy-induced failures noted".
+
 ### Tunable env vars
 
 | Var | Default | Meaning |

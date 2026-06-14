@@ -80,9 +80,25 @@ def build_heartbit_env(
     if model:
         env["HEARTBIT_MODEL"] = model
 
-    # Optional OpenAI-compatible proxy base url (e.g. for a gateway).
+    # Optional OpenAI-compatible proxy base url (e.g. for a gateway or the
+    # ChatGPT-subscription Codex proxy). Pair with `-m codex/gpt-5.5`: provider
+    # "codex" is unknown to heartbit, so with a base_url and NO key it uses
+    # AuthStyle::None — which is what permits a non-HTTPS localhost/gateway URL.
     if "HEARTBIT_BASE_URL" in base_env:
         env["HEARTBIT_BASE_URL"] = base_env["HEARTBIT_BASE_URL"]
+
+    # Tuning vars forwarded verbatim when set on the host (Harbor merges this dict
+    # over the container env). HEARTBIT_ORCHESTRATOR=1 selects the entry-agent
+    # "brain" (heartbit-tui parity) over the bare single-agent path;
+    # HEARTBIT_SUB_AGENT_MAX_TURNS raises the delegated-sub-agent budget;
+    # HEARTBIT_API_KEY lets a keyed HTTPS endpoint override the no-key default.
+    for passthrough in (
+        "HEARTBIT_ORCHESTRATOR",
+        "HEARTBIT_SUB_AGENT_MAX_TURNS",
+        "HEARTBIT_API_KEY",
+    ):
+        if passthrough in base_env:
+            env[passthrough] = base_env[passthrough]
 
     env["HEARTBIT_WORKSPACE"] = workspace
     env["HEARTBIT_MAX_TURNS"] = str(max_turns)

@@ -65,6 +65,31 @@ def test_build_env_pins_provider_and_forwards_only_that_key():
     assert env["HEARTBIT_MAX_TURNS"] == "60"
 
 
+def test_build_env_codex_proxy_orchestrator_shape():
+    # Benchmark the TUI "brain" on a ChatGPT-subscription Codex proxy: provider
+    # "codex" is unknown to heartbit, so with a base_url and NO key it uses
+    # AuthStyle::None (the only style that permits an http:// gateway URL).
+    env = build_heartbit_env(
+        model_name="codex/gpt-5.5",
+        base_env={
+            "HEARTBIT_BASE_URL": "http://172.17.0.1:10531/v1",
+            "HEARTBIT_ORCHESTRATOR": "1",
+            "HEARTBIT_SUB_AGENT_MAX_TURNS": "200",
+            # A stray key for another provider must NOT leak to the codex run.
+            "ANTHROPIC_API_KEY": "sk-ant-should-not-leak",
+        },
+        workspace="/app",
+    )
+    assert env["HEARTBIT_PROVIDER"] == "codex"
+    assert env["HEARTBIT_MODEL"] == "gpt-5.5"
+    assert env["HEARTBIT_BASE_URL"] == "http://172.17.0.1:10531/v1"
+    assert env["HEARTBIT_ORCHESTRATOR"] == "1"
+    assert env["HEARTBIT_SUB_AGENT_MAX_TURNS"] == "200"
+    # No key for an unknown provider (AuthStyle::None over http).
+    assert "HEARTBIT_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 def test_build_env_no_prefix_forwards_available_keys_for_autodetect():
     env = build_heartbit_env(
         model_name="claude-haiku-4-5",
