@@ -70,6 +70,12 @@ enum Commands {
         /// and does not fail the run.
         #[arg(long)]
         trace_file: Option<PathBuf>,
+        /// Run the unified entry-agent ORCHESTRATOR (the TUI's "brain": one
+        /// capable agent that gathers, then delegates / runs workflows) instead
+        /// of the bare single AgentRunner. Headless parity with heartbit-tui for
+        /// benchmarking. Also enabled by `HEARTBIT_ORCHESTRATOR=1`. Env path only.
+        #[arg(long)]
+        orchestrator: bool,
     },
     /// Start the Restate-compatible HTTP worker
     #[cfg(feature = "restate")]
@@ -382,6 +388,7 @@ async fn main() -> Result<()> {
             approve,
             verbose,
             trace_file,
+            orchestrator,
         }) => {
             let task_str = task.join(" ");
             if task_str.is_empty() {
@@ -394,6 +401,7 @@ async fn main() -> Result<()> {
                 verbose,
                 cli.observability.as_deref(),
                 trace_file,
+                orchestrator,
             )
             .await
         }
@@ -502,12 +510,14 @@ async fn main() -> Result<()> {
                 false,
                 cli.observability.as_deref(),
                 None,
+                false,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_standalone(
     config_path: Option<&std::path::Path>,
     task: &str,
@@ -515,10 +525,21 @@ async fn run_standalone(
     verbose: bool,
     observability_flag: Option<&str>,
     trace_file: Option<PathBuf>,
+    orchestrator: bool,
 ) -> Result<()> {
     match config_path {
         Some(path) => run_from_config(path, task, approve, verbose, observability_flag).await,
-        None => run_from_env(task, approve, verbose, observability_flag, trace_file).await,
+        None => {
+            run_from_env(
+                task,
+                approve,
+                verbose,
+                observability_flag,
+                trace_file,
+                orchestrator,
+            )
+            .await
+        }
     }
 }
 
@@ -2235,6 +2256,7 @@ async fn run_from_env(
     verbose: bool,
     observability_flag: Option<&str>,
     trace_file: Option<PathBuf>,
+    orchestrator: bool,
 ) -> Result<()> {
     init_tracing();
     let mode = resolve_observability(observability_flag, None, verbose);
@@ -2257,16 +2279,40 @@ async fn run_from_env(
     let ws_root = default_workspace_root_path();
     let workspace_dir = provision_workspace(&ws_root);
 
-    let mut output = run_default_agent(
-        provider,
-        task,
-        on_text,
-        on_approval,
-        on_event,
-        mode,
-        workspace_dir,
-    )
-    .await?;
+    // The entry-agent orchestrator (TUI "brain") is opt-in via `--orchestrator`
+    // or `HEARTBIT_ORCHESTRATOR=1`; otherwise the bare single-agent path.
+    let use_orchestrator = orchestrator
+        || matches!(
+            std::env::var("HEARTBIT_ORCHESTRATOR")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true")
+        );
+
+    let mut output = if use_orchestrator {
+        run_entry_agent_orchestrator(
+            provider,
+            task,
+            on_text,
+            on_approval,
+            on_event,
+            mode,
+            workspace_dir,
+        )
+        .await?
+    } else {
+        run_default_agent(
+            provider,
+            task,
+            on_text,
+            on_approval,
+            on_event,
+            mode,
+            workspace_dir,
+        )
+        .await?
+    };
     output.estimated_cost_usd = heartbit::estimate_cost(&model, &output.tokens_used);
     // Headless-benchmark trace: serialize the final AgentOutput for the Harbor
     // adapter. The agent already did its work in the container, so a write
@@ -2520,6 +2566,160 @@ async fn run_default_agent(
     let runner = builder.build()?;
     let output = runner.execute(task).await?;
     Ok(output)
+}
+
+/// Headless turn budget for a delegated sub-agent (heartbit-tui parity:
+/// `SUB_AGENT_MAX_TURNS`). A broad audit/research delegation fans out into dozens
+/// of read/grep/bash turns; the bare-runner default of 50 starves it.
+const CLI_SUB_AGENT_MAX_TURNS: usize = 200;
+
+/// Build the headless 2-member squad (worker, researcher) the entry-agent
+/// orchestrator delegates to — mirrors heartbit-tui's `default_sub_agents`
+/// (distinct generalist roles, the high turn budget, scratch discipline). Each
+/// gets its OWN fresh builtins (own FileTracker/TodoStore).
+fn cli_default_sub_agents(
+    workspace_dir: &Option<PathBuf>,
+    noninteractive: bool,
+    max_turns: usize,
+) -> Vec<heartbit::SubAgentConfig> {
+    let make = |name: &str, description: &str, prompt: &str| {
+        let mut btc = BuiltinToolsConfig::default();
+        if !noninteractive {
+            btc.on_question = Some(question_callback());
+        }
+        btc.workspace = workspace_dir.clone();
+        btc.dangerous_tools = true;
+        heartbit::SubAgentConfig {
+            name: name.into(),
+            description: description.into(),
+            system_prompt: prompt.into(),
+            tools: builtin_tools(btc),
+            max_turns: Some(max_turns),
+            max_tokens: Some(8192),
+            ..Default::default()
+        }
+    };
+    vec![
+        make(
+            "worker",
+            "General implementation agent: reads, searches, edits, and runs code in the workspace. Use for concrete file changes, builds, tests, and command execution.",
+            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result. Return findings in your final message; write any working file under ./scratch, never the repo root.",
+        ),
+        make(
+            "researcher",
+            "Investigation agent: explores the codebase and gathers facts (search, read files, run read-only commands). Use to understand, locate, or analyze before changes.",
+            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked. For a read-only task write NO files; return everything in your final message.",
+        ),
+    ]
+}
+
+/// Run the unified entry-agent ORCHESTRATOR headless — the heartbit-tui "brain"
+/// (`build_engine`) minus the UI: ONE capable entry agent that gathers with its
+/// own tools, then delegates to the squad or runs a workflow recipe. Mirrors the
+/// four elements that drive the TUI's good behaviour: `entry_agent` +
+/// `run_workflow` (parallel fan-out) + the Cemri selection guidance + a high
+/// sub-agent turn budget.
+///
+/// Deliberately omitted vs. the TUI: the intent ROUTER (its CLARIFY/STUDY modes
+/// would make a headless agent ask questions it cannot — there is no user to
+/// answer), and lessons/advisor (secondary). If this path sticks, extract a
+/// shared `build_entry_orchestrator()` so it and `build_engine` don't diverge.
+async fn run_entry_agent_orchestrator(
+    provider: Arc<BoxedProvider>,
+    task: &str,
+    on_text: Arc<OnText>,
+    on_approval: Option<Arc<OnApproval>>,
+    on_event: Option<Arc<OnEvent>>,
+    observability_mode: ObservabilityMode,
+    workspace_dir: Option<PathBuf>,
+) -> Result<AgentOutput> {
+    let noninteractive =
+        noninteractive_enabled(std::env::var("HEARTBIT_NONINTERACTIVE").ok().as_deref());
+    let cwd = workspace_dir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_max_turns: usize = parse_env("HEARTBIT_MAX_TURNS").unwrap_or(300);
+    let sub_agent_max_turns: usize =
+        parse_env("HEARTBIT_SUB_AGENT_MAX_TURNS").unwrap_or(CLI_SUB_AGENT_MAX_TURNS);
+
+    // Entry agent's direct tools: builtins FIRST.
+    let mut tools = {
+        let mut btc = BuiltinToolsConfig::default();
+        if !noninteractive {
+            btc.on_question = Some(question_callback());
+        }
+        btc.workspace = workspace_dir.clone();
+        btc.dangerous_tools = true;
+        builtin_tools(btc)
+    };
+    if let Ok(servers) = std::env::var("HEARTBIT_MCP_SERVERS") {
+        let entries: Vec<McpServerEntry> = parse_csv_env(&servers)
+            .into_iter()
+            .map(McpServerEntry::Simple)
+            .collect();
+        tools.extend(load_mcp_tools("heartbit", &entries).await);
+    }
+
+    // run_workflow: the deterministic fan-out path (parallel_review, deep_research…)
+    // — the KEY element of the TUI brain (the good live audit fanned out through it).
+    let registry = heartbit::default_registry();
+    let recipe_meta = registry.meta();
+    let pf_provider = provider.clone();
+    let provider_factory: Arc<heartbit::ProviderFactory> =
+        Arc::new(move |_role: &str| Ok(pf_provider.clone()));
+    tools.push(Arc::new(
+        heartbit::RunWorkflowTool::new(registry, provider.clone())
+            .with_provider_factory(provider_factory)
+            .with_workspace(cwd.clone()),
+    ));
+
+    // Scope guard + set_scope (anti-drift; unseeded = no restriction).
+    let scope_guard = Arc::new(heartbit::ScopeGuard::new(vec![]));
+    tools.push(Arc::new(
+        heartbit::SetScopeTool::new(scope_guard.clone()).with_workspace(cwd.clone()),
+    ));
+
+    // Instructions = base + the Cemri orchestration-selection guidance, wired into
+    // the entry agent so it fans broad tasks out instead of overloading one
+    // sub-agent (the guidance is a public const that no prompt used before).
+    let instructions = format!(
+        "You are operating headless on a terminal task. Accomplish it end-to-end with \
+         your tools, then STOP with a concise final answer. Read before you edit; \
+         verify with the shell where possible.\n\n## When to delegate vs. fan out\n{}\n\
+         For a broad audit/survey/migration, split the work into several focused, \
+         INDEPENDENT sub-agent tasks (one per area/risk class) and delegate them \
+         together, or run a workflow recipe — don't hand one giant task to a single \
+         sub-agent. Write scratch files only under ./scratch, never the repo root.",
+        heartbit::MULTI_AGENT_SELECTION_GUIDANCE,
+    );
+
+    let mut builder = heartbit::Orchestrator::builder(provider.clone())
+        .entry_agent(tools)
+        .guardrail(scope_guard)
+        .entry_workflow_recipes(recipe_meta)
+        .max_turns(entry_max_turns)
+        .workspace(cwd.clone())
+        .instruction_text(instructions)
+        .on_text(on_text)
+        .observability_mode(observability_mode)
+        // Judge-gated completion: headless, the "fast" judge role = same provider.
+        .entry_goal_judge(provider)
+        // Doom-loop detection (same as the TUI): identical batches abort fast.
+        .max_identical_tool_calls(3)
+        .max_fuzzy_identical_tool_calls(5);
+    if let Some(cb) = on_approval {
+        builder = builder.on_approval(cb);
+    }
+    if let Some(cb) = on_event {
+        builder = builder.on_event(cb);
+    }
+    for cfg in cli_default_sub_agents(&workspace_dir, noninteractive, sub_agent_max_turns) {
+        builder = builder.sub_agent_full(cfg);
+    }
+
+    let mut orchestrator = builder.build()?;
+    orchestrator.run(task).await.map_err(Into::into)
 }
 
 /// Run an interactive chat session (REPL mode).
