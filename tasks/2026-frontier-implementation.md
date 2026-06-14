@@ -31,7 +31,16 @@ Honest framing: this is ~8 substantial features (a multi-item roadmap). Deliveri
 
 37 new tests across the 9 code additions. The full CaMeL *capabilities interpreter* (provable IFC) is the research-grade extension beyond #10's Plan-Then-Execute skeleton — noted as future work.
 
-## WIRING HONESTY (critical — same "DEFINED-but-UNWIRED" class the 2026-06-13 audit flagged)
+## WIRING — DONE (all primitives now have a live runtime path, each with an integration test)
+- #5 Verifier → **`VerifiedAgent`** (runnable best-of-N agent over real `AgentRunner`s + `select_best`).
+- #8 Reranker → **`RerankingKnowledgeBase`** (decorator: over-fetch → rerank → truncate; live `KnowledgeBase`).
+- #7 TrajectoryStore → **`run_with_experience`** (primes a task with `skill_hint`, runs a real runner, records the trajectory — flywheel closed).
+- #2 QuarantinedReader → **`QuarantinedToolWrapper`** (wrap any untrusted-content tool; raw output goes only to the tool-less reader, agent gets the extracted value).
+- #10 SecurePlanExecutor → **`execute_with_runner`** (trusted steps on a real `AgentRunner`, untrusted quarantined — the dual-LLM boundary in one call).
+Integration tests use real runners / KnowledgeBase / tools (not just isolated mocks). Workspace gate green (5375 tests).
+Remaining for true production-grade: LIVE (non-mock provider) validation against AgentDojo/InjecAgent + SWE-bench/GAIA — needs API keys + a harness run, out of scope for unit CI.
+
+## (historical) WIRING HONESTY — the gap this section recorded is now CLOSED above
 Unit-green proves each module works in isolation; it does NOT prove the framework gained the live capability. Status of each:
 - **LIVE in runtime:** #1 trifecta — `analyze_tools` warns in `AgentRunnerBuilder::build()`.
 - **Opt-in library guards** (correct to ship un-installed — matches every existing guardrail; the caller adds them via `.guardrails(...)`): #3 `FunctionCallGuard`, #4 `CascadingGuardrail`, #6 `InjectionTool`/`InjectionRobustnessScorer` (eval helpers).

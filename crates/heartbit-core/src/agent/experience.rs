@@ -135,6 +135,51 @@ impl TrajectoryStore {
     }
 }
 
+/// Run `runner` on `task` with the experience loop closed: prime the task with
+/// any learned [`skill_hint`](TrajectoryStore::skill_hint) from `store`
+/// (procedural memory from a similar past run), then record the resulting
+/// trajectory back into `store`. Each call can learn from prior successful ones —
+/// the self-improvement flywheel as a single runtime entry point.
+///
+/// A run is recorded as successful unless it errored or its goal judge returned
+/// `Some(false)`.
+pub async fn run_with_experience<P>(
+    runner: &super::AgentRunner<P>,
+    store: &TrajectoryStore,
+    task: &str,
+) -> Result<super::AgentOutput, crate::error::Error>
+where
+    P: crate::llm::LlmProvider + 'static,
+{
+    // Prime with a learned procedure for a similar past task, if any.
+    let primed = match store.skill_hint(task) {
+        Some(hint) => format!("{hint}\n\n---\nNow do this task:\n{task}"),
+        None => task.to_string(),
+    };
+    let output = runner.execute(&primed).await;
+    // Record the trajectory (using the ORIGINAL task for future similarity).
+    let trajectory = match &output {
+        Ok(o) => Trajectory {
+            task: task.to_string(),
+            actions: o
+                .tool_call_results
+                .iter()
+                .map(|r| r.tool_name.clone())
+                .collect(),
+            success: o.goal_met != Some(false),
+            result: o.result.clone(),
+        },
+        Err(_) => Trajectory {
+            task: task.to_string(),
+            actions: Vec::new(),
+            success: false,
+            result: String::new(),
+        },
+    };
+    store.record(trajectory);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +242,63 @@ mod tests {
         let store = TrajectoryStore::new(100);
         store.record(traj("bake a cake", &["mix"], true));
         assert!(store.skill_hint("debug a rust compiler error").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_with_experience_records_then_primes_next_run() {
+        use crate::agent::test_helpers::{MockProvider, make_agent};
+        use std::sync::Arc;
+
+        let store = TrajectoryStore::new(100);
+
+        // First run: no prior experience → task sent verbatim, then recorded.
+        let p1 = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "scraped the site",
+            5,
+            5,
+        )]));
+        let runner1 = make_agent(Arc::clone(&p1), "a");
+        run_with_experience(&runner1, &store, "scrape a website for prices")
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        // The first task was NOT primed (no prior experience). Scope the guard so
+        // it drops before the next await.
+        let user1 = {
+            let req1 = p1.captured_requests.lock().unwrap();
+            req1[0].messages[0]
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    crate::llm::types::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(!user1.contains("Learned procedure"));
+
+        // Second, similar run: the learned procedure primes the task.
+        let p2 = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "ok", 5, 5,
+        )]));
+        let runner2 = make_agent(Arc::clone(&p2), "b");
+        run_with_experience(&runner2, &store, "scrape a website for product data")
+            .await
+            .unwrap();
+        let req2 = p2.captured_requests.lock().unwrap();
+        let user2 = req2[0].messages[0]
+            .content
+            .iter()
+            .find_map(|b| match b {
+                crate::llm::types::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            user2.contains("Learned procedure"),
+            "the second similar run must be primed with the learned procedure: {user2}"
+        );
+        assert_eq!(store.len(), 2);
     }
 
     #[test]

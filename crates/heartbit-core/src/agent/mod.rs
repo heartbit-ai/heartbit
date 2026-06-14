@@ -41,6 +41,7 @@ pub mod tenant_tracker;
 mod tetris_live;
 pub mod token_estimator;
 pub mod tool_filter;
+pub mod verified;
 pub mod verifier;
 pub mod voting;
 pub mod workflow;
@@ -51,13 +52,14 @@ pub(crate) mod test_helpers;
 
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
-pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader};
-pub use experience::{Trajectory, TrajectoryStore, distill_procedure};
+pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader, QuarantinedToolWrapper};
+pub use experience::{Trajectory, TrajectoryStore, distill_procedure, run_with_experience};
 pub use interrupt::InterruptHandle;
 pub use plan_execute::{
     PlanStep, PrivilegedPlanner, SecurePlan, SecurePlanExecutor, StepTrust, parse_plan,
 };
 pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
+pub use verified::{VerifiedAgent, VerifiedAgentBuilder, VerifiedResult};
 pub use verifier::{LlmVerifier, Selected, Verifier, select_best};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
