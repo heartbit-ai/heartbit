@@ -41,9 +41,9 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
-    AgentEvent, ApprovalDecision, BoxedProvider, InterruptHandle, OnApproval, OnEvent, OnInput,
-    OnText, OpenRouterProvider, Orchestrator, PermissionAction, PermissionRule, PermissionRuleset,
-    RetryingProvider, SubAgentConfig,
+    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
+    OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator, PermissionAction,
+    PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -213,6 +213,13 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let has_anthropic = std::env::var("ANTHROPIC_API_KEY")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    // A custom OpenAI-compatible endpoint (e.g. a ChatGPT-subscription Codex
+    // proxy, a local model, or the real OpenAI API) is a complete provider on its
+    // own — no OpenRouter key needed, so the agent may spawn.
+    let has_custom_endpoint = std::env::var("HEARTBIT_OPENAI_BASE_URL")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_fallback = has_anthropic || has_custom_endpoint;
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let input_rx = Arc::new(Mutex::new(input_rx));
@@ -220,7 +227,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
 
     let mut app = App::new(model);
     app.api_key = api_key;
-    app.has_fallback_provider = has_anthropic;
+    app.has_fallback_provider = has_fallback;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
@@ -253,8 +260,18 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     {
         app.history.push(Cell::Notice(notice));
     }
+    // Custom OpenAI-compatible endpoint in use: tell the user (and remind them to
+    // set the matching model with /model — the default is an OpenRouter id).
+    if has_custom_endpoint {
+        let url = std::env::var("HEARTBIT_OPENAI_BASE_URL").unwrap_or_default();
+        app.history.push(Cell::Notice(format!(
+            "custom OpenAI-compatible endpoint: {url} — set the model with /model \
+             (e.g. gpt-5-codex for a ChatGPT-subscription Codex proxy). This takes \
+             priority over OpenRouter."
+        )));
+    }
     // No provider configured at all → open the key prompt immediately.
-    if app.api_key.is_none() && !has_anthropic {
+    if app.api_key.is_none() && !has_fallback {
         app.modal = Some(app::Modal::KeyEntry(app::KeyEntryModal::default()));
     }
 
@@ -327,6 +344,27 @@ fn build_provider(
     on_retry: Arc<heartbit_core::OnRetry>,
     prompt_caching: bool,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
+    // Custom OpenAI-compatible endpoint (`HEARTBIT_OPENAI_BASE_URL`). Takes
+    // PRIORITY over OpenRouter so the same config can target: a local model
+    // (Ollama / vLLM / LM Studio), the real OpenAI API, OR a localhost proxy that
+    // bridges a ChatGPT-subscription Codex token to OpenAI-compatible requests
+    // (so the agent runs on the subscription's quota — see docs/chatgpt-subscription.md).
+    // A key present ⇒ Bearer over HTTPS (real API); no key ⇒ AuthStyle::None,
+    // which is what permits a non-HTTPS localhost base_url (the Codex proxy).
+    if let Ok(base_url) = std::env::var("HEARTBIT_OPENAI_BASE_URL")
+        && !base_url.trim().is_empty()
+    {
+        let key = std::env::var("HEARTBIT_OPENAI_API_KEY").unwrap_or_default();
+        let auth = if key.trim().is_empty() {
+            AuthStyle::None
+        } else {
+            AuthStyle::Bearer
+        };
+        let base = OpenAiCompatProvider::new(key, model, base_url, auth);
+        return Ok(Arc::new(BoxedProvider::new(
+            RetryingProvider::with_defaults(base).with_on_retry(on_retry),
+        )));
+    }
     if let Some(key) = openrouter_key {
         // Prompt caching (default ON): cache_control breakpoints land on the
         // system prompt + conversation prefix. Qwen/Anthropic/Gemini routes
