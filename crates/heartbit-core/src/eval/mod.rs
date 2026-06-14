@@ -38,6 +38,9 @@ pub const KNOWN_SCORERS: &[&str] = &[
     "safety",
 ];
 
+pub mod injection;
+pub use injection::{InjectionRobustnessScorer, InjectionTool};
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
