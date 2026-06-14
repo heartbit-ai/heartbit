@@ -268,8 +268,8 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     if let Some(url) = app.custom_endpoint.clone() {
         app.history.push(Cell::Notice(format!(
             "custom OpenAI-compatible endpoint: {url} — set the model with /model \
-             (e.g. gpt-5-codex for a ChatGPT-subscription Codex proxy). This takes \
-             priority over OpenRouter."
+             (e.g. gpt-5.5 for a ChatGPT-subscription Codex proxy; check its \
+             /v1/models). This takes priority over OpenRouter."
         )));
     }
     // No provider configured at all → open the key prompt immediately.

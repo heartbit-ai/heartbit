@@ -54,16 +54,26 @@ This writes `~/.codex/auth.json`. Treat that file like a password.
 
 ### 2. Run a local Codex → OpenAI-compatible proxy
 
-Pick a maintained proxy (it tracks the changing Codex wire format so you don't
-have to):
+Use [`EvanZhouDev/openai-oauth`](https://github.com/EvanZhouDev/openai-oauth) — a
+Node localhost proxy that auto-reads `~/.codex/auth.json` and **defaults to exactly
+the port/URL `/codex` expects**. No build step:
 
-- [`Securiteru/codex-openai-proxy`](https://github.com/Securiteru/codex-openai-proxy)
-  — built for "use a ChatGPT Plus token via OpenAI API compatibility".
-- [`EvanZhouDev/openai-oauth`](https://github.com/EvanZhouDev/openai-oauth) —
-  localhost proxy pre-authenticated from `~/.codex/auth.json`.
+```bash
+npx openai-oauth                    # listens on http://127.0.0.1:10531/v1
+```
 
-Follow that project's README to start it; note the port (e.g. `10531`). You'll
-get an endpoint like `http://127.0.0.1:10531/v1`.
+It prints the discovered model set, e.g.:
+
+```
+OpenAI-compatible endpoint ready at http://127.0.0.1:10531/v1
+Available Models: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark, codex-auto-review
+```
+
+Keep this running in its own terminal. The model ids are **account/version-
+dependent** — list the live set any time with
+`curl -s http://127.0.0.1:10531/v1/models`. (Alternative: the Rust
+[`Securiteru/codex-openai-proxy`](https://github.com/Securiteru/codex-openai-proxy)
+— `cargo build --release`, default port 8080, geared toward ngrok/VS Code.)
 
 ### 3. Point the heartbit TUI at the proxy
 
@@ -76,7 +86,7 @@ Start the TUI, then run:
 ```
 
 That single command points the engine at the default proxy URL
-(`http://127.0.0.1:10531/v1`), switches the model to `gpt-5-codex`, and respawns
+(`http://127.0.0.1:10531/v1`), switches the model to `gpt-5.5`, and respawns
 the agent — all at once. Pass a URL to override the port
 (`/codex http://127.0.0.1:8080/v1`), and `/codex off` reverts to your normal
 provider. It prints the ToS caveat and warns if `~/.codex/auth.json` is missing.
@@ -105,11 +115,14 @@ On startup the TUI prints a notice confirming the custom endpoint. Then set the
 model to one the Codex backend exposes:
 
 ```
-/model gpt-5-codex
+/model gpt-5.5
 ```
 
 (Use whatever model id the proxy advertises — the Codex backend exposes its own
-model set, not the full OpenAI catalogue. Check the proxy's `/v1/models`.)
+model set, not the full OpenAI catalogue. List it with
+`curl -s http://127.0.0.1:10531/v1/models`. Note `gpt-5-codex` is **not** a valid
+id and returns `Bad Request`; the current set is `gpt-5.5`, `gpt-5.4`,
+`gpt-5.4-mini`, `gpt-5.3-codex-spark`, `codex-auto-review`.)
 
 ## Notes & troubleshooting
 

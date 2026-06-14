@@ -1523,10 +1523,13 @@ impl App {
         self.custom_endpoint = Some(url.clone());
         // A custom endpoint IS a provider — let a no-OpenRouter-key session start.
         self.has_fallback_provider = true;
-        // The Codex backend exposes its own (coding-tuned) model set. SESSION-ONLY:
-        // deliberately NOT persisted (no `SaveModel`) — a Codex model id written to
-        // the config would brick the next launch when the proxy is gone.
-        self.model = "gpt-5-codex".to_string();
+        // The Codex backend exposes its own model set (discovered live, account/
+        // version-dependent — e.g. gpt-5.5, gpt-5.4, gpt-5.4-mini). `gpt-5.5` is the
+        // current flagship default; switch with `/model <id>` (check the proxy's
+        // `/v1/models`). SESSION-ONLY: deliberately NOT persisted (no `SaveModel`) —
+        // a model id written to config would brick the next launch when the proxy
+        // is gone.
+        self.model = "gpt-5.5".to_string();
         // Best-effort: warn (don't block) if the Codex login token is absent — the
         // proxy needs `~/.codex/auth.json` (run `codex login`). Advisory only, so
         // the reducer stays testable (it never depends on this file existing).
@@ -1536,7 +1539,8 @@ impl App {
             .unwrap_or(false);
         let when = self.queue_respawn();
         let mut notice = format!(
-            "codex endpoint → {url} · model gpt-5-codex — {when}. \
+            "codex endpoint → {url} · model gpt-5.5 — {when}. \
+             (switch with /model <id> — see the proxy's /v1/models.) \
              ⚠ subscription-token use outside Codex risks a ToS ban (see \
              docs/chatgpt-subscription.md); start the local proxy first."
         );
@@ -2355,7 +2359,7 @@ mod tests {
             Some("http://127.0.0.1:10531/v1"),
             "bare /codex uses the default proxy URL"
         );
-        assert_eq!(app.model, "gpt-5-codex");
+        assert_eq!(app.model, "gpt-5.5");
         assert!(app.has_fallback_provider, "a custom endpoint IS a provider");
         // SESSION-ONLY: the Codex model id must NOT be persisted (it would brick
         // the next cold start once the proxy is gone).
@@ -2382,7 +2386,7 @@ mod tests {
             app.custom_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/v1")
         );
-        assert_eq!(app.model, "gpt-5-codex");
+        assert_eq!(app.model, "gpt-5.5");
 
         typed(&mut app, "/codex off");
         app.update(key(KeyCode::Enter));
