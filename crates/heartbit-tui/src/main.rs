@@ -526,12 +526,12 @@ fn default_sub_agents(
         make(
             app::DEFAULT_SQUAD[0],
             "General implementation agent: reads, searches, edits, and runs code in the workspace. Use for concrete file changes, builds, tests, and command execution.",
-            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result.",
+            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result. Return your findings in your final message — do NOT write scratch/coordination files in the repo; if you genuinely need a working file, put it under ./scratch (gitignored), never the repo root.",
         ),
         make(
             app::DEFAULT_SQUAD[1],
             "Investigation agent: explores the codebase and gathers facts (search, read files, run read-only commands). Use to understand, locate, or analyze before changes.",
-            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked.",
+            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked. For a read-only task, do not write ANY files (no scratchpad/blackboard in the repo): return everything in your final message; if a working file is truly needed, put it under ./scratch (gitignored), never the repo root.",
         ),
     ]
 }
@@ -939,6 +939,20 @@ async fn build_engine(
         }
         None => instructions,
     };
+    // Orchestration-selection guidance (Cemri et al. 2503.13657). The entry agent
+    // decides whether to fan out; this is exactly the "decompose a broad task into
+    // INDEPENDENT parallel sub-agent tasks, don't hand one giant task to one
+    // sub-agent" advice. It lived in core as a public const but was wired into NO
+    // prompt (shelfware) — a live audit run gave the whole investigation to a
+    // single researcher, which then died at its turn cap. Inject it here so the
+    // entry agent actually sees it.
+    let instructions = format!(
+        "{instructions}\n\n## When to delegate vs. fan out\n{}\n\
+         For a broad audit/survey/migration, split the work into several focused, \
+         INDEPENDENT sub-agent tasks (e.g. one per area or risk class) and delegate \
+         them together, rather than one large task to a single sub-agent.",
+        heartbit_core::MULTI_AGENT_SELECTION_GUIDANCE,
+    );
     // ONE compact startup line instead of the old five-notice wall (campaign
     // round-1 frame evidence). Failures above stay as their own loud notices.
     let _ = ui_tx.send(Msg::Notice(format!(
@@ -1888,11 +1902,14 @@ mod sub_agent_config_tests {
                 "{} must carry the high sub-agent turn budget",
                 a.name
             );
+            // Floor check via the runtime value (not the const) so it stays well
+            // above the old 60-turn cap that killed the audit's researcher.
+            assert!(
+                a.max_turns.unwrap() >= 200,
+                "{} sub-agent budget must stay >= 200 (old cap 60 failed)",
+                a.name
+            );
         }
-        assert!(
-            SUB_AGENT_MAX_TURNS >= 200,
-            "the sub-agent budget must stay well above the old 60-turn cap"
-        );
     }
 }
 
