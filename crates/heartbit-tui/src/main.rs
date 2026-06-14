@@ -54,6 +54,18 @@ use crate::msg::{Msg, PendingTool};
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
 
+/// Process-global experience store (new 2026-frontier core): records each
+/// completed conversation as a trajectory and recalls a learned procedure to
+/// prime a later similar request — the self-improvement flywheel, without
+/// threading state through the agent-spawn machinery. Single-process TUI, so a
+/// `OnceLock` is the natural home; lives for the session.
+static TRAJECTORY_STORE: std::sync::OnceLock<Arc<heartbit_core::agent::TrajectoryStore>> =
+    std::sync::OnceLock::new();
+
+fn trajectory_store() -> &'static Arc<heartbit_core::agent::TrajectoryStore> {
+    TRAJECTORY_STORE.get_or_init(|| Arc::new(heartbit_core::agent::TrajectoryStore::new(200)))
+}
+
 /// Warning notice when `HEARTBIT_MODEL` is set: the env var has higher
 /// precedence than the config, so `/model` changes are silently ignored until
 /// it is unset (live-finding footgun). Pure for testing; the caller passes the
@@ -354,10 +366,11 @@ fn build_provider(
 struct Engine(Box<Orchestrator<BoxedProvider>>);
 
 impl Engine {
-    /// Run the (multi-turn) session, starting with `first`.
-    async fn run(&mut self, first: &str) -> anyhow::Result<()> {
-        self.0.run(first).await?;
-        Ok(())
+    /// Run the (multi-turn) session, starting with `first`. Returns the final
+    /// [`AgentOutput`](heartbit_core::AgentOutput) so the caller can record it
+    /// (e.g. into the experience store).
+    async fn run(&mut self, first: &str) -> anyhow::Result<heartbit_core::AgentOutput> {
+        Ok(self.0.run(first).await?)
     }
 }
 
@@ -1149,7 +1162,33 @@ fn spawn_agent(
                     let first = input_rx.lock().await.recv().await;
                     agent_parked.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(first) = first {
-                        let _ = engine.run(&first).await;
+                        // Experience flywheel (new core): prime the request with a
+                        // learned procedure from a similar SUCCESSFUL conversation
+                        // earlier this session, then record this run. Empty store
+                        // (fresh session) → no priming → identical behaviour, so
+                        // this is purely additive. The prime is invisible to the
+                        // UI (which already shows the user's typed message); only
+                        // the agent sees it.
+                        let store = trajectory_store();
+                        let primed = match store.skill_hint(&first) {
+                            Some(hint) => {
+                                format!("{hint}\n\n---\nNow handle this request:\n{first}")
+                            }
+                            None => first.clone(),
+                        };
+                        let result = engine.run(&primed).await;
+                        if let Ok(output) = &result {
+                            store.record(heartbit_core::agent::Trajectory {
+                                task: first.clone(),
+                                actions: output
+                                    .tool_call_results
+                                    .iter()
+                                    .map(|r| r.tool_name.clone())
+                                    .collect(),
+                                success: output.goal_met != Some(false),
+                                result: output.result.clone(),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
