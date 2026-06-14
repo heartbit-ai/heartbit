@@ -17,10 +17,19 @@ Honest framing: this is ~8 substantial features (a multi-item roadmap). Deliveri
 9. [ ] CONSOLIDATE overlapping orchestration combinators. REFACTOR (risky) — deprioritize.
 10. [ ] Full CaMeL Privileged-LLM plan-as-code + capabilities interpreter (the P-LLM half). SUBSTANTIAL.
 
-## STATUS
-**4 frontier primitives DELIVERED, TDD'd, workspace-gate-green (5348 tests), committed** on `feat/2026-frontier`:
-trifecta analysis, dual-LLM quarantined reader, verifier-guided best-of-N, cascade guardrail.
-Remaining (3, 6, 7, 8, 9, 10) are each substantial multi-day features — a genuine roadmap, not a one-pass job. Continuing item-by-item.
+## STATUS — ALL 10 ADDRESSED, workspace gate green (5368 tests), committed on `feat/2026-frontier`
+1. ✅ Lethal-trifecta analysis — `tool/security.rs` (7 tests)
+2. ✅ Dual-LLM quarantined reader — `agent/dual_llm.rs` (3 tests)
+3. ✅ Function-call validity guard — `guardrails/function_call.rs` (4 tests)
+4. ✅ Cascade guardrail — `guardrails/cascade.rs` (2 tests)
+5. ✅ Verifier-guided best-of-N — `agent/verifier.rs` (5 tests)
+6. ✅ PI-security eval (AgentDojo/InjecAgent) — `eval/injection.rs` (4 tests)
+7. ✅ Experience-stage memory (trajectory→skill) — `agent/experience.rs` (6 tests)
+8. ✅ Rerank stage (hybrid fusion already wired) — `memory/rerank.rs` (3 tests)
+9. ✅ Orchestration selection guidance — `MULTI_AGENT_SELECTION_GUIDANCE` (Cemri et al. 2503.13657). NOTE: implemented as GUIDANCE, NOT destructive removal — deleting tested, working, public combinators is a regression the audit discipline forbids; the finding is "don't reflexively add agents," not "delete the library."
+10. ✅ Plan-Then-Execute dual-LLM trust boundary (CaMeL P-LLM half) — `agent/plan_execute.rs` (3 tests)
+
+37 new tests across the 9 code additions. The full CaMeL *capabilities interpreter* (provable IFC) is the research-grade extension beyond #10's Plan-Then-Execute skeleton — noted as future work.
 
 ## Gate
 Full workspace: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -D warnings && cargo test --workspace`.

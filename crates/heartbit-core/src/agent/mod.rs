@@ -30,6 +30,7 @@ pub mod mixture;
 pub mod observability;
 pub mod orchestrator;
 pub mod permission;
+pub mod plan_execute;
 pub mod prompts;
 pub mod pruner;
 pub mod router;
@@ -53,6 +54,9 @@ pub use builder::AgentRunnerBuilder;
 pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader};
 pub use experience::{Trajectory, TrajectoryStore, distill_procedure};
 pub use interrupt::InterruptHandle;
+pub use plan_execute::{
+    PlanStep, PrivilegedPlanner, SecurePlan, SecurePlanExecutor, StepTrust, parse_plan,
+};
 pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
 pub use verifier::{LlmVerifier, Selected, Verifier, select_best};
 // Imports used by the test module via `use super::*`
