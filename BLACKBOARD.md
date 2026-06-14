@@ -1,75 +1,37 @@
 # Blackboard
 
+## agent:worker
+
+### Vérification non destructive — Option B (2026-06-14)
+
+Commandes lancées depuis la racine du dépôt, sans correction ni modification de fichiers source/config :
+
+1. `cargo fmt -- --check`
+   - Statut exit : 0
+   - Durée : real ~1.861s
+   - Diagnostics significatifs : aucun warning/erreur affiché.
+
+2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   - Statut exit : 0
+   - Durée : real ~43.308s (`Finished ... in 43.13s`).
+   - Diagnostics significatifs : aucun warning/erreur final.
+
+3. `cargo test --workspace --all-features`
+   - Statut exit : 0
+   - Durée : real ~2m12.012s.
+   - Diagnostics significatifs : warnings Cargo de collisions de noms de sortie pour plusieurs examples (`custom_tool`, `eval`, `guardrails`, `hello_agent`, `mcp_agent`, `memory`, `multi_agent`, `simple_agent`) entre les packages `heartbit-core` et `heartbit`; note Cargo indique que cela pourrait devenir une erreur future (cargo issue #6313). Tests et doctests visibles terminés avec succès, notamment bloc final `heartbit-tui`: 299 passed, 0 failed; doctests `heartbit`, `heartbit_core`, `heartbit_ghost`, `heartbit_macro`, `heartbit_sensors`, `heartbit_telegram` OK avec quelques doctests ignorés.
+
+Aucune commande demandée n'a échoué ni été impossible à exécuter. Aucun correctif appliqué.
+
 ## agent:researcher
 
-### TERMINÉ — Rapport complet généré
+### TERMINÉ — audit statique Option B non destructif
 
-## Résumé de l'Investigation — Projet Heartbit
-
-**IDENTITÉ:**
-- Runtime multi-agents entreprise en Rust (v2026.507.4)
-- 9 crates + 1 app WIP (mini-crm)
-- 3 chemins d'exécution: standalone, durable, daemon
-- Protocoles MCP + A2A implémentés
-
-**STRUCTURE:**
-- `heartbit-core` (framework principal) — 18 builtins, providers LLM, mémoire hybride
-- `heartbit` (runtime umbrella) — daemon Kafka/Axum, auth JWT, channels Telegram/Discord/Slack
-- `heartbit-cli` (binaire) — commandes run/daemon/chat
-- `heartbit-ghost` (agent Twitter/X autonome) — pipeline contenu complet
-- `heartbit-sensors` (pipeline ingestion) — 7 sources (audio, email, RSS, webhook...)
-- `heartbit-gateway` (point d'entrée) — cron + sensors → Kafka
-- `heartbit-telegram` (bridge) — intégration Telegram bot
-- `heartbit-tui` (interface terminal) — ratatui + crossterm
-- `heartbit-macro` (proc macros) — #[tool] attribute
-- `mini-crm` (démo WIP) — exclu quality gate
-
-**COMPILATION:**
-❌ ÉCHEC — heartbit-tui (2 erreurs E0004)
-  → `crates/heartbit-tui/src/app.rs:355` — modal HistorySearch non géré
-  → `crates/heartbit-tui/src/ui.rs:192` — modal HistorySearch non géré
-⚠️ warnings mini-crm (non-bloquant, hors gate)
-✅ Autres crates OK
-
-**QUALITY GATE REQUIS:**
-```bash
-cargo fmt --check && cargo clippy -- -D warnings && cargo test
-```
-Actuellement bloqué par erreurs heartbit-tui
-
-**FICHIERS DE CONTEXTE:**
-- `AGENTS.md` — Instructions agents IA (complet)
-- `CLAUDE.md` — Instructions Claude (TDD mandatory)
-- `README.md`, `CHANGELOG.md`, `IMPLEMENTATION_SUMMARY.md`
-- `book/` (documentation utilisateur mdBook)
-- `docs/` (plans techniques + specs design)
-- `tasks/` (12 plans actifs)
-- `tests/` (25+ scripts E2E bash)
-
-**DÉPENDANCES CLÉS:**
-- tokio 1.49 (async runtime)
-- reqwest 0.12 (HTTP client)
-- serde/serde_json 1.0 (sérialisation)
-- sqlx 0.8 + pgvector 0.4 (PostgreSQL)
-- rdkafka 0.37 (Apache Kafka)
-- axum 0.8 (HTTP framework)
-- a2a-sdk 0.7 (Agent-to-Agent)
-- teloxide 0.17 (Telegram bot)
-- opentelemetry 0.28 (observabilité)
-
-## Actions Requises
-
-🔴 IMMÉDIAT (bloquant):
-1. Corriger `crates/heartbit-tui/src/app.rs:355` — ajouter case pour `Modal::HistorySearch(_)`
-2. Corriger `crates/heartbit-tui/src/ui.rs:192` — ajouter case pour `Modal::HistorySearch(_)`
-3. Valider avec: `cargo check -p heartbit-tui`
-
-🟡 RECOMMANDÉ:
-4. Nettoyer mini-crm (code non utilisé, optionnel)
-5. Exécuter tests complets pour vérifier intégrité
-
-🟢 OPTIONNEL:
-6. Mettre à jour IMPLEMENTATION_SUMMARY.md
-7. Revoir AGENTS.md pour cohérence
-
-RAPPORT COMPLET disponible en réponse textuelle ci-dessus.
+Résumé final:
+- Aucun secret de production évident détecté par recherche statique; constats prudents sur identifiants de dev/exemple faibles dans `daemon-dev.toml`, `telegram-test.toml`, `docker-compose*.yml`.
+- Risque principal: daemon HTTP peut exposer routes sensibles si aucun `HEARTBIT_API_KEY`/`[daemon.auth].bearer_tokens`/JWKS n'est configuré; le code log seulement un avertissement et merge les routes protégées. Références: `crates/heartbit-cli/src/daemon/mod.rs:1091-1105`, `1244-1261`, `1282-1290`.
+- Metrics daemon publiques/non authentifiées: `/v1/metrics` dans routes publiques (`crates/heartbit-cli/src/daemon/mod.rs:1244-1248`), handler Prometheus (`crates/heartbit-cli/src/daemon/handlers.rs:711-734`), metrics par défaut activées (`crates/heartbit-core/src/config/daemon.rs:849-854`). `daemon-lite.toml:17,21-22` bind `0.0.0.0:8080` + metrics enabled.
+- Configs exposées/faibles: `docker-compose.daemon.yml:12,23` et `docker-compose.yml:31` utilisent mot de passe Postgres `heartbit`; `docker-compose.yml:27-28` expose 5432; `docker-compose.yml:45-50` expose Kafka 9092/0.0.0.0. `daemon-dev.toml:32,113` DSN `hbv:hbv_dev`; `telegram-test.toml:16` DSN `heartbit:heartbit`.
+- Occurrences panic-family Rust: heuristique sur `git grep` => runtime env. 104 `unwrap()`, 211 `expect(`, 5 `panic!`, 0 `todo!`/`unimplemented!`; inline tests env. 5015 `unwrap()`, 1003 `expect(`, 299 `panic!`, 3 `unimplemented!`; fichiers tests/examples 189 occurrences. Fichier runtime le plus chargé: `crates/heartbit-core/src/tool/builtins/bash.rs` (43 occurrences, principalement `Mutex::lock().expect(...)`, p.ex. lignes 206,334,356).
+- CI présent: `.github/workflows/ci.yml` exécute fmt, clippy `-D warnings`, `cargo test --no-run`, `cargo test --lib` lignes 27-37; release utilise secret GitHub `CARGO_REGISTRY_TOKEN` lignes 102-109. `.dockerignore` présent mais minimal (`target/`, `.git/`, `.github/`, `*.md`, `!CLAUDE.md`).
+- Vérification croisée: cohérent avec `agent:worker` (CI/tests/clippy OK). Pas de contradiction identifiée.

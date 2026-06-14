@@ -54,6 +54,14 @@ use crate::msg::{Msg, PendingTool};
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
 
+/// Per-turn budget for a delegated sub-agent. A real audit/research task fans
+/// out into dozens of read/grep/bash turns; the old cap of 60 made the
+/// investigation sub-agent die mid-task with "Max turns exceeded" (live trace
+/// 6a2e92e3: the researcher failed at 60 after 41 reads + 17 bash, so the audit
+/// returned partial). Kept well below the entry agent's 300 so a runaway
+/// sub-agent still terminates.
+const SUB_AGENT_MAX_TURNS: usize = 200;
+
 /// Process-global experience store (new 2026-frontier core): records each
 /// completed conversation as a trajectory and recalls a learned procedure to
 /// prime a later similar request — the self-improvement flywheel, without
@@ -502,7 +510,7 @@ fn default_sub_agents(
             description: description.into(),
             system_prompt: prompt.into(),
             tools,
-            max_turns: Some(60),
+            max_turns: Some(SUB_AGENT_MAX_TURNS),
             max_tokens: Some(8192),
             session_prune_config: recall.as_ref().map(|_| gentle_prune_config()),
             context: heartbit_core::SubAgentContextConfig {
@@ -1858,6 +1866,33 @@ mod permission_tests {
                 "{tool} must still ask"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_config_tests {
+    use super::*;
+
+    #[test]
+    fn delegated_sub_agents_get_a_high_turn_budget() {
+        // Regression: the old 60-turn cap killed the audit's investigation
+        // sub-agent mid-task (live trace 6a2e92e3 → "Max turns exceeded").
+        // A delegated audit/research run needs a much larger budget.
+        let cwd = std::path::PathBuf::from("/tmp");
+        let agents = default_sub_agents(&cwd, &[], false, None, false);
+        assert!(!agents.is_empty());
+        for a in &agents {
+            assert_eq!(
+                a.max_turns,
+                Some(SUB_AGENT_MAX_TURNS),
+                "{} must carry the high sub-agent turn budget",
+                a.name
+            );
+        }
+        assert!(
+            SUB_AGENT_MAX_TURNS >= 200,
+            "the sub-agent budget must stay well above the old 60-turn cap"
+        );
     }
 }
 
