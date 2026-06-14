@@ -6071,6 +6071,124 @@ mod tests {
         }
     }
 
+    // ── Frontier invariant #4 (guardrails cascade / function-call) ──
+    // Guardrails run in the DECLARED order; the first `Deny` short-circuits the
+    // chain (downstream guardrails are NOT consulted) AND the denied tool call
+    // NEVER reaches the tool's `execute()`. A red here is a real security defect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frontier_guardrail_order_short_circuits_and_blocks_tool_execution() {
+        use crate::agent::guardrail::{GuardAction, Guardrail};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A tool that flips a flag IFF its execute() actually runs.
+        struct ProbeTool {
+            executed: Arc<AtomicBool>,
+        }
+        impl Tool for ProbeTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "probe".into(),
+                    description: "records execution".into(),
+                    input_schema: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+            fn execute(
+                &self,
+                _ctx: &crate::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, Error>> + Send + '_>>
+            {
+                self.executed.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::success("ran")) })
+            }
+        }
+        // First guard denies "probe". Second guard records if it was consulted.
+        struct DenyProbe;
+        impl Guardrail for DenyProbe {
+            fn name(&self) -> &str {
+                "deny-probe"
+            }
+            fn pre_tool(
+                &self,
+                call: &crate::llm::types::ToolCall,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>>
+            {
+                let deny = call.name == "probe";
+                Box::pin(async move {
+                    Ok(if deny {
+                        GuardAction::deny("probe is forbidden")
+                    } else {
+                        GuardAction::Allow
+                    })
+                })
+            }
+        }
+        struct RecordConsulted {
+            consulted: Arc<AtomicBool>,
+        }
+        impl Guardrail for RecordConsulted {
+            fn name(&self) -> &str {
+                "record-consulted"
+            }
+            fn pre_tool(
+                &self,
+                _call: &crate::llm::types::ToolCall,
+            ) -> Pin<Box<dyn std::future::Future<Output = Result<GuardAction, Error>> + Send + '_>>
+            {
+                self.consulted.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(GuardAction::Allow) })
+            }
+        }
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let downstream_consulted = Arc::new(AtomicBool::new(false));
+
+        let provider = Arc::new(MockProvider::new(vec![
+            tool_use_named("probe", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(ProbeTool {
+                executed: executed.clone(),
+            }))
+            // Declared order: deny FIRST, recorder SECOND.
+            .guardrail(Arc::new(DenyProbe))
+            .guardrail(Arc::new(RecordConsulted {
+                consulted: downstream_consulted.clone(),
+            }))
+            .max_turns(5)
+            .build()
+            .unwrap();
+        runner.execute("go").await.unwrap();
+
+        // (a) the blocked call NEVER reached the tool.
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "a guardrail-denied tool call must never reach execute()"
+        );
+        // (b) first Deny short-circuited the chain: downstream guard NOT consulted.
+        assert!(
+            !downstream_consulted.load(Ordering::SeqCst),
+            "a downstream guardrail must not be consulted after an upstream Deny"
+        );
+        // (c) the denial came back as an error tool result, so the loop continued.
+        let reqs = provider.captured_requests.lock().unwrap();
+        let denied = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|b| {
+                matches!(b, ContentBlock::ToolResult { is_error, content, .. }
+                if *is_error && content.contains("Guardrail denied"))
+            });
+        assert!(
+            denied,
+            "the blocked call must return a guardrail-denied error result"
+        );
+    }
+
     fn nudge_text_in(req: &crate::llm::types::CompletionRequest) -> usize {
         req.messages
             .iter()

@@ -115,6 +115,34 @@ mod tests {
                 })
             })
         }
+        fn pre_tool(
+            &self,
+            _call: &ToolCall,
+        ) -> Pin<Box<dyn Future<Output = Result<GuardAction, Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(GuardAction::Deny {
+                    reason: "expensive tool judge denied".into(),
+                })
+            })
+        }
+        fn post_tool(
+            &self,
+            _call: &ToolCall,
+            output: &mut ToolOutput,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            output.content.push_str(" [judged]");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn tool_call(input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input,
+        }
     }
 
     fn text_response(text: &str) -> CompletionResponse {
@@ -159,5 +187,106 @@ mod tests {
             1,
             "flagged text must escalate to the expensive judge exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn clean_tool_input_skips_inner_pre_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = CascadingGuardrail::with_keywords(
+            Arc::new(CountingDeny {
+                calls: Arc::clone(&calls),
+            }),
+            vec!["rm -rf".into()],
+        );
+        let action = guard
+            .pre_tool(&tool_call(serde_json::json!({"command": "ls -la"})))
+            .await
+            .unwrap();
+        assert_eq!(action, GuardAction::Allow);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "clean input must not escalate"
+        );
+    }
+
+    #[tokio::test]
+    async fn flagged_tool_input_escalates_pre_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = CascadingGuardrail::with_keywords(
+            Arc::new(CountingDeny {
+                calls: Arc::clone(&calls),
+            }),
+            vec!["rm -rf".into()],
+        );
+        let action = guard
+            .pre_tool(&tool_call(serde_json::json!({"command": "rm -rf /"})))
+            .await
+            .unwrap();
+        assert!(matches!(action, GuardAction::Deny { .. }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "flagged input escalates once"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_tool_output_skips_inner_post_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = CascadingGuardrail::with_keywords(
+            Arc::new(CountingDeny {
+                calls: Arc::clone(&calls),
+            }),
+            vec!["secret".into()],
+        );
+        let mut out = ToolOutput::success("ordinary output");
+        guard
+            .post_tool(&tool_call(serde_json::json!({})), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "clean output must not escalate"
+        );
+        assert_eq!(out.content, "ordinary output", "clean output is untouched");
+    }
+
+    #[tokio::test]
+    async fn flagged_tool_output_escalates_post_tool() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = CascadingGuardrail::with_keywords(
+            Arc::new(CountingDeny {
+                calls: Arc::clone(&calls),
+            }),
+            vec!["secret".into()],
+        );
+        let mut out = ToolOutput::success("the secret is 42");
+        guard
+            .post_tool(&tool_call(serde_json::json!({})), &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "flagged output escalates once"
+        );
+        assert!(
+            out.content.contains("[judged]"),
+            "the inner post_tool ran and mutated the output: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn name_is_cascading() {
+        let guard = CascadingGuardrail::with_keywords(
+            Arc::new(CountingDeny {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            vec!["x".into()],
+        );
+        assert_eq!(guard.name(), "cascading");
     }
 }
