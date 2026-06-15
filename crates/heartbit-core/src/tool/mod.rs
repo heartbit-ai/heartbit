@@ -8,8 +8,11 @@ pub mod handoff;
 pub mod mcp;
 pub mod mcp_presets;
 pub mod mcp_server;
+pub mod security;
 pub mod set_goal;
 pub mod set_scope;
+
+pub use security::{ToolExposure, TrifectaReport, analyze_exposures, classify_tool_name};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -138,6 +141,27 @@ pub trait Tool: Send + Sync {
     fn redact_for_history(&self, output: &str) -> String {
         output.to_string()
     }
+
+    /// The tool's lethal-trifecta exposure (reads-private / ingests-untrusted /
+    /// can-exfiltrate). The default classifies by name via
+    /// [`classify_tool_name`]; a tool that knows its own capabilities precisely
+    /// (e.g. a read-only MCP tool whose name looks like a writer) should override
+    /// this. Used by [`analyze_tools`] to warn when an agent's tool set forms the
+    /// lethal trifecta.
+    fn security_exposure(&self) -> security::ToolExposure {
+        security::classify_tool_name(&self.definition().name)
+    }
+}
+
+/// Analyse a live tool set for the lethal trifecta (see [`security`]). Returns a
+/// [`TrifectaReport`]; call [`TrifectaReport::warning`] for a message when all
+/// three legs co-occur.
+pub fn analyze_tools(tools: &[std::sync::Arc<dyn Tool>]) -> security::TrifectaReport {
+    let pairs: Vec<(String, security::ToolExposure)> = tools
+        .iter()
+        .map(|t| (t.definition().name, t.security_exposure()))
+        .collect();
+    security::analyze_exposures(pairs.iter().map(|(n, e)| (n.as_str(), *e)))
 }
 
 /// Validate tool input against the tool's declared JSON Schema.

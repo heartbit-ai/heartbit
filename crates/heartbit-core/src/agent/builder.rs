@@ -751,6 +751,17 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             )));
         }
 
+        // SECURITY: lethal-trifecta config check (Willison, Jun 2025). Warn at
+        // build time when this agent's tool set can simultaneously read private
+        // data, ingest untrusted content, AND communicate externally — an
+        // indirect prompt injection can then exfiltrate the private data. This is
+        // a defense-in-depth signal; the operator should break the trifecta or
+        // gate the exfiltration tools behind approval.
+        let trifecta = crate::tool::analyze_tools(&all_tools);
+        if let Some(warning) = trifecta.warning() {
+            tracing::warn!(agent = %self.name, "{warning}");
+        }
+
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::with_capacity(all_tools.len());
         let mut tool_defs: Vec<ToolDefinition> = Vec::with_capacity(all_tools.len());
 

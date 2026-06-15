@@ -3,7 +3,10 @@
 pub mod chunker;
 pub mod in_memory;
 pub mod loader;
+pub mod reranking;
 pub mod tools;
+
+pub use reranking::RerankingKnowledgeBase;
 
 use std::future::Future;
 use std::pin::Pin;

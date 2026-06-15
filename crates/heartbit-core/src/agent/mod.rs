@@ -12,8 +12,10 @@ pub mod dag;
 pub mod debate;
 mod deep_research;
 mod doom_loop;
+pub mod dual_llm;
 pub mod evaluator;
 pub mod events;
+pub mod experience;
 pub mod flow;
 pub mod goal;
 #[cfg(test)]
@@ -28,6 +30,7 @@ pub mod mixture;
 pub mod observability;
 pub mod orchestrator;
 pub mod permission;
+pub mod plan_execute;
 pub mod prompts;
 pub mod pruner;
 pub mod router;
@@ -38,6 +41,8 @@ pub mod tenant_tracker;
 mod tetris_live;
 pub mod token_estimator;
 pub mod tool_filter;
+pub mod verified;
+pub mod verifier;
 pub mod voting;
 pub mod workflow;
 pub mod workflow_tool;
@@ -47,8 +52,15 @@ pub(crate) mod test_helpers;
 
 // Re-exports for backward compatibility
 pub use builder::AgentRunnerBuilder;
+pub use dual_llm::{QUARANTINE_NOT_FOUND, QuarantinedReader, QuarantinedToolWrapper};
+pub use experience::{Trajectory, TrajectoryStore, distill_procedure, run_with_experience};
 pub use interrupt::InterruptHandle;
+pub use plan_execute::{
+    PlanStep, PrivilegedPlanner, SecurePlan, SecurePlanExecutor, StepTrust, parse_plan,
+};
 pub use runner::{AgentOutput, AgentRunner, DelegationNudge, OnInput};
+pub use verified::{VerifiedAgent, VerifiedAgentBuilder, VerifiedResult};
+pub use verifier::{LlmVerifier, Selected, Verifier, select_best};
 // Imports used by the test module via `use super::*`
 #[cfg(test)]
 use crate::error::Error;

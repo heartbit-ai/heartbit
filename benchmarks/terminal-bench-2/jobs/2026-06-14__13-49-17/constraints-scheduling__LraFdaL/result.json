@@ -1,0 +1,120 @@
+{
+    "id": "c4d79af5-f30a-4e62-a341-c4e3b0b52f18",
+    "task_name": "terminal-bench/constraints-scheduling",
+    "trial_name": "constraints-scheduling__LraFdaL",
+    "trial_uri": "file:///home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/jobs/2026-06-14__13-49-17/constraints-scheduling__LraFdaL",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "constraints-scheduling",
+        "ref": "sha256:757c2b9672df2db1ca879878e6c13dcad20222381694a29920eb452276a69d90"
+    },
+    "source": "terminal-bench/terminal-bench-2",
+    "task_checksum": "0c770fe766caca60da162caf26132ed233af15b6fe86ad113933f870e139722a",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/constraints-scheduling",
+            "ref": "sha256:757c2b9672df2db1ca879878e6c13dcad20222381694a29920eb452276a69d90",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2"
+        },
+        "trial_name": "constraints-scheduling__LraFdaL",
+        "trials_dir": "jobs/2026-06-14__13-49-17",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "heartbit_tb2.agent:HeartbitAgent",
+            "model_name": "codex/gpt-5.5",
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "env": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "env": {},
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "env": {},
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "f1cadb19-5807-4af5-ad9f-2c9ba28cd81c"
+    },
+    "agent_info": {
+        "name": "heartbit",
+        "version": "unknown",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": "codex"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 0,
+        "n_cache_tokens": 0,
+        "n_output_tokens": 0,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "model_name": "gpt-5.5",
+            "tool_calls_made": 5,
+            "goal_met": true,
+            "reasoning_tokens": 0,
+            "result_preview": "Created `/app/meeting_scheduled.ics`.\n\nScheduled slot: **Wednesday, January 17, 2024, 11:00–12:00 UTC**.\n\nVerified:\n- Valid ICS structure and required headers.\n- Includes all three attendees.\n- 1-hour meeting within business hours.\n- No conflicts with Alice, Bob, or Carol’s existing calendar events.\n- Satisfies all hard availability constraints and avoids Carol’s Monday preference.",
+            "source": "trace-file"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-06-14T14:03:28.968159Z",
+    "finished_at": "2026-06-14T14:05:00.402117Z",
+    "environment_setup": {
+        "started_at": "2026-06-14T14:03:28.973409Z",
+        "finished_at": "2026-06-14T14:03:34.455877Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-06-14T14:03:34.455900Z",
+        "finished_at": "2026-06-14T14:03:34.841299Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-06-14T14:03:34.841405Z",
+        "finished_at": "2026-06-14T14:04:36.299529Z"
+    },
+    "verifier": {
+        "started_at": "2026-06-14T14:04:36.850408Z",
+        "finished_at": "2026-06-14T14:04:48.523394Z"
+    },
+    "step_results": null
+}

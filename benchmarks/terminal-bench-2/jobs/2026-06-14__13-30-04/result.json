@@ -1,0 +1,56 @@
+{
+    "id": "a8912ce6-09b6-40a9-b64d-8f0048339dcb",
+    "started_at": "2026-06-14T13:30:08.732966",
+    "updated_at": "2026-06-14T13:33:26.835895Z",
+    "finished_at": null,
+    "n_total_trials": 89,
+    "stats": {
+        "n_completed_trials": 7,
+        "n_errored_trials": 7,
+        "n_running_trials": 0,
+        "n_pending_trials": 82,
+        "n_cancelled_trials": 2,
+        "n_retries": 0,
+        "evals": {
+            "heartbit__gpt-5.5__terminal-bench/terminal-bench-2": {
+                "n_trials": 4,
+                "n_errors": 7,
+                "metrics": [
+                    {
+                        "mean": 0.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "0.0": [
+                            "build-pov-ray__DquZ37V",
+                            "overfull-hbox__QbibVrh",
+                            "video-processing__egsmPXd",
+                            "distribution-search__7f5M9p8"
+                        ]
+                    }
+                },
+                "exception_stats": {
+                    "NonZeroAgentExitCodeError": [
+                        "build-pov-ray__DquZ37V",
+                        "overfull-hbox__QbibVrh",
+                        "video-processing__egsmPXd",
+                        "distribution-search__7f5M9p8"
+                    ],
+                    "OSError": [
+                        "break-filter-js-from-html__D3VTyym"
+                    ],
+                    "CancelledError": [
+                        "circuit-fibsqrt__azbLL35",
+                        "make-mips-interpreter__3ETWuMg"
+                    ]
+                }
+            }
+        },
+        "n_input_tokens": null,
+        "n_cache_tokens": null,
+        "n_output_tokens": null,
+        "cost_usd": null
+    }
+}

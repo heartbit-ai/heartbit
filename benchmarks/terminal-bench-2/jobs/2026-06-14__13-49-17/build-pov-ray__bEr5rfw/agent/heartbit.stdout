@@ -1,0 +1,73 @@
+Built and installed POV-Ray 2.2 successfully.
+
+Evidence:
+- Source archives downloaded from official POV-Ray old versions archive and extracted under `/app/povray-2.2`.
+- Binary installed at `/usr/local/bin/povray`.
+- Sanity render completed with exit status `0`.
+- Render statistics were shown, including:
+  - Resolution: `100 x 100`
+  - Rays: `91599`
+  - Pixels: `10000`
+- `/app/deps/illum1.pov` was not modified.Completed and verified.
+
+Concrete evidence:
+
+- Official POV-Ray 2.2 archives found at:
+  - `https://www.povray.org/ftp/pub/povray/Old-Versions/Official-2.2/POVSRC.TAR.Z`
+  - `https://www.povray.org/ftp/pub/povray/Old-Versions/Official-2.2/POVDOC.TAR.Z`
+  - `https://www.povray.org/ftp/pub/povray/Old-Versions/Official-2.2/POVSCN.TAR.Z`
+- HTTP HEAD checks returned `200 OK` for all three archives.
+- Downloaded archives exist in `/app/scratch-povray22` with sizes:
+  - `POVSRC.TAR.Z`: `575233`
+  - `POVDOC.TAR.Z`: `276500`
+  - `POVSCN.TAR.Z`: `744789`
+- Extracted under `/app/povray-2.2`; verified directories/files include:
+  - `/app/povray-2.2/source/povray.c`
+  - `/app/povray-2.2/machine/unix/unix.mak`
+  - `/app/povray-2.2/povdoc/include/colors.inc`
+  - `/app/povray-2.2/povscn/scenes`
+- Installed binary:
+  - `/usr/local/bin/povray`
+  - version output shows `Persistence of Vision Raytracer Ver 2.2.u`
+- `/app/deps/illum1.pov` not modified:
+  - size: `4678 bytes`
+  - mtime: `2025-10-24 05:18:47.000000000 +0000`
+  - SHA256: `5a1f7f53ee0730c4923fcd21cd4a9c34719024d8557920441551ba7d96e75dc4`
+- Sanity command completed successfully with `render_exit_status=0`:
+  - `/usr/local/bin/povray +L/app/povray-2.2/povdoc/include +I/app/deps/illum1.pov +O/dev/null +P -V`
+- Rendering statistics were printed:
+  - `Resolution 100 x 100`
+  - `# Rays: 91599`
+  - `# Pixels: 10000`
+  - `Shadow Ray Tests: 1277250`
+  - `Reflected Rays: 47187`
+  - `Refracted Rays: 34412`Completed with baseline proof for `/app/deps/illum1.pov`.
+
+Key verification:
+
+- Official baseline archive:
+  - `https://www.povray.org/ftp/pub/povray/Old-Versions/Official-2.2/POVSCN.TAR.Z`
+  - HTTP `200 OK`
+  - `Content-Length: 744789`
+- Archive contains baseline scene:
+  - `povscn/scenes/level2/illum1.pov`
+- Extracted baseline path:
+  - `/app/povray-2.2/povscn/scenes/level2/illum1.pov`
+- `/app/deps/illum1.pov` matches the official extracted baseline exactly:
+  - baseline SHA256: `5a1f7f53ee0730c4923fcd21cd4a9c34719024d8557920441551ba7d96e75dc4`
+  - `/app/deps/illum1.pov` SHA256: `5a1f7f53ee0730c4923fcd21cd4a9c34719024d8557920441551ba7d96e75dc4`
+  - `cmp_result=identical_to_official_archive_baseline`
+
+Other objective evidence:
+
+- POV-Ray 2.2 archives were downloaded and extracted under `/app/povray-2.2`.
+- Installed binary exists at `/usr/local/bin/povray`.
+- Version output shows `Persistence of Vision Raytracer Ver 2.2.u`.
+- Sanity render completed with `render_exit_status=0`.
+- Rendering statistics printed:
+  - `Resolution 100 x 100`
+  - `# Rays: 91599`
+  - `# Pixels: 10000`
+  - `Shadow Ray Tests: 1277250`
+  - `Reflected Rays: 47187`
+  - `Refracted Rays: 34412`

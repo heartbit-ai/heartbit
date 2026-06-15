@@ -1,0 +1,101 @@
+{
+    "id": "bc6dba85-6a14-4664-9ff7-1b40ee0ef9b4",
+    "task_name": "terminal-bench/break-filter-js-from-html",
+    "trial_name": "break-filter-js-from-html__D3VTyym",
+    "trial_uri": "file:///home/pleclech/projects/heartbit/benchmarks/terminal-bench-2/jobs/2026-06-14__13-30-04/break-filter-js-from-html__D3VTyym",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "break-filter-js-from-html",
+        "ref": "sha256:59a2641df9bca789642ad4ab3f5790de5ffed6eb4a594ca7846d26422a55c4a8"
+    },
+    "source": "terminal-bench/terminal-bench-2",
+    "task_checksum": "3d0f7651479ff6739729cc962b44510501fa83a3df4cfc874583d4de3e4ef610",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/break-filter-js-from-html",
+            "ref": "sha256:59a2641df9bca789642ad4ab3f5790de5ffed6eb4a594ca7846d26422a55c4a8",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2"
+        },
+        "trial_name": "break-filter-js-from-html__D3VTyym",
+        "trials_dir": "jobs/2026-06-14__13-30-04",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "heartbit_tb2.agent:HeartbitAgent",
+            "model_name": "codex/gpt-5.5",
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {},
+            "env": {},
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "env": {},
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "env": {},
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "a8912ce6-09b6-40a9-b64d-8f0048339dcb"
+    },
+    "agent_info": {
+        "name": "heartbit",
+        "version": "unknown",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": "codex"
+        }
+    },
+    "agent_result": null,
+    "verifier_result": null,
+    "exception_info": {
+        "exception_type": "OSError",
+        "exception_message": "[Errno 28] No space left on device: 'jobs/2026-06-14__13-30-04/break-filter-js-from-html__D3VTyym/agent/setup'",
+        "exception_traceback": "Traceback (most recent call last):\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 291, in run\n    await self._prepare()\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 322, in _prepare\n    await self._setup_agent()\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/trial/trial.py\", line 812, in _setup_agent\n    await asyncio.wait_for(\n  File \"/usr/lib/python3.12/asyncio/tasks.py\", line 520, in wait_for\n    return await fut\n           ^^^^^^^^^\n  File \"/home/pleclech/.local/share/uv/tools/harbor/lib/python3.12/site-packages/harbor/agents/installed/base.py\", line 377, in setup\n    setup_dir.mkdir(parents=True, exist_ok=True)\n  File \"/usr/lib/python3.12/pathlib.py\", line 1313, in mkdir\n    os.mkdir(self, mode)\nOSError: [Errno 28] No space left on device: 'jobs/2026-06-14__13-30-04/break-filter-js-from-html__D3VTyym/agent/setup'\n",
+        "occurred_at": "2026-06-14T13:33:02.219017"
+    },
+    "started_at": "2026-06-14T13:32:47.120452Z",
+    "finished_at": "2026-06-14T13:33:13.830337Z",
+    "environment_setup": {
+        "started_at": "2026-06-14T13:32:47.127143Z",
+        "finished_at": "2026-06-14T13:33:02.096049Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-06-14T13:33:02.096071Z",
+        "finished_at": "2026-06-14T13:33:02.217725Z"
+    },
+    "agent_execution": null,
+    "verifier": null,
+    "step_results": null
+}

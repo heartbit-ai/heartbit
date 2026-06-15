@@ -1,0 +1,10 @@
+Created `/app/meeting_scheduled.ics`.
+
+Scheduled slot: **Wednesday, January 17, 2024, 11:00–12:00 UTC**.
+
+Verified:
+- Valid ICS structure and required headers.
+- Includes all three attendees.
+- 1-hour meeting within business hours.
+- No conflicts with Alice, Bob, or Carol’s existing calendar events.
+- Satisfies all hard availability constraints and avoids Carol’s Monday preference.

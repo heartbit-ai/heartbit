@@ -62,8 +62,12 @@ impl Tool for SetScopeTool {
             description: "Declare the files/directories your current task is allowed to \
                           MODIFY (edit/write outside them will be denied). Call it after \
                           planning substantive work; call it again to widen the scope — \
-                          widening is deliberate and visible, drift is not. An empty list \
-                          removes the restriction."
+                          widening is deliberate and visible, drift is not. These are \
+                          WRITABLE roots, not a read-only filter: scoping to \".\" makes \
+                          the whole repo writable, and an EMPTY list REMOVES the \
+                          restriction (allows ALL mutations) — it does NOT make the task \
+                          read-only. To stay read-only, simply do not modify files; to \
+                          limit edits, scope to the specific files you will change."
                 .into(),
             input_schema: json!({
                 "type": "object",

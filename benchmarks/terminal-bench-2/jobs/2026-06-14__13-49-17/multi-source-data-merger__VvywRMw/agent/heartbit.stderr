@@ -1,0 +1,4 @@
+[2m2026-06-14T14:13:46.213127Z[0m [33m WARN[0m [2mheartbit_core::agent::builder[0m[2m:[0m LETHAL TRIFECTA: this agent can read private data ([bash, read, grep, glob, todoread]), ingest untrusted content ([bash, webfetch, websearch]), AND communicate externally ([bash, webfetch]) — an indirect prompt injection in the untrusted content can exfiltrate the private data. Break the trifecta (remove one leg), gate the exfiltration tools behind human approval, or run the untrusted-content path in a quarantined (no-tool) context. [3magent[0m[2m=[0morchestrator
+
+---
+Tokens used: 0 in / 0 out | Tool calls: 6

@@ -215,6 +215,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "list the registered workflow recipes (run_workflow)",
     ),
     ("/key", "set the OpenRouter API key"),
+    (
+        "/codex",
+        "run on a ChatGPT-subscription Codex proxy (`/codex [url|off]`)",
+    ),
     ("/quit", "exit the TUI"),
 ];
 
@@ -409,8 +413,21 @@ pub struct App {
     /// The OpenRouter API key in effect (from env, config, or set in-TUI).
     pub api_key: Option<String>,
     /// True when a provider can start without an OpenRouter key (e.g. an
-    /// `ANTHROPIC_API_KEY` env fallback) — so a no-key submit need not prompt.
+    /// `ANTHROPIC_API_KEY` env fallback, or a custom endpoint via `/codex`) — so a
+    /// no-key submit need not prompt.
     pub has_fallback_provider: bool,
+    /// A custom OpenAI-compatible base URL (`http://127.0.0.1:.../v1`), set by
+    /// `/codex` or the `HEARTBIT_OPENAI_BASE_URL` env var at startup. When `Some`,
+    /// the engine builds an `OpenAiCompatProvider` against it (priority over
+    /// OpenRouter), so the TUI can run on a ChatGPT-subscription Codex proxy or any
+    /// OpenAI-compatible endpoint. Applies on the next agent start.
+    pub custom_endpoint: Option<String>,
+    /// While `/codex` is active, the `(model, has_fallback_provider)` that were in
+    /// effect BEFORE activation — restored by `/codex off`. `/codex` is a SESSION
+    /// override (never persisted): the model swap must not leak a Codex model id
+    /// into the saved config, which would brick the next cold start when the proxy
+    /// is gone. `None` ⇒ Codex not active.
+    pub codex_saved: Option<(String, bool)>,
     pub tokens: TokenUsage,
     /// MCP servers to connect when the agent starts (mirrors the config file).
     pub mcp_servers: Vec<McpServerSpec>,
@@ -506,6 +523,8 @@ impl App {
             model: model.into(),
             api_key: None,
             has_fallback_provider: false,
+            custom_endpoint: None,
+            codex_saved: None,
             tokens: TokenUsage::default(),
             mcp_servers: Vec::new(),
             models: Vec::new(),
@@ -864,7 +883,21 @@ impl App {
                 agent,
                 success,
                 tokens,
-            } => self.agent_finish(&agent, success, tokens),
+                error,
+            } => {
+                self.agent_finish(&agent, success, tokens);
+                // A sub-agent failure stays non-fatal (the orchestrator gets the
+                // error as a tool result and continues), but it must be VISIBLE —
+                // a silent "Max turns exceeded" let a half-done audit pass for a
+                // finished one (live trace 6a2e92e3).
+                if !success {
+                    let reason = error.unwrap_or_else(|| "failed".into());
+                    self.history.push(Cell::Notice(format!(
+                        "⚠ sub-agent {agent} failed: {reason} — its result is partial; \
+                         the orchestrator continues with what it returned."
+                    )));
+                }
+            }
             Msg::AgentSpawned { name, task } => {
                 self.agent_set_working(&name, "spawned");
                 self.history.push(Cell::Notice(format!(
@@ -1206,6 +1239,7 @@ impl App {
                     self.set_model(arg);
                 }
             }
+            "codex" => self.activate_codex(arg),
             "mcp" => self.handle_mcp(arg),
             "mode" => self.set_mode(arg),
             "agents" | "agent" | "workflow" => self.toggle_multi_agent(arg),
@@ -1465,6 +1499,77 @@ impl App {
             .push(Cell::Notice(format!("model set to {model} — {when}")));
     }
 
+    /// `/codex [url|off]` — one command to run the TUI on a ChatGPT-subscription
+    /// Codex quota. It points the engine at a local Codex→OpenAI-compatible proxy
+    /// (default `http://127.0.0.1:10531/v1`), switches the model to a Codex id, and
+    /// respawns the agent. `off` reverts to the normal provider on the next start.
+    ///
+    /// ⚠ Using a ChatGPT-subscription token outside Codex is a likely Terms-of-
+    /// Service violation (ban risk) and is fragile — see docs/chatgpt-subscription.md.
+    /// The TUI only points at the proxy; it never touches the Codex token itself.
+    fn activate_codex(&mut self, arg: String) {
+        let arg = arg.trim();
+        if matches!(arg, "off" | "clear" | "stop") {
+            self.custom_endpoint = None;
+            // Restore the pre-codex model + fallback (the override is session-only).
+            if let Some((model, fallback)) = self.codex_saved.take() {
+                self.model = model;
+                self.has_fallback_provider = fallback;
+            }
+            // The model source changed back to OpenRouter — reload that catalog.
+            self.refresh_model_catalog();
+            let when = self.queue_respawn();
+            self.history.push(Cell::Notice(format!(
+                "codex endpoint cleared — reverting to your normal provider ({}), {when}",
+                self.model
+            )));
+            return;
+        }
+        // The proxy's OpenAI-compatible base URL (arg overrides the default port).
+        let url = if arg.is_empty() {
+            "http://127.0.0.1:10531/v1".to_string()
+        } else {
+            arg.to_string()
+        };
+        // Stash the model + fallback to restore on `/codex off` — but only on the
+        // FIRST activation, so re-running `/codex <url>` keeps the original values.
+        if self.codex_saved.is_none() {
+            self.codex_saved = Some((self.model.clone(), self.has_fallback_provider));
+        }
+        self.custom_endpoint = Some(url.clone());
+        // A custom endpoint IS a provider — let a no-OpenRouter-key session start.
+        self.has_fallback_provider = true;
+        // Load the proxy's model list into the /model picker (replaces the stale
+        // OpenRouter catalogue) so the user can pick any model the subscription
+        // exposes through Codex.
+        self.refresh_model_catalog();
+        // The Codex backend exposes its own model set (discovered live, account/
+        // version-dependent — e.g. gpt-5.5, gpt-5.4, gpt-5.4-mini). `gpt-5.5` is the
+        // current flagship default; switch with `/model <id>` (check the proxy's
+        // `/v1/models`). SESSION-ONLY: deliberately NOT persisted (no `SaveModel`) —
+        // a model id written to config would brick the next launch when the proxy
+        // is gone.
+        self.model = "gpt-5.5".to_string();
+        // Best-effort: warn (don't block) if the Codex login token is absent — the
+        // proxy needs `~/.codex/auth.json` (run `codex login`). Advisory only, so
+        // the reducer stays testable (it never depends on this file existing).
+        let auth_missing = std::env::var("HOME")
+            .ok()
+            .map(|h| !std::path::Path::new(&h).join(".codex/auth.json").exists())
+            .unwrap_or(false);
+        let when = self.queue_respawn();
+        let mut notice = format!(
+            "codex endpoint → {url} · model gpt-5.5 — {when}. \
+             (switch with /model <id> — see the proxy's /v1/models.) \
+             ⚠ subscription-token use outside Codex risks a ToS ban (see \
+             docs/chatgpt-subscription.md); start the local proxy first."
+        );
+        if auth_missing {
+            notice.push_str(" Note: ~/.codex/auth.json not found — run `codex login`.");
+        }
+        self.history.push(Cell::Notice(notice));
+    }
+
     /// Set the advisor's frontier model (`/model advisor <name>`): persist,
     /// notice. Takes effect on the next agent start (the advisor provider is
     /// built once at engine spawn).
@@ -1610,6 +1715,16 @@ impl App {
 
     /// Open the OpenRouter model picker for `target` (main model or advisor),
     /// fetching the catalog on first use.
+    /// Force a reload of the `/model` picker catalogue from the CURRENT source —
+    /// the custom endpoint's `/v1/models` when one is set (e.g. the Codex proxy),
+    /// else the OpenRouter catalogue. Called when the source changes (`/codex`
+    /// on/off) so the picker never shows the wrong provider's models.
+    fn refresh_model_catalog(&mut self) {
+        self.models.clear();
+        self.models_loading = true;
+        self.effects.push(Effect::FetchModels);
+    }
+
     fn open_model_picker(&mut self, target: ModelTarget) {
         self.modal = Some(Modal::ModelPicker(ModelPicker {
             target,
@@ -2262,6 +2377,78 @@ mod tests {
             app.effects
                 .contains(&Effect::SaveModel("openai/gpt-x".into()))
         );
+    }
+
+    #[test]
+    fn slash_codex_sets_endpoint_model_and_respawns() {
+        let mut app = keyed(); // idle → respawn is immediate
+        typed(&mut app, "/codex");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.custom_endpoint.as_deref(),
+            Some("http://127.0.0.1:10531/v1"),
+            "bare /codex uses the default proxy URL"
+        );
+        assert_eq!(app.model, "gpt-5.5");
+        assert!(app.has_fallback_provider, "a custom endpoint IS a provider");
+        // SESSION-ONLY: the Codex model id must NOT be persisted (it would brick
+        // the next cold start once the proxy is gone).
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveModel(_))),
+            "/codex must not persist the model to config"
+        );
+        assert!(
+            app.effects.contains(&Effect::RespawnAgent),
+            "the model/endpoint switch must rebuild the idle agent"
+        );
+    }
+
+    #[test]
+    fn slash_codex_refreshes_the_model_catalog_from_the_proxy() {
+        let mut app = keyed();
+        // Seed a stale OpenRouter catalogue so we can prove it gets cleared.
+        app.models = vec![crate::models::ModelEntry {
+            id: "openrouter/old".into(),
+            name: "old".into(),
+            context: None,
+        }];
+        typed(&mut app, "/codex");
+        app.update(key(KeyCode::Enter));
+        assert!(
+            app.models.is_empty(),
+            "the stale OpenRouter catalogue must be cleared so the proxy's loads"
+        );
+        assert!(app.models_loading, "a refetch is in flight");
+        assert!(
+            app.effects.contains(&Effect::FetchModels),
+            "/codex must refetch the catalogue (now from the proxy's /v1/models)"
+        );
+    }
+
+    #[test]
+    fn slash_codex_off_restores_the_prior_model_and_fallback() {
+        let mut app = keyed(); // keyed() ⇒ model "m", no fallback
+        let prior_model = app.model.clone();
+        let prior_fallback = app.has_fallback_provider;
+        typed(&mut app, "/codex http://127.0.0.1:8080/v1");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.custom_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(app.model, "gpt-5.5");
+
+        typed(&mut app, "/codex off");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.custom_endpoint, None, "/codex off clears the endpoint");
+        assert_eq!(app.model, prior_model, "the pre-codex model is restored");
+        assert_eq!(
+            app.has_fallback_provider, prior_fallback,
+            "the pre-codex fallback flag is restored"
+        );
+        assert!(app.codex_saved.is_none(), "the stash is consumed");
     }
 
     #[test]
@@ -3246,10 +3433,38 @@ mod tests {
             agent: "worker".into(),
             success: true,
             tokens: 1234,
+            error: None,
         });
         let w = app.agents.iter().find(|r| r.name == "worker").unwrap();
         assert_eq!(w.state, AgentState::Done);
         assert_eq!(w.tokens, 1234);
+    }
+
+    #[test]
+    fn failed_sub_agent_pushes_a_visible_notice() {
+        // Live trace 6a2e92e3: the researcher hit "Max turns (60) exceeded" and
+        // the failure was swallowed (roster row only). It must be surfaced.
+        let mut app = multi();
+        app.update(Msg::AgentsDispatched(vec!["researcher".into()]));
+        app.update(Msg::SubAgentDone {
+            agent: "researcher".into(),
+            success: false,
+            tokens: 10,
+            error: Some("Max turns (60) exceeded".into()),
+        });
+        assert!(
+            app.history.iter().any(|c| matches!(
+                c,
+                Cell::Notice(n) if n.contains("researcher failed") && n.contains("Max turns")
+            )),
+            "a sub-agent failure must surface a visible notice naming the reason"
+        );
+        // …and stay non-fatal (the run is not marked failed).
+        assert!(
+            !app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("run failed")))
+        );
     }
 
     #[test]

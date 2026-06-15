@@ -69,7 +69,7 @@ pub use agent::orchestrator::{
 pub use agent::permission::{
     LearnedPermissions, PermissionAction, PermissionRule, PermissionRuleset,
 };
-pub use agent::prompts::MULTI_AGENT_COLLAB_PROMPT;
+pub use agent::prompts::{MULTI_AGENT_COLLAB_PROMPT, MULTI_AGENT_SELECTION_GUIDANCE};
 pub use agent::pruner::SessionPruneConfig;
 pub use agent::routing::{
     AgentCapability, ComplexitySignals, KeywordRoutingStrategy, RoutingDecision, RoutingMode,

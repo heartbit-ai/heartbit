@@ -41,9 +41,9 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
-    AgentEvent, ApprovalDecision, BoxedProvider, InterruptHandle, OnApproval, OnEvent, OnInput,
-    OnText, OpenRouterProvider, Orchestrator, PermissionAction, PermissionRule, PermissionRuleset,
-    RetryingProvider, SubAgentConfig,
+    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
+    OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator, PermissionAction,
+    PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -53,6 +53,26 @@ use crate::cells::Cell;
 use crate::msg::{Msg, PendingTool};
 
 const DEFAULT_MODEL: &str = "qwen/qwen3-235b-a22b-2507";
+
+/// Per-turn budget for a delegated sub-agent. A real audit/research task fans
+/// out into dozens of read/grep/bash turns; the old cap of 60 made the
+/// investigation sub-agent die mid-task with "Max turns exceeded" (live trace
+/// 6a2e92e3: the researcher failed at 60 after 41 reads + 17 bash, so the audit
+/// returned partial). Kept well below the entry agent's 300 so a runaway
+/// sub-agent still terminates.
+const SUB_AGENT_MAX_TURNS: usize = 200;
+
+/// Process-global experience store (new 2026-frontier core): records each
+/// completed conversation as a trajectory and recalls a learned procedure to
+/// prime a later similar request — the self-improvement flywheel, without
+/// threading state through the agent-spawn machinery. Single-process TUI, so a
+/// `OnceLock` is the natural home; lives for the session.
+static TRAJECTORY_STORE: std::sync::OnceLock<Arc<heartbit_core::agent::TrajectoryStore>> =
+    std::sync::OnceLock::new();
+
+fn trajectory_store() -> &'static Arc<heartbit_core::agent::TrajectoryStore> {
+    TRAJECTORY_STORE.get_or_init(|| Arc::new(heartbit_core::agent::TrajectoryStore::new(200)))
+}
 
 /// Warning notice when `HEARTBIT_MODEL` is set: the env var has higher
 /// precedence than the config, so `/model` changes are silently ignored until
@@ -201,6 +221,15 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let has_anthropic = std::env::var("ANTHROPIC_API_KEY")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    // A custom OpenAI-compatible endpoint (e.g. a ChatGPT-subscription Codex
+    // proxy, a local model, or the real OpenAI API) is a complete provider on its
+    // own — no OpenRouter key needed, so the agent may spawn.
+    let custom_endpoint = std::env::var("HEARTBIT_OPENAI_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_custom_endpoint = custom_endpoint.is_some();
+    let has_fallback = has_anthropic || has_custom_endpoint;
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let input_rx = Arc::new(Mutex::new(input_rx));
@@ -208,7 +237,8 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
 
     let mut app = App::new(model);
     app.api_key = api_key;
-    app.has_fallback_provider = has_anthropic;
+    app.has_fallback_provider = has_fallback;
+    app.custom_endpoint = custom_endpoint;
     app.mcp_servers = cfg.mcp_servers.clone();
     app.multi_agent = cfg.multi_agent;
     app.context_recall = cfg.context_recall;
@@ -241,8 +271,17 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     {
         app.history.push(Cell::Notice(notice));
     }
+    // Custom OpenAI-compatible endpoint in use: tell the user (and remind them to
+    // set the matching model with /model — the default is an OpenRouter id).
+    if let Some(url) = app.custom_endpoint.clone() {
+        app.history.push(Cell::Notice(format!(
+            "custom OpenAI-compatible endpoint: {url} — set the model with /model \
+             (e.g. gpt-5.5 for a ChatGPT-subscription Codex proxy; check its \
+             /v1/models). This takes priority over OpenRouter."
+        )));
+    }
     // No provider configured at all → open the key prompt immediately.
-    if app.api_key.is_none() && !has_anthropic {
+    if app.api_key.is_none() && !has_fallback {
         app.modal = Some(app::Modal::KeyEntry(app::KeyEntryModal::default()));
     }
 
@@ -310,11 +349,39 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
 /// heartbit-cli's `build_on_retry`) — retries are diagnostic gold and were
 /// previously invisible in the TUI.
 fn build_provider(
+    custom_endpoint: Option<&str>,
     openrouter_key: Option<String>,
     model: &str,
     on_retry: Arc<heartbit_core::OnRetry>,
     prompt_caching: bool,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
+    // Custom OpenAI-compatible endpoint (`/codex`, or `HEARTBIT_OPENAI_BASE_URL` at
+    // startup). Takes PRIORITY over OpenRouter so the same config can target: a
+    // local model (Ollama / vLLM / LM Studio), the real OpenAI API, OR a localhost
+    // proxy that bridges a ChatGPT-subscription Codex token to OpenAI-compatible
+    // requests (so the agent runs on the subscription's quota — see
+    // docs/chatgpt-subscription.md). A key present ⇒ Bearer over HTTPS (real API);
+    // no key ⇒ AuthStyle::None, which is what permits a non-HTTPS localhost
+    // base_url (the Codex proxy).
+    if let Some(base_url) = custom_endpoint.filter(|u| !u.trim().is_empty()) {
+        let base_url = base_url.to_string();
+        let is_tls = base_url.trim_start().starts_with("https://");
+        let key = std::env::var("HEARTBIT_OPENAI_API_KEY").unwrap_or_default();
+        // Bearer requires HTTPS (the provider rejects a key over plain http). A
+        // localhost proxy is `http://`, so a stray `HEARTBIT_OPENAI_API_KEY` in the
+        // environment must NOT force Bearer there — fall back to `AuthStyle::None`,
+        // which is what permits the non-TLS URL. Bearer only when both a key is
+        // present AND the endpoint is TLS (a real HTTPS API).
+        let auth = if !key.trim().is_empty() && is_tls {
+            AuthStyle::Bearer
+        } else {
+            AuthStyle::None
+        };
+        let base = OpenAiCompatProvider::new(key, model, base_url, auth);
+        return Ok(Arc::new(BoxedProvider::new(
+            RetryingProvider::with_defaults(base).with_on_retry(on_retry),
+        )));
+    }
     if let Some(key) = openrouter_key {
         // Prompt caching (default ON): cache_control breakpoints land on the
         // system prompt + conversation prefix. Qwen/Anthropic/Gemini routes
@@ -354,10 +421,11 @@ fn build_provider(
 struct Engine(Box<Orchestrator<BoxedProvider>>);
 
 impl Engine {
-    /// Run the (multi-turn) session, starting with `first`.
-    async fn run(&mut self, first: &str) -> anyhow::Result<()> {
-        self.0.run(first).await?;
-        Ok(())
+    /// Run the (multi-turn) session, starting with `first`. Returns the final
+    /// [`AgentOutput`](heartbit_core::AgentOutput) so the caller can record it
+    /// (e.g. into the experience store).
+    async fn run(&mut self, first: &str) -> anyhow::Result<heartbit_core::AgentOutput> {
+        Ok(self.0.run(first).await?)
     }
 }
 
@@ -442,7 +510,7 @@ fn default_sub_agents(
             description: description.into(),
             system_prompt: prompt.into(),
             tools,
-            max_turns: Some(60),
+            max_turns: Some(SUB_AGENT_MAX_TURNS),
             max_tokens: Some(8192),
             session_prune_config: recall.as_ref().map(|_| gentle_prune_config()),
             context: heartbit_core::SubAgentContextConfig {
@@ -458,12 +526,12 @@ fn default_sub_agents(
         make(
             app::DEFAULT_SQUAD[0],
             "General implementation agent: reads, searches, edits, and runs code in the workspace. Use for concrete file changes, builds, tests, and command execution.",
-            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result.",
+            "You are a focused implementation engineer. Do the delegated task end-to-end with the tools, make the smallest correct change, verify it, and report a concise result. Return your findings in your final message — do NOT write scratch/coordination files in the repo; if you genuinely need a working file, put it under ./scratch (gitignored), never the repo root.",
         ),
         make(
             app::DEFAULT_SQUAD[1],
             "Investigation agent: explores the codebase and gathers facts (search, read files, run read-only commands). Use to understand, locate, or analyze before changes.",
-            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked.",
+            "You are a careful researcher. Investigate the delegated question using the tools, then report concrete findings (file paths, line numbers, facts) — do not make changes unless asked. For a read-only task, do not write ANY files (no scratchpad/blackboard in the repo): return everything in your final message; if a working file is truly needed, put it under ./scratch (gitignored), never the repo root.",
         ),
     ]
 }
@@ -473,6 +541,7 @@ fn default_sub_agents(
 /// provider, never into the tool environment (bash gets a no-secrets allowlist).
 #[allow(clippy::too_many_arguments)]
 async fn build_engine(
+    custom_endpoint: Option<String>,
     api_key: Option<String>,
     model: &str,
     ui_tx: UnboundedSender<Msg>,
@@ -532,7 +601,13 @@ async fn build_engine(
             },
         )
     };
-    let provider = build_provider(api_key.clone(), model, on_retry.clone(), prompt_caching)?;
+    let provider = build_provider(
+        custom_endpoint.as_deref(),
+        api_key.clone(),
+        model,
+        on_retry.clone(),
+        prompt_caching,
+    )?;
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -611,6 +686,9 @@ async fn build_engine(
         let main_model = model.to_string();
         let fast = fast_model.clone();
         let frontier = frontier_model.clone();
+        // A custom endpoint (e.g. the Codex proxy) is the ONLY provider this
+        // session has — sub-role models must target it too, not OpenRouter.
+        let custom_endpoint = custom_endpoint.clone();
         Arc::new(move |role: &str| {
             let resolved = match role {
                 "main" | "" => return Ok(main_provider.clone()),
@@ -621,8 +699,14 @@ async fn build_engine(
             if resolved == main_model {
                 return Ok(main_provider.clone());
             }
-            build_provider(api_key.clone(), &resolved, on_retry.clone(), true)
-                .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
+            build_provider(
+                custom_endpoint.as_deref(),
+                api_key.clone(),
+                &resolved,
+                on_retry.clone(),
+                true,
+            )
+            .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
         })
     };
     // Recipe-internal agents stream their events to the TRACE ONLY — not to
@@ -855,6 +939,20 @@ async fn build_engine(
         }
         None => instructions,
     };
+    // Orchestration-selection guidance (Cemri et al. 2503.13657). The entry agent
+    // decides whether to fan out; this is exactly the "decompose a broad task into
+    // INDEPENDENT parallel sub-agent tasks, don't hand one giant task to one
+    // sub-agent" advice. It lived in core as a public const but was wired into NO
+    // prompt (shelfware) — a live audit run gave the whole investigation to a
+    // single researcher, which then died at its turn cap. Inject it here so the
+    // entry agent actually sees it.
+    let instructions = format!(
+        "{instructions}\n\n## When to delegate vs. fan out\n{}\n\
+         For a broad audit/survey/migration, split the work into several focused, \
+         INDEPENDENT sub-agent tasks (e.g. one per area or risk class) and delegate \
+         them together, rather than one large task to a single sub-agent.",
+        heartbit_core::MULTI_AGENT_SELECTION_GUIDANCE,
+    );
     // ONE compact startup line instead of the old five-notice wall (campaign
     // round-1 frame evidence). Failures above stay as their own loud notices.
     let _ = ui_tx.send(Msg::Notice(format!(
@@ -865,6 +963,14 @@ async fn build_engine(
             summary_parts.join(" · ")
         }
     )));
+    // SECURITY: surface heartbit-core's lethal-trifecta check (Willison, Jun
+    // 2025) as a startup notice. When the agent's tools can simultaneously read
+    // private data, ingest untrusted content, AND communicate externally, an
+    // indirect prompt injection can exfiltrate the private data. (New capability
+    // from the 2026-frontier core.) Analyse BEFORE `tools` is moved below.
+    if let Some(warning) = heartbit_core::tool::analyze_tools(&tools).warning() {
+        let _ = ui_tx.send(Msg::Notice(format!("⚠ security — {warning}")));
+    }
     let mut builder = Orchestrator::builder(provider)
         .entry_agent(tools)
         .guardrail(scope_guard)
@@ -1076,6 +1182,7 @@ fn spawn_agent(
         context_recall: app.context_recall,
         verify_command: app.verify_command.clone(),
     });
+    let custom_endpoint = app.custom_endpoint.clone();
     let api_key = app.api_key.clone();
     let model = app.model.clone();
     let mcp_servers = app.mcp_servers.clone();
@@ -1111,6 +1218,7 @@ fn spawn_agent(
             .expect("agent runtime");
         rt.block_on(async move {
             match build_engine(
+                custom_endpoint,
                 api_key,
                 &model,
                 runner_tx,
@@ -1141,7 +1249,33 @@ fn spawn_agent(
                     let first = input_rx.lock().await.recv().await;
                     agent_parked.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(first) = first {
-                        let _ = engine.run(&first).await;
+                        // Experience flywheel (new core): prime the request with a
+                        // learned procedure from a similar SUCCESSFUL conversation
+                        // earlier this session, then record this run. Empty store
+                        // (fresh session) → no priming → identical behaviour, so
+                        // this is purely additive. The prime is invisible to the
+                        // UI (which already shows the user's typed message); only
+                        // the agent sees it.
+                        let store = trajectory_store();
+                        let primed = match store.skill_hint(&first) {
+                            Some(hint) => {
+                                format!("{hint}\n\n---\nNow handle this request:\n{first}")
+                            }
+                            None => first.clone(),
+                        };
+                        let result = engine.run(&primed).await;
+                        if let Ok(output) = &result {
+                            store.record(heartbit_core::agent::Trajectory {
+                                task: first.clone(),
+                                actions: output
+                                    .tool_call_results
+                                    .iter()
+                                    .map(|r| r.tool_name.clone())
+                                    .collect(),
+                                success: output.goal_met != Some(false),
+                                result: output.result.clone(),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -1462,11 +1596,19 @@ async fn run_ui(
                     }
                 }
                 Effect::FetchModels => {
-                    // Fetch the OpenRouter catalog off the UI thread; the result
-                    // comes back as Msg::ModelsLoaded / ModelsFailed.
+                    // Fetch the model catalog off the UI thread; the result comes
+                    // back as Msg::ModelsLoaded / ModelsFailed. When a custom
+                    // endpoint is active (e.g. the Codex proxy via /codex), list
+                    // ITS models (`/v1/models`) so the picker offers the
+                    // subscription's models, not the OpenRouter catalogue.
                     let tx = ui_tx.clone();
+                    let endpoint = app.custom_endpoint.clone();
                     tokio::spawn(async move {
-                        let msg = match models::fetch_openrouter_models().await {
+                        let result = match &endpoint {
+                            Some(base) => models::fetch_openai_models(base).await,
+                            None => models::fetch_openrouter_models().await,
+                        };
+                        let msg = match result {
                             Ok(m) => Msg::ModelsLoaded(m),
                             Err(e) => Msg::ModelsFailed(e.to_string()),
                         };
@@ -1736,6 +1878,36 @@ mod permission_tests {
                 rules.evaluate(tool, &serde_json::json!({})),
                 Some(PermissionAction::Ask),
                 "{tool} must still ask"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_config_tests {
+    use super::*;
+
+    #[test]
+    fn delegated_sub_agents_get_a_high_turn_budget() {
+        // Regression: the old 60-turn cap killed the audit's investigation
+        // sub-agent mid-task (live trace 6a2e92e3 → "Max turns exceeded").
+        // A delegated audit/research run needs a much larger budget.
+        let cwd = std::path::PathBuf::from("/tmp");
+        let agents = default_sub_agents(&cwd, &[], false, None, false);
+        assert!(!agents.is_empty());
+        for a in &agents {
+            assert_eq!(
+                a.max_turns,
+                Some(SUB_AGENT_MAX_TURNS),
+                "{} must carry the high sub-agent turn budget",
+                a.name
+            );
+            // Floor check via the runtime value (not the const) so it stays well
+            // above the old 60-turn cap that killed the audit's researcher.
+            assert!(
+                a.max_turns.unwrap() >= 200,
+                "{} sub-agent budget must stay >= 200 (old cap 60 failed)",
+                a.name
             );
         }
     }
