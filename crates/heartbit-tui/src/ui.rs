@@ -413,7 +413,7 @@ pub fn view(frame: &mut Frame, app: &App) {
             }
             mlines.push(Line::raw(""));
             mlines.push(Line::from(Span::styled(
-                "[y] allow   [a] always allow   [n] deny",
+                "[y] allow   [a] always allow   [n] deny   [d] always deny",
                 Style::default().fg(Color::Cyan),
             )));
             let h = (mlines.len() as u16 + 2).min(area.height);
@@ -1780,6 +1780,32 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("-old code"), "diff removal missing:\n{text}");
         assert!(text.contains("+new code"), "diff addition missing:\n{text}");
+    }
+
+    #[test]
+    fn approval_modal_hint_lists_every_answer_key() {
+        use crate::msg::PendingTool;
+        use std::sync::mpsc::sync_channel;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        let (tx, _rx) = sync_channel(1);
+        app.update(crate::msg::Msg::Approval {
+            tools: vec![PendingTool {
+                name: "bash".into(),
+                input: "{}".into(),
+            }],
+            reply: tx,
+        });
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        // Every key `handle_approval_key` actually handles must be advertised.
+        for k in ["y", "n", "a", "d"] {
+            assert!(
+                text.contains(&format!("[{k}]")),
+                "approval hint must advertise [{k}]:\n{text}"
+            );
+        }
     }
 
     #[test]

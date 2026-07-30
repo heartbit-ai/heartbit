@@ -1834,7 +1834,9 @@ impl App {
                     self.permission_mode.describe()
                 )));
             }
-            KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
+            // Ctrl+U clears the DRAFT only — the recall history (seeded from
+            // previous sessions in this directory) must survive.
+            KeyCode::Char('u') if ctrl => self.composer.clear(),
             // Ctrl+R: reverse-search the submit history.
             KeyCode::Char('r') if ctrl => {
                 self.modal = Some(Modal::HistorySearch(HistorySearch::default()));
@@ -3650,6 +3652,22 @@ mod tests {
         typed(&mut app, "b");
         assert_eq!(app.composer.text(), "a\nb");
         assert!(app.effects.is_empty(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_draft_but_keeps_recall_history() {
+        let mut app = keyed();
+        app.composer.seed_history(vec!["earlier prompt".into()]);
+        typed(&mut app, "a draft");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)));
+        typed(&mut app, "with two lines");
+        app.update(ctrl('u'));
+        // The draft is gone and the cursor is genuinely reset (row too).
+        assert!(app.composer.text().is_empty());
+        assert_eq!(app.composer.cursor(), (0, 0));
+        // …but the seeded history survives: Up recalls it.
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "earlier prompt");
     }
 
     #[test]
