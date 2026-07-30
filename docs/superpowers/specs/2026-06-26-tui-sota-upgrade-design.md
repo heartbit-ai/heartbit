@@ -35,8 +35,10 @@ behind on five, in order of severity:
    (only `EnableMouseCapture`, `main.rs:324`) although the crossterm feature is
    compiled in (`Cargo.toml:78`) and the `Event::Paste` arm exists
    (`main.rs:1101`); Kitty keyboard flags are never pushed, so the
-   already-implemented-and-tested Shift+Enter newline (`app.rs:1817`, test
-   `app.rs:3649`) is unreachable on most terminals.
+   already-implemented-and-tested **Shift**+Enter newline (`app.rs:1817`, test
+   `app.rs:3649`) never receives its modifier on most terminals. (Alt+Enter *does*
+   work today — the branch is `if shift || alt` — so this is a missing second
+   newline binding, not a total absence.)
 4. **The reading surface is flat.** Code renders in one colour
    (`markdown.rs:10`), diffs are line-level only (`diff.rs`), no transcript
    search, no expandable tool output.
@@ -86,7 +88,7 @@ acceptance condition, not advice.
 |---|------|------|----------------------------|
 | **C1** | `initial_messages(Vec<Message>)` history-reseed seam on `AgentRunnerBuilder`, mirrored on the orchestrator entry agent | 2 | **Named acceptance criteria:** (a) a seeded history survives **one full compaction cycle** with absolute message indices correctly re-anchored (regression source: lessons 2026-06-09); (b) with `initial_messages` unset, behaviour is **byte-identical** to today; (c) alternating-role invariants hold for any seeded transcript, including one ending on a tool call |
 | **C2** | Ranged compaction entry point ("summarize from / up to here") | 2 | Reuses the existing estimate-aware compaction path (`runner.rs:372-379`); automatic compaction behaviour unchanged |
-| **C3** | Post-edit formatter hook in `write`/`edit`/`patch`, gated by `BuiltinToolsConfig` | 1 | The shared `FileTracker` mtime is **refreshed after the formatter rewrites the file**, or the next edit falsely trips the read-before-write guard; a formatter failure never fails the edit; default configuration is a no-op |
+| **C3** | Post-edit formatter hook in `write`/`edit`/`patch`, gated by `BuiltinToolsConfig` | 1 | Formatting happens **in memory, before the single write** (stdin→stdout, the subprocess never receives a path): that keeps `FileTracker`'s post-write `record_read` matching the final bytes, keeps the returned snippet consistent with disk, and preserves the F-FS-1 `write_beneath_root`/`write_no_follow` symlink hardening. A formatter failure never fails the edit; the default configuration is a no-op |
 | **C4** | Skill invocation: `$ARGUMENTS` / `$N` / named substitution; opt-in `` !`cmd` `` pre-render; frontmatter `allowed-tools` as a one-turn grant via `PermissionRuleset::append_rules` | 3 | Skill-name path-traversal validation stays intact; the model-triggered skill path is unchanged; shell pre-render ships **default-off** |
 | **C5** | `ShellHookGuardrail` (implements the existing `Guardrail` trait) + new firing points for SessionStart/SessionEnd/PreCompact | 3 | First-`Deny`-wins ordering; fail-open on timeout (precedent: `LlmJudgeGuardrail`); standalone-path scoping unchanged |
 | **C6** | Steer slot checked at the tool boundary, sibling to `InterruptHandle` | 3 | Injected text becomes a correctly-ordered user message; never spliced mid-LLM-stream; interrupt semantics untouched |
@@ -165,10 +167,16 @@ a thing a human runs, not a test count.
 ### Wave 1 — Table stakes + shelfware
 **Core:** C3 only. **Sub-spec:** `2026-06-26-tui-wave1-table-stakes-design.md`
 
-Tier 0 (persistent approval rules, LSP diagnostics, `/effort`, Kitty keyboard
-flags, bracketed paste + focus events, two micro-defects) plus the visible input
-queue, syntax highlighting, word-level diffs, `/diff`, post-edit formatters, and
+Tier 0 (persistent approval rules, `/effort`, Kitty keyboard flags, bracketed
+paste + focus events, two micro-defects) plus the visible input queue, syntax
+highlighting, word-level diffs, `/diff`, post-edit formatters, and
 turn-completion notifications.
+
+> **LSP diagnostics moved to Wave 1.5** (sub-spec decision D-1): verification
+> showed that wiring `.lsp_manager()` as-is ships a guaranteed 30 s stall with
+> zero diagnostics (`lsp/server.rs:195-239`) plus a malformed `file://` URI
+> (`server.rs:89`,`:148`), i.e. three more core changes of which two are not
+> optional. Deferring is what keeps "Wave 1 needs C3 only" true.
 
 > **Acceptance signal:** in a Kitty-protocol terminal, paste a 5-line block — it
 > lands as a *single* draft and Shift+Enter inserts a newline; approve a tool
