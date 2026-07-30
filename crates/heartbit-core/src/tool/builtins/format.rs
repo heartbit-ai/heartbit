@@ -90,8 +90,8 @@ pub async fn format_content(cfg: &FormatterConfig, path: &Path, content: &str) -
     // exceeds the pipe buffer would otherwise deadlock on large files.
     let writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&bytes).await;
-        let _ = stdin.shutdown().await;
+        stdin.write_all(&bytes).await?;
+        stdin.shutdown().await
     });
 
     let output = match tokio::time::timeout(cfg.timeout, child.wait_with_output()).await {
@@ -102,7 +102,18 @@ pub async fn format_content(cfg: &FormatterConfig, path: &Path, content: &str) -
             return None;
         }
     };
-    let _ = writer.await;
+
+    // CORRECTNESS: Rust ignores SIGPIPE, so a formatter that exits 0 without
+    // reading all of stdin (a `head`-style wrapper, an internal size limit)
+    // makes our write fail with a plain EPIPE `io::Error` instead of killing
+    // the process — but `output.status` can still read as success with
+    // non-empty (partial) stdout. A formatter that never consumed the whole
+    // buffer cannot have faithfully transformed it, so only trust the output
+    // when the writer finished writing (and closing) stdin without error.
+    match writer.await {
+        Ok(Ok(())) => {}
+        _ => return None,
+    }
 
     if !output.status.success() || output.stdout.is_empty() {
         return None;
@@ -188,6 +199,22 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(format_content(&c, Path::new("a.rs"), "x").await.is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn partial_stdin_consumption_is_skipped_not_truncated() {
+        // `head -c 10` reads only its first chunk of stdin then exits 0,
+        // closing the read end of the pipe long before the writer can finish
+        // sending 1MB. Rust ignores SIGPIPE, so the writer's write_all fails
+        // with a plain io::Error (EPIPE) instead of killing the process —
+        // but the child's exit status and (truncated) stdout can still look
+        // like a success. A formatter that never consumed the whole buffer
+        // cannot have faithfully transformed it: this must fail open, never
+        // hand back the truncated bytes it happened to echo.
+        let c = cfg("rs", &["head", "-c", "10"]);
+        let big = "x".repeat(1_000_000);
+        let out = format_content(&c, Path::new("a.rs"), &big).await;
+        assert!(out.is_none(), "expected fail-open, got: {out:?}");
     }
 
     #[tokio::test]

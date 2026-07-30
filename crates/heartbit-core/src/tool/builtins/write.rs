@@ -133,27 +133,9 @@ impl Tool for WriteTool {
             };
 
             // If file exists, enforce read-before-write guard
-            if target.exists() {
-                if let Err(msg) = self.file_tracker.check_unmodified(&target) {
-                    return Ok(ToolOutput::error(msg));
-                }
-
-                // Skip write if content identical. The message is deliberately
-                // emphatic: a model that keeps re-writing the same content
-                // usually believes the write FAILED — when it actually
-                // succeeded and the file is fine, just not where the model is
-                // looking (live finding 6a25d21b: bash cwd drift made the file
-                // invisible, so the model rewrote it in a doom loop).
-                if let Ok(existing) = tokio::fs::read_to_string(&target).await
-                    && existing == content
-                {
-                    return Ok(ToolOutput::success(format!(
-                        "File already has EXACTLY this content — the write SUCCEEDED, \
-                         nothing to do: {file_path}. Do NOT write it again. If you can't \
-                         find or run it, the problem is your working directory or path, not \
-                         the write — check `pwd` and use an absolute path."
-                    )));
-                }
+            let target_exists = target.exists();
+            if target_exists && let Err(msg) = self.file_tracker.check_unmodified(&target) {
+                return Ok(ToolOutput::error(msg));
             }
 
             // Format in memory BEFORE the single write: keeps the post-write
@@ -162,6 +144,14 @@ impl Tool for WriteTool {
             // path (F-FS-1 symlink hardening stays in force). `Cow` avoids
             // cloning `content` on the (default) no-formatter path — unlike
             // edit.rs/patch.rs, write.rs's buffer starts as a borrowed `&str`.
+            //
+            // This runs BEFORE the identical-content check below (not after,
+            // as originally written) so that check compares against the SAME
+            // bytes that would land on disk. Comparing the raw, unformatted
+            // incoming text against disk would never match again once a file
+            // has been formatted once — disk always holds formatted bytes
+            // from then on — silently defeating the anti-doom-loop guard the
+            // message below exists for.
             let content: std::borrow::Cow<'_, str> = match &self.formatters {
                 Some(fc) => match super::format::format_content(fc, &target, content).await {
                     Some(formatted) => std::borrow::Cow::Owned(formatted),
@@ -170,6 +160,24 @@ impl Tool for WriteTool {
                 None => std::borrow::Cow::Borrowed(content),
             };
             let content = content.as_ref();
+
+            // Skip write if content identical. The message is deliberately
+            // emphatic: a model that keeps re-writing the same content
+            // usually believes the write FAILED — when it actually
+            // succeeded and the file is fine, just not where the model is
+            // looking (live finding 6a25d21b: bash cwd drift made the file
+            // invisible, so the model rewrote it in a doom loop).
+            if target_exists
+                && let Ok(existing) = tokio::fs::read_to_string(&target).await
+                && existing == content
+            {
+                return Ok(ToolOutput::success(format!(
+                    "File already has EXACTLY this content — the write SUCCEEDED, \
+                     nothing to do: {file_path}. Do NOT write it again. If you can't \
+                     find or run it, the problem is your working directory or path, not \
+                     the write — check `pwd` and use an absolute path."
+                )));
+            }
 
             let bytes = content.len();
             match write_root {
@@ -530,6 +538,71 @@ mod tests {
         // intervening read must pass, which is the whole point of formatting
         // before the single write.
         assert!(tracker.check_unmodified(&target).is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_doom_loop_guard_compares_against_the_formatted_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+        let fc = std::sync::Arc::new(fc);
+
+        // First write: "hello" formats to "HELLO" on disk.
+        let tool1 = WriteTool::new(tracker.clone(), None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(fc.clone());
+        tool1
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "HELLO");
+
+        // Second write of the SAME source text — the model re-sends "hello",
+        // believing nothing happened. The doom-loop guard must compare
+        // against the FORMATTED buffer ("HELLO", matching disk) and
+        // short-circuit with the emphatic "already succeeded" message (live
+        // finding 6a25d21b), rather than silently reformatting/rewriting on
+        // every turn.
+        let tool2 =
+            WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new())).with_formatters(fc);
+        let result = tool2
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("write SUCCEEDED"),
+            "expected the anti-doom-loop message, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let tool = WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(std::sync::Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "hello");
     }
 
     #[tokio::test]

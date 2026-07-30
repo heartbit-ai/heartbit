@@ -216,8 +216,17 @@ impl Tool for EditTool {
             // Update tracker
             let _ = self.file_tracker.record_read(&target);
 
-            // Build output: show changed lines with context
-            let output = format_edit_snippet(&new_content, idx, new_string.len());
+            // Build output: show changed lines with context. `idx`/
+            // `new_string.len()` were computed against the PRE-format buffer;
+            // if formatting shrank the content past that point, an unclamped
+            // offset makes `format_edit_snippet` fall through to dumping the
+            // WHOLE (already-formatted) buffer instead of a bounded window.
+            // Clamping degrades that case to "tail of file" instead.
+            let snippet_offset = idx.min(new_content.len());
+            let snippet_len = new_string
+                .len()
+                .min(new_content.len().saturating_sub(snippet_offset));
+            let output = format_edit_snippet(&new_content, snippet_offset, snippet_len);
 
             Ok(ToolOutput::success(output))
         })
@@ -555,6 +564,53 @@ mod tests {
         // The mtime guard matches the FINAL bytes — a follow-up edit with no
         // intervening read must pass.
         assert!(tracker.check_unmodified(&path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_snippet_clamps_to_the_formatted_buffer_not_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let mut original = String::new();
+        for n in 1..=30 {
+            original.push_str(&format!("line{n:02}\n"));
+        }
+        std::fs::write(&path, &original).unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        // `head -c 65` truncates the POST-replacement buffer down to 65 bytes
+        // — the first 9 full lines plus 2 chars of the 10th — far short of
+        // where `idx`/`new_string.len()` (computed against the PRE-format,
+        // ~200+ byte buffer) point.
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["head".into(), "-c".into(), "65".into()]);
+
+        let tool = EditTool::new(tracker.clone(), None, Arc::new(Vec::new()))
+            .with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "line30",
+                    "new_string": "line30_EXTENDED_TAIL_TEXT"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        // On disk: the truncated buffer.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 65);
+        // The snippet must be bounded by the (short) formatted content — a
+        // stale, pre-format offset must NOT fall through to dumping the
+        // whole buffer from line 1.
+        assert!(
+            !result.content.contains("line01"),
+            "snippet should not dump from the start of the file: {}",
+            result.content
+        );
     }
 
     #[test]
