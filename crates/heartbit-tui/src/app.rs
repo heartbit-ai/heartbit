@@ -1364,6 +1364,11 @@ impl App {
         if let Some(q) = self.queued.pop_front() {
             self.history.push(Cell::User(q.display));
             self.running = true; // the drained message starts a fresh turn
+            // Dropping `follow` on a mid-turn SUBMIT is fine (the user was
+            // scrolled up reading); but a DRAIN starts a brand-new turn whose
+            // reply should be visible — re-arm it here, or the new answer
+            // streams off-screen while the view stays wherever it was left.
+            self.follow = true;
             self.effects.push(Effect::SendInput(q.wire));
         }
     }
@@ -5212,9 +5217,13 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_drops_the_queue_too() {
-        // Interrupt also sets running = false — it must not strand the queue
-        // either (same invariant as the two failure sites).
+    fn esc_twice_drops_then_interrupts() {
+        // Review rename (2026-07-30): `interrupt()`'s own internal
+        // `drop_queued()` call is unreachable — its single caller (the Esc
+        // key handler) already routes a non-empty queue to `drop_queued()`
+        // directly and only calls `interrupt()` once the queue is empty. This
+        // test proves that two-press Esc behavior at the KEY-HANDLER level,
+        // not that `interrupt()`'s internal call fires — it never does.
         let mut app = keyed();
         app.running = true;
         typed(&mut app, "stranded by interrupt");
@@ -5242,6 +5251,53 @@ mod tests {
                 .contains(&Effect::SendInput("queued for completion".into()))
         );
         assert!(app.running, "the drained message starts a new turn");
+    }
+
+    #[test]
+    fn drain_re_arms_follow_so_the_new_reply_is_visible() {
+        // Review F2 (2026-07-30): dropping `follow` on a mid-turn SUBMIT is
+        // fine (the user was scrolled up reading); the cost lands at DRAIN,
+        // where a brand-new turn begins and its reply must not stream
+        // off-screen while the view stays wherever the user left it.
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued while scrolled up");
+        app.update(key(KeyCode::Enter));
+        // Scroll away from the bottom — mirrors `sending_a_message_re_pins_to_bottom`.
+        app.scroll_offset(100);
+        app.update(Msg::WheelUp);
+        assert!(!app.follow, "scrolling up unpins from the bottom");
+        app.update(Msg::RunCompleted);
+        assert!(
+            app.follow,
+            "a drained message starts a new turn — its reply must be visible"
+        );
+    }
+
+    #[test]
+    fn mid_turn_analyze_ready_queues_instead_of_bypassing() {
+        // Review F3: only `submit()` had mid-turn coverage — the other six
+        // choke-point senders could regress to a direct `effects.push(
+        // Effect::SendInput(..))` and every existing idle-only test (e.g.
+        // `analyze_ready_starts_a_run_with_the_task`) would stay green. This
+        // guards the pattern on a second, representative sender.
+        let mut app = keyed();
+        app.running = true;
+        app.update(Msg::AnalyzeReady {
+            display: "analyzing session s1".into(),
+            task: "the big prompt".into(),
+        });
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "AnalyzeReady must queue, not bypass, mid-turn"
+        );
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_))),
+            "no direct send while a turn is already running"
+        );
     }
 
     #[test]
