@@ -1194,10 +1194,11 @@ async fn connect_mcp(
 /// approval modal (Normal mode only — YOLO short-circuits to allow-all before
 /// this ruleset is ever consulted, and Plan mode denies mutations outright).
 /// `[a]`lways-allow persists as a learned rule for that tool — `learned` rules
-/// come FIRST, because [`PermissionRuleset::evaluate`] is first-match-wins;
-/// putting them after the hardcoded defaults would make them unreachable for
-/// any tool the defaults already cover (this was the bug: the old terminal
-/// `*/*→Ask` catch-all sat in front of every learned/in-session rule).
+/// are checked BEFORE the hardcoded defaults below, because
+/// [`PermissionRuleset::evaluate`] is first-match-wins; putting them after
+/// would make them unreachable for any tool the defaults already cover (this
+/// was the bug: the old terminal `*/*→Ask` catch-all sat in front of every
+/// learned/in-session rule).
 ///
 /// There is deliberately NO terminal catch-all rule anymore: an unmatched
 /// tool now evaluates to `None`, not `Some(Ask)`. That is safe only because
@@ -1205,13 +1206,32 @@ async fn connect_mcp(
 /// exact same `needs_approval` arm — pinned by
 /// `heartbit-core`'s `ask_and_none_both_route_to_approval` test so this
 /// invariant can't silently regress into Yolo.
+///
+/// The four harness-dialogue tools (`question`/`set_goal`/`set_scope`/`handoff`)
+/// are the ONE exception to learned-first: they are pinned AHEAD of `learned`,
+/// not just ahead of the other defaults. They touch no workspace file —
+/// asking the user to APPROVE the agent's request to ask them a question is a
+/// double modal (live finding, session 6a254624); set_goal/set_scope mutate
+/// in-process harness state only; handoff writes its brief OUTSIDE the
+/// workspace (`<config>/handoffs`) — so no learned rule may ever deny them,
+/// from EITHER surface. This matters because `learned_permissions_path()`
+/// resolves to the same on-disk store `heartbit-cli` reads/writes
+/// (`heartbit-cli/src/main.rs` around `LearnedPermissions::default_path()`):
+/// without this pin, denying `question` once in a CLI run would silently kill
+/// it in every future TUI session too, with no in-TUI way to recover.
 fn merged_permissions(learned: &[PermissionRule]) -> PermissionRuleset {
     let allow = |tool: &str| PermissionRule {
         tool: tool.into(),
         pattern: "*".into(),
         action: PermissionAction::Allow,
     };
-    let mut rules = learned.to_vec();
+    let mut rules = vec![
+        allow("question"),
+        allow("set_goal"),
+        allow("set_scope"),
+        allow("handoff"),
+    ];
+    rules.extend(learned.to_vec());
     rules.extend([
         allow("read"),
         allow("grep"),
@@ -1219,15 +1239,6 @@ fn merged_permissions(learned: &[PermissionRule]) -> PermissionRuleset {
         allow("list"),
         allow("todoread"),
         allow("todowrite"),
-        // Harness-dialogue tools: no workspace effect — asking the user to
-        // APPROVE the agent's request to ask them a question is a double
-        // modal (live finding, session 6a254624). set_goal/set_scope mutate
-        // in-process harness state only; handoff writes its brief OUTSIDE the
-        // workspace (<config>/handoffs).
-        allow("question"),
-        allow("set_goal"),
-        allow("set_scope"),
-        allow("handoff"),
     ]);
     PermissionRuleset::new(rules)
 }
@@ -2108,6 +2119,46 @@ mod permission_tests {
             merged_permissions(&learned).evaluate("read", &serde_json::json!({})),
             Some(PermissionAction::Deny),
             "a learned rule must be able to override a hardcoded default"
+        );
+    }
+
+    #[test]
+    fn merged_permissions_pins_dialogue_tools_ahead_of_learned_denies() {
+        // Escalated review finding: `learned_permissions_path()` resolves to
+        // the SAME on-disk store heartbit-cli reads/writes
+        // (LearnedPermissions::default_path()). Without this pin, a `[d]` on
+        // `question` in a CLI run would write `question:*→Deny`, and because
+        // learned rules go first, that rule would override the TUI's
+        // hardcoded `allow("question")` — killing the harness-dialogue tool
+        // in every future TUI session with no in-TUI recovery. The four
+        // dialogue tools must be un-blockable by ANY learned rule, from
+        // either surface.
+        let learned = vec![
+            PermissionRule {
+                tool: "question".into(),
+                pattern: "*".into(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                tool: "read".into(),
+                pattern: "*".into(),
+                action: PermissionAction::Deny,
+            },
+        ];
+        let rules = merged_permissions(&learned);
+        // The dialogue tool is un-blockable...
+        assert_eq!(
+            rules.evaluate("question", &serde_json::json!({})),
+            Some(PermissionAction::Allow),
+            "a learned Deny must not be able to block a harness-dialogue tool"
+        );
+        // ...but the pin is narrow, not a blanket demotion of all learned
+        // rules: a non-dialogue tool's learned Deny still overrides its
+        // hardcoded default.
+        assert_eq!(
+            rules.evaluate("read", &serde_json::json!({})),
+            Some(PermissionAction::Deny),
+            "learned rules must still win over hardcoded defaults for non-dialogue tools"
         );
     }
 }
