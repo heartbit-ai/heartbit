@@ -177,11 +177,47 @@ impl PermissionMode {
     }
 }
 
+/// Reasoning-effort level the user selected. `Off` (the default) omits the field
+/// entirely, reproducing today's requests bit-for-bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortLevel {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl EffortLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// The four levels in picker order.
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+}
+
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/mode", "set execution mode: normal | plan | yolo"),
     ("/model", "set the model (`/model advisor` for the advisor)"),
+    ("/effort", "set reasoning effort (off|low|medium|high)"),
     (
         "/handoff",
         "brief for another session (`/handoff <purpose>`)",
@@ -231,6 +267,9 @@ pub enum Effect {
     SaveKey(String),
     /// Persist a new model id to the config file.
     SaveModel(String),
+    /// Persist the reasoning-effort level to the config file (`None` = off,
+    /// omitting the field entirely rather than storing `"off"`).
+    SaveReasoningEffort(Option<String>),
     /// Persist the advisor's frontier model to the config file (None = clear,
     /// falling back to the main model).
     SaveFrontierModel(Option<String>),
@@ -288,6 +327,7 @@ impl Effect {
             Effect::SendInput(_) => "send_input",
             Effect::SaveKey(_) => "save_key",
             Effect::SaveModel(_) => "save_model",
+            Effect::SaveReasoningEffort(_) => "save_reasoning_effort",
             Effect::SaveFrontierModel(_) => "save_frontier_model",
             Effect::SaveMcp(_) => "save_mcp",
             Effect::FetchModels => "fetch_models",
@@ -394,6 +434,11 @@ pub enum Modal {
     ModePicker {
         sel: usize,
     },
+    /// `/effort` picker: choose the reasoning-effort level (`sel` indexes
+    /// [`EffortLevel::ALL`]).
+    EffortPicker {
+        sel: usize,
+    },
     HistorySearch(HistorySearch),
     SessionPicker(SessionPicker),
 }
@@ -410,6 +455,10 @@ pub struct App {
     pub composer: Composer,
     pub modal: Option<Modal>,
     pub model: String,
+    /// Reasoning-effort level (`/effort`), gated to OpenRouter/custom-endpoint
+    /// providers only — `main.rs::effort_for_provider` never lets it reach the
+    /// `ANTHROPIC_API_KEY` fallback. Applies on next agent start.
+    pub effort: EffortLevel,
     /// The OpenRouter API key in effect (from env, config, or set in-TUI).
     pub api_key: Option<String>,
     /// True when a provider can start without an OpenRouter key (e.g. an
@@ -525,6 +574,7 @@ impl App {
             composer: Composer::new(),
             modal: None,
             model: model.into(),
+            effort: EffortLevel::default(),
             api_key: None,
             has_fallback_provider: false,
             custom_endpoint: None,
@@ -764,7 +814,8 @@ impl App {
                     | Some(Modal::Question(_))
                     | Some(Modal::SessionPicker(_))
                     | Some(Modal::HandoffPicker { .. })
-                    | Some(Modal::ModePicker { .. }) => {}
+                    | Some(Modal::ModePicker { .. })
+                    | Some(Modal::EffortPicker { .. }) => {}
                     None => self.composer.insert_str(&s),
                 }
             }
@@ -1254,6 +1305,16 @@ impl App {
                     self.set_model(arg);
                 }
             }
+            "effort" => {
+                if arg.is_empty() {
+                    self.open_effort_picker();
+                } else if let Some(level) = EffortLevel::parse(&arg) {
+                    self.set_effort(level);
+                } else {
+                    self.history
+                        .push(Cell::Notice("usage: /effort off|low|medium|high".into()));
+                }
+            }
             "codex" => self.activate_codex(arg),
             "mcp" => self.handle_mcp(arg),
             "mode" => self.set_mode(arg),
@@ -1388,9 +1449,9 @@ impl App {
             }
             "help" => {
                 self.history.push(Cell::Notice(
-                    "commands: /mode [normal|plan|yolo] · /model [name] · /mcp [list|add …|clear] · \
-                     /stats · /analyze · /learn · /research <question> · /verify <cmd> · /clear · \
-                     /resume · /export · /key · /quit"
+                    "commands: /mode [normal|plan|yolo] · /model [name] · /effort [off|low|medium|high] · \
+                     /mcp [list|add …|clear] · /stats · /analyze · /learn · /research <question> · \
+                     /verify <cmd> · /clear · /resume · /export · /key · /quit"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(
@@ -1512,6 +1573,31 @@ impl App {
         let when = self.queue_respawn();
         self.history
             .push(Cell::Notice(format!("model set to {model} — {when}")));
+    }
+
+    /// Set the reasoning-effort level (same semantics as `/effort <level>`):
+    /// update, persist, notice. `Off` clears the config key entirely (rather
+    /// than persisting `"off"`) so a stale value never lingers. Takes effect
+    /// on the next agent start (gated to OpenRouter/custom-endpoint providers
+    /// in `main.rs::effort_for_provider` — never the Anthropic fallback).
+    fn set_effort(&mut self, level: EffortLevel) {
+        self.effort = level;
+        let saved = (level != EffortLevel::Off).then(|| level.label().to_string());
+        self.effects.push(Effect::SaveReasoningEffort(saved));
+        let when = self.queue_respawn();
+        self.history.push(Cell::Notice(format!(
+            "reasoning effort set to {} — {when}",
+            level.label()
+        )));
+    }
+
+    /// Bare `/effort`: open the picker, preselected on the current level.
+    fn open_effort_picker(&mut self) {
+        let sel = EffortLevel::ALL
+            .iter()
+            .position(|l| *l == self.effort)
+            .unwrap_or(0);
+        self.modal = Some(Modal::EffortPicker { sel });
     }
 
     /// `/codex [url|off]` — one command to run the TUI on a ChatGPT-subscription
@@ -1930,6 +2016,7 @@ impl App {
             Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
             Some(Modal::HandoffPicker { .. }) => self.handle_handoff_picker_key(key),
             Some(Modal::ModePicker { .. }) => self.handle_mode_picker_key(key),
+            Some(Modal::EffortPicker { .. }) => self.handle_effort_picker_key(key),
             None => {}
         }
     }
@@ -2046,6 +2133,36 @@ impl App {
                         mode.label(),
                         mode.describe()
                     )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `/effort` picker keys: ↑/↓ select (wrap), Enter apply, Esc cancel.
+    fn handle_effort_picker_key(&mut self, key: KeyEvent) {
+        let n = EffortLevel::ALL.len();
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up => {
+                if let Some(Modal::EffortPicker { sel }) = &mut self.modal {
+                    *sel = (*sel + n - 1) % n;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(Modal::EffortPicker { sel }) = &mut self.modal {
+                    *sel = (*sel + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let level = match &self.modal {
+                    Some(Modal::EffortPicker { sel }) => EffortLevel::ALL.get(*sel).copied(),
+                    _ => None,
+                };
+                self.modal = None;
+                // Same application path as `/effort <arg>`.
+                if let Some(level) = level {
+                    self.set_effort(level);
                 }
             }
             _ => {}
@@ -2864,6 +2981,122 @@ mod tests {
             app.effects.contains(&Effect::RespawnAgent),
             "Esc ends the turn — the deferred respawn must flush"
         );
+    }
+
+    #[test]
+    fn effort_level_parse_and_label_roundtrip() {
+        for (s, lvl) in [
+            ("off", EffortLevel::Off),
+            ("low", EffortLevel::Low),
+            ("medium", EffortLevel::Medium),
+            ("high", EffortLevel::High),
+        ] {
+            assert_eq!(EffortLevel::parse(s), Some(lvl));
+            assert_eq!(lvl.label(), s);
+        }
+        assert_eq!(EffortLevel::parse("HIGH"), Some(EffortLevel::High));
+        assert_eq!(EffortLevel::parse("turbo"), None);
+        assert_eq!(EffortLevel::default(), EffortLevel::Off);
+    }
+
+    #[test]
+    fn slash_effort_sets_level_persists_and_requests_respawn() {
+        let mut app = keyed();
+        typed(&mut app, "/effort high");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::High);
+        assert!(
+            app.effects
+                .contains(&Effect::SaveReasoningEffort(Some("high".into())))
+        );
+        assert!(app.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn slash_effort_off_clears_and_drops_the_config_key() {
+        let mut app = keyed();
+        typed(&mut app, "/effort high");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        typed(&mut app, "/effort off");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(app.effects.contains(&Effect::SaveReasoningEffort(None)));
+    }
+
+    #[test]
+    fn slash_effort_mid_run_defers_respawn_to_turn_idle() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "/effort low");
+        app.update(key(KeyCode::Enter));
+        assert!(app.pending_respawn);
+        assert!(!app.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn slash_effort_unknown_arg_reports_usage_and_changes_nothing() {
+        let mut app = keyed();
+        typed(&mut app, "/effort turbo");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveReasoningEffort(_)))
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("usage")))
+        );
+    }
+
+    #[test]
+    fn slash_effort_bare_opens_picker_preselected_on_current_level() {
+        let mut app = keyed();
+        app.effort = EffortLevel::Medium;
+        typed(&mut app, "/effort");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::EffortPicker { sel: 2 }) // Medium is EffortLevel::ALL[2]
+        ));
+    }
+
+    #[test]
+    fn effort_picker_enter_applies_the_highlighted_level() {
+        let mut app = keyed();
+        app.modal = Some(Modal::EffortPicker { sel: 3 }); // High
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::High);
+        assert!(app.modal.is_none());
+        assert!(
+            app.effects
+                .contains(&Effect::SaveReasoningEffort(Some("high".into())))
+        );
+    }
+
+    #[test]
+    fn effort_picker_esc_cancels_without_changing_anything() {
+        let mut app = keyed();
+        app.effort = EffortLevel::Off;
+        app.modal = Some(Modal::EffortPicker { sel: 3 });
+        app.update(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(app.effects.is_empty());
+    }
+
+    #[test]
+    fn paste_into_effort_picker_is_a_no_op() {
+        // Mirrors the ModePicker contract in Msg::Paste's match — a picker
+        // has no text field, so a paste must not leak anywhere.
+        let mut app = keyed();
+        app.modal = Some(Modal::EffortPicker { sel: 0 });
+        app.update(Msg::Paste("ignored".into()));
+        assert!(matches!(app.modal, Some(Modal::EffortPicker { sel: 0 })));
+        assert!(app.composer.is_empty());
     }
 
     #[test]

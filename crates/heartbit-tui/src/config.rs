@@ -73,6 +73,14 @@ pub struct TuiConfig {
     /// The model id (e.g. `qwen/qwen3-235b-a22b-2507`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level (`off` | `low` | `medium` | `high`), set via
+    /// `/effort`. Deliberately a plain `Option<String>`, not a typed enum:
+    /// `TuiConfig::load_from` swallows any parse error and returns `Default`,
+    /// so a typo in a typed field would silently wipe the whole config
+    /// (including the stored API key). Unset/absent = `off` (the default —
+    /// no `reasoning` field sent, matching pre-Task-5 behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// MCP servers to connect when the agent starts (builtins still take priority).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerSpec>,
@@ -145,6 +153,7 @@ impl Default for TuiConfig {
         Self {
             openrouter_api_key: None,
             model: None,
+            reasoning_effort: None,
             mcp_servers: Vec::new(),
             multi_agent: false,
             context_recall: true,
@@ -260,6 +269,28 @@ mod tests {
             toml::from_str("fast_model = \"q/light\"\nfrontier_model = \"a/opus\"").unwrap();
         assert_eq!(cfg.fast_model.as_deref(), Some("q/light"));
         assert_eq!(cfg.frontier_model.as_deref(), Some("a/opus"));
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_to_none_and_roundtrips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.reasoning_effort.is_none(), "missing key means unset");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        let saved = TuiConfig {
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        saved.save_to(&path).unwrap();
+        assert_eq!(TuiConfig::load_from(&path), saved);
+        // None must be omitted from the file, not serialized as an empty key.
+        let bare_path = dir.path().join("bare.toml");
+        TuiConfig::default().save_to(&bare_path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&bare_path)
+                .unwrap()
+                .contains("reasoning_effort")
+        );
     }
 
     #[test]

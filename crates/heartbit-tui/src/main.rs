@@ -255,6 +255,11 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         )));
     app.fast_model = cfg.fast_model.clone();
     app.frontier_model = cfg.frontier_model.clone();
+    app.effort = cfg
+        .reasoning_effort
+        .as_deref()
+        .and_then(app::EffortLevel::parse)
+        .unwrap_or_default();
     app.workflow_journal_dir = session::sessions_dir().join("journals").join(&session_id);
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
@@ -502,6 +507,36 @@ fn build_provider(
     anyhow::bail!("no OpenRouter API key configured (set one with /key or OPENROUTER_API_KEY)")
 }
 
+/// Gate the effort by provider. Only OpenRouter and custom OpenAI-compatible
+/// endpoints get it; the ANTHROPIC_API_KEY fallback must never receive it: on
+/// the non-streaming sub-agent path, Anthropic's `ApiContentBlock` is
+/// `Text | ToolUse` with `#[serde(tag = "type")]` and no `#[serde(other)]`
+/// (anthropic.rs:778-789), so a returned `thinking` block fails deserialization
+/// and the sub-agent errors out. `Off` always omits the field — never
+/// `ReasoningEffort::None`, which would emit `reasoning: {"effort":"none"}`, a
+/// request this TUI never sent before this feature.
+fn effort_for_provider(
+    level: app::EffortLevel,
+    custom_endpoint: Option<&str>,
+    openrouter_key: Option<&str>,
+) -> Option<heartbit_core::ReasoningEffort> {
+    use heartbit_core::ReasoningEffort;
+    // Mirror `build_provider`'s own custom-endpoint condition exactly
+    // (`custom_endpoint.filter(|u| !u.trim().is_empty())`): a blank/whitespace
+    // endpoint makes `build_provider` fall through to OpenRouter/Anthropic, so
+    // this gate must treat it the same way, not as "has a custom endpoint".
+    let has_custom_endpoint = custom_endpoint.filter(|u| !u.trim().is_empty()).is_some();
+    if !has_custom_endpoint && openrouter_key.is_none() {
+        return None;
+    }
+    match level {
+        app::EffortLevel::Off => None,
+        app::EffortLevel::Low => Some(ReasoningEffort::Low),
+        app::EffortLevel::Medium => Some(ReasoningEffort::Medium),
+        app::EffortLevel::High => Some(ReasoningEffort::High),
+    }
+}
+
 /// The unified entry agent the TUI drives (option C): the [`Orchestrator`]
 /// evolved into ONE capable agent that decides per request — answer directly,
 /// do simple work, delegate to the squad, or run a workflow. A thin newtype so
@@ -649,6 +684,7 @@ async fn build_engine(
     frontier_model: Option<String>,
     request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     workflow_journal_dir: PathBuf,
+    effort: app::EffortLevel,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -697,6 +733,11 @@ async fn build_engine(
         on_retry.clone(),
         prompt_caching,
     )?;
+    // Computed ONCE and given to both the entry agent and every sub-agent
+    // below — see `effort_for_provider`'s doc comment for why the Anthropic
+    // fallback must never see this.
+    let reasoning_effort =
+        effort_for_provider(effort, custom_endpoint.as_deref(), api_key.as_deref());
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -1147,6 +1188,9 @@ async fn build_engine(
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
+    if let Some(effort) = reasoning_effort {
+        builder = builder.reasoning_effort(effort);
+    }
     // Forwards to the entry runner AND all three sub-agent spawn paths
     // (orchestrator.rs:3153-3155, :610, :1150, :1593) — one call suffices.
     // `None` when the on-disk file failed to load (see the notice sent
@@ -1164,8 +1208,12 @@ async fn build_engine(
             .with_pin(request_mode_pin.clone()),
     ));
     // The squad available for delegation: each sub-agent gets its own context
-    // stack (recitation / restore-on-demand / compaction / replan).
-    for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
+    // stack (recitation / restore-on-demand / compaction / replan). The gated
+    // reasoning effort is applied here (not threaded through
+    // `default_sub_agents`'s signature) so its existing unit test call site
+    // stays untouched — same value the entry agent got above.
+    for mut cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
+        cfg.reasoning_effort = reasoning_effort;
         builder = builder.sub_agent_full(cfg);
     }
     let orch = builder.build()?;
@@ -1374,6 +1422,7 @@ fn spawn_agent(
     let frontier_model = app.frontier_model.clone();
     let request_mode_pin = request_mode_pin.clone();
     let workflow_journal_dir = app.workflow_journal_dir.clone();
+    let effort = app.effort;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -1417,6 +1466,7 @@ fn spawn_agent(
                 frontier_model,
                 request_mode_pin,
                 workflow_journal_dir,
+                effort,
             )
             .await
             {
@@ -1634,6 +1684,14 @@ async fn run_ui(
                 Effect::SaveFrontierModel(model) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.frontier_model = model;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
+                Effect::SaveReasoningEffort(level) => {
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.reasoning_effort = level;
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
@@ -2159,6 +2217,57 @@ mod permission_tests {
             rules.evaluate("read", &serde_json::json!({})),
             Some(PermissionAction::Deny),
             "learned rules must still win over hardcoded defaults for non-dialogue tools"
+        );
+    }
+}
+
+#[cfg(test)]
+mod effort_gating_tests {
+    use super::*;
+
+    #[test]
+    fn effort_never_reaches_the_anthropic_fallback_provider() {
+        use heartbit_core::ReasoningEffort;
+        // OpenRouter or a custom endpoint: the effort is threaded.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, None, Some("sk-or-x")),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Low, Some("http://127.0.0.1:1/v1"), None),
+            Some(ReasoningEffort::Low)
+        );
+        // Anthropic fallback (no custom endpoint, no OpenRouter key): NEVER.
+        // Anthropic's non-streaming ApiContentBlock is Text|ToolUse with
+        // #[serde(tag="type")] and no #[serde(other)] (anthropic.rs:778-789), so
+        // a returned `thinking` block fails deserialization on the sub-agent path.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, None, None),
+            None
+        );
+        // Off always omits the field — never ReasoningEffort::None, which would
+        // send reasoning:{"effort":"none"}, a request the TUI never sent before.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Off, None, Some("sk-or-x")),
+            None
+        );
+        // A blank/whitespace-only custom endpoint must NOT count as "has a
+        // custom endpoint" — `build_provider` treats it the same way
+        // (`custom_endpoint.filter(|u| !u.trim().is_empty())`), falling
+        // through to the Anthropic fallback. The gate must match exactly, or
+        // this reintroduces the same failure the task is about.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, Some("   "), None),
+            None
+        );
+    }
+
+    #[test]
+    fn effort_for_provider_covers_every_level_when_gated_open() {
+        use heartbit_core::ReasoningEffort;
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Medium, None, Some("k")),
+            Some(ReasoningEffort::Medium)
         );
     }
 }

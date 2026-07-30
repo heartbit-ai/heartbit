@@ -559,6 +559,43 @@ pub fn view(frame: &mut Frame, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title(" mode "));
             frame.render_widget(widget, rect);
         }
+        Some(Modal::EffortPicker { sel }) => {
+            let w = area.width.min(74);
+            let h = 8u16.min(area.height);
+            let rect = centered(area, w, h);
+            frame.render_widget(Clear, rect);
+            let current = app.effort;
+            let mut mlines: Vec<Line> = crate::app::EffortLevel::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let marker = if *l == current { "●" } else { " " };
+                    let row = format!(" {marker} {}", l.label());
+                    if i == *sel {
+                        Line::from(Span::styled(
+                            row,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::raw(row)
+                    }
+                })
+                .collect();
+            mlines.push(Line::raw(""));
+            mlines.push(Line::from(Span::styled(
+                " ↑↓ · Enter set · Esc",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let widget = Paragraph::new(mlines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" reasoning effort "),
+            );
+            frame.render_widget(widget, rect);
+        }
         Some(Modal::HistorySearch(h)) => {
             let matches = app.history_matches(&h.query);
             let w = area.width.min(80);
@@ -720,6 +757,14 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     if let Some(advisor) = &app.frontier_model {
         identity.push(Span::styled(
             format!("· advised by {advisor} "),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    // Reasoning-effort level (`/effort`) — hidden when Off, so the default
+    // status line stays identical to before this feature existed.
+    if app.effort != crate::app::EffortLevel::Off {
+        identity.push(Span::styled(
+            format!("· effort:{} ", app.effort.label()),
             Style::default().fg(Color::Magenta),
         ));
     }
@@ -1593,6 +1638,59 @@ mod tests {
         assert!(
             !text.contains("advised by"),
             "no advisor → no 'advised by' segment:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_effort_when_set() {
+        use crate::app::EffortLevel;
+        let backend = TestBackend::new(110, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("mistralai/mistral-medium");
+        app.effort = EffortLevel::High;
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("effort:high"),
+            "effort level missing from status line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_line_omits_effort_when_off() {
+        // Off is the default — the status line must render bit-for-bit like
+        // it did before this feature existed.
+        let backend = TestBackend::new(110, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new("mistralai/mistral-medium");
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            !text.contains("effort:"),
+            "Off must not show an effort segment:\n{text}"
+        );
+    }
+
+    #[test]
+    fn effort_picker_renders_all_levels_and_marks_the_current_one() {
+        use crate::app::{EffortLevel, Modal};
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.effort = EffortLevel::Medium;
+        app.modal = Some(Modal::EffortPicker { sel: 0 });
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        for level in EffortLevel::ALL {
+            assert!(
+                text.contains(level.label()),
+                "{} missing from the picker:\n{text}",
+                level.label()
+            );
+        }
+        assert!(
+            text.contains("reasoning effort"),
+            "picker title missing:\n{text}"
         );
     }
 
