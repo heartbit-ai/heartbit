@@ -316,6 +316,14 @@ pub enum Effect {
     Learn,
     /// Validate + commit the staged lessons (digest = value at stage time).
     CommitLessons(u64),
+    /// Fire a desktop notification (focus-gated turn-completion / approval —
+    /// Task 7). `title`/`body` may carry agent-controlled text (tool names,
+    /// provider error strings) UNsanitized: `notify::emit` sanitizes at the
+    /// I/O boundary, immediately before writing bytes, not here.
+    Notify {
+        title: String,
+        body: String,
+    },
     /// Tear down and exit.
     Quit,
 }
@@ -349,6 +357,7 @@ impl Effect {
             Effect::Analyze(_) => "analyze",
             Effect::Learn => "learn",
             Effect::CommitLessons(_) => "commit_lessons",
+            Effect::Notify { .. } => "notify",
             Effect::Quit => "quit",
         }
     }
@@ -550,6 +559,11 @@ pub struct App {
     /// Defaults `true` so a terminal that never reports focus reads as
     /// focused. Task 7 (notifications) reads this to decide whether to notify.
     pub focused: bool,
+    /// Desktop notifications on turn-completion/approval while unfocused
+    /// (`tui.toml`'s `notify`, default on). Gates alongside `focused` and
+    /// `splash`; the bytes are written by `notify::emit` from the main loop's
+    /// effect pass — never here, never in `view()`, never on the agent thread.
+    pub notify: bool,
     /// A model/advisor change landed MID-RUN: the engine rebuild is deferred
     /// to turn-idle (an immediate channel swap would let the next message
     /// spawn a second engine while the old one still runs — audit 2026-06-09).
@@ -630,6 +644,7 @@ impl App {
             last_ttft_ms: 0,
             running: false,
             focused: true,
+            notify: true,
             pending_respawn: false,
             learning: None,
             follow: true,
@@ -886,6 +901,7 @@ impl App {
                 had_tool_calls,
                 ttft_ms,
             } => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.tokens.input_tokens =
                     self.tokens.input_tokens.saturating_add(usage.input_tokens);
@@ -921,6 +937,7 @@ impl App {
                     // Turn boundary: release at most one queued message. If
                     // one was waiting, `running` goes back to `true`.
                     self.drain_one_queued();
+                    self.notify_turn_idle(was_running, "Heartbit", "turn complete");
                 }
             }
             // A sub-agent's LLM call: its cost is real (session totals) but its
@@ -1030,6 +1047,7 @@ impl App {
             }
             Msg::Notice(text) => self.history.push(Cell::Notice(text)),
             Msg::RunCompleted => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 // Backstop: a session ending right at the answer still commits the
@@ -1041,8 +1059,10 @@ impl App {
                 // Turn boundary: release at most one queued message. If one
                 // was waiting, `running` goes back to `true`.
                 self.drain_one_queued();
+                self.notify_turn_idle(was_running, "Heartbit", "turn complete");
             }
             Msg::AgentExited(_) => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 // An abnormal/early thread exit must NOT commit a half-rewritten
@@ -1053,8 +1073,10 @@ impl App {
                 // Abnormal end: there is no live turn to release into — drop
                 // the backlog rather than stranding it silently.
                 self.drop_queued();
+                self.notify_turn_idle(was_running, "Heartbit", "session ended");
             }
             Msg::RunFailed(error) => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 self.learning = None;
@@ -1063,6 +1085,14 @@ impl App {
                 self.drop_queued();
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
+                // Captured before `error` moves into EmergencyHandoff below;
+                // sanitized later at the `notify::emit` I/O boundary, not here
+                // (a provider error string is agent/provider-controlled text).
+                self.notify_turn_idle(
+                    was_running,
+                    "Heartbit — run failed",
+                    first_words(&error, 80),
+                );
                 // P12: a run failure is terminal for this engine — leave a
                 // deterministic emergency brief so the next session can
                 // continue deliberately (the 402 incident left an amnesiac
@@ -1074,6 +1104,26 @@ impl App {
                 ));
             }
             Msg::Approval { tools, reply } => {
+                // Not a `running` transition (the turn stays in flight while the
+                // user decides) — gate directly on `running` instead of a
+                // was_running→!running edge. Tool names are agent-controlled
+                // text; sanitized later at the `notify::emit` I/O boundary.
+                if self.running
+                    && self.notify
+                    && !self.focused
+                    && self.splash.is_none()
+                    && !tools.is_empty()
+                {
+                    let names = tools
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.effects.push(Effect::Notify {
+                        title: "Heartbit — approval needed".into(),
+                        body: names,
+                    });
+                }
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
             }
             Msg::Question { request, reply } => {
@@ -1388,6 +1438,25 @@ impl App {
             "{n} queued message{} dropped — retype if still needed",
             if n == 1 { "" } else { "s" }
         )));
+    }
+
+    /// Push `Effect::Notify` for a turn-idle site, gated on: notifications
+    /// enabled, terminal unfocused, no splash overlay, AND the turn genuinely
+    /// just ended — `was_running` (captured before this message's mutations)
+    /// was `true` and `running` is now `false`. That transition is the
+    /// dedupe: if an earlier message in the same turn boundary (e.g.
+    /// `LlmDone{false}`) already flipped `running` to `false`, a later one
+    /// (e.g. a stale `RunCompleted`) sees `was_running == false` here and
+    /// stays silent — at most one notification fires per turn. It is also
+    /// what suppresses notification when a queued message was drained right
+    /// back into a fresh turn (`running` returns to `true` before this call).
+    fn notify_turn_idle(&mut self, was_running: bool, title: &str, body: impl Into<String>) {
+        if was_running && !self.running && self.notify && !self.focused && self.splash.is_none() {
+            self.effects.push(Effect::Notify {
+                title: title.to_string(),
+                body: body.into(),
+            });
+        }
     }
 
     fn handle_slash(&mut self, cmd: String) {
@@ -4919,6 +4988,164 @@ mod tests {
         assert!(!app.focused);
         app.update(Msg::FocusChanged(true));
         assert!(app.focused);
+    }
+
+    fn unfocused_running() -> App {
+        let mut app = keyed();
+        app.notify = true;
+        app.focused = false;
+        app.running = true;
+        app
+    }
+
+    fn notified(app: &App) -> bool {
+        app.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Notify { .. }))
+    }
+
+    #[test]
+    fn notify_on_turn_idle_when_unfocused() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(notified(&app));
+    }
+
+    #[test]
+    fn focused_terminal_suppresses_notify() {
+        let mut app = unfocused_running();
+        app.focused = true;
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn notify_disabled_by_config_suppresses() {
+        let mut app = unfocused_running();
+        app.notify = false;
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn tool_turn_does_not_notify() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: true,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn at_most_one_notify_per_turn() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        app.effects.clear();
+        app.update(Msg::RunCompleted);
+        assert!(
+            !notified(&app),
+            "RunCompleted must not re-notify after LlmDone"
+        );
+    }
+
+    #[test]
+    fn notify_suppressed_during_splash() {
+        let mut app = unfocused_running();
+        app.splash = Some(0);
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    // --- Task 7 follow-up: the sites the six brief tests above don't drive
+    // (approval, RunFailed's error content, drained-queue suppression) ---
+
+    #[test]
+    fn approval_notifies_when_unfocused() {
+        let mut app = unfocused_running();
+        let (tx, _rx) = sync_channel(1);
+        app.update(Msg::Approval {
+            tools: vec![PendingTool {
+                name: "bash".into(),
+                input: "rm -rf".into(),
+            }],
+            reply: tx,
+        });
+        assert!(notified(&app));
+    }
+
+    #[test]
+    fn approval_while_focused_does_not_notify() {
+        let mut app = unfocused_running();
+        app.focused = true;
+        let (tx, _rx) = sync_channel(1);
+        app.update(Msg::Approval {
+            tools: vec![PendingTool {
+                name: "bash".into(),
+                input: "rm -rf".into(),
+            }],
+            reply: tx,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn run_failed_notifies_with_the_error() {
+        let mut app = unfocused_running();
+        app.update(Msg::RunFailed("boom: provider timeout".into()));
+        let body = app.effects.iter().find_map(|e| match e {
+            Effect::Notify { body, .. } => Some(body.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            body.as_deref(),
+            Some("boom: provider timeout"),
+            "the error must reach the notify body, read out before `error` moves into EmergencyHandoff"
+        );
+    }
+
+    #[test]
+    fn drained_queue_suppresses_the_turn_end_notify() {
+        let mut app = unfocused_running();
+        // `unfocused_running()` already sets `running = true`, so this submit
+        // queues (via the real send_or_queue choke point) instead of sending.
+        typed(&mut app, "next thing");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            !notified(&app),
+            "a drained queue starts a fresh turn — no notify"
+        );
+        assert!(
+            app.running,
+            "the drained message should have restarted a turn"
+        );
     }
 
     #[test]

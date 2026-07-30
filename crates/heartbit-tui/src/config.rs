@@ -121,6 +121,11 @@ pub struct TuiConfig {
     /// `splash = false` in tui.toml.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub splash: bool,
+    /// Desktop notification (terminal OSC escape sequence) when a turn ends
+    /// or an approval is waiting, while the terminal is unfocused. ON by
+    /// default; disable with `notify = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub notify: bool,
     /// Model for the "fast" role — cheap classification/extraction stages in
     /// workflows (falls back to the main model when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +168,7 @@ impl Default for TuiConfig {
             brave_api_key: None,
             prompt_caching: true,
             splash: true,
+            notify: true,
             fast_model: None,
             frontier_model: None,
             keyboard_enhancement: true,

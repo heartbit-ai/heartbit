@@ -26,6 +26,7 @@ mod lessons;
 mod markdown;
 mod models;
 mod msg;
+mod notify;
 mod session;
 mod splash;
 mod trace;
@@ -244,6 +245,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
     app.prompt_caching = cfg.prompt_caching;
+    app.notify = cfg.notify;
     app.splash = cfg.splash.then_some(0);
     // Same deterministic registry the engine builds — /workflows lists it.
     app.workflow_recipes = heartbit_core::default_registry().meta();
@@ -2042,6 +2044,7 @@ async fn run_ui(
                         )),
                     }
                 }
+                Effect::Notify { title, body } => notify::emit(&title, &body),
                 Effect::Quit => app.should_quit = true,
             }
             trace.record_ui(&trace::UiEvent::Effect {
