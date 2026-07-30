@@ -25,6 +25,7 @@ pub struct WriteTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
     path_policy: Option<Arc<CorePathPolicy>>,
+    formatters: Option<Arc<crate::tool::builtins::format::FormatterConfig>>,
 }
 
 impl WriteTool {
@@ -38,6 +39,7 @@ impl WriteTool {
             workspace,
             protected_paths,
             path_policy: None,
+            formatters: None,
         }
     }
 
@@ -46,6 +48,16 @@ impl WriteTool {
     /// `check_path` is called before any I/O.
     pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Format the content with these formatters before writing.
+    #[must_use]
+    pub fn with_formatters(
+        mut self,
+        formatters: Arc<crate::tool::builtins::format::FormatterConfig>,
+    ) -> Self {
+        self.formatters = Some(formatters);
         self
     }
 }
@@ -143,6 +155,19 @@ impl Tool for WriteTool {
                     )));
                 }
             }
+
+            // Format in memory BEFORE the single write: keeps the post-write
+            // record_read mtime matching the final bytes, keeps the returned
+            // snippet consistent with disk, and never hands the subprocess a
+            // path (F-FS-1 symlink hardening stays in force).
+            let content = match &self.formatters {
+                Some(fc) => match super::format::format_content(fc, &target, content).await {
+                    Some(formatted) => formatted,
+                    None => content.to_string(),
+                },
+                None => content.to_string(),
+            };
+            let content = content.as_str();
 
             let bytes = content.len();
             match write_root {
@@ -478,6 +503,46 @@ mod tests {
             after, "ORIGINAL CONTENT",
             "victim file was modified despite symlink rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn write_formats_content_before_the_single_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+
+        let tool = WriteTool::new(tracker.clone(), None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(std::sync::Arc::new(fc));
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+        )
+        .await
+        .unwrap();
+
+        // On disk: formatted.
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "HELLO");
+        // The mtime guard matches the FINAL bytes — a follow-up edit with no
+        // intervening read must pass, which is the whole point of formatting
+        // before the single write.
+        assert!(tracker.check_unmodified(&target).is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_without_formatters_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let tool = WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new()));
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "hello");
     }
 
     // SECURITY (F-FS-1): end-to-end through WriteTool. An INTERMEDIATE

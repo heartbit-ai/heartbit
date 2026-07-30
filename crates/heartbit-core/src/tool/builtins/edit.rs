@@ -24,6 +24,7 @@ pub struct EditTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
     path_policy: Option<Arc<CorePathPolicy>>,
+    formatters: Option<Arc<crate::tool::builtins::format::FormatterConfig>>,
 }
 
 impl EditTool {
@@ -37,6 +38,7 @@ impl EditTool {
             workspace,
             protected_paths,
             path_policy: None,
+            formatters: None,
         }
     }
 
@@ -45,6 +47,16 @@ impl EditTool {
     /// `check_path` is called before any I/O.
     pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Format the content with these formatters before writing.
+    #[must_use]
+    pub fn with_formatters(
+        mut self,
+        formatters: Arc<crate::tool::builtins::format::FormatterConfig>,
+    ) -> Self {
+        self.formatters = Some(formatters);
         self
     }
 }
@@ -172,6 +184,20 @@ impl Tool for EditTool {
             };
             let new_content =
                 String::from(&content[..idx]) + new_string + &content[idx + old_string.len()..];
+
+            // Format in memory BEFORE the single write: keeps the post-write
+            // record_read mtime matching the final bytes, keeps the returned
+            // snippet consistent with disk, and never hands the subprocess a
+            // path (F-FS-1 symlink hardening stays in force). Runs before
+            // `format_edit_snippet` so the snippet the model sees matches what
+            // lands on disk.
+            let new_content = match &self.formatters {
+                Some(fc) => match super::format::format_content(fc, &target, &new_content).await {
+                    Some(formatted) => formatted,
+                    None => new_content,
+                },
+                None => new_content,
+            };
 
             // Write (symlink-safe; see F-FS-1 note above)
             match write_root {
@@ -495,6 +521,40 @@ mod tests {
             "expected success, got: {:?}",
             result.content
         );
+    }
+
+    #[tokio::test]
+    async fn edit_formats_content_before_the_single_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+
+        let tool = EditTool::new(tracker.clone(), None, Arc::new(Vec::new()))
+            .with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        // On disk: the post-replacement buffer went through the formatter.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "HI WORLD\n");
+        // The mtime guard matches the FINAL bytes — a follow-up edit with no
+        // intervening read must pass.
+        assert!(tracker.check_unmodified(&path).is_ok());
     }
 
     #[test]
