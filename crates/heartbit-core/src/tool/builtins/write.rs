@@ -159,15 +159,17 @@ impl Tool for WriteTool {
             // Format in memory BEFORE the single write: keeps the post-write
             // record_read mtime matching the final bytes, keeps the returned
             // snippet consistent with disk, and never hands the subprocess a
-            // path (F-FS-1 symlink hardening stays in force).
-            let content = match &self.formatters {
+            // path (F-FS-1 symlink hardening stays in force). `Cow` avoids
+            // cloning `content` on the (default) no-formatter path — unlike
+            // edit.rs/patch.rs, write.rs's buffer starts as a borrowed `&str`.
+            let content: std::borrow::Cow<'_, str> = match &self.formatters {
                 Some(fc) => match super::format::format_content(fc, &target, content).await {
-                    Some(formatted) => formatted,
-                    None => content.to_string(),
+                    Some(formatted) => std::borrow::Cow::Owned(formatted),
+                    None => std::borrow::Cow::Borrowed(content),
                 },
-                None => content.to_string(),
+                None => std::borrow::Cow::Borrowed(content),
             };
-            let content = content.as_str();
+            let content = content.as_ref();
 
             let bytes = content.len();
             match write_root {
