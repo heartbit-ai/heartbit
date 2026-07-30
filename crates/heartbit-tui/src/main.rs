@@ -320,8 +320,48 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
     // transcript — without it, terminals translate the wheel into ↑/↓ arrows
-    // (which would scroll the composer's command history instead).
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // (which would scroll the composer's command history instead). Bracketed
+    // paste lets a multi-line paste land as Event::Paste (already translated
+    // and inserted correctly) instead of per-character Enter keys that would
+    // submit the draft early. Focus events feed `App::focused` (Task 7 reads
+    // it for notifications).
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
+    );
+    // Pushed UNCONDITIONALLY (spec D-3): no capability probe.
+    // `supports_keyboard_enhancement()` blocks up to 2000 ms and errors on
+    // terminals that never answer — including this project's own pty harness
+    // — and it would buy nothing there, because Alt+Enter already works on
+    // every terminal today (`app.rs` composer key handling: `if shift ||
+    // alt`). A private-mode CSI is ignored by terminals that don't implement
+    // it.
+    //
+    // Exactly `DISAMBIGUATE_ESCAPE_CODES` (spec D-5): it is sufficient for
+    // Shift+Enter (`CSI 13;2u` → `'\r'` → `KeyCode::Enter` + SHIFT) and it
+    // leaves Shift+Tab as `BackTab`, so the permission-mode cycle survives.
+    // Do NOT add `REPORT_EVENT_TYPES`: `KeyEvent::kind` is only populated
+    // under it on Unix and `translate` admits only `KeyEventKind::Press`, so
+    // held keys (e.g. Backspace, arrows) would stop auto-repeating.
+    if cfg.keyboard_enhancement
+        && crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(KITTY_FLAGS)
+        )
+        .is_ok()
+    {
+        KITTY_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // WRAP ratatui's panic hook, never replace it: replacing would lose its
+    // own restore() and leave raw mode on after a panic.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_modes();
+        prev_hook(info);
+    }));
+
     let result = run_ui(
         &mut terminal,
         &mut app,
@@ -338,9 +378,58 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         trace_handle,
     )
     .await;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    restore_terminal_modes();
     ratatui::restore();
     result
+}
+
+/// The exact Kitty flag set this process pushes (spec D-5): only
+/// `DISAMBIGUATE_ESCAPE_CODES` — see the push call site for why. Named (rather
+/// than inlined at the call site) so `kitty_push_and_pop_emit_the_minimal_sequences`
+/// asserts against the value production actually pushes: adding a flag here
+/// requires updating that test, which is the point.
+const KITTY_FLAGS: crossterm::event::KeyboardEnhancementFlags =
+    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// The literal bytes `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
+/// writes — frozen here as a regression guard (test-only: production drives
+/// the write through the `crossterm::Command` impl, not this string).
+#[cfg(test)]
+fn kitty_push_sequence() -> &'static str {
+    "\x1b[>1u"
+}
+
+/// The literal bytes `PopKeyboardEnhancementFlags` writes (test-only, see
+/// [`kitty_push_sequence`]).
+#[cfg(test)]
+fn kitty_pop_sequence() -> &'static str {
+    "\x1b[<1u"
+}
+
+/// True exactly once, for the first caller. Guarantees the pop is emitted at
+/// most once even when both the panic hook and the normal exit path run.
+fn take_pushed(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+static KITTY_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Disable every terminal mode this process enabled, newest first. Safe to
+/// call from the panic hook and from the normal exit path — the Kitty pop is
+/// guarded so it is emitted at most once even if both run.
+fn restore_terminal_modes() {
+    use std::io::stdout;
+    if take_pushed(&KITTY_PUSHED) {
+        // Its own execute!: queue! short-circuits on the first error, and the
+        // Kitty pop must not be lost because an unrelated command failed.
+        let _ = crossterm::execute!(stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(
+        stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableMouseCapture
+    );
 }
 
 /// Resolve a provider. OpenRouter is preferred (the project's qwen setup); an
@@ -1099,6 +1188,8 @@ fn translate(event: Event) -> Option<Msg> {
     match event {
         Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
         Event::Paste(s) => Some(Msg::Paste(s)),
+        Event::FocusGained => Some(Msg::FocusChanged(true)),
+        Event::FocusLost => Some(Msg::FocusChanged(false)),
         Event::Resize(..) => Some(Msg::Resize),
         // Mouse capture is on, so the wheel arrives as scroll events (not arrow
         // keys) — route it to the transcript, leaving ↑/↓ for command history.
@@ -1963,5 +2054,44 @@ mod agent_lifecycle_tests {
         }
         assert!(saw_exit, "AgentExited(epoch) must be sent on panic");
         assert!(saw_notice, "the panic must surface as a visible notice");
+    }
+}
+
+#[cfg(test)]
+mod terminal_mode_tests {
+    use super::*;
+
+    #[test]
+    fn translate_maps_focus_events_and_paste() {
+        use crossterm::event::Event;
+        assert!(matches!(
+            translate(Event::FocusGained),
+            Some(Msg::FocusChanged(true))
+        ));
+        assert!(matches!(
+            translate(Event::FocusLost),
+            Some(Msg::FocusChanged(false))
+        ));
+        assert!(matches!(translate(Event::Paste("x".into())), Some(Msg::Paste(s)) if s == "x"));
+    }
+
+    #[test]
+    fn kitty_push_and_pop_emit_the_minimal_sequences() {
+        // Exactly DISAMBIGUATE_ESCAPE_CODES: asserted against the actual
+        // constant production pushes, so any future flag addition to
+        // KITTY_FLAGS must be a deliberate, test-updating change (spec D-5).
+        assert_eq!(KITTY_FLAGS.bits(), 0b0000_0001);
+        assert_eq!(kitty_push_sequence(), "\x1b[>1u");
+        assert_eq!(kitty_pop_sequence(), "\x1b[<1u");
+    }
+
+    #[test]
+    fn kitty_pop_is_emitted_at_most_once() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(take_pushed(&flag));
+        assert!(
+            !take_pushed(&flag),
+            "a second teardown must not re-emit the pop"
+        );
     }
 }

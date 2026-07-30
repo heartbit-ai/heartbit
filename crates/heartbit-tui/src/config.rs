@@ -121,6 +121,12 @@ pub struct TuiConfig {
     /// the main model when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier_model: Option<String>,
+    /// Push `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` at startup so
+    /// Shift+Enter receives its modifier (a private-mode CSI a non-supporting
+    /// terminal ignores). ON by default; escape hatch:
+    /// `keyboard_enhancement = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub keyboard_enhancement: bool,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -150,6 +156,7 @@ impl Default for TuiConfig {
             splash: true,
             fast_model: None,
             frontier_model: None,
+            keyboard_enhancement: true,
         }
     }
 }
@@ -253,6 +260,18 @@ mod tests {
         assert!(cfg.splash, "missing key means ON");
         let cfg: TuiConfig = toml::from_str("splash = false").unwrap();
         assert!(!cfg.splash);
+    }
+
+    #[test]
+    fn keyboard_enhancement_defaults_on_and_parses_off() {
+        // The escape hatch for the unconditional Kitty flag push (spec D-3):
+        // this is the user's only recovery path if a terminal misbehaves, so
+        // it must actually parse to `false`, not just default to `true`.
+        assert!(TuiConfig::default().keyboard_enhancement);
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.keyboard_enhancement, "missing key means ON");
+        let cfg: TuiConfig = toml::from_str("keyboard_enhancement = false").unwrap();
+        assert!(!cfg.keyboard_enhancement);
     }
 
     #[test]

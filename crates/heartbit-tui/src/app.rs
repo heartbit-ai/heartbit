@@ -472,6 +472,10 @@ pub struct App {
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
     pub last_ttft_ms: u64,
     pub running: bool,
+    /// Whether the terminal window currently has focus (`EnableFocusChange`).
+    /// Defaults `true` so a terminal that never reports focus reads as
+    /// focused. Task 7 (notifications) reads this to decide whether to notify.
+    pub focused: bool,
     /// A model/advisor change landed MID-RUN: the engine rebuild is deferred
     /// to turn-idle (an immediate channel swap would let the next message
     /// spawn a second engine while the old one still runs — audit 2026-06-09).
@@ -546,6 +550,7 @@ impl App {
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
+            focused: true,
             pending_respawn: false,
             learning: None,
             follow: true,
@@ -735,25 +740,35 @@ impl App {
             // is harmless — the renderer clamps the offset to the top.
             Msg::WheelUp => self.scroll_up(WHEEL_STEP),
             Msg::WheelDown => self.scroll_down(WHEEL_STEP),
-            Msg::Paste(s) => match &mut self.modal {
-                // Pasting into a prompt must land in that field, not the composer
-                // hidden behind the modal.
-                Some(Modal::KeyEntry(m)) => m.input.push_str(&s.replace(['\n', '\r'], "")),
-                Some(Modal::ModelPicker(p)) => {
-                    p.query.push_str(&s.replace(['\n', '\r'], ""));
-                    p.selected = 0;
+            Msg::Paste(s) => {
+                // A paste during the splash dismisses the overlay too — unlike a
+                // key (which the splash consumes outright), the paste already
+                // carries content the user wants landed, so fall through to the
+                // existing insert below instead of dropping it.
+                if self.splash.is_some() {
+                    self.splash = None;
                 }
-                Some(Modal::HistorySearch(h)) => {
-                    h.query.push_str(&s.replace(['\n', '\r'], ""));
-                    h.sel = 0;
+                match &mut self.modal {
+                    // Pasting into a prompt must land in that field, not the
+                    // composer hidden behind the modal.
+                    Some(Modal::KeyEntry(m)) => m.input.push_str(&s.replace(['\n', '\r'], "")),
+                    Some(Modal::ModelPicker(p)) => {
+                        p.query.push_str(&s.replace(['\n', '\r'], ""));
+                        p.selected = 0;
+                    }
+                    Some(Modal::HistorySearch(h)) => {
+                        h.query.push_str(&s.replace(['\n', '\r'], ""));
+                        h.sel = 0;
+                    }
+                    Some(Modal::Approval(_))
+                    | Some(Modal::Question(_))
+                    | Some(Modal::SessionPicker(_))
+                    | Some(Modal::HandoffPicker { .. })
+                    | Some(Modal::ModePicker { .. }) => {}
+                    None => self.composer.insert_str(&s),
                 }
-                Some(Modal::Approval(_))
-                | Some(Modal::Question(_))
-                | Some(Modal::SessionPicker(_))
-                | Some(Modal::HandoffPicker { .. })
-                | Some(Modal::ModePicker { .. }) => {}
-                None => self.composer.insert_str(&s),
-            },
+            }
+            Msg::FocusChanged(focused) => self.focused = focused,
             Msg::Key(key) => {
                 // Any key dismisses the splash and is CONSUMED — an impatient
                 // first keypress must not leak a stray char into the composer
@@ -4463,6 +4478,58 @@ mod tests {
         assert_eq!(app.composer.text(), "", "the dismissing key must NOT type");
         app.update(key(KeyCode::Char('h')));
         assert_eq!(app.composer.text(), "h", "subsequent keys flow normally");
+    }
+
+    #[test]
+    fn multiline_paste_lands_as_one_draft_and_does_not_submit() {
+        let mut app = keyed();
+        app.update(Msg::Paste("line one\nline two\nline three".into()));
+        assert_eq!(app.composer.text(), "line one\nline two\nline three");
+        // A paste NEVER submits.
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_)))
+        );
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn paste_mid_draft_preserves_the_tail_and_leaves_cursor_after_insert() {
+        let mut app = keyed();
+        typed(&mut app, "ab");
+        app.update(key(KeyCode::Left)); // cursor between a and b
+        app.update(Msg::Paste("X\nY".into()));
+        assert_eq!(app.composer.text(), "aX\nYb");
+    }
+
+    #[test]
+    fn crlf_paste_yields_single_newlines() {
+        let mut app = keyed();
+        app.update(Msg::Paste("a\r\nb".into()));
+        assert_eq!(app.composer.text(), "a\nb");
+    }
+
+    #[test]
+    fn paste_during_splash_dismisses_the_overlay_and_keeps_the_text() {
+        let mut app = keyed();
+        app.splash = Some(0);
+        app.update(Msg::Paste("hello".into()));
+        assert!(app.splash.is_none(), "the paste must dismiss the splash");
+        assert_eq!(app.composer.text(), "hello");
+    }
+
+    #[test]
+    fn focus_defaults_to_focused_and_tracks_both_directions() {
+        let mut app = App::new("m");
+        assert!(
+            app.focused,
+            "a terminal that never reports focus must read as focused"
+        );
+        app.update(Msg::FocusChanged(false));
+        assert!(!app.focused);
+        app.update(Msg::FocusChanged(true));
+        assert!(app.focused);
     }
 
     #[test]

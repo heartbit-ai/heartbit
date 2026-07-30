@@ -27,6 +27,10 @@ pub enum Msg {
     // ---- from the terminal ----
     Key(KeyEvent),
     Paste(String),
+    /// The terminal window gained (`true`) or lost (`false`) focus. Requires
+    /// `EnableFocusChange`; terminals that do not report it never send this, so
+    /// `App::focused` stays `true` and every consumer sees today's behaviour.
+    FocusChanged(bool),
     Resize,
     /// Mouse wheel — scroll the transcript (output history), NOT the composer's
     /// command history (which stays on ↑/↓).
