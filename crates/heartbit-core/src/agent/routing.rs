@@ -681,6 +681,98 @@ pub fn resolve_routing_mode(config_mode: RoutingMode) -> RoutingMode {
 mod tests {
     use super::*;
 
+    /// Every reason the production router may attribute a decision to. Keeping
+    /// this list closed is the point of frontier invariant #7: a decision whose
+    /// reason is not in here would be a SILENT, unspecified fallback.
+    const DECLARED_REASONS: &[&str] = &[
+        // Tier 1 — decided by score alone (routing.rs:378-382, :395).
+        "heuristic score above orchestrate threshold",
+        "heuristic score below single-agent threshold (no domain signals)",
+        "heuristic score below single-agent threshold (no agent matched detected domains)",
+        "heuristic score below single-agent threshold (matched by domain coverage)",
+        // Tier 2 — decided by domain coverage (routing.rs:486, :499, :505).
+        "no domains detected, defaulting to single agent",
+        "no single agent covers all detected domains",
+        "single agent covers all detected domains",
+    ];
+
+    // ── Frontier invariant #7 (orchestration guidance) ──
+    // Fixed input → expected decision, and EVERY decision explains itself with a
+    // reason drawn from the declared vocabulary. No silent unspecified fallback.
+    #[test]
+    fn routing_follows_declared_guidance_with_no_silent_fallback() {
+        // (input, expects_orchestrate)
+        let cases: &[(&str, bool)] = &[
+            // Trivial question: no domains → single agent.
+            ("What is the capital of France?", false),
+            // Multi-step across two domains no single agent covers → orchestrate.
+            (
+                "First, research the best database schema for user authentication. \
+                 Finally, write frontend React components for the login form.",
+                true,
+            ),
+            // Explicit delegation language → orchestrate.
+            (
+                "Delegate this to the researcher and then have the coder implement it, \
+                 splitting the work between both agents across several steps.",
+                true,
+            ),
+            // Single-domain code task the coder covers → single agent.
+            ("Fix the failing unit test in the parser", false),
+        ];
+
+        let agents = make_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+
+        for (input, expects_orchestrate) in cases {
+            let (decision, _signals) = analyzer.analyze(input);
+            let reason = match &decision {
+                RoutingDecision::SingleAgent { reason, .. } => {
+                    assert!(
+                        !*expects_orchestrate,
+                        "expected Orchestrate for {input:?}, got SingleAgent({reason})"
+                    );
+                    *reason
+                }
+                RoutingDecision::Orchestrate { reason } => {
+                    assert!(
+                        *expects_orchestrate,
+                        "expected SingleAgent for {input:?}, got Orchestrate({reason})"
+                    );
+                    *reason
+                }
+            };
+            // The decision must explain itself, from the DECLARED vocabulary only.
+            assert!(
+                !reason.trim().is_empty(),
+                "every routing decision must carry a reason ({input:?})"
+            );
+            assert!(
+                DECLARED_REASONS.contains(&reason),
+                "undeclared routing reason {reason:?} for {input:?} — a silent fallback. \
+                 Declared: {DECLARED_REASONS:?}"
+            );
+        }
+    }
+
+    // The same fixed input must always route the same way — routing is a pure
+    // function of (input, capabilities), with no hidden state or nondeterminism.
+    #[test]
+    fn routing_is_deterministic_for_a_fixed_input() {
+        let agents = make_agents();
+        let analyzer = TaskComplexityAnalyzer::new(&agents);
+        let task = "First, research the database schema. Finally, write React components.";
+        let (first, s1) = analyzer.analyze(task);
+        let (second, s2) = analyzer.analyze(task);
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "the same input must produce the same decision"
+        );
+        assert_eq!(s1.domain_signals, s2.domain_signals);
+        assert_eq!(s1.complexity_score, s2.complexity_score);
+    }
+
     fn make_agents() -> Vec<AgentCapability> {
         vec![
             AgentCapability::from_config(

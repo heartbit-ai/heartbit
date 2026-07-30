@@ -280,6 +280,67 @@ mod tests {
         }
     }
 
+    // ── Frontier invariant #2 (dual-LLM / quarantine) ──
+    // The quarantined LLM has NO tools AND no privileged context: the request it
+    // receives is exactly the extraction query plus the delimited untrusted
+    // content — one message, quarantine framing, nothing else. No conversation
+    // history, no agent system prompt, no prior tool results can ride along.
+    #[tokio::test]
+    async fn quarantined_reader_gets_no_tools_and_no_privileged_context() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "Example Domain",
+            5,
+            2,
+        )]));
+        let reader = QuarantinedReader::new(Arc::clone(&provider));
+        reader
+            .extract("<title>Example Domain</title>", "the page title")
+            .await
+            .unwrap();
+
+        let reqs = provider.captured_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+
+        // (a) No tools — an injection in the content cannot act.
+        assert!(
+            req.tools.is_empty(),
+            "the quarantined LLM must have no tools"
+        );
+        // (b) Exactly ONE user message — no privileged conversation history crosses.
+        assert_eq!(
+            req.messages.len(),
+            1,
+            "no conversation history may cross the quarantine boundary"
+        );
+        assert_eq!(req.messages[0].role, Role::User);
+        // (c) The system prompt is the quarantine framing, not a privileged agent prompt.
+        assert!(
+            req.system.contains("DATA-EXTRACTION"),
+            "system must be the quarantine framing, got: {}",
+            req.system
+        );
+        // (d) The payload is only the query + the content, and the content is
+        //     delimited as DATA (spotlighting), never presented as instructions.
+        let text = req.messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("the page title"), "carries the query");
+        assert!(
+            text.contains("<title>Example Domain</title>"),
+            "carries the content"
+        );
+        assert!(
+            text.contains("BEGIN UNTRUSTED CONTENT") && text.contains("END UNTRUSTED CONTENT"),
+            "the untrusted content must be delimited as data: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn wrapper_quarantines_untrusted_tool_output() {
         let reader_provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(

@@ -301,6 +301,48 @@ mod tests {
         assert_eq!(store.len(), 2);
     }
 
+    // ── Frontier invariant #6 (no cross-session leak) ──
+    // A trajectory recorded in one session's store is NEVER recalled through
+    // another store. Recall is scoped to the instance, so a second session cannot
+    // read the first session's task text, actions or results. This is a standing
+    // regression guard: making the store a process-global static would break it.
+    #[test]
+    fn trajectories_never_leak_across_stores() {
+        let session_a = TrajectoryStore::new(100);
+        let session_b = TrajectoryStore::new(100);
+
+        session_a.record(Trajectory {
+            task: "deploy the acme billing service".into(),
+            actions: vec!["read_secret".into(), "kubectl_apply".into()],
+            success: true,
+            result: "CONFIDENTIAL-A: deployed with token sk-live-a1b2".into(),
+        });
+
+        assert_eq!(session_a.len(), 1);
+        assert_eq!(session_b.len(), 0, "a fresh session starts empty");
+
+        // The other session recalls NOTHING for the very same task text…
+        assert!(
+            session_b
+                .recall_similar("deploy the acme billing service", 5)
+                .is_empty(),
+            "session B must not see session A's trajectory"
+        );
+        // …and gets no distilled procedure either (so nothing leaks into a prompt).
+        assert!(
+            session_b
+                .skill_hint("deploy the acme billing service")
+                .is_none(),
+            "no cross-session skill hint may be produced"
+        );
+        // Sanity: the owning session DOES recall it (the test would pass vacuously
+        // if recall were simply broken).
+        let hint = session_a
+            .skill_hint("deploy the acme billing service")
+            .expect("the owning session recalls its own trajectory");
+        assert!(hint.contains("kubectl_apply"));
+    }
+
     #[test]
     fn capacity_evicts_oldest() {
         let store = TrajectoryStore::new(2);

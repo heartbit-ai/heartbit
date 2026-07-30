@@ -55,7 +55,8 @@ pub use agent::guardrails::{
     BehavioralMonitorGuardrailBuilder, BudgetRule, ConditionalGuardrail, GuardrailChain,
     GuardrailMode, InjectionClassifierGuardrail, LlmJudgeGuardrail, LlmJudgeGuardrailBuilder,
     PiiAction, PiiDetector, PiiGuardrail, ScopeGuard, SecretAction, SecretScannerGuardrail,
-    SecretScannerGuardrailBuilder, SensorSecurityGuardrail, ToolPolicyGuardrail, WarnToDeny,
+    SecretScannerGuardrailBuilder, SensorSecurityGuardrail, ToolPolicyGuardrail, TrifectaGuard,
+    WarnToDeny,
 };
 pub use agent::handoff::{HandoffRunner, HandoffRunnerBuilder, make_handoff_tool};
 pub use agent::instructions::{

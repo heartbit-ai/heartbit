@@ -13,6 +13,7 @@ pub mod scope_guard;
 pub mod secret_scanner;
 pub mod sensor_security;
 pub mod tool_policy;
+pub mod trifecta;
 
 pub use action_budget::{ActionBudgetGuardrail, ActionBudgetGuardrailBuilder, BudgetRule};
 pub use behavioral::{BehaviorRule, BehavioralMonitorGuardrail, BehavioralMonitorGuardrailBuilder};
@@ -28,3 +29,4 @@ pub use scope_guard::ScopeGuard;
 pub use secret_scanner::{SecretAction, SecretScannerGuardrail, SecretScannerGuardrailBuilder};
 pub use sensor_security::SensorSecurityGuardrail;
 pub use tool_policy::{InputConstraint, ToolPolicyGuardrail, ToolRule};
+pub use trifecta::TrifectaGuard;
