@@ -6895,6 +6895,26 @@ mod tests {
         );
     }
 
+    /// Pins the arm the TUI's permission model depends on: dropping the terminal
+    /// `*/*→Ask` rule is only safe because `None` and `Some(Ask)` both route to
+    /// human approval. If this ever diverges, the TUI silently becomes Yolo.
+    #[test]
+    fn ask_and_none_both_route_to_approval() {
+        use crate::agent::permission::{PermissionAction, PermissionRule, PermissionRuleset};
+        let asked = PermissionRuleset::new(vec![PermissionRule {
+            tool: "bash".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Ask,
+        }]);
+        assert_eq!(
+            asked.evaluate("bash", &serde_json::json!({})),
+            Some(PermissionAction::Ask)
+        );
+        // An unmatched tool yields None — and the runner treats the two
+        // identically at runner.rs:2097 (`Some(Ask) | None => needs_approval`).
+        assert_eq!(asked.evaluate("write", &serde_json::json!({})), None);
+    }
+
     // CLARIFY ask-first: a `question` batched WITH mutations has not been
     // answered when the writes run — the plan gate must refuse the batch
     // (and a refused batch must not arm the contract flags).

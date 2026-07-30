@@ -221,6 +221,15 @@ pub fn config_path() -> PathBuf {
     base.join("heartbit").join("tui.toml")
 }
 
+/// Resolve the learned-approval-rules file path: the same directory as
+/// [`config_path`] (so it too honors `HEARTBIT_TUI_CONFIG`, letting a
+/// test/acceptance run isolate it), filename `permissions.toml`. Loaded via
+/// `heartbit_core::LearnedPermissions::load` and written 0600 by that type,
+/// same as `tui.toml`'s own secret handling in this file.
+pub fn learned_permissions_path() -> PathBuf {
+    config_path().with_file_name("permissions.toml")
+}
+
 #[cfg(unix)]
 fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -422,5 +431,26 @@ mod tests {
         unsafe { std::env::set_var("HEARTBIT_TUI_CONFIG", "/tmp/explicit/tui.toml") };
         assert_eq!(config_path(), PathBuf::from("/tmp/explicit/tui.toml"));
         unsafe { std::env::remove_var("HEARTBIT_TUI_CONFIG") };
+    }
+
+    // Task 4 (persistent approval rules): the learned-permissions file must
+    // sit BESIDE tui.toml, whatever `config_path()` resolves to. Asserted
+    // structurally (same parent dir, `permissions.toml` filename) rather
+    // than by mutating HEARTBIT_TUI_CONFIG — `config_path_honors_env_override`
+    // above already mutates that same process-global env var, and cargo runs
+    // tests in parallel on one process, so a second env-mutating test here
+    // would race it (a `remove_var` landing between the other test's
+    // `set_var` and its assert). Because `learned_permissions_path` is
+    // defined as `config_path().with_file_name(..)`, this structural check
+    // already implies the env override is inherited without re-touching env.
+    #[test]
+    fn learned_permissions_path_sits_beside_config_path() {
+        let config = config_path();
+        let learned = learned_permissions_path();
+        assert_eq!(learned.parent(), config.parent());
+        assert_eq!(
+            learned.file_name(),
+            Some(std::ffi::OsStr::new("permissions.toml"))
+        );
     }
 }

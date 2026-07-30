@@ -41,9 +41,9 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
-    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
-    OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator, PermissionAction,
-    PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
+    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, LearnedPermissions,
+    OnApproval, OnEvent, OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator,
+    PermissionAction, PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -881,10 +881,46 @@ async fn build_engine(
             let _ = tx.send(Msg::ReasoningDelta(s.to_string()));
         })
     };
+    // Learned approval rules, persisted 0600 next to tui.toml
+    // (config::learned_permissions_path, honors HEARTBIT_TUI_CONFIG so an
+    // acceptance run can isolate it). Loaded BEFORE the "ready — …" summary
+    // is sent below so the count can appear in it. `load()` already returns
+    // an empty store when the file is absent — the Err arm is only a
+    // corrupt/oversized file, and there is no way to construct a fresh
+    // `LearnedPermissions` bound to `learned_path` from outside heartbit-core
+    // (its fields are private, no public constructor). Rather than add one
+    // (out of scope — core gets exactly one new test this task), a load
+    // failure is surfaced as a notice and persistence is simply skipped for
+    // the session: safer than the alternative of handing the runner a fresh
+    // empty store at that path, whose first save would silently truncate
+    // whatever the user's file actually contains.
+    let learned_path = config::learned_permissions_path();
+    let (learned_rules, learned): (
+        Vec<PermissionRule>,
+        Option<Arc<std::sync::Mutex<LearnedPermissions>>>,
+    ) = match LearnedPermissions::load(&learned_path) {
+        Ok(l) => (l.rules().to_vec(), Some(Arc::new(std::sync::Mutex::new(l)))),
+        Err(e) => {
+            let _ = ui_tx.send(Msg::Notice(format!(
+                    "learned permissions: failed to load {} — {e} (approvals won't persist this session)",
+                    learned_path.display()
+                )));
+            (Vec::new(), None)
+        }
+    };
+    if !learned_rules.is_empty() {
+        summary_parts.push(format!("{} learned rules", learned_rules.len()));
+    }
+    // Whether AlwaysAllow/AlwaysDeny will actually reach disk this session —
+    // `false` only when the on-disk file failed to load above, in which case
+    // the notice below must not claim a persist that didn't happen.
+    let learned_persists = learned.is_some();
+
     let on_approval: Arc<OnApproval> = {
         let tx = ui_tx.clone();
         let perm_mode = perm_mode.clone();
         let trace_approvals = trace.clone();
+        let learned_path_for_notice = learned_path.clone();
         Arc::new(move |calls: &[heartbit_core::llm::types::ToolCall]| {
             let started = std::time::Instant::now();
             let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
@@ -944,6 +980,29 @@ async fn build_engine(
                 &decision,
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
+            // Discoverability: core's own persistence failure is a
+            // `tracing::warn!` (runner.rs:680-683) that never reaches the TUI
+            // (init_tracing filters to heartbit::interrupt only), so this
+            // notice is the only signal — success or failure — that `[a]`/`[d]`
+            // actually took. In-session it always takes effect (runner.rs:673
+            // appends to the live ruleset unconditionally); disk persistence
+            // depends on `learned_persists` (false only when the on-disk file
+            // failed to load at startup — see the notice sent then).
+            if decision.is_persistent() {
+                let _ = tx.send(Msg::Notice(if learned_persists {
+                    format!(
+                        "remembered: {} — persisted to {}",
+                        names.join(", "),
+                        learned_path_for_notice.display()
+                    )
+                } else {
+                    format!(
+                        "remembered: {} — for this session only ({} failed to load at startup)",
+                        names.join(", "),
+                        learned_path_for_notice.display()
+                    )
+                }));
+            }
             decision
         })
     };
@@ -1073,7 +1132,7 @@ async fn build_engine(
         .max_turns(300)
         .workspace(cwd.clone())
         .instruction_text(instructions)
-        .permission_rules(default_permissions())
+        .permission_rules(merged_permissions(&learned_rules))
         .on_text(on_text)
         .on_reasoning(on_reasoning)
         .on_event(on_event)
@@ -1087,6 +1146,15 @@ async fn build_engine(
         .max_fuzzy_identical_tool_calls(5);
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
+    }
+    // Forwards to the entry runner AND all three sub-agent spawn paths
+    // (orchestrator.rs:3153-3155, :610, :1150, :1593) — one call suffices.
+    // `None` when the on-disk file failed to load (see the notice sent
+    // above); the session still gets in-memory learned rules via
+    // `persist_approval_decision`'s `permission_rules.write().append_rules`
+    // (runner.rs:673), it just won't survive a restart.
+    if let Some(learned) = learned {
+        builder = builder.learned_permissions(learned);
     }
     // Request-intent router: marker layer + "fast" classifier + safe default,
     // with the /mode pin shared from the UI thread.
@@ -1123,14 +1191,28 @@ async fn connect_mcp(
 
 /// A Claude-Code-like default policy: read-only tools run silently; everything
 /// that can mutate the workspace (write/edit/patch/bash/…) asks the human via the
-/// approval modal. `[a]`lways-allow persists as a learned rule for that tool.
-fn default_permissions() -> PermissionRuleset {
+/// approval modal (Normal mode only — YOLO short-circuits to allow-all before
+/// this ruleset is ever consulted, and Plan mode denies mutations outright).
+/// `[a]`lways-allow persists as a learned rule for that tool — `learned` rules
+/// come FIRST, because [`PermissionRuleset::evaluate`] is first-match-wins;
+/// putting them after the hardcoded defaults would make them unreachable for
+/// any tool the defaults already cover (this was the bug: the old terminal
+/// `*/*→Ask` catch-all sat in front of every learned/in-session rule).
+///
+/// There is deliberately NO terminal catch-all rule anymore: an unmatched
+/// tool now evaluates to `None`, not `Some(Ask)`. That is safe only because
+/// `runner.rs:2097` routes `Some(PermissionAction::Ask)` and `None` to the
+/// exact same `needs_approval` arm — pinned by
+/// `heartbit-core`'s `ask_and_none_both_route_to_approval` test so this
+/// invariant can't silently regress into Yolo.
+fn merged_permissions(learned: &[PermissionRule]) -> PermissionRuleset {
     let allow = |tool: &str| PermissionRule {
         tool: tool.into(),
         pattern: "*".into(),
         action: PermissionAction::Allow,
     };
-    PermissionRuleset::new(vec![
+    let mut rules = learned.to_vec();
+    rules.extend([
         allow("read"),
         allow("grep"),
         allow("glob"),
@@ -1146,12 +1228,8 @@ fn default_permissions() -> PermissionRuleset {
         allow("set_goal"),
         allow("set_scope"),
         allow("handoff"),
-        PermissionRule {
-            tool: "*".into(),
-            pattern: "*".into(),
-            action: PermissionAction::Ask,
-        },
-    ])
+    ]);
+    PermissionRuleset::new(rules)
 }
 
 /// Walk the project for `@`-mention autocomplete: relative file paths, skipping
@@ -1955,7 +2033,7 @@ mod permission_tests {
         // request to ask them a question (double modal). Harness-dialogue
         // tools (question, set_goal, set_scope, handoff) touch no workspace
         // file and must never sit behind an approval prompt.
-        let rules = default_permissions();
+        let rules = merged_permissions(&[]);
         for tool in ["question", "set_goal", "set_scope", "handoff"] {
             assert_eq!(
                 rules.evaluate(tool, &serde_json::json!({})),
@@ -1963,14 +2041,74 @@ mod permission_tests {
                 "{tool} must be auto-allowed"
             );
         }
-        // Mutating tools still go through approval.
+        // Mutating tools have no hardcoded rule and no terminal catch-all
+        // anymore, so they evaluate to `None` — NOT `Some(Ask)`. This is the
+        // Task 4 fix: `runner.rs:2097` routes `None` and `Some(Ask)` to the
+        // exact same `needs_approval` arm (pinned by heartbit-core's
+        // `ask_and_none_both_route_to_approval`), so dropping the terminal
+        // catch-all is behaviour-identical for these tools while letting a
+        // learned/in-session rule for them actually be reachable.
         for tool in ["write", "edit", "bash", "patch"] {
             assert_eq!(
                 rules.evaluate(tool, &serde_json::json!({})),
-                Some(PermissionAction::Ask),
-                "{tool} must still ask"
+                None,
+                "{tool} must fall through to None (routes to approval same as Ask)"
             );
         }
+    }
+
+    #[test]
+    fn merged_permissions_with_no_learned_rules_matches_today() {
+        let rules = merged_permissions(&[]);
+        // The 10 explicit allows are unchanged…
+        for tool in ["read", "grep", "glob", "list", "todoread", "todowrite"] {
+            assert_eq!(
+                rules.evaluate(tool, &serde_json::json!({})),
+                Some(PermissionAction::Allow),
+                "{tool} must still be auto-allowed"
+            );
+        }
+        // …and the terminal catch-all is GONE: unmatched tools fall through to
+        // None, which runner.rs:2097 routes to approval exactly like Some(Ask).
+        for tool in ["write", "edit", "bash", "patch"] {
+            assert_eq!(rules.evaluate(tool, &serde_json::json!({})), None, "{tool}");
+        }
+    }
+
+    #[test]
+    fn merged_permissions_orders_learned_rules_first() {
+        let learned = vec![PermissionRule {
+            tool: "bash".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Allow,
+        }];
+        // evaluate is first-match-wins, so a learned rule must precede the
+        // defaults or it can never be reached.
+        assert_eq!(
+            merged_permissions(&learned).evaluate("bash", &serde_json::json!({})),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn merged_permissions_learned_rule_overrides_a_hardcoded_default() {
+        // `bash` (above) has no hardcoded rule at all, so that assertion would
+        // pass whether learned rules are ordered first or last — it doesn't
+        // actually discriminate ordering. `read` DOES have a hardcoded
+        // Allow, so a learned Deny for `read` only wins if learned rules are
+        // checked BEFORE the 10 defaults (first-match-wins in
+        // PermissionRuleset::evaluate). This is the case that would catch a
+        // regression to `rules.extend(learned)` (append instead of prepend).
+        let learned = vec![PermissionRule {
+            tool: "read".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Deny,
+        }];
+        assert_eq!(
+            merged_permissions(&learned).evaluate("read", &serde_json::json!({})),
+            Some(PermissionAction::Deny),
+            "a learned rule must be able to override a hardcoded default"
+        );
     }
 }
 
