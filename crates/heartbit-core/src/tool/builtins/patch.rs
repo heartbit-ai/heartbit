@@ -667,6 +667,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1,3 +1,3 @@\n line 1\n-line 2\n+line TWO\n line 3\n",
+            path.display()
+        );
+
+        let tool =
+            PatchTool::new(tracker, None, Arc::new(Vec::new())).with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line 1\nline TWO\nline 3\n"
+        );
+    }
+
+    #[tokio::test]
     async fn patch_applies_simple_diff() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");

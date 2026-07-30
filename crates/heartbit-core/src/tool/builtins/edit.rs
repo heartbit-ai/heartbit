@@ -567,6 +567,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi world\n");
+    }
+
+    #[tokio::test]
     async fn edit_snippet_clamps_to_the_formatted_buffer_not_the_whole_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.rs");
