@@ -11,6 +11,18 @@ use crate::app::{App, Modal};
 
 const SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 
+/// Height of the queued-messages box above the composer: `0` (no space at
+/// all) when nothing is queued, so an idle frame is pixel-identical to one
+/// rendered before this feature existed. Otherwise one row per queued entry
+/// plus borders, capped so a long backlog can't crowd out the transcript.
+fn queue_height(queued_len: usize, frame_h: u16) -> u16 {
+    if queued_len == 0 {
+        return 0;
+    }
+    let cap = frame_h / 3;
+    ((queued_len as u16).saturating_add(2)).clamp(3, cap.max(3))
+}
+
 /// Flatten the transcript (history + the live streaming reply) into lines.
 pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -115,9 +127,16 @@ pub fn view(frame: &mut Frame, app: &App) {
     } else {
         2
     };
+    // Visible input queue (above the composer, T1.3): messages submitted
+    // while a turn was in flight. A ZERO-height constraint when the queue is
+    // empty (the overwhelmingly common case) means this chunk takes no space
+    // at all — the frame below (transcript `line_count`/`max_off`/
+    // `scroll_offset`) is untouched, identical to before this feature existed.
+    let queue_h = queue_height(app.queued.len(), area.height);
     let chunks = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(status_h),
+        Constraint::Length(queue_h),
         Constraint::Length(comp_h),
     ])
     .split(area);
@@ -194,6 +213,34 @@ pub fn view(frame: &mut Frame, app: &App) {
         );
     }
 
+    // --- queued messages (visible input queue, T1.3) ---
+    // Submitted while a turn was in flight: held here (App::queued) instead
+    // of the invisible unbounded input channel, so the user can see, edit
+    // (↑) and cancel (Esc) them. Nothing renders — and `queue_h` is 0 — while
+    // the queue is empty.
+    if !app.queued.is_empty() {
+        let items: Vec<Line> = app
+            .queued
+            .iter()
+            .map(|q| {
+                // The clean DISPLAY text — never the wire payload, which may
+                // carry an invisible directive (e.g. Plan mode's prefix).
+                let preview = q.display.lines().next().unwrap_or("").trim();
+                Line::from(Span::styled(
+                    format!(" • {preview}"),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect();
+        let widget = Paragraph::new(items)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " queued ({}) · ↑ edit newest · Esc drop ",
+                app.queued.len()
+            )))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(widget, chunks[2]);
+    }
+
     // --- composer ---
     // Pre-wrapped rows + a vertical scroll that keeps the cursor's row inside
     // the (height-capped) box: when the draft outgrows the cap, the view
@@ -224,7 +271,7 @@ pub fn view(frame: &mut Frame, app: &App) {
     let composer = Paragraph::new(comp_text)
         .scroll((comp_scroll as u16, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(composer, chunks[2]);
+    frame.render_widget(composer, chunks[3]);
 
     // --- slash-command autocomplete menu (floats above the composer) ---
     let candidates = app.command_candidates();
@@ -232,8 +279,8 @@ pub fn view(frame: &mut Frame, app: &App) {
         let h = (candidates.len() as u16 + 2).min(area.height);
         let w = 52.min(area.width);
         let rect = Rect {
-            x: chunks[2].x,
-            y: chunks[2].y.saturating_sub(h),
+            x: chunks[3].x,
+            y: chunks[3].y.saturating_sub(h),
             width: w,
             height: h,
         };
@@ -273,8 +320,8 @@ pub fn view(frame: &mut Frame, app: &App) {
             let h = (files.len() as u16 + 2).min(area.height).min(10);
             let w = 60.min(area.width);
             let rect = Rect {
-                x: chunks[2].x,
-                y: chunks[2].y.saturating_sub(h),
+                x: chunks[3].x,
+                y: chunks[3].y.saturating_sub(h),
                 width: w,
                 height: h,
             };
@@ -730,8 +777,8 @@ pub fn view(frame: &mut Frame, app: &App) {
             // Show the text cursor in the composer when no modal is up — at
             // its WRAPPED position, adjusted by the composer's scroll.
             frame.set_cursor_position(Position::new(
-                chunks[2].x + 1 + cur_col as u16,
-                chunks[2].y + 1 + (cur_row - comp_scroll) as u16,
+                chunks[3].x + 1 + cur_col as u16,
+                chunks[3].y + 1 + (cur_row - comp_scroll) as u16,
             ));
         }
     }
@@ -987,6 +1034,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::QueuedInput;
     use crate::cells::Cell;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1029,6 +1077,84 @@ mod tests {
             "running indicator missing:\n{text}"
         );
         assert!(text.contains("draft"), "composer text missing:\n{text}");
+    }
+
+    #[test]
+    fn queue_height_is_zero_when_empty() {
+        // The load-bearing invariant behind "an empty queue renders an
+        // identical frame": the layout constraint takes NO space at all, not
+        // just a small one.
+        assert_eq!(queue_height(0, 24), 0);
+        assert_eq!(queue_height(0, 6), 0);
+    }
+
+    #[test]
+    fn empty_queue_renders_no_queue_box() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("qwen-235b");
+        app.history.push(Cell::User("hello world".into()));
+        app.running = true;
+        app.composer.insert_str("draft");
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        // Same assertions as `renders_transcript_status_and_composer` — an
+        // empty queue must not perturb anything already rendered.
+        assert!(text.contains("hello world"));
+        assert!(text.contains("draft"));
+        assert!(
+            !text.contains("queued ("),
+            "no queue box without queued messages:\n{text}"
+        );
+    }
+
+    #[test]
+    fn queued_messages_render_above_the_composer() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("qwen-235b");
+        app.running = true;
+        app.queued.push_back("first queued message".into());
+        app.queued.push_back("second queued message".into());
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("queued (2)"), "queue count missing:\n{text}");
+        assert!(
+            text.contains("first queued message"),
+            "oldest queued entry missing:\n{text}"
+        );
+        assert!(
+            text.contains("second queued message"),
+            "newest queued entry missing:\n{text}"
+        );
+        assert!(
+            text.contains("edit newest"),
+            "Up/Esc affordance missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn queue_box_previews_display_not_the_wire_payload() {
+        // The whole point of the display/wire split: the queue box must show
+        // the user's clean text, never the internal directive riding along
+        // in the wire payload (e.g. Plan mode's read-only prefix). A fixture
+        // built with `.into()` (display == wire) can't catch a regression
+        // that swaps which field the preview reads — this one can.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("m");
+        app.running = true;
+        app.queued.push_back(QueuedInput {
+            display: "check the parser".into(),
+            wire: "[PLAN MODE — READ-ONLY]\n\ncheck the parser".into(),
+        });
+        terminal.draw(|f| view(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("check the parser"));
+        assert!(
+            !text.contains("PLAN MODE"),
+            "wire directive leaked into the queue box:\n{text}"
+        );
     }
 
     #[test]

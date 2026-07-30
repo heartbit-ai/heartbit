@@ -443,6 +443,31 @@ pub enum Modal {
     SessionPicker(SessionPicker),
 }
 
+/// A message held in the visible queue: the user-facing text (shown in the
+/// queue box, drained into the transcript as a `Cell::User`, and reloaded by
+/// Up for editing) kept SEPARATE from the wire payload actually sent to the
+/// agent (`Effect::SendInput`), which may carry an invisible directive the
+/// display must never show — e.g. Plan mode's read-only prefix. A single
+/// shared string here would leak that directive into the transcript and back
+/// into the composer the moment a Plan-mode submit landed mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedInput {
+    pub(crate) display: String,
+    pub(crate) wire: String,
+}
+
+#[cfg(test)]
+impl From<&str> for QueuedInput {
+    /// Test-only convenience: most fixtures don't care about the display/wire
+    /// split, so both sides get the same text.
+    fn from(s: &str) -> Self {
+        Self {
+            display: s.to_string(),
+            wire: s.to_string(),
+        }
+    }
+}
+
 /// The full UI state.
 pub struct App {
     pub history: Vec<Cell>,
@@ -563,6 +588,10 @@ pub struct App {
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
     tool_index: HashMap<String, usize>,
+    /// Messages submitted while a turn was in flight, held HERE rather than
+    /// pushed into the invisible unbounded input channel so the user can see,
+    /// edit and cancel them. Invariant: non-empty ⇒ `running`.
+    pub(crate) queued: std::collections::VecDeque<QueuedInput>,
 }
 
 impl App {
@@ -616,6 +645,7 @@ impl App {
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),
+            queued: std::collections::VecDeque::new(),
         }
     }
 
@@ -888,6 +918,9 @@ impl App {
                         self.effects.push(Effect::CommitLessons(digest));
                     }
                     self.flush_pending_respawn();
+                    // Turn boundary: release at most one queued message. If
+                    // one was waiting, `running` goes back to `true`.
+                    self.drain_one_queued();
                 }
             }
             // A sub-agent's LLM call: its cost is real (session totals) but its
@@ -1005,6 +1038,9 @@ impl App {
                     self.effects.push(Effect::CommitLessons(digest));
                 }
                 self.flush_pending_respawn();
+                // Turn boundary: release at most one queued message. If one
+                // was waiting, `running` goes back to `true`.
+                self.drain_one_queued();
             }
             Msg::AgentExited(_) => {
                 self.finalize_active();
@@ -1014,12 +1050,17 @@ impl App {
                 // next run's first text-only LlmDone.
                 self.learning = None;
                 self.flush_pending_respawn();
+                // Abnormal end: there is no live turn to release into — drop
+                // the backlog rather than stranding it silently.
+                self.drop_queued();
             }
             Msg::RunFailed(error) => {
                 self.finalize_active();
                 self.running = false;
                 self.learning = None;
                 self.flush_pending_respawn();
+                // Abnormal end: same as AgentExited — drop, don't drain.
+                self.drop_queued();
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
                 // P12: a run failure is terminal for this engine — leave a
@@ -1091,11 +1132,20 @@ impl App {
                 self.history.push(Cell::Notice(format!("stats: {e}")));
             }
             Msg::AnalyzeReady { display, task } => {
-                self.history.push(Cell::User(display));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
-                self.effects.push(Effect::SendInput(task));
+                // The async prep (trace fetch + prompt build) may resolve
+                // while a DIFFERENT turn is still in flight — queue rather
+                // than bypass straight into the invisible channel. Queuing
+                // `display` alongside `task` also means a mid-turn /analyze
+                // shows the friendly label, not the raw tool instruction,
+                // once it's later drained.
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             Msg::AnalyzeFailed(e) => {
                 self.history.push(Cell::Notice(format!("analyze: {e}")));
@@ -1105,12 +1155,18 @@ impl App {
                 task,
                 staged_digest,
             } => {
-                self.history.push(Cell::User(display));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
+                // Arm the commit regardless of idle/mid-turn — it tracks the
+                // digest to commit once THIS /learn's task actually runs, not
+                // the turn that happens to be in flight right now.
                 self.learning = Some(staged_digest);
-                self.effects.push(Effect::SendInput(task));
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             Msg::LearnFailed(e) => {
                 self.history.push(Cell::Notice(format!("learn: {e}")));
@@ -1253,11 +1309,9 @@ impl App {
         let text = self.composer.take();
         // Persist the raw prompt to the per-directory history (slash commands
         // never reach here — they returned above, so secrets stay unrecallable).
+        // This is independent of whether the turn is sent now or queued — the
+        // recall history cares about what was TYPED, not when it was SENT.
         self.effects.push(Effect::PersistPrompt(text.clone()));
-        self.history.push(Cell::User(text.clone())); // display the user's text verbatim
-        self.running = true;
-        self.follow = true; // jump back to the newest when the user sends
-        self.seed_idle_squad(); // fresh roster: the whole squad, available
         // Plan mode: prefix a read-only directive so the agent PRODUCES A PLAN
         // instead of attempting edits and getting silently denied by the gate.
         // Per-turn (reflects the mode at send time); the display stays clean.
@@ -1269,9 +1323,66 @@ impl App {
                  normal/YOLO mode to execute.]\n\n{text}"
             )
         } else {
-            text
+            text.clone()
         };
-        self.effects.push(Effect::SendInput(sent));
+        // A turn already in flight: `send_or_queue` below holds this one
+        // visibly instead of pushing straight into the invisible input
+        // channel. The start-of-turn bookkeeping (display cell, roster reset)
+        // only applies to a genuinely fresh turn — repeating it mid-turn would
+        // reset the LIVE roster back to Idle and double-display the message
+        // once it's eventually drained.
+        let was_idle = !self.running;
+        self.send_or_queue(text.clone(), sent);
+        if was_idle {
+            self.history.push(Cell::User(text)); // display the user's text verbatim
+            self.running = true;
+            self.follow = true; // jump back to the newest when the user sends
+            self.seed_idle_squad(); // fresh roster: the whole squad, available
+        }
+    }
+
+    /// The single choke point for every user-visible send: `display` is what
+    /// the human sees (queue box, transcript, Up-recall); `wire` is the exact
+    /// payload that becomes `Effect::SendInput` and may carry an invisible
+    /// directive `display` must not (e.g. Plan mode's read-only prefix). Six
+    /// call sites reach this in addition to `submit` above (AnalyzeReady,
+    /// LearnReady, `/goal` clear, `/goal` set, `/handoff`, `/research`) —
+    /// routing them all through here is what keeps the queue honest instead
+    /// of leaving mid-turn bypasses straight into the invisible input channel.
+    fn send_or_queue(&mut self, display: String, wire: String) {
+        if self.running {
+            self.queued.push_back(QueuedInput { display, wire });
+        } else {
+            self.effects.push(Effect::SendInput(wire));
+        }
+    }
+
+    /// Release at most ONE queued message at a turn boundary. Releasing
+    /// several would push the rest back into the invisible channel — the
+    /// very defect this queue exists to fix.
+    fn drain_one_queued(&mut self) {
+        if let Some(q) = self.queued.pop_front() {
+            self.history.push(Cell::User(q.display));
+            self.running = true; // the drained message starts a fresh turn
+            self.effects.push(Effect::SendInput(q.wire));
+        }
+    }
+
+    /// Drop the entire backlog with a recoverable notice — used whenever a
+    /// turn ends WITHOUT a next turn to release into (failure, unexpected
+    /// exit, user interrupt), or when the user explicitly cancels the
+    /// backlog with Esc. The text is gone, but the notice makes the drop
+    /// visible instead of silently stranding the messages.
+    fn drop_queued(&mut self) {
+        let n = self.queued.len();
+        if n == 0 {
+            return;
+        }
+        self.queued.clear();
+        self.history.push(Cell::Notice(format!(
+            "{n} queued message{} dropped — retype if still needed",
+            if n == 1 { "" } else { "s" }
+        )));
     }
 
     fn handle_slash(&mut self, cmd: String) {
@@ -1349,15 +1460,23 @@ impl App {
                             .into(),
                     ));
                 } else if arg.eq_ignore_ascii_case("clear") {
-                    self.effects.push(Effect::SendInput(
+                    // Display is the slash command itself — these instructions
+                    // were never shown verbatim even on an immediate send, so
+                    // a mid-turn queue+drain gets a friendly label instead of
+                    // reusing the raw tool-call text.
+                    self.send_or_queue(
+                        "/goal clear".to_string(),
                         "Call the `set_goal` tool with clear=true (remove the completion goal)."
                             .to_string(),
-                    ));
+                    );
                 } else {
-                    self.effects.push(Effect::SendInput(format!(
-                        "Call the `set_goal` tool now with this objective, then keep working \
-                         toward it: \"{arg}\""
-                    )));
+                    self.send_or_queue(
+                        format!("/goal {arg}"),
+                        format!(
+                            "Call the `set_goal` tool now with this objective, then keep working \
+                             toward it: \"{arg}\""
+                        ),
+                    );
                 }
             }
             "handoff" => {
@@ -1366,10 +1485,13 @@ impl App {
                     // invalid by design — the purpose tailors the brief).
                     self.effects.push(Effect::ListHandoffs);
                 } else {
-                    self.effects.push(Effect::SendInput(format!(
-                        "Call the `handoff` tool now with purpose: \"{arg}\". Then tell me \
-                         the brief's path in one line."
-                    )));
+                    self.send_or_queue(
+                        format!("/handoff {arg}"),
+                        format!(
+                            "Call the `handoff` tool now with purpose: \"{arg}\". Then tell me \
+                             the brief's path in one line."
+                        ),
+                    );
                 }
             }
             "stats" => {
@@ -1441,11 +1563,18 @@ impl App {
                      do not improvise your own research.",
                     q = serde_json::to_string(&arg).unwrap_or_else(|_| format!("\"{arg}\"")),
                 );
-                self.history.push(Cell::User(format!("researching: {arg}")));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
-                self.effects.push(Effect::SendInput(task));
+                // /research isn't guarded against mid-run reentry either — a
+                // second /research while one is already going through must
+                // queue, not bypass into the invisible channel.
+                let display = format!("researching: {arg}");
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             "help" => {
                 self.history.push(Cell::Notice(
@@ -1957,13 +2086,31 @@ impl App {
             }
             KeyCode::Left => self.composer.move_left(),
             KeyCode::Right => self.composer.move_right(),
-            KeyCode::Up => self.composer.history_prev(),
+            // A non-empty queue changes what Up means: pop the newest queued
+            // entry back for editing instead of recalling prompt history —
+            // editing what's about to be sent takes priority over recall.
+            KeyCode::Up => {
+                if let Some(q) = self.queued.pop_back() {
+                    // The CLEAN display text, never the wire payload — a
+                    // Plan-mode queued message must not bring its invisible
+                    // directive back into the composer.
+                    self.composer.set_text(&q.display);
+                } else {
+                    self.composer.history_prev();
+                }
+            }
             KeyCode::Down => self.composer.history_next(),
             KeyCode::PageUp => self.scroll_up(SCROLL_STEP),
             KeyCode::PageDown => self.scroll_down(SCROLL_STEP),
-            // Esc interrupts a running turn; when idle it just clears the composer.
+            // A non-empty queue changes what Esc means too: drop the backlog
+            // (visibly, via a notice) rather than interrupting the turn that
+            // is actually still in flight. Only once the queue is empty does
+            // Esc fall through to its running/idle meaning — so idle-Esc
+            // (queue always empty then, by the invariant) is unchanged.
             KeyCode::Esc => {
-                if self.running {
+                if !self.queued.is_empty() {
+                    self.drop_queued();
+                } else if self.running {
                     self.interrupt();
                 } else {
                     self.composer.clear();
@@ -2004,6 +2151,10 @@ impl App {
         self.running = false;
         // The interrupt ends the turn — a deferred model change applies now.
         self.flush_pending_respawn();
+        // No live turn to release into — drop the backlog (defensive: the
+        // Esc handler above already routes a non-empty queue away from here,
+        // but keep the invariant locally true too).
+        self.drop_queued();
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -4915,5 +5066,239 @@ mod tests {
         ));
         assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("/analyze")));
+    }
+
+    // --- Task 6: visible input queue ---
+
+    #[test]
+    fn submit_while_running_queues_instead_of_sending() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "second thing");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_)))
+        );
+    }
+
+    #[test]
+    fn queued_message_drains_at_turn_idle_as_a_user_cell() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued one");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(app.queued.is_empty());
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("queued one".into()))
+        );
+    }
+
+    #[test]
+    fn turn_idle_drains_only_one_queued_message() {
+        let mut app = keyed();
+        app.running = true;
+        for t in ["a", "b"] {
+            typed(&mut app, t);
+            app.update(key(KeyCode::Enter));
+        }
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "releasing several would re-hide the rest"
+        );
+    }
+
+    #[test]
+    fn tool_calling_llm_done_does_not_drain_the_queue() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "later");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: true,
+            ttft_ms: 0,
+        });
+        assert_eq!(app.queued.len(), 1, "the turn is not over — a tool is next");
+    }
+
+    #[test]
+    fn run_failed_and_agent_exit_drop_the_queue() {
+        for msg in [Msg::RunFailed("boom".into()), Msg::AgentExited(1)] {
+            let mut app = keyed();
+            app.running = true;
+            typed(&mut app, "stranded");
+            app.update(key(KeyCode::Enter));
+            app.update(msg);
+            assert!(
+                app.queued.is_empty(),
+                "a failed turn must not strand the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_is_empty_whenever_the_turn_is_idle() {
+        let mut app = keyed();
+        assert!(app.queued.is_empty() && !app.running);
+        typed(&mut app, "immediate");
+        app.update(key(KeyCode::Enter));
+        assert!(app.queued.is_empty(), "an idle submit sends, never queues");
+        assert!(app.effects.contains(&Effect::SendInput("immediate".into())));
+    }
+
+    #[test]
+    fn up_arrow_pops_the_newest_queued_message_for_editing() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "edit me");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Up));
+        assert!(app.queued.is_empty());
+        assert_eq!(app.composer.text(), "edit me");
+    }
+
+    #[test]
+    fn up_arrow_with_an_empty_queue_still_recalls_prompt_history() {
+        // Idle-Up must keep its pre-existing meaning (recall) when there is
+        // nothing queued — only a non-empty queue changes what Up does.
+        let mut app = keyed();
+        typed(&mut app, "first prompt");
+        app.update(key(KeyCode::Enter)); // idle submit — sends immediately, never queues
+        assert!(app.queued.is_empty());
+        app.composer.seed_history(vec!["first prompt".into()]);
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "first prompt");
+    }
+
+    #[test]
+    fn esc_drops_the_queue_without_interrupting_the_running_turn() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued while busy");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.effects.clear();
+        app.update(key(KeyCode::Esc));
+        assert!(app.queued.is_empty(), "Esc drops the backlog");
+        assert!(app.running, "the in-flight turn itself is untouched");
+        assert!(
+            !app.effects.contains(&Effect::Interrupt),
+            "a queue-drop is not an interrupt"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("dropped"))),
+            "the drop must be visible, not silent"
+        );
+    }
+
+    #[test]
+    fn interrupt_drops_the_queue_too() {
+        // Interrupt also sets running = false — it must not strand the queue
+        // either (same invariant as the two failure sites).
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "stranded by interrupt");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.update(key(KeyCode::Esc)); // queue non-empty → drops the queue, not an interrupt
+        assert!(app.queued.is_empty());
+        assert!(app.running);
+        // A second Esc now finds an empty queue — falls through to interrupt.
+        app.update(key(KeyCode::Esc));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn run_completed_drains_one_queued_message() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued for completion");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::RunCompleted);
+        assert!(app.queued.is_empty());
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("queued for completion".into()))
+        );
+        assert!(app.running, "the drained message starts a new turn");
+    }
+
+    #[test]
+    fn plan_mode_queued_message_keeps_display_clean_when_drained() {
+        // A single queued String can't carry "clean display" and "plan-
+        // prefixed wire payload" separately — a mid-turn Plan-mode submit
+        // must NOT leak the internal directive into the transcript once
+        // drained (advisor finding: the idle path already gets this right
+        // via `plan_mode_prefixes_a_read_only_directive_but_keeps_display_clean`,
+        // but that test never exercises `was_idle == false`).
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        app.running = true;
+        typed(&mut app, "check the parser");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::User(t) if t == "check the parser")),
+            "the drained display must be the user's clean text, not the internal \
+             directive: {:?}",
+            app.history
+        );
+        let sent = app
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SendInput(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a message was sent");
+        assert!(
+            sent.contains("PLAN MODE"),
+            "the wire payload keeps the directive"
+        );
+        assert!(sent.contains("check the parser"));
+    }
+
+    #[test]
+    fn up_arrow_pops_the_clean_display_even_in_plan_mode() {
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        app.running = true;
+        typed(&mut app, "check the parser");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Up));
+        assert_eq!(
+            app.composer.text(),
+            "check the parser",
+            "no PLAN MODE directive leaking into the composer on edit"
+        );
     }
 }
