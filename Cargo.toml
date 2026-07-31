@@ -81,6 +81,9 @@ crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 # ThemeSet::load_defaults — never touch, since they load pre-built embedded
 # dumps) and drags in a duplicate `quick-xml` version alongside the workspace's
 # existing one. This explicit set gives the same embedded-dump loading + the
-# pure-Rust (no C toolchain) regex engine with 8 new crates and zero dupes —
-# verified via `cargo tree -d`. Do not "simplify" this back to `default-fancy`.
+# pure-Rust (no C toolchain) regex engine with 8 new crates, avoiding the
+# `quick-xml` duplicate above (verified via `cargo tree -d`). It does NOT make
+# the graph dupe-free: syntect still pulls its own `fancy-regex` major version
+# (0.16.x) alongside jsonschema's (0.14.x). Do not "simplify" this back to
+# `default-fancy`.
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }

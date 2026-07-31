@@ -1239,9 +1239,15 @@ impl App {
                 task,
                 staged_digest,
             } => {
-                // Arm the commit regardless of idle/mid-turn — it tracks the
-                // digest to commit once THIS /learn's task actually runs, not
-                // the turn that happens to be in flight right now.
+                // Stage the digest now so the next CommitLessons can skip the
+                // commit if the staged-lessons file is still exactly what it
+                // was at stage time (digest match → no-op, nothing rewrote
+                // it). This is a no-change guard, not a turn-affinity fix:
+                // `self.learning` is a single slot, so if a turn is already
+                // in flight when /learn runs, THAT turn's idle (not /learn's)
+                // drains this slot first — /learn's own commit can then fire
+                // at the wrong boundary or be skipped entirely. Known
+                // limitation, tracked as a follow-up; not fixed here.
                 self.learning = Some(staged_digest);
                 let was_idle = !self.running;
                 self.send_or_queue(display.clone(), task);
