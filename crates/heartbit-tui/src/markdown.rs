@@ -75,10 +75,21 @@ fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
 ///
 /// `buf` is the raw text pulldown-cmark handed us, which carries the source's
 /// own trailing `\n` (the line before the closing fence). We strip exactly
-/// that one trailing newline before splitting into lines, and drop any
-/// highlighted range whose text is only `"\n"` — both paths then emit exactly
-/// one [`Line`] per source line, with identical characters, which is the
-/// invariant `highlighting_preserves_code_characters_and_line_count` checks.
+/// that one trailing newline before splitting into lines, and TRIM (not just
+/// exact-match) a trailing `\n` off every highlighted range's text — both
+/// paths then emit exactly one [`Line`] per source line, with identical
+/// characters, which is the invariant
+/// `highlighting_preserves_code_characters_and_line_count` checks.
+///
+/// The trim (rather than an exact `*t == "\n"` match) matters: syntect merges
+/// the line terminator into the PRECEDING range whenever no scope changes at
+/// end-of-line — e.g. a `//` comment or an in-progress multi-line string —
+/// so a range's text can be `" trailing comment\n"`, not a separate `"\n"`
+/// range. An exact match misses that and leaves a literal newline character
+/// embedded inside a `Span`, silently breaking the invariant for any block
+/// containing a comment or multi-line string that isn't the block's last
+/// line (a comment or string AS the last line is already clean, since the
+/// block's own trailing newline was stripped above).
 fn highlight_code_block(buf: &str, lang: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
     let text = buf.strip_suffix('\n').unwrap_or(buf);
     if text.is_empty() {
@@ -88,17 +99,29 @@ fn highlight_code_block(buf: &str, lang: Option<&str>, theme: &Theme) -> Vec<Lin
         Some(syntax) => {
             let mut h = HighlightLines::new(syntax, theme);
             LinesWithEndings::from(text)
-                .map(|line| {
-                    let ranges = h.highlight_line(line, syntax_set()).unwrap_or_default();
-                    Line::from(
+                .map(|line| match h.highlight_line(line, syntax_set()) {
+                    Ok(ranges) => Line::from(
                         ranges
                             .into_iter()
-                            .filter(|(_, t)| *t != "\n")
-                            .map(|(style, t)| {
-                                Span::styled(t.to_string(), syntect_style_to_ratatui(style))
+                            .filter_map(|(style, t)| {
+                                let t = t.strip_suffix('\n').unwrap_or(t);
+                                (!t.is_empty()).then(|| {
+                                    Span::styled(t.to_string(), syntect_style_to_ratatui(style))
+                                })
                             })
                             .collect::<Vec<_>>(),
-                    )
+                    ),
+                    // A syntect parse error yields zero ranges — falling back
+                    // to `unwrap_or_default()` would silently DELETE this
+                    // line's characters. Keep them, in the flat CODE colour.
+                    Err(_) => {
+                        let flat = line.strip_suffix('\n').unwrap_or(line);
+                        if flat.is_empty() {
+                            Line::default()
+                        } else {
+                            Line::from(Span::styled(flat.to_string(), Style::default().fg(CODE)))
+                        }
+                    }
                 })
                 .collect()
         }
@@ -609,7 +632,16 @@ mod tests {
     fn highlighting_preserves_code_characters_and_line_count() {
         // THE invariant: highlighting must not change one character or one line,
         // or every existing markdown assertion silently becomes wrong.
-        let src = "```rust\nfn main() {\n    let x = 1;\n}\n```";
+        //
+        // The fixture MUST include a comment line followed by another line,
+        // and a multi-line string: syntect merges the line terminator into
+        // the PRECEDING range whenever no scope changes at end-of-line (a
+        // `//` comment or an in-progress string are exactly that), so a
+        // fixture with no such line cannot catch a filter that only drops
+        // ranges whose text is EXACTLY "\n" — a comment as the block's LAST
+        // line would be clean too (the block's own trailing newline is
+        // stripped before highlighting), so the comment must NOT be last.
+        let src = "```rust\nfn main() {\n    // trailing comment\n    let s = \"line one\nline two\";\n}\n```";
         let hl = render(src);
         let flat = render(&src.replace("```rust", "```"));
         assert_eq!(all_text(&hl), all_text(&flat));
