@@ -606,6 +606,12 @@ pub struct App {
     /// pushed into the invisible unbounded input channel so the user can see,
     /// edit and cancel them. Invariant: non-empty ⇒ `running`.
     pub(crate) queued: std::collections::VecDeque<QueuedInput>,
+    /// View-side memoization of highlighted Markdown (interior-mutable, same
+    /// precedent as `last_max_off`): `terminal.draw()` re-renders every agent
+    /// cell on every keystroke and every 120ms tick, so re-running syntect
+    /// uncached would burn a syntax parser dozens of times a second. The
+    /// reducer never reads or writes this field — see `Msg::Resize` below.
+    pub(crate) md: crate::markdown::MarkdownCache,
 }
 
 impl App {
@@ -661,6 +667,7 @@ impl App {
             effects: Vec::new(),
             tool_index: HashMap::new(),
             queued: std::collections::VecDeque::new(),
+            md: crate::markdown::MarkdownCache::default(),
         }
     }
 
@@ -830,6 +837,14 @@ impl App {
                     self.splash = (t < crate::splash::SPLASH_TICKS).then_some(t);
                 }
             }
+            // Deliberately NOT touching `self.md` here (or anywhere in
+            // `update`/its helpers — the reducer stays pure, no cache reads
+            // or writes). A resize cannot serve stale content from the
+            // Markdown cache: entries hold LOGICAL lines, and wrapping to the
+            // terminal width happens at draw time in `ui::view` via
+            // `Paragraph::wrap` against the live `transcript_area.width` —
+            // nothing width-derived is ever stored under the cache's key
+            // (see `MarkdownCache`'s doc comment).
             Msg::Resize => {}
             // Mouse wheel scrolls the transcript (output history). Over-scrolling
             // is harmless — the renderer clamps the offset to the top.

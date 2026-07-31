@@ -140,6 +140,14 @@ pub struct TuiConfig {
     /// `keyboard_enhancement = false` in tui.toml.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub keyboard_enhancement: bool,
+    /// A bundled `syntect` theme name (e.g. `"InspiredGitHub"`) for
+    /// highlighted fenced code blocks in the transcript. Unset or unresolvable
+    /// falls back to the built-in default — never a typed enum, so a typo
+    /// here degrades gracefully instead of (via `load_from`'s parse-error →
+    /// `Default` swallow) wiping the whole config, secrets included. Set via
+    /// hand-editing `tui.toml` (no in-TUI command yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax_theme: Option<String>,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -172,6 +180,7 @@ impl Default for TuiConfig {
             fast_model: None,
             frontier_model: None,
             keyboard_enhancement: true,
+            syntax_theme: None,
         }
     }
 }
@@ -296,6 +305,28 @@ mod tests {
             !std::fs::read_to_string(&bare_path)
                 .unwrap()
                 .contains("reasoning_effort")
+        );
+    }
+
+    #[test]
+    fn syntax_theme_defaults_to_none_and_roundtrips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.syntax_theme.is_none(), "missing key means unset");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        let saved = TuiConfig {
+            syntax_theme: Some("InspiredGitHub".into()),
+            ..Default::default()
+        };
+        saved.save_to(&path).unwrap();
+        assert_eq!(TuiConfig::load_from(&path), saved);
+        // None must be omitted from the file, not serialized as an empty key.
+        let bare_path = dir.path().join("bare.toml");
+        TuiConfig::default().save_to(&bare_path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&bare_path)
+                .unwrap()
+                .contains("syntax_theme")
         );
     }
 

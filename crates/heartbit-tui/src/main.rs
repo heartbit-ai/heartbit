@@ -247,6 +247,7 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.prompt_caching = cfg.prompt_caching;
     app.notify = cfg.notify;
     app.splash = cfg.splash.then_some(0);
+    app.md = markdown::MarkdownCache::new(cfg.syntax_theme.as_deref());
     // Same deterministic registry the engine builds — /workflows lists it.
     app.workflow_recipes = heartbit_core::default_registry().meta();
     // Per-directory persistent prompt history: ↑ recalls prompts from

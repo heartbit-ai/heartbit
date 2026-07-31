@@ -25,6 +25,11 @@ fn queue_height(queued_len: usize, frame_h: u16) -> u16 {
 
 /// Flatten the transcript (history + the live streaming reply) into lines.
 pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+    // Sweep the Markdown cache for the new frame FIRST (exactly one caller,
+    // by design — see `MarkdownCache::begin_frame`'s doc comment): every
+    // settled `Cell::Agent` rendered below marks itself touched again this
+    // frame, so only cells that scrolled out of the transcript get evicted.
+    app.md.begin_frame();
     let mut lines = Vec::new();
     // Fresh session: a small identity header instead of a bare wall of
     // notices (cleared the moment the conversation starts).
@@ -45,7 +50,13 @@ pub fn transcript_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
     }
     for cell in &app.history {
-        lines.extend(cell.to_lines());
+        // Route the (potentially expensive, syntax-highlighted) Markdown
+        // render through the cache; every other cell kind is cheap to build
+        // fresh and goes through `to_lines()` unchanged.
+        match cell {
+            crate::cells::Cell::Agent(text) => lines.extend(app.md.render(text)),
+            other => lines.extend(other.to_lines()),
+        }
         lines.push(Line::raw(""));
     }
     // Live chain-of-thought (reasoning models) renders dimmed above the answer,
