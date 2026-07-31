@@ -22,6 +22,7 @@ mod cells;
 mod composer;
 mod config;
 mod diff;
+mod gitdiff;
 mod lessons;
 mod markdown;
 mod models;
@@ -1924,6 +1925,64 @@ async fn run_ui(
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()));
                         let _ = tx.send(Msg::StatsReady(result));
+                    });
+                }
+                Effect::GitDiff => {
+                    let tx = ui_tx.clone();
+                    let workdir = cwd.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            tokio::task::spawn_blocking(move || -> Result<String, String> {
+                                let tracked = std::process::Command::new("git")
+                                    .current_dir(&workdir)
+                                    .args(["diff", "HEAD"])
+                                    .output()
+                                    .map_err(|e| format!("git not runnable: {e}"))?;
+                                if !tracked.status.success() {
+                                    // A non-git cwd (or a fresh repo with no HEAD)
+                                    // lands here — the caller renders this as a
+                                    // notice, never a crash.
+                                    return Err(String::from_utf8_lossy(&tracked.stderr)
+                                        .trim()
+                                        .to_string());
+                                }
+                                let mut combined =
+                                    String::from_utf8_lossy(&tracked.stdout).into_owned();
+
+                                // Untracked files never appear in `git diff HEAD` —
+                                // list them and append each as a synthetic
+                                // "new file" unified-diff section, so `/diff` shows
+                                // the CUMULATIVE working-tree diff, not just
+                                // tracked changes.
+                                if let Ok(listed) = std::process::Command::new("git")
+                                    .current_dir(&workdir)
+                                    .args(["ls-files", "--others", "--exclude-standard"])
+                                    .output()
+                                    && listed.status.success()
+                                {
+                                    // Cap per-file bytes read: a huge untracked
+                                    // file must not be fully read just to
+                                    // render (at most) MAX_GIT_DIFF_LINES of it.
+                                    const MAX_UNTRACKED_FILE_BYTES: usize = 256 * 1024;
+                                    for path in String::from_utf8_lossy(&listed.stdout).lines() {
+                                        let Ok(bytes) = std::fs::read(workdir.join(path)) else {
+                                            continue; // unreadable — skip, never fail the whole diff
+                                        };
+                                        if bytes.len() > MAX_UNTRACKED_FILE_BYTES {
+                                            continue;
+                                        }
+                                        let Ok(content) = String::from_utf8(bytes) else {
+                                            continue; // binary file — no meaningful text diff
+                                        };
+                                        combined
+                                            .push_str(&gitdiff::format_untracked(path, &content));
+                                    }
+                                }
+                                Ok(combined)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(Msg::GitDiffReady(result));
                     });
                 }
                 Effect::Analyze(target) => {

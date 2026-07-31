@@ -127,6 +127,11 @@ pub enum Msg {
     SessionLoaded(Vec<crate::cells::Cell>),
     /// Saved handoff briefs (for the `/handoff` picker).
     HandoffsListed(Vec<crate::session::HandoffMeta>),
+    /// `/diff`: the cumulative working-tree diff text (already includes
+    /// untracked files), or why it couldn't be gathered (e.g. not a git
+    /// repo) — `Ok("")` means "no changes", rendered as a notice, not a
+    /// `Cell::Diff`.
+    GitDiffReady(Result<String, String>),
 
     // ---- the synchronous approval round-trip ----
     Approval {

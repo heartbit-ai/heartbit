@@ -255,6 +255,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/codex",
         "run on a ChatGPT-subscription Codex proxy (`/codex [url|off]`)",
     ),
+    ("/diff", "show the working-tree diff"),
     ("/quit", "exit the TUI"),
 ];
 
@@ -316,6 +317,10 @@ pub enum Effect {
     Learn,
     /// Validate + commit the staged lessons (digest = value at stage time).
     CommitLessons(u64),
+    /// Gather the cumulative working-tree diff (`/diff`): `git diff HEAD`
+    /// plus untracked files, run off the UI thread — git is I/O, never
+    /// invoked from the reducer.
+    GitDiff,
     /// Fire a desktop notification (focus-gated turn-completion / approval —
     /// Task 7). `title`/`body` may carry agent-controlled text (tool names,
     /// provider error strings) UNsanitized: `notify::emit` sanitizes at the
@@ -357,6 +362,7 @@ impl Effect {
             Effect::Analyze(_) => "analyze",
             Effect::Learn => "learn",
             Effect::CommitLessons(_) => "commit_lessons",
+            Effect::GitDiff => "git_diff",
             Effect::Notify { .. } => "notify",
             Effect::Quit => "quit",
         }
@@ -1196,6 +1202,19 @@ impl App {
             Msg::StatsReady(Err(e)) => {
                 self.history.push(Cell::Notice(format!("stats: {e}")));
             }
+            Msg::GitDiffReady(Ok(text)) if text.trim().is_empty() => {
+                self.history
+                    .push(Cell::Notice("no changes in the working tree".into()));
+            }
+            Msg::GitDiffReady(Ok(text)) => {
+                self.history.push(Cell::Diff {
+                    lines: crate::gitdiff::parse(&text),
+                });
+            }
+            Msg::GitDiffReady(Err(e)) => {
+                self.history
+                    .push(Cell::Notice(format!("git diff failed: {e}")));
+            }
             Msg::AnalyzeReady { display, task } => {
                 // The async prep (trace fetch + prompt build) may resolve
                 // while a DIFFERENT turn is still in flight — queue rather
@@ -1541,6 +1560,7 @@ impl App {
             }
             "export" => self.effects.push(Effect::ExportSession),
             "resume" => self.effects.push(Effect::ListSessions),
+            "diff" => self.effects.push(Effect::GitDiff),
             "goal" => {
                 if arg.is_empty() {
                     self.history.push(Cell::Notice(
@@ -1669,7 +1689,7 @@ impl App {
                 self.history.push(Cell::Notice(
                     "commands: /mode [normal|plan|yolo] · /model [name] · /effort [off|low|medium|high] · \
                      /mcp [list|add …|clear] · /stats · /analyze · /learn · /research <question> · \
-                     /verify <cmd> · /clear · /resume · /export · /key · /quit"
+                     /verify <cmd> · /diff · /clear · /resume · /export · /key · /quit"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(
@@ -4522,6 +4542,43 @@ mod tests {
         assert!(matches!(app.history.last(), Some(Cell::Stats { label, .. }) if label == "t1"));
         app.update(Msg::StatsReady(Err("no trace".into())));
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
+    }
+
+    #[test]
+    fn slash_diff_requests_the_working_tree_diff() {
+        let mut app = keyed();
+        typed(&mut app, "/diff");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::GitDiff));
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_))),
+            "/diff is local — it must not consume an LLM turn"
+        );
+    }
+
+    #[test]
+    fn git_diff_ready_renders_a_diff_cell_and_empty_is_a_notice() {
+        let mut app = keyed();
+        app.update(Msg::GitDiffReady(Ok("@@ -1,1 +1,1 @@\n-a\n+b\n".into())));
+        assert!(app.history.iter().any(|c| matches!(c, Cell::Diff { .. })));
+
+        let mut app2 = keyed();
+        app2.update(Msg::GitDiffReady(Ok(String::new())));
+        assert!(
+            app2.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("no changes")))
+        );
+
+        let mut app3 = keyed();
+        app3.update(Msg::GitDiffReady(Err("not a git repository".into())));
+        assert!(
+            app3.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("git")))
+        );
     }
 
     #[test]
