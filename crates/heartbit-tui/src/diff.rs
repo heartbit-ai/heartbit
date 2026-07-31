@@ -8,10 +8,12 @@
 //! Any other tool, or malformed input, yields an empty Vec → the caller falls
 //! back to the normal compact tool cell (never panic, never render garbage).
 //!
-//! `parse_unified` (used by the `patch` tool and `/diff` via `gitdiff::parse`)
-//! additionally pairs adjacent Del/Add runs of equal length and fills their
-//! `emph` ranges via [`word_emphasis`], so a one-word change doesn't read as a
-//! whole rewritten line.
+//! Both the `edit` tool's Del/Add lines and `parse_unified` (used by the
+//! `patch` tool and `/diff` via `gitdiff::parse`) pair adjacent Del/Add runs
+//! of equal length and fill their `emph` ranges via [`word_emphasis`], so a
+//! one-word change doesn't read as a whole rewritten line. `write` is pure
+//! additions (a new file has no Del run to pair against), so it never gets
+//! emphasis — not because it's excluded, but because there's nothing to pair.
 
 use std::ops::Range;
 
@@ -23,9 +25,10 @@ pub struct DiffLine {
     /// Word-level emphasis within `text` (byte ranges): sorted,
     /// non-overlapping, non-empty, and each bound lands on a char boundary.
     /// Empty for context lines and for any Del/Add line that wasn't part of
-    /// an equal-length adjacent pairing (`edit`/`write` tool diffs, or a
-    /// `patch`/`/diff` run past the pairing budget) — such a line renders to
-    /// exactly one span, identical to before this field existed.
+    /// an equal-length adjacent pairing (mismatched old/new line counts on
+    /// an `edit`, `write`'s pure-addition lines which have no Del run to
+    /// pair against, or a run past the pairing budget) — such a line renders
+    /// to exactly one span, identical to before this field existed.
     #[serde(default)]
     pub emph: Vec<Range<usize>>,
 }
@@ -64,6 +67,14 @@ pub fn diff_lines(tool_name: &str, input_json: &str) -> Vec<DiffLine> {
                             emph: Vec::new(),
                         });
                     }
+                    // The Del run (all of `old`) is immediately followed by
+                    // the Add run (all of `new`) by construction above, so
+                    // this pairs 1:1 when the line counts match — the most
+                    // common diff surface in the transcript gets word
+                    // emphasis too, not just `patch`/`/diff`. `write` is
+                    // pure Add lines (no Del run ever precedes it), so this
+                    // is a no-op there; not called on that arm.
+                    pair_and_emphasize(&mut lines);
                     lines
                 }
                 _ => Vec::new(),
@@ -122,20 +133,36 @@ pub fn parse_unified(text: &str) -> Vec<DiffLine> {
     if !text.lines().any(|l| l.starts_with("@@ ")) {
         return legacy_parse(text);
     }
+    let raw: Vec<&str> = text.split('\n').collect();
     let mut lines = Vec::new();
-    // True at the very start and right after a `diff --git` section marker —
-    // the window before this file section's first hunk, in which EVERY line
-    // is metadata (`---`/`+++`/`index`/`new file mode`/`similarity index`/
+    // True at the very start and right after a new file section begins — the
+    // window before this section's first hunk, in which EVERY line is
+    // metadata (`---`/`+++`/`index`/`new file mode`/`similarity index`/
     // `Binary files … differ`/…), never real hunk content: the unified-diff
-    // format guarantees hunk lines only ever appear after an `@@` line, so
-    // nothing needs a per-prefix header check here — just drop everything
-    // until `@@`. Reset per section so a multi-file `git diff` (several
-    // `diff --git`/…/`@@` groups concatenated) parses each file correctly
-    // instead of only recognizing the first.
+    // format guarantees hunk lines only ever appear after an `@@` line, so no
+    // per-prefix check is needed here beyond spotting the section boundary —
+    // just drop everything until `@@`.
+    //
+    // A new section is signalled either by a `diff --git` line (git's own
+    // `diff` output) or by a `--- `/`+++ ` header PAIR (core's `patch` tool
+    // format, which never emits `diff --git` at all — patch.rs:413-421,
+    // exercised by its own `patch_multi_file` test). The `+++ ` lookahead on
+    // the `--- ` check is required and mirrors core's own rule exactly: a
+    // *deleted* line whose content itself starts with `-- ` renders as
+    // `--- ...` (leading `-` diff marker + content) and must not be mistaken
+    // for a header — only a genuine `--- `/`+++ ` PAIR counts.
     let mut expect_header = true;
-    for l in text.split('\n') {
+    let mut i = 0;
+    while i < raw.len() {
+        let l = raw[i];
         if l.starts_with("diff ") {
             expect_header = true;
+            i += 1;
+            continue;
+        }
+        if l.starts_with("--- ") && raw.get(i + 1).is_some_and(|n| n.starts_with("+++ ")) {
+            expect_header = true;
+            i += 1;
             continue;
         }
         if l.starts_with("@@") {
@@ -145,9 +172,11 @@ pub fn parse_unified(text: &str) -> Vec<DiffLine> {
                 text: l.to_string(),
                 emph: Vec::new(),
             });
+            i += 1;
             continue;
         }
         if expect_header {
+            i += 1;
             continue;
         }
         let (kind, txt) = if let Some(rest) = l.strip_prefix('+') {
@@ -162,6 +191,7 @@ pub fn parse_unified(text: &str) -> Vec<DiffLine> {
             text: txt.to_string(),
             emph: Vec::new(),
         });
+        i += 1;
     }
     pair_and_emphasize(&mut lines);
     lines
@@ -453,6 +483,10 @@ mod tests {
         let d = diff_lines("write", r#"{"file_path":"f","content":"line1\nline2"}"#);
         assert_eq!(kinds(&d), vec![DiffKind::Add, DiffKind::Add]);
         assert_eq!(d[0].text, "line1");
+        // Pure additions never form a Del run, so `pair_and_emphasize` (which
+        // `edit` now also runs) is a no-op here — not an exclusion, just
+        // nothing to pair against.
+        assert!(d.iter().all(|l| l.emph.is_empty()));
     }
 
     #[test]
@@ -537,6 +571,52 @@ mod tests {
         );
         assert!(d.iter().any(|l| l.text == "one"));
         assert!(d.iter().any(|l| l.text == "two"));
+    }
+
+    #[test]
+    fn multi_file_patch_text_without_diff_git_lines_drops_both_headers() {
+        // Core's OWN `patch` tool takes only `patch_text` and never emits a
+        // `diff --git` line — multi-file patches are just `--- `/`+++ ` PAIRS
+        // back to back (patch.rs:413-421, exercised by core's own
+        // `patch_multi_file` test at patch.rs:1058). Mirrors that fixture
+        // exactly (two files, one hunk each, no `diff --git` anywhere).
+        let text = "--- a/file1.txt\n+++ b/file1.txt\n@@ -1 +1 @@\n-hello\n+HELLO\n\
+                     --- a/file2.txt\n+++ b/file2.txt\n@@ -1 +1 @@\n-world\n+WORLD\n";
+        let d = parse_unified(text);
+        assert!(
+            d.iter()
+                .all(|l| !l.text.contains("file1.txt") && !l.text.contains("file2.txt")),
+            "the second file's `--- `/`+++ ` header must not leak as Del/Add \
+             content lines: {d:?}"
+        );
+        assert_eq!(
+            kinds(&d),
+            vec![
+                DiffKind::Ctx,
+                DiffKind::Del,
+                DiffKind::Add,
+                DiffKind::Ctx,
+                DiffKind::Del,
+                DiffKind::Add,
+            ],
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|l| l.text == "hello" && l.kind == DiffKind::Del)
+        );
+        assert!(
+            d.iter()
+                .any(|l| l.text == "HELLO" && l.kind == DiffKind::Add)
+        );
+        assert!(
+            d.iter()
+                .any(|l| l.text == "world" && l.kind == DiffKind::Del)
+        );
+        assert!(
+            d.iter()
+                .any(|l| l.text == "WORLD" && l.kind == DiffKind::Add)
+        );
     }
 
     #[test]

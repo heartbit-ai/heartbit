@@ -737,20 +737,48 @@ mod tests {
             duration_ms: Some(3),
             agent: None,
         };
-        let s = plain(&cell.to_lines());
+        let lines = cell.to_lines();
+        let s = plain(&lines);
         assert!(s.contains("-let x = 1;"), "removed line missing:\n{s}");
         assert!(s.contains("+let x = 2;"), "added line missing:\n{s}");
-        // the colors are set (red del / green add)
-        let spans: Vec<_> = cell.to_lines().into_iter().flat_map(|l| l.spans).collect();
+        // The colour is a property of the LINE, not of any one span: `edit`
+        // diffs now get word emphasis like every other diff surface (only
+        // the single changed token "1"/"2" is emphasised), so the removed/
+        // added line is legitimately split into multiple spans. Assert on
+        // the line's reconstructed text plus its colour, not on there being
+        // one unsplit span.
+        let line_text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let del_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("-let x = 1;"))
+            .expect("the removed line must be present");
         assert!(
-            spans
+            del_line
+                .spans
                 .iter()
-                .any(|sp| sp.content.contains("-let x = 1;") && sp.style.fg == Some(Color::Red))
+                .all(|sp| sp.style.fg == Some(Color::Red)),
+            "every span of the removed line must be red: {:?}",
+            del_line.spans
         );
+        let add_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("+let x = 2;"))
+            .expect("the added line must be present");
         assert!(
-            spans
+            add_line
+                .spans
                 .iter()
-                .any(|sp| sp.content.contains("+let x = 2;") && sp.style.fg == Some(Color::Green))
+                .all(|sp| sp.style.fg == Some(Color::Green)),
+            "every span of the added line must be green: {:?}",
+            add_line.spans
+        );
+        // And emphasis genuinely fired (not just "didn't crash"): the
+        // changed token is its own span, distinct from the rest of the line.
+        assert!(
+            del_line.spans.len() > 1,
+            "expected the changed token to split the line: {:?}",
+            del_line.spans
         );
     }
 
