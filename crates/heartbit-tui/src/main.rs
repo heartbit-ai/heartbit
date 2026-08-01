@@ -22,10 +22,12 @@ mod cells;
 mod composer;
 mod config;
 mod diff;
+mod gitdiff;
 mod lessons;
 mod markdown;
 mod models;
 mod msg;
+mod notify;
 mod session;
 mod splash;
 mod trace;
@@ -41,9 +43,9 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use heartbit_core::tool::builtins::{BuiltinToolsConfig, builtin_tools};
 use heartbit_core::{
-    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, OnApproval, OnEvent,
-    OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator, PermissionAction,
-    PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
+    AgentEvent, ApprovalDecision, AuthStyle, BoxedProvider, InterruptHandle, LearnedPermissions,
+    OnApproval, OnEvent, OnInput, OnText, OpenAiCompatProvider, OpenRouterProvider, Orchestrator,
+    PermissionAction, PermissionRule, PermissionRuleset, RetryingProvider, SubAgentConfig,
 };
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -244,7 +246,9 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
     app.prompt_caching = cfg.prompt_caching;
+    app.notify = cfg.notify;
     app.splash = cfg.splash.then_some(0);
+    app.md = markdown::MarkdownCache::new(cfg.syntax_theme.as_deref());
     // Same deterministic registry the engine builds — /workflows lists it.
     app.workflow_recipes = heartbit_core::default_registry().meta();
     // Per-directory persistent prompt history: ↑ recalls prompts from
@@ -255,6 +259,11 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         )));
     app.fast_model = cfg.fast_model.clone();
     app.frontier_model = cfg.frontier_model.clone();
+    app.effort = cfg
+        .reasoning_effort
+        .as_deref()
+        .and_then(app::EffortLevel::parse)
+        .unwrap_or_default();
     app.workflow_journal_dir = session::sessions_dir().join("journals").join(&session_id);
     // The unified entry agent can ALWAYS delegate (the squad is always available),
     // so seed the roster's available squad unconditionally — it shows when the
@@ -320,8 +329,48 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // Capture the mouse so the wheel arrives as scroll events we route to the
     // transcript — without it, terminals translate the wheel into ↑/↓ arrows
-    // (which would scroll the composer's command history instead).
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // (which would scroll the composer's command history instead). Bracketed
+    // paste lets a multi-line paste land as Event::Paste (already translated
+    // and inserted correctly) instead of per-character Enter keys that would
+    // submit the draft early. Focus events feed `App::focused` (Task 7 reads
+    // it for notifications).
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
+    );
+    // Pushed UNCONDITIONALLY (spec D-3): no capability probe.
+    // `supports_keyboard_enhancement()` blocks up to 2000 ms and errors on
+    // terminals that never answer — including this project's own pty harness
+    // — and it would buy nothing there, because Alt+Enter already works on
+    // every terminal today (`app.rs` composer key handling: `if shift ||
+    // alt`). A private-mode CSI is ignored by terminals that don't implement
+    // it.
+    //
+    // Exactly `DISAMBIGUATE_ESCAPE_CODES` (spec D-5): it is sufficient for
+    // Shift+Enter (`CSI 13;2u` → `'\r'` → `KeyCode::Enter` + SHIFT) and it
+    // leaves Shift+Tab as `BackTab`, so the permission-mode cycle survives.
+    // Do NOT add `REPORT_EVENT_TYPES`: `KeyEvent::kind` is only populated
+    // under it on Unix and `translate` admits only `KeyEventKind::Press`, so
+    // held keys (e.g. Backspace, arrows) would stop auto-repeating.
+    if cfg.keyboard_enhancement
+        && crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(KITTY_FLAGS)
+        )
+        .is_ok()
+    {
+        KITTY_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // WRAP ratatui's panic hook, never replace it: replacing would lose its
+    // own restore() and leave raw mode on after a panic.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_modes();
+        prev_hook(info);
+    }));
+
     let result = run_ui(
         &mut terminal,
         &mut app,
@@ -338,9 +387,58 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
         trace_handle,
     )
     .await;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    restore_terminal_modes();
     ratatui::restore();
     result
+}
+
+/// The exact Kitty flag set this process pushes (spec D-5): only
+/// `DISAMBIGUATE_ESCAPE_CODES` — see the push call site for why. Named (rather
+/// than inlined at the call site) so `kitty_push_and_pop_emit_the_minimal_sequences`
+/// asserts against the value production actually pushes: adding a flag here
+/// requires updating that test, which is the point.
+const KITTY_FLAGS: crossterm::event::KeyboardEnhancementFlags =
+    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// The literal bytes `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`
+/// writes — frozen here as a regression guard (test-only: production drives
+/// the write through the `crossterm::Command` impl, not this string).
+#[cfg(test)]
+fn kitty_push_sequence() -> &'static str {
+    "\x1b[>1u"
+}
+
+/// The literal bytes `PopKeyboardEnhancementFlags` writes (test-only, see
+/// [`kitty_push_sequence`]).
+#[cfg(test)]
+fn kitty_pop_sequence() -> &'static str {
+    "\x1b[<1u"
+}
+
+/// True exactly once, for the first caller. Guarantees the pop is emitted at
+/// most once even when both the panic hook and the normal exit path run.
+fn take_pushed(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+static KITTY_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Disable every terminal mode this process enabled, newest first. Safe to
+/// call from the panic hook and from the normal exit path — the Kitty pop is
+/// guarded so it is emitted at most once even if both run.
+fn restore_terminal_modes() {
+    use std::io::stdout;
+    if take_pushed(&KITTY_PUSHED) {
+        // Its own execute!: queue! short-circuits on the first error, and the
+        // Kitty pop must not be lost because an unrelated command failed.
+        let _ = crossterm::execute!(stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(
+        stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableMouseCapture
+    );
 }
 
 /// Resolve a provider. OpenRouter is preferred (the project's qwen setup); an
@@ -411,6 +509,36 @@ fn build_provider(
         )));
     }
     anyhow::bail!("no OpenRouter API key configured (set one with /key or OPENROUTER_API_KEY)")
+}
+
+/// Gate the effort by provider. Only OpenRouter and custom OpenAI-compatible
+/// endpoints get it; the ANTHROPIC_API_KEY fallback must never receive it: on
+/// the non-streaming sub-agent path, Anthropic's `ApiContentBlock` is
+/// `Text | ToolUse` with `#[serde(tag = "type")]` and no `#[serde(other)]`
+/// (anthropic.rs:778-789), so a returned `thinking` block fails deserialization
+/// and the sub-agent errors out. `Off` always omits the field — never
+/// `ReasoningEffort::None`, which would emit `reasoning: {"effort":"none"}`, a
+/// request this TUI never sent before this feature.
+fn effort_for_provider(
+    level: app::EffortLevel,
+    custom_endpoint: Option<&str>,
+    openrouter_key: Option<&str>,
+) -> Option<heartbit_core::ReasoningEffort> {
+    use heartbit_core::ReasoningEffort;
+    // Mirror `build_provider`'s own custom-endpoint condition exactly
+    // (`custom_endpoint.filter(|u| !u.trim().is_empty())`): a blank/whitespace
+    // endpoint makes `build_provider` fall through to OpenRouter/Anthropic, so
+    // this gate must treat it the same way, not as "has a custom endpoint".
+    let has_custom_endpoint = custom_endpoint.filter(|u| !u.trim().is_empty()).is_some();
+    if !has_custom_endpoint && openrouter_key.is_none() {
+        return None;
+    }
+    match level {
+        app::EffortLevel::Off => None,
+        app::EffortLevel::Low => Some(ReasoningEffort::Low),
+        app::EffortLevel::Medium => Some(ReasoningEffort::Medium),
+        app::EffortLevel::High => Some(ReasoningEffort::High),
+    }
 }
 
 /// The unified entry agent the TUI drives (option C): the [`Orchestrator`]
@@ -560,6 +688,7 @@ async fn build_engine(
     frontier_model: Option<String>,
     request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     workflow_journal_dir: PathBuf,
+    effort: app::EffortLevel,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -608,6 +737,11 @@ async fn build_engine(
         on_retry.clone(),
         prompt_caching,
     )?;
+    // Computed ONCE and given to both the entry agent and every sub-agent
+    // below — see `effort_for_provider`'s doc comment for why the Anthropic
+    // fallback must never see this.
+    let reasoning_effort =
+        effort_for_provider(effort, custom_endpoint.as_deref(), api_key.as_deref());
 
     // Connect MCP once (on this thread's runtime — the stdio transport binds to
     // its spawn runtime). The tools are Arc, shared across agents. Successes
@@ -792,10 +926,46 @@ async fn build_engine(
             let _ = tx.send(Msg::ReasoningDelta(s.to_string()));
         })
     };
+    // Learned approval rules, persisted 0600 next to tui.toml
+    // (config::learned_permissions_path, honors HEARTBIT_TUI_CONFIG so an
+    // acceptance run can isolate it). Loaded BEFORE the "ready — …" summary
+    // is sent below so the count can appear in it. `load()` already returns
+    // an empty store when the file is absent — the Err arm is only a
+    // corrupt/oversized file, and there is no way to construct a fresh
+    // `LearnedPermissions` bound to `learned_path` from outside heartbit-core
+    // (its fields are private, no public constructor). Rather than add one
+    // (out of scope — core gets exactly one new test this task), a load
+    // failure is surfaced as a notice and persistence is simply skipped for
+    // the session: safer than the alternative of handing the runner a fresh
+    // empty store at that path, whose first save would silently truncate
+    // whatever the user's file actually contains.
+    let learned_path = config::learned_permissions_path();
+    let (learned_rules, learned): (
+        Vec<PermissionRule>,
+        Option<Arc<std::sync::Mutex<LearnedPermissions>>>,
+    ) = match LearnedPermissions::load(&learned_path) {
+        Ok(l) => (l.rules().to_vec(), Some(Arc::new(std::sync::Mutex::new(l)))),
+        Err(e) => {
+            let _ = ui_tx.send(Msg::Notice(format!(
+                    "learned permissions: failed to load {} — {e} (approvals won't persist this session)",
+                    learned_path.display()
+                )));
+            (Vec::new(), None)
+        }
+    };
+    if !learned_rules.is_empty() {
+        summary_parts.push(format!("{} learned rules", learned_rules.len()));
+    }
+    // Whether AlwaysAllow/AlwaysDeny will actually reach disk this session —
+    // `false` only when the on-disk file failed to load above, in which case
+    // the notice below must not claim a persist that didn't happen.
+    let learned_persists = learned.is_some();
+
     let on_approval: Arc<OnApproval> = {
         let tx = ui_tx.clone();
         let perm_mode = perm_mode.clone();
         let trace_approvals = trace.clone();
+        let learned_path_for_notice = learned_path.clone();
         Arc::new(move |calls: &[heartbit_core::llm::types::ToolCall]| {
             let started = std::time::Instant::now();
             let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
@@ -855,6 +1025,29 @@ async fn build_engine(
                 &decision,
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
+            // Discoverability: core's own persistence failure is a
+            // `tracing::warn!` (runner.rs:680-683) that never reaches the TUI
+            // (init_tracing filters to heartbit::interrupt only), so this
+            // notice is the only signal — success or failure — that `[a]`/`[d]`
+            // actually took. In-session it always takes effect (runner.rs:673
+            // appends to the live ruleset unconditionally); disk persistence
+            // depends on `learned_persists` (false only when the on-disk file
+            // failed to load at startup — see the notice sent then).
+            if decision.is_persistent() {
+                let _ = tx.send(Msg::Notice(if learned_persists {
+                    format!(
+                        "remembered: {} — persisted to {}",
+                        names.join(", "),
+                        learned_path_for_notice.display()
+                    )
+                } else {
+                    format!(
+                        "remembered: {} — for this session only ({} failed to load at startup)",
+                        names.join(", "),
+                        learned_path_for_notice.display()
+                    )
+                }));
+            }
             decision
         })
     };
@@ -984,7 +1177,7 @@ async fn build_engine(
         .max_turns(300)
         .workspace(cwd.clone())
         .instruction_text(instructions)
-        .permission_rules(default_permissions())
+        .permission_rules(merged_permissions(&learned_rules))
         .on_text(on_text)
         .on_reasoning(on_reasoning)
         .on_event(on_event)
@@ -999,6 +1192,18 @@ async fn build_engine(
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
+    if let Some(effort) = reasoning_effort {
+        builder = builder.reasoning_effort(effort);
+    }
+    // Forwards to the entry runner AND all three sub-agent spawn paths
+    // (orchestrator.rs:3153-3155, :610, :1150, :1593) — one call suffices.
+    // `None` when the on-disk file failed to load (see the notice sent
+    // above); the session still gets in-memory learned rules via
+    // `persist_approval_decision`'s `permission_rules.write().append_rules`
+    // (runner.rs:673), it just won't survive a restart.
+    if let Some(learned) = learned {
+        builder = builder.learned_permissions(learned);
+    }
     // Request-intent router: marker layer + "fast" classifier + safe default,
     // with the /mode pin shared from the UI thread.
     let router_fast = provider_factory("fast").ok();
@@ -1007,8 +1212,12 @@ async fn build_engine(
             .with_pin(request_mode_pin.clone()),
     ));
     // The squad available for delegation: each sub-agent gets its own context
-    // stack (recitation / restore-on-demand / compaction / replan).
-    for cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
+    // stack (recitation / restore-on-demand / compaction / replan). The gated
+    // reasoning effort is applied here (not threaded through
+    // `default_sub_agents`'s signature) so its existing unit test call site
+    // stays untouched — same value the entry agent got above.
+    for mut cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
+        cfg.reasoning_effort = reasoning_effort;
         builder = builder.sub_agent_full(cfg);
     }
     let orch = builder.build()?;
@@ -1034,35 +1243,56 @@ async fn connect_mcp(
 
 /// A Claude-Code-like default policy: read-only tools run silently; everything
 /// that can mutate the workspace (write/edit/patch/bash/…) asks the human via the
-/// approval modal. `[a]`lways-allow persists as a learned rule for that tool.
-fn default_permissions() -> PermissionRuleset {
+/// approval modal (Normal mode only — YOLO short-circuits to allow-all before
+/// this ruleset is ever consulted, and Plan mode denies mutations outright).
+/// `[a]`lways-allow persists as a learned rule for that tool — `learned` rules
+/// are checked BEFORE the hardcoded defaults below, because
+/// [`PermissionRuleset::evaluate`] is first-match-wins; putting them after
+/// would make them unreachable for any tool the defaults already cover (this
+/// was the bug: the old terminal `*/*→Ask` catch-all sat in front of every
+/// learned/in-session rule).
+///
+/// There is deliberately NO terminal catch-all rule anymore: an unmatched
+/// tool now evaluates to `None`, not `Some(Ask)`. That is safe only because
+/// `runner.rs:2097` routes `Some(PermissionAction::Ask)` and `None` to the
+/// exact same `needs_approval` arm — pinned by
+/// `heartbit-core`'s `ask_and_none_both_route_to_approval` test so this
+/// invariant can't silently regress into Yolo.
+///
+/// The four harness-dialogue tools (`question`/`set_goal`/`set_scope`/`handoff`)
+/// are the ONE exception to learned-first: they are pinned AHEAD of `learned`,
+/// not just ahead of the other defaults. They touch no workspace file —
+/// asking the user to APPROVE the agent's request to ask them a question is a
+/// double modal (live finding, session 6a254624); set_goal/set_scope mutate
+/// in-process harness state only; handoff writes its brief OUTSIDE the
+/// workspace (`<config>/handoffs`) — so no learned rule may ever deny them,
+/// from EITHER surface. This matters because `learned_permissions_path()`
+/// resolves to the same on-disk store `heartbit-cli` reads/writes
+/// (`heartbit-cli/src/main.rs` around `LearnedPermissions::default_path()`):
+/// without this pin, denying `question` once in a CLI run would silently kill
+/// it in every future TUI session too, with no in-TUI way to recover.
+fn merged_permissions(learned: &[PermissionRule]) -> PermissionRuleset {
     let allow = |tool: &str| PermissionRule {
         tool: tool.into(),
         pattern: "*".into(),
         action: PermissionAction::Allow,
     };
-    PermissionRuleset::new(vec![
+    let mut rules = vec![
+        allow("question"),
+        allow("set_goal"),
+        allow("set_scope"),
+        allow("handoff"),
+    ];
+    rules.extend(learned.to_vec());
+    rules.extend([
         allow("read"),
         allow("grep"),
         allow("glob"),
         allow("list"),
         allow("todoread"),
         allow("todowrite"),
-        // Harness-dialogue tools: no workspace effect — asking the user to
-        // APPROVE the agent's request to ask them a question is a double
-        // modal (live finding, session 6a254624). set_goal/set_scope mutate
-        // in-process harness state only; handoff writes its brief OUTSIDE the
-        // workspace (<config>/handoffs).
-        allow("question"),
-        allow("set_goal"),
-        allow("set_scope"),
-        allow("handoff"),
-        PermissionRule {
-            tool: "*".into(),
-            pattern: "*".into(),
-            action: PermissionAction::Ask,
-        },
-    ])
+    ]);
+    PermissionRuleset::new(rules)
 }
 
 /// Walk the project for `@`-mention autocomplete: relative file paths, skipping
@@ -1099,6 +1329,8 @@ fn translate(event: Event) -> Option<Msg> {
     match event {
         Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
         Event::Paste(s) => Some(Msg::Paste(s)),
+        Event::FocusGained => Some(Msg::FocusChanged(true)),
+        Event::FocusLost => Some(Msg::FocusChanged(false)),
         Event::Resize(..) => Some(Msg::Resize),
         // Mouse capture is on, so the wheel arrives as scroll events (not arrow
         // keys) — route it to the transcript, leaving ↑/↓ for command history.
@@ -1194,6 +1426,7 @@ fn spawn_agent(
     let frontier_model = app.frontier_model.clone();
     let request_mode_pin = request_mode_pin.clone();
     let workflow_journal_dir = app.workflow_journal_dir.clone();
+    let effort = app.effort;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -1237,6 +1470,7 @@ fn spawn_agent(
                 frontier_model,
                 request_mode_pin,
                 workflow_journal_dir,
+                effort,
             )
             .await
             {
@@ -1454,6 +1688,14 @@ async fn run_ui(
                 Effect::SaveFrontierModel(model) => {
                     let mut cfg = config::TuiConfig::load();
                     cfg.frontier_model = model;
+                    if let Err(e) = cfg.save() {
+                        app.history
+                            .push(Cell::Notice(format!("could not save config: {e}")));
+                    }
+                }
+                Effect::SaveReasoningEffort(level) => {
+                    let mut cfg = config::TuiConfig::load();
+                    cfg.reasoning_effort = level;
                     if let Err(e) = cfg.save() {
                         app.history
                             .push(Cell::Notice(format!("could not save config: {e}")));
@@ -1685,6 +1927,64 @@ async fn run_ui(
                         let _ = tx.send(Msg::StatsReady(result));
                     });
                 }
+                Effect::GitDiff => {
+                    let tx = ui_tx.clone();
+                    let workdir = cwd.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            tokio::task::spawn_blocking(move || -> Result<String, String> {
+                                let tracked = std::process::Command::new("git")
+                                    .current_dir(&workdir)
+                                    .args(["diff", "HEAD"])
+                                    .output()
+                                    .map_err(|e| format!("git not runnable: {e}"))?;
+                                if !tracked.status.success() {
+                                    // A non-git cwd (or a fresh repo with no HEAD)
+                                    // lands here — the caller renders this as a
+                                    // notice, never a crash.
+                                    return Err(String::from_utf8_lossy(&tracked.stderr)
+                                        .trim()
+                                        .to_string());
+                                }
+                                let mut combined =
+                                    String::from_utf8_lossy(&tracked.stdout).into_owned();
+
+                                // Untracked files never appear in `git diff HEAD` —
+                                // list them and append each as a synthetic
+                                // "new file" unified-diff section, so `/diff` shows
+                                // the CUMULATIVE working-tree diff, not just
+                                // tracked changes.
+                                if let Ok(listed) = std::process::Command::new("git")
+                                    .current_dir(&workdir)
+                                    .args(["ls-files", "--others", "--exclude-standard"])
+                                    .output()
+                                    && listed.status.success()
+                                {
+                                    // Cap per-file bytes read: a huge untracked
+                                    // file must not be fully read just to
+                                    // render (at most) MAX_GIT_DIFF_LINES of it.
+                                    const MAX_UNTRACKED_FILE_BYTES: usize = 256 * 1024;
+                                    for path in String::from_utf8_lossy(&listed.stdout).lines() {
+                                        let Ok(bytes) = std::fs::read(workdir.join(path)) else {
+                                            continue; // unreadable — skip, never fail the whole diff
+                                        };
+                                        if bytes.len() > MAX_UNTRACKED_FILE_BYTES {
+                                            continue;
+                                        }
+                                        let Ok(content) = String::from_utf8(bytes) else {
+                                            continue; // binary file — no meaningful text diff
+                                        };
+                                        combined
+                                            .push_str(&gitdiff::format_untracked(path, &content));
+                                    }
+                                }
+                                Ok(combined)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(Msg::GitDiffReady(result));
+                    });
+                }
                 Effect::Analyze(target) => {
                     let tx = ui_tx.clone();
                     let sid = session_id.clone();
@@ -1804,6 +2104,7 @@ async fn run_ui(
                         )),
                     }
                 }
+                Effect::Notify { title, body } => notify::emit(&title, &body),
                 Effect::Quit => app.should_quit = true,
             }
             trace.record_ui(&trace::UiEvent::Effect {
@@ -1864,7 +2165,7 @@ mod permission_tests {
         // request to ask them a question (double modal). Harness-dialogue
         // tools (question, set_goal, set_scope, handoff) touch no workspace
         // file and must never sit behind an approval prompt.
-        let rules = default_permissions();
+        let rules = merged_permissions(&[]);
         for tool in ["question", "set_goal", "set_scope", "handoff"] {
             assert_eq!(
                 rules.evaluate(tool, &serde_json::json!({})),
@@ -1872,14 +2173,165 @@ mod permission_tests {
                 "{tool} must be auto-allowed"
             );
         }
-        // Mutating tools still go through approval.
+        // Mutating tools have no hardcoded rule and no terminal catch-all
+        // anymore, so they evaluate to `None` — NOT `Some(Ask)`. This is the
+        // Task 4 fix: `runner.rs:2097` routes `None` and `Some(Ask)` to the
+        // exact same `needs_approval` arm (pinned by heartbit-core's
+        // `ask_and_none_both_route_to_approval`), so dropping the terminal
+        // catch-all is behaviour-identical for these tools while letting a
+        // learned/in-session rule for them actually be reachable.
         for tool in ["write", "edit", "bash", "patch"] {
             assert_eq!(
                 rules.evaluate(tool, &serde_json::json!({})),
-                Some(PermissionAction::Ask),
-                "{tool} must still ask"
+                None,
+                "{tool} must fall through to None (routes to approval same as Ask)"
             );
         }
+    }
+
+    #[test]
+    fn merged_permissions_with_no_learned_rules_matches_today() {
+        let rules = merged_permissions(&[]);
+        // The 10 explicit allows are unchanged…
+        for tool in ["read", "grep", "glob", "list", "todoread", "todowrite"] {
+            assert_eq!(
+                rules.evaluate(tool, &serde_json::json!({})),
+                Some(PermissionAction::Allow),
+                "{tool} must still be auto-allowed"
+            );
+        }
+        // …and the terminal catch-all is GONE: unmatched tools fall through to
+        // None, which runner.rs:2097 routes to approval exactly like Some(Ask).
+        for tool in ["write", "edit", "bash", "patch"] {
+            assert_eq!(rules.evaluate(tool, &serde_json::json!({})), None, "{tool}");
+        }
+    }
+
+    #[test]
+    fn merged_permissions_orders_learned_rules_first() {
+        let learned = vec![PermissionRule {
+            tool: "bash".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Allow,
+        }];
+        // evaluate is first-match-wins, so a learned rule must precede the
+        // defaults or it can never be reached.
+        assert_eq!(
+            merged_permissions(&learned).evaluate("bash", &serde_json::json!({})),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn merged_permissions_learned_rule_overrides_a_hardcoded_default() {
+        // `bash` (above) has no hardcoded rule at all, so that assertion would
+        // pass whether learned rules are ordered first or last — it doesn't
+        // actually discriminate ordering. `read` DOES have a hardcoded
+        // Allow, so a learned Deny for `read` only wins if learned rules are
+        // checked BEFORE the 10 defaults (first-match-wins in
+        // PermissionRuleset::evaluate). This is the case that would catch a
+        // regression to `rules.extend(learned)` (append instead of prepend).
+        let learned = vec![PermissionRule {
+            tool: "read".into(),
+            pattern: "*".into(),
+            action: PermissionAction::Deny,
+        }];
+        assert_eq!(
+            merged_permissions(&learned).evaluate("read", &serde_json::json!({})),
+            Some(PermissionAction::Deny),
+            "a learned rule must be able to override a hardcoded default"
+        );
+    }
+
+    #[test]
+    fn merged_permissions_pins_dialogue_tools_ahead_of_learned_denies() {
+        // Escalated review finding: `learned_permissions_path()` resolves to
+        // the SAME on-disk store heartbit-cli reads/writes
+        // (LearnedPermissions::default_path()). Without this pin, a `[d]` on
+        // `question` in a CLI run would write `question:*→Deny`, and because
+        // learned rules go first, that rule would override the TUI's
+        // hardcoded `allow("question")` — killing the harness-dialogue tool
+        // in every future TUI session with no in-TUI recovery. The four
+        // dialogue tools must be un-blockable by ANY learned rule, from
+        // either surface.
+        let learned = vec![
+            PermissionRule {
+                tool: "question".into(),
+                pattern: "*".into(),
+                action: PermissionAction::Deny,
+            },
+            PermissionRule {
+                tool: "read".into(),
+                pattern: "*".into(),
+                action: PermissionAction::Deny,
+            },
+        ];
+        let rules = merged_permissions(&learned);
+        // The dialogue tool is un-blockable...
+        assert_eq!(
+            rules.evaluate("question", &serde_json::json!({})),
+            Some(PermissionAction::Allow),
+            "a learned Deny must not be able to block a harness-dialogue tool"
+        );
+        // ...but the pin is narrow, not a blanket demotion of all learned
+        // rules: a non-dialogue tool's learned Deny still overrides its
+        // hardcoded default.
+        assert_eq!(
+            rules.evaluate("read", &serde_json::json!({})),
+            Some(PermissionAction::Deny),
+            "learned rules must still win over hardcoded defaults for non-dialogue tools"
+        );
+    }
+}
+
+#[cfg(test)]
+mod effort_gating_tests {
+    use super::*;
+
+    #[test]
+    fn effort_never_reaches_the_anthropic_fallback_provider() {
+        use heartbit_core::ReasoningEffort;
+        // OpenRouter or a custom endpoint: the effort is threaded.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, None, Some("sk-or-x")),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Low, Some("http://127.0.0.1:1/v1"), None),
+            Some(ReasoningEffort::Low)
+        );
+        // Anthropic fallback (no custom endpoint, no OpenRouter key): NEVER.
+        // Anthropic's non-streaming ApiContentBlock is Text|ToolUse with
+        // #[serde(tag="type")] and no #[serde(other)] (anthropic.rs:778-789), so
+        // a returned `thinking` block fails deserialization on the sub-agent path.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, None, None),
+            None
+        );
+        // Off always omits the field — never ReasoningEffort::None, which would
+        // send reasoning:{"effort":"none"}, a request the TUI never sent before.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Off, None, Some("sk-or-x")),
+            None
+        );
+        // A blank/whitespace-only custom endpoint must NOT count as "has a
+        // custom endpoint" — `build_provider` treats it the same way
+        // (`custom_endpoint.filter(|u| !u.trim().is_empty())`), falling
+        // through to the Anthropic fallback. The gate must match exactly, or
+        // this reintroduces the same failure the task is about.
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::High, Some("   "), None),
+            None
+        );
+    }
+
+    #[test]
+    fn effort_for_provider_covers_every_level_when_gated_open() {
+        use heartbit_core::ReasoningEffort;
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Medium, None, Some("k")),
+            Some(ReasoningEffort::Medium)
+        );
     }
 }
 
@@ -1963,5 +2415,44 @@ mod agent_lifecycle_tests {
         }
         assert!(saw_exit, "AgentExited(epoch) must be sent on panic");
         assert!(saw_notice, "the panic must surface as a visible notice");
+    }
+}
+
+#[cfg(test)]
+mod terminal_mode_tests {
+    use super::*;
+
+    #[test]
+    fn translate_maps_focus_events_and_paste() {
+        use crossterm::event::Event;
+        assert!(matches!(
+            translate(Event::FocusGained),
+            Some(Msg::FocusChanged(true))
+        ));
+        assert!(matches!(
+            translate(Event::FocusLost),
+            Some(Msg::FocusChanged(false))
+        ));
+        assert!(matches!(translate(Event::Paste("x".into())), Some(Msg::Paste(s)) if s == "x"));
+    }
+
+    #[test]
+    fn kitty_push_and_pop_emit_the_minimal_sequences() {
+        // Exactly DISAMBIGUATE_ESCAPE_CODES: asserted against the actual
+        // constant production pushes, so any future flag addition to
+        // KITTY_FLAGS must be a deliberate, test-updating change (spec D-5).
+        assert_eq!(KITTY_FLAGS.bits(), 0b0000_0001);
+        assert_eq!(kitty_push_sequence(), "\x1b[>1u");
+        assert_eq!(kitty_pop_sequence(), "\x1b[<1u");
+    }
+
+    #[test]
+    fn kitty_pop_is_emitted_at_most_once() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(take_pushed(&flag));
+        assert!(
+            !take_pushed(&flag),
+            "a second teardown must not re-emit the pop"
+        );
     }
 }

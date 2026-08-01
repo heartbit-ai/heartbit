@@ -73,6 +73,14 @@ pub struct TuiConfig {
     /// The model id (e.g. `qwen/qwen3-235b-a22b-2507`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level (`off` | `low` | `medium` | `high`), set via
+    /// `/effort`. Deliberately a plain `Option<String>`, not a typed enum:
+    /// `TuiConfig::load_from` swallows any parse error and returns `Default`,
+    /// so a typo in a typed field would silently wipe the whole config
+    /// (including the stored API key). Unset/absent = `off` (the default —
+    /// no `reasoning` field sent, matching pre-Task-5 behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// MCP servers to connect when the agent starts (builtins still take priority).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerSpec>,
@@ -113,6 +121,11 @@ pub struct TuiConfig {
     /// `splash = false` in tui.toml.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub splash: bool,
+    /// Desktop notification (terminal OSC escape sequence) when a turn ends
+    /// or an approval is waiting, while the terminal is unfocused. ON by
+    /// default; disable with `notify = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub notify: bool,
     /// Model for the "fast" role — cheap classification/extraction stages in
     /// workflows (falls back to the main model when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +134,20 @@ pub struct TuiConfig {
     /// the main model when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier_model: Option<String>,
+    /// Push `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` at startup so
+    /// Shift+Enter receives its modifier (a private-mode CSI a non-supporting
+    /// terminal ignores). ON by default; escape hatch:
+    /// `keyboard_enhancement = false` in tui.toml.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub keyboard_enhancement: bool,
+    /// A bundled `syntect` theme name (e.g. `"InspiredGitHub"`) for
+    /// highlighted fenced code blocks in the transcript. Unset or unresolvable
+    /// falls back to the built-in default — never a typed enum, so a typo
+    /// here degrades gracefully instead of (via `load_from`'s parse-error →
+    /// `Default` swallow) wiping the whole config, secrets included. Set via
+    /// hand-editing `tui.toml` (no in-TUI command yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syntax_theme: Option<String>,
 }
 
 /// serde default for `context_recall` (ON unless the config explicitly disables it).
@@ -139,6 +166,7 @@ impl Default for TuiConfig {
         Self {
             openrouter_api_key: None,
             model: None,
+            reasoning_effort: None,
             mcp_servers: Vec::new(),
             multi_agent: false,
             context_recall: true,
@@ -148,8 +176,11 @@ impl Default for TuiConfig {
             brave_api_key: None,
             prompt_caching: true,
             splash: true,
+            notify: true,
             fast_model: None,
             frontier_model: None,
+            keyboard_enhancement: true,
+            syntax_theme: None,
         }
     }
 }
@@ -214,6 +245,15 @@ pub fn config_path() -> PathBuf {
     base.join("heartbit").join("tui.toml")
 }
 
+/// Resolve the learned-approval-rules file path: the same directory as
+/// [`config_path`] (so it too honors `HEARTBIT_TUI_CONFIG`, letting a
+/// test/acceptance run isolate it), filename `permissions.toml`. Loaded via
+/// `heartbit_core::LearnedPermissions::load` and written 0600 by that type,
+/// same as `tui.toml`'s own secret handling in this file.
+pub fn learned_permissions_path() -> PathBuf {
+    config_path().with_file_name("permissions.toml")
+}
+
 #[cfg(unix)]
 fn write_secret(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
@@ -247,12 +287,68 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_defaults_to_none_and_roundtrips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.reasoning_effort.is_none(), "missing key means unset");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        let saved = TuiConfig {
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        saved.save_to(&path).unwrap();
+        assert_eq!(TuiConfig::load_from(&path), saved);
+        // None must be omitted from the file, not serialized as an empty key.
+        let bare_path = dir.path().join("bare.toml");
+        TuiConfig::default().save_to(&bare_path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&bare_path)
+                .unwrap()
+                .contains("reasoning_effort")
+        );
+    }
+
+    #[test]
+    fn syntax_theme_defaults_to_none_and_roundtrips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.syntax_theme.is_none(), "missing key means unset");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui.toml");
+        let saved = TuiConfig {
+            syntax_theme: Some("InspiredGitHub".into()),
+            ..Default::default()
+        };
+        saved.save_to(&path).unwrap();
+        assert_eq!(TuiConfig::load_from(&path), saved);
+        // None must be omitted from the file, not serialized as an empty key.
+        let bare_path = dir.path().join("bare.toml");
+        TuiConfig::default().save_to(&bare_path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&bare_path)
+                .unwrap()
+                .contains("syntax_theme")
+        );
+    }
+
+    #[test]
     fn splash_defaults_on_and_parses_off() {
         assert!(TuiConfig::default().splash);
         let cfg: TuiConfig = toml::from_str("").unwrap();
         assert!(cfg.splash, "missing key means ON");
         let cfg: TuiConfig = toml::from_str("splash = false").unwrap();
         assert!(!cfg.splash);
+    }
+
+    #[test]
+    fn keyboard_enhancement_defaults_on_and_parses_off() {
+        // The escape hatch for the unconditional Kitty flag push (spec D-3):
+        // this is the user's only recovery path if a terminal misbehaves, so
+        // it must actually parse to `false`, not just default to `true`.
+        assert!(TuiConfig::default().keyboard_enhancement);
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.keyboard_enhancement, "missing key means ON");
+        let cfg: TuiConfig = toml::from_str("keyboard_enhancement = false").unwrap();
+        assert!(!cfg.keyboard_enhancement);
     }
 
     #[test]
@@ -403,5 +499,26 @@ mod tests {
         unsafe { std::env::set_var("HEARTBIT_TUI_CONFIG", "/tmp/explicit/tui.toml") };
         assert_eq!(config_path(), PathBuf::from("/tmp/explicit/tui.toml"));
         unsafe { std::env::remove_var("HEARTBIT_TUI_CONFIG") };
+    }
+
+    // Task 4 (persistent approval rules): the learned-permissions file must
+    // sit BESIDE tui.toml, whatever `config_path()` resolves to. Asserted
+    // structurally (same parent dir, `permissions.toml` filename) rather
+    // than by mutating HEARTBIT_TUI_CONFIG — `config_path_honors_env_override`
+    // above already mutates that same process-global env var, and cargo runs
+    // tests in parallel on one process, so a second env-mutating test here
+    // would race it (a `remove_var` landing between the other test's
+    // `set_var` and its assert). Because `learned_permissions_path` is
+    // defined as `config_path().with_file_name(..)`, this structural check
+    // already implies the env override is inherited without re-touching env.
+    #[test]
+    fn learned_permissions_path_sits_beside_config_path() {
+        let config = config_path();
+        let learned = learned_permissions_path();
+        assert_eq!(learned.parent(), config.parent());
+        assert_eq!(
+            learned.file_name(),
+            Some(std::ffi::OsStr::new("permissions.toml"))
+        );
     }
 }

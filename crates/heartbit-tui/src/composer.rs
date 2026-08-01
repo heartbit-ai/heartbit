@@ -219,8 +219,10 @@ impl Composer {
         }
     }
 
-    /// Clear the live buffer WITHOUT recording it in history (used for slash
-    /// commands so a `/key <token>` secret is never recalled via the Up arrow).
+    /// Clear the live buffer WITHOUT recording it in history and WITHOUT
+    /// touching recall `history` itself — used for slash commands (so a
+    /// `/key <token>` secret is never recalled via the Up arrow) and for
+    /// Ctrl+U (so clearing a draft never loses previously recalled prompts).
     pub fn clear(&mut self) {
         self.lines = vec![Vec::new()];
         self.row = 0;

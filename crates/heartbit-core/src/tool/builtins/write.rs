@@ -25,6 +25,7 @@ pub struct WriteTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
     path_policy: Option<Arc<CorePathPolicy>>,
+    formatters: Option<Arc<crate::tool::builtins::format::FormatterConfig>>,
 }
 
 impl WriteTool {
@@ -38,6 +39,7 @@ impl WriteTool {
             workspace,
             protected_paths,
             path_policy: None,
+            formatters: None,
         }
     }
 
@@ -46,6 +48,16 @@ impl WriteTool {
     /// `check_path` is called before any I/O.
     pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Format the content with these formatters before writing.
+    #[must_use]
+    pub fn with_formatters(
+        mut self,
+        formatters: Arc<crate::tool::builtins::format::FormatterConfig>,
+    ) -> Self {
+        self.formatters = Some(formatters);
         self
     }
 }
@@ -121,27 +133,50 @@ impl Tool for WriteTool {
             };
 
             // If file exists, enforce read-before-write guard
-            if target.exists() {
-                if let Err(msg) = self.file_tracker.check_unmodified(&target) {
-                    return Ok(ToolOutput::error(msg));
-                }
+            let target_exists = target.exists();
+            if target_exists && let Err(msg) = self.file_tracker.check_unmodified(&target) {
+                return Ok(ToolOutput::error(msg));
+            }
 
-                // Skip write if content identical. The message is deliberately
-                // emphatic: a model that keeps re-writing the same content
-                // usually believes the write FAILED — when it actually
-                // succeeded and the file is fine, just not where the model is
-                // looking (live finding 6a25d21b: bash cwd drift made the file
-                // invisible, so the model rewrote it in a doom loop).
-                if let Ok(existing) = tokio::fs::read_to_string(&target).await
-                    && existing == content
-                {
-                    return Ok(ToolOutput::success(format!(
-                        "File already has EXACTLY this content — the write SUCCEEDED, \
-                         nothing to do: {file_path}. Do NOT write it again. If you can't \
-                         find or run it, the problem is your working directory or path, not \
-                         the write — check `pwd` and use an absolute path."
-                    )));
-                }
+            // Format in memory BEFORE the single write: keeps the post-write
+            // record_read mtime matching the final bytes, keeps the returned
+            // snippet consistent with disk, and never hands the subprocess a
+            // path (F-FS-1 symlink hardening stays in force). `Cow` avoids
+            // cloning `content` on the (default) no-formatter path — unlike
+            // edit.rs/patch.rs, write.rs's buffer starts as a borrowed `&str`.
+            //
+            // This runs BEFORE the identical-content check below (not after,
+            // as originally written) so that check compares against the SAME
+            // bytes that would land on disk. Comparing the raw, unformatted
+            // incoming text against disk would never match again once a file
+            // has been formatted once — disk always holds formatted bytes
+            // from then on — silently defeating the anti-doom-loop guard the
+            // message below exists for.
+            let content: std::borrow::Cow<'_, str> = match &self.formatters {
+                Some(fc) => match super::format::format_content(fc, &target, content).await {
+                    Some(formatted) => std::borrow::Cow::Owned(formatted),
+                    None => std::borrow::Cow::Borrowed(content),
+                },
+                None => std::borrow::Cow::Borrowed(content),
+            };
+            let content = content.as_ref();
+
+            // Skip write if content identical. The message is deliberately
+            // emphatic: a model that keeps re-writing the same content
+            // usually believes the write FAILED — when it actually
+            // succeeded and the file is fine, just not where the model is
+            // looking (live finding 6a25d21b: bash cwd drift made the file
+            // invisible, so the model rewrote it in a doom loop).
+            if target_exists
+                && let Ok(existing) = tokio::fs::read_to_string(&target).await
+                && existing == content
+            {
+                return Ok(ToolOutput::success(format!(
+                    "File already has EXACTLY this content — the write SUCCEEDED, \
+                     nothing to do: {file_path}. Do NOT write it again. If you can't \
+                     find or run it, the problem is your working directory or path, not \
+                     the write — check `pwd` and use an absolute path."
+                )));
             }
 
             let bytes = content.len();
@@ -478,6 +513,111 @@ mod tests {
             after, "ORIGINAL CONTENT",
             "victim file was modified despite symlink rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn write_formats_content_before_the_single_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+
+        let tool = WriteTool::new(tracker.clone(), None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(std::sync::Arc::new(fc));
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+        )
+        .await
+        .unwrap();
+
+        // On disk: formatted.
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "HELLO");
+        // The mtime guard matches the FINAL bytes — a follow-up edit with no
+        // intervening read must pass, which is the whole point of formatting
+        // before the single write.
+        assert!(tracker.check_unmodified(&target).is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_doom_loop_guard_compares_against_the_formatted_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+        let fc = std::sync::Arc::new(fc);
+
+        // First write: "hello" formats to "HELLO" on disk.
+        let tool1 = WriteTool::new(tracker.clone(), None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(fc.clone());
+        tool1
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "HELLO");
+
+        // Second write of the SAME source text — the model re-sends "hello",
+        // believing nothing happened. The doom-loop guard must compare
+        // against the FORMATTED buffer ("HELLO", matching disk) and
+        // short-circuit with the emphatic "already succeeded" message (live
+        // finding 6a25d21b), rather than silently reformatting/rewriting on
+        // every turn.
+        let tool2 =
+            WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new())).with_formatters(fc);
+        let result = tool2
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("write SUCCEEDED"),
+            "expected the anti-doom-loop message, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let tool = WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new()))
+            .with_formatters(std::sync::Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn write_without_formatters_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.rs");
+        let tracker = std::sync::Arc::new(FileTracker::new());
+        let tool = WriteTool::new(tracker, None, std::sync::Arc::new(Vec::new()));
+        tool.execute(
+            &crate::ExecutionContext::default(),
+            serde_json::json!({"file_path": target.to_str().unwrap(), "content": "hello"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "hello");
     }
 
     // SECURITY (F-FS-1): end-to-end through WriteTool. An INTERMEDIATE

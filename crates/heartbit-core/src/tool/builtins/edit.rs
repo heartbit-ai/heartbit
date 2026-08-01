@@ -24,6 +24,7 @@ pub struct EditTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
     path_policy: Option<Arc<CorePathPolicy>>,
+    formatters: Option<Arc<crate::tool::builtins::format::FormatterConfig>>,
 }
 
 impl EditTool {
@@ -37,6 +38,7 @@ impl EditTool {
             workspace,
             protected_paths,
             path_policy: None,
+            formatters: None,
         }
     }
 
@@ -45,6 +47,16 @@ impl EditTool {
     /// `check_path` is called before any I/O.
     pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Format the content with these formatters before writing.
+    #[must_use]
+    pub fn with_formatters(
+        mut self,
+        formatters: Arc<crate::tool::builtins::format::FormatterConfig>,
+    ) -> Self {
+        self.formatters = Some(formatters);
         self
     }
 }
@@ -173,6 +185,20 @@ impl Tool for EditTool {
             let new_content =
                 String::from(&content[..idx]) + new_string + &content[idx + old_string.len()..];
 
+            // Format in memory BEFORE the single write: keeps the post-write
+            // record_read mtime matching the final bytes, keeps the returned
+            // snippet consistent with disk, and never hands the subprocess a
+            // path (F-FS-1 symlink hardening stays in force). Runs before
+            // `format_edit_snippet` so the snippet the model sees matches what
+            // lands on disk.
+            let new_content = match &self.formatters {
+                Some(fc) => match super::format::format_content(fc, &target, &new_content).await {
+                    Some(formatted) => formatted,
+                    None => new_content,
+                },
+                None => new_content,
+            };
+
             // Write (symlink-safe; see F-FS-1 note above)
             match write_root {
                 Some(root) => {
@@ -190,8 +216,17 @@ impl Tool for EditTool {
             // Update tracker
             let _ = self.file_tracker.record_read(&target);
 
-            // Build output: show changed lines with context
-            let output = format_edit_snippet(&new_content, idx, new_string.len());
+            // Build output: show changed lines with context. `idx`/
+            // `new_string.len()` were computed against the PRE-format buffer;
+            // if formatting shrank the content past that point, an unclamped
+            // offset makes `format_edit_snippet` fall through to dumping the
+            // WHOLE (already-formatted) buffer instead of a bounded window.
+            // Clamping degrades that case to "tail of file" instead.
+            let snippet_offset = idx.min(new_content.len());
+            let snippet_len = new_string
+                .len()
+                .min(new_content.len().saturating_sub(snippet_offset));
+            let output = format_edit_snippet(&new_content, snippet_offset, snippet_len);
 
             Ok(ToolOutput::success(output))
         })
@@ -493,6 +528,115 @@ mod tests {
         assert!(
             !result.is_error,
             "expected success, got: {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_formats_content_before_the_single_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+
+        let tool = EditTool::new(tracker.clone(), None, Arc::new(Vec::new()))
+            .with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        // On disk: the post-replacement buffer went through the formatter.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "HI WORLD\n");
+        // The mtime guard matches the FINAL bytes — a follow-up edit with no
+        // intervening read must pass.
+        assert!(tracker.check_unmodified(&path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let tool = EditTool::new(tracker, None, Arc::new(Vec::new())).with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi world\n");
+    }
+
+    #[tokio::test]
+    async fn edit_snippet_clamps_to_the_formatted_buffer_not_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let mut original = String::new();
+        for n in 1..=30 {
+            original.push_str(&format!("line{n:02}\n"));
+        }
+        std::fs::write(&path, &original).unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        // `head -c 65` truncates the POST-replacement buffer down to 65 bytes
+        // — the first 9 full lines plus 2 chars of the 10th — far short of
+        // where `idx`/`new_string.len()` (computed against the PRE-format,
+        // ~200+ byte buffer) point.
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["head".into(), "-c".into(), "65".into()]);
+
+        let tool = EditTool::new(tracker.clone(), None, Arc::new(Vec::new()))
+            .with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "line30",
+                    "new_string": "line30_EXTENDED_TAIL_TEXT"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        // On disk: the truncated buffer.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 65);
+        // The snippet must be bounded by the (short) formatted content — a
+        // stale, pre-format offset must NOT fall through to dumping the
+        // whole buffer from line 1.
+        assert!(
+            !result.content.contains("line01"),
+            "snippet should not dump from the start of the file: {}",
             result.content
         );
     }

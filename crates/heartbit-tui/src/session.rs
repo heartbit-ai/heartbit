@@ -290,6 +290,18 @@ pub fn to_markdown(history: &[Cell]) -> String {
                     stats.render()
                 ));
             }
+            Cell::Diff { lines } => {
+                out.push_str("**working tree diff**\n\n```diff\n");
+                for l in lines {
+                    let sign = match l.kind {
+                        crate::diff::DiffKind::Add => "+",
+                        crate::diff::DiffKind::Del => "-",
+                        crate::diff::DiffKind::Ctx => " ",
+                    };
+                    out.push_str(&format!("{sign}{}\n", l.text));
+                }
+                out.push_str("```\n\n");
+            }
         }
     }
     out
@@ -426,6 +438,61 @@ mod tests {
         // The stats card exports as the plain fenced table.
         assert!(md.contains("**stats — t-9**"), "{md}");
         assert!(md.contains("tools") || md.contains("records"), "{md}");
+    }
+
+    #[test]
+    fn to_markdown_renders_a_diff_cell_as_a_diff_fence() {
+        let history = vec![Cell::Diff {
+            lines: vec![
+                crate::diff::DiffLine {
+                    kind: crate::diff::DiffKind::Del,
+                    text: "old".into(),
+                    emph: Vec::new(),
+                },
+                crate::diff::DiffLine {
+                    kind: crate::diff::DiffKind::Add,
+                    text: "new".into(),
+                    emph: Vec::new(),
+                },
+            ],
+        }];
+        let md = to_markdown(&history);
+        assert!(md.contains("```diff"), "{md}");
+        assert!(md.contains("-old"), "{md}");
+        assert!(md.contains("+new"), "{md}");
+    }
+
+    #[test]
+    // The single-element `vec![8..9]` below is a deliberate one-range `emph`
+    // fixture, not a range being (mis)used to build a `Vec` of its elements.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn cell_diff_with_emph_roundtrips_through_save_and_load() {
+        // `render_diff_line` trusts `emph` enough to slice into `text` (with
+        // defensive bounds-checking) — this proves the ranges it trusts
+        // actually survive `/resume`'s save→load JSON round-trip intact,
+        // not just that the derives compile.
+        let dir = tempfile::tempdir().unwrap();
+        let history = vec![Cell::Diff {
+            lines: vec![crate::diff::DiffLine {
+                kind: crate::diff::DiffKind::Del,
+                text: "let x = 1;".into(),
+                emph: vec![8..9],
+            }],
+        }];
+        let s = Session {
+            id: "diff-rt".into(),
+            created: "now".into(),
+            history,
+        };
+        save(dir.path(), &s).unwrap();
+        let loaded = load(dir.path(), "diff-rt").unwrap();
+        match &loaded.history[0] {
+            Cell::Diff { lines } => {
+                assert_eq!(lines[0].text, "let x = 1;");
+                assert_eq!(lines[0].emph, vec![8..9]);
+            }
+            other => panic!("expected Cell::Diff, got {other:?}"),
+        }
     }
 
     #[test]

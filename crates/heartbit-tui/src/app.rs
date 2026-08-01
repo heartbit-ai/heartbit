@@ -177,11 +177,47 @@ impl PermissionMode {
     }
 }
 
+/// Reasoning-effort level the user selected. `Off` (the default) omits the field
+/// entirely, reproducing today's requests bit-for-bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortLevel {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl EffortLevel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// The four levels in picker order.
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+}
+
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/mode", "set execution mode: normal | plan | yolo"),
     ("/model", "set the model (`/model advisor` for the advisor)"),
+    ("/effort", "set reasoning effort (off|low|medium|high)"),
     (
         "/handoff",
         "brief for another session (`/handoff <purpose>`)",
@@ -219,6 +255,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/codex",
         "run on a ChatGPT-subscription Codex proxy (`/codex [url|off]`)",
     ),
+    ("/diff", "show the working-tree diff"),
     ("/quit", "exit the TUI"),
 ];
 
@@ -231,6 +268,9 @@ pub enum Effect {
     SaveKey(String),
     /// Persist a new model id to the config file.
     SaveModel(String),
+    /// Persist the reasoning-effort level to the config file (`None` = off,
+    /// omitting the field entirely rather than storing `"off"`).
+    SaveReasoningEffort(Option<String>),
     /// Persist the advisor's frontier model to the config file (None = clear,
     /// falling back to the main model).
     SaveFrontierModel(Option<String>),
@@ -277,6 +317,18 @@ pub enum Effect {
     Learn,
     /// Validate + commit the staged lessons (digest = value at stage time).
     CommitLessons(u64),
+    /// Gather the cumulative working-tree diff (`/diff`): `git diff HEAD`
+    /// plus untracked files, run off the UI thread — git is I/O, never
+    /// invoked from the reducer.
+    GitDiff,
+    /// Fire a desktop notification (focus-gated turn-completion / approval —
+    /// Task 7). `title`/`body` may carry agent-controlled text (tool names,
+    /// provider error strings) UNsanitized: `notify::emit` sanitizes at the
+    /// I/O boundary, immediately before writing bytes, not here.
+    Notify {
+        title: String,
+        body: String,
+    },
     /// Tear down and exit.
     Quit,
 }
@@ -288,6 +340,7 @@ impl Effect {
             Effect::SendInput(_) => "send_input",
             Effect::SaveKey(_) => "save_key",
             Effect::SaveModel(_) => "save_model",
+            Effect::SaveReasoningEffort(_) => "save_reasoning_effort",
             Effect::SaveFrontierModel(_) => "save_frontier_model",
             Effect::SaveMcp(_) => "save_mcp",
             Effect::FetchModels => "fetch_models",
@@ -309,6 +362,8 @@ impl Effect {
             Effect::Analyze(_) => "analyze",
             Effect::Learn => "learn",
             Effect::CommitLessons(_) => "commit_lessons",
+            Effect::GitDiff => "git_diff",
+            Effect::Notify { .. } => "notify",
             Effect::Quit => "quit",
         }
     }
@@ -394,8 +449,38 @@ pub enum Modal {
     ModePicker {
         sel: usize,
     },
+    /// `/effort` picker: choose the reasoning-effort level (`sel` indexes
+    /// [`EffortLevel::ALL`]).
+    EffortPicker {
+        sel: usize,
+    },
     HistorySearch(HistorySearch),
     SessionPicker(SessionPicker),
+}
+
+/// A message held in the visible queue: the user-facing text (shown in the
+/// queue box, drained into the transcript as a `Cell::User`, and reloaded by
+/// Up for editing) kept SEPARATE from the wire payload actually sent to the
+/// agent (`Effect::SendInput`), which may carry an invisible directive the
+/// display must never show — e.g. Plan mode's read-only prefix. A single
+/// shared string here would leak that directive into the transcript and back
+/// into the composer the moment a Plan-mode submit landed mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueuedInput {
+    pub(crate) display: String,
+    pub(crate) wire: String,
+}
+
+#[cfg(test)]
+impl From<&str> for QueuedInput {
+    /// Test-only convenience: most fixtures don't care about the display/wire
+    /// split, so both sides get the same text.
+    fn from(s: &str) -> Self {
+        Self {
+            display: s.to_string(),
+            wire: s.to_string(),
+        }
+    }
 }
 
 /// The full UI state.
@@ -410,6 +495,10 @@ pub struct App {
     pub composer: Composer,
     pub modal: Option<Modal>,
     pub model: String,
+    /// Reasoning-effort level (`/effort`), gated to OpenRouter/custom-endpoint
+    /// providers only — `main.rs::effort_for_provider` never lets it reach the
+    /// `ANTHROPIC_API_KEY` fallback. Applies on next agent start.
+    pub effort: EffortLevel,
     /// The OpenRouter API key in effect (from env, config, or set in-TUI).
     pub api_key: Option<String>,
     /// True when a provider can start without an OpenRouter key (e.g. an
@@ -472,6 +561,15 @@ pub struct App {
     /// Time-to-first-token of the latest turn (ms) — status-line throughput.
     pub last_ttft_ms: u64,
     pub running: bool,
+    /// Whether the terminal window currently has focus (`EnableFocusChange`).
+    /// Defaults `true` so a terminal that never reports focus reads as
+    /// focused. Task 7 (notifications) reads this to decide whether to notify.
+    pub focused: bool,
+    /// Desktop notifications on turn-completion/approval while unfocused
+    /// (`tui.toml`'s `notify`, default on). Gates alongside `focused` and
+    /// `splash`; the bytes are written by `notify::emit` from the main loop's
+    /// effect pass — never here, never in `view()`, never on the agent thread.
+    pub notify: bool,
     /// A model/advisor change landed MID-RUN: the engine rebuild is deferred
     /// to turn-idle (an immediate channel swap would let the next message
     /// spawn a second engine while the old one still runs — audit 2026-06-09).
@@ -510,6 +608,16 @@ pub struct App {
     pub effects: Vec<Effect>,
     /// Maps an in-flight tool_call_id to its index in `history`.
     tool_index: HashMap<String, usize>,
+    /// Messages submitted while a turn was in flight, held HERE rather than
+    /// pushed into the invisible unbounded input channel so the user can see,
+    /// edit and cancel them. Invariant: non-empty ⇒ `running`.
+    pub(crate) queued: std::collections::VecDeque<QueuedInput>,
+    /// View-side memoization of highlighted Markdown (interior-mutable, same
+    /// precedent as `last_max_off`): `terminal.draw()` re-renders every agent
+    /// cell on every keystroke and every 120ms tick, so re-running syntect
+    /// uncached would burn a syntax parser dozens of times a second. The
+    /// reducer never reads or writes this field — see `Msg::Resize` below.
+    pub(crate) md: crate::markdown::MarkdownCache,
 }
 
 impl App {
@@ -521,6 +629,7 @@ impl App {
             composer: Composer::new(),
             modal: None,
             model: model.into(),
+            effort: EffortLevel::default(),
             api_key: None,
             has_fallback_provider: false,
             custom_endpoint: None,
@@ -546,6 +655,8 @@ impl App {
             context_tokens: 0,
             last_ttft_ms: 0,
             running: false,
+            focused: true,
+            notify: true,
             pending_respawn: false,
             learning: None,
             follow: true,
@@ -561,6 +672,8 @@ impl App {
             should_quit: false,
             effects: Vec::new(),
             tool_index: HashMap::new(),
+            queued: std::collections::VecDeque::new(),
+            md: crate::markdown::MarkdownCache::default(),
         }
     }
 
@@ -730,30 +843,49 @@ impl App {
                     self.splash = (t < crate::splash::SPLASH_TICKS).then_some(t);
                 }
             }
+            // Deliberately NOT touching `self.md` here (or anywhere in
+            // `update`/its helpers — the reducer stays pure, no cache reads
+            // or writes). A resize cannot serve stale content from the
+            // Markdown cache: entries hold LOGICAL lines, and wrapping to the
+            // terminal width happens at draw time in `ui::view` via
+            // `Paragraph::wrap` against the live `transcript_area.width` —
+            // nothing width-derived is ever stored under the cache's key
+            // (see `MarkdownCache`'s doc comment).
             Msg::Resize => {}
             // Mouse wheel scrolls the transcript (output history). Over-scrolling
             // is harmless — the renderer clamps the offset to the top.
             Msg::WheelUp => self.scroll_up(WHEEL_STEP),
             Msg::WheelDown => self.scroll_down(WHEEL_STEP),
-            Msg::Paste(s) => match &mut self.modal {
-                // Pasting into a prompt must land in that field, not the composer
-                // hidden behind the modal.
-                Some(Modal::KeyEntry(m)) => m.input.push_str(&s.replace(['\n', '\r'], "")),
-                Some(Modal::ModelPicker(p)) => {
-                    p.query.push_str(&s.replace(['\n', '\r'], ""));
-                    p.selected = 0;
+            Msg::Paste(s) => {
+                // A paste during the splash dismisses the overlay too — unlike a
+                // key (which the splash consumes outright), the paste already
+                // carries content the user wants landed, so fall through to the
+                // existing insert below instead of dropping it.
+                if self.splash.is_some() {
+                    self.splash = None;
                 }
-                Some(Modal::HistorySearch(h)) => {
-                    h.query.push_str(&s.replace(['\n', '\r'], ""));
-                    h.sel = 0;
+                match &mut self.modal {
+                    // Pasting into a prompt must land in that field, not the
+                    // composer hidden behind the modal.
+                    Some(Modal::KeyEntry(m)) => m.input.push_str(&s.replace(['\n', '\r'], "")),
+                    Some(Modal::ModelPicker(p)) => {
+                        p.query.push_str(&s.replace(['\n', '\r'], ""));
+                        p.selected = 0;
+                    }
+                    Some(Modal::HistorySearch(h)) => {
+                        h.query.push_str(&s.replace(['\n', '\r'], ""));
+                        h.sel = 0;
+                    }
+                    Some(Modal::Approval(_))
+                    | Some(Modal::Question(_))
+                    | Some(Modal::SessionPicker(_))
+                    | Some(Modal::HandoffPicker { .. })
+                    | Some(Modal::ModePicker { .. })
+                    | Some(Modal::EffortPicker { .. }) => {}
+                    None => self.composer.insert_str(&s),
                 }
-                Some(Modal::Approval(_))
-                | Some(Modal::Question(_))
-                | Some(Modal::SessionPicker(_))
-                | Some(Modal::HandoffPicker { .. })
-                | Some(Modal::ModePicker { .. }) => {}
-                None => self.composer.insert_str(&s),
-            },
+            }
+            Msg::FocusChanged(focused) => self.focused = focused,
             Msg::Key(key) => {
                 // Any key dismisses the splash and is CONSUMED — an impatient
                 // first keypress must not leak a stray char into the composer
@@ -790,6 +922,7 @@ impl App {
                 had_tool_calls,
                 ttft_ms,
             } => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.tokens.input_tokens =
                     self.tokens.input_tokens.saturating_add(usage.input_tokens);
@@ -822,6 +955,10 @@ impl App {
                         self.effects.push(Effect::CommitLessons(digest));
                     }
                     self.flush_pending_respawn();
+                    // Turn boundary: release at most one queued message. If
+                    // one was waiting, `running` goes back to `true`.
+                    self.drain_one_queued();
+                    self.notify_turn_idle(was_running, "Heartbit", "turn complete");
                 }
             }
             // A sub-agent's LLM call: its cost is real (session totals) but its
@@ -931,6 +1068,7 @@ impl App {
             }
             Msg::Notice(text) => self.history.push(Cell::Notice(text)),
             Msg::RunCompleted => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 // Backstop: a session ending right at the answer still commits the
@@ -939,8 +1077,13 @@ impl App {
                     self.effects.push(Effect::CommitLessons(digest));
                 }
                 self.flush_pending_respawn();
+                // Turn boundary: release at most one queued message. If one
+                // was waiting, `running` goes back to `true`.
+                self.drain_one_queued();
+                self.notify_turn_idle(was_running, "Heartbit", "turn complete");
             }
             Msg::AgentExited(_) => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 // An abnormal/early thread exit must NOT commit a half-rewritten
@@ -948,14 +1091,29 @@ impl App {
                 // next run's first text-only LlmDone.
                 self.learning = None;
                 self.flush_pending_respawn();
+                // Abnormal end: there is no live turn to release into — drop
+                // the backlog rather than stranding it silently.
+                self.drop_queued();
+                self.notify_turn_idle(was_running, "Heartbit", "session ended");
             }
             Msg::RunFailed(error) => {
+                let was_running = self.running;
                 self.finalize_active();
                 self.running = false;
                 self.learning = None;
                 self.flush_pending_respawn();
+                // Abnormal end: same as AgentExited — drop, don't drain.
+                self.drop_queued();
                 self.history
                     .push(Cell::Notice(format!("run failed: {error}")));
+                // Captured before `error` moves into EmergencyHandoff below;
+                // sanitized later at the `notify::emit` I/O boundary, not here
+                // (a provider error string is agent/provider-controlled text).
+                self.notify_turn_idle(
+                    was_running,
+                    "Heartbit — run failed",
+                    first_words(&error, 80),
+                );
                 // P12: a run failure is terminal for this engine — leave a
                 // deterministic emergency brief so the next session can
                 // continue deliberately (the 402 incident left an amnesiac
@@ -967,6 +1125,26 @@ impl App {
                 ));
             }
             Msg::Approval { tools, reply } => {
+                // Not a `running` transition (the turn stays in flight while the
+                // user decides) — gate directly on `running` instead of a
+                // was_running→!running edge. Tool names are agent-controlled
+                // text; sanitized later at the `notify::emit` I/O boundary.
+                if self.running
+                    && self.notify
+                    && !self.focused
+                    && self.splash.is_none()
+                    && !tools.is_empty()
+                {
+                    let names = tools
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.effects.push(Effect::Notify {
+                        title: "Heartbit — approval needed".into(),
+                        body: names,
+                    });
+                }
                 self.modal = Some(Modal::Approval(ApprovalModal { tools, reply }));
             }
             Msg::Question { request, reply } => {
@@ -1024,12 +1202,34 @@ impl App {
             Msg::StatsReady(Err(e)) => {
                 self.history.push(Cell::Notice(format!("stats: {e}")));
             }
+            Msg::GitDiffReady(Ok(text)) if text.trim().is_empty() => {
+                self.history
+                    .push(Cell::Notice("no changes in the working tree".into()));
+            }
+            Msg::GitDiffReady(Ok(text)) => {
+                self.history.push(Cell::Diff {
+                    lines: crate::gitdiff::parse(&text),
+                });
+            }
+            Msg::GitDiffReady(Err(e)) => {
+                self.history
+                    .push(Cell::Notice(format!("git diff failed: {e}")));
+            }
             Msg::AnalyzeReady { display, task } => {
-                self.history.push(Cell::User(display));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
-                self.effects.push(Effect::SendInput(task));
+                // The async prep (trace fetch + prompt build) may resolve
+                // while a DIFFERENT turn is still in flight — queue rather
+                // than bypass straight into the invisible channel. Queuing
+                // `display` alongside `task` also means a mid-turn /analyze
+                // shows the friendly label, not the raw tool instruction,
+                // once it's later drained.
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             Msg::AnalyzeFailed(e) => {
                 self.history.push(Cell::Notice(format!("analyze: {e}")));
@@ -1039,12 +1239,24 @@ impl App {
                 task,
                 staged_digest,
             } => {
-                self.history.push(Cell::User(display));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
+                // Stage the digest now so the next CommitLessons can skip the
+                // commit if the staged-lessons file is still exactly what it
+                // was at stage time (digest match → no-op, nothing rewrote
+                // it). This is a no-change guard, not a turn-affinity fix:
+                // `self.learning` is a single slot, so if a turn is already
+                // in flight when /learn runs, THAT turn's idle (not /learn's)
+                // drains this slot first — /learn's own commit can then fire
+                // at the wrong boundary or be skipped entirely. Known
+                // limitation, tracked as a follow-up; not fixed here.
                 self.learning = Some(staged_digest);
-                self.effects.push(Effect::SendInput(task));
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             Msg::LearnFailed(e) => {
                 self.history.push(Cell::Notice(format!("learn: {e}")));
@@ -1187,11 +1399,9 @@ impl App {
         let text = self.composer.take();
         // Persist the raw prompt to the per-directory history (slash commands
         // never reach here — they returned above, so secrets stay unrecallable).
+        // This is independent of whether the turn is sent now or queued — the
+        // recall history cares about what was TYPED, not when it was SENT.
         self.effects.push(Effect::PersistPrompt(text.clone()));
-        self.history.push(Cell::User(text.clone())); // display the user's text verbatim
-        self.running = true;
-        self.follow = true; // jump back to the newest when the user sends
-        self.seed_idle_squad(); // fresh roster: the whole squad, available
         // Plan mode: prefix a read-only directive so the agent PRODUCES A PLAN
         // instead of attempting edits and getting silently denied by the gate.
         // Per-turn (reflects the mode at send time); the display stays clean.
@@ -1203,9 +1413,90 @@ impl App {
                  normal/YOLO mode to execute.]\n\n{text}"
             )
         } else {
-            text
+            text.clone()
         };
-        self.effects.push(Effect::SendInput(sent));
+        // A turn already in flight: `send_or_queue` below holds this one
+        // visibly instead of pushing straight into the invisible input
+        // channel. The start-of-turn bookkeeping (display cell, roster reset)
+        // only applies to a genuinely fresh turn — repeating it mid-turn would
+        // reset the LIVE roster back to Idle and double-display the message
+        // once it's eventually drained.
+        let was_idle = !self.running;
+        self.send_or_queue(text.clone(), sent);
+        if was_idle {
+            self.history.push(Cell::User(text)); // display the user's text verbatim
+            self.running = true;
+            self.follow = true; // jump back to the newest when the user sends
+            self.seed_idle_squad(); // fresh roster: the whole squad, available
+        }
+    }
+
+    /// The single choke point for every user-visible send: `display` is what
+    /// the human sees (queue box, transcript, Up-recall); `wire` is the exact
+    /// payload that becomes `Effect::SendInput` and may carry an invisible
+    /// directive `display` must not (e.g. Plan mode's read-only prefix). Six
+    /// call sites reach this in addition to `submit` above (AnalyzeReady,
+    /// LearnReady, `/goal` clear, `/goal` set, `/handoff`, `/research`) —
+    /// routing them all through here is what keeps the queue honest instead
+    /// of leaving mid-turn bypasses straight into the invisible input channel.
+    fn send_or_queue(&mut self, display: String, wire: String) {
+        if self.running {
+            self.queued.push_back(QueuedInput { display, wire });
+        } else {
+            self.effects.push(Effect::SendInput(wire));
+        }
+    }
+
+    /// Release at most ONE queued message at a turn boundary. Releasing
+    /// several would push the rest back into the invisible channel — the
+    /// very defect this queue exists to fix.
+    fn drain_one_queued(&mut self) {
+        if let Some(q) = self.queued.pop_front() {
+            self.history.push(Cell::User(q.display));
+            self.running = true; // the drained message starts a fresh turn
+            // Dropping `follow` on a mid-turn SUBMIT is fine (the user was
+            // scrolled up reading); but a DRAIN starts a brand-new turn whose
+            // reply should be visible — re-arm it here, or the new answer
+            // streams off-screen while the view stays wherever it was left.
+            self.follow = true;
+            self.effects.push(Effect::SendInput(q.wire));
+        }
+    }
+
+    /// Drop the entire backlog with a recoverable notice — used whenever a
+    /// turn ends WITHOUT a next turn to release into (failure, unexpected
+    /// exit, user interrupt), or when the user explicitly cancels the
+    /// backlog with Esc. The text is gone, but the notice makes the drop
+    /// visible instead of silently stranding the messages.
+    fn drop_queued(&mut self) {
+        let n = self.queued.len();
+        if n == 0 {
+            return;
+        }
+        self.queued.clear();
+        self.history.push(Cell::Notice(format!(
+            "{n} queued message{} dropped — retype if still needed",
+            if n == 1 { "" } else { "s" }
+        )));
+    }
+
+    /// Push `Effect::Notify` for a turn-idle site, gated on: notifications
+    /// enabled, terminal unfocused, no splash overlay, AND the turn genuinely
+    /// just ended — `was_running` (captured before this message's mutations)
+    /// was `true` and `running` is now `false`. That transition is the
+    /// dedupe: if an earlier message in the same turn boundary (e.g.
+    /// `LlmDone{false}`) already flipped `running` to `false`, a later one
+    /// (e.g. a stale `RunCompleted`) sees `was_running == false` here and
+    /// stays silent — at most one notification fires per turn. It is also
+    /// what suppresses notification when a queued message was drained right
+    /// back into a fresh turn (`running` returns to `true` before this call).
+    fn notify_turn_idle(&mut self, was_running: bool, title: &str, body: impl Into<String>) {
+        if was_running && !self.running && self.notify && !self.focused && self.splash.is_none() {
+            self.effects.push(Effect::Notify {
+                title: title.to_string(),
+                body: body.into(),
+            });
+        }
     }
 
     fn handle_slash(&mut self, cmd: String) {
@@ -1239,6 +1530,16 @@ impl App {
                     self.set_model(arg);
                 }
             }
+            "effort" => {
+                if arg.is_empty() {
+                    self.open_effort_picker();
+                } else if let Some(level) = EffortLevel::parse(&arg) {
+                    self.set_effort(level);
+                } else {
+                    self.history
+                        .push(Cell::Notice("usage: /effort off|low|medium|high".into()));
+                }
+            }
             "codex" => self.activate_codex(arg),
             "mcp" => self.handle_mcp(arg),
             "mode" => self.set_mode(arg),
@@ -1265,6 +1566,7 @@ impl App {
             }
             "export" => self.effects.push(Effect::ExportSession),
             "resume" => self.effects.push(Effect::ListSessions),
+            "diff" => self.effects.push(Effect::GitDiff),
             "goal" => {
                 if arg.is_empty() {
                     self.history.push(Cell::Notice(
@@ -1273,15 +1575,23 @@ impl App {
                             .into(),
                     ));
                 } else if arg.eq_ignore_ascii_case("clear") {
-                    self.effects.push(Effect::SendInput(
+                    // Display is the slash command itself — these instructions
+                    // were never shown verbatim even on an immediate send, so
+                    // a mid-turn queue+drain gets a friendly label instead of
+                    // reusing the raw tool-call text.
+                    self.send_or_queue(
+                        "/goal clear".to_string(),
                         "Call the `set_goal` tool with clear=true (remove the completion goal)."
                             .to_string(),
-                    ));
+                    );
                 } else {
-                    self.effects.push(Effect::SendInput(format!(
-                        "Call the `set_goal` tool now with this objective, then keep working \
-                         toward it: \"{arg}\""
-                    )));
+                    self.send_or_queue(
+                        format!("/goal {arg}"),
+                        format!(
+                            "Call the `set_goal` tool now with this objective, then keep working \
+                             toward it: \"{arg}\""
+                        ),
+                    );
                 }
             }
             "handoff" => {
@@ -1290,10 +1600,13 @@ impl App {
                     // invalid by design — the purpose tailors the brief).
                     self.effects.push(Effect::ListHandoffs);
                 } else {
-                    self.effects.push(Effect::SendInput(format!(
-                        "Call the `handoff` tool now with purpose: \"{arg}\". Then tell me \
-                         the brief's path in one line."
-                    )));
+                    self.send_or_queue(
+                        format!("/handoff {arg}"),
+                        format!(
+                            "Call the `handoff` tool now with purpose: \"{arg}\". Then tell me \
+                             the brief's path in one line."
+                        ),
+                    );
                 }
             }
             "stats" => {
@@ -1365,17 +1678,24 @@ impl App {
                      do not improvise your own research.",
                     q = serde_json::to_string(&arg).unwrap_or_else(|_| format!("\"{arg}\"")),
                 );
-                self.history.push(Cell::User(format!("researching: {arg}")));
-                self.running = true;
-                self.follow = true;
-                self.seed_idle_squad();
-                self.effects.push(Effect::SendInput(task));
+                // /research isn't guarded against mid-run reentry either — a
+                // second /research while one is already going through must
+                // queue, not bypass into the invisible channel.
+                let display = format!("researching: {arg}");
+                let was_idle = !self.running;
+                self.send_or_queue(display.clone(), task);
+                if was_idle {
+                    self.history.push(Cell::User(display));
+                    self.running = true;
+                    self.follow = true;
+                    self.seed_idle_squad();
+                }
             }
             "help" => {
                 self.history.push(Cell::Notice(
-                    "commands: /mode [normal|plan|yolo] · /model [name] · /mcp [list|add …|clear] · \
-                     /stats · /analyze · /learn · /research <question> · /verify <cmd> · /clear · \
-                     /resume · /export · /key · /quit"
+                    "commands: /mode [normal|plan|yolo] · /model [name] · /effort [off|low|medium|high] · \
+                     /mcp [list|add …|clear] · /stats · /analyze · /learn · /research <question> · \
+                     /verify <cmd> · /diff · /clear · /resume · /export · /key · /quit"
                         .into(),
                 ));
                 self.history.push(Cell::Notice(
@@ -1497,6 +1817,31 @@ impl App {
         let when = self.queue_respawn();
         self.history
             .push(Cell::Notice(format!("model set to {model} — {when}")));
+    }
+
+    /// Set the reasoning-effort level (same semantics as `/effort <level>`):
+    /// update, persist, notice. `Off` clears the config key entirely (rather
+    /// than persisting `"off"`) so a stale value never lingers. Takes effect
+    /// on the next agent start (gated to OpenRouter/custom-endpoint providers
+    /// in `main.rs::effort_for_provider` — never the Anthropic fallback).
+    fn set_effort(&mut self, level: EffortLevel) {
+        self.effort = level;
+        let saved = (level != EffortLevel::Off).then(|| level.label().to_string());
+        self.effects.push(Effect::SaveReasoningEffort(saved));
+        let when = self.queue_respawn();
+        self.history.push(Cell::Notice(format!(
+            "reasoning effort set to {} — {when}",
+            level.label()
+        )));
+    }
+
+    /// Bare `/effort`: open the picker, preselected on the current level.
+    fn open_effort_picker(&mut self) {
+        let sel = EffortLevel::ALL
+            .iter()
+            .position(|l| *l == self.effort)
+            .unwrap_or(0);
+        self.modal = Some(Modal::EffortPicker { sel });
     }
 
     /// `/codex [url|off]` — one command to run the TUI on a ChatGPT-subscription
@@ -1834,7 +2179,9 @@ impl App {
                     self.permission_mode.describe()
                 )));
             }
-            KeyCode::Char('u') if ctrl => self.composer = Composer::new(),
+            // Ctrl+U clears the DRAFT only — the recall history (seeded from
+            // previous sessions in this directory) must survive.
+            KeyCode::Char('u') if ctrl => self.composer.clear(),
             // Ctrl+R: reverse-search the submit history.
             KeyCode::Char('r') if ctrl => {
                 self.modal = Some(Modal::HistorySearch(HistorySearch::default()));
@@ -1854,13 +2201,31 @@ impl App {
             }
             KeyCode::Left => self.composer.move_left(),
             KeyCode::Right => self.composer.move_right(),
-            KeyCode::Up => self.composer.history_prev(),
+            // A non-empty queue changes what Up means: pop the newest queued
+            // entry back for editing instead of recalling prompt history —
+            // editing what's about to be sent takes priority over recall.
+            KeyCode::Up => {
+                if let Some(q) = self.queued.pop_back() {
+                    // The CLEAN display text, never the wire payload — a
+                    // Plan-mode queued message must not bring its invisible
+                    // directive back into the composer.
+                    self.composer.set_text(&q.display);
+                } else {
+                    self.composer.history_prev();
+                }
+            }
             KeyCode::Down => self.composer.history_next(),
             KeyCode::PageUp => self.scroll_up(SCROLL_STEP),
             KeyCode::PageDown => self.scroll_down(SCROLL_STEP),
-            // Esc interrupts a running turn; when idle it just clears the composer.
+            // A non-empty queue changes what Esc means too: drop the backlog
+            // (visibly, via a notice) rather than interrupting the turn that
+            // is actually still in flight. Only once the queue is empty does
+            // Esc fall through to its running/idle meaning — so idle-Esc
+            // (queue always empty then, by the invariant) is unchanged.
             KeyCode::Esc => {
-                if self.running {
+                if !self.queued.is_empty() {
+                    self.drop_queued();
+                } else if self.running {
                     self.interrupt();
                 } else {
                     self.composer.clear();
@@ -1901,6 +2266,10 @@ impl App {
         self.running = false;
         // The interrupt ends the turn — a deferred model change applies now.
         self.flush_pending_respawn();
+        // No live turn to release into — drop the backlog (defensive: the
+        // Esc handler above already routes a non-empty queue away from here,
+        // but keep the invariant locally true too).
+        self.drop_queued();
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -1913,6 +2282,7 @@ impl App {
             Some(Modal::SessionPicker(_)) => self.handle_session_picker_key(key),
             Some(Modal::HandoffPicker { .. }) => self.handle_handoff_picker_key(key),
             Some(Modal::ModePicker { .. }) => self.handle_mode_picker_key(key),
+            Some(Modal::EffortPicker { .. }) => self.handle_effort_picker_key(key),
             None => {}
         }
     }
@@ -2029,6 +2399,36 @@ impl App {
                         mode.label(),
                         mode.describe()
                     )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `/effort` picker keys: ↑/↓ select (wrap), Enter apply, Esc cancel.
+    fn handle_effort_picker_key(&mut self, key: KeyEvent) {
+        let n = EffortLevel::ALL.len();
+        match key.code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up => {
+                if let Some(Modal::EffortPicker { sel }) = &mut self.modal {
+                    *sel = (*sel + n - 1) % n;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(Modal::EffortPicker { sel }) = &mut self.modal {
+                    *sel = (*sel + 1) % n;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+                let level = match &self.modal {
+                    Some(Modal::EffortPicker { sel }) => EffortLevel::ALL.get(*sel).copied(),
+                    _ => None,
+                };
+                self.modal = None;
+                // Same application path as `/effort <arg>`.
+                if let Some(level) = level {
+                    self.set_effort(level);
                 }
             }
             _ => {}
@@ -2850,6 +3250,122 @@ mod tests {
     }
 
     #[test]
+    fn effort_level_parse_and_label_roundtrip() {
+        for (s, lvl) in [
+            ("off", EffortLevel::Off),
+            ("low", EffortLevel::Low),
+            ("medium", EffortLevel::Medium),
+            ("high", EffortLevel::High),
+        ] {
+            assert_eq!(EffortLevel::parse(s), Some(lvl));
+            assert_eq!(lvl.label(), s);
+        }
+        assert_eq!(EffortLevel::parse("HIGH"), Some(EffortLevel::High));
+        assert_eq!(EffortLevel::parse("turbo"), None);
+        assert_eq!(EffortLevel::default(), EffortLevel::Off);
+    }
+
+    #[test]
+    fn slash_effort_sets_level_persists_and_requests_respawn() {
+        let mut app = keyed();
+        typed(&mut app, "/effort high");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::High);
+        assert!(
+            app.effects
+                .contains(&Effect::SaveReasoningEffort(Some("high".into())))
+        );
+        assert!(app.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn slash_effort_off_clears_and_drops_the_config_key() {
+        let mut app = keyed();
+        typed(&mut app, "/effort high");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        typed(&mut app, "/effort off");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(app.effects.contains(&Effect::SaveReasoningEffort(None)));
+    }
+
+    #[test]
+    fn slash_effort_mid_run_defers_respawn_to_turn_idle() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "/effort low");
+        app.update(key(KeyCode::Enter));
+        assert!(app.pending_respawn);
+        assert!(!app.effects.contains(&Effect::RespawnAgent));
+    }
+
+    #[test]
+    fn slash_effort_unknown_arg_reports_usage_and_changes_nothing() {
+        let mut app = keyed();
+        typed(&mut app, "/effort turbo");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SaveReasoningEffort(_)))
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("usage")))
+        );
+    }
+
+    #[test]
+    fn slash_effort_bare_opens_picker_preselected_on_current_level() {
+        let mut app = keyed();
+        app.effort = EffortLevel::Medium;
+        typed(&mut app, "/effort");
+        app.update(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::EffortPicker { sel: 2 }) // Medium is EffortLevel::ALL[2]
+        ));
+    }
+
+    #[test]
+    fn effort_picker_enter_applies_the_highlighted_level() {
+        let mut app = keyed();
+        app.modal = Some(Modal::EffortPicker { sel: 3 }); // High
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.effort, EffortLevel::High);
+        assert!(app.modal.is_none());
+        assert!(
+            app.effects
+                .contains(&Effect::SaveReasoningEffort(Some("high".into())))
+        );
+    }
+
+    #[test]
+    fn effort_picker_esc_cancels_without_changing_anything() {
+        let mut app = keyed();
+        app.effort = EffortLevel::Off;
+        app.modal = Some(Modal::EffortPicker { sel: 3 });
+        app.update(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.effort, EffortLevel::Off);
+        assert!(app.effects.is_empty());
+    }
+
+    #[test]
+    fn paste_into_effort_picker_is_a_no_op() {
+        // Mirrors the ModePicker contract in Msg::Paste's match — a picker
+        // has no text field, so a paste must not leak anywhere.
+        let mut app = keyed();
+        app.modal = Some(Modal::EffortPicker { sel: 0 });
+        app.update(Msg::Paste("ignored".into()));
+        assert!(matches!(app.modal, Some(Modal::EffortPicker { sel: 0 })));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
     fn sub_agent_llm_done_accumulates_cost_without_lifecycle() {
         // Audit 2026-06-09: sub-agent LlmResponse leaked into Msg::LlmDone —
         // flipping running=false mid-run, settling the roster after the FIRST
@@ -3653,6 +4169,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_u_clears_the_draft_but_keeps_recall_history() {
+        let mut app = keyed();
+        app.composer.seed_history(vec!["earlier prompt".into()]);
+        typed(&mut app, "a draft");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)));
+        typed(&mut app, "with two lines");
+        app.update(ctrl('u'));
+        // The draft is gone and the cursor is genuinely reset (row too).
+        assert!(app.composer.text().is_empty());
+        assert_eq!(app.composer.cursor(), (0, 0));
+        // …but the seeded history survives: Up recalls it.
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "earlier prompt");
+    }
+
+    #[test]
     fn reasoning_streams_live_then_flushes_above_the_answer() {
         let mut app = App::new("m");
         // Reasoning streams first into its own buffer (rendered live, dimmed)…
@@ -4016,6 +4548,43 @@ mod tests {
         assert!(matches!(app.history.last(), Some(Cell::Stats { label, .. }) if label == "t1"));
         app.update(Msg::StatsReady(Err("no trace".into())));
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("no trace")));
+    }
+
+    #[test]
+    fn slash_diff_requests_the_working_tree_diff() {
+        let mut app = keyed();
+        typed(&mut app, "/diff");
+        app.update(key(KeyCode::Enter));
+        assert!(app.effects.contains(&Effect::GitDiff));
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_))),
+            "/diff is local — it must not consume an LLM turn"
+        );
+    }
+
+    #[test]
+    fn git_diff_ready_renders_a_diff_cell_and_empty_is_a_notice() {
+        let mut app = keyed();
+        app.update(Msg::GitDiffReady(Ok("@@ -1,1 +1,1 @@\n-a\n+b\n".into())));
+        assert!(app.history.iter().any(|c| matches!(c, Cell::Diff { .. })));
+
+        let mut app2 = keyed();
+        app2.update(Msg::GitDiffReady(Ok(String::new())));
+        assert!(
+            app2.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("no changes")))
+        );
+
+        let mut app3 = keyed();
+        app3.update(Msg::GitDiffReady(Err("not a git repository".into())));
+        assert!(
+            app3.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("git")))
+        );
     }
 
     #[test]
@@ -4448,6 +5017,216 @@ mod tests {
     }
 
     #[test]
+    fn multiline_paste_lands_as_one_draft_and_does_not_submit() {
+        let mut app = keyed();
+        app.update(Msg::Paste("line one\nline two\nline three".into()));
+        assert_eq!(app.composer.text(), "line one\nline two\nline three");
+        // A paste NEVER submits.
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_)))
+        );
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn paste_mid_draft_preserves_the_tail_and_leaves_cursor_after_insert() {
+        let mut app = keyed();
+        typed(&mut app, "ab");
+        app.update(key(KeyCode::Left)); // cursor between a and b
+        app.update(Msg::Paste("X\nY".into()));
+        assert_eq!(app.composer.text(), "aX\nYb");
+    }
+
+    #[test]
+    fn crlf_paste_yields_single_newlines() {
+        let mut app = keyed();
+        app.update(Msg::Paste("a\r\nb".into()));
+        assert_eq!(app.composer.text(), "a\nb");
+    }
+
+    #[test]
+    fn paste_during_splash_dismisses_the_overlay_and_keeps_the_text() {
+        let mut app = keyed();
+        app.splash = Some(0);
+        app.update(Msg::Paste("hello".into()));
+        assert!(app.splash.is_none(), "the paste must dismiss the splash");
+        assert_eq!(app.composer.text(), "hello");
+    }
+
+    #[test]
+    fn focus_defaults_to_focused_and_tracks_both_directions() {
+        let mut app = App::new("m");
+        assert!(
+            app.focused,
+            "a terminal that never reports focus must read as focused"
+        );
+        app.update(Msg::FocusChanged(false));
+        assert!(!app.focused);
+        app.update(Msg::FocusChanged(true));
+        assert!(app.focused);
+    }
+
+    fn unfocused_running() -> App {
+        let mut app = keyed();
+        app.notify = true;
+        app.focused = false;
+        app.running = true;
+        app
+    }
+
+    fn notified(app: &App) -> bool {
+        app.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Notify { .. }))
+    }
+
+    #[test]
+    fn notify_on_turn_idle_when_unfocused() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(notified(&app));
+    }
+
+    #[test]
+    fn focused_terminal_suppresses_notify() {
+        let mut app = unfocused_running();
+        app.focused = true;
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn notify_disabled_by_config_suppresses() {
+        let mut app = unfocused_running();
+        app.notify = false;
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn tool_turn_does_not_notify() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: true,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn at_most_one_notify_per_turn() {
+        let mut app = unfocused_running();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        app.effects.clear();
+        app.update(Msg::RunCompleted);
+        assert!(
+            !notified(&app),
+            "RunCompleted must not re-notify after LlmDone"
+        );
+    }
+
+    #[test]
+    fn notify_suppressed_during_splash() {
+        let mut app = unfocused_running();
+        app.splash = Some(0);
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(!notified(&app));
+    }
+
+    // --- Task 7 follow-up: the sites the six brief tests above don't drive
+    // (approval, RunFailed's error content, drained-queue suppression) ---
+
+    #[test]
+    fn approval_notifies_when_unfocused() {
+        let mut app = unfocused_running();
+        let (tx, _rx) = sync_channel(1);
+        app.update(Msg::Approval {
+            tools: vec![PendingTool {
+                name: "bash".into(),
+                input: "rm -rf".into(),
+            }],
+            reply: tx,
+        });
+        assert!(notified(&app));
+    }
+
+    #[test]
+    fn approval_while_focused_does_not_notify() {
+        let mut app = unfocused_running();
+        app.focused = true;
+        let (tx, _rx) = sync_channel(1);
+        app.update(Msg::Approval {
+            tools: vec![PendingTool {
+                name: "bash".into(),
+                input: "rm -rf".into(),
+            }],
+            reply: tx,
+        });
+        assert!(!notified(&app));
+    }
+
+    #[test]
+    fn run_failed_notifies_with_the_error() {
+        let mut app = unfocused_running();
+        app.update(Msg::RunFailed("boom: provider timeout".into()));
+        let body = app.effects.iter().find_map(|e| match e {
+            Effect::Notify { body, .. } => Some(body.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            body.as_deref(),
+            Some("boom: provider timeout"),
+            "the error must reach the notify body, read out before `error` moves into EmergencyHandoff"
+        );
+    }
+
+    #[test]
+    fn drained_queue_suppresses_the_turn_end_notify() {
+        let mut app = unfocused_running();
+        // `unfocused_running()` already sets `running = true`, so this submit
+        // queues (via the real send_or_queue choke point) instead of sending.
+        typed(&mut app, "next thing");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            !notified(&app),
+            "a drained queue starts a fresh turn — no notify"
+        );
+        assert!(
+            app.running,
+            "the drained message should have restarted a turn"
+        );
+    }
+
+    #[test]
     fn research_slug_is_safe_and_bounded() {
         assert_eq!(
             research_slug("How does Plate Solving work?"),
@@ -4597,5 +5376,290 @@ mod tests {
         ));
         assert!(!app.running);
         assert!(matches!(app.history.last(), Some(Cell::Notice(n)) if n.contains("/analyze")));
+    }
+
+    // --- Task 6: visible input queue ---
+
+    #[test]
+    fn submit_while_running_queues_instead_of_sending() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "second thing");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_)))
+        );
+    }
+
+    #[test]
+    fn queued_message_drains_at_turn_idle_as_a_user_cell() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued one");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(app.queued.is_empty());
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("queued one".into()))
+        );
+    }
+
+    #[test]
+    fn turn_idle_drains_only_one_queued_message() {
+        let mut app = keyed();
+        app.running = true;
+        for t in ["a", "b"] {
+            typed(&mut app, t);
+            app.update(key(KeyCode::Enter));
+        }
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "releasing several would re-hide the rest"
+        );
+    }
+
+    #[test]
+    fn tool_calling_llm_done_does_not_drain_the_queue() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "later");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: true,
+            ttft_ms: 0,
+        });
+        assert_eq!(app.queued.len(), 1, "the turn is not over — a tool is next");
+    }
+
+    #[test]
+    fn run_failed_and_agent_exit_drop_the_queue() {
+        for msg in [Msg::RunFailed("boom".into()), Msg::AgentExited(1)] {
+            let mut app = keyed();
+            app.running = true;
+            typed(&mut app, "stranded");
+            app.update(key(KeyCode::Enter));
+            app.update(msg);
+            assert!(
+                app.queued.is_empty(),
+                "a failed turn must not strand the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_is_empty_whenever_the_turn_is_idle() {
+        let mut app = keyed();
+        assert!(app.queued.is_empty() && !app.running);
+        typed(&mut app, "immediate");
+        app.update(key(KeyCode::Enter));
+        assert!(app.queued.is_empty(), "an idle submit sends, never queues");
+        assert!(app.effects.contains(&Effect::SendInput("immediate".into())));
+    }
+
+    #[test]
+    fn up_arrow_pops_the_newest_queued_message_for_editing() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "edit me");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Up));
+        assert!(app.queued.is_empty());
+        assert_eq!(app.composer.text(), "edit me");
+    }
+
+    #[test]
+    fn up_arrow_with_an_empty_queue_still_recalls_prompt_history() {
+        // Idle-Up must keep its pre-existing meaning (recall) when there is
+        // nothing queued — only a non-empty queue changes what Up does.
+        let mut app = keyed();
+        typed(&mut app, "first prompt");
+        app.update(key(KeyCode::Enter)); // idle submit — sends immediately, never queues
+        assert!(app.queued.is_empty());
+        app.composer.seed_history(vec!["first prompt".into()]);
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.composer.text(), "first prompt");
+    }
+
+    #[test]
+    fn esc_drops_the_queue_without_interrupting_the_running_turn() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued while busy");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.effects.clear();
+        app.update(key(KeyCode::Esc));
+        assert!(app.queued.is_empty(), "Esc drops the backlog");
+        assert!(app.running, "the in-flight turn itself is untouched");
+        assert!(
+            !app.effects.contains(&Effect::Interrupt),
+            "a queue-drop is not an interrupt"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::Notice(n) if n.contains("dropped"))),
+            "the drop must be visible, not silent"
+        );
+    }
+
+    #[test]
+    fn esc_twice_drops_then_interrupts() {
+        // Review rename (2026-07-30): `interrupt()`'s own internal
+        // `drop_queued()` call is unreachable — its single caller (the Esc
+        // key handler) already routes a non-empty queue to `drop_queued()`
+        // directly and only calls `interrupt()` once the queue is empty. This
+        // test proves that two-press Esc behavior at the KEY-HANDLER level,
+        // not that `interrupt()`'s internal call fires — it never does.
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "stranded by interrupt");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.update(key(KeyCode::Esc)); // queue non-empty → drops the queue, not an interrupt
+        assert!(app.queued.is_empty());
+        assert!(app.running);
+        // A second Esc now finds an empty queue — falls through to interrupt.
+        app.update(key(KeyCode::Esc));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn run_completed_drains_one_queued_message() {
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued for completion");
+        app.update(key(KeyCode::Enter));
+        app.effects.clear();
+        app.update(Msg::RunCompleted);
+        assert!(app.queued.is_empty());
+        assert!(
+            app.effects
+                .contains(&Effect::SendInput("queued for completion".into()))
+        );
+        assert!(app.running, "the drained message starts a new turn");
+    }
+
+    #[test]
+    fn drain_re_arms_follow_so_the_new_reply_is_visible() {
+        // Review F2 (2026-07-30): dropping `follow` on a mid-turn SUBMIT is
+        // fine (the user was scrolled up reading); the cost lands at DRAIN,
+        // where a brand-new turn begins and its reply must not stream
+        // off-screen while the view stays wherever the user left it.
+        let mut app = keyed();
+        app.running = true;
+        typed(&mut app, "queued while scrolled up");
+        app.update(key(KeyCode::Enter));
+        // Scroll away from the bottom — mirrors `sending_a_message_re_pins_to_bottom`.
+        app.scroll_offset(100);
+        app.update(Msg::WheelUp);
+        assert!(!app.follow, "scrolling up unpins from the bottom");
+        app.update(Msg::RunCompleted);
+        assert!(
+            app.follow,
+            "a drained message starts a new turn — its reply must be visible"
+        );
+    }
+
+    #[test]
+    fn mid_turn_analyze_ready_queues_instead_of_bypassing() {
+        // Review F3: only `submit()` had mid-turn coverage — the other six
+        // choke-point senders could regress to a direct `effects.push(
+        // Effect::SendInput(..))` and every existing idle-only test (e.g.
+        // `analyze_ready_starts_a_run_with_the_task`) would stay green. This
+        // guards the pattern on a second, representative sender.
+        let mut app = keyed();
+        app.running = true;
+        app.update(Msg::AnalyzeReady {
+            display: "analyzing session s1".into(),
+            task: "the big prompt".into(),
+        });
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "AnalyzeReady must queue, not bypass, mid-turn"
+        );
+        assert!(
+            !app.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendInput(_))),
+            "no direct send while a turn is already running"
+        );
+    }
+
+    #[test]
+    fn plan_mode_queued_message_keeps_display_clean_when_drained() {
+        // A single queued String can't carry "clean display" and "plan-
+        // prefixed wire payload" separately — a mid-turn Plan-mode submit
+        // must NOT leak the internal directive into the transcript once
+        // drained (advisor finding: the idle path already gets this right
+        // via `plan_mode_prefixes_a_read_only_directive_but_keeps_display_clean`,
+        // but that test never exercises `was_idle == false`).
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        app.running = true;
+        typed(&mut app, "check the parser");
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.queued.len(), 1);
+        app.effects.clear();
+        app.update(Msg::LlmDone {
+            usage: TokenUsage::default(),
+            had_tool_calls: false,
+            ttft_ms: 0,
+        });
+        assert!(
+            app.history
+                .iter()
+                .any(|c| matches!(c, Cell::User(t) if t == "check the parser")),
+            "the drained display must be the user's clean text, not the internal \
+             directive: {:?}",
+            app.history
+        );
+        let sent = app
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SendInput(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a message was sent");
+        assert!(
+            sent.contains("PLAN MODE"),
+            "the wire payload keeps the directive"
+        );
+        assert!(sent.contains("check the parser"));
+    }
+
+    #[test]
+    fn up_arrow_pops_the_clean_display_even_in_plan_mode() {
+        let mut app = keyed();
+        app.permission_mode = PermissionMode::Plan;
+        app.running = true;
+        typed(&mut app, "check the parser");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Up));
+        assert_eq!(
+            app.composer.text(),
+            "check the parser",
+            "no PLAN MODE directive leaking into the composer on edit"
+        );
     }
 }

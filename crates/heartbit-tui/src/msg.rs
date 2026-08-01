@@ -27,6 +27,10 @@ pub enum Msg {
     // ---- from the terminal ----
     Key(KeyEvent),
     Paste(String),
+    /// The terminal window gained (`true`) or lost (`false`) focus. Requires
+    /// `EnableFocusChange`; terminals that do not report it never send this, so
+    /// `App::focused` stays `true` and every consumer sees today's behaviour.
+    FocusChanged(bool),
     Resize,
     /// Mouse wheel — scroll the transcript (output history), NOT the composer's
     /// command history (which stays on ↑/↓).
@@ -123,6 +127,11 @@ pub enum Msg {
     SessionLoaded(Vec<crate::cells::Cell>),
     /// Saved handoff briefs (for the `/handoff` picker).
     HandoffsListed(Vec<crate::session::HandoffMeta>),
+    /// `/diff`: the cumulative working-tree diff text (already includes
+    /// untracked files), or why it couldn't be gathered (e.g. not a git
+    /// repo) — `Ok("")` means "no changes", rendered as a notice, not a
+    /// `Cell::Diff`.
+    GitDiffReady(Result<String, String>),
 
     // ---- the synchronous approval round-trip ----
     Approval {

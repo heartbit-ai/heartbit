@@ -4,6 +4,7 @@ mod bash;
 mod edit;
 mod fetch_full_output;
 mod file_tracker;
+pub mod format;
 mod glob;
 mod grep;
 pub mod handoff;
@@ -433,6 +434,9 @@ pub struct BuiltinToolsConfig {
     /// before any I/O, complementing the existing workspace + protected_paths
     /// mechanism and the Linux-only Landlock sandbox.
     pub path_policy: Option<Arc<crate::sandbox::CorePathPolicy>>,
+    /// Optional post-edit formatters. `None` (default) = no subprocess ever
+    /// runs and every write is byte-identical to today's.
+    pub formatters: Option<Arc<format::FormatterConfig>>,
     /// Explicit, highest-precedence skill directories given to the `skill` tool
     /// (each holding `<name>/SKILL.md`). These are searched before the
     /// conventional `.opencode/.claude/skills` walk and are the SAME dirs the
@@ -500,6 +504,7 @@ impl Default for BuiltinToolsConfig {
             twitter_credentials: None,
             allowlist: None,
             path_policy: None,
+            formatters: None,
             skill_dirs: Vec::new(),
             context_recall_store: None,
         }
@@ -511,12 +516,26 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
     let ws = config.workspace.map(|w| w.canonicalize().unwrap_or(w));
     let pp = Arc::new(config.protected_paths);
     let path_policy = config.path_policy;
+    let formatters = config.formatters;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     macro_rules! maybe_policy {
         ($tool:expr) => {
             if let Some(ref pp) = path_policy {
                 $tool.with_path_policy(Arc::clone(pp))
+            } else {
+                $tool
+            }
+        };
+    }
+
+    // Post-edit formatters (write/edit/patch only — read-only builtins never
+    // write). `formatters: None` (the default) means this is a no-op and every
+    // write stays byte-identical to today's.
+    macro_rules! maybe_fmt {
+        ($tool:expr) => {
+            if let Some(ref fc) = formatters {
+                $tool.with_formatters(Arc::clone(fc))
             } else {
                 $tool
             }
@@ -546,16 +565,16 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
             ws.clone(),
             Arc::clone(&pp),
         ))) as Arc<dyn Tool>,
-        Arc::new(maybe_policy!(write::WriteTool::new(
+        Arc::new(maybe_fmt!(maybe_policy!(write::WriteTool::new(
             config.file_tracker.clone(),
             ws.clone(),
             Arc::clone(&pp),
-        ))),
-        Arc::new(maybe_policy!(edit::EditTool::new(
+        )))),
+        Arc::new(maybe_fmt!(maybe_policy!(edit::EditTool::new(
             config.file_tracker.clone(),
             ws.clone(),
             Arc::clone(&pp),
-        ))),
+        )))),
         // SECURITY (F-FS-4): apply the same `path_policy` to grep/glob/list
         // that read/write/edit/patch already use. Without this, an LLM with
         // no workspace configured can enumerate `/home` or grep `/etc` for
@@ -572,11 +591,11 @@ pub fn builtin_tools(config: BuiltinToolsConfig) -> Vec<Arc<dyn Tool>> {
             ws.clone(),
             Arc::clone(&pp)
         ))),
-        Arc::new(maybe_policy!(patch::PatchTool::new(
+        Arc::new(maybe_fmt!(maybe_policy!(patch::PatchTool::new(
             config.file_tracker.clone(),
             ws,
             Arc::clone(&pp),
-        ))),
+        )))),
         Arc::new(webfetch::WebFetchTool::new()),
         Arc::new(websearch::WebSearchTool::new()),
         Arc::new(image_generate::ImageGenerateTool::new()),

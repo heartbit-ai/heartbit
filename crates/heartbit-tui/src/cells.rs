@@ -42,6 +42,10 @@ pub enum Cell {
         label: String,
         stats: Box<crate::trace_stats::TraceStats>,
     },
+    /// `/diff` — the cumulative working-tree diff (tracked + untracked),
+    /// already parsed into `DiffLine`s so it renders through the same
+    /// `render_diff_lines` path as a tool-call preview.
+    Diff { lines: Vec<crate::diff::DiffLine> },
 }
 
 /// `982` · `4.4k` · `1.2M` — compact token counts.
@@ -87,6 +91,12 @@ fn sparkline(values: &[u64], width: usize) -> String {
 /// Max diff lines shown inline before truncation (compact "aperçu" philosophy).
 const MAX_DIFF_LINES: usize = 10;
 
+/// Max diff lines shown for the dedicated `/diff` view — larger than the
+/// per-tool-call "aperçu" cap above (this is an explicit "show me
+/// everything" request), but still bounded so a huge working-tree diff can't
+/// dump thousands of lines into the transcript.
+const MAX_GIT_DIFF_LINES: usize = 200;
+
 /// Render a tool's input as colored diff `Line`s (red `-` / green `+` / dim
 /// context), capped at `max` with a "… N more" note. Empty for non-editing
 /// tools or malformed input — the caller then shows only the compact header.
@@ -96,19 +106,14 @@ pub fn diff_preview(tool_name: &str, input: &str, max: usize) -> Vec<Line<'stati
     if diff.is_empty() {
         return Vec::new();
     }
+    render_diff_lines(&diff, max)
+}
+
+/// Shared renderer for a parsed diff (tool-call preview and `/diff` alike):
+/// capped at `max` with the "… N more diff lines" note.
+fn render_diff_lines(diff: &[crate::diff::DiffLine], max: usize) -> Vec<Line<'static>> {
     let total = diff.len();
-    let mut out: Vec<Line<'static>> = diff
-        .iter()
-        .take(max)
-        .map(|d| {
-            let (sign, style) = match d.kind {
-                crate::diff::DiffKind::Add => ("+", Style::default().fg(Color::Green)),
-                crate::diff::DiffKind::Del => ("-", Style::default().fg(Color::Red)),
-                crate::diff::DiffKind::Ctx => (" ", Style::default().fg(Color::DarkGray)),
-            };
-            Line::from(Span::styled(format!("  {sign}{}", d.text), style))
-        })
-        .collect();
+    let mut out: Vec<Line<'static>> = diff.iter().take(max).map(render_diff_line).collect();
     if total > max {
         out.push(Line::from(Span::styled(
             format!("  … ({} more diff lines)", total - max),
@@ -116,6 +121,52 @@ pub fn diff_preview(tool_name: &str, input: &str, max: usize) -> Vec<Line<'stati
         )));
     }
     out
+}
+
+/// Render a single diff line: base color by kind (red del / green add / dim
+/// ctx), with any `emph` ranges rendered bold+underlined within that color —
+/// so a one-word change reads as "this word changed", not "this whole line
+/// changed". `emph.is_empty()` renders to exactly one span: today's
+/// unemphasised look, bit-for-bit.
+fn render_diff_line(d: &crate::diff::DiffLine) -> Line<'static> {
+    let (sign, style) = match d.kind {
+        crate::diff::DiffKind::Add => ("+", Style::default().fg(Color::Green)),
+        crate::diff::DiffKind::Del => ("-", Style::default().fg(Color::Red)),
+        crate::diff::DiffKind::Ctx => (" ", Style::default().fg(Color::DarkGray)),
+    };
+    let prefix = format!("  {sign}");
+    let full = format!("{prefix}{}", d.text);
+    if d.emph.is_empty() {
+        return Line::from(Span::styled(full, style));
+    }
+    let emph_style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let offset = prefix.len();
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    for r in &d.emph {
+        // Defensive: `emph` can arrive from a deserialized session file this
+        // process didn't write (`/resume`) — never trust it enough to slice
+        // out of range, out of order, or off a char boundary.
+        let start = r.start.saturating_add(offset);
+        let end = r.end.saturating_add(offset);
+        if start < pos
+            || end <= start
+            || end > full.len()
+            || !full.is_char_boundary(start)
+            || !full.is_char_boundary(end)
+        {
+            continue;
+        }
+        if start > pos {
+            spans.push(Span::styled(full[pos..start].to_string(), style));
+        }
+        spans.push(Span::styled(full[start..end].to_string(), emph_style));
+        pos = end;
+    }
+    if pos < full.len() {
+        spans.push(Span::styled(full[pos..].to_string(), style));
+    }
+    Line::from(spans)
 }
 
 /// A stable identity color for an agent name (consistent across the transcript
@@ -287,6 +338,16 @@ impl Cell {
                 lines
             }
             Cell::Stats { label, stats } => stats_card(label, stats),
+            Cell::Diff { lines } => {
+                let mut out = vec![Line::from(Span::styled(
+                    "▎ working tree diff",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                out.extend(render_diff_lines(lines, MAX_GIT_DIFF_LINES));
+                out
+            }
         }
     }
 }
@@ -676,20 +737,48 @@ mod tests {
             duration_ms: Some(3),
             agent: None,
         };
-        let s = plain(&cell.to_lines());
+        let lines = cell.to_lines();
+        let s = plain(&lines);
         assert!(s.contains("-let x = 1;"), "removed line missing:\n{s}");
         assert!(s.contains("+let x = 2;"), "added line missing:\n{s}");
-        // the colors are set (red del / green add)
-        let spans: Vec<_> = cell.to_lines().into_iter().flat_map(|l| l.spans).collect();
+        // The colour is a property of the LINE, not of any one span: `edit`
+        // diffs now get word emphasis like every other diff surface (only
+        // the single changed token "1"/"2" is emphasised), so the removed/
+        // added line is legitimately split into multiple spans. Assert on
+        // the line's reconstructed text plus its colour, not on there being
+        // one unsplit span.
+        let line_text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let del_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("-let x = 1;"))
+            .expect("the removed line must be present");
         assert!(
-            spans
+            del_line
+                .spans
                 .iter()
-                .any(|sp| sp.content.contains("-let x = 1;") && sp.style.fg == Some(Color::Red))
+                .all(|sp| sp.style.fg == Some(Color::Red)),
+            "every span of the removed line must be red: {:?}",
+            del_line.spans
         );
+        let add_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("+let x = 2;"))
+            .expect("the added line must be present");
         assert!(
-            spans
+            add_line
+                .spans
                 .iter()
-                .any(|sp| sp.content.contains("+let x = 2;") && sp.style.fg == Some(Color::Green))
+                .all(|sp| sp.style.fg == Some(Color::Green)),
+            "every span of the added line must be green: {:?}",
+            add_line.spans
+        );
+        // And emphasis genuinely fired (not just "didn't crash"): the
+        // changed token is its own span, distinct from the rest of the line.
+        assert!(
+            del_line.spans.len() > 1,
+            "expected the changed token to split the line: {:?}",
+            del_line.spans
         );
     }
 
@@ -730,5 +819,71 @@ mod tests {
         let lines = Cell::Notice("auto-compacted".into()).to_lines();
         assert!(plain(&lines).contains("auto-compacted"));
         assert!(plain(&lines).starts_with("— "));
+    }
+
+    #[test]
+    fn diff_line_with_no_emphasis_renders_as_one_span() {
+        let line = crate::diff::DiffLine {
+            kind: crate::diff::DiffKind::Del,
+            text: "let x = 1;".into(),
+            emph: Vec::new(),
+        };
+        let rendered = render_diff_line(&line);
+        assert_eq!(rendered.spans.len(), 1, "{:?}", rendered.spans);
+        assert_eq!(rendered.spans[0].content, "  -let x = 1;");
+        // "bit-for-bit unchanged" covers style too, not just content/count.
+        assert_eq!(rendered.spans[0].style, Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn diff_line_with_emphasis_splits_into_styled_spans() {
+        let del = crate::diff::word_emphasis("let x = 1;", "let x = 2;").0;
+        let line = crate::diff::DiffLine {
+            kind: crate::diff::DiffKind::Del,
+            text: "let x = 1;".into(),
+            emph: del,
+        };
+        let rendered = render_diff_line(&line);
+        assert!(
+            rendered.spans.len() > 1,
+            "expected split spans: {:?}",
+            rendered.spans
+        );
+        let emphasized = rendered
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "1")
+            .expect("the changed token must be its own span");
+        assert!(emphasized.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn diff_line_malformed_emph_from_disk_does_not_panic() {
+        // `Cell::Diff` round-trips through `session::save`/`load` (serde) — a
+        // hand-edited or stale session file could carry an out-of-range or
+        // non-boundary `emph` range. The renderer must degrade, never panic.
+        let line = crate::diff::DiffLine {
+            kind: crate::diff::DiffKind::Add,
+            text: "hé".into(),
+            // out of range, empty, and a non-char-boundary end (mid the 2-byte 'é').
+            emph: vec![50..90, 1..1, 1..2],
+        };
+        let rendered = render_diff_line(&line); // must not panic
+        assert_eq!(rendered.spans.len(), 1);
+    }
+
+    #[test]
+    fn diff_cell_renders_a_header_and_the_lines_capped() {
+        let lines: Vec<crate::diff::DiffLine> = (0..(MAX_GIT_DIFF_LINES + 5))
+            .map(|i| crate::diff::DiffLine {
+                kind: crate::diff::DiffKind::Add,
+                text: format!("line {i}"),
+                emph: Vec::new(),
+            })
+            .collect();
+        let cell = Cell::Diff { lines };
+        let s = plain(&cell.to_lines());
+        assert!(s.contains("working tree diff"), "{s}");
+        assert!(s.contains("more diff lines"), "{s}");
     }
 }

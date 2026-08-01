@@ -25,6 +25,7 @@ pub struct PatchTool {
     workspace: Option<PathBuf>,
     protected_paths: Arc<Vec<PathBuf>>,
     path_policy: Option<Arc<CorePathPolicy>>,
+    formatters: Option<Arc<crate::tool::builtins::format::FormatterConfig>>,
 }
 
 impl PatchTool {
@@ -38,6 +39,7 @@ impl PatchTool {
             workspace,
             protected_paths,
             path_policy: None,
+            formatters: None,
         }
     }
 
@@ -46,6 +48,16 @@ impl PatchTool {
     /// `check_path` is called before any I/O.
     pub fn with_path_policy(mut self, policy: Arc<CorePathPolicy>) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Format the content with these formatters before writing.
+    #[must_use]
+    pub fn with_formatters(
+        mut self,
+        formatters: Arc<crate::tool::builtins::format::FormatterConfig>,
+    ) -> Self {
+        self.formatters = Some(formatters);
         self
     }
 }
@@ -274,6 +286,22 @@ impl Tool for PatchTool {
                     },
                     None => (path.clone(), None),
                 };
+
+                // Format in memory BEFORE the single write: keeps the
+                // post-write record_read mtime matching the final bytes and
+                // never hands the subprocess a path (F-FS-1 symlink
+                // hardening stays in force). Applied per-file, against that
+                // file's own buffer and target.
+                let new_content = match &self.formatters {
+                    Some(fc) => {
+                        match super::format::format_content(fc, &target, &new_content).await {
+                            Some(formatted) => formatted,
+                            None => new_content,
+                        }
+                    }
+                    None => new_content,
+                };
+
                 match write_root {
                     Some(root) => {
                         super::write_beneath_root(&root, &target, new_content.as_bytes())
@@ -598,6 +626,76 @@ mod tests {
             !result.is_error,
             "expected success, got: {:?}",
             result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_formats_content_before_the_single_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1,3 +1,3 @@\n line 1\n-line 2\n+line TWO\n line 3\n",
+            path.display()
+        );
+
+        let tool = PatchTool::new(tracker.clone(), None, Arc::new(Vec::new()))
+            .with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+
+        // On disk: the post-patch buffer went through the formatter.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "LINE 1\nLINE TWO\nLINE 3\n"
+        );
+        // The mtime guard matches the FINAL bytes.
+        assert!(tracker.check_unmodified(&path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn patch_survives_a_broken_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let tracker = Arc::new(FileTracker::new());
+        tracker.record_read(&path).unwrap();
+
+        let mut fc = crate::tool::builtins::format::FormatterConfig::default();
+        fc.set("rs", vec!["heartbit-no-such-formatter-binary".into()]);
+
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1,3 +1,3 @@\n line 1\n-line 2\n+line TWO\n line 3\n",
+            path.display()
+        );
+
+        let tool =
+            PatchTool::new(tracker, None, Arc::new(Vec::new())).with_formatters(Arc::new(fc));
+        let result = tool
+            .execute(
+                &crate::ExecutionContext::default(),
+                json!({"patch_text": patch}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line 1\nline TWO\nline 3\n"
         );
     }
 
