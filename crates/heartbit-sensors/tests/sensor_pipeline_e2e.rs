@@ -5050,7 +5050,6 @@ async fn kafka_full_pipeline_rss_source_to_commands() {
                         ref summary,
                         ref priority,
                         ref extracted_entities,
-                        estimated_tokens: _,
                         ..
                     }) = d
                     {
