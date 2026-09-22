@@ -1863,7 +1863,13 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // a stall when content is empty (TB2 constraints orch=1).
                     let announced = announces_intent(&last_text)
                         || (empty && announces_intent(reasoning));
+                    // Text-only agents (blog_writer max_turns=1, no tools) must
+                    // be allowed to EndTurn with empty/whitespace — act_gate
+                    // would otherwise burn the only turn (ghost CI 2026-09-22:
+                    // MaxTurnsExceeded(1) on whitespace draft).
+                    let has_tools = !self.tools.is_empty();
                     if !llm_interrupted
+                        && has_tools
                         && request_tool_calls == 0
                         && act_gate_nudges < MAX_ACT_GATE_NUDGES
                         && (announced || empty)
@@ -1902,6 +1908,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // closed (TB2 openssl/nginx: exit 0 with stall placeholder
                     // was reward 0).
                     if !llm_interrupted
+                        && has_tools
                         && request_tool_calls == 0
                         && act_gate_nudges >= MAX_ACT_GATE_NUDGES
                         && (announced || empty)
@@ -5543,6 +5550,28 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("[act gate]")),
             "reasoning-only announce must be redirected: {texts:?}"
+        );
+    }
+
+    // Ghost blog_writer (max_turns=1, no tools) returns whitespace drafts
+    // intentionally — act_gate must not burn the only turn (CI 2026-09-22).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_gate_skips_text_only_agents() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "   \n\n   \n",
+            10,
+            5,
+        )]));
+        let runner = AgentRunner::builder(provider)
+            .name("blog_writer")
+            .system_prompt("sys")
+            .max_turns(1)
+            .build()
+            .unwrap();
+        let out = runner.execute("write").await.unwrap();
+        assert!(
+            out.result.trim().is_empty(),
+            "whitespace draft must pass through unchanged"
         );
     }
 
