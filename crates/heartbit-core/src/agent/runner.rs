@@ -5393,8 +5393,7 @@ mod tests {
         // put "First, I'll read the three calendar files." in reasoning with
         // empty content + end_turn + zero tools. Text-only act_gate missed it.
         let mut reasoning_only = MockProvider::text_response("", 10, 5);
-        reasoning_only.reasoning =
-            Some("First, I'll read the three calendar files.\n".into());
+        reasoning_only.reasoning = Some("First, I'll read the three calendar files.\n".into());
         let provider = Arc::new(MockProvider::new(vec![
             reasoning_only,
             tool_use_named("work", 10),

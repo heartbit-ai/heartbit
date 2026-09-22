@@ -71,7 +71,13 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_timeout(api_key, model, base_url, auth_style, DEFAULT_REQUEST_TIMEOUT)
+        Self::new_with_timeout(
+            api_key,
+            model,
+            base_url,
+            auth_style,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
     }
 
     /// Like [`Self::new`], but with an explicit per-request HTTP timeout.
