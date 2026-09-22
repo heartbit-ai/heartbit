@@ -250,7 +250,7 @@ patterns are redacted.
 | `HEARTBIT_BIN` | `target/release/heartbit` | Prebuilt binary path on the host (`prebuilt` mode). |
 | `HEARTBIT_SRC_BUNDLE` | `dist/heartbit-src.tar.gz` | Source bundle path (`build` mode). |
 | `HEARTBIT_MAX_TURNS` | `60` | heartbit ReAct turn cap per task. |
-| `HEARTBIT_MAX_TOKENS` | `4096` bare / `8192` orchestrator | Per-completion token budget. Raise for reasoning models (Qwen) — 4096 truncates mid-thought. |
+| `HEARTBIT_MAX_TOKENS` | `4096` bare / `16384` orchestrator | Per-completion token budget. Raise for reasoning models (Qwen) — 8192 still Truncated on constraints-scheduling orch=1 (2026-09-22). |
 | `HEARTBIT_OPENAI_TIMEOUT_SECS` | `120` | Per-request HTTP timeout for OpenAI-compat hosts (raise to ~300 for cold-start Koyeb). |
 | `HEARTBIT_TOOL_TIMEOUT` | `600` | Per-shell-command timeout (seconds; heartbit caps at 600). |
 | `HEARTBIT_RUN_TIMEOUT_SEC` | `1800` | Wall-clock cap the adapter puts on the whole run. |

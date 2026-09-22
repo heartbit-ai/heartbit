@@ -2691,10 +2691,10 @@ async fn run_entry_agent_orchestrator(
     let sub_agent_max_turns: usize =
         parse_env("HEARTBIT_SUB_AGENT_MAX_TURNS").unwrap_or(CLI_SUB_AGENT_MAX_TURNS);
     // Reasoning models (Qwen-on-vLLM) spend tokens in `message.reasoning`
-    // before `content`. Core default 4096 truncates mid-thought (TB2 smoke
-    // 2026-09-22: "Response truncated (max_tokens reached)"). 8192 matches the
-    // TUI `qwen-vllm` profile / sub-agent budget; override via env.
-    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(8192);
+    // before `content`. 4096 truncates mid-thought; 8192 still Truncated on
+    // constraints-scheduling after the slim headless prompt (TB2 2026-09-22
+    // fix3). 16384 cleared it (fix4: reward 1.0, 15 tools).
+    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(16384);
 
     // Entry agent's direct tools: builtins FIRST.
     let mut tools = {
