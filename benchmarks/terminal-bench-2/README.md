@@ -216,6 +216,32 @@ benchmarks/terminal-bench-2/scripts/run-tb2-qwen.sh
 Containers need outbound HTTPS to the host (public Koyeb URLs work; a
 localhost proxy still needs the docker0 gateway bind — see Codex section).
 
+### Post-run Langfuse (harness tuning)
+
+Keep the slim musl binary free of OTLP. After a job finishes, ingest
+`--trace-file` + Harbor reward into a **self-hosted** Langfuse:
+
+```bash
+# once
+cd benchmarks/terminal-bench-2/langfuse && docker compose up -d
+# open http://localhost:3000 → create project → copy keys
+
+export LANGFUSE_HOST=http://localhost:3000
+export LANGFUSE_PUBLIC_KEY=pk-lf-…
+export LANGFUSE_SECRET_KEY=sk-lf-…
+
+# dry-run (no network):
+./scripts/ingest-langfuse.sh --dry-run jobs/tb2-qwen-orch-max8192
+
+# ingest:
+./scripts/ingest-langfuse.sh jobs/tb2-qwen-orch-max8192
+```
+
+If `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` are set when you run
+`run-tb2-qwen.sh`, ingest runs automatically after a successful Harbor job.
+Tool I/O is truncated (`LANGFUSE_IO_CHARS`, default 4000) and secret-ish
+patterns are redacted.
+
 ### Tunable env vars
 
 | Var | Default | Meaning |

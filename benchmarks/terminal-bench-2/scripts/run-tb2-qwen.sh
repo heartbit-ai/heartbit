@@ -79,7 +79,7 @@ fi
 echo "bin=$HEARTBIT_BIN"
 echo "model=$MODEL orchestrator=$HEARTBIT_ORCHESTRATOR max_tokens=$HEARTBIT_MAX_TOKENS timeout=${HEARTBIT_OPENAI_TIMEOUT_SECS}s base=$HEARTBIT_BASE_URL"
 
-exec harbor run \
+harbor run \
   -d terminal-bench/terminal-bench-2 \
   --agent-import-path heartbit_tb2.agent:HeartbitAgent \
   -m "$MODEL" \
@@ -90,3 +90,15 @@ exec harbor run \
   -o "$TB2/jobs" \
   "${INCLUDE[@]}" \
   "$@"
+status=$?
+
+# Opt-in post-run Langfuse ingest (host-side — never inside the musl jail).
+# Set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY (and optionally LANGFUSE_HOST).
+if [[ $status -eq 0 && -n "${LANGFUSE_PUBLIC_KEY:-}" && -n "${LANGFUSE_SECRET_KEY:-}" ]]; then
+  JOB_DIR="$TB2/jobs/$JOB_NAME"
+  if [[ -d "$JOB_DIR" ]]; then
+    echo "ingest → Langfuse ($JOB_DIR) …"
+    "$TB2/scripts/ingest-langfuse.sh" "$JOB_DIR" || echo "warn: Langfuse ingest failed (harness run still OK)" >&2
+  fi
+fi
+exit "$status"

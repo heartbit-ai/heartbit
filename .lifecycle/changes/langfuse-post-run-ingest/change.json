@@ -1,0 +1,79 @@
+{
+  "id": "langfuse-post-run-ingest",
+  "state": "draft",
+  "objective": "Ingest post-run Heartbit traces (TB2 --trace-file + reward Harbor) into a self-hosted Langfuse for harness tuning, without embedding telemetry in the slim musl binary.",
+  "non_goals": [
+    "Ne pas ajouter la feature telemetry au binaire musl slim",
+    "Ne pas exiger le SDK langfuse Python (stdlib only)",
+    "Pas de datasets / scores auto avancés (lot suivant)",
+    "Pas d’OTLP live depuis le jail Harbor"
+  ],
+  "project": {
+    "field": "brownfield",
+    "baseline_revision": "2927be3",
+    "invariants": [
+      "Le chemin TB2 existant (run-tb2-qwen.sh, heartbit_io) reste inchangé sans LANGFUSE_*",
+      "Aucun secret n’est commité ; les clés viennent de l’env",
+      "Les tests heartbit_io existants restent verts"
+    ],
+    "rollback": "Retirer scripts/langfuse_* et le compose ; le harness TB2 continue sans eux."
+  },
+  "grill": {
+    "mode": "autonomous",
+    "notes": [
+      "Assumption: ingest host-side après le trial, pas depuis le container agent.",
+      "Assumption: Langfuse self-host via docker compose officiel allégé.",
+      "Pre-mortem: payloads trop gros (82 tools × stdout) → troncature + dry-run.",
+      "Pre-mortem: pas de generations LLM granulaires dans --trace-file → 1 generation agrégée + spans tools."
+    ]
+  },
+  "risk": {
+    "tier": "structured",
+    "signals": ["cross-component"],
+    "rationale": "Nouveau chemin d’observabilité hors binaire ; ne touche pas le runtime agent."
+  },
+  "acceptance": [
+    {
+      "id": "continuity-io-tests",
+      "criterion": "Les tests heartbit_io restent verts.",
+      "verification": "python3 -c run tests/test_heartbit_io.py",
+      "continuity": true
+    },
+    {
+      "id": "dry-run-batch",
+      "criterion": "Dry-run sur le job tb2-qwen-orch-max8192 produit un batch ingestion valide (trace + spans + score reward).",
+      "verification": "scripts/ingest-langfuse.sh --dry-run <job>"
+    },
+    {
+      "id": "opt-in-only",
+      "criterion": "Sans LANGFUSE_PUBLIC_KEY/SECRET_KEY, run-tb2-qwen.sh ne tente aucun ingest.",
+      "verification": "lecture script + test unitaire"
+    }
+  ],
+  "execution": {
+    "mode": "sequential",
+    "rationale": "Un seul lot : parse → script → compose → tests."
+  },
+  "tasks": [
+    {
+      "id": "parse-build",
+      "outcome": "heartbit_tb2/langfuse_ingest.py construit un batch Langfuse depuis trial dirs."
+    },
+    {
+      "id": "cli-script",
+      "outcome": "scripts/ingest-langfuse.sh (dry-run + POST) + hook optionnel run-tb2-qwen."
+    },
+    {
+      "id": "compose",
+      "outcome": "docker-compose Langfuse self-host + README section."
+    },
+    {
+      "id": "tests",
+      "outcome": "tests/test_langfuse_ingest.py verts."
+    }
+  ],
+  "approvals": {
+    "contract": true,
+    "critical_actions": true
+  }
+}
