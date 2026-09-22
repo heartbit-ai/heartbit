@@ -20,6 +20,9 @@ _PROVIDER_KEY_ENV = {
     "openrouter": "OPENROUTER_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "google": "GEMINI_API_KEY",
+    # Custom OpenAI-compat hosts (Koyeb vLLM, etc.): same Bearer style as openai,
+    # but the real URL comes from HEARTBIT_BASE_URL. Accept either key name.
+    "qwen": "OPENAI_API_KEY",
 }
 
 
@@ -44,6 +47,25 @@ def provider_api_key_env(provider: str | None) -> str | None:
     return _PROVIDER_KEY_ENV.get(provider.lower())
 
 
+def _resolve_api_key(provider: str | None, base_env: dict[str, str]) -> str | None:
+    """Pick the API key for this run.
+
+    Priority for OpenAI-compat / custom hosts (``openai``, ``qwen``, or any
+    unknown provider with ``HEARTBIT_BASE_URL`` set):
+      1. ``HEARTBIT_API_KEY`` (explicit harness override)
+      2. ``HEARTBIT_OPENAI_API_KEY`` (same name the TUI uses)
+      3. Provider-mapped env (``OPENAI_API_KEY``, …)
+    """
+    if "HEARTBIT_API_KEY" in base_env and base_env["HEARTBIT_API_KEY"].strip():
+        return base_env["HEARTBIT_API_KEY"]
+    if "HEARTBIT_OPENAI_API_KEY" in base_env and base_env["HEARTBIT_OPENAI_API_KEY"].strip():
+        return base_env["HEARTBIT_OPENAI_API_KEY"]
+    key_env = provider_api_key_env(provider)
+    if key_env and key_env in base_env and base_env[key_env].strip():
+        return base_env[key_env]
+    return None
+
+
 def build_heartbit_env(
     model_name: str | None,
     base_env: dict[str, str],
@@ -65,27 +87,43 @@ def build_heartbit_env(
     # dict over the container env). heartbit resolves its workspace from
     # HEARTBIT_WORKSPACE and runs bash with its own PATH allowlist.
 
+    has_base_url = bool(base_env.get("HEARTBIT_BASE_URL", "").strip())
+
     if provider:
-        env["HEARTBIT_PROVIDER"] = provider
-        key_env = provider_api_key_env(provider)
-        if key_env and key_env in base_env:
-            env[key_env] = base_env[key_env]
-            # Generic per-run override heartbit also accepts.
-            env["HEARTBIT_API_KEY"] = base_env[key_env]
+        # ``qwen/...`` is an OpenAI-compat alias: heartbit's registry knows
+        # ``openai`` and accepts HEARTBIT_BASE_URL as the override. Pin the
+        # wire provider to openai so AuthStyle::Bearer + HTTPS works.
+        wire_provider = "openai" if provider.lower() == "qwen" else provider
+        env["HEARTBIT_PROVIDER"] = wire_provider
+        key = _resolve_api_key(provider, base_env)
+        if key:
+            # Keep the conventional env name when we know it, plus the generic
+            # override heartbit's env path always reads.
+            key_env = provider_api_key_env(provider)
+            if key_env:
+                env[key_env] = key
+            env["HEARTBIT_API_KEY"] = key
+        elif not has_base_url:
+            # No key and no custom base → nothing to do (heartbit will fail
+            # loudly at provider build time). With a base_url and no key we
+            # intentionally leave AuthStyle::None (Codex localhost proxy).
+            pass
     else:
         # No provider prefix: forward whatever key is present so auto-detect works.
         for key_env in set(_PROVIDER_KEY_ENV.values()):
             if key_env in base_env:
                 env[key_env] = base_env[key_env]
+        key = _resolve_api_key(None, base_env)
+        if key:
+            env["HEARTBIT_API_KEY"] = key
     if model:
         env["HEARTBIT_MODEL"] = model
 
-    # Optional OpenAI-compatible proxy base url (e.g. for a gateway or the
-    # ChatGPT-subscription Codex proxy). Pair with `-m codex/gpt-5.5`: provider
-    # "codex" is unknown to heartbit, so with a base_url and NO key it uses
-    # AuthStyle::None — which is what permits a non-HTTPS localhost/gateway URL.
-    if "HEARTBIT_BASE_URL" in base_env:
-        env["HEARTBIT_BASE_URL"] = base_env["HEARTBIT_BASE_URL"]
+    # Optional OpenAI-compatible proxy / custom host base url (Codex gateway,
+    # Koyeb vLLM, …). Pair with `-m openai/…` or `-m qwen/…` + a key for HTTPS,
+    # or `-m codex/…` with NO key for a plain-http localhost proxy.
+    if has_base_url:
+        env["HEARTBIT_BASE_URL"] = base_env["HEARTBIT_BASE_URL"].strip()
 
     # Tuning vars forwarded verbatim when set on the host (Harbor merges this dict
     # over the container env). HEARTBIT_ORCHESTRATOR=1 selects the entry-agent
@@ -96,8 +134,11 @@ def build_heartbit_env(
         "HEARTBIT_ORCHESTRATOR",
         "HEARTBIT_SUB_AGENT_MAX_TURNS",
         "HEARTBIT_API_KEY",
+        "HEARTBIT_PROMPT_CACHING",
+        "HEARTBIT_MAX_TOKENS",
+        "HEARTBIT_OPENAI_TIMEOUT_SECS",
     ):
-        if passthrough in base_env:
+        if passthrough in base_env and passthrough not in env:
             env[passthrough] = base_env[passthrough]
 
     env["HEARTBIT_WORKSPACE"] = workspace

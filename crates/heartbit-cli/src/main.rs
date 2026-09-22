@@ -631,9 +631,11 @@ fn build_base_provider(
             heartbit::AuthStyle::None
         };
 
-        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
-            key, model, url, auth_style,
-        )));
+        let mut provider = heartbit::OpenAiCompatProvider::new(key, model, url, auth_style);
+        if let Some(secs) = openai_compat_timeout_secs() {
+            provider = provider.with_request_timeout(std::time::Duration::from_secs(secs));
+        }
+        return Ok(BoxedProvider::new(provider));
     }
 
     // Unknown provider: if base_url is provided, try OpenAI-compatible
@@ -644,9 +646,11 @@ fn build_base_provider(
         } else {
             heartbit::AuthStyle::Bearer
         };
-        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
-            key, model, url, auth_style,
-        )));
+        let mut provider = heartbit::OpenAiCompatProvider::new(key, model, url, auth_style);
+        if let Some(secs) = openai_compat_timeout_secs() {
+            provider = provider.with_request_timeout(std::time::Duration::from_secs(secs));
+        }
+        return Ok(BoxedProvider::new(provider));
     }
 
     bail!(
@@ -654,6 +658,12 @@ fn build_base_provider(
          Or provide a base_url for custom OpenAI-compatible endpoints.",
         heartbit::known_llm_providers().join(", ")
     );
+}
+
+/// Per-request HTTP timeout for OpenAI-compat hosts (Koyeb cold start, etc.).
+/// Reads `HEARTBIT_OPENAI_TIMEOUT_SECS` — same name the TUI uses.
+fn openai_compat_timeout_secs() -> Option<u64> {
+    parse_env("HEARTBIT_OPENAI_TIMEOUT_SECS").filter(|&n| n > 0)
 }
 
 /// Build a `HeuristicGate` from cascade gate configuration.
@@ -2458,6 +2468,7 @@ async fn run_default_agent(
     }
 
     let max_turns: usize = parse_env("HEARTBIT_MAX_TURNS").unwrap_or(50);
+    let max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(4096);
     let summarize_threshold: u32 = parse_env("HEARTBIT_SUMMARIZE_THRESHOLD").unwrap_or(80_000);
     let max_tool_output_bytes: usize =
         parse_env("HEARTBIT_MAX_TOOL_OUTPUT_BYTES").unwrap_or(32_768);
@@ -2484,6 +2495,7 @@ async fn run_default_agent(
         .system_prompt(&env_system_prompt)
         .tools(tools)
         .max_turns(max_turns)
+        .max_tokens(max_tokens)
         .summarize_threshold(summarize_threshold)
         .max_tool_output_bytes(max_tool_output_bytes)
         .tool_timeout(std::time::Duration::from_secs(tool_timeout_secs))
@@ -2678,6 +2690,11 @@ async fn run_entry_agent_orchestrator(
     let entry_max_turns: usize = parse_env("HEARTBIT_MAX_TURNS").unwrap_or(300);
     let sub_agent_max_turns: usize =
         parse_env("HEARTBIT_SUB_AGENT_MAX_TURNS").unwrap_or(CLI_SUB_AGENT_MAX_TURNS);
+    // Reasoning models (Qwen-on-vLLM) spend tokens in `message.reasoning`
+    // before `content`. Core default 4096 truncates mid-thought (TB2 smoke
+    // 2026-09-22: "Response truncated (max_tokens reached)"). 8192 matches the
+    // TUI `qwen-vllm` profile / sub-agent budget; override via env.
+    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(8192);
 
     // Entry agent's direct tools: builtins FIRST.
     let mut tools = {
@@ -2735,6 +2752,7 @@ async fn run_entry_agent_orchestrator(
         .guardrail(scope_guard)
         .entry_workflow_recipes(recipe_meta)
         .max_turns(entry_max_turns)
+        .max_tokens(entry_max_tokens)
         .workspace(cwd.clone())
         .instruction_text(instructions)
         .on_text(on_text)

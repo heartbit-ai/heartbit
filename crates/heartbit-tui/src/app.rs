@@ -541,6 +541,10 @@ pub struct App {
     /// OpenRouter prompt-caching breakpoints (escape hatch in tui.toml; ON by
     /// default — non-supporting routes strip the markers harmlessly).
     pub prompt_caching: bool,
+    /// Entry-agent max_tokens (from profile / tui.toml). `None` → core default.
+    pub max_tokens: Option<u32>,
+    /// HTTP timeout for custom OpenAI-compat endpoints (seconds).
+    pub http_timeout_secs: Option<u64>,
     /// The available sub-agent pool (multi-agent mode), seeded into the roster as
     /// Idle at the start of each turn so the user always sees the whole squad —
     /// and can tell when only some of it actually gets dispatched.
@@ -643,6 +647,8 @@ impl App {
             context_recall: true,
             verify_command: None,
             prompt_caching: true,
+            max_tokens: None,
+            http_timeout_secs: None,
             squad: Vec::new(),
             agents: Vec::new(),
             todos: Vec::new(),

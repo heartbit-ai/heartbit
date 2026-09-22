@@ -193,6 +193,29 @@ key ⇒ `AuthStyle::None`, which is what permits the non-HTTPS gateway URL.
 > smoke / small subset; for a citable number use a real API key and report
 > "TUI-brain, model, N tasks, proxy-induced failures noted".
 
+### Running on a custom OpenAI-compat host (Qwen / vLLM / Koyeb)
+
+Point the adapter at any HTTPS OpenAI-compatible endpoint (same path the TUI
+uses). Prefer `-m qwen/<model>` so the adapter wires `HEARTBIT_PROVIDER=openai`
++ Bearer auth; the URL comes from `HEARTBIT_BASE_URL`:
+
+```bash
+# or: source the harness .env that already has HEARTBIT_OPENAI_*
+export HEARTBIT_BASE_URL="https://YOUR-HOST/v1"
+export HEARTBIT_API_KEY="…"                 # or HEARTBIT_OPENAI_API_KEY
+export HEARTBIT_ORCHESTRATOR=1              # TUI-brain entry agent
+export HEARTBIT_INSTALL_MODE=prebuilt
+export HEARTBIT_BIN=target/x86_64-unknown-linux-musl/release/heartbit
+export HEARTBIT_BIN_STATIC=1
+
+# helper (warms the endpoint, smoke-filters easy tasks):
+benchmarks/terminal-bench-2/scripts/run-tb2-qwen.sh
+# full suite: …/run-tb2-qwen.sh --full
+```
+
+Containers need outbound HTTPS to the host (public Koyeb URLs work; a
+localhost proxy still needs the docker0 gateway bind — see Codex section).
+
 ### Tunable env vars
 
 | Var | Default | Meaning |
@@ -201,6 +224,8 @@ key ⇒ `AuthStyle::None`, which is what permits the non-HTTPS gateway URL.
 | `HEARTBIT_BIN` | `target/release/heartbit` | Prebuilt binary path on the host (`prebuilt` mode). |
 | `HEARTBIT_SRC_BUNDLE` | `dist/heartbit-src.tar.gz` | Source bundle path (`build` mode). |
 | `HEARTBIT_MAX_TURNS` | `60` | heartbit ReAct turn cap per task. |
+| `HEARTBIT_MAX_TOKENS` | `4096` bare / `8192` orchestrator | Per-completion token budget. Raise for reasoning models (Qwen) — 4096 truncates mid-thought. |
+| `HEARTBIT_OPENAI_TIMEOUT_SECS` | `120` | Per-request HTTP timeout for OpenAI-compat hosts (raise to ~300 for cold-start Koyeb). |
 | `HEARTBIT_TOOL_TIMEOUT` | `600` | Per-shell-command timeout (seconds; heartbit caps at 600). |
 | `HEARTBIT_RUN_TIMEOUT_SEC` | `1800` | Wall-clock cap the adapter puts on the whole run. |
 | `HEARTBIT_TB_WORKDIR` | `$(pwd)` in container | Task working dir (workspace root). |

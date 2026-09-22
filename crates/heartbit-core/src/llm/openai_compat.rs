@@ -15,11 +15,18 @@ use crate::llm::types::{CompletionRequest, CompletionResponse};
 /// like `api-key` (Azure-style) which reqwest does NOT strip on cross-host
 /// redirect. When `false` (used only for `AuthStyle::None`, i.e. local
 /// providers like Ollama/vLLM), HTTP is allowed.
-fn build_secure_client(enforce_https: bool) -> Result<Client, Error> {
+/// Default per-request timeout for OpenAI-compat calls. Long enough for most
+/// hosted APIs; too short for a cold-start vLLM on a free-tier host (live
+/// finding 2026-09-22: Koyeb can spend ~100s before the first byte). Callers
+/// targeting those endpoints should raise it via
+/// [`OpenAiCompatProvider::with_request_timeout`].
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn build_secure_client(enforce_https: bool, request_timeout: Duration) -> Result<Client, Error> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120));
+        .timeout(request_timeout);
     if enforce_https {
         builder = builder.https_only(true);
     }
@@ -64,15 +71,37 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
         auth_style: AuthStyle,
     ) -> Self {
+        Self::new_with_timeout(api_key, model, base_url, auth_style, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::new`], but with an explicit per-request HTTP timeout.
+    /// Use a longer timeout for cold-start hosts (e.g. 300s for a sleeping
+    /// Koyeb vLLM); keep the default for warm public APIs.
+    pub fn new_with_timeout(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        auth_style: AuthStyle,
+        request_timeout: Duration,
+    ) -> Self {
         let enforce_https = !matches!(auth_style, AuthStyle::None);
         Self {
-            client: build_secure_client(enforce_https)
+            client: build_secure_client(enforce_https, request_timeout)
                 .expect("failed to build hardened HTTPS client for OpenAiCompatProvider"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
             auth_style,
         }
+    }
+
+    /// Rebuild the inner HTTP client with a different per-request timeout.
+    /// Fluently chain after [`Self::new`]: `OpenAiCompatProvider::new(...).with_request_timeout(Duration::from_secs(300))`.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        let enforce_https = !matches!(self.auth_style, AuthStyle::None);
+        self.client = build_secure_client(enforce_https, request_timeout)
+            .expect("failed to rebuild hardened HTTPS client for OpenAiCompatProvider");
+        self
     }
 
     /// Convenience constructor for OpenRouter.
@@ -255,5 +284,14 @@ mod tests {
     fn is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<OpenAiCompatProvider>();
+    }
+
+    #[test]
+    fn with_request_timeout_rebuilds_without_changing_identity() {
+        let p = OpenAiCompatProvider::new("k", "m", "https://example.com/v1", AuthStyle::Bearer)
+            .with_request_timeout(Duration::from_secs(300));
+        assert_eq!(p.model, "m");
+        assert_eq!(p.base_url, "https://example.com/v1");
+        assert!(matches!(p.auth_style, AuthStyle::Bearer));
     }
 }

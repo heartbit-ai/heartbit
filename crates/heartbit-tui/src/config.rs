@@ -67,12 +67,24 @@ impl McpServerSpec {
 /// Persisted TUI settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
+    /// Named model profile (`qwen-vllm`, `openrouter-default`, `codex-proxy`).
+    /// Applied at load time: fills unset fields only (see `profile::apply_to_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// The OpenRouter API token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openrouter_api_key: Option<String>,
     /// The model id (e.g. `qwen/qwen3-235b-a22b-2507`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-completion token budget for the entry agent (and a hint for
+    /// sub-agents). Reasoning models need headroom above the visible answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Per-request HTTP timeout (seconds) for custom OpenAI-compat endpoints.
+    /// Overrides the core default of 120s — needed for cold-start hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_timeout_secs: Option<u64>,
     /// Reasoning-effort level (`off` | `low` | `medium` | `high`), set via
     /// `/effort`. Deliberately a plain `Option<String>`, not a typed enum:
     /// `TuiConfig::load_from` swallows any parse error and returns `Default`,
@@ -164,8 +176,11 @@ fn is_true(b: &bool) -> bool {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
+            profile: None,
             openrouter_api_key: None,
             model: None,
+            max_tokens: None,
+            http_timeout_secs: None,
             reasoning_effort: None,
             mcp_servers: Vec::new(),
             multi_agent: false,
@@ -187,12 +202,15 @@ impl Default for TuiConfig {
 
 impl TuiConfig {
     /// Load from `path`, returning defaults if the file is missing or malformed
-    /// (a corrupt config must never prevent the TUI from starting).
+    /// (a corrupt config must never prevent the TUI from starting). Applies a
+    /// named `profile` afterwards so unset fields pick up model-family knobs.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut cfg = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let _ = crate::profile::apply_to_config(&mut cfg);
+        cfg
     }
 
     /// Atomically persist to `path` with 0600 permissions, creating parent dirs.

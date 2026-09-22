@@ -28,6 +28,7 @@ mod markdown;
 mod models;
 mod msg;
 mod notify;
+mod profile;
 mod session;
 mod splash;
 mod trace;
@@ -246,6 +247,8 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
     app.prompt_caching = cfg.prompt_caching;
+    app.max_tokens = cfg.max_tokens;
+    app.http_timeout_secs = cfg.http_timeout_secs;
     app.notify = cfg.notify;
     app.splash = cfg.splash.then_some(0);
     app.md = markdown::MarkdownCache::new(cfg.syntax_theme.as_deref());
@@ -287,6 +290,19 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
             "custom OpenAI-compatible endpoint: {url} — set the model with /model \
              (e.g. gpt-5.5 for a ChatGPT-subscription Codex proxy; check its \
              /v1/models). This takes priority over OpenRouter."
+        )));
+    }
+    if let Some(id) = cfg.profile.as_deref() {
+        let summary = profile::builtin(id)
+            .map(|p| p.summary)
+            .unwrap_or("unknown profile (no builtin match — knobs unchanged)");
+        app.history.push(Cell::Notice(format!(
+            "profile `{id}` — {summary} · max_tokens={} · http_timeout={}s · caching={}",
+            app.max_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".into()),
+            app.http_timeout_secs.unwrap_or(120),
+            if app.prompt_caching { "on" } else { "off" },
         )));
     }
     // No provider configured at all → open the key prompt immediately.
@@ -452,6 +468,7 @@ fn build_provider(
     model: &str,
     on_retry: Arc<heartbit_core::OnRetry>,
     prompt_caching: bool,
+    http_timeout_secs: Option<u64>,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
     // Custom OpenAI-compatible endpoint (`/codex`, or `HEARTBIT_OPENAI_BASE_URL` at
     // startup). Takes PRIORITY over OpenRouter so the same config can target: a
@@ -475,7 +492,18 @@ fn build_provider(
         } else {
             AuthStyle::None
         };
-        let base = OpenAiCompatProvider::new(key, model, base_url, auth);
+        // Timeout: profile / tui.toml → HEARTBIT_OPENAI_TIMEOUT_SECS → 120s default.
+        // Cold-start Koyeb vLLM needs ~300s (live probe 2026-09-22).
+        let timeout_secs = http_timeout_secs
+            .or_else(|| {
+                std::env::var("HEARTBIT_OPENAI_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(120)
+            .max(1);
+        let base = OpenAiCompatProvider::new(key, model, base_url, auth)
+            .with_request_timeout(Duration::from_secs(timeout_secs));
         return Ok(Arc::new(BoxedProvider::new(
             RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
@@ -689,6 +717,8 @@ async fn build_engine(
     request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     workflow_journal_dir: PathBuf,
     effort: app::EffortLevel,
+    max_tokens: Option<u32>,
+    http_timeout_secs: Option<u64>,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -736,6 +766,7 @@ async fn build_engine(
         model,
         on_retry.clone(),
         prompt_caching,
+        http_timeout_secs,
     )?;
     // Computed ONCE and given to both the entry agent and every sub-agent
     // below — see `effort_for_provider`'s doc comment for why the Anthropic
@@ -839,6 +870,9 @@ async fn build_engine(
                 &resolved,
                 on_retry.clone(),
                 true,
+                // Sub-role models share the session timeout (cold-start hosts
+                // need the same budget as the main provider).
+                http_timeout_secs,
             )
             .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
         })
@@ -1189,6 +1223,12 @@ async fn build_engine(
         // here). Identical batches abort fast; near-duplicates get more rope.
         .max_identical_tool_calls(3)
         .max_fuzzy_identical_tool_calls(5);
+    // Profile / tui.toml max_tokens (e.g. qwen-vllm → 8192). Reasoning models
+    // spend budget in `message.reasoning` before `content`; the core default
+    // of 4096 truncates mid-thought (TB2 smoke 2026-09-22).
+    if let Some(n) = max_tokens {
+        builder = builder.max_tokens(n);
+    }
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
@@ -1427,6 +1467,8 @@ fn spawn_agent(
     let request_mode_pin = request_mode_pin.clone();
     let workflow_journal_dir = app.workflow_journal_dir.clone();
     let effort = app.effort;
+    let max_tokens = app.max_tokens;
+    let http_timeout_secs = app.http_timeout_secs;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -1471,6 +1513,8 @@ fn spawn_agent(
                 request_mode_pin,
                 workflow_journal_dir,
                 effort,
+                max_tokens,
+                http_timeout_secs,
             )
             .await
             {
