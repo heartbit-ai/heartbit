@@ -125,6 +125,9 @@ fn is_prose_question_battery(text: &str) -> bool {
 /// True when `text` announces imminent first-person action — the
 /// narrate-then-stop failure mode ("Je vais créer… Laisse-moi d'abord
 /// vérifier…" then end_turn with zero tool calls; live session 6a2552a9).
+/// Also matches Qwen reasoning-only stalls ("First, I'll read…") when the
+/// caller passes `response.reasoning` (TB2 constraints-scheduling orch=1,
+/// 2026-09-22: empty content, intent only in reasoning, act_gate missed).
 /// Deliberately small fr/en marker list; combined with the zero-work
 /// condition by the caller, so a closing "let me know" after real work
 /// never triggers.
@@ -256,6 +259,25 @@ const ESCALATION_AFTER_FAILURES: u32 = 3;
 /// threshold; this many further repeats (the model ignoring it) trips the
 /// hard stop (live finding 6a25d21b: the soft warning was ignored 3→4→5).
 const DOOM_HARD_STOP_MARGIN: u32 = 2;
+
+/// True when a tool call's JSON input carries no non-empty string payload —
+/// the Qwen empty-arg failure mode (TB2 smoke batch2: bash `{}`, and also
+/// `{"timeout": 60000}` with no `command`, which previously escaped the
+/// empty-object check and still doom-aborted openssl/filter-js).
+fn tool_call_args_empty(tc: &crate::llm::types::ToolCall) -> bool {
+    input_lacks_string_payload(&tc.input)
+}
+
+fn input_lacks_string_payload(input: &serde_json::Value) -> bool {
+    match input {
+        serde_json::Value::Object(map) => !map
+            .values()
+            .any(|v| matches!(v, serde_json::Value::String(s) if !s.trim().is_empty())),
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
+}
 
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
@@ -408,6 +430,10 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) run_timeout: Option<Duration>,
     /// Optional reasoning/thinking effort level for models that support it.
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
+    /// When true, resolve enable_thinking / effort / max_tokens per user
+    /// request via [`crate::llm::thinking_budget`] (overrides a fixed
+    /// `reasoning_effort` for that request).
+    pub(super) adaptive_reasoning: bool,
     /// When true, inject a reflection prompt after tool results to encourage
     /// the agent to assess results before the next action (Reflexion/CRITIC pattern).
     pub(super) enable_reflection: bool,
@@ -565,6 +591,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             interrupt: None,
             run_timeout: None,
             reasoning_effort: None,
+            adaptive_reasoning: false,
             enable_reflection: false,
             tool_output_compression_threshold: None,
             tool_result_ingest_cap: Some(DEFAULT_TOOL_RESULT_INGEST_CAP),
@@ -691,6 +718,48 @@ impl<P: LlmProvider> AgentRunner<P> {
         self.provider
             .model_name()
             .and_then(|model| crate::llm::pricing::estimate_cost(model, usage))
+    }
+
+    /// Re-resolve thinking budget for a fresh user request and apply it to `ctx`.
+    fn apply_adaptive_budget(
+        &self,
+        ctx: &mut AgentContext,
+        prompt: &str,
+        request_mode: super::router::RequestMode,
+    ) {
+        if !self.adaptive_reasoning {
+            return;
+        }
+        let budget = crate::llm::thinking_budget::resolve_thinking_budget(
+            &crate::llm::thinking_budget::ThinkingBudgetInput::new(prompt)
+                .with_mode(Some(request_mode.label()))
+                .with_tool_count(self.tools.len())
+                .with_ceiling(self.max_tokens),
+        );
+        ctx.set_reasoning_effort(Some(budget.effort));
+        ctx.set_max_tokens(budget.max_tokens);
+        debug!(
+            agent = %self.name,
+            tier = budget.tier.label(),
+            enable_thinking = budget.enable_thinking,
+            max_tokens = budget.max_tokens,
+            reason = %budget.reason,
+            "adaptive thinking budget resolved"
+        );
+        let effort = match budget.effort {
+            crate::llm::types::ReasoningEffort::High => "high",
+            crate::llm::types::ReasoningEffort::Medium => "medium",
+            crate::llm::types::ReasoningEffort::Low => "low",
+            crate::llm::types::ReasoningEffort::None => "none",
+        };
+        self.emit(AgentEvent::ThinkingBudgetResolved {
+            agent: self.name.clone(),
+            tier: budget.tier.label().to_string(),
+            enable_thinking: budget.enable_thinking,
+            effort: effort.to_string(),
+            max_tokens: budget.max_tokens,
+            reason: budget.reason,
+        });
     }
 
     /// Run the agent on `task` and return the final output.
@@ -862,6 +931,14 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
+            // Empty-arg doom soft-resets forever at the hard-stop path (TB2
+            // openssl/filter-js still aborted after a one-shot rescue).
+            // max_turns bounds the loop.
+            // Bounded rescue when a turn burns max_tokens on reasoning/prose
+            // with zero tool calls (TB2 filter-js: Truncated at 16384; one
+            // rescue was not enough on rerun2). Same budget as act_gate.
+            let mut truncated_rescues: u32 = 0;
+            const MAX_TRUNCATED_RESCUES: u32 = 3;
             let mut last_model_name: Option<String> = None;
             // Reactive overflow-recovery ladder (prevents both infinite
             // compaction loops AND the single-shot dead-end): 0 = untried,
@@ -879,9 +956,16 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut nudge_sent = false;
             // Ask-gate: one prose-battery→question-tool redirect per request.
             let mut prose_question_nudged = false;
-            // Act-gate: tools executed this request + one-shot redirect flag.
+            // Act-gate: tools executed this request + bounded stall redirects.
+            // Qwen-on-vLLM under the entry-agent prompt (TB2 constraints
+            // orch=1, 2026-09-22) can burn a text announce then empty EndTurn
+            // with zero tools — budget three redirects. Do NOT force
+            // tool_choice=Any against this OpenAI-compat endpoint: live TB2
+            // 2026-09-22 returned HTTP 502 "empty choices in all streaming
+            // chunks" on the forced turn.
             let mut request_tool_calls: u32 = 0;
-            let mut intent_nudged = false;
+            let mut act_gate_nudges: u32 = 0;
+            const MAX_ACT_GATE_NUDGES: u32 = 3;
             // Plan-gate state: wish phrasing of the CURRENT request, whether a
             // plan artifact (question/todos/goal/scope/recipe) was produced,
             // cumulative mutations, and the one-shot flag.
@@ -924,6 +1008,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
                 None => super::router::RequestMode::Execute,
             };
+            // Adaptive thinking: score this request once before the first LLM
+            // turn (and again on each on_input — see below). Fixed
+            // `reasoning_effort` stays as the context default when adaptive
+            // is off.
+            self.apply_adaptive_budget(&mut ctx, task, request_mode);
             // STUDY contract: the go/no-go question must happen before the
             // study can settle (one corrective per request).
             let mut question_called = false;
@@ -1710,8 +1799,31 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 if tool_calls.is_empty() {
-                    // Check for truncation
+                    // Check for truncation. Qwen-on-vLLM often fills the whole
+                    // completion budget with reasoning and never emits tools
+                    // (TB2 filter-js-from-html, 16384 tokens, 2026-09-22).
+                    // One rescue per request: ask for a short tool call next.
                     if response.stop_reason == StopReason::MaxTokens {
+                        if truncated_rescues < MAX_TRUNCATED_RESCUES {
+                            truncated_rescues += 1;
+                            debug!(
+                                agent = %self.name,
+                                nudge = truncated_rescues,
+                                "truncated rescue; nudging for concise tool use"
+                            );
+                            self.emit(AgentEvent::GateFired {
+                                agent: self.name.clone(),
+                                gate: "truncated_rescue".into(),
+                                reason: "max_tokens with zero tool calls".into(),
+                            });
+                            ctx.add_user_message(format!(
+                                "[truncated] Your previous reply hit max_tokens before \
+                                 any tool call (nudge {truncated_rescues}/{MAX_TRUNCATED_RESCUES}). \
+                                 Continue NOW with a short tool call \
+                                 (e.g. bash/read/write) — no long reasoning."
+                            ));
+                            continue;
+                        }
                         self.emit(AgentEvent::RunFailed {
                             agent: self.name.clone(),
                             error: "Response truncated (max_tokens reached)".into(),
@@ -1777,34 +1889,97 @@ impl<P: LlmProvider> AgentRunner<P> {
                         continue;
                     }
 
-                    // Act-gate: a stop that ANNOUNCES action with ZERO tools
-                    // executed this request is narrate-then-stall, not an
-                    // answer (live finding 6a2552a9: "Je vais créer… Laisse-
-                    // moi d'abord vérifier…" then silence). One-shot redirect:
-                    // do the work now, or ask properly.
+                    // Act-gate: a stop that ANNOUNCES action (in content OR
+                    // reasoning) or returns EMPTY content with ZERO tools is a
+                    // stall, not a completion. Live findings:
+                    // - 6a2552a9: "Je vais créer…" then silence
+                    // - TB2 constraints orch=1 2026-09-22: reasoning="First,
+                    //   I'll read…", text="", end_turn — text-only check missed
+                    // - same day local repro after two one-shots: third turn
+                    //   still EndTurn with 0 tools (placeholder text)
+                    // Budget MAX_ACT_GATE_NUDGES redirects per request.
+                    // (tool_choice=Any was tried then dropped: Qwen/vLLM
+                    // returned 502 empty-choices on the forced turn.)
+                    let last_text = ctx.last_assistant_text().unwrap_or_default();
+                    let reasoning = response.reasoning.as_deref().unwrap_or("");
+                    // Treat the act-gate placeholder as empty: Qwen-on-vLLM
+                    // (TB2 nginx rerun3) echoed "[stalled — calling tools now]"
+                    // as its final answer after seeing it in history.
+                    const STALL_PLACEHOLDER: &str = "[stalled — calling tools now]";
+                    let empty = {
+                        let t = last_text.trim();
+                        t.is_empty() || t == STALL_PLACEHOLDER
+                    };
+                    // Reasoning "Let me think…" is normal chain-of-thought when
+                    // content already answers; only treat reasoning announce as
+                    // a stall when content is empty (TB2 constraints orch=1).
+                    let announced = announces_intent(&last_text)
+                        || (empty && announces_intent(reasoning));
+                    // Text-only agents (blog_writer max_turns=1, no tools) must
+                    // be allowed to EndTurn with empty/whitespace — act_gate
+                    // would otherwise burn the only turn (ghost CI 2026-09-22:
+                    // MaxTurnsExceeded(1) on whitespace draft).
+                    let has_tools = !self.tools.is_empty();
                     if !llm_interrupted
-                        && !intent_nudged
+                        && has_tools
                         && request_tool_calls == 0
-                        && ctx.last_assistant_text().is_some_and(|t| announces_intent(&t))
+                        && act_gate_nudges < MAX_ACT_GATE_NUDGES
+                        && (announced || empty)
                     {
-                        intent_nudged = true;
-                        debug!(agent = %self.name, "announced intent with zero work; act gate");
+                        act_gate_nudges += 1;
+                        let reason = if announced && empty {
+                            "announced intent in reasoning, zero tools"
+                        } else if announced {
+                            "announced intent, zero tools"
+                        } else {
+                            "empty end_turn, zero tools"
+                        };
+                        debug!(agent = %self.name, %reason, nudge = act_gate_nudges, "act gate");
                         self.emit(AgentEvent::GateFired {
                             agent: self.name.clone(),
                             gate: "act_gate".into(),
-                            reason: "announced intent, zero tools".into(),
+                            reason: reason.into(),
                         });
 
-                        ctx.add_user_message(
-                            "[act gate] You announced what you are about to do, then \
-                             stopped without doing it. If any requirement is unclear, ask \
-                             the user NOW with the `question` tool; if it is a feature \
-                             request, plan first (todos with acceptance criteria, \
-                             set_goal). Otherwise EXECUTE it now with your tools in this \
-                             same turn — never stop on an announcement."
-                                .to_string(),
-                        );
+                        if last_text.trim().is_empty() {
+                            ctx.ensure_last_assistant_nonempty(STALL_PLACEHOLDER);
+                        }
+
+                        ctx.add_user_message(format!(
+                            "[act gate] You stopped without calling any tool \
+                             (nudge {act_gate_nudges}/{MAX_ACT_GATE_NUDGES}). \
+                             EXECUTE the task NOW: your next response MUST include \
+                             at least one tool call (read/bash/write/…). Do not \
+                             narrate, do not answer empty, do not stop on reasoning. \
+                             Emit a tool_use / function call immediately. Do NOT \
+                             repeat the stall placeholder."
+                        ));
                         continue;
+                    }
+                    // Budget exhausted and still no productive tools — fail
+                    // closed (TB2 openssl/nginx: exit 0 with stall placeholder
+                    // was reward 0).
+                    if !llm_interrupted
+                        && has_tools
+                        && request_tool_calls == 0
+                        && act_gate_nudges >= MAX_ACT_GATE_NUDGES
+                        && (announced || empty)
+                    {
+                        self.emit(AgentEvent::RunFailed {
+                            agent: self.name.clone(),
+                            error: format!(
+                                "stalled after {MAX_ACT_GATE_NUDGES} act_gate nudges \
+                                 with zero productive tools"
+                            ),
+                            partial_usage: total_usage,
+                        });
+                        return Err((
+                            Error::Agent(format!(
+                                "stalled after {MAX_ACT_GATE_NUDGES} act_gate nudges \
+                                 with zero productive tools"
+                            )),
+                            total_usage,
+                        ));
                     }
 
                     // STUDY contract: a study must END in a proposal + an
@@ -1984,6 +2159,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                             });
                             request_mode = routed.mode;
                         }
+                        self.apply_adaptive_budget(&mut ctx, &next_message, request_mode);
                         request_start_msg = ctx.message_count();
                         ctx.add_user_message(next_message);
                         nudge_tool_calls = 0;
@@ -1991,7 +2167,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                         nudge_sent = false;
                         prose_question_nudged = false;
                         request_tool_calls = 0;
-                        intent_nudged = false;
+                        act_gate_nudges = 0;
+                        truncated_rescues = 0;
+                        doom_tracker = DoomLoopTracker::new();
                         // Per-request continuation budgets re-arm with the
                         // other gates: a second set_goal (or a new red-verify
                         // cycle) on a later request gets its full budget.
@@ -2221,6 +2399,49 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // 6a25d21b: doom detected at 3/4/5, never stopped, user
                         // had to interrupt by hand).
                         if doom_tracker.count() >= threshold + DOOM_HARD_STOP_MARGIN {
+                            // Empty-arg rescue (TB2 smoke batch2 2026-09-22):
+                            // Qwen hammered bash with `{}` / timeout-only args;
+                            // aborting → NonZeroExit → reward 0. One rescue was
+                            // not enough (openssl/filter-js still aborted on
+                            // the second hard stop). Keep soft-resetting empty
+                            // loops; max_turns is the bound.
+                            if tool_calls.iter().all(tool_call_args_empty) {
+                                doom_tracker = DoomLoopTracker::new();
+                                debug!(
+                                    agent = %self.name,
+                                    "empty-arg doom rescue; schema example injected"
+                                );
+                                self.emit(AgentEvent::GateFired {
+                                    agent: self.name.clone(),
+                                    gate: "empty_arg_doom_rescue".into(),
+                                    reason: "identical empty tool args; schema example".into(),
+                                });
+                                let results: Vec<ToolResult> = tool_calls
+                                    .iter()
+                                    .map(|tc| {
+                                        ToolResult::error(
+                                            tc.id.clone(),
+                                            format!(
+                                                "Your `{name}` call had EMPTY arguments. \
+                                                 Pass the required JSON fields. Examples: \
+                                                 bash({{\"command\": \"ls -la /app\"}}), \
+                                                 read({{\"file_path\": \"/app/README.md\"}}). \
+                                                 Do NOT call tools with {{}}.",
+                                                name = tc.name
+                                            ),
+                                        )
+                                    })
+                                    .collect();
+                                total_tool_calls += tool_calls.len();
+                                ctx.add_tool_results(results);
+                                ctx.add_user_message(
+                                    "[empty-arg rescue] Every recent tool call used empty \
+                                     arguments ({}). Call the tool AGAIN with real parameters \
+                                     — e.g. bash({\"command\": \"pwd; ls -la\"})."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
                             self.emit(AgentEvent::DoomLoopDetected {
                                 agent: self.name.clone(),
                                 turn: ctx.current_turn(),
@@ -2255,14 +2476,22 @@ impl<P: LlmProvider> AgentRunner<P> {
                         let results: Vec<ToolResult> = tool_calls
                             .iter()
                             .map(|tc| {
-                                ToolResult::error(
-                                    tc.id.clone(),
+                                let msg = if tool_call_args_empty(tc) {
+                                    format!(
+                                        "Doom loop: identical EMPTY `{name}` args repeated {} \
+                                         times. Pass real parameters — e.g. bash({{\"command\": \
+                                         \"ls -la /app\"}}).",
+                                        doom_tracker.count(),
+                                        name = tc.name
+                                    )
+                                } else {
                                     format!(
                                         "Doom loop detected: identical tool calls repeated {} \
                                          times consecutively. Try a different approach.",
                                         doom_tracker.count()
-                                    ),
-                                )
+                                    )
+                                };
+                                ToolResult::error(tc.id.clone(), msg)
                             })
                             .collect();
                         total_tool_calls += tool_calls.len();
@@ -2723,6 +2952,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                             .await
                     }
                 };
+                let productive_this_batch = batch_records
+                    .iter()
+                    .chain(barrier_records.iter())
+                    .filter(|r| !r.is_error || !input_lacks_string_payload(&r.input))
+                    .count() as u32;
                 tool_call_records.extend(batch_records);
                 tool_call_records.extend(barrier_records);
                 results.extend(barrier_results);
@@ -2916,7 +3150,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // that the squad exists (prompt guidance alone has proven
                 // insufficient on mid-tier models — same rationale as the
                 // doom-loop and replan gates).
-                request_tool_calls += allowed_calls.len() as u32;
+                // Act-gate productivity: empty-arg / schema-invalid calls do
+                // NOT disarm the gate (TB2 nginx rerun2: bash({}) then empty
+                // EndTurn). Successful executes and real-arg failures do.
+                request_tool_calls += productive_this_batch;
                 if let Some(ref nudge) = self.delegation_nudge {
                     nudge_tool_calls += allowed_calls.len() as u32;
                     if allowed_calls
@@ -5300,12 +5537,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn act_gate_is_one_shot() {
-        // If the model announces again right after the redirect, let it
-        // through — bounded, no loop.
+    async fn act_gate_exhausted_fails_closed() {
+        // After MAX_ACT_GATE_NUDGES redirects with still zero productive tools,
+        // fail closed (TB2 openssl rerun2: exit 0 with "[stalled…]" was reward 0).
         let provider = Arc::new(MockProvider::new(vec![
             MockProvider::text_response("Je vais créer le fichier maintenant.", 10, 5),
             MockProvider::text_response("Je vais vraiment le faire bientôt.", 10, 5),
+            MockProvider::text_response("Je vais encore annoncer.", 10, 5),
+            MockProvider::text_response("Je vais finalement passer.", 10, 5),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        let err = runner.execute("crée un fichier").await.unwrap_err();
+        let err = match err {
+            Error::WithPartialUsage { source, .. } => *source,
+            e => e,
+        };
+        assert!(
+            matches!(err, Error::Agent(ref m) if m.contains("act_gate")),
+            "exhausted act_gate must fail closed, got: {err:?}"
+        );
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            4,
+            "3 nudges + final announce that fails closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_only_announce_triggers_act_gate() {
+        // Live finding (TB2 constraints-scheduling orch=1, 2026-09-22): Qwen
+        // put "First, I'll read the three calendar files." in reasoning with
+        // empty content + end_turn + zero tools. Text-only act_gate missed it.
+        let mut reasoning_only = MockProvider::text_response("", 10, 5);
+        reasoning_only.reasoning = Some("First, I'll read the three calendar files.\n".into());
+        let provider = Arc::new(MockProvider::new(vec![
+            reasoning_only,
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
         ]));
         let runner = AgentRunner::builder(provider.clone())
             .name("test")
@@ -5314,12 +5588,119 @@ mod tests {
             .max_turns(6)
             .build()
             .unwrap();
-        let out = runner.execute("crée un fichier").await.unwrap();
+        let out = runner.execute("read the calendars").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            out.result.contains("bientôt"),
-            "second announce passes through"
+            texts.iter().any(|t| t.contains("[act gate]")),
+            "reasoning-only announce must be redirected: {texts:?}"
         );
-        assert_eq!(provider.captured_requests.lock().unwrap().len(), 2);
+    }
+
+    // Ghost blog_writer (max_turns=1, no tools) returns whitespace drafts
+    // intentionally — act_gate must not burn the only turn (CI 2026-09-22).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_gate_skips_text_only_agents() {
+        let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+            "   \n\n   \n",
+            10,
+            5,
+        )]));
+        let runner = AgentRunner::builder(provider)
+            .name("blog_writer")
+            .system_prompt("sys")
+            .max_turns(1)
+            .build()
+            .unwrap();
+        let out = runner.execute("write").await.unwrap();
+        assert!(
+            out.result.trim().is_empty(),
+            "whitespace draft must pass through unchanged"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_end_turn_after_announce_triggers_empty_stall() {
+        // After a text announce redirect, a blank EndTurn must still get
+        // another nudge within the budget (otherwise result="" / 0 tools —
+        // TB2 constraints orch=1 r2).
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("I'll start by examining the calendars.", 10, 5),
+            MockProvider::text_response("", 10, 5), // empty after act_gate
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        let out = runner.execute("schedule a meeting").await.unwrap();
+        assert_eq!(out.result, "done");
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            4,
+            "announce + empty stall + tool + done"
+        );
+        let reqs = provider.captured_requests.lock().unwrap();
+        let gate_count = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if text.contains("[act gate]") => Some(text.as_str()),
+                _ => None,
+            })
+            .count();
+        assert!(
+            gate_count >= 2,
+            "both announce and empty-stall gates must fire (got {gate_count})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_end_turn_without_announce_triggers_empty_stall() {
+        // Blank EndTurn + zero tools (no announce markers in text/reasoning)
+        // is still a stall — redirect within the budget.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("", 10, 5),
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("do the task").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[act gate]")),
+            "empty stall must redirect: {texts:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6892,6 +7273,132 @@ mod tests {
         assert!(
             provider.captured_requests.lock().unwrap().len() < 30,
             "fuzzy doom must hard-stop well before max_turns"
+        );
+    }
+
+    #[test]
+    fn tool_call_args_empty_detects_blank_json() {
+        let empty = crate::llm::types::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        };
+        assert!(super::tool_call_args_empty(&empty));
+        let blank_cmd = crate::llm::types::ToolCall {
+            id: "2".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "  "}),
+        };
+        assert!(super::tool_call_args_empty(&blank_cmd));
+        // timeout-only still has no string payload (TB2 openssl/nginx).
+        let timeout_only = crate::llm::types::ToolCall {
+            id: "2b".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"timeout": 60000}),
+        };
+        assert!(super::tool_call_args_empty(&timeout_only));
+        let real = crate::llm::types::ToolCall {
+            id: "3".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        };
+        assert!(!super::tool_call_args_empty(&real));
+    }
+
+    // TB2 smoke batch2 (2026-09-22): Qwen hammered bash({}) five times and the
+    // hard doom abort ended the trial (fix-git / openssl / nginx). One rescue
+    // with a schema example must let the model continue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_arg_doom_rescue_lets_model_continue() {
+        let mut responses: Vec<_> = (0..4).map(|_| tool_use_named("work", 1)).collect();
+        responses.push(MockProvider::text_response("recovered", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_identical_tool_calls(2)
+            .max_turns(20)
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        let out = runner.execute("go").await.unwrap();
+        assert_eq!(out.result, "recovered");
+        let events_snapshot = events.lock().unwrap().clone();
+        let gates: Vec<_> = events_snapshot
+            .iter()
+            .filter_map(|e| match e {
+                crate::agent::events::AgentEvent::GateFired { gate, .. } => Some(gate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gates.contains(&"empty_arg_doom_rescue"),
+            "expected empty_arg_doom_rescue gate, got {gates:?}"
+        );
+    }
+
+    // After the first rescue, further empty-arg hard stops must keep
+    // soft-resetting (TB2 openssl/filter-js aborted on the second hard stop
+    // when rescue was one-shot). Never DoomLoopAborted for empty args.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_arg_doom_keeps_rescuing_until_real_args() {
+        let mut responses: Vec<_> = (0..10).map(|_| tool_use_named("work", 1)).collect();
+        responses.push(MockProvider::text_response("finally", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_identical_tool_calls(2)
+            .max_turns(30)
+            .build()
+            .unwrap();
+        let out = runner.execute("go").await.unwrap();
+        assert_eq!(out.result, "finally");
+    }
+
+    // TB2 filter-js-from-html: first MaxTokens with zero tools must nudge, not die.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncated_rescue_lets_model_continue() {
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::types::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "long reasoning…".into(),
+                }],
+                stop_reason: StopReason::MaxTokens,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            MockProvider::text_response("done via tools path", 1, 1),
+        ]));
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .max_turns(6)
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        let out = runner.execute("filter html").await.unwrap();
+        assert!(out.result.contains("done"));
+        let events_snapshot = events.lock().unwrap().clone();
+        let gates: Vec<_> = events_snapshot
+            .iter()
+            .filter_map(|e| match e {
+                crate::agent::events::AgentEvent::GateFired { gate, .. } => Some(gate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gates.contains(&"truncated_rescue"),
+            "expected truncated_rescue gate, got {gates:?}"
         );
     }
 

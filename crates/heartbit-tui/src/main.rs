@@ -28,6 +28,7 @@ mod markdown;
 mod models;
 mod msg;
 mod notify;
+mod profile;
 mod session;
 mod splash;
 mod trace;
@@ -246,6 +247,8 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
     app.context_recall = cfg.context_recall;
     app.verify_command = cfg.verify_command.clone();
     app.prompt_caching = cfg.prompt_caching;
+    app.max_tokens = cfg.max_tokens;
+    app.http_timeout_secs = cfg.http_timeout_secs;
     app.notify = cfg.notify;
     app.splash = cfg.splash.then_some(0);
     app.md = markdown::MarkdownCache::new(cfg.syntax_theme.as_deref());
@@ -287,6 +290,19 @@ async fn run(cfg: config::TuiConfig) -> anyhow::Result<()> {
             "custom OpenAI-compatible endpoint: {url} — set the model with /model \
              (e.g. gpt-5.5 for a ChatGPT-subscription Codex proxy; check its \
              /v1/models). This takes priority over OpenRouter."
+        )));
+    }
+    if let Some(id) = cfg.profile.as_deref() {
+        let summary = profile::builtin(id)
+            .map(|p| p.summary)
+            .unwrap_or("unknown profile (no builtin match — knobs unchanged)");
+        app.history.push(Cell::Notice(format!(
+            "profile `{id}` — {summary} · max_tokens={} · http_timeout={}s · caching={}",
+            app.max_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".into()),
+            app.http_timeout_secs.unwrap_or(120),
+            if app.prompt_caching { "on" } else { "off" },
         )));
     }
     // No provider configured at all → open the key prompt immediately.
@@ -452,6 +468,7 @@ fn build_provider(
     model: &str,
     on_retry: Arc<heartbit_core::OnRetry>,
     prompt_caching: bool,
+    http_timeout_secs: Option<u64>,
 ) -> anyhow::Result<Arc<BoxedProvider>> {
     // Custom OpenAI-compatible endpoint (`/codex`, or `HEARTBIT_OPENAI_BASE_URL` at
     // startup). Takes PRIORITY over OpenRouter so the same config can target: a
@@ -475,7 +492,18 @@ fn build_provider(
         } else {
             AuthStyle::None
         };
-        let base = OpenAiCompatProvider::new(key, model, base_url, auth);
+        // Timeout: profile / tui.toml → HEARTBIT_OPENAI_TIMEOUT_SECS → 120s default.
+        // Cold-start Koyeb vLLM needs ~300s (live probe 2026-09-22).
+        let timeout_secs = http_timeout_secs
+            .or_else(|| {
+                std::env::var("HEARTBIT_OPENAI_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(120)
+            .max(1);
+        let base = OpenAiCompatProvider::new(key, model, base_url, auth)
+            .with_request_timeout(Duration::from_secs(timeout_secs));
         return Ok(Arc::new(BoxedProvider::new(
             RetryingProvider::with_defaults(base).with_on_retry(on_retry),
         )));
@@ -519,6 +547,10 @@ fn build_provider(
 /// and the sub-agent errors out. `Off` always omits the field — never
 /// `ReasoningEffort::None`, which would emit `reasoning: {"effort":"none"}`, a
 /// request this TUI never sent before this feature.
+///
+/// `Adaptive` returns `None` here: the builder gets
+/// [`OrchestratorBuilder::adaptive_reasoning`] instead, and each request is
+/// scored by `thinking_budget`.
 fn effort_for_provider(
     level: app::EffortLevel,
     custom_endpoint: Option<&str>,
@@ -534,7 +566,14 @@ fn effort_for_provider(
         return None;
     }
     match level {
+        // Custom OpenAI-compat (vLLM Qwen): Off must send ReasoningEffort::None
+        // so OpenAiCompatProvider can set chat_template_kwargs.enable_thinking=
+        // false. Omitting the field leaves vLLM thinking ON (live probe
+        // 2026-09-22: hello → 184 chars of reasoning). OpenRouter Off still
+        // omits — we never used effort=none there before.
+        app::EffortLevel::Off if has_custom_endpoint => Some(heartbit_core::ReasoningEffort::None),
         app::EffortLevel::Off => None,
+        app::EffortLevel::Adaptive => None,
         app::EffortLevel::Low => Some(ReasoningEffort::Low),
         app::EffortLevel::Medium => Some(ReasoningEffort::Medium),
         app::EffortLevel::High => Some(ReasoningEffort::High),
@@ -689,6 +728,8 @@ async fn build_engine(
     request_mode_pin: Arc<std::sync::atomic::AtomicU8>,
     workflow_journal_dir: PathBuf,
     effort: app::EffortLevel,
+    max_tokens: Option<u32>,
+    http_timeout_secs: Option<u64>,
 ) -> anyhow::Result<Engine> {
     // on_event is defined BEFORE the provider so retry attempts can flow
     // through the same path (event → trace tap + UI message).
@@ -736,6 +777,7 @@ async fn build_engine(
         model,
         on_retry.clone(),
         prompt_caching,
+        http_timeout_secs,
     )?;
     // Computed ONCE and given to both the entry agent and every sub-agent
     // below — see `effort_for_provider`'s doc comment for why the Anthropic
@@ -839,6 +881,9 @@ async fn build_engine(
                 &resolved,
                 on_retry.clone(),
                 true,
+                // Sub-role models share the session timeout (cold-start hosts
+                // need the same budget as the main provider).
+                http_timeout_secs,
             )
             .map_err(|e| heartbit_core::Error::Config(format!("provider for '{role}': {e}")))
         })
@@ -1189,10 +1234,26 @@ async fn build_engine(
         // here). Identical batches abort fast; near-duplicates get more rope.
         .max_identical_tool_calls(3)
         .max_fuzzy_identical_tool_calls(5);
+    // Profile / tui.toml max_tokens (e.g. qwen-vllm → 8192). Reasoning models
+    // spend budget in `message.reasoning` before `content`; the core default
+    // of 4096 truncates mid-thought (TB2 smoke 2026-09-22).
+    if let Some(n) = max_tokens {
+        builder = builder.max_tokens(n);
+    }
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
-    if let Some(effort) = reasoning_effort {
+    // Adaptive: per-request thinking budget (hello → off; TB2 → high).
+    // Fixed effort: only when the provider gate returned Some.
+    if effort == app::EffortLevel::Adaptive {
+        let has_custom = custom_endpoint
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .is_some();
+        if has_custom || api_key.is_some() {
+            builder = builder.adaptive_reasoning(true);
+        }
+    } else if let Some(effort) = reasoning_effort {
         builder = builder.reasoning_effort(effort);
     }
     // Forwards to the entry runner AND all three sub-agent spawn paths
@@ -1215,9 +1276,13 @@ async fn build_engine(
     // stack (recitation / restore-on-demand / compaction / replan). The gated
     // reasoning effort is applied here (not threaded through
     // `default_sub_agents`'s signature) so its existing unit test call site
-    // stays untouched — same value the entry agent got above.
+    // stays untouched — same value the entry agent got above. Adaptive mode
+    // leaves sub-agent effort unset; `adaptive_reasoning(true)` already marked
+    // them when registered.
     for mut cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
-        cfg.reasoning_effort = reasoning_effort;
+        if effort != app::EffortLevel::Adaptive {
+            cfg.reasoning_effort = reasoning_effort;
+        }
         builder = builder.sub_agent_full(cfg);
     }
     let orch = builder.build()?;
@@ -1427,6 +1492,8 @@ fn spawn_agent(
     let request_mode_pin = request_mode_pin.clone();
     let workflow_journal_dir = app.workflow_journal_dir.clone();
     let effort = app.effort;
+    let max_tokens = app.max_tokens;
+    let http_timeout_secs = app.http_timeout_secs;
     let runner_tx = ui_tx.clone();
     let done_tx = ui_tx.clone();
     let input_rx = input_rx.clone();
@@ -1471,6 +1538,8 @@ fn spawn_agent(
                 request_mode_pin,
                 workflow_journal_dir,
                 effort,
+                max_tokens,
+                http_timeout_secs,
             )
             .await
             {
@@ -2308,10 +2377,25 @@ mod effort_gating_tests {
             effort_for_provider(app::EffortLevel::High, None, None),
             None
         );
-        // Off always omits the field — never ReasoningEffort::None, which would
-        // send reasoning:{"effort":"none"}, a request the TUI never sent before.
+        // Off on OpenRouter still omits the field.
         assert_eq!(
             effort_for_provider(app::EffortLevel::Off, None, Some("sk-or-x")),
+            None
+        );
+        // Off on a custom OpenAI-compat endpoint (vLLM Qwen) must send
+        // ReasoningEffort::None so the provider can disable thinking via
+        // chat_template_kwargs (live probe 2026-09-22).
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Off, Some("https://example.com/v1"), None),
+            Some(ReasoningEffort::None)
+        );
+        // Adaptive resolves per-request via thinking_budget — no fixed effort.
+        assert_eq!(
+            effort_for_provider(
+                app::EffortLevel::Adaptive,
+                Some("https://example.com/v1"),
+                None
+            ),
             None
         );
         // A blank/whitespace-only custom endpoint must NOT count as "has a

@@ -1,0 +1,90 @@
+{
+  "id": "tui-model-profiles",
+  "state": "draft",
+  "objective": "Ajouter des profils TUI par famille de modèles, sonder Qwen/Koyeb en live, et ajuster le harness (timeout HTTP, max_tokens, caching) pour que le TUI soit fiable sur cet endpoint OpenAI-compat.",
+  "non_goals": [
+    "Ne pas remplacer le provider OpenRouter/Anthropic par défaut",
+    "Ne pas écraser ~/.config/heartbit/tui.toml (OpenRouter de Pascal)",
+    "Ne pas démarrer un daemon/gateway Kafka",
+    "Pas de support multi-tenant daemon pour ces profils"
+  ],
+  "project": {
+    "field": "brownfield",
+    "baseline_revision": "3d4e3c1e4acc3aa0da213d2620c2f05c74f5b116",
+    "invariants": [
+      "Sans profile=, le TUI garde le comportement actuel (OpenRouter/Anthropic/custom endpoint env)",
+      "HEARTBIT_OPENAI_BASE_URL continue de primer sur OpenRouter",
+      "Les secrets restent hors git (.env gitignored, tui.toml 0600)",
+      "cargo test -p heartbit-tui reste vert hors tests live ignorés"
+    ],
+    "rollback": "Retirer profile= des configs isolées et revert du commit profils/timeout."
+  },
+  "grill": {
+    "mode": "autonomous",
+    "notes": [
+      "Assumption: « harness » = TUI + câblage provider OpenAI-compat + scripts de sonde, pas le daemon Kafka.",
+      "Assumption: profils nommés (qwen-vllm, openrouter-default, …) ; champs explicites du toml écrasent le profil.",
+      "Pre-mortem: timeout HTTP 120s trop court sur cold start Koyeb → runs TUI en échec ; max_tokens trop bas sur modèle reasoning → content null / Truncated.",
+      "Pas de gap user-only résiduel: endpoint, clé et modèle déjà fournis ; on ne touche pas tui.toml global."
+    ]
+  },
+  "risk": {
+    "tier": "structured",
+    "signals": ["cross-component", "x-cold-start", "x-live-llm"],
+    "rationale": "Touche heartbit-core (timeout client) + heartbit-tui (config/profils). Les appels LLM live sont déjà autorisés par la demande utilisateur ; signal advisory x-live-llm seulement."
+  },
+  "acceptance": [
+    {
+      "id": "continuity-tui-tests",
+      "criterion": "La suite unitaire heartbit-tui hors live reste verte.",
+      "verification": "cargo test -p heartbit-tui --offline",
+      "continuity": true
+    },
+    {
+      "id": "live-models",
+      "criterion": "GET /v1/models (chaud) liste qwen3.8-27b.",
+      "verification": "scripts/probe-openai-compat.sh models"
+    },
+    {
+      "id": "live-chat",
+      "criterion": "POST /v1/chat/completions avec max_tokens suffisant renvoie content non vide contenant pong.",
+      "verification": "scripts/probe-openai-compat.sh chat"
+    },
+    {
+      "id": "live-agent",
+      "criterion": "Un AgentRunner (mêmes env que le TUI) répond à une question triviale sans Truncated.",
+      "verification": "cargo test -p heartbit-tui live_qwen_agent_runner -- --ignored --nocapture"
+    },
+    {
+      "id": "profile-applies",
+      "criterion": "profile=qwen-vllm pose model/max_tokens/timeout/prompt_caching sans casser l’override explicite.",
+      "verification": "cargo test -p heartbit-tui profile::"
+    }
+  ],
+  "execution": {
+    "mode": "sequential",
+    "rationale": "Sondes live d’abord pour figer les knobs, puis profils+timeout, puis vérifs unitaires."
+  },
+  "tasks": [
+    {
+      "id": "probe-live",
+      "outcome": "Plan de tests exécuté contre Koyeb ; findings documentés (cold start, reasoning, tools)."
+    },
+    {
+      "id": "timeout-core",
+      "outcome": "OpenAiCompatProvider accepte un timeout configurable ; le TUI lit HEARTBIT_OPENAI_TIMEOUT_SECS / profil."
+    },
+    {
+      "id": "profiles-tui",
+      "outcome": "Profils builtin + champ profile= dans tui.toml ; wiring max_tokens dans build_engine."
+    },
+    {
+      "id": "probe-script",
+      "outcome": "scripts/probe-openai-compat.sh + test live ignoré AgentRunner."
+    }
+  ],
+  "approvals": {
+    "contract": true,
+    "critical_actions": true
+  }
+}

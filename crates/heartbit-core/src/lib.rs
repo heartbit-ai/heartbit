@@ -153,6 +153,9 @@ pub use llm::registry::{
     resolve_api_key,
 };
 pub use llm::retry::{OnRetry, RetryConfig, RetryingProvider};
+pub use llm::thinking_budget::{
+    ThinkingBudget, ThinkingBudgetInput, ThinkingTier, resolve_thinking_budget,
+};
 pub use llm::types::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, ReasoningEffort, Role,
     StopReason, TokenUsage, ToolCall, ToolChoice, ToolDefinition, ToolResult,

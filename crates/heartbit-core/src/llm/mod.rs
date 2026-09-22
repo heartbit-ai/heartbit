@@ -110,6 +110,7 @@ pub mod openrouter;
 pub mod pricing;
 pub mod registry;
 pub mod retry;
+pub mod thinking_budget;
 pub mod types;
 
 use std::future::Future;

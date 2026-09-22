@@ -90,6 +90,52 @@ def test_build_env_codex_proxy_orchestrator_shape():
     assert "ANTHROPIC_API_KEY" not in env
 
 
+def test_build_env_qwen_koyeb_uses_openai_wire_and_tui_key():
+    # Heartbit Harness path: custom HTTPS OpenAI-compat host + TUI-brain
+    # orchestrator. `-m qwen/qwen3.8-27b` is rewritten to provider=openai so
+    # AuthStyle::Bearer works; the URL comes from HEARTBIT_BASE_URL.
+    env = build_heartbit_env(
+        model_name="qwen/qwen3.8-27b",
+        base_env={
+            "HEARTBIT_BASE_URL": "https://qwen.example/v1",
+            "HEARTBIT_OPENAI_API_KEY": "koyeb-secret",
+            "HEARTBIT_ORCHESTRATOR": "1",
+            "HEARTBIT_SUB_AGENT_MAX_TURNS": "200",
+            "HEARTBIT_MAX_TOKENS": "8192",
+            "HEARTBIT_OPENAI_TIMEOUT_SECS": "300",
+            "ANTHROPIC_API_KEY": "sk-ant-should-not-leak",
+        },
+        workspace="/task",
+        max_turns="100",
+    )
+    assert env["HEARTBIT_PROVIDER"] == "openai"
+    assert env["HEARTBIT_MODEL"] == "qwen3.8-27b"
+    assert env["HEARTBIT_BASE_URL"] == "https://qwen.example/v1"
+    assert env["HEARTBIT_API_KEY"] == "koyeb-secret"
+    assert env["OPENAI_API_KEY"] == "koyeb-secret"
+    assert env["HEARTBIT_ORCHESTRATOR"] == "1"
+    assert env["HEARTBIT_SUB_AGENT_MAX_TURNS"] == "200"
+    assert env["HEARTBIT_MAX_TOKENS"] == "8192"
+    assert env["HEARTBIT_OPENAI_TIMEOUT_SECS"] == "300"
+    assert env["HEARTBIT_MAX_TURNS"] == "100"
+    assert env["HEARTBIT_NONINTERACTIVE"] == "1"
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_build_env_openai_prefers_heartbit_api_key_over_openai_env():
+    env = build_heartbit_env(
+        model_name="openai/qwen3.8-27b",
+        base_env={
+            "HEARTBIT_BASE_URL": "https://qwen.example/v1",
+            "HEARTBIT_API_KEY": "preferred",
+            "OPENAI_API_KEY": "ignored",
+        },
+        workspace="/task",
+    )
+    assert env["HEARTBIT_API_KEY"] == "preferred"
+    assert env["OPENAI_API_KEY"] == "preferred"
+
+
 def test_build_env_no_prefix_forwards_available_keys_for_autodetect():
     env = build_heartbit_env(
         model_name="claude-haiku-4-5",

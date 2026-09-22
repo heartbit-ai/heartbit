@@ -15,11 +15,18 @@ use crate::llm::types::{CompletionRequest, CompletionResponse};
 /// like `api-key` (Azure-style) which reqwest does NOT strip on cross-host
 /// redirect. When `false` (used only for `AuthStyle::None`, i.e. local
 /// providers like Ollama/vLLM), HTTP is allowed.
-fn build_secure_client(enforce_https: bool) -> Result<Client, Error> {
+/// Default per-request timeout for OpenAI-compat calls. Long enough for most
+/// hosted APIs; too short for a cold-start vLLM on a free-tier host (live
+/// finding 2026-09-22: Koyeb can spend ~100s before the first byte). Callers
+/// targeting those endpoints should raise it via
+/// [`OpenAiCompatProvider::with_request_timeout`].
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn build_secure_client(enforce_https: bool, request_timeout: Duration) -> Result<Client, Error> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120));
+        .timeout(request_timeout);
     if enforce_https {
         builder = builder.https_only(true);
     }
@@ -64,15 +71,43 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
         auth_style: AuthStyle,
     ) -> Self {
+        Self::new_with_timeout(
+            api_key,
+            model,
+            base_url,
+            auth_style,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Like [`Self::new`], but with an explicit per-request HTTP timeout.
+    /// Use a longer timeout for cold-start hosts (e.g. 300s for a sleeping
+    /// Koyeb vLLM); keep the default for warm public APIs.
+    pub fn new_with_timeout(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        auth_style: AuthStyle,
+        request_timeout: Duration,
+    ) -> Self {
         let enforce_https = !matches!(auth_style, AuthStyle::None);
         Self {
-            client: build_secure_client(enforce_https)
+            client: build_secure_client(enforce_https, request_timeout)
                 .expect("failed to build hardened HTTPS client for OpenAiCompatProvider"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
             auth_style,
         }
+    }
+
+    /// Rebuild the inner HTTP client with a different per-request timeout.
+    /// Fluently chain after [`Self::new`]: `OpenAiCompatProvider::new(...).with_request_timeout(Duration::from_secs(300))`.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        let enforce_https = !matches!(self.auth_style, AuthStyle::None);
+        self.client = build_secure_client(enforce_https, request_timeout)
+            .expect("failed to rebuild hardened HTTPS client for OpenAiCompatProvider");
+        self
     }
 
     /// Convenience constructor for OpenRouter.
@@ -109,7 +144,8 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, Error> {
-        let body = super::openrouter::build_openai_request(&self.model, &request)?;
+        let mut body = super::openrouter::build_openai_request(&self.model, &request)?;
+        apply_openai_compat_thinking(&mut body, &request);
 
         let req = self
             .client
@@ -155,6 +191,7 @@ impl OpenAiCompatProvider {
         on_reasoning: &crate::llm::OnReasoning,
     ) -> Result<CompletionResponse, Error> {
         let mut body = super::openrouter::build_openai_request(&self.model, &request)?;
+        apply_openai_compat_thinking(&mut body, &request);
         body["stream"] = serde_json::json!(true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
 
@@ -178,9 +215,92 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// vLLM/Qwen3 thinking control for OpenAI-compat endpoints.
+///
+/// Live probe 2026-09-22 (Koyeb qwen3.8-27b): a bare `hello` with
+/// `reasoning.effort=none` still returned ~180–280 chars of
+/// `message.reasoning`. The same request with
+/// `chat_template_kwargs: {"enable_thinking": false}` returned
+/// `reasoning_len=0` and a one-line greeting.
+///
+/// Adaptive budgets (see [`crate::llm::thinking_budget`]) map Off/Low →
+/// `false` and Medium/High → `true`. Omitting `reasoning_effort` leaves the
+/// model default alone.
+fn apply_openai_compat_thinking(body: &mut serde_json::Value, request: &CompletionRequest) {
+    if let Some(enable) =
+        super::thinking_budget::enable_thinking_for_effort(request.reasoning_effort)
+    {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable});
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_openai_compat_thinking_sets_chat_template_kwargs_on_none() {
+        use crate::llm::types::{CompletionRequest, Message, ReasoningEffort};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 256,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::None),
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn apply_openai_compat_thinking_enables_on_high() {
+        use crate::llm::types::{CompletionRequest, Message, ReasoningEffort};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hard task")],
+            tools: vec![],
+            max_tokens: 8192,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn apply_openai_compat_thinking_disables_on_low() {
+        use crate::llm::types::{CompletionRequest, Message, ReasoningEffort};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("short q")],
+            tools: vec![],
+            max_tokens: 2048,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn apply_openai_compat_thinking_silent_when_effort_omitted() {
+        use crate::llm::types::{CompletionRequest, Message};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 256,
+            tool_choice: None,
+            reasoning_effort: None,
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
 
     #[test]
     fn openrouter_convenience_constructor() {
@@ -255,5 +375,14 @@ mod tests {
     fn is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<OpenAiCompatProvider>();
+    }
+
+    #[test]
+    fn with_request_timeout_rebuilds_without_changing_identity() {
+        let p = OpenAiCompatProvider::new("k", "m", "https://example.com/v1", AuthStyle::Bearer)
+            .with_request_timeout(Duration::from_secs(300));
+        assert_eq!(p.model, "m");
+        assert_eq!(p.base_url, "https://example.com/v1");
+        assert!(matches!(p.auth_style, AuthStyle::Bearer));
     }
 }

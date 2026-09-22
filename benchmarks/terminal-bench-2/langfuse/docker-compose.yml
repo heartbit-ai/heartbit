@@ -1,0 +1,57 @@
+# Self-hosted Langfuse for Heartbit harness tuning (post-run ingest).
+#
+#   cd benchmarks/terminal-bench-2/langfuse
+#   docker compose up -d
+#   open http://localhost:3000  → create project → copy public/secret keys
+#
+# Then:
+#   export LANGFUSE_HOST=http://localhost:3000
+#   export LANGFUSE_PUBLIC_KEY=pk-lf-…
+#   export LANGFUSE_SECRET_KEY=sk-lf-…
+#   ../scripts/ingest-langfuse.sh ../jobs/tb2-qwen-orch-max8192
+#
+# Why self-host: TB2 traces contain task prompts + tool I/O; keep them local.
+services:
+  langfuse-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-web:
+    image: langfuse/langfuse:2
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      # Dev-only secrets — replace before any shared deploy.
+      NEXTAUTH_SECRET: heartbit-langfuse-dev-nextauth-secret-change-me
+      SALT: heartbit-langfuse-dev-salt-change-me
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # Seed a local project so ingest works without a browser click.
+      LANGFUSE_INIT_ORG_ID: "heartbit-org"
+      LANGFUSE_INIT_ORG_NAME: "Heartbit"
+      LANGFUSE_INIT_PROJECT_ID: "heartbit-harness"
+      LANGFUSE_INIT_PROJECT_NAME: "harness"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "pk-lf-heartbit-local"
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: "sk-lf-heartbit-local-dev-only"
+      LANGFUSE_INIT_USER_EMAIL: "dev@heartbit.local"
+      LANGFUSE_INIT_USER_NAME: "dev"
+      LANGFUSE_INIT_USER_PASSWORD: "heartbit-dev"
+
+volumes:
+  langfuse_pg:

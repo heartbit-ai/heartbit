@@ -631,9 +631,11 @@ fn build_base_provider(
             heartbit::AuthStyle::None
         };
 
-        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
-            key, model, url, auth_style,
-        )));
+        let mut provider = heartbit::OpenAiCompatProvider::new(key, model, url, auth_style);
+        if let Some(secs) = openai_compat_timeout_secs() {
+            provider = provider.with_request_timeout(std::time::Duration::from_secs(secs));
+        }
+        return Ok(BoxedProvider::new(provider));
     }
 
     // Unknown provider: if base_url is provided, try OpenAI-compatible
@@ -644,9 +646,11 @@ fn build_base_provider(
         } else {
             heartbit::AuthStyle::Bearer
         };
-        return Ok(BoxedProvider::new(heartbit::OpenAiCompatProvider::new(
-            key, model, url, auth_style,
-        )));
+        let mut provider = heartbit::OpenAiCompatProvider::new(key, model, url, auth_style);
+        if let Some(secs) = openai_compat_timeout_secs() {
+            provider = provider.with_request_timeout(std::time::Duration::from_secs(secs));
+        }
+        return Ok(BoxedProvider::new(provider));
     }
 
     bail!(
@@ -654,6 +658,12 @@ fn build_base_provider(
          Or provide a base_url for custom OpenAI-compatible endpoints.",
         heartbit::known_llm_providers().join(", ")
     );
+}
+
+/// Per-request HTTP timeout for OpenAI-compat hosts (Koyeb cold start, etc.).
+/// Reads `HEARTBIT_OPENAI_TIMEOUT_SECS` — same name the TUI uses.
+fn openai_compat_timeout_secs() -> Option<u64> {
+    parse_env("HEARTBIT_OPENAI_TIMEOUT_SECS").filter(|&n| n > 0)
 }
 
 /// Build a `HeuristicGate` from cascade gate configuration.
@@ -2458,6 +2468,7 @@ async fn run_default_agent(
     }
 
     let max_turns: usize = parse_env("HEARTBIT_MAX_TURNS").unwrap_or(50);
+    let max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(4096);
     let summarize_threshold: u32 = parse_env("HEARTBIT_SUMMARIZE_THRESHOLD").unwrap_or(80_000);
     let max_tool_output_bytes: usize =
         parse_env("HEARTBIT_MAX_TOOL_OUTPUT_BYTES").unwrap_or(32_768);
@@ -2484,6 +2495,7 @@ async fn run_default_agent(
         .system_prompt(&env_system_prompt)
         .tools(tools)
         .max_turns(max_turns)
+        .max_tokens(max_tokens)
         .summarize_threshold(summarize_threshold)
         .max_tool_output_bytes(max_tool_output_bytes)
         .tool_timeout(std::time::Duration::from_secs(tool_timeout_secs))
@@ -2678,6 +2690,12 @@ async fn run_entry_agent_orchestrator(
     let entry_max_turns: usize = parse_env("HEARTBIT_MAX_TURNS").unwrap_or(300);
     let sub_agent_max_turns: usize =
         parse_env("HEARTBIT_SUB_AGENT_MAX_TURNS").unwrap_or(CLI_SUB_AGENT_MAX_TURNS);
+    // Reasoning models (Qwen-on-vLLM) spend tokens in `message.reasoning`
+    // before `content`. 4096 truncates mid-thought; 8192 still Truncated on
+    // constraints-scheduling (TB2 2026-09-22 fix3). 16384 cleared constraints
+    // but filter-js still Truncated twice — runner rescues up to 3 times and
+    // we raise the default headroom.
+    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(32768);
 
     // Entry agent's direct tools: builtins FIRST.
     let mut tools = {
@@ -2716,34 +2734,54 @@ async fn run_entry_agent_orchestrator(
         heartbit::SetScopeTool::new(scope_guard.clone()).with_workspace(cwd.clone()),
     ));
 
-    // Instructions = base + the Cemri orchestration-selection guidance, wired into
-    // the entry agent so it fans broad tasks out instead of overloading one
-    // sub-agent (the guidance is a public const that no prompt used before).
-    let instructions = format!(
-        "You are operating headless on a terminal task. Accomplish it end-to-end with \
-         your tools, then STOP with a concise final answer. Read before you edit; \
-         verify with the shell where possible.\n\n## When to delegate vs. fan out\n{}\n\
-         For a broad audit/survey/migration, split the work into several focused, \
-         INDEPENDENT sub-agent tasks (one per area/risk class) and delegate them \
-         together, or run a workflow recipe — don't hand one giant task to a single \
-         sub-agent. Write scratch files only under ./scratch, never the repo root.",
-        heartbit::MULTI_AGENT_SELECTION_GUIDANCE,
-    );
+    // Headless NONINTERACTIVE (TB2): keep the entry agent + builtins, but strip
+    // the TUI "brain" extras that push Qwen into reasoning-only EndTurn —
+    // set_goal discipline + Cemri fan-out preamble. Evidence 2026-09-22:
+    // constraints-scheduling orch=1 → 0 tools / result="" (×2); bare (no
+    // set_goal, no fan-out prompt) → 1.0 / 11 tools; act_gate fired 3× then
+    // still 0 tools with placeholder result. Interactive TUI keeps the full
+    // brain.
+    let instructions = if noninteractive {
+        "You are operating headless on a terminal task. Your FIRST response MUST \
+         include a tool call (read/bash/grep/…) to inspect the workspace — never \
+         end_turn with only reasoning or an empty message. Accomplish the task \
+         end-to-end with your tools, then STOP with a concise final answer. Read \
+         before you edit; verify with the shell where possible. Prefer doing the \
+         work yourself with direct tools; only delegate if the work is clearly \
+         parallelizable across independent areas. Write scratch files only under \
+         ./scratch, never the repo root."
+            .to_string()
+    } else {
+        format!(
+            "You are operating headless on a terminal task. Accomplish it end-to-end with \
+             your tools, then STOP with a concise final answer. Read before you edit; \
+             verify with the shell where possible.\n\n## When to delegate vs. fan out\n{}\n\
+             For a broad audit/survey/migration, split the work into several focused, \
+             INDEPENDENT sub-agent tasks (one per area/risk class) and delegate them \
+             together, or run a workflow recipe — don't hand one giant task to a single \
+             sub-agent. Write scratch files only under ./scratch, never the repo root.",
+            heartbit::MULTI_AGENT_SELECTION_GUIDANCE,
+        )
+    };
 
     let mut builder = heartbit::Orchestrator::builder(provider.clone())
         .entry_agent(tools)
         .guardrail(scope_guard)
         .entry_workflow_recipes(recipe_meta)
         .max_turns(entry_max_turns)
+        .max_tokens(entry_max_tokens)
         .workspace(cwd.clone())
         .instruction_text(instructions)
         .on_text(on_text)
         .observability_mode(observability_mode)
-        // Judge-gated completion: headless, the "fast" judge role = same provider.
-        .entry_goal_judge(provider)
         // Doom-loop detection (same as the TUI): identical batches abort fast.
         .max_identical_tool_calls(3)
         .max_fuzzy_identical_tool_calls(5);
+    // Judge-gated completion is interactive/TUI value; skip on TB2 headless
+    // so the entry prompt does not demand set_goal before acting.
+    if !noninteractive {
+        builder = builder.entry_goal_judge(provider);
+    }
     if let Some(cb) = on_approval {
         builder = builder.on_approval(cb);
     }

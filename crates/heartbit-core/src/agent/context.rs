@@ -143,6 +143,16 @@ impl AgentContext {
         self
     }
 
+    /// Update effort mid-run (adaptive thinking budget re-resolution).
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.reasoning_effort = effort;
+    }
+
+    /// Update max_tokens mid-run (adaptive thinking budget re-resolution).
+    pub(crate) fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = max_tokens;
+    }
+
     /// The live conversation — snapshotted at tool dispatch for
     /// `ExecutionContext.transcript` (introspection tools like the advisor).
     pub(crate) fn messages(&self) -> &[Message] {
@@ -167,6 +177,39 @@ impl AgentContext {
 
     pub(crate) fn add_assistant_message(&mut self, message: Message) {
         self.messages.push(message);
+    }
+
+    /// Replace empty/whitespace-only text on the last assistant message with a
+    /// placeholder. Providers (Anthropic especially) reject empty assistant
+    /// content on the next request — needed when an empty EndTurn is redirected
+    /// by a stop gate (Qwen reasoning-only stalls).
+    pub(crate) fn ensure_last_assistant_nonempty(&mut self, placeholder: &str) {
+        let Some(msg) = self.messages.last_mut() else {
+            return;
+        };
+        if msg.role != Role::Assistant {
+            return;
+        }
+        let text: String = msg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !text.trim().is_empty() {
+            return;
+        }
+        // Drop blank text blocks; keep any tool_use blocks if present.
+        msg.content
+            .retain(|b| !matches!(b, ContentBlock::Text { text } if text.trim().is_empty()));
+        msg.content.insert(
+            0,
+            ContentBlock::Text {
+                text: placeholder.to_string(),
+            },
+        );
     }
 
     pub(crate) fn add_user_message(&mut self, text: impl Into<String>) {

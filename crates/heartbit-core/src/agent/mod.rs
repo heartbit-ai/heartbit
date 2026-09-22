@@ -511,7 +511,8 @@ mod tests {
 
     #[tokio::test]
     async fn agent_errors_on_max_tokens() {
-        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+        // truncated_rescue budget is 3; a 4th consecutive Truncated fails.
+        let truncated = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "truncated...".into(),
             }],
@@ -519,7 +520,13 @@ mod tests {
             reasoning: None,
             usage: TokenUsage::default(),
             model: None,
-        }]));
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            truncated.clone(),
+            truncated.clone(),
+            truncated.clone(),
+            truncated,
+        ]));
 
         let runner = AgentRunner::builder(provider)
             .name("test")
