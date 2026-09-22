@@ -141,9 +141,10 @@ pub fn parse_reasoning_effort(s: &str) -> Result<ReasoningEffort, Error> {
         "high" => Ok(ReasoningEffort::High),
         "medium" => Ok(ReasoningEffort::Medium),
         "low" => Ok(ReasoningEffort::Low),
-        "none" => Ok(ReasoningEffort::None),
+        // "off" is the TUI profile spelling; same as "none".
+        "none" | "off" => Ok(ReasoningEffort::None),
         _ => Err(Error::Config(format!(
-            "invalid reasoning_effort '{}': must be high, medium, low, or none",
+            "invalid reasoning_effort '{}': must be high, medium, low, none, or off",
             s
         ))),
     }

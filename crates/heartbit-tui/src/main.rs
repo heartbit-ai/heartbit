@@ -562,6 +562,12 @@ fn effort_for_provider(
         return None;
     }
     match level {
+        // Custom OpenAI-compat (vLLM Qwen): Off must send ReasoningEffort::None
+        // so OpenAiCompatProvider can set chat_template_kwargs.enable_thinking=
+        // false. Omitting the field leaves vLLM thinking ON (live probe
+        // 2026-09-22: hello → 184 chars of reasoning). OpenRouter Off still
+        // omits — we never used effort=none there before.
+        app::EffortLevel::Off if has_custom_endpoint => Some(heartbit_core::ReasoningEffort::None),
         app::EffortLevel::Off => None,
         app::EffortLevel::Low => Some(ReasoningEffort::Low),
         app::EffortLevel::Medium => Some(ReasoningEffort::Medium),
@@ -2352,11 +2358,17 @@ mod effort_gating_tests {
             effort_for_provider(app::EffortLevel::High, None, None),
             None
         );
-        // Off always omits the field — never ReasoningEffort::None, which would
-        // send reasoning:{"effort":"none"}, a request the TUI never sent before.
+        // Off on OpenRouter still omits the field.
         assert_eq!(
             effort_for_provider(app::EffortLevel::Off, None, Some("sk-or-x")),
             None
+        );
+        // Off on a custom OpenAI-compat endpoint (vLLM Qwen) must send
+        // ReasoningEffort::None so the provider can disable thinking via
+        // chat_template_kwargs (live probe 2026-09-22).
+        assert_eq!(
+            effort_for_provider(app::EffortLevel::Off, Some("https://example.com/v1"), None),
+            Some(ReasoningEffort::None)
         );
         // A blank/whitespace-only custom endpoint must NOT count as "has a
         // custom endpoint" — `build_provider` treats it the same way

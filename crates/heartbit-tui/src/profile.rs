@@ -34,8 +34,9 @@ pub const BUILTINS: &[ModelProfile] = &[
         // null + finish=length; max_tokens=256 → content "pong". 8192 leaves
         // room for tool rounds without Truncated.
         max_tokens: Some(8192),
-        // Effort off: this vLLM build already emits a `reasoning` field; sending
-        // OpenRouter-style `reasoning.effort` is unnecessary noise.
+        // Effort off → ReasoningEffort::None on the custom-endpoint path so
+        // OpenAiCompat can send chat_template_kwargs.enable_thinking=false
+        // (vLLM Qwen ignores OpenRouter-style reasoning.effort=none).
         reasoning_effort: Some("off"),
         // OpenRouter cache_control breakpoints are meaningless on a private
         // vLLM endpoint and can confuse some OpenAI-compat parsers.
@@ -43,7 +44,7 @@ pub const BUILTINS: &[ModelProfile] = &[
         // Default OpenAiCompat client is 120s; a Koyeb cold start can burn
         // ~100s before the first byte. 300s covers restart + first completion.
         http_timeout_secs: Some(300),
-        summary: "Qwen on vLLM/OpenAI-compat (cold-start tolerant, reasoning-safe max_tokens)",
+        summary: "Qwen on vLLM/OpenAI-compat (thinking off by default, cold-start tolerant)",
     },
     ModelProfile {
         id: "openrouter-default",
