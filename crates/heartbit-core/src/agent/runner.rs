@@ -125,6 +125,9 @@ fn is_prose_question_battery(text: &str) -> bool {
 /// True when `text` announces imminent first-person action — the
 /// narrate-then-stop failure mode ("Je vais créer… Laisse-moi d'abord
 /// vérifier…" then end_turn with zero tool calls; live session 6a2552a9).
+/// Also matches Qwen reasoning-only stalls ("First, I'll read…") when the
+/// caller passes `response.reasoning` (TB2 constraints-scheduling orch=1,
+/// 2026-09-22: empty content, intent only in reasoning, act_gate missed).
 /// Deliberately small fr/en marker list; combined with the zero-work
 /// condition by the caller, so a closing "let me know" after real work
 /// never triggers.
@@ -882,6 +885,10 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Act-gate: tools executed this request + one-shot redirect flag.
             let mut request_tool_calls: u32 = 0;
             let mut intent_nudged = false;
+            // Empty-stall: separate one-shot so announce→empty still nudges
+            // (TB2 constraints orch=1: act_gate fired on text announce, then
+            // a blank EndTurn exited with result="" / 0 tools).
+            let mut empty_stall_nudged = false;
             // Plan-gate state: wish phrasing of the CURRENT request, whether a
             // plan artifact (question/todos/goal/scope/recipe) was produced,
             // cumulative mutations, and the one-shot flag.
@@ -1782,18 +1789,41 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // answer (live finding 6a2552a9: "Je vais créer… Laisse-
                     // moi d'abord vérifier…" then silence). One-shot redirect:
                     // do the work now, or ask properly.
+                    //
+                    // Reasoning models (Qwen-on-vLLM) often put the announce in
+                    // `response.reasoning` with empty `content` — then end_turn.
+                    // `last_assistant_text()` is empty so the text-only check
+                    // missed it (live repro 2026-09-22: reasoning="First, I'll
+                    // read the three calendar files.", text="", tool_call_count=0).
+                    let last_text = ctx.last_assistant_text().unwrap_or_default();
+                    let reasoning = response.reasoning.as_deref().unwrap_or("");
+                    let announced = announces_intent(&last_text)
+                        || (last_text.trim().is_empty() && announces_intent(reasoning));
                     if !llm_interrupted
                         && !intent_nudged
                         && request_tool_calls == 0
-                        && ctx.last_assistant_text().is_some_and(|t| announces_intent(&t))
+                        && announced
                     {
                         intent_nudged = true;
                         debug!(agent = %self.name, "announced intent with zero work; act gate");
                         self.emit(AgentEvent::GateFired {
                             agent: self.name.clone(),
                             gate: "act_gate".into(),
-                            reason: "announced intent, zero tools".into(),
+                            reason: if last_text.trim().is_empty() {
+                                "announced intent in reasoning, zero tools".into()
+                            } else {
+                                "announced intent, zero tools".into()
+                            },
                         });
+
+                        // Empty content + continue would 400 on Anthropic; keep
+                        // a visible placeholder when the announce lived only in
+                        // reasoning.
+                        if last_text.trim().is_empty() {
+                            ctx.ensure_last_assistant_nonempty(
+                                "[announced next steps in reasoning — executing now]",
+                            );
+                        }
 
                         ctx.add_user_message(
                             "[act gate] You announced what you are about to do, then \
@@ -1802,6 +1832,39 @@ impl<P: LlmProvider> AgentRunner<P> {
                              request, plan first (todos with acceptance criteria, \
                              set_goal). Otherwise EXECUTE it now with your tools in this \
                              same turn — never stop on an announcement."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+
+                    // Empty-stall gate: EndTurn with ZERO tools and empty
+                    // content (blank or reasoning-only without announce
+                    // markers). Separate one-shot from act_gate so a text
+                    // announce redirect followed by another empty EndTurn
+                    // still gets one nudge (TB2 constraints-scheduling
+                    // orch=1 r2: stdout announced, result="", 0 tools).
+                    if !llm_interrupted
+                        && !empty_stall_nudged
+                        && request_tool_calls == 0
+                        && last_text.trim().is_empty()
+                    {
+                        empty_stall_nudged = true;
+                        debug!(agent = %self.name, "empty end_turn with zero work; act gate");
+                        self.emit(AgentEvent::GateFired {
+                            agent: self.name.clone(),
+                            gate: "act_gate".into(),
+                            reason: "empty end_turn, zero tools".into(),
+                        });
+
+                        ctx.ensure_last_assistant_nonempty(
+                            "[empty response — continuing with tools]",
+                        );
+
+                        ctx.add_user_message(
+                            "[act gate] You stopped with an empty answer and no tool \
+                             calls. This task requires using your tools NOW — read \
+                             files, run commands, write outputs — then continue. Never \
+                             stop on silent reasoning or a blank message."
                                 .to_string(),
                         );
                         continue;
@@ -1992,6 +2055,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         intent_nudged = false;
+                        empty_stall_nudged = false;
                         // Per-request continuation budgets re-arm with the
                         // other gates: a second set_goal (or a new red-verify
                         // cycle) on a later request gets its full budget.
@@ -5302,7 +5366,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn act_gate_is_one_shot() {
         // If the model announces again right after the redirect, let it
-        // through — bounded, no loop.
+        // through — bounded, no loop. (Empty second turns are handled by the
+        // separate empty-stall one-shot below.)
         let provider = Arc::new(MockProvider::new(vec![
             MockProvider::text_response("Je vais créer le fichier maintenant.", 10, 5),
             MockProvider::text_response("Je vais vraiment le faire bientôt.", 10, 5),
@@ -5320,6 +5385,120 @@ mod tests {
             "second announce passes through"
         );
         assert_eq!(provider.captured_requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_only_announce_triggers_act_gate() {
+        // Live finding (TB2 constraints-scheduling orch=1, 2026-09-22): Qwen
+        // put "First, I'll read the three calendar files." in reasoning with
+        // empty content + end_turn + zero tools. Text-only act_gate missed it.
+        let mut reasoning_only = MockProvider::text_response("", 10, 5);
+        reasoning_only.reasoning =
+            Some("First, I'll read the three calendar files.\n".into());
+        let provider = Arc::new(MockProvider::new(vec![
+            reasoning_only,
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("read the calendars").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[act gate]")),
+            "reasoning-only announce must be redirected: {texts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_end_turn_after_announce_triggers_empty_stall() {
+        // After a text announce redirect, a blank EndTurn must still get one
+        // nudge (otherwise result="" / 0 tools — TB2 constraints orch=1 r2).
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("I'll start by examining the calendars.", 10, 5),
+            MockProvider::text_response("", 10, 5), // empty after act_gate
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(8)
+            .build()
+            .unwrap();
+        let out = runner.execute("schedule a meeting").await.unwrap();
+        assert_eq!(out.result, "done");
+        assert_eq!(
+            provider.captured_requests.lock().unwrap().len(),
+            4,
+            "announce + empty stall + tool + done"
+        );
+        let reqs = provider.captured_requests.lock().unwrap();
+        let gate_count = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if text.contains("[act gate]") => Some(text.as_str()),
+                _ => None,
+            })
+            .count();
+        assert!(
+            gate_count >= 2,
+            "both announce and empty-stall gates must fire (got {gate_count})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_end_turn_without_announce_triggers_empty_stall() {
+        // Blank EndTurn + zero tools (no announce markers in text/reasoning)
+        // is still a stall — one-shot redirect to use tools.
+        let provider = Arc::new(MockProvider::new(vec![
+            MockProvider::text_response("", 10, 5),
+            tool_use_named("work", 10),
+            MockProvider::text_response("done", 10, 1),
+        ]));
+        let runner = AgentRunner::builder(provider.clone())
+            .name("test")
+            .system_prompt("sys")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_turns(6)
+            .build()
+            .unwrap();
+        let out = runner.execute("do the task").await.unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = provider.captured_requests.lock().unwrap();
+        let texts: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("[act gate]") && t.contains("empty answer")),
+            "empty stall must redirect: {texts:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
