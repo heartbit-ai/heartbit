@@ -2733,19 +2733,35 @@ async fn run_entry_agent_orchestrator(
         heartbit::SetScopeTool::new(scope_guard.clone()).with_workspace(cwd.clone()),
     ));
 
-    // Instructions = base + the Cemri orchestration-selection guidance, wired into
-    // the entry agent so it fans broad tasks out instead of overloading one
-    // sub-agent (the guidance is a public const that no prompt used before).
-    let instructions = format!(
-        "You are operating headless on a terminal task. Accomplish it end-to-end with \
-         your tools, then STOP with a concise final answer. Read before you edit; \
-         verify with the shell where possible.\n\n## When to delegate vs. fan out\n{}\n\
-         For a broad audit/survey/migration, split the work into several focused, \
-         INDEPENDENT sub-agent tasks (one per area/risk class) and delegate them \
-         together, or run a workflow recipe — don't hand one giant task to a single \
-         sub-agent. Write scratch files only under ./scratch, never the repo root.",
-        heartbit::MULTI_AGENT_SELECTION_GUIDANCE,
-    );
+    // Headless NONINTERACTIVE (TB2): keep the entry agent + builtins, but strip
+    // the TUI "brain" extras that push Qwen into reasoning-only EndTurn —
+    // set_goal discipline + Cemri fan-out preamble. Evidence 2026-09-22:
+    // constraints-scheduling orch=1 → 0 tools / result="" (×2); bare (no
+    // set_goal, no fan-out prompt) → 1.0 / 11 tools; act_gate fired 3× then
+    // still 0 tools with placeholder result. Interactive TUI keeps the full
+    // brain.
+    let instructions = if noninteractive {
+        "You are operating headless on a terminal task. Your FIRST response MUST \
+         include a tool call (read/bash/grep/…) to inspect the workspace — never \
+         end_turn with only reasoning or an empty message. Accomplish the task \
+         end-to-end with your tools, then STOP with a concise final answer. Read \
+         before you edit; verify with the shell where possible. Prefer doing the \
+         work yourself with direct tools; only delegate if the work is clearly \
+         parallelizable across independent areas. Write scratch files only under \
+         ./scratch, never the repo root."
+            .to_string()
+    } else {
+        format!(
+            "You are operating headless on a terminal task. Accomplish it end-to-end with \
+             your tools, then STOP with a concise final answer. Read before you edit; \
+             verify with the shell where possible.\n\n## When to delegate vs. fan out\n{}\n\
+             For a broad audit/survey/migration, split the work into several focused, \
+             INDEPENDENT sub-agent tasks (one per area/risk class) and delegate them \
+             together, or run a workflow recipe — don't hand one giant task to a single \
+             sub-agent. Write scratch files only under ./scratch, never the repo root.",
+            heartbit::MULTI_AGENT_SELECTION_GUIDANCE,
+        )
+    };
 
     let mut builder = heartbit::Orchestrator::builder(provider.clone())
         .entry_agent(tools)
@@ -2757,11 +2773,14 @@ async fn run_entry_agent_orchestrator(
         .instruction_text(instructions)
         .on_text(on_text)
         .observability_mode(observability_mode)
-        // Judge-gated completion: headless, the "fast" judge role = same provider.
-        .entry_goal_judge(provider)
         // Doom-loop detection (same as the TUI): identical batches abort fast.
         .max_identical_tool_calls(3)
         .max_fuzzy_identical_tool_calls(5);
+    // Judge-gated completion is interactive/TUI value; skip on TB2 headless
+    // so the entry prompt does not demand set_goal before acting.
+    if !noninteractive {
+        builder = builder.entry_goal_judge(provider);
+    }
     if let Some(cb) = on_approval {
         builder = builder.on_approval(cb);
     }
