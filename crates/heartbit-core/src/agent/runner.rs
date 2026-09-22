@@ -887,10 +887,11 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Empty-arg doom soft-resets forever at the hard-stop path (TB2
             // openssl/filter-js still aborted after a one-shot rescue).
             // max_turns bounds the loop.
-            // One-shot rescue when a turn burns max_tokens on reasoning/prose
-            // with zero tool calls (TB2 batch2 filter-js-from-html: Truncated
-            // at 16384 → NonZeroExit). Nudge once to continue via tools.
-            let mut truncated_rescued = false;
+            // Bounded rescue when a turn burns max_tokens on reasoning/prose
+            // with zero tool calls (TB2 filter-js: Truncated at 16384; one
+            // rescue was not enough on rerun2). Same budget as act_gate.
+            let mut truncated_rescues: u32 = 0;
+            const MAX_TRUNCATED_RESCUES: u32 = 3;
             let mut last_model_name: Option<String> = None;
             // Reactive overflow-recovery ladder (prevents both infinite
             // compaction loops AND the single-shot dead-end): 0 = untried,
@@ -1751,10 +1752,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // (TB2 filter-js-from-html, 16384 tokens, 2026-09-22).
                     // One rescue per request: ask for a short tool call next.
                     if response.stop_reason == StopReason::MaxTokens {
-                        if !truncated_rescued {
-                            truncated_rescued = true;
+                        if truncated_rescues < MAX_TRUNCATED_RESCUES {
+                            truncated_rescues += 1;
                             debug!(
                                 agent = %self.name,
+                                nudge = truncated_rescues,
                                 "truncated rescue; nudging for concise tool use"
                             );
                             self.emit(AgentEvent::GateFired {
@@ -1762,12 +1764,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                                 gate: "truncated_rescue".into(),
                                 reason: "max_tokens with zero tool calls".into(),
                             });
-                            ctx.add_user_message(
+                            ctx.add_user_message(format!(
                                 "[truncated] Your previous reply hit max_tokens before \
-                                 any tool call. Continue NOW with a short tool call \
+                                 any tool call (nudge {truncated_rescues}/{MAX_TRUNCATED_RESCUES}). \
+                                 Continue NOW with a short tool call \
                                  (e.g. bash/read/write) — no long reasoning."
-                                    .to_string(),
-                            );
+                            ));
                             continue;
                         }
                         self.emit(AgentEvent::RunFailed {
@@ -1848,9 +1850,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // returned 502 empty-choices on the forced turn.)
                     let last_text = ctx.last_assistant_text().unwrap_or_default();
                     let reasoning = response.reasoning.as_deref().unwrap_or("");
-                    let announced =
-                        announces_intent(&last_text) || announces_intent(reasoning);
                     let empty = last_text.trim().is_empty();
+                    // Reasoning "Let me think…" is normal chain-of-thought when
+                    // content already answers; only treat reasoning announce as
+                    // a stall when content is empty (TB2 constraints orch=1).
+                    let announced = announces_intent(&last_text)
+                        || (empty && announces_intent(reasoning));
                     if !llm_interrupted
                         && request_tool_calls == 0
                         && act_gate_nudges < MAX_ACT_GATE_NUDGES
@@ -1886,6 +1891,30 @@ impl<P: LlmProvider> AgentRunner<P> {
                              Emit a tool_use / function call immediately."
                         ));
                         continue;
+                    }
+                    // Budget exhausted and still no productive tools — fail
+                    // closed (TB2 openssl rerun2: exit 0 with result
+                    // "[stalled — calling tools now]" and reward 0).
+                    if !llm_interrupted
+                        && request_tool_calls == 0
+                        && act_gate_nudges >= MAX_ACT_GATE_NUDGES
+                        && (announced || empty)
+                    {
+                        self.emit(AgentEvent::RunFailed {
+                            agent: self.name.clone(),
+                            error: format!(
+                                "stalled after {MAX_ACT_GATE_NUDGES} act_gate nudges \
+                                 with zero productive tools"
+                            ),
+                            partial_usage: total_usage,
+                        });
+                        return Err((
+                            Error::Agent(format!(
+                                "stalled after {MAX_ACT_GATE_NUDGES} act_gate nudges \
+                                 with zero productive tools"
+                            )),
+                            total_usage,
+                        ));
                     }
 
                     // STUDY contract: a study must END in a proposal + an
@@ -2073,7 +2102,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         act_gate_nudges = 0;
-                        truncated_rescued = false;
+                        truncated_rescues = 0;
                         doom_tracker = DoomLoopTracker::new();
                         // Per-request continuation budgets re-arm with the
                         // other gates: a second set_goal (or a new red-verify
@@ -2857,6 +2886,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                             .await
                     }
                 };
+                let productive_this_batch = batch_records
+                    .iter()
+                    .chain(barrier_records.iter())
+                    .filter(|r| !r.is_error || !input_lacks_string_payload(&r.input))
+                    .count() as u32;
                 tool_call_records.extend(batch_records);
                 tool_call_records.extend(barrier_records);
                 results.extend(barrier_results);
@@ -3050,7 +3084,10 @@ impl<P: LlmProvider> AgentRunner<P> {
                 // that the squad exists (prompt guidance alone has proven
                 // insufficient on mid-tier models — same rationale as the
                 // doom-loop and replan gates).
-                request_tool_calls += allowed_calls.len() as u32;
+                // Act-gate productivity: empty-arg / schema-invalid calls do
+                // NOT disarm the gate (TB2 nginx rerun2: bash({}) then empty
+                // EndTurn). Successful executes and real-arg failures do.
+                request_tool_calls += productive_this_batch;
                 if let Some(ref nudge) = self.delegation_nudge {
                     nudge_tool_calls += allowed_calls.len() as u32;
                     if allowed_calls
@@ -5434,9 +5471,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn act_gate_is_one_shot() {
-        // After MAX_ACT_GATE_NUDGES redirects, a further announce passes
-        // through — bounded, no infinite loop.
+    async fn act_gate_exhausted_fails_closed() {
+        // After MAX_ACT_GATE_NUDGES redirects with still zero productive tools,
+        // fail closed (TB2 openssl rerun2: exit 0 with "[stalled…]" was reward 0).
         let provider = Arc::new(MockProvider::new(vec![
             MockProvider::text_response("Je vais créer le fichier maintenant.", 10, 5),
             MockProvider::text_response("Je vais vraiment le faire bientôt.", 10, 5),
@@ -5450,16 +5487,19 @@ mod tests {
             .max_turns(8)
             .build()
             .unwrap();
-        let out = runner.execute("crée un fichier").await.unwrap();
+        let err = runner.execute("crée un fichier").await.unwrap_err();
+        let err = match err {
+            Error::WithPartialUsage { source, .. } => *source,
+            e => e,
+        };
         assert!(
-            out.result.contains("passer"),
-            "announce after budget exhausted passes through: {}",
-            out.result
+            matches!(err, Error::Agent(ref m) if m.contains("act_gate")),
+            "exhausted act_gate must fail closed, got: {err:?}"
         );
         assert_eq!(
             provider.captured_requests.lock().unwrap().len(),
             4,
-            "3 nudges + final announce"
+            "3 nudges + final announce that fails closed"
         );
     }
 

@@ -33,8 +33,9 @@ export HEARTBIT_ORCHESTRATOR="${HEARTBIT_ORCHESTRATOR:-1}"
 export HEARTBIT_SUB_AGENT_MAX_TURNS="${HEARTBIT_SUB_AGENT_MAX_TURNS:-200}"
 export HEARTBIT_MAX_TURNS="${HEARTBIT_MAX_TURNS:-100}"
 # Reasoning models burn tokens before content; 8192 still Truncated on
-# constraints-scheduling orch=1 (TB2 2026-09-22 fix3). 16384 → reward 1.0.
-export HEARTBIT_MAX_TOKENS="${HEARTBIT_MAX_TOKENS:-16384}"
+# constraints-scheduling orch=1 (TB2 2026-09-22 fix3). 16384 cleared
+# constraints but filter-js still Truncated — default 32768 + harness rescue.
+export HEARTBIT_MAX_TOKENS="${HEARTBIT_MAX_TOKENS:-32768}"
 # Koyeb cold start can exceed the OpenAiCompat 120s default.
 export HEARTBIT_OPENAI_TIMEOUT_SECS="${HEARTBIT_OPENAI_TIMEOUT_SECS:-300}"
 export HEARTBIT_PROMPT_CACHING=0

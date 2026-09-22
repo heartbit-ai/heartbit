@@ -2692,10 +2692,10 @@ async fn run_entry_agent_orchestrator(
         parse_env("HEARTBIT_SUB_AGENT_MAX_TURNS").unwrap_or(CLI_SUB_AGENT_MAX_TURNS);
     // Reasoning models (Qwen-on-vLLM) spend tokens in `message.reasoning`
     // before `content`. 4096 truncates mid-thought; 8192 still Truncated on
-    // constraints-scheduling after the slim headless prompt (TB2 2026-09-22
-    // fix3). 16384 cleared constraints (fix4: reward 1.0) but filter-js still
-    // Truncated once — runner now one-shot-rescues that path.
-    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(16384);
+    // constraints-scheduling (TB2 2026-09-22 fix3). 16384 cleared constraints
+    // but filter-js still Truncated twice — runner rescues up to 3 times and
+    // we raise the default headroom.
+    let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(32768);
 
     // Entry agent's direct tools: builtins FIRST.
     let mut tools = {
