@@ -884,14 +884,14 @@ impl<P: LlmProvider> AgentRunner<P> {
             let mut prose_question_nudged = false;
             // Act-gate: tools executed this request + bounded stall redirects.
             // Qwen-on-vLLM under the entry-agent prompt (TB2 constraints
-            // orch=1, 2026-09-22) can burn two one-shots (reasoning announce +
-            // empty) then emit a non-announce placeholder still with zero
-            // tools — so we budget three redirects and force tool_choice=Any
-            // on the next LLM call after each.
+            // orch=1, 2026-09-22) can burn a text announce then empty EndTurn
+            // with zero tools — budget three redirects. Do NOT force
+            // tool_choice=Any against this OpenAI-compat endpoint: live TB2
+            // 2026-09-22 returned HTTP 502 "empty choices in all streaming
+            // chunks" on the forced turn.
             let mut request_tool_calls: u32 = 0;
             let mut act_gate_nudges: u32 = 0;
             const MAX_ACT_GATE_NUDGES: u32 = 3;
-            let mut force_tool_choice_next = false;
             // Plan-gate state: wish phrasing of the CURRENT request, whether a
             // plan artifact (question/todos/goal/scope/recipe) was produced,
             // cumulative mutations, and the one-shot flag.
@@ -991,16 +991,6 @@ impl<P: LlmProvider> AgentRunner<P> {
                 } else {
                     ctx.to_request()
                 };
-
-                // After an act-gate stall redirect, force at least one tool call
-                // on the next turn — Qwen under the orch prompt ignores plain
-                // text nudges (live: two gates fired, third turn still EndTurn
-                // with 0 tools). Maps to OpenAI `tool_choice=required`.
-                if force_tool_choice_next && !request.tools.is_empty() {
-                    request.tool_choice = Some(crate::llm::types::ToolChoice::Any);
-                    force_tool_choice_next = false;
-                    debug!(agent = %self.name, "act gate: forcing tool_choice=Any on this turn");
-                }
 
                 // Long-horizon planning (recitation): re-surface the live plan
                 // (open todos, read from the actual store) at the context tail
@@ -1805,8 +1795,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                     //   I'll read…", text="", end_turn — text-only check missed
                     // - same day local repro after two one-shots: third turn
                     //   still EndTurn with 0 tools (placeholder text)
-                    // Budget MAX_ACT_GATE_NUDGES redirects per request, and
-                    // force tool_choice=Any on the following LLM call.
+                    // Budget MAX_ACT_GATE_NUDGES redirects per request.
+                    // (tool_choice=Any was tried then dropped: Qwen/vLLM
+                    // returned 502 empty-choices on the forced turn.)
                     let last_text = ctx.last_assistant_text().unwrap_or_default();
                     let reasoning = response.reasoning.as_deref().unwrap_or("");
                     let announced =
@@ -1818,7 +1809,6 @@ impl<P: LlmProvider> AgentRunner<P> {
                         && (announced || empty)
                     {
                         act_gate_nudges += 1;
-                        force_tool_choice_next = true;
                         let reason = if announced && empty {
                             "announced intent in reasoning, zero tools"
                         } else if announced {
@@ -1844,7 +1834,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                              (nudge {act_gate_nudges}/{MAX_ACT_GATE_NUDGES}). \
                              EXECUTE the task NOW: your next response MUST include \
                              at least one tool call (read/bash/write/…). Do not \
-                             narrate, do not answer empty, do not stop on reasoning."
+                             narrate, do not answer empty, do not stop on reasoning. \
+                             Emit a tool_use / function call immediately."
                         ));
                         continue;
                     }
@@ -2034,7 +2025,6 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         act_gate_nudges = 0;
-                        force_tool_choice_next = false;
                         // Per-request continuation budgets re-arm with the
                         // other gates: a second set_goal (or a new red-verify
                         // cycle) on a later request gets its full budget.
@@ -5394,11 +5384,6 @@ mod tests {
         let out = runner.execute("read the calendars").await.unwrap();
         assert_eq!(out.result, "done");
         let reqs = provider.captured_requests.lock().unwrap();
-        assert_eq!(
-            reqs[1].tool_choice,
-            Some(crate::llm::types::ToolChoice::Any),
-            "act gate must force tool_choice=Any on the next turn"
-        );
         let texts: Vec<String> = reqs[1]
             .messages
             .iter()
@@ -5453,20 +5438,12 @@ mod tests {
             gate_count >= 2,
             "both announce and empty-stall gates must fire (got {gate_count})"
         );
-        assert_eq!(
-            reqs[1].tool_choice,
-            Some(crate::llm::types::ToolChoice::Any)
-        );
-        assert_eq!(
-            reqs[2].tool_choice,
-            Some(crate::llm::types::ToolChoice::Any)
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_end_turn_without_announce_triggers_empty_stall() {
         // Blank EndTurn + zero tools (no announce markers in text/reasoning)
-        // is still a stall — redirect + force tools.
+        // is still a stall — redirect within the budget.
         let provider = Arc::new(MockProvider::new(vec![
             MockProvider::text_response("", 10, 5),
             tool_use_named("work", 10),
@@ -5482,10 +5459,6 @@ mod tests {
         let out = runner.execute("do the task").await.unwrap();
         assert_eq!(out.result, "done");
         let reqs = provider.captured_requests.lock().unwrap();
-        assert_eq!(
-            reqs[1].tool_choice,
-            Some(crate::llm::types::ToolChoice::Any)
-        );
         let texts: Vec<String> = reqs[1]
             .messages
             .iter()
