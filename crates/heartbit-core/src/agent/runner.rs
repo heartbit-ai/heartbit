@@ -260,19 +260,21 @@ const ESCALATION_AFTER_FAILURES: u32 = 3;
 /// hard stop (live finding 6a25d21b: the soft warning was ignored 3→4→5).
 const DOOM_HARD_STOP_MARGIN: u32 = 2;
 
-/// True when a tool call's JSON input is empty or only blank strings — the
-/// Qwen empty-`{}` failure mode (TB2 smoke batch2: bash without `command`).
+/// True when a tool call's JSON input carries no non-empty string payload —
+/// the Qwen empty-arg failure mode (TB2 smoke batch2: bash `{}`, and also
+/// `{"timeout": 60000}` with no `command`, which previously escaped the
+/// empty-object check and still doom-aborted openssl/filter-js).
 fn tool_call_args_empty(tc: &crate::llm::types::ToolCall) -> bool {
-    match &tc.input {
-        serde_json::Value::Object(map) if map.is_empty() => true,
-        serde_json::Value::Object(map) => map.values().all(|v| match v {
-            serde_json::Value::Null => true,
-            serde_json::Value::String(s) => s.trim().is_empty(),
-            serde_json::Value::Object(m) if m.is_empty() => true,
-            serde_json::Value::Array(a) if a.is_empty() => true,
-            _ => false,
-        }),
+    input_lacks_string_payload(&tc.input)
+}
+
+fn input_lacks_string_payload(input: &serde_json::Value) -> bool {
+    match input {
+        serde_json::Value::Object(map) => !map
+            .values()
+            .any(|v| matches!(v, serde_json::Value::String(s) if !s.trim().is_empty())),
         serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
         _ => false,
     }
 }
@@ -882,10 +884,9 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
-            // One-shot rescue when a hard doom abort would fire on empty-arg
-            // tool calls (TB2 batch2: bash {} ×5 → NonZeroExit). Reset the
-            // tracker, inject a schema example, and let the model continue.
-            let mut empty_arg_doom_rescued = false;
+            // Empty-arg doom soft-resets forever at the hard-stop path (TB2
+            // openssl/filter-js still aborted after a one-shot rescue).
+            // max_turns bounds the loop.
             // One-shot rescue when a turn burns max_tokens on reasoning/prose
             // with zero tool calls (TB2 batch2 filter-js-from-html: Truncated
             // at 16384 → NonZeroExit). Nudge once to continue via tools.
@@ -2072,7 +2073,6 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         act_gate_nudges = 0;
-                        empty_arg_doom_rescued = false;
                         truncated_rescued = false;
                         doom_tracker = DoomLoopTracker::new();
                         // Per-request continuation budgets re-arm with the
@@ -2305,14 +2305,12 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // had to interrupt by hand).
                         if doom_tracker.count() >= threshold + DOOM_HARD_STOP_MARGIN {
                             // Empty-arg rescue (TB2 smoke batch2 2026-09-22):
-                            // Qwen hammered bash with `{}` five times; soft
-                            // warnings said "try a different approach" but not
-                            // "pass command". Aborting → NonZeroExit → reward 0.
-                            // One rescue: reset tracker + concrete schema example.
-                            if !empty_arg_doom_rescued
-                                && tool_calls.iter().all(tool_call_args_empty)
-                            {
-                                empty_arg_doom_rescued = true;
+                            // Qwen hammered bash with `{}` / timeout-only args;
+                            // aborting → NonZeroExit → reward 0. One rescue was
+                            // not enough (openssl/filter-js still aborted on
+                            // the second hard stop). Keep soft-resetting empty
+                            // loops; max_turns is the bound.
+                            if tool_calls.iter().all(tool_call_args_empty) {
                                 doom_tracker = DoomLoopTracker::new();
                                 debug!(
                                     agent = %self.name,
@@ -7164,6 +7162,13 @@ mod tests {
             input: serde_json::json!({"command": "  "}),
         };
         assert!(super::tool_call_args_empty(&blank_cmd));
+        // timeout-only still has no string payload (TB2 openssl/nginx).
+        let timeout_only = crate::llm::types::ToolCall {
+            id: "2b".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"timeout": 60000}),
+        };
+        assert!(super::tool_call_args_empty(&timeout_only));
         let real = crate::llm::types::ToolCall {
             id: "3".into(),
             name: "bash".into(),
@@ -7208,10 +7213,13 @@ mod tests {
         );
     }
 
-    // After the one-shot rescue, a second empty-arg hard doom must still abort.
+    // After the first rescue, further empty-arg hard stops must keep
+    // soft-resetting (TB2 openssl/filter-js aborted on the second hard stop
+    // when rescue was one-shot). Never DoomLoopAborted for empty args.
     #[tokio::test(flavor = "multi_thread")]
-    async fn empty_arg_doom_rescue_only_once() {
-        let responses: Vec<_> = (0..10).map(|_| tool_use_named("work", 1)).collect();
+    async fn empty_arg_doom_keeps_rescuing_until_real_args() {
+        let mut responses: Vec<_> = (0..10).map(|_| tool_use_named("work", 1)).collect();
+        responses.push(MockProvider::text_response("finally", 1, 1));
         let provider = Arc::new(MockProvider::new(responses));
         let runner = AgentRunner::builder(provider)
             .name("t")
@@ -7221,15 +7229,8 @@ mod tests {
             .max_turns(30)
             .build()
             .unwrap();
-        let err = runner.execute("go").await.unwrap_err();
-        let err = match err {
-            Error::WithPartialUsage { source, .. } => *source,
-            e => e,
-        };
-        assert!(
-            matches!(err, Error::DoomLoopAborted(_)),
-            "second empty-arg doom must abort, got: {err:?}"
-        );
+        let out = runner.execute("go").await.unwrap();
+        assert_eq!(out.result, "finally");
     }
 
     // TB2 filter-js-from-html: first MaxTokens with zero tools must nudge, not die.

@@ -201,6 +201,16 @@ pub fn validate_tool_input(
                  tool call's arguments (e.g. file content goes in the tool's \
                  input fields), not in your text response.",
             );
+        } else if input.as_object().is_some_and(|map| {
+            // TB2 nginx/openssl (2026-09-22): Qwen sent {"timeout": 60000}
+            // without `command` — not an empty object, but still no payload.
+            !map.values()
+                .any(|v| matches!(v, serde_json::Value::String(s) if !s.trim().is_empty()))
+        }) {
+            msg.push_str(
+                ". Your arguments have no non-empty string fields — pass the \
+                 required strings (e.g. bash needs {\"command\": \"ls -la\"}).",
+            );
         }
         Err(msg)
     }
@@ -243,6 +253,20 @@ mod tests {
         assert!(
             !err.contains("text response"),
             "partial input must not get the empty-args hint: {err}"
+        );
+        // Number-only args (bash timeout without command) also need a hint.
+        let bash_schema = json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"}
+            },
+            "required": ["command"]
+        });
+        let err = validate_tool_input(&bash_schema, &json!({"timeout": 60000})).unwrap_err();
+        assert!(
+            err.contains("no non-empty string"),
+            "timeout-only must get the string-payload hint, got: {err}"
         );
     }
 
