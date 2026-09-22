@@ -177,8 +177,9 @@ impl PermissionMode {
     }
 }
 
-/// Reasoning-effort level the user selected. `Off` (the default) omits the field
-/// entirely, reproducing today's requests bit-for-bit.
+/// Reasoning-effort level the user selected. `Off` omits the field (or sends
+/// `enable_thinking=false` on OpenAI-compat). `Adaptive` resolves a per-request
+/// budget from prompt complexity (see `thinking_budget`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortLevel {
     #[default]
@@ -186,6 +187,8 @@ pub enum EffortLevel {
     Low,
     Medium,
     High,
+    /// Per-request thinking budget (trivial → off; hard agentic → high).
+    Adaptive,
 }
 
 impl EffortLevel {
@@ -195,6 +198,7 @@ impl EffortLevel {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "adaptive" | "auto" => Some(Self::Adaptive),
             _ => None,
         }
     }
@@ -205,11 +209,18 @@ impl EffortLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Adaptive => "adaptive",
         }
     }
 
-    /// The four levels in picker order.
-    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::High];
+    /// The levels in picker order.
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Adaptive,
+    ];
 }
 
 /// Slash commands offered by the `/` autocomplete menu: (name, description).
@@ -217,7 +228,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "list commands"),
     ("/mode", "set execution mode: normal | plan | yolo"),
     ("/model", "set the model (`/model advisor` for the advisor)"),
-    ("/effort", "set reasoning effort (off|low|medium|high)"),
+    (
+        "/effort",
+        "set reasoning effort (off|low|medium|high|adaptive)",
+    ),
     (
         "/handoff",
         "brief for another session (`/handoff <purpose>`)",
@@ -3262,10 +3276,12 @@ mod tests {
             ("low", EffortLevel::Low),
             ("medium", EffortLevel::Medium),
             ("high", EffortLevel::High),
+            ("adaptive", EffortLevel::Adaptive),
         ] {
             assert_eq!(EffortLevel::parse(s), Some(lvl));
             assert_eq!(lvl.label(), s);
         }
+        assert_eq!(EffortLevel::parse("auto"), Some(EffortLevel::Adaptive));
         assert_eq!(EffortLevel::parse("HIGH"), Some(EffortLevel::High));
         assert_eq!(EffortLevel::parse("turbo"), None);
         assert_eq!(EffortLevel::default(), EffortLevel::Off);

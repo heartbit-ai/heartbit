@@ -143,6 +143,16 @@ impl AgentContext {
         self
     }
 
+    /// Update effort mid-run (adaptive thinking budget re-resolution).
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.reasoning_effort = effort;
+    }
+
+    /// Update max_tokens mid-run (adaptive thinking budget re-resolution).
+    pub(crate) fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = max_tokens;
+    }
+
     /// The live conversation — snapshotted at tool dispatch for
     /// `ExecutionContext.transcript` (introspection tools like the advisor).
     pub(crate) fn messages(&self) -> &[Message] {

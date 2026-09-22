@@ -547,6 +547,10 @@ fn build_provider(
 /// and the sub-agent errors out. `Off` always omits the field — never
 /// `ReasoningEffort::None`, which would emit `reasoning: {"effort":"none"}`, a
 /// request this TUI never sent before this feature.
+///
+/// `Adaptive` returns `None` here: the builder gets
+/// [`OrchestratorBuilder::adaptive_reasoning`] instead, and each request is
+/// scored by `thinking_budget`.
 fn effort_for_provider(
     level: app::EffortLevel,
     custom_endpoint: Option<&str>,
@@ -569,6 +573,7 @@ fn effort_for_provider(
         // omits — we never used effort=none there before.
         app::EffortLevel::Off if has_custom_endpoint => Some(heartbit_core::ReasoningEffort::None),
         app::EffortLevel::Off => None,
+        app::EffortLevel::Adaptive => None,
         app::EffortLevel::Low => Some(ReasoningEffort::Low),
         app::EffortLevel::Medium => Some(ReasoningEffort::Medium),
         app::EffortLevel::High => Some(ReasoningEffort::High),
@@ -1238,7 +1243,17 @@ async fn build_engine(
     if let Some(judge) = entry_goal_judge {
         builder = builder.entry_goal_judge(judge);
     }
-    if let Some(effort) = reasoning_effort {
+    // Adaptive: per-request thinking budget (hello → off; TB2 → high).
+    // Fixed effort: only when the provider gate returned Some.
+    if effort == app::EffortLevel::Adaptive {
+        let has_custom = custom_endpoint
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .is_some();
+        if has_custom || api_key.is_some() {
+            builder = builder.adaptive_reasoning(true);
+        }
+    } else if let Some(effort) = reasoning_effort {
         builder = builder.reasoning_effort(effort);
     }
     // Forwards to the entry runner AND all three sub-agent spawn paths
@@ -1261,9 +1276,13 @@ async fn build_engine(
     // stack (recitation / restore-on-demand / compaction / replan). The gated
     // reasoning effort is applied here (not threaded through
     // `default_sub_agents`'s signature) so its existing unit test call site
-    // stays untouched — same value the entry agent got above.
+    // stays untouched — same value the entry agent got above. Adaptive mode
+    // leaves sub-agent effort unset; `adaptive_reasoning(true)` already marked
+    // them when registered.
     for mut cfg in default_sub_agents(&cwd, &mcp_tools, context_recall, context_window, replan) {
-        cfg.reasoning_effort = reasoning_effort;
+        if effort != app::EffortLevel::Adaptive {
+            cfg.reasoning_effort = reasoning_effort;
+        }
         builder = builder.sub_agent_full(cfg);
     }
     let orch = builder.build()?;
@@ -2369,6 +2388,15 @@ mod effort_gating_tests {
         assert_eq!(
             effort_for_provider(app::EffortLevel::Off, Some("https://example.com/v1"), None),
             Some(ReasoningEffort::None)
+        );
+        // Adaptive resolves per-request via thinking_budget — no fixed effort.
+        assert_eq!(
+            effort_for_provider(
+                app::EffortLevel::Adaptive,
+                Some("https://example.com/v1"),
+                None
+            ),
+            None
         );
         // A blank/whitespace-only custom endpoint must NOT count as "has a
         // custom endpoint" — `build_provider` treats it the same way

@@ -54,6 +54,8 @@ pub(crate) struct SubAgentDef {
     pub(crate) provider_override: Option<Arc<BoxedProvider>>,
     /// Optional reasoning/thinking effort level for this sub-agent.
     pub(crate) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
+    /// When true, resolve thinking budget per task (see thinking_budget).
+    pub(crate) adaptive_reasoning: bool,
     /// Enable reflection prompts after tool results for this sub-agent.
     pub(crate) enable_reflection: Option<bool>,
     /// Tool output compression threshold in bytes for this sub-agent.
@@ -126,6 +128,7 @@ impl SubAgentDef {
             guardrails: vec![],
             provider_override: None,
             reasoning_effort: None,
+            adaptive_reasoning: false,
             enable_reflection: None,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
@@ -166,6 +169,7 @@ impl From<SubAgentConfig> for SubAgentDef {
             guardrails: def.guardrails,
             provider_override: def.provider,
             reasoning_effort: def.reasoning_effort,
+            adaptive_reasoning: false,
             enable_reflection: def.enable_reflection,
             tool_output_compression_threshold: def.tool_output_compression_threshold,
             max_tools_per_turn: def.max_tools_per_turn,
@@ -246,6 +250,7 @@ impl<P: LlmProvider + 'static> Orchestrator<P> {
             run_timeout: None,
             enable_squads: None,
             reasoning_effort: None,
+            adaptive_reasoning: false,
             enable_reflection: false,
             tool_output_compression_threshold: None,
             max_tools_per_turn: None,
@@ -539,7 +544,9 @@ impl DelegateTaskTool {
                 if let Some(timeout) = agent_def.run_timeout {
                     builder = builder.run_timeout(timeout);
                 }
-                if let Some(effort) = agent_def.reasoning_effort {
+                if agent_def.adaptive_reasoning {
+                    builder = builder.adaptive_reasoning(true);
+                } else if let Some(effort) = agent_def.reasoning_effort {
                     builder = builder.reasoning_effort(effort);
                 }
                 if let Some(true) = agent_def.enable_reflection {
@@ -1080,7 +1087,9 @@ impl Tool for FormSquadTool {
                     if let Some(timeout) = agent_def.run_timeout {
                         builder = builder.run_timeout(timeout);
                     }
-                    if let Some(effort) = agent_def.reasoning_effort {
+                    if agent_def.adaptive_reasoning {
+                        builder = builder.adaptive_reasoning(true);
+                    } else if let Some(effort) = agent_def.reasoning_effort {
                         builder = builder.reasoning_effort(effort);
                     }
                     if let Some(true) = agent_def.enable_reflection {
@@ -2259,6 +2268,7 @@ pub struct OrchestratorBuilder<P: LlmProvider> {
     run_timeout: Option<Duration>,
     enable_squads: Option<bool>,
     reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
+    adaptive_reasoning: bool,
     enable_reflection: bool,
     tool_output_compression_threshold: Option<usize>,
     max_tools_per_turn: Option<usize>,
@@ -2415,6 +2425,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// Add a sub-agent using a fully specified [`SubAgentConfig`].
     pub fn sub_agent_full(mut self, config: SubAgentConfig) -> Self {
         let mut def = SubAgentDef::from(config);
+        if self.adaptive_reasoning {
+            def.adaptive_reasoning = true;
+        }
         if def.workspace.is_none() {
             def.workspace = self.workspace.clone();
         }
@@ -2667,6 +2680,20 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
     /// Set reasoning/thinking effort level for the orchestrator's own LLM calls.
     pub fn reasoning_effort(mut self, effort: crate::llm::types::ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Enable adaptive thinking budgets on the entry agent and every
+    /// registered sub-agent (see [`crate::llm::thinking_budget`]).
+    pub fn adaptive_reasoning(mut self, enabled: bool) -> Self {
+        self.adaptive_reasoning = enabled;
+        // Retroactively mark already-registered sub-agents so a late call
+        // still covers them.
+        if enabled {
+            for a in &mut self.sub_agents {
+                a.adaptive_reasoning = true;
+            }
+        }
         self
     }
 
@@ -3168,7 +3195,9 @@ impl<P: LlmProvider + 'static> OrchestratorBuilder<P> {
         if let Some(timeout) = self.run_timeout {
             runner_builder = runner_builder.run_timeout(timeout);
         }
-        if let Some(effort) = self.reasoning_effort {
+        if self.adaptive_reasoning {
+            runner_builder = runner_builder.adaptive_reasoning(true);
+        } else if let Some(effort) = self.reasoning_effort {
             runner_builder = runner_builder.reasoning_effort(effort);
         }
         if self.enable_reflection {
@@ -3655,6 +3684,7 @@ mod tests {
                 guardrails: vec![],
                 provider_override: None,
                 reasoning_effort: None,
+                adaptive_reasoning: false,
                 enable_reflection: None,
                 tool_output_compression_threshold: None,
                 max_tools_per_turn: None,
@@ -7590,6 +7620,7 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RequestRouted { agent, .. }
+                | AgentEvent::ThinkingBudgetResolved { agent, .. }
                 | AgentEvent::GateFired { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
@@ -8286,6 +8317,7 @@ mod tests {
                 | AgentEvent::GuardrailDenied { agent, .. }
                 | AgentEvent::GuardrailWarned { agent, .. }
                 | AgentEvent::RequestRouted { agent, .. }
+                | AgentEvent::ThinkingBudgetResolved { agent, .. }
                 | AgentEvent::GateFired { agent, .. }
                 | AgentEvent::RetryAttempt { agent, .. }
                 | AgentEvent::DoomLoopDetected { agent, .. }
@@ -8324,6 +8356,7 @@ mod tests {
                 AgentEvent::GuardrailDenied { .. } => "GuardrailDenied",
                 AgentEvent::GuardrailWarned { .. } => "GuardrailWarned",
                 AgentEvent::RequestRouted { .. } => "RequestRouted",
+                AgentEvent::ThinkingBudgetResolved { .. } => "ThinkingBudgetResolved",
                 AgentEvent::GateFired { .. } => "GateFired",
                 AgentEvent::RetryAttempt { .. } => "RetryAttempt",
                 AgentEvent::DoomLoopDetected { .. } => "DoomLoopDetected",

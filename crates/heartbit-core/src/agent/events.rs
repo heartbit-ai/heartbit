@@ -180,6 +180,22 @@ pub enum AgentEvent {
         /// Classifier confidence (1.0 for deterministic sources).
         confidence: f32,
     },
+    /// Adaptive thinking-budget router chose enable_thinking / effort / max_tokens
+    /// for this user request (see `llm::thinking_budget`).
+    ThinkingBudgetResolved {
+        /// Agent name.
+        agent: String,
+        /// Tier label ("off"/"low"/"medium"/"high").
+        tier: String,
+        /// Whether `enable_thinking` will be sent true.
+        enable_thinking: bool,
+        /// Effort label ("none"/"low"/"medium"/"high").
+        effort: String,
+        /// max_tokens applied to the next LLM call(s) for this request.
+        max_tokens: u32,
+        /// Scorer explanation for traces.
+        reason: String,
+    },
     /// A deterministic harness gate fired (ask/act/plan/mode-contract/study/
     /// repair-hint/escalation/delegation-nudge). These inject guidance into
     /// the agent's context; this event makes them visible in the trace so a
@@ -370,6 +386,7 @@ impl AgentEvent {
             Self::GuardrailWarned { .. } => "guardrail_warned",
             Self::RunFailed { .. } => "run_failed",
             Self::RequestRouted { .. } => "request_routed",
+            Self::ThinkingBudgetResolved { .. } => "thinking_budget_resolved",
             Self::GateFired { .. } => "gate_fired",
             Self::RetryAttempt { .. } => "retry_attempt",
             Self::DoomLoopDetected { .. } => "doom_loop_detected",

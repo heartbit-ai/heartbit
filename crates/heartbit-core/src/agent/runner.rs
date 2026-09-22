@@ -430,6 +430,10 @@ pub struct AgentRunner<P: LlmProvider> {
     pub(super) run_timeout: Option<Duration>,
     /// Optional reasoning/thinking effort level for models that support it.
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
+    /// When true, resolve enable_thinking / effort / max_tokens per user
+    /// request via [`crate::llm::thinking_budget`] (overrides a fixed
+    /// `reasoning_effort` for that request).
+    pub(super) adaptive_reasoning: bool,
     /// When true, inject a reflection prompt after tool results to encourage
     /// the agent to assess results before the next action (Reflexion/CRITIC pattern).
     pub(super) enable_reflection: bool,
@@ -587,6 +591,7 @@ impl<P: LlmProvider> AgentRunner<P> {
             interrupt: None,
             run_timeout: None,
             reasoning_effort: None,
+            adaptive_reasoning: false,
             enable_reflection: false,
             tool_output_compression_threshold: None,
             tool_result_ingest_cap: Some(DEFAULT_TOOL_RESULT_INGEST_CAP),
@@ -713,6 +718,48 @@ impl<P: LlmProvider> AgentRunner<P> {
         self.provider
             .model_name()
             .and_then(|model| crate::llm::pricing::estimate_cost(model, usage))
+    }
+
+    /// Re-resolve thinking budget for a fresh user request and apply it to `ctx`.
+    fn apply_adaptive_budget(
+        &self,
+        ctx: &mut AgentContext,
+        prompt: &str,
+        request_mode: super::router::RequestMode,
+    ) {
+        if !self.adaptive_reasoning {
+            return;
+        }
+        let budget = crate::llm::thinking_budget::resolve_thinking_budget(
+            &crate::llm::thinking_budget::ThinkingBudgetInput::new(prompt)
+                .with_mode(Some(request_mode.label()))
+                .with_tool_count(self.tools.len())
+                .with_ceiling(self.max_tokens),
+        );
+        ctx.set_reasoning_effort(Some(budget.effort));
+        ctx.set_max_tokens(budget.max_tokens);
+        debug!(
+            agent = %self.name,
+            tier = budget.tier.label(),
+            enable_thinking = budget.enable_thinking,
+            max_tokens = budget.max_tokens,
+            reason = %budget.reason,
+            "adaptive thinking budget resolved"
+        );
+        let effort = match budget.effort {
+            crate::llm::types::ReasoningEffort::High => "high",
+            crate::llm::types::ReasoningEffort::Medium => "medium",
+            crate::llm::types::ReasoningEffort::Low => "low",
+            crate::llm::types::ReasoningEffort::None => "none",
+        };
+        self.emit(AgentEvent::ThinkingBudgetResolved {
+            agent: self.name.clone(),
+            tier: budget.tier.label().to_string(),
+            enable_thinking: budget.enable_thinking,
+            effort: effort.to_string(),
+            max_tokens: budget.max_tokens,
+            reason: budget.reason,
+        });
     }
 
     /// Run the agent on `task` and return the final output.
@@ -961,6 +1008,11 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
                 None => super::router::RequestMode::Execute,
             };
+            // Adaptive thinking: score this request once before the first LLM
+            // turn (and again on each on_input — see below). Fixed
+            // `reasoning_effort` stays as the context default when adaptive
+            // is off.
+            self.apply_adaptive_budget(&mut ctx, task, request_mode);
             // STUDY contract: the go/no-go question must happen before the
             // study can settle (one corrective per request).
             let mut question_called = false;
@@ -2107,6 +2159,7 @@ impl<P: LlmProvider> AgentRunner<P> {
                             });
                             request_mode = routed.mode;
                         }
+                        self.apply_adaptive_budget(&mut ctx, &next_message, request_mode);
                         request_start_msg = ctx.message_count();
                         ctx.add_user_message(next_message);
                         nudge_tool_calls = 0;

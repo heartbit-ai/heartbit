@@ -63,6 +63,7 @@ pub struct AgentRunnerBuilder<P: LlmProvider> {
     pub(super) interrupt: Option<super::interrupt::InterruptHandle>,
     pub(super) run_timeout: Option<Duration>,
     pub(super) reasoning_effort: Option<crate::llm::types::ReasoningEffort>,
+    pub(super) adaptive_reasoning: bool,
     pub(super) enable_reflection: bool,
     pub(super) tool_output_compression_threshold: Option<usize>,
     pub(super) tool_result_ingest_cap: Option<usize>,
@@ -329,6 +330,17 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
     /// Default: `None` (no reasoning).
     pub fn reasoning_effort(mut self, effort: crate::llm::types::ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Enable adaptive thinking budgets: each fresh user request is scored
+    /// (structure + request mode + tool inventory) and mapped to
+    /// enable_thinking / effort / max_tokens. See
+    /// [`crate::llm::thinking_budget`].
+    ///
+    /// Default: `false`.
+    pub fn adaptive_reasoning(mut self, enabled: bool) -> Self {
+        self.adaptive_reasoning = enabled;
         self
     }
 
@@ -887,6 +899,7 @@ impl<P: LlmProvider> AgentRunnerBuilder<P> {
             interrupt: self.interrupt,
             run_timeout: self.run_timeout,
             reasoning_effort: self.reasoning_effort,
+            adaptive_reasoning: self.adaptive_reasoning,
             enable_reflection: self.enable_reflection,
             tool_output_compression_threshold: self.tool_output_compression_threshold,
             tool_result_ingest_cap: self.tool_result_ingest_cap,

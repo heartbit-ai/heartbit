@@ -31,20 +31,21 @@ pub const BUILTINS: &[ModelProfile] = &[
         model: Some("qwen3.8-27b"),
         // Reasoning models spend tokens in `message.reasoning` before
         // `message.content`. Live probe 2026-09-22: max_tokens=16 → content
-        // null + finish=length; max_tokens=256 → content "pong". 8192 leaves
-        // room for tool rounds without Truncated.
-        max_tokens: Some(8192),
-        // Effort off → ReasoningEffort::None on the custom-endpoint path so
-        // OpenAiCompat can send chat_template_kwargs.enable_thinking=false
-        // (vLLM Qwen ignores OpenRouter-style reasoning.effort=none).
-        reasoning_effort: Some("off"),
+        // null + finish=length; max_tokens=256 → content "pong". Adaptive
+        // High targets 16384 (live probe: 8192 filled with reasoning only on
+        // a hard nginx/openssl task). Ceiling is the adaptive budget cap.
+        max_tokens: Some(16384),
+        // Adaptive: trivial chat → enable_thinking=false; hard agentic/TB2 →
+        // high. Replaces the previous fixed "off" (which fixed hello but
+        // starved hard tasks of thinking). See llm::thinking_budget.
+        reasoning_effort: Some("adaptive"),
         // OpenRouter cache_control breakpoints are meaningless on a private
         // vLLM endpoint and can confuse some OpenAI-compat parsers.
         prompt_caching: Some(false),
         // Default OpenAiCompat client is 120s; a Koyeb cold start can burn
         // ~100s before the first byte. 300s covers restart + first completion.
         http_timeout_secs: Some(300),
-        summary: "Qwen on vLLM/OpenAI-compat (thinking off by default, cold-start tolerant)",
+        summary: "Qwen on vLLM/OpenAI-compat (adaptive thinking, cold-start tolerant)",
     },
     ModelProfile {
         id: "openrouter-default",
@@ -125,10 +126,10 @@ mod tests {
         };
         assert_eq!(apply_to_config(&mut cfg), Some("qwen-vllm"));
         assert_eq!(cfg.model.as_deref(), Some("qwen3.8-27b"));
-        assert_eq!(cfg.max_tokens, Some(8192));
+        assert_eq!(cfg.max_tokens, Some(16384));
         assert_eq!(cfg.http_timeout_secs, Some(300));
         assert!(!cfg.prompt_caching);
-        assert_eq!(cfg.reasoning_effort.as_deref(), Some("off"));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("adaptive"));
     }
 
     #[test]

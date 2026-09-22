@@ -221,13 +221,16 @@ impl OpenAiCompatProvider {
 /// `reasoning.effort=none` still returned ~180–280 chars of
 /// `message.reasoning`. The same request with
 /// `chat_template_kwargs: {"enable_thinking": false}` returned
-/// `reasoning_len=0` and a one-line greeting. Only applied when the
-/// caller explicitly set [`ReasoningEffort::None`] — omitting the field
-/// keeps the model default (thinking on).
+/// `reasoning_len=0` and a one-line greeting.
+///
+/// Adaptive budgets (see [`crate::llm::thinking_budget`]) map Off/Low →
+/// `false` and Medium/High → `true`. Omitting `reasoning_effort` leaves the
+/// model default alone.
 fn apply_openai_compat_thinking(body: &mut serde_json::Value, request: &CompletionRequest) {
-    use super::types::ReasoningEffort;
-    if request.reasoning_effort == Some(ReasoningEffort::None) {
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    if let Some(enable) =
+        super::thinking_budget::enable_thinking_for_effort(request.reasoning_effort)
+    {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable});
     }
 }
 
@@ -245,6 +248,38 @@ mod tests {
             max_tokens: 256,
             tool_choice: None,
             reasoning_effort: Some(ReasoningEffort::None),
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn apply_openai_compat_thinking_enables_on_high() {
+        use crate::llm::types::{CompletionRequest, Message, ReasoningEffort};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("hard task")],
+            tools: vec![],
+            max_tokens: 8192,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
+        apply_openai_compat_thinking(&mut body, &request);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn apply_openai_compat_thinking_disables_on_low() {
+        use crate::llm::types::{CompletionRequest, Message, ReasoningEffort};
+        let request = CompletionRequest {
+            system: String::new(),
+            messages: vec![Message::user("short q")],
+            tools: vec![],
+            max_tokens: 2048,
+            tool_choice: None,
+            reasoning_effort: Some(ReasoningEffort::Low),
         };
         let mut body = super::super::openrouter::build_openai_request("m", &request).unwrap();
         apply_openai_compat_thinking(&mut body, &request);
