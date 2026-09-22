@@ -76,18 +76,18 @@ pub fn builtin(id: &str) -> Option<&'static ModelProfile> {
 pub fn apply_to_config(cfg: &mut TuiConfig) -> Option<&'static str> {
     let id = cfg.profile.as_deref()?.to_string();
     let profile = builtin(&id)?;
-    if cfg.model.is_none() {
-        if let Some(m) = profile.model {
-            cfg.model = Some(m.to_string());
-        }
+    if cfg.model.is_none()
+        && let Some(m) = profile.model
+    {
+        cfg.model = Some(m.to_string());
     }
     if cfg.max_tokens.is_none() {
         cfg.max_tokens = profile.max_tokens;
     }
-    if cfg.reasoning_effort.is_none() {
-        if let Some(e) = profile.reasoning_effort {
-            cfg.reasoning_effort = Some(e.to_string());
-        }
+    if cfg.reasoning_effort.is_none()
+        && let Some(e) = profile.reasoning_effort
+    {
+        cfg.reasoning_effort = Some(e.to_string());
     }
     if let Some(pc) = profile.prompt_caching {
         // prompt_caching defaults to true in TuiConfig::default; treat the
