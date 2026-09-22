@@ -3885,7 +3885,7 @@ mod tests {
             },
             CompletionResponse {
                 content: vec![ContentBlock::Text {
-                    text: "Sorry, let me respond directly.".into(),
+                    text: "Unable to use that tool; answering without it.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
                 reasoning: None,
@@ -3900,7 +3900,10 @@ mod tests {
             .unwrap();
 
         let output = orch.run("do something").await.unwrap();
-        assert_eq!(output.result, "Sorry, let me respond directly.");
+        assert_eq!(
+            output.result,
+            "Unable to use that tool; answering without it."
+        );
     }
 
     #[tokio::test]
@@ -3918,10 +3921,12 @@ mod tests {
                 usage: TokenUsage::default(),
                 model: None,
             },
-            // 2: LLM recovers after seeing the error
+            // 2: LLM recovers after seeing the error — avoid act_gate
+            // announce markers ("let me" / "i'll") that would consume
+            // another mock response.
             CompletionResponse {
                 content: vec![ContentBlock::Text {
-                    text: "Let me try again properly.".into(),
+                    text: "Retrying with a proper task list is required.".into(),
                 }],
                 stop_reason: StopReason::EndTurn,
                 reasoning: None,
@@ -3936,7 +3941,10 @@ mod tests {
             .unwrap();
 
         let output = orch.run("do something").await.unwrap();
-        assert_eq!(output.result, "Let me try again properly.");
+        assert_eq!(
+            output.result,
+            "Retrying with a proper task list is required."
+        );
     }
 
     #[tokio::test]

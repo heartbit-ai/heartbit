@@ -1850,7 +1850,14 @@ impl<P: LlmProvider> AgentRunner<P> {
                     // returned 502 empty-choices on the forced turn.)
                     let last_text = ctx.last_assistant_text().unwrap_or_default();
                     let reasoning = response.reasoning.as_deref().unwrap_or("");
-                    let empty = last_text.trim().is_empty();
+                    // Treat the act-gate placeholder as empty: Qwen-on-vLLM
+                    // (TB2 nginx rerun3) echoed "[stalled — calling tools now]"
+                    // as its final answer after seeing it in history.
+                    const STALL_PLACEHOLDER: &str = "[stalled — calling tools now]";
+                    let empty = {
+                        let t = last_text.trim();
+                        t.is_empty() || t == STALL_PLACEHOLDER
+                    };
                     // Reasoning "Let me think…" is normal chain-of-thought when
                     // content already answers; only treat reasoning announce as
                     // a stall when content is empty (TB2 constraints orch=1).
@@ -1876,10 +1883,8 @@ impl<P: LlmProvider> AgentRunner<P> {
                             reason: reason.into(),
                         });
 
-                        if empty {
-                            ctx.ensure_last_assistant_nonempty(
-                                "[stalled — calling tools now]",
-                            );
+                        if last_text.trim().is_empty() {
+                            ctx.ensure_last_assistant_nonempty(STALL_PLACEHOLDER);
                         }
 
                         ctx.add_user_message(format!(
@@ -1888,13 +1893,14 @@ impl<P: LlmProvider> AgentRunner<P> {
                              EXECUTE the task NOW: your next response MUST include \
                              at least one tool call (read/bash/write/…). Do not \
                              narrate, do not answer empty, do not stop on reasoning. \
-                             Emit a tool_use / function call immediately."
+                             Emit a tool_use / function call immediately. Do NOT \
+                             repeat the stall placeholder."
                         ));
                         continue;
                     }
                     // Budget exhausted and still no productive tools — fail
-                    // closed (TB2 openssl rerun2: exit 0 with result
-                    // "[stalled — calling tools now]" and reward 0).
+                    // closed (TB2 openssl/nginx: exit 0 with stall placeholder
+                    // was reward 0).
                     if !llm_interrupted
                         && request_tool_calls == 0
                         && act_gate_nudges >= MAX_ACT_GATE_NUDGES
