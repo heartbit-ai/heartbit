@@ -2693,7 +2693,8 @@ async fn run_entry_agent_orchestrator(
     // Reasoning models (Qwen-on-vLLM) spend tokens in `message.reasoning`
     // before `content`. 4096 truncates mid-thought; 8192 still Truncated on
     // constraints-scheduling after the slim headless prompt (TB2 2026-09-22
-    // fix3). 16384 cleared it (fix4: reward 1.0, 15 tools).
+    // fix3). 16384 cleared constraints (fix4: reward 1.0) but filter-js still
+    // Truncated once — runner now one-shot-rescues that path.
     let entry_max_tokens: u32 = parse_env("HEARTBIT_MAX_TOKENS").unwrap_or(16384);
 
     // Entry agent's direct tools: builtins FIRST.

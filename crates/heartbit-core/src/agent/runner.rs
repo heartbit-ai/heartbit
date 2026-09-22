@@ -260,6 +260,23 @@ const ESCALATION_AFTER_FAILURES: u32 = 3;
 /// hard stop (live finding 6a25d21b: the soft warning was ignored 3→4→5).
 const DOOM_HARD_STOP_MARGIN: u32 = 2;
 
+/// True when a tool call's JSON input is empty or only blank strings — the
+/// Qwen empty-`{}` failure mode (TB2 smoke batch2: bash without `command`).
+fn tool_call_args_empty(tc: &crate::llm::types::ToolCall) -> bool {
+    match &tc.input {
+        serde_json::Value::Object(map) if map.is_empty() => true,
+        serde_json::Value::Object(map) => map.values().all(|v| match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::String(s) => s.trim().is_empty(),
+            serde_json::Value::Object(m) if m.is_empty() => true,
+            serde_json::Value::Array(a) if a.is_empty() => true,
+            _ => false,
+        }),
+        serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
 /// Harness-barrier tools: they mutate the guard/goal state sibling calls are
 /// checked against, so a batch containing one is split — barriers execute
 /// FIRST, serially, before the rest is guard-checked and dispatched (TOCTOU
@@ -865,6 +882,14 @@ impl<P: LlmProvider> AgentRunner<P> {
             // Track recently used tool names (last 2 turns) for dynamic tool selection
             let mut recently_used_tools: Vec<String> = Vec::new();
             let mut doom_tracker = DoomLoopTracker::new();
+            // One-shot rescue when a hard doom abort would fire on empty-arg
+            // tool calls (TB2 batch2: bash {} ×5 → NonZeroExit). Reset the
+            // tracker, inject a schema example, and let the model continue.
+            let mut empty_arg_doom_rescued = false;
+            // One-shot rescue when a turn burns max_tokens on reasoning/prose
+            // with zero tool calls (TB2 batch2 filter-js-from-html: Truncated
+            // at 16384 → NonZeroExit). Nudge once to continue via tools.
+            let mut truncated_rescued = false;
             let mut last_model_name: Option<String> = None;
             // Reactive overflow-recovery ladder (prevents both infinite
             // compaction loops AND the single-shot dead-end): 0 = untried,
@@ -1720,8 +1745,30 @@ impl<P: LlmProvider> AgentRunner<P> {
                 }
 
                 if tool_calls.is_empty() {
-                    // Check for truncation
+                    // Check for truncation. Qwen-on-vLLM often fills the whole
+                    // completion budget with reasoning and never emits tools
+                    // (TB2 filter-js-from-html, 16384 tokens, 2026-09-22).
+                    // One rescue per request: ask for a short tool call next.
                     if response.stop_reason == StopReason::MaxTokens {
+                        if !truncated_rescued {
+                            truncated_rescued = true;
+                            debug!(
+                                agent = %self.name,
+                                "truncated rescue; nudging for concise tool use"
+                            );
+                            self.emit(AgentEvent::GateFired {
+                                agent: self.name.clone(),
+                                gate: "truncated_rescue".into(),
+                                reason: "max_tokens with zero tool calls".into(),
+                            });
+                            ctx.add_user_message(
+                                "[truncated] Your previous reply hit max_tokens before \
+                                 any tool call. Continue NOW with a short tool call \
+                                 (e.g. bash/read/write) — no long reasoning."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         self.emit(AgentEvent::RunFailed {
                             agent: self.name.clone(),
                             error: "Response truncated (max_tokens reached)".into(),
@@ -2025,6 +2072,9 @@ impl<P: LlmProvider> AgentRunner<P> {
                         prose_question_nudged = false;
                         request_tool_calls = 0;
                         act_gate_nudges = 0;
+                        empty_arg_doom_rescued = false;
+                        truncated_rescued = false;
+                        doom_tracker = DoomLoopTracker::new();
                         // Per-request continuation budgets re-arm with the
                         // other gates: a second set_goal (or a new red-verify
                         // cycle) on a later request gets its full budget.
@@ -2254,6 +2304,51 @@ impl<P: LlmProvider> AgentRunner<P> {
                         // 6a25d21b: doom detected at 3/4/5, never stopped, user
                         // had to interrupt by hand).
                         if doom_tracker.count() >= threshold + DOOM_HARD_STOP_MARGIN {
+                            // Empty-arg rescue (TB2 smoke batch2 2026-09-22):
+                            // Qwen hammered bash with `{}` five times; soft
+                            // warnings said "try a different approach" but not
+                            // "pass command". Aborting → NonZeroExit → reward 0.
+                            // One rescue: reset tracker + concrete schema example.
+                            if !empty_arg_doom_rescued
+                                && tool_calls.iter().all(tool_call_args_empty)
+                            {
+                                empty_arg_doom_rescued = true;
+                                doom_tracker = DoomLoopTracker::new();
+                                debug!(
+                                    agent = %self.name,
+                                    "empty-arg doom rescue; schema example injected"
+                                );
+                                self.emit(AgentEvent::GateFired {
+                                    agent: self.name.clone(),
+                                    gate: "empty_arg_doom_rescue".into(),
+                                    reason: "identical empty tool args; schema example".into(),
+                                });
+                                let results: Vec<ToolResult> = tool_calls
+                                    .iter()
+                                    .map(|tc| {
+                                        ToolResult::error(
+                                            tc.id.clone(),
+                                            format!(
+                                                "Your `{name}` call had EMPTY arguments. \
+                                                 Pass the required JSON fields. Examples: \
+                                                 bash({{\"command\": \"ls -la /app\"}}), \
+                                                 read({{\"file_path\": \"/app/README.md\"}}). \
+                                                 Do NOT call tools with {{}}.",
+                                                name = tc.name
+                                            ),
+                                        )
+                                    })
+                                    .collect();
+                                total_tool_calls += tool_calls.len();
+                                ctx.add_tool_results(results);
+                                ctx.add_user_message(
+                                    "[empty-arg rescue] Every recent tool call used empty \
+                                     arguments ({}). Call the tool AGAIN with real parameters \
+                                     — e.g. bash({\"command\": \"pwd; ls -la\"})."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
                             self.emit(AgentEvent::DoomLoopDetected {
                                 agent: self.name.clone(),
                                 turn: ctx.current_turn(),
@@ -2288,14 +2383,22 @@ impl<P: LlmProvider> AgentRunner<P> {
                         let results: Vec<ToolResult> = tool_calls
                             .iter()
                             .map(|tc| {
-                                ToolResult::error(
-                                    tc.id.clone(),
+                                let msg = if tool_call_args_empty(tc) {
+                                    format!(
+                                        "Doom loop: identical EMPTY `{name}` args repeated {} \
+                                         times. Pass real parameters — e.g. bash({{\"command\": \
+                                         \"ls -la /app\"}}).",
+                                        doom_tracker.count(),
+                                        name = tc.name
+                                    )
+                                } else {
                                     format!(
                                         "Doom loop detected: identical tool calls repeated {} \
                                          times consecutively. Try a different approach.",
                                         doom_tracker.count()
-                                    ),
-                                )
+                                    )
+                                };
+                                ToolResult::error(tc.id.clone(), msg)
                             })
                             .collect();
                         total_tool_calls += tool_calls.len();
@@ -7044,6 +7147,129 @@ mod tests {
         assert!(
             provider.captured_requests.lock().unwrap().len() < 30,
             "fuzzy doom must hard-stop well before max_turns"
+        );
+    }
+
+    #[test]
+    fn tool_call_args_empty_detects_blank_json() {
+        let empty = crate::llm::types::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        };
+        assert!(super::tool_call_args_empty(&empty));
+        let blank_cmd = crate::llm::types::ToolCall {
+            id: "2".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "  "}),
+        };
+        assert!(super::tool_call_args_empty(&blank_cmd));
+        let real = crate::llm::types::ToolCall {
+            id: "3".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        };
+        assert!(!super::tool_call_args_empty(&real));
+    }
+
+    // TB2 smoke batch2 (2026-09-22): Qwen hammered bash({}) five times and the
+    // hard doom abort ended the trial (fix-git / openssl / nginx). One rescue
+    // with a schema example must let the model continue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_arg_doom_rescue_lets_model_continue() {
+        let mut responses: Vec<_> = (0..4).map(|_| tool_use_named("work", 1)).collect();
+        responses.push(MockProvider::text_response("recovered", 1, 1));
+        let provider = Arc::new(MockProvider::new(responses));
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_identical_tool_calls(2)
+            .max_turns(20)
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        let out = runner.execute("go").await.unwrap();
+        assert_eq!(out.result, "recovered");
+        let events_snapshot = events.lock().unwrap().clone();
+        let gates: Vec<_> = events_snapshot
+            .iter()
+            .filter_map(|e| match e {
+                crate::agent::events::AgentEvent::GateFired { gate, .. } => Some(gate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gates.contains(&"empty_arg_doom_rescue"),
+            "expected empty_arg_doom_rescue gate, got {gates:?}"
+        );
+    }
+
+    // After the one-shot rescue, a second empty-arg hard doom must still abort.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_arg_doom_rescue_only_once() {
+        let responses: Vec<_> = (0..10).map(|_| tool_use_named("work", 1)).collect();
+        let provider = Arc::new(MockProvider::new(responses));
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .tool(Arc::new(NamedTool { name: "work" }))
+            .max_identical_tool_calls(2)
+            .max_turns(30)
+            .build()
+            .unwrap();
+        let err = runner.execute("go").await.unwrap_err();
+        let err = match err {
+            Error::WithPartialUsage { source, .. } => *source,
+            e => e,
+        };
+        assert!(
+            matches!(err, Error::DoomLoopAborted(_)),
+            "second empty-arg doom must abort, got: {err:?}"
+        );
+    }
+
+    // TB2 filter-js-from-html: first MaxTokens with zero tools must nudge, not die.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncated_rescue_lets_model_continue() {
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::types::CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "long reasoning…".into(),
+                }],
+                stop_reason: StopReason::MaxTokens,
+                reasoning: None,
+                usage: TokenUsage::default(),
+                model: None,
+            },
+            MockProvider::text_response("done via tools path", 1, 1),
+        ]));
+        let events: Arc<std::sync::Mutex<Vec<crate::agent::events::AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let runner = AgentRunner::builder(provider)
+            .name("t")
+            .system_prompt("s")
+            .max_turns(6)
+            .on_event(Arc::new(move |e| ev.lock().expect("lock").push(e)))
+            .build()
+            .unwrap();
+        let out = runner.execute("filter html").await.unwrap();
+        assert!(out.result.contains("done"));
+        let events_snapshot = events.lock().unwrap().clone();
+        let gates: Vec<_> = events_snapshot
+            .iter()
+            .filter_map(|e| match e {
+                crate::agent::events::AgentEvent::GateFired { gate, .. } => Some(gate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gates.contains(&"truncated_rescue"),
+            "expected truncated_rescue gate, got {gates:?}"
         );
     }
 

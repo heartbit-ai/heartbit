@@ -269,10 +269,8 @@ fn body_snippet_from_path(post_path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(post_path).ok()?;
     let trimmed = content.trim_start();
     let body = if let Some(after) = trimmed.strip_prefix("---") {
-        match after.find("\n---\n") {
-            Some(end) => after[end + 5..].trim_start_matches('\n').to_string(),
-            None => return None,
-        }
+        let end = after.find("\n---\n")?;
+        after[end + 5..].trim_start_matches('\n').to_string()
     } else {
         trimmed.to_string()
     };

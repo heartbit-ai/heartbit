@@ -511,7 +511,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_errors_on_max_tokens() {
-        let provider = Arc::new(MockProvider::new(vec![CompletionResponse {
+        // One-shot truncated_rescue consumes the first MaxTokens; a second
+        // consecutive Truncated still fails the run (TB2 filter-js 2026-09-22).
+        let truncated = CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: "truncated...".into(),
             }],
@@ -519,7 +521,8 @@ mod tests {
             reasoning: None,
             usage: TokenUsage::default(),
             model: None,
-        }]));
+        };
+        let provider = Arc::new(MockProvider::new(vec![truncated.clone(), truncated]));
 
         let runner = AgentRunner::builder(provider)
             .name("test")

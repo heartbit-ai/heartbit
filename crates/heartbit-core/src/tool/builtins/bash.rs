@@ -194,8 +194,18 @@ impl Tool for BashTool {
             let command = input
                 .get("command")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Agent("command is required".into()))?;
-
+                .unwrap_or("")
+                .to_string();
+            // Qwen-on-vLLM (TB2 smoke batch2 2026-09-22) repeatedly called
+            // bash with `{}` / missing command, then doom-loop aborted the run
+            // (fix-git, openssl, nginx). Surface a concrete example so the
+            // next turn can recover instead of guessing the schema again.
+            if command.trim().is_empty() {
+                return Ok(ToolOutput::error(
+                    "bash requires a non-empty `command` string. \
+                     Example: {\"command\": \"ls -la /app\"}",
+                ));
+            }
             let timeout_ms = input
                 .get("timeout")
                 .and_then(|v| v.as_u64())
@@ -485,6 +495,26 @@ mod tests {
         assert!(!result.is_error, "got error: {}", result.content);
         assert!(result.content.contains("hello"));
         assert!(result.content.contains("exit code: 0"));
+    }
+
+    // TB2 smoke batch2 (2026-09-22): Qwen called bash with `{}` / missing
+    // command; returning Agent("command is required") was opaque. Surface a
+    // concrete example so the next turn can recover.
+    #[tokio::test]
+    async fn bash_empty_command_returns_schema_example() {
+        let tool = BashTool::new();
+        for input in [json!({}), json!({"command": ""}), json!({"command": "  "})] {
+            let result = tool
+                .execute(&crate::ExecutionContext::default(), input)
+                .await
+                .unwrap();
+            assert!(result.is_error, "empty command must be an error result");
+            assert!(
+                result.content.contains("ls -la /app"),
+                "must include schema example, got: {}",
+                result.content
+            );
+        }
     }
 
     // Live /analyze finding: the `{ cmd; }` wrap glued `; }` onto the heredoc

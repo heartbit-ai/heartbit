@@ -115,7 +115,9 @@ def build_trial_batch(
         "task_name": task_name,
         "trial_name": trial_name,
         "tool_calls_made": (trace or {}).get("tool_calls_made")
-        or ((result or {}).get("agent_result") or {}).get("metadata", {}).get("tool_calls_made"),
+        or (((result or {}).get("agent_result") or {}).get("metadata") or {}).get(
+            "tool_calls_made"
+        ),
         "source": "heartbit-tb2-post-run",
         "trace_file": str(trace_path) if trace_path.is_file() else None,
     }
@@ -137,9 +139,9 @@ def build_trial_batch(
                 "output": {
                     "result_preview": truncate(
                         (trace or {}).get("result")
-                        or ((result or {}).get("agent_result") or {})
-                        .get("metadata", {})
-                        .get("result_preview"),
+                        or (((result or {}).get("agent_result") or {}).get("metadata") or {}).get(
+                            "result_preview"
+                        ),
                         io_chars,
                     ),
                     "reward": reward,
