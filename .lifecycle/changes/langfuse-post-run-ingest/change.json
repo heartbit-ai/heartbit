@@ -1,6 +1,6 @@
 {
   "id": "langfuse-post-run-ingest",
-  "state": "draft",
+  "state": "complete",
   "objective": "Ingest post-run Heartbit traces (TB2 --trace-file + reward Harbor) into a self-hosted Langfuse for harness tuning, without embedding telemetry in the slim musl binary.",
   "non_goals": [
     "Ne pas ajouter la feature telemetry au binaire musl slim",
