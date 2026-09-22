@@ -26,7 +26,10 @@ fi
 export HEARTBIT_BASE_URL="$HEARTBIT_OPENAI_BASE_URL"
 export HEARTBIT_API_KEY="$HEARTBIT_OPENAI_API_KEY"
 # TUI-brain parity (entry-agent orchestrator + squad).
-export HEARTBIT_ORCHESTRATOR=1
+# TUI-brain parity by default; override to 0 when evidence shows the entry
+# orchestrator empty-exits on a task (Qwen × constraints-scheduling 2026-09-22:
+# orch Mean 0.0 ×2 with 0 tools; bare Mean 1.0 with 11 tools).
+export HEARTBIT_ORCHESTRATOR="${HEARTBIT_ORCHESTRATOR:-1}"
 export HEARTBIT_SUB_AGENT_MAX_TURNS="${HEARTBIT_SUB_AGENT_MAX_TURNS:-200}"
 export HEARTBIT_MAX_TURNS="${HEARTBIT_MAX_TURNS:-100}"
 # Reasoning models burn tokens before content; 4096 truncates (smoke 2026-09-22).
