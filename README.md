@@ -7,7 +7,7 @@
 
 # Heartbit — the Rust agentic framework
 
-A production-grade framework for building LLM-powered agents in Rust.
+An early-stage framework for building LLM-powered agents in Rust.
 Type-safe, async-native, and runtime-agnostic. Zero-copy ReAct loops with
 parallel tool execution via `tokio::JoinSet`, no Python/Node overhead.
 
